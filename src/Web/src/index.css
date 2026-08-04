@@ -1,0 +1,105 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens — ADR-0021. The @theme block is Tailwind v4's CSS-first
+ * config: every --color-* / --font-* / --spacing-* / --radius-* token
+ * declared here becomes both a CSS variable AND a Tailwind utility
+ * (bg-surface, text-accent, font-mono, etc).
+ *
+ * Naming convention:
+ *   --color-{semantic}      — chrome (surface, border, accent, text)
+ *   --color-state-{name}    — semantic data state (success, warning, danger)
+ *   --color-cat-{slug}      — category palette (groceries, dining, …)
+ *
+ * Light theme only per ADR-0021 Rule 4; dark mode is a future ADR + PR
+ * that overrides these tokens inside a [data-theme="dark"] block.
+ */
+@theme {
+    /* Fonts — Inter for prose + UI, JetBrains Mono for numbers. */
+    --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+        Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo,
+        Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+
+    /* Surface + border tokens. Contrast pass (ADR-0021 revision): the
+       prior border (slate-200) and hover (slate-100) were too faint for
+       a dense grid. Bumped border → slate-300 and hover → slate-200 so
+       separators and hover read clearly. surface-muted / -sidebar stay
+       near-white (slate-50): muted is the whole-app canvas the register
+       rows sit on transparently, so darkening it greys every row. */
+    --color-surface: #ffffff;
+    --color-surface-muted: #f8fafc;
+    /* The sidebar / accounts panel is content, not a header band — it
+       reads as white like the register surface. Grey is reserved for
+       header bands (surface-header) and the faint app canvas
+       (surface-muted), never for content panels. */
+    --color-surface-sidebar: #ffffff;
+    --color-surface-hover: #e2e8f0;
+    /* Header / column bands sit ON the white list surface and want to
+       read clearly as chrome — a step darker than the near-white canvas
+       (slate-100 vs slate-50). Distinct token so the band can be
+       deepened without darkening the whole-app canvas (surface-muted). */
+    --color-surface-header: #f1f5f9;
+    --color-border: #cbd5e1;
+    --color-border-strong: #94a3b8;
+
+    /* Text tokens. text-subtle was slate-400 (#94a3b8) → ~2.6:1 on
+       white, below WCAG AA; slate-500 clears AA (4.8:1) for the
+       secondary labels it's used on throughout. */
+    --color-text: #0f172a;
+    --color-text-muted: #475569;
+    --color-text-subtle: #64748b;
+    --color-text-inverse: #f8fafc;
+
+    /* Accent — slate teal (teal-600). Single accent per ADR-0021 Rule 4. */
+    --color-accent: #0d9488;
+    --color-accent-hover: #0f766e;
+    --color-accent-soft: #ccfbf1;
+    --color-accent-soft-text: #0f766e;
+
+    /* Semantic data states. NOT chrome accents — reserved for data display. */
+    --color-state-success: #15803d;
+    --color-state-success-soft: #dcfce7;
+    --color-state-warning: #92400e;
+    --color-state-warning-soft: #fef3c7;
+    --color-state-danger: #b91c1c;
+    --color-state-danger-soft: #fee2e2;
+
+    /* Category palette — ADR-0021 Rule 5. */
+    --color-cat-groc-soft: #fff7ed;
+    --color-cat-groc-text: #9a3412;
+    --color-cat-din-soft: #faf5ff;
+    --color-cat-din-text: #6b21a8;
+    --color-cat-house-soft: #eff6ff;
+    --color-cat-house-text: #1d4ed8;
+    --color-cat-util-soft: #fffbeb;
+    --color-cat-util-text: #92400e;
+    --color-cat-sub-soft: #eef2ff;
+    --color-cat-sub-text: #4338ca;
+    --color-cat-tran-soft: #ecfeff;
+    --color-cat-tran-text: #155e75;
+    --color-cat-sal-soft: #ecfdf5;
+    --color-cat-sal-text: #047857;
+    --color-cat-xfer-soft: #f1f5f9;
+    --color-cat-xfer-text: #475569;
+    --color-cat-phone-soft: #f0f9ff;
+    --color-cat-phone-text: #075985;
+    --color-cat-rec-soft: #fdf2f8;
+    --color-cat-rec-text: #9d174d;
+}
+
+/*
+ * Base resets that aren't expressible via @theme tokens.
+ *
+ *   color-scheme:light tells the browser to use light-mode form
+ *   controls + scrollbars (so a user with dark system pref doesn't see
+ *   dark scrollbars on our light app). Update when dark mode lands.
+ *
+ *   font-feature-settings turns on tabular numerals globally on the
+ *   sans font, so KPI values + amount sums line up without forcing
+ *   monospace. Mono font tokens already carry their own tnum.
+ */
+:root {
+    color-scheme: light;
+    font-feature-settings: "tnum" 1;
+}

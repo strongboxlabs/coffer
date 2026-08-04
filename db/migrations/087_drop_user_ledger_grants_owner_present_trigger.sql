@@ -1,0 +1,40 @@
+-- =============================================================================
+-- 087 — drop trg_user_ledger_grants_owner_present + function
+-- =============================================================================
+--
+-- Per [ADR-0032](../decisions/0032-triggers-as-last-resort.md), validation
+-- invariants live in API code. Fourth removal in the validation-trigger
+-- sweep.
+--
+-- INVARIANT (migration 014):
+--     every ledger has >= 1 owner in user_ledger_grants.
+--
+-- The trigger fired AFTER DELETE / UPDATE OF role ON user_ledger_grants,
+-- raising if the affected ledger was left with zero owners.
+--
+-- AUDIT — current write surface:
+--
+--   * LedgersRepository.AssignOwnerAsync — inserts a grant. INSERT-
+--     only path; never triggers the owner-present check (the trigger
+--     doesn't fire on INSERT, only DELETE / UPDATE OF role).
+--   * No API endpoint today revokes or downgrades grants — the
+--     trigger has had no opportunity to fire since it was armed.
+--
+-- The invariant remains real. When a future slice adds an endpoint
+-- like `DELETE /api/users/{id}/ledger-grants/{ledgerId}` or
+-- `PATCH …/role`, that endpoint will do its own check:
+--
+--     var ownerCount = await _db.UserLedgerGrants
+--         .CountAsync(g => g.LedgerId == ledgerId && g.Role == "owner");
+--     if (ownerCount < 1) return Fail("Cannot remove the last owner.");
+--
+-- API-side enforcement returns a friendly 422 with a typed error
+-- code instead of a Postgres exception bubbling through the
+-- ExceptionHandlerMiddleware as a generic 500.
+--
+-- Direct-SQL data migrations that re-assign ownership remain the
+-- operator's responsibility (engineering-standards §3.3).
+-- =============================================================================
+
+DROP TRIGGER IF EXISTS trg_user_ledger_grants_owner_present ON user_ledger_grants;
+DROP FUNCTION IF EXISTS fn_validate_ledger_has_owner();

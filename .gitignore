@@ -1,0 +1,99 @@
+# Personal financial data — never commit. Synthetic / documentation
+# samples live in data/samples/ and are tracked.
+data/*.json
+data/*.moneydance
+data/*.csv
+data/*.ofx
+data/*.qif
+data/*.qfx
+
+# Local environment
+.env
+.env.local
+.env.*.local
+*.env
+
+# Backups
+*.bak
+*.backup
+*.dump
+*.sql.gz
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+.idea/
+.vs/
+.vscode/*
+!.vscode/extensions.json
+*.code-workspace
+!.vscode/settings.json
+*.swp
+*.swo
+
+# Claude Code per-project metadata
+.claude/
+
+# Research / discovery scratch files (regenerate locally; never commit)
+scratch_*.py
+scratch_*.sql
+scratch_*.cs
+
+# .NET (Phase 3+)
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Bb]uild/
+[Bb]ld/
+[Oo]ut/
+[Pp]ublish/
+publish/
+TestResults/
+[Cc]overage/
+*.coverage
+*.coveragexml
+
+# Frontend (Phase 4+)
+node_modules/
+dist/
+.vite/
+.next/
+.turbo/
+.cache/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Web build outputs / TS project-references caches
+src/Web/dist/
+src/Web/node_modules/
+
+# Docker
+docker-compose.override.yml
+
+# Postgres dump artifacts (if accidentally created in repo dir)
+*.dump
+postgres_data/
+
+# Logs
+*.log
+logs/
+
+# Temp
+tmp/
+temp/
+.commit-msg.tmp
+.pr-body.tmp
+# scripts/stress-lane.sh keeps the full run here; timings are printed from it.
+.stress-lane.log

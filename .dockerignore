@@ -1,0 +1,22 @@
+# Build context hygiene — keep the image build fast + reproducible.
+# Host build outputs / deps are rebuilt inside the stages.
+**/bin
+**/obj
+**/node_modules
+src/Web/dist
+.git
+.github
+.vs
+.vscode
+tests
+docs
+scripts
+# Exclude data/ from the build context, EXCEPT the sample dataset, which the API
+# embeds for the setup form's "Include a Demo ledger" box (ADR-0088). `data/*`
+# ignores data's contents while leaving the dir itself, so the negation can
+# re-include samples.
+data/*
+!data/samples
+*.user
+**/.env
+.env

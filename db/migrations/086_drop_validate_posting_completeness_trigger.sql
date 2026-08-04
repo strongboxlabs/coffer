@@ -1,0 +1,45 @@
+-- =============================================================================
+-- 086 — drop trg_validate_posting_completeness + function
+-- =============================================================================
+--
+-- Per [ADR-0032](../decisions/0032-triggers-as-last-resort.md), validation
+-- invariants live in API code. Third removal in the validation-trigger
+-- sweep (after 084's posting_role and 085's posting_cardinality).
+--
+-- INVARIANT (ADR-0019, completeness half):
+--     every (header_id, posting_index) has either 0 or 2 legs at
+--     transaction commit. 1 leg = incomplete posting.
+--
+-- This was a DEFERRED constraint trigger — it fired per-row at
+-- COMMIT, after all the statements in a transaction had run. The
+-- per-row optimization in migration 066 made it O(log N) per leg
+-- via the uq_txn_legs_posting index, but the surface is still
+-- substantial: every leg INSERT, UPDATE, or DELETE in a transaction
+-- adds an entry to the deferred queue.
+--
+-- AUDIT — every write site already upholds completeness by
+-- construction within its transaction:
+--
+--   * InvestmentTransactionsRepository.PatchAsync — opens a
+--     transaction; marks old legs for delete; inserts new legs via
+--     the batched TVF; commits. Final state is symmetric pairs.
+--   * InvestmentTransactionsRepository.CreateAsync — same pattern.
+--   * IngestOrchestrator.RunPullAsync — inserts header + 2 legs
+--     together for each new transaction.
+--   * RegisterRepository.DeleteAsync (hard delete) — CASCADE on
+--     header_id removes both legs atomically; 0 legs remain (OK).
+--   * Importer.Moneydance.Db.TransactionsRepository — bulk insert
+--     with paired legs, atomic within the import transaction.
+--   * trg_txn_legs_recompute_* (kept) — recompute triggers don't
+--     INSERT / DELETE legs, only UPDATE balance_after or write
+--     downstream rows (holdings, lots).
+--
+-- Raw-SQL writes are prohibited outside repository / migration code
+-- (engineering-standards §3.3). The single test that exercised this
+-- trigger via raw SQL (Rejects_single_leg_left_at_transaction_commit)
+-- is removed in the same commit; API-level integration tests cover
+-- the post-state on every Create / PATCH / DELETE path.
+-- =============================================================================
+
+DROP TRIGGER IF EXISTS trg_validate_posting_completeness ON txn_legs;
+DROP FUNCTION IF EXISTS fn_validate_posting_completeness();

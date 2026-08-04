@@ -1,0 +1,125 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>Coffer.Api</RootNamespace>
+    <AssemblyName>coffer-api</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <UserSecretsId>coffer-api-dev</UserSecretsId>
+    <!-- ADR-0044: the API version axis. Semver baseline bumped at
+         releases; the git short SHA + commit count are stamped onto
+         the assembly by the StampGitVersion target below and surfaced
+         via GET /api/meta/version. We compose InformationalVersion
+         ourselves, so suppress the SDK's automatic +<sha> append. -->
+    <Version>0.40.0</Version>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+
+  <!-- ADR-0044: stamp the build identity (commit count = monotonic
+       build number, short SHA, commit date) onto the assembly so the
+       About panel can show a progression the user can eyeball. Runs
+       before the SDK generates AssemblyInfo. Every git call is
+       ContinueOnError + defaulted, so a .git-less build (e.g. a Docker
+       layer without the repo) falls back to build 0 / "nogit" rather
+       than failing the build. -->
+  <Target Name="StampGitVersion" BeforeTargets="GetAssemblyVersion;CoreGenerateAssemblyInfo;GenerateAssemblyInfo">
+    <Exec Command="git rev-list --count HEAD" ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="GitCommitCount" />
+      <Output TaskParameter="ExitCode" PropertyName="GitCountExit" />
+    </Exec>
+    <Exec Command="git rev-parse --short HEAD" ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="GitShortSha" />
+      <Output TaskParameter="ExitCode" PropertyName="GitShaExit" />
+    </Exec>
+    <!-- The format specifier needs a literal percent to reach git, but
+         it passes through two layers: MSBuild (where %25 means '%') and
+         the temp batch file Exec runs (where '%%' means a literal '%').
+         So %25%25 becomes '%%' for the batch, which git sees as '%cd'. -->
+    <Exec Command="git log -1 --format=%25%25cd --date=short" ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="GitCommitDate" />
+      <Output TaskParameter="ExitCode" PropertyName="GitDateExit" />
+    </Exec>
+    <PropertyGroup>
+      <GitCommitCount Condition="'$(GitCountExit)' != '0' Or '$(GitCommitCount)' == ''">0</GitCommitCount>
+      <GitShortSha Condition="'$(GitShaExit)' != '0' Or '$(GitShortSha)' == ''">nogit</GitShortSha>
+      <GitCommitDate Condition="'$(GitDateExit)' != '0' Or '$(GitCommitDate)' == ''"></GitCommitDate>
+      <InformationalVersion>$(Version)+$(GitShortSha.Trim())</InformationalVersion>
+    </PropertyGroup>
+    <ItemGroup>
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>BuildNumber</_Parameter1>
+        <_Parameter2>$(GitCommitCount.Trim())</_Parameter2>
+      </AssemblyAttribute>
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>CommitDate</_Parameter1>
+        <_Parameter2>$(GitCommitDate.Trim())</_Parameter2>
+      </AssemblyAttribute>
+    </ItemGroup>
+  </Target>
+
+  <ItemGroup>
+    <PackageReference Include="dbup-postgresql" Version="6.1.5" />
+    <PackageReference Include="Fido2.AspNet" Version="4.0.1" />
+    <PackageReference Include="Google.Apis.Drive.v3" Version="1.75.0.4192" />
+    <PackageReference Include="Konscious.Security.Cryptography.Argon2" Version="1.3.1" />
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.10" />
+    <!-- Pin the transitive Microsoft.OpenApi to a patched version. AspNetCore.OpenApi
+         10.0.9 pulls 2.0.0, which has GHSA-v5pm-xwqc-g5wc (high: a circular schema
+         reference can stack-overflow the OpenAPI parser). Fixed in 2.7.5; same major,
+         so the resolver satisfies AspNetCore.OpenApi's floor with it. -->
+    <PackageReference Include="Microsoft.OpenApi" Version="2.11.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.10" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="1.4.1" />
+    <PackageReference Include="MR.EntityFrameworkCore.KeysetPagination" Version="1.6.0" />
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
+    <PackageReference Include="Npgsql.OpenTelemetry" Version="10.0.3" />
+    <!-- OFX 1.x SGML + 2.x XML parser. MIT; jim-dale/BankingTools; actively
+         maintained (1.8.1 released 2025-11-22, investment statement support
+         landed 2025-11-20). Zero deps on net10.0. Pinned to a specific
+         version; bus-factor mitigation is the IFileProvider adapter
+         (`OfxFileProvider`) — if upstream stalls, MIT lets us vendor
+         `src/OfxNet/` directly into the repo. -->
+    <PackageReference Include="OfxNet" Version="1.8.1" />
+    <PackageReference Include="OpenIddict.AspNetCore" Version="7.6.0" />
+    <PackageReference Include="OpenIddict.EntityFrameworkCore" Version="7.6.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.17.0" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.17.0" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.17.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Coffer.Domain.Investment\Coffer.Domain.Investment.csproj" />
+    <ProjectReference Include="..\Coffer.Domain.Reminders\Coffer.Domain.Reminders.csproj" />
+    <!-- ADR-0071 D2: the API drives the Moneydance import pipeline for the
+         in-app "new ledger from export" flow. References the Spectre-free
+         library, not the CLI. -->
+    <ProjectReference Include="..\Importer.Moneydance\Importer.Moneydance.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Api.Tests" />
+  </ItemGroup>
+
+  <!-- ADR-0071 D5: the curated starter category tree seeded into new ledgers.
+       Embedded (not read from disk) so it ships in the assembly.
+       GENERATED from the demo sample (ADR-0091) — do not hand-edit the .json;
+       edit data/samples/moneydance-export-demo.json and re-run
+       data/samples/starter-categories.gen.mjs. -->
+  <ItemGroup>
+    <EmbeddedResource Include="Provisioning\starter-categories.json"
+                      LogicalName="Coffer.Api.Provisioning.starter-categories.json" />
+    <!-- The bundled sample dataset, embedded so ProvisioningService can seed the
+         Demo ledger when setup's one question is answered yes (ADR-0088; it was
+         the retired `provision` subcommand that first needed this). Canonical
+         copy stays in data/samples (the importer tests and the starter-category
+         generator read it there); the .dockerignore carves data/samples back
+         into the build context. -->
+    <EmbeddedResource Include="..\..\data\samples\moneydance-export-demo.json"
+                      LogicalName="Coffer.Api.Provisioning.moneydance-export-demo.json" />
+  </ItemGroup>
+
+</Project>

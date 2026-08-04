@@ -1,0 +1,64 @@
+{
+  "name": "coffer-web",
+  "private": true,
+  "version": "0.40.0",
+  "type": "module",
+  "description": "Coffer web UI per ADR-0007. Vite + React + TanStack stack.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run --pool=forks",
+    "test:watch": "vitest --pool=forks"
+  },
+  "//deps-rationale": [
+    "@simplewebauthn/browser  — well-trodden WebAuthn client (base64url + navigator.credentials wrapper).",
+    "@tanstack/react-query    — server state (cache + retries + suspense). One QueryClient per app.",
+    "@tanstack/react-router   — type-safe router; code-based routing (no codegen) for explicitness.",
+    "@tanstack/react-virtual  — row-windowing for the register (only renders visible rows).",
+    "react / react-dom        — pinned at 18.3.x: one major version behind 19 to stay on the most-trodden tier.",
+    "class-variance-authority — variants for our hand-built primitives (Button / Input / Card).",
+    "clsx + tailwind-merge    — utility class composition, the de-facto idiom in the Tailwind ecosystem.",
+    "lucide-react             — icon set (the same set shadcn uses).",
+    "tailwindcss + @tailwindcss/vite — v4, CSS-first config. The @theme block in src/index.css holds the design tokens (ADR-0021)."
+  ],
+  "dependencies": {
+    "@simplewebauthn/browser": "13.3.0",
+    "@tanstack/react-query": "5.101.4",
+    "@tanstack/react-router": "1.170.18",
+    "@tanstack/react-virtual": "3.14.8",
+    "class-variance-authority": "0.7.1",
+    "clsx": "2.1.1",
+    "lucide-react": "1.25.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-virtuoso": "4.18.11",
+    "tailwind-merge": "3.6.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@tailwindcss/vite": "4.3.3",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
+    "@testing-library/user-event": "14.6.1",
+    "@types/node": "26.1.1",
+    "@types/react": "18.3.18",
+    "@types/react-dom": "18.3.5",
+    "@vitejs/plugin-react": "6.0.4",
+    "eslint": "10.7.0",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "eslint-plugin-react-refresh": "0.5.3",
+    "globals": "17.7.0",
+    "jsdom": "29.1.1",
+    "tailwindcss": "4.3.3",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.65.0",
+    "vite": "8.1.5",
+    "vitest": "4.1.10"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

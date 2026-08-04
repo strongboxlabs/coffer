@@ -1,0 +1,100 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: coffer-postgres
+    environment:
+      # Superuser — the docker-entrypoint creates this role on first
+      # container start. The init script under db/init mints the two
+      # application roles (coffer_service, coffer_app) using
+      # COFFER_SERVICE_PASSWORD / COFFER_APP_PASSWORD; both are required
+      # at first start, see .env.example.
+      POSTGRES_USER: ${POSTGRES_USER:-coffer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-coffer}
+      COFFER_SERVICE_PASSWORD: ${COFFER_SERVICE_PASSWORD:?COFFER_SERVICE_PASSWORD must be set in .env}
+      COFFER_APP_PASSWORD:     ${COFFER_APP_PASSWORD:?COFFER_APP_PASSWORD must be set in .env}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Init scripts run once on a fresh data directory and mint the
+      # two application roles. The schema itself is owned by the API's
+      # DbUp runner from PR 3.8 onward (Phase 3 transition flagged in
+      # docs/operations.md) — `db/migrations` is no longer mounted
+      # here.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Single-container API + SPA (ADR-0059). Builds the image from the repo
+  # Dockerfile; serves /api and the React bundle same-origin on :8080. Runs
+  # DbUp migrations at startup, so it only waits for Postgres to be healthy.
+  api:
+    # Published image (ADR-0060 DR): a recovery host `docker compose pull`s this
+    # from ghcr instead of building (needs `docker login ghcr.io` — private
+    # package). Local `up --build` tags the built image with this same name, so
+    # dev and published stay consistent. Pin a version on a recovery host via
+    # COFFER_IMAGE_TAG (default: latest).
+    image: ${COFFER_IMAGE:-ghcr.io/strongboxlabs/coffer}:${COFFER_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: coffer-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Production}
+      # coffer_app (NOBYPASSRLS) at request time; coffer_service (BYPASSRLS) for
+      # migrations + pre-auth. Host is the compose service name.
+      COFFER_API__ConnectionString: "Host=postgres;Port=5432;Database=${POSTGRES_DB:-coffer};Username=coffer_app;Password=${COFFER_APP_PASSWORD:?COFFER_APP_PASSWORD must be set in .env}"
+      COFFER_API__ServiceConnectionString: "Host=postgres;Port=5432;Database=${POSTGRES_DB:-coffer};Username=coffer_service;Password=${COFFER_SERVICE_PASSWORD:?COFFER_SERVICE_PASSWORD must be set in .env}"
+      COFFER_MASTER_KEK_BASE64: ${COFFER_MASTER_KEK_BASE64:?COFFER_MASTER_KEK_BASE64 must be set in .env}
+      # KEK id label stamped on new wraps (ledgers.lek_kek_id). Defaults to v1
+      # (matches MasterKeyLoader); `rotate-kek` bumps it. Passing it here lets a
+      # rotation's new id actually reach the container.
+      COFFER_MASTER_KEK_ID: ${COFFER_MASTER_KEK_ID:-v1}
+      # WebAuthn relying party. Defaults suit a localhost install on API_PORT;
+      # override for a real domain (RpId = bare host, origin = full URL).
+      COFFER_API__Fido2__RpId: ${COFFER_RP_ID:-localhost}
+      # Allowed passkey origins, one per numbered slot (COFFER_WEB_ORIGIN_0, _1,
+      # …). Slot 0 is the main app. Add a slot for each extra host that runs its
+      # own WebAuthn sign-in — e.g. a separate MCP subdomain (ADR-0063), whose
+      # OAuth login runs on that host and must be an allowed origin or sign-in
+      # fails ("origin ... not equal to ..."); RpId (the parent domain) already
+      # covers a subdomain. install.sh sets both; duplicates dedupe at runtime
+      # (the RP origin set is a HashSet). For a 3rd origin add COFFER_WEB_ORIGIN_2
+      # below as Origins__2.
+      COFFER_API__Fido2__Origins__0: ${COFFER_WEB_ORIGIN_0:-http://localhost:8080}
+      COFFER_API__Fido2__Origins__1: ${COFFER_WEB_ORIGIN_1:-http://localhost:8080}
+      # MCP read-only report server (ADR-0063), off by default. Set
+      # COFFER_MCP_ENABLED=true in .env to expose /mcp + the Connected-apps
+      # token UI for AI clients (Claude, etc.).
+      COFFER_API__Mcp__Enabled: ${COFFER_MCP_ENABLED:-false}
+      # Workstation GC (memory-footprint tuning). Server GC — the ASP.NET Core
+      # default — allocates a heap per logical CPU and is lazy about returning
+      # memory, so on a multi-core host with no pressure the process climbs to
+      # multiple GB and holds. Coffer is low-concurrency, so Workstation GC keeps
+      # the working set small (MS's own benchmark: ~500MB -> ~70MB) at a
+      # negligible throughput cost. Pairs with mem_limit below.
+      DOTNET_gcServer: "0"
+    ports:
+      - "${API_PORT:-8080}:8080"
+    volumes:
+      # First-run bootstrap.url artifact (ADR-0059 / bootstrap-token CLI).
+      - coffer_data:/app/data
+    restart: unless-stopped
+    # Hard memory cap for the API container. .NET's GC is cgroup-aware: with a
+    # limit set it treats this as total physical memory and caps the managed
+    # heap at ~75% of it, collecting aggressively as it nears the cap — so the
+    # process can't creep to multiple GB. Tune per host via COFFER_API_MEM_LIMIT
+    # in .env (survives install.sh, which overwrites this compose file).
+    mem_limit: ${COFFER_API_MEM_LIMIT:-1g}
+
+volumes:
+  postgres_data:
+  coffer_data:
