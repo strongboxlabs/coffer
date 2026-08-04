@@ -50,7 +50,7 @@ The body should answer "why this change is needed" and "what alternatives were c
 ### 2.3 Pull requests
 
 - Every change goes through a PR, even when only one person reviews.
-- The PR template ([.github/PULL_REQUEST_TEMPLATE.md](../.github/PULL_REQUEST_TEMPLATE.md)) is mandatory.
+- The repository's PR template is mandatory (`.github/PULL_REQUEST_TEMPLATE.md`).
 - CI must pass before merge.
 - Schema changes require: a new migration file, a [database-schema.md](database-schema.md) update, and a verification step in [db/test/](../db/test/).
 

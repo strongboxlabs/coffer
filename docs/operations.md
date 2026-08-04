@@ -5,8 +5,8 @@ Day-to-day operational procedures for Coffer. Updated as the system grows.
 ---
 
 > **Running Coffer for development** (spin-up, the manual Vite fallback, first-run)
-> lives in the [README](../README.md#running-it-development); contributor workflow,
-> CI, and the release process live in [CONTRIBUTING.md](../CONTRIBUTING.md). This
+> lives in the [README](../README.md#running-it-development); the standards the code
+> is held to live in [engineering-standards.md](engineering-standards.md). This
 > doc is operator-facing: deploying, backing up, recovering, and diagnosing a
 > running install.
 

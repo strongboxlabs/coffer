@@ -4,8 +4,8 @@ A self-hosted personal finance application built on .NET + PostgreSQL.
 Replaces Moneydance for users who want to keep years of financial history under
 their own control — a browser UI you can reach from anywhere over HTTPS,
 passkey-only login (no passwords to phish, guess or reuse), double-entry
-bookkeeping, live bank-feed sync via SimpleFIN, and an MCP server so you can ask
-Claude about your finances without letting a model near the arithmetic.
+bookkeeping, live bank-feed sync via SimpleFIN, and an MCP server that lets Claude
+work with your ledger without letting a model near the arithmetic.
 
 > *Not affiliated with The Infinite Kind or Moneydance. "Moneydance" is referenced
 > solely to describe interoperability and migration paths.*
@@ -15,10 +15,11 @@ Claude about your finances without letting a model near the arithmetic.
 - **A real migration path off Moneydance** — [imports the export](#moneydance-import)
   with history intact: accounts, transactions, investment lots, cost basis, splits,
   reminders. Not a CSV of last year's spending.
-- **[AI report access over MCP](#mcp--ai-report-access-adr-0063)** — Claude and other
-  clients get typed report tools, but every number is computed by Coffer under
-  row-level security, never by the model. Read-only by default; writes need two
-  separate switches.
+- **[AI access to your ledger over MCP](#mcp--ai-access-to-your-ledger-adr-0063)** —
+  Claude and other clients get typed tools to *query* it and, opt-in, to *clean it up*
+  (recategorize, merge duplicates, retag in bulk, convert in-kind transfers). Every
+  number is computed by Coffer under row-level security, never by the model.
+  Read-only by default; writes need two independent switches and every one is audited.
 - **[Exposed to the internet on purpose](#reaching-it-from-the-internet)** — passkeys
   only, and HTTPS is structural rather than advisory.
 - **Double-entry underneath** — every flow is a balanced posting pair, so balances,
@@ -187,11 +188,17 @@ diagnostics — `audit` (which MD fields are dropped or lossy) and `reconcile` (
 re-import would drop, run against an ephemeral rolled-back ledger) — are documented
 in [docs/moneydance-import-fidelity.md](docs/moneydance-import-fidelity.md).
 
-## MCP — AI report access (ADR-0063)
+## MCP — AI access to your ledger (ADR-0063)
 
-Coffer can expose report-building tools to AI clients (Claude Desktop, claude.ai)
-over the Model Context Protocol — read-only by default, with **opt-in, admin-gated
-write tools** (ADR-0081) for AI-assisted cleanup. Off by default.
+Coffer can expose typed tools to AI clients (Claude Desktop, claude.ai) over the
+Model Context Protocol: **reading** — reports, holdings, allocation, returns,
+transaction drill-down — and, opt-in, **writing** for data cleanup (ADR-0081).
+Read-only by default; the whole surface is off by default.
+
+The principle throughout: **financial math happens in deterministic tools, narration
+happens in the model.** Cost basis, realized gains and returns are computed by
+Coffer under row-level security; the model never calculates them, it only asks and
+explains.
 
 1. **Enable it:** flip **System → MCP** on (admin) and restart the API — or set
    `COFFER_MCP_ENABLED=true` in `.env`. Either turns on `/mcp` plus an OAuth 2.1
@@ -255,16 +262,18 @@ Coffer/
 ├── NuGet.config                     Restricts package sources to nuget.org (hermetic builds)
 ├── docker-compose.yml               postgres 16 + single-container api/spa
 ├── .env.example                     Placeholder env values (real .env is gitignored)
-├── CONTRIBUTING.md                  Dev workflow
+├── CONTRIBUTING.md                  Contribution policy + how to report bugs
 ├── SECURITY.md                      Vulnerability disclosure
 └── README.md                        This file
 ```
 
 ## Contributing
 
-This is a personal project, but it is built to professional standards.
-See [CONTRIBUTING.md](CONTRIBUTING.md) and
-[docs/engineering-standards.md](docs/engineering-standards.md) for the rules.
+Outside contributions aren't being accepted at present — see
+[CONTRIBUTING.md](CONTRIBUTING.md), which also covers what *is* useful (bug reports,
+security disclosure) and the fact that forking is explicitly fine. The standards the
+code is held to are in
+[docs/engineering-standards.md](docs/engineering-standards.md).
 
 ## License
 

@@ -45,7 +45,7 @@ every build we publish a container image for** — not just occasional
 image tag (`ghcr.io/<owner>/coffer:<semver>`). MAJOR.MINOR.PATCH by impact
 (feature → MINOR, fix → PATCH while pre-1.0). This keeps the container
 tag, the About-panel version, and the git tag (`v<semver>`) in lockstep,
-so "what's deployed" is never ambiguous. See CONTRIBUTING.md → *Releasing*.
+so "what's deployed" is never ambiguous. See the maintainer release process.
 Rationale: a container tag that doesn't match the build version inside it
 is a lie — the image says `0.2.0` while About says `0.1.0`. Note the
 caveat below: container images build `.git`-less, so the build-number /
