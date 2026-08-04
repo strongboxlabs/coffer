@@ -1,0 +1,87 @@
+# .github/workflows/release.yml — for the PUBLIC repo (strongboxlabs/coffer).
+#
+# Authored HERE, not derived from the private repo: snapshots exclude .github/, both
+# because the private workflows target a self-hosted runner (they would queue forever
+# here) and because publishing runner provisioning detail is unwise. The publish
+# script preserves .github/ on the public side, so this file survives every snapshot.
+#
+# NEVER attach a self-hosted runner to this repository. It is public, so fork PRs
+# would execute on the host.
+name: Release image
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# Least privilege, stated explicitly rather than inherited: packages:write to push to
+# ghcr, contents:write only because the release step below creates a GitHub Release.
+# Drop contents to `read` if you remove that step.
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Build + push to ghcr.io
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tags derive from the git tag, which publish-public.sh sets to the version in
+      # src/Api/Api.csproj — so the image tag always equals the build version inside
+      # it (ADR-0044). Don't hand-tag images here; that reintroduces the drift.
+      - name: Image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/coffer
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+
+      - name: Build + push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # Refresh the base images on every release so the published artifact ships
+          # the current patched .NET runtime rather than a cached stale layer.
+          pull: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The repo shows one squashed commit per release, so auto-generated notes would
+      # be meaningless. Point at the artifact instead and let the tag be the changelog.
+      - name: GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --notes "Container image: \`ghcr.io/${{ github.repository_owner }}/coffer:${VERSION#v}\`
+
+          Published as a source snapshot; see the README for install and upgrade steps." \
+            || echo "release already exists — skipping"
