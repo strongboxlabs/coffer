@@ -1,0 +1,165 @@
+# CI: schema + trigger verification, the .NET suite sharded across runners, and the
+# web build.
+#
+# Shard filters live in scripts/ci-dotnet-shards.sh and are selected here by name,
+# never copied, so a namespace move cannot desync a workflow from the suite.
+#
+# Keep runs-on as a GitHub-hosted runner. Workflow code from fork pull requests
+# executes with the job, so pointing this at a machine of your own would run
+# untrusted code on it.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  schema:
+    name: Schema apply + trigger verification
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: coffer
+          POSTGRES_PASSWORD: coffer_ci
+          POSTGRES_DB: coffer
+        options: >-
+          --health-cmd "pg_isready -U coffer"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          # 5432 is free on a hosted runner (unlike the private dev host, where the
+          # dev stack owns it and CI has to use a spare port).
+          - 5432:5432
+
+    env:
+      PGPASSWORD: coffer_ci
+      PGPORT: 5432
+      COFFER_SERVICE_PASSWORD: ci_service_pw
+      COFFER_APP_PASSWORD: ci_app_pw
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Wait for Postgres
+        run: |
+          for _ in {1..30}; do
+            if pg_isready -h localhost -U coffer; then echo "postgres ready"; exit 0; fi
+            sleep 2
+          done
+          echo "postgres did not become ready"; exit 1
+
+      # coffer_service needs BYPASSRLS for the RLS bootstrap migration; coffer_app is
+      # the runtime role. Reuses the same script docker-compose does, so CI and a real
+      # install provision identically.
+      - name: Provision coffer_service + coffer_app roles
+        env:
+          POSTGRES_USER: coffer
+          POSTGRES_DB: coffer
+          PGHOST: localhost
+        run: |
+          set -euo pipefail
+          chmod +x db/init/00-init-roles.sh
+          db/init/00-init-roles.sh
+
+      - name: Apply migrations
+        run: |
+          set -euo pipefail
+          for f in db/migrations/*.sql; do
+            echo "==> applying $f"
+            psql -h localhost -U coffer -d coffer -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Run trigger verification scripts
+        run: |
+          set -euo pipefail
+          for f in db/test/*.sql; do
+            echo "==> running $f"
+            psql -h localhost -U coffer -d coffer -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+  audit:
+    name: API no-raw-sql audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Audit src/Api for unsanctioned raw SQL
+        run: |
+          chmod +x scripts/audit-no-raw-sql.sh
+          scripts/audit-no-raw-sql.sh
+
+  dotnet-test:
+    # One shard per runner. Each job rebuilds the solution, which looks wasteful but
+    # is not: the jobs run in PARALLEL on separate machines, so wall-clock is one
+    # build plus the slowest shard. Sharing a build artifact between jobs would trade
+    # that for upload/download of the whole output — not obviously a win, and more
+    # moving parts.
+    name: .NET tests (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Must match SHARD_NAMES in scripts/ci-dotnet-shards.sh. An unknown name
+        # there exits 2 rather than running nothing, so a typo fails loudly instead
+        # of reporting a green build that tested nothing.
+        shard: [s1, s1b, s2, s3, s4, importer]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up .NET (pinned via global.json)
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      # Integration tests spin their own Postgres via Testcontainers; Docker is
+      # preinstalled on hosted runners, so nothing else is needed.
+      - name: Build once + run this shard
+        run: |
+          chmod +x scripts/ci-dotnet-shards.sh
+          scripts/ci-dotnet-shards.sh --shard ${{ matrix.shard }}
+
+  web:
+    name: Web build + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/Web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/Web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test -- --run
+
+      - name: Build
+        run: npm run build
