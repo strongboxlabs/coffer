@@ -5,11 +5,10 @@
 # Testcontainers Postgres), aggregate, and exit non-zero if any shard fails.
 # =============================================================================
 #
-# The coffer-dev CI runner is a SINGLE self-hosted runner (one job at a time), so
-# a GitHub matrix of test shards runs SEQUENTIALLY and each shard job re-runs
-# `dotnet build` (~90s × 6 ≈ 9 min of redundant building). This mirrors
-# scripts/preflight.sh's proven dotnet-shard harness so CI builds once and runs
-# the shards in parallel on the runner's cores instead.
+# Default mode suits ONE capable machine: a CI matrix would make the shards run
+# sequentially there and each job would re-pay `dotnet build` (~90s x 6 ~= 9 min of
+# redundant building). So this mirrors scripts/preflight.sh's dotnet-shard harness --
+# build once, then run the shards in parallel across the machine's cores.
 #
 # Shard partition is identical to preflight.sh (namespace-based, balanced by
 # measured run time; S4 is the COMPLEMENT so every Api.Tests test runs in exactly
@@ -20,11 +19,37 @@ set -uo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+# --shard <name> runs exactly ONE shard and exits.
+#
+# For the opposite topology: several smaller machines, one shard each, run as a CI
+# matrix. Duplicating the filter strings into a workflow to achieve that would
+# guarantee drift the first time a namespace moves -- so a workflow passes a shard
+# name and the filters stay defined here, once, for both modes.
+SHARD=''
+SHARD_NAMES='s1 s1b s2 s3 s4 importer'
+if [[ "${1-}" == "--shard" ]]; then
+    SHARD="${2:?--shard needs a name}"
+    # Reject an unknown name loudly. Otherwise no shard matches, nothing runs, the
+    # aggregation finds zero failures and the job reports success — a green build
+    # that tested nothing, which is worse than a red one.
+    [[ " $SHARD_NAMES " == *" $SHARD "* ]] \
+        || { echo "ci-dotnet-shards: unknown shard '$SHARD' (have: $SHARD_NAMES)" >&2; exit 2; }
+fi
+
 logdir="$(mktemp -d)"
 declare -A PID
 
 launch() {
     local name="$1"; shift
+    # Single-shard mode: run the one we were asked for in the FOREGROUND (so the
+    # runner streams its output live) and exit with its status. Every other launch
+    # call becomes a no-op, which is why the call sites below need no changes.
+    if [[ -n "$SHARD" ]]; then
+        [[ "$name" == "$SHARD" ]] || return 0
+        echo "==> shard $name"
+        "$@"
+        exit $?
+    fi
     ( s=$(date +%s); "$@"; rc=$?; echo "$(( $(date +%s) - s ))" > "$logdir/$name.time"; exit "$rc" ) \
         >"$logdir/$name.log" 2>&1 &
     PID[$name]=$!

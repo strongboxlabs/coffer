@@ -500,15 +500,19 @@ CI runs on every push and PR:
 
 A red CI never merges. If CI is flaky, fix the flake — don't retry.
 
-### 9.1 The runner is sequential — build once, shard in parallel
+### 9.1 Sharding: build once, and don't assume a matrix helps
 
-The self-hosted `coffer-dev` runner executes **one job at a time**, so a
-`strategy.matrix` of test shards runs *sequentially* and each job pays its own
-`dotnet build`. CI therefore mirrors `scripts/preflight.sh` instead: one job
-builds once, then `scripts/ci-dotnet-shards.sh` runs the shard filters as
-parallel background processes across the runner's cores. Don't reintroduce a
-matrix for the .NET tests — on a single sequential runner it buys nothing and
-multiplies the build.
+The .NET suite is sharded by namespace, with the filters defined once in
+`scripts/ci-dotnet-shards.sh` and never copied into a workflow — a namespace move
+would otherwise desync the two silently. The last shard is the COMPLEMENT of the
+others, so coverage is provably total and a newly added `Integration/<Folder>` can
+never be skipped.
+
+Whether to fan those shards across *processes* or across *jobs* depends on the
+executor: one large machine wants a single job that builds once and runs the shards
+in parallel across its cores (`ci-dotnet-shards.sh` with no arguments); several
+smaller machines want one shard each (`--shard <name>`). Neither is universally
+right, so pick from the runner topology rather than by habit.
 
 **Measured dead end — do not revive without new measurement.** A pre-migrated
 Postgres image (baking the ~183 migrations into the fixture image) was built and
@@ -519,7 +523,6 @@ full contended preflight measured 328s against a ~325-362s baseline, dead in the
 noise. Shards are bound by **test execution** (233-317s each), not bootstrap. The
 image was abandoned as zero-gain added maintenance. The original ~85-90s figure
 was an assumption that was never measured; measure first.
-
 ---
 
 ## 10. When in doubt

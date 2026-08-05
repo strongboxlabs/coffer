@@ -5,8 +5,17 @@
 # trivial). Three stages: build the SPA, publish the API, assemble a slim
 # runtime that carries the binary + db/migrations + wwwroot.
 
+# MULTI-ARCH: the image publishes for linux/amd64 + linux/arm64 (a lot of
+# self-hosters run Pi / Apple Silicon / Ampere). Emulating the whole build under QEMU
+# would take 30-60+ min per release, because every heavy step here — npm ci, the Vite
+# build, dotnet publish — happens INSIDE the image. So the two build stages are
+# pinned to $BUILDPLATFORM and run natively, and only the final runtime stage is
+# target-arch. The SPA bundle is architecture-independent JavaScript, and .NET
+# cross-publishes with `-a $TARGETARCH`, so nothing is lost by building natively.
+
 # --- Stage 1: build the SPA -------------------------------------------------
-FROM node:22-alpine AS web
+# --platform=$BUILDPLATFORM: JS output is arch-independent, so never emulate this.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS web
 WORKDIR /web
 # package files first so the npm layer caches across source-only changes.
 COPY src/Web/package.json src/Web/package-lock.json ./
@@ -17,7 +26,11 @@ COPY src/Web/ ./
 RUN npm run build
 
 # --- Stage 2: publish the API ----------------------------------------------
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS api
+# Native SDK, cross-published for the target: the compiler runs at full speed and
+# only the emitted apphost is arch-specific. TARGETARCH is supplied by buildx
+# ('amd64' / 'arm64'), which is exactly what `dotnet publish -a` expects.
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS api
+ARG TARGETARCH
 WORKDIR /src
 COPY global.json ./
 # Publish the API project only; restore pulls just its transitive project
@@ -28,7 +41,7 @@ COPY src/ ./src/
 # box (ADR-0088); data/ is otherwise dockerignored, with data/samples carved
 # back in.
 COPY data/samples ./data/samples
-RUN dotnet publish src/Api/Api.csproj -c Release -o /publish
+RUN dotnet publish src/Api/Api.csproj -c Release -a "$TARGETARCH" -o /publish
 
 # --- Stage 3: runtime -------------------------------------------------------
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime

@@ -63,7 +63,7 @@ Stand up Coffer (app + Postgres) on a fresh Linux host:
 bash <(curl -fsSL https://raw.githubusercontent.com/strongboxlabs/coffer/main/scripts/install.sh)
 ```
 
-**Installing from a private fork?** Anonymous `raw.githubusercontent.com` 404s on a private repo, so fetch the script over the authenticated API and pass the same token in — a classic PAT with `repo` + `read:packages` (it also logs in to ghcr for the image pull):
+**Installing from a private fork?** Anonymous `raw.githubusercontent.com` 404s when the source is not public, so fetch the script over the authenticated API and pass the same token in — a classic PAT with `repo` + `read:packages` (it also logs in to ghcr for the image pull):
 
 ```bash
 T=<pat>
@@ -170,9 +170,13 @@ early development — are in [docs/operations.md](docs/operations.md).
 
 ## Moneydance import
 
-The SPA has an in-app import wizard (ADR-0071); there's also a CLI
-(`coffer-import-moneydance`) that connects as `coffer_service` (BYPASSRLS, for
-cross-ledger access):
+**Use the in-app import wizard** (ADR-0071) — Ledgers → Import. Every UI import
+creates a new ledger, and it's the only path that exists in the published container.
+
+The CLI below is **not in the image**: the Dockerfile publishes `Api.csproj` only, so
+`coffer-import-moneydance` requires a source checkout and the .NET SDK. It exists for
+bulk work and the two read-only fidelity diagnostics, not as the normal route. It
+connects as `coffer_service` (BYPASSRLS, for cross-ledger access):
 
 ```powershell
 $env:COFFER_DB_CONNECTION = "Host=localhost;Port=5432;Database=coffer;Username=coffer_service;Password=$($env:COFFER_SERVICE_PASSWORD)"
