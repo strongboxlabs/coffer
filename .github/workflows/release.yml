@@ -1,12 +1,9 @@
-# .github/workflows/release.yml — for the PUBLIC repo (strongboxlabs/coffer).
+# Builds the container image on a version tag and pushes it to ghcr.io, then opens a
+# GitHub Release for the tag.
 #
-# Authored HERE, not derived from the private repo: snapshots exclude .github/, both
-# because the private workflows target a self-hosted runner (they would queue forever
-# here) and because publishing runner provisioning detail is unwise. The publish
-# script preserves .github/ on the public side, so this file survives every snapshot.
-#
-# NEVER attach a self-hosted runner to this repository. It is public, so fork PRs
-# would execute on the host.
+# Keep runs-on as a GitHub-hosted runner. Workflow code from fork pull requests
+# executes with the job, so pointing this at a machine of your own would run
+# untrusted code on it.
 name: Release image
 
 on:
@@ -33,6 +30,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # arm64 emulation for the runtime stage only. The two build stages are pinned
+      # to $BUILDPLATFORM in the Dockerfile and run natively, so QEMU is used just
+      # for the final apt layer — minutes, not the 30-60 a fully emulated build costs.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -43,9 +48,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tags derive from the git tag, which publish-public.sh sets to the version in
-      # src/Api/Api.csproj — so the image tag always equals the build version inside
-      # it (ADR-0044). Don't hand-tag images here; that reintroduces the drift.
+      # Tags derive from the git tag, which always equals the <Version> in
+      # src/Api/Api.csproj (ADR-0044) — so the image tag matches the build version
+      # inside it. Don't hand-tag images here; that reintroduces the drift.
       - name: Image metadata (tags + labels)
         id: meta
         uses: docker/metadata-action@v6
@@ -55,6 +60,14 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+          # Set these EXPLICITLY. metadata-action otherwise infers them from GitHub's
+          # repository metadata, and the licenses label came out empty — so the GHCR
+          # package page showed no license for an AGPL project. Don't leave a
+          # user-visible legal field to auto-detection.
+          labels: |
+            org.opencontainers.image.title=Coffer
+            org.opencontainers.image.description=Self-hosted Moneydance replacement: double-entry personal finance in your browser, reachable from anywhere with passkey-only login, plus MCP tools for AI access to your ledger.
+            org.opencontainers.image.licenses=AGPL-3.0-only
 
       - name: Build + push
         uses: docker/build-push-action@v7
@@ -65,14 +78,19 @@ jobs:
           # Refresh the base images on every release so the published artifact ships
           # the current patched .NET runtime rather than a cached stale layer.
           pull: true
-          platforms: linux/amd64
+          # arm64 included because a large share of self-hosters run Raspberry Pi,
+          # Apple Silicon or Ampere VPSes and simply cannot use an amd64-only image.
+          # Verified before enabling: the .NET cross-publish emits linux-arm64 output
+          # natively, and PGDG publishes postgresql-client-16 for arm64 on noble (the
+          # aspnet:10.0 base), which the runtime stage needs.
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # The repo shows one squashed commit per release, so auto-generated notes would
-      # be meaningless. Point at the artifact instead and let the tag be the changelog.
+      # Notes point at the artifact rather than a generated commit list; the tag is
+      # the changelog.
       - name: GitHub Release
         if: github.ref_type == 'tag'
         env:
@@ -83,5 +101,5 @@ jobs:
             --title "$VERSION" \
             --notes "Container image: \`ghcr.io/${{ github.repository_owner }}/coffer:${VERSION#v}\`
 
-          Published as a source snapshot; see the README for install and upgrade steps." \
+          See the README for install and upgrade steps." \
             || echo "release already exists — skipping"
