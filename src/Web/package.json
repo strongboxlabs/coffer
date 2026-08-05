@@ -1,7 +1,7 @@
 {
   "name": "coffer-web",
   "private": true,
-  "version": "0.40.1",
+  "version": "0.40.2",
   "type": "module",
   "description": "Coffer web UI per ADR-0007. Vite + React + TanStack stack.",
   "scripts": {
