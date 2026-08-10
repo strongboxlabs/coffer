@@ -103,6 +103,70 @@ public sealed class PostgresFixture : IAsyncLifetime
     }
 
     /// <summary>
+    /// A connection string for a database on this container that has **no Coffer
+    /// schema** — created on demand and left empty. Models the state the API
+    /// actually boots into on a fresh install: Postgres reachable, migrations not
+    /// yet applied, so none of the app's tables exist.
+    /// </summary>
+    /// <remarks>
+    /// Needed because <see cref="ServiceConnectionString"/> points at the migrated
+    /// shared database, which can never represent "virgin". Uses the same
+    /// service-role credentials so callers exercise the production connection
+    /// shape. Idempotent — repeated calls reuse the same empty database.
+    /// </remarks>
+    public string EmptyDatabaseConnectionString(string databaseName = "coffer_empty_probe")
+    {
+        using (var admin = new NpgsqlConnection(_container.GetConnectionString()))
+        {
+            admin.Open();
+            using var exists = new NpgsqlCommand(
+                "SELECT 1 FROM pg_database WHERE datname = @n", admin);
+            exists.Parameters.AddWithValue("n", databaseName);
+            if (exists.ExecuteScalar() is null)
+            {
+                // CREATE DATABASE can't be parameterized and won't run inside a
+                // transaction; the name is a hard-coded default or test-supplied,
+                // never user input, but quote it anyway.
+                using var create = new NpgsqlCommand(
+                    $"CREATE DATABASE \"{databaseName.Replace("\"", "\"\"")}\"", admin);
+                create.ExecuteNonQuery();
+            }
+        }
+
+        // Schema privileges are PER DATABASE, so the GRANTs ProvisionRolesAsync
+        // applied to the main database don't reach this one — without these, the
+        // service role gets "42501: permission denied for schema public" the
+        // moment a caller tries to migrate it. Same grants as production's
+        // db/init/00-init-roles.sh.
+        var adminToNewDb = new NpgsqlConnectionStringBuilder(_container.GetConnectionString())
+        {
+            Database = databaseName,
+        }.ConnectionString;
+        using (var grant = new NpgsqlConnection(adminToNewDb))
+        {
+            grant.Open();
+            using var cmd = new NpgsqlCommand(
+                """
+                GRANT CREATE, USAGE ON SCHEMA public TO coffer_service;
+                GRANT USAGE          ON SCHEMA public TO coffer_app;
+                -- Extensions need superuser, so create them here rather than
+                -- letting 001_extensions.sql try as coffer_service. This mirrors
+                -- production, where they are install-managed and outlive a
+                -- restore (see BackupService.WipeServiceOwnedObjectsAsync); the
+                -- migration's IF NOT EXISTS then no-ops.
+                CREATE EXTENSION IF NOT EXISTS pg_trgm;
+                CREATE EXTENSION IF NOT EXISTS pgcrypto;
+                """, grant);
+            cmd.ExecuteNonQuery();
+        }
+
+        return new NpgsqlConnectionStringBuilder(ServiceConnectionString)
+        {
+            Database = databaseName,
+        }.ConnectionString;
+    }
+
+    /// <summary>
     /// Open a raw <see cref="NpgsqlConnection"/> bound to the
     /// service-role connection string. Kept for tests that need
     /// direct SQL without an EF context (e.g. TRUNCATE between

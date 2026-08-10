@@ -157,6 +157,11 @@ export type {
 export type { BackupKekCheck, BackupRetention, BackupSummary, BackupSchedule } from './types/backup';
 export type { DriveSyncStatus, DriveConnectStart } from './types/driveSync';
 export type {
+    MasterKeyStatus,
+    MasterKeyReveal,
+    MasterKeyRotation,
+} from './types/masterKey';
+export type {
     ReminderSummary,
     UpcomingOccurrence,
     UpcomingKind,

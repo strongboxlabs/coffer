@@ -116,13 +116,41 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
             _devAuthEnabled ? "true" : "false");
         Environment.SetEnvironmentVariable("COFFER_API__Mcp__Enabled",
             _mcpEnabled ? "true" : "false");
-        // ADR-0026 — Program.cs reads COFFER_MASTER_KEK_BASE64 eagerly
-        // at startup and fails fast if missing. Pin a deterministic
-        // test KEK so every host build starts. 32 zero bytes; the
-        // test container doesn't store anything we care about
-        // protecting.
-        Environment.SetEnvironmentVariable("COFFER_MASTER_KEK_BASE64",
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        // ADR-0026 + ADR-0092 D1 — Program.cs resolves the master KEK eagerly at
+        // startup and fails fast if it finds none. Point Api:MasterKey:Path at a
+        // fixture key file so every host build starts, and CLEAR the deprecated
+        // env var: it still takes precedence during the D6 transition, so leaving
+        // it set would mean the suite exercises the migration path forever and
+        // never the file path that is actually the steady state.
+        Environment.SetEnvironmentVariable(
+            "COFFER_API__MasterKey__Path", EnsureFixtureKeyFile());
+        Environment.SetEnvironmentVariable("COFFER_MASTER_KEK_BASE64", null);
+    }
+
+    /// <summary>Deterministic fixture KEK — 32 zero bytes. The test container
+    /// holds nothing worth protecting, and a fixed key keeps wrapped values
+    /// comparable across host builds.</summary>
+    private const string FixtureKekBase64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    /// <summary>
+    /// Write the fixture key to a temp file and return its path. Stable within a
+    /// process — host builds happen repeatedly across a collection and every one
+    /// must resolve the same key — but scoped PER PROCESS by pid.
+    /// </summary>
+    /// <remarks>
+    /// The pid matters: <c>preflight.sh</c> shards the suite across N parallel
+    /// <c>dotnet test</c> processes precisely because this class mutates
+    /// process-global env vars. A single shared filename would have those shards
+    /// writing one file concurrently, so a reader could catch a half-written key —
+    /// a rare, ugly flake. Per-pid files cost nothing and cannot race.
+    /// </remarks>
+    private static string EnsureFixtureKeyFile()
+    {
+        var path = Path.Combine(
+            Path.GetTempPath(),
+            $"coffer-tests-master.{Environment.ProcessId}.key");
+        File.WriteAllText(path, FixtureKekBase64);
+        return path;
     }
 
     /// <summary>

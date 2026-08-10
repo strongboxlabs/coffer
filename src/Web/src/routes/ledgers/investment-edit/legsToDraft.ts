@@ -1,6 +1,6 @@
 import type { LedgerInvestmentAction } from '@/lib/types';
 import { toDateInputValue } from '@/lib/dates';
-import type { InvestmentTxnDraft } from './validation';
+import { seedTransactedAt, type InvestmentTxnDraft } from './validation';
 
 /** The minimal leg shape `legsToDraft` actually reads. The register's
  *  `InvestmentRow` satisfies it structurally, and so do reminder-template legs
@@ -48,6 +48,8 @@ export function legsToDraft(
     brokerageAccountId: string,
     header: {
         postedAt: string;
+        /** Tax date from the row; blanked below when it is the posted day. */
+        transactedAt?: string | null;
         payee: string | null;
         memo: string | null;
         checkNumber: string | null;
@@ -102,6 +104,7 @@ export function legsToDraft(
     return {
         brokerageAccountId,
         postedAt: toDateInputValue(header.postedAt),
+        transactedAt: seedTransactedAt(header),
         action,
         payee: header.payee ?? '',
         memo: header.memo ?? '',
@@ -136,6 +139,8 @@ function transferSharesToDraft(
     viewingBrokerageId: string,
     header: {
         postedAt: string;
+        /** Tax date from the row; blanked below when it is the posted day. */
+        transactedAt?: string | null;
         payee: string | null;
         memo: string | null;
         checkNumber: string | null;
@@ -171,6 +176,7 @@ function transferSharesToDraft(
     return {
         brokerageAccountId: sourceBrokerage ?? viewingBrokerageId,
         postedAt: toDateInputValue(header.postedAt),
+        transactedAt: seedTransactedAt(header),
         action: 'transfer_shares',
         payee: header.payee ?? '',
         memo: header.memo ?? '',

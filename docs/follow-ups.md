@@ -33,7 +33,7 @@ restore performance (mig 188 + the on-demand scale lane; parked with ~9× timeou
 headroom — see that section), CI
 build-once + runner Docker reap (`scripts/ci-dotnet-shards.sh` + the ci.yml reap
 step; the measured pre-migrated-image dead end is recorded in
-[engineering-standards.md §9.1](engineering-standards.md#91-the-runner-is-sequential--build-once-shard-in-parallel)),
+[engineering-standards.md §9.1](engineering-standards.md#91-sharding-build-once-and-dont-assume-a-matrix-helps)),
 the representative reference ledger (#414), and the observability + audit-trail
 gap sweep (only the prod OTLP exporter remains — see Observability below).
 
@@ -79,6 +79,53 @@ provider key.
 
 *Unordered, grouped by area. Promote an item into **Next** above when you commit
 to shipping it.*
+
+## Secrets handling
+
+### Database credentials still travel by environment variable
+*open (surfaced 2026-08-06, alongside ADR-0092).*
+
+ADR-0092 moved the master KEK out of `COFFER_MASTER_KEK_BASE64` into a file,
+because an environment variable is readable via `docker inspect`,
+`/proc/<pid>/environ`, child process environments and crash dumps. The database
+credentials still travel exactly that way, so the reasoning now applies unevenly.
+
+The one that actually matters is **the API's connection strings**.
+`docker-compose.yml` interpolates `COFFER_APP_PASSWORD` / `COFFER_SERVICE_PASSWORD`
+into `COFFER_API__ConnectionString` and `…ServiceConnectionString`, which sit in the
+API container's environment — so `docker inspect coffer-api` prints the credentials
+the app authenticates with. Fixing it needs a path-valued option mirroring
+`Api:MasterKey:Path` (say `Api:ConnectionStringPath`), or mounted Docker secrets
+plus a config provider that reads them; .NET config has no `_FILE` convention to
+lean on.
+
+`POSTGRES_PASSWORD` is a smaller win and a one-liner: the official Postgres image
+honours `POSTGRES_PASSWORD_FILE`. Note it's the *superuser* password, which the app
+never uses — it connects as `coffer_app` / `coffer_service` — so it's second in
+priority, not first.
+
+`POSTGRES_USER`, `POSTGRES_DB` and `POSTGRES_PORT` are not secrets and should stay
+where they are.
+
+Worth being honest about the ceiling: anyone who can read `/proc` or run
+`docker inspect` on the host can also read the Postgres data directory. The KEK
+earned a file for two reasons these don't share — it must be *writable* (rotation
+and adoption mutate it) and it is deliberately the one secret kept out of the
+database so it can't ride along in a dump. This is real hardening, not a live
+vulnerability, and it wants its own ADR rather than being bolted on.
+
+### The backup passphrase ceremony is lighter than the master key's
+*open (surfaced 2026-08-06).*
+
+ADR-0092 D5b made the stored backup passphrase revealable behind a fresh assertion,
+which fixed the silent failure (a forgotten passphrase meant every backup was
+unrestorable with nothing saying so). What it did *not* do is give the passphrase
+the save-it-now treatment the master key gets at first run: the master key is shown
+during setup behind an acknowledgement, while the passphrase is only ever typed by
+the operator into a dialog. Since the passphrase is what actually gates restoring an
+artifact — a `.cofferbak` is sealed under it, not under the KEK — the argument for a
+first-class "save this" moment is arguably stronger there. Needs a shape: probably a
+prompt when backups are first enabled rather than another setup step.
 
 ## Localisation
 
@@ -564,7 +611,7 @@ shipped, collapsing ~1000s of sequential CI toward preflight's ~300s. Preflight 
 runs ~300s wall-clock, bound by test execution across shards (233-317s each).
 
 Before proposing another optimization here, read
-[engineering-standards.md §9.1](engineering-standards.md#91-the-runner-is-sequential--build-once-shard-in-parallel):
+[engineering-standards.md §9.1](engineering-standards.md#91-sharding-build-once-and-dont-assume-a-matrix-helps):
 the pre-migrated-image idea was built, benchmarked and abandoned for zero gain, on
 the strength of a bootstrap cost that had been assumed rather than measured.
 

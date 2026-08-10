@@ -743,6 +743,7 @@ export function InvestmentRegisterPage() {
                         accountId,
                         {
                             postedAt: target.postedAt,
+                            transactedAt: target.transactedAt,
                             payee: target.payee,
                             memo: target.headerMemo ?? target.memo,
                             checkNumber: target.checkNumber,
@@ -868,6 +869,7 @@ export function InvestmentRegisterPage() {
 
         const headerFields = {
             postedAt: canonical.postedAt,
+            transactedAt: canonical.transactedAt,
             payee: canonical.payee,
             memo: canonical.headerMemo ?? canonical.memo,
             checkNumber: canonical.checkNumber,
@@ -1121,13 +1123,13 @@ export function InvestmentRegisterPage() {
                         disabled={visibleRowsForSelection.length === 0}
                         selectAllLabel="Select all transactions in this account"
                     />
-                    <span role="columnheader">Date · Check #</span>
-                    <span role="columnheader">Action</span>
-                    <span role="columnheader">Payee · Memo</span>
-                    <span role="columnheader">Category | Transfer · Fee</span>
-                    <span role="columnheader">Security · Shares @ Price</span>
-                    <span role="columnheader" className="text-right">Amount</span>
-                    <span role="columnheader" className="text-right">Balance</span>
+                    <span role="columnheader" className="truncate">Date</span>
+                    <span role="columnheader" className="truncate">Action</span>
+                    <span role="columnheader" className="truncate">Payee · Memo</span>
+                    <span role="columnheader" className="truncate">Category | Transfer · Fee</span>
+                    <span role="columnheader" className="truncate">Security · Shares @ Price</span>
+                    <span role="columnheader" className="truncate text-right">Amount</span>
+                    <span role="columnheader" className="truncate text-right">Balance</span>
                     </>
                 )}
             >

@@ -274,8 +274,8 @@ public sealed class SyntheticLedger
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken)
                                                        .ConfigureAwait(false);
         await db.Database.ExecuteSqlInterpolatedAsync($@"
-            INSERT INTO txn_headers (id, ledger_id, origin, action, payee, posted_at, created_at)
-            VALUES ({headerId}, {LedgerId}, 'manual', 'buy', 'buy', {postedAt}, {postedAt});
+            INSERT INTO txn_headers (id, ledger_id, origin, action, payee, posted_at, transacted_at, created_at)
+            VALUES ({headerId}, {LedgerId}, 'manual', 'buy', 'buy', {postedAt}, {postedAt}, {postedAt});
             INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount,
                                   security_id, quantity, unit_price, posting_role)
             VALUES
@@ -539,8 +539,8 @@ public sealed class SyntheticLedger
         // /transactions POST writes origin='manual' as the equivalent
         // signal.
         await db.Database.ExecuteSqlInterpolatedAsync($@"
-            INSERT INTO txn_headers (id, ledger_id, origin, payee, posted_at, created_at)
-            VALUES ({headerId}, {LedgerId}, 'manual', {payee}, {postedAt}, {postedAt});
+            INSERT INTO txn_headers (id, ledger_id, origin, payee, posted_at, transacted_at, created_at)
+            VALUES ({headerId}, {LedgerId}, 'manual', {payee}, {postedAt}, {postedAt}, {postedAt});
             INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount)
             VALUES
                 ({fromLegId}, {headerId}, {LedgerId}, {fromAccountId}, 0, {amount}),
@@ -601,8 +601,8 @@ public sealed class SyntheticLedger
         // origin='manual' + external_id NULL satisfies the mig-109
         // CHECK (external_id IS NOT NULL OR origin = 'manual').
         await db.Database.ExecuteSqlInterpolatedAsync($@"
-            INSERT INTO txn_headers (id, ledger_id, origin, payee, posted_at, created_at)
-            VALUES ({headerId}, {LedgerId}, 'manual', {payee}, {postedAt}, {postedAt});",
+            INSERT INTO txn_headers (id, ledger_id, origin, payee, posted_at, transacted_at, created_at)
+            VALUES ({headerId}, {LedgerId}, 'manual', {payee}, {postedAt}, {postedAt}, {postedAt});",
             cancellationToken).ConfigureAwait(false);
 
         for (var i = 0; i < legs.Count; i++)

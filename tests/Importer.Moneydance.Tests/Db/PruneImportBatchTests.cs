@@ -157,10 +157,10 @@ public sealed class PruneImportBatchTests
     {
         await conn.ExecuteAsync("""
             INSERT INTO txn_headers
-                (id, ledger_id, origin, external_id, payee, posted_at,
+                (id, ledger_id, origin, external_id, payee, posted_at, transacted_at,
                  import_source, created_at, is_recurring_template)
             VALUES
-                (@Id, @LedgerId, @Origin, @ExternalId, @Payee, @PostedAt,
+                (@Id, @LedgerId, @Origin, @ExternalId, @Payee, @PostedAt,@PostedAt,
                  @ImportSource, @CreatedAt, @IsTemplate);
             """, new
             {

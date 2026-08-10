@@ -170,6 +170,7 @@ export function InvestmentTxnRowEdit({
     const queryClient = useQueryClient();
     const actionId = useId();
     const dateId = useId();
+    const taxDateId = useId();
     const checkNumberId = useId();
     const payeeId = useId();
     const memoId = useId();
@@ -184,7 +185,7 @@ export function InvestmentTxnRowEdit({
     });
     const {
         draft, errors, isValid,
-        setAction, setPostedAt, setPayee, setMemo, setCheckNumber,
+        setAction, setPostedAt, setTransactedAt, setPayee, setMemo, setCheckNumber,
         setSecurityId, setShares, setPrice, setAmount,
         setCategoryAccountId, setTransferAccountId,
         setFeeAccountId, setFeeAmount,
@@ -361,11 +362,12 @@ export function InvestmentTxnRowEdit({
             // apart from the surrounding rows.
             className="grid items-start gap-2 border-y border-accent/40 bg-accent-soft/10 px-3 py-2"
         >
-            {/* Row 1: action picker + date + cancel/save controls.
-                Spans the full grid via a nested flex so the fields
-                row below can use the register's column template. */}
-            <div className="col-span-full flex flex-wrap items-center gap-3 pb-2">
-                <div className="flex items-center gap-2 text-xs">
+            {/* Row 1: action picker + dates + check#. Spans the full grid via a
+                nested flex so the fields row below can use the register's column
+                template. Labels sit ABOVE their fields, matching every other row
+                in this editor — they used to be inline here alone. */}
+            <div className="col-span-full flex flex-wrap items-end gap-3 pb-2">
+                <div className="flex flex-col gap-1 text-xs">
                     <FieldLabel htmlFor={actionId}>Action</FieldLabel>
                     <select
                         id={actionId}
@@ -396,7 +398,7 @@ export function InvestmentTxnRowEdit({
                     </select>
                 </div>
 
-                <div className="flex items-center gap-2 text-xs">
+                <div className="flex flex-col gap-1 text-xs">
                     <FieldLabel htmlFor={dateId}>Date</FieldLabel>
                     <input
                         id={dateId}
@@ -408,7 +410,29 @@ export function InvestmentTxnRowEdit({
                     />
                 </div>
 
-                <div className="flex items-center gap-2 text-xs">
+                {/* Tax date. Blank = same as the posted date; the payload builder
+                    sends postedAt for blank rather than null, because the
+                    investment PATCH is wholesale-replace and an omitted field
+                    CLEARS the stored value. */}
+                <div className="flex flex-col gap-1 text-xs">
+                    {/* "(optional)" goes in the LABEL, following Fee: a
+                        `placeholder` is inert on type="date" — the browser's own
+                        mm/dd/yyyy mask occupies that space — so the text inputs'
+                        placeholder convention cannot carry it here. */}
+                    <FieldLabel htmlFor={taxDateId}>Tax date (optional)</FieldLabel>
+                    <input
+                        id={taxDateId}
+                        type="date"
+                        value={draft.transactedAt}
+                        onChange={(e) => setTransactedAt(e.target.value)}
+                        disabled={disabled}
+                        aria-label="Tax date"
+                        title="Leave blank when the tax date is the same as the posted date"
+                        className="h-7 rounded border border-border bg-surface px-2 font-mono text-xs"
+                    />
+                </div>
+
+                <div className="flex flex-col gap-1 text-xs">
                     <FieldLabel htmlFor={checkNumberId}>Check #</FieldLabel>
                     <input
                         id={checkNumberId}

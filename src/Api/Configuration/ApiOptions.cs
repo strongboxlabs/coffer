@@ -39,6 +39,27 @@ public sealed class ApiOptions
     public string ServiceConnectionString { get; init; } = string.Empty;
 
     /// <summary>
+    /// Path to a file containing ONLY the <c>coffer_app</c> password. When set,
+    /// <see cref="DbPasswordResolver"/> injects it into
+    /// <see cref="ConnectionString"/> before this type is bound, and any
+    /// <c>Password=</c> already in that string is ignored.
+    /// </summary>
+    /// <remarks>
+    /// Exists so the credential isn't an environment variable — see
+    /// <see cref="DbPasswordResolver"/> for why that matters. Optional: leave
+    /// unset to keep the password in the connection string (the arrangement
+    /// before this landed, and the simpler one for a bare-metal install).
+    /// </remarks>
+    public string AppPasswordFile { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Path to a file containing ONLY the <c>coffer_service</c> password. As
+    /// <see cref="AppPasswordFile"/>, but for
+    /// <see cref="ServiceConnectionString"/>.
+    /// </summary>
+    public string ServicePasswordFile { get; init; } = string.Empty;
+
+    /// <summary>
     /// When set, the dev-auth handler is registered and treats every request
     /// as the bootstrap system user. The handler additionally requires
     /// <c>ASPNETCORE_ENVIRONMENT=Development</c>; both gates must hold per
@@ -86,6 +107,30 @@ public sealed class ApiOptions
     /// <c>Api:AuditRetentionDays</c>.
     /// </summary>
     public int AuditRetentionDays { get; init; } = 180;
+
+    /// <summary>
+    /// Master-KEK file location (ADR-0092 D1). Bound from <c>Api:MasterKey</c>.
+    /// </summary>
+    public MasterKeyFileOptions MasterKey { get; init; } = new();
+}
+
+/// <summary>
+/// Where the master KEK file lives (ADR-0092 D1). Only the <i>path</i> is
+/// configuration — the key itself never enters the options tree, because that
+/// tree lands in log dumps and <c>appsettings.json</c> commits (see
+/// <c>MasterKey</c> for the same reasoning applied to the in-memory holder).
+/// </summary>
+public sealed class MasterKeyFileOptions
+{
+    /// <summary>
+    /// Path to the base64 key file. Null → <c>data/master.key</c> beside the
+    /// binary, on the <c>coffer_data</c> volume (ADR-0059). Point it at an
+    /// injected secret to keep the key off the app's own volume —
+    /// <c>/run/secrets/coffer_kek</c> for Docker secrets, a projected Kubernetes
+    /// Secret, or a Key Vault CSI mount. Tests set a temp path, the same way
+    /// <c>Api:Backup:Directory</c> works.
+    /// </summary>
+    public string? Path { get; init; }
 }
 
 /// <summary>
@@ -140,6 +185,29 @@ public sealed class McpOptions
     /// absolute ceiling). Default 5.
     /// </summary>
     public int DcrRateLimitPerMinute { get; init; } = 5;
+
+    /// <summary>
+    /// Public base URL an MCP client should be pointed at, e.g.
+    /// <c>https://mcp.coffer.example.com</c>. Surfaced in the admin UI so an
+    /// operator can copy the address to paste into Claude or another client.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Fed by <c>COFFER_MCP_URL</c>. Optional: when unset the UI falls back to the
+    /// origin of the request it is being viewed on, which is right for the common
+    /// single-host install and wrong for a split one — an install whose MCP server
+    /// answers on its own subdomain would otherwise be told to use the main web
+    /// address, which is the case an operator most needs told correctly.
+    /// </para>
+    /// <para>
+    /// Named for its role rather than derived from a positional slot. It would have
+    /// been available as <c>Fido2:Origins[1]</c> by convention, but that array is an
+    /// allowed-origin list whose second entry only happens to be the MCP host —
+    /// nothing enforces it, and a second consumer reading meaning into the index
+    /// would make an undeclared convention load-bearing.
+    /// </para>
+    /// </remarks>
+    public string PublicUrl { get; init; } = string.Empty;
 }
 
 /// <summary>

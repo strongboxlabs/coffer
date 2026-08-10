@@ -312,7 +312,8 @@ public sealed class RemindersRepository
             Payee = template.Payee,
             Memo = template.Memo,
             PostedAt = occurrenceDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc),
-            TransactedAt = null,
+            // NOT NULL since mig 189: no distinct tax date is stored as the posted date.
+            TransactedAt = occurrenceDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc),
             CheckNumber = template.CheckNumber,
             IsPending = false,
             IsHidden = false,
@@ -924,7 +925,8 @@ public sealed class RemindersRepository
         Memo = memo,
         CheckNumber = checkNumber,
         PostedAt = startDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc),
-        TransactedAt = null,
+        // NOT NULL since mig 189.
+        TransactedAt = startDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc),
         IsPending = false,
         IsHidden = false,
         IsMergedInto = null,

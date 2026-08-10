@@ -25,6 +25,7 @@ export interface InvestmentTxnDraftHook {
     isValid: boolean;
     setAction:             (next: LedgerInvestmentAction | null) => void;
     setPostedAt:           (next: string) => void;
+    setTransactedAt:       (next: string) => void;
     setPayee:              (next: string) => void;
     setMemo:               (next: string) => void;
     setCheckNumber:        (next: string) => void;
@@ -44,6 +45,7 @@ function makeInitial(brokerageAccountId: string): InvestmentTxnDraft {
     return {
         brokerageAccountId,
         postedAt: new Date().toISOString().slice(0, 10),
+        transactedAt: '',
         action: null,
         payee: '',
         memo: '',
@@ -93,6 +95,7 @@ export function useInvestmentTxnDraft(args: {
         isValid,
         setAction:             (v) => update('action', v),
         setPostedAt:           (v) => update('postedAt', v),
+        setTransactedAt:       (v) => update('transactedAt', v),
         setPayee:              (v) => update('payee', v),
         setMemo:               (v) => update('memo', v),
         setCheckNumber:        (v) => update('checkNumber', v),

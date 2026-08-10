@@ -42,11 +42,45 @@ public static class BootstrapRestoreStaging
     /// <summary>The staged passphrase (read at boot to apply the restore).</summary>
     public static string ReadPassphrase() => File.ReadAllText(PassphrasePath);
 
-    /// <summary>Delete the staged artifact, passphrase, and marker.</summary>
+    private static string SourceKeyPath => Path.Combine(Dir, "source-master.key");
+
+    /// <summary>
+    /// Stage the SOURCE install's master KEK for adoption (ADR-0092 D4) — the
+    /// clean-migration path, where the operator has the key the backup's secrets
+    /// were sealed under and wants to carry them over rather than re-establish them.
+    /// </summary>
+    /// <remarks>
+    /// Kept beside the archive and the passphrase, on the same volume and under the
+    /// same trust boundary (the class remarks above), and shredded by
+    /// <see cref="Clear"/> along with everything else. Written separately from the
+    /// pending marker so a staged key never on its own makes a restore look ready.
+    /// </remarks>
+    public static async Task StageSourceKeyAsync(string base64Key, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(base64Key);
+        await File.WriteAllTextAsync(SourceKeyPath, base64Key.Trim(), ct).ConfigureAwait(false);
+    }
+
+    /// <summary>True when a source key is staged for adoption.</summary>
+    public static bool HasSourceKey() => File.Exists(SourceKeyPath);
+
+    /// <summary>The staged source key, or null when none was supplied.</summary>
+    public static string? ReadSourceKey() =>
+        HasSourceKey() ? File.ReadAllText(SourceKeyPath).Trim() : null;
+
+    /// <summary>
+    /// Shred just the staged source key, leaving the pending restore intact. Called
+    /// the moment the key has been adopted into the live key file — the restore
+    /// itself is applied on the NEXT boot, under the adopted key.
+    /// </summary>
+    public static void ClearSourceKey() => TryDelete(SourceKeyPath);
+
+    /// <summary>Delete the staged artifact, passphrase, source key, and marker.</summary>
     public static void Clear()
     {
         TryDelete(ArchivePath);
         TryDelete(PassphrasePath);
+        TryDelete(SourceKeyPath);
         TryDelete(MarkerPath);
     }
 

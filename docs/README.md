@@ -20,6 +20,7 @@ as part of every change ([engineering-standards.md](engineering-standards.md)).
 |---|---|
 | [engineering-standards.md](engineering-standards.md) | Coding standards, testing policy, migration rules, the "no hacks" charter. |
 | [operations.md](operations.md) | Run / backup / restore / disaster recovery. |
+| [upgrading.md](upgrading.md) | Moving a **live** install between versions — order of operations, the migrations that don't apply themselves, and why a rollback is a restore. |
 | [decisions/](decisions/) | Architecture Decision Records (ADRs) — one file per material decision, written when the decision is made. |
 
 ## Planning

@@ -96,4 +96,9 @@ public sealed class GoogleDriveOAuthClient : IDriveOAuthClient
 public sealed class DriveOAuthException : Exception
 {
     public DriveOAuthException(string message) : base(message) { }
+
+    /// <summary>Wrapping form — used where a crypto failure is translated into a
+    /// Drive-level error (ADR-0092 D5) so the original stays in the log chain.</summary>
+    public DriveOAuthException(string message, Exception innerException)
+        : base(message, innerException) { }
 }

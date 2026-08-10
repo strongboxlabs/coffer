@@ -47,6 +47,24 @@ public sealed class ChallengeStore
     /// </summary>
     public const string InviteFlow = "invite";
 
+    /// <summary>
+    /// Flow identifier for re-authenticating before the master KEK is revealed
+    /// (ADR-0092 D2). Deliberately its own flow so a challenge minted for login
+    /// can never be redeemed here — the session cookie already proves "an admin";
+    /// this assertion proves "the human is present right now".
+    /// </summary>
+    public const string MasterKeyRevealFlow = "masterkey-reveal";
+
+    /// <summary>
+    /// Flow identifier for re-authenticating before the stored backup passphrase is
+    /// revealed (ADR-0092 D7). Its own flow, not shared with
+    /// <see cref="MasterKeyRevealFlow"/>: cross-redemption between two admin step-ups
+    /// gains an attacker nothing, but keeping "a challenge is good for exactly the
+    /// ceremony it was minted for" as a flat invariant is cheaper to reason about
+    /// than arguing the exception each time a surface is added.
+    /// </summary>
+    public const string BackupPassphraseRevealFlow = "backup-passphrase-reveal";
+
     private readonly ServiceDbContextFactory _serviceFactory;
 
     public ChallengeStore(ServiceDbContextFactory serviceFactory)

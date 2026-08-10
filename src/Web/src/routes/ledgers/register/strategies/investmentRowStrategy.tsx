@@ -38,10 +38,11 @@ function renderTxnBody(
     const balanceText = formatBalance(txn.balanceAfter, currency);
     const dateText = formatLedgerDateLong(txn.postedAt);
     const dateSubLabel = investmentStrategy.renderDateSubLabel?.(txn) ?? null;
+    const actionSubLabel = investmentStrategy.renderActionSubLabel?.(txn) ?? null;
     const amountSubtitle = investmentStrategy.renderAmountSubtitle?.(txn) ?? null;
     return (
         <>
-            {/* Slot 3: date + check# subtitle */}
+            {/* Slot 3: date + tax-date subtitle */}
             <span className="font-mono tabular-nums text-text-default">
                 <span className="block">{dateText}</span>
                 {dateSubLabel ? (
@@ -50,8 +51,17 @@ function renderTxnBody(
                     </span>
                 ) : null}
             </span>
-            {/* Slot 4: action chip */}
-            <span>{investmentStrategy.renderSlot4(txn)}</span>
+            {/* Slot 4: action chip + check# subtitle. The check number is an MD
+                marker qualifying the ACTION (Auto / EXfr / Xfr), so it stacks
+                here; slot 3's second line is the tax date. */}
+            <span className="min-w-0">
+                <span className="block">{investmentStrategy.renderSlot4(txn)}</span>
+                {actionSubLabel ? (
+                    <span className="block font-mono text-[0.6875rem] text-text-muted">
+                        {actionSubLabel}
+                    </span>
+                ) : null}
+            </span>
             {/* Slot 5: payee + memo (with "↗ Split" prefix on
                 target-side rows per ADR-0036). */}
             <span className="min-w-0">
@@ -113,9 +123,10 @@ function renderSplitParentBody(
     const balanceText = formatBalance(aggregate.balanceAfter, currency);
     const dateText = formatLedgerDateLong(aggregate.postedAt);
     const dateSubLabel = investmentStrategy.renderDateSubLabel?.(aggregate) ?? null;
+    const actionSubLabel = investmentStrategy.renderActionSubLabel?.(aggregate) ?? null;
     return (
         <>
-            {/* Slot 3: date + check# subtitle */}
+            {/* Slot 3: date + tax-date subtitle */}
             <span className="font-mono tabular-nums text-text-default">
                 <span className="block">{dateText}</span>
                 {dateSubLabel ? (
@@ -124,8 +135,15 @@ function renderSplitParentBody(
                     </span>
                 ) : null}
             </span>
-            {/* Slot 4: action chip (derived 'Xfr' on target splits). */}
-            <span>{investmentStrategy.renderSlot4(aggregate)}</span>
+            {/* Slot 4: action chip (derived 'Xfr' on target splits) + check#. */}
+            <span className="min-w-0">
+                <span className="block">{investmentStrategy.renderSlot4(aggregate)}</span>
+                {actionSubLabel ? (
+                    <span className="block font-mono text-[0.6875rem] text-text-muted">
+                        {actionSubLabel}
+                    </span>
+                ) : null}
+            </span>
             {/* Slot 5: "↗ Split" treatment + payee/memo — same chip the
                 flat target rows carry (ADR-0036). */}
             <span className="min-w-0">

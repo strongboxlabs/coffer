@@ -89,6 +89,10 @@ export function reminderInvestmentDraft(
         postingRole: asPostingRole(l.postingRole),
     }));
 
+    // No transactedAt: an occurrence is materialised ON its schedule date, and the
+    // template's tax date belongs to the template's own date, not to this
+    // occurrence. Omitted deliberately — the draft defaults to blank, which the
+    // payload builder sends as the posted date.
     const draft = legsToDraft(action, brokerageAccountId, {
         postedAt: occurrenceDate,
         payee: detail.payee,

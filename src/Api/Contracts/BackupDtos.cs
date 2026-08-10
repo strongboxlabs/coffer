@@ -16,6 +16,13 @@ public static class BackupContracts
     /// <summary>Body for <c>PUT /api/admin/backups/passphrase</c>.</summary>
     public sealed record SetBackupPassphraseRequest(string Passphrase);
 
+    /// <summary>
+    /// Response for <c>POST /api/admin/backups/passphrase/reveal</c> (ADR-0092 D7) —
+    /// the stored backup passphrase in cleartext. Returned only from a POST carrying a
+    /// verified fresh assertion, with <c>Cache-Control: no-store</c>.
+    /// </summary>
+    public sealed record RevealPassphraseResponse(string Passphrase);
+
     /// <summary>Response for the backup schedule (<c>GET/PUT
     /// /api/admin/backups/schedule</c>): the daily schedule plus whether a
     /// passphrase has been set (the panel disables enabling until it is).</summary>

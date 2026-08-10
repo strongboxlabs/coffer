@@ -8,6 +8,7 @@ import {
     fetchBackups,
     fetchBackupRetention,
     fetchBackupSchedule,
+    revealBackupPassphrase,
     pinBackup,
     saveBackupSchedule,
     setBackupRetention,
@@ -46,6 +47,14 @@ export function BackupsPanel() {
     const [passphraseOpen, setPassphraseOpen] = useState(false);
     const [deleteTarget, setDeleteTarget] = useState<BackupSummary | null>(null);
     const [actionError, setActionError] = useState<string | null>(null);
+    /** Revealed backup passphrase (ADR-0092 D7). Component state only — never the
+     *  query cache, and dropped when the panel unmounts. */
+    const [revealedPassphrase, setRevealedPassphrase] = useState<string | null>(null);
+
+    const revealMutation = useMutation({
+        mutationFn: revealBackupPassphrase,
+        onSuccess: setRevealedPassphrase,
+    });
 
     const createMutation = useMutation({
         mutationFn: createBackup,
@@ -119,16 +128,58 @@ export function BackupsPanel() {
                                     : 'Not set. Required before creating or scheduling a backup.'}
                             </p>
                         </div>
-                        <Button
-                            type="button"
-                            variant={passphraseSet ? 'ghost' : 'primary'}
-                            size="sm"
-                            onClick={() => setPassphraseOpen(true)}
-                            disabled={scheduleQuery.isPending}
-                        >
-                            {passphraseSet ? 'Change' : 'Set passphrase'}
-                        </Button>
+                        <div className="flex shrink-0 items-center gap-2">
+                            {/* ADR-0092 D7. Without this an operator who forgot the
+                                passphrase kept taking backups that all succeeded and
+                                were all unrestorable, with nothing saying so — even
+                                though the server unseals it on every scheduled run. */}
+                            {passphraseSet ? (
+                                <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() => revealMutation.mutate()}
+                                    disabled={revealMutation.isPending}
+                                >
+                                    {revealMutation.isPending ? 'Confirming…' : 'Show'}
+                                </Button>
+                            ) : null}
+                            <Button
+                                type="button"
+                                variant={passphraseSet ? 'ghost' : 'primary'}
+                                size="sm"
+                                onClick={() => setPassphraseOpen(true)}
+                                disabled={scheduleQuery.isPending}
+                            >
+                                {passphraseSet ? 'Change' : 'Set passphrase'}
+                            </Button>
+                        </div>
                     </div>
+
+                    {revealedPassphrase !== null ? (
+                        <div className="mt-3 space-y-2 rounded border border-accent bg-accent-soft p-3">
+                            <p className="text-xs font-semibold text-accent-soft-text">
+                                Backup passphrase
+                            </p>
+                            <code className="block select-all break-all font-mono text-sm text-text">
+                                {revealedPassphrase}
+                            </code>
+                            <Button
+                                type="button"
+                                variant="secondary"
+                                size="sm"
+                                onClick={() => setRevealedPassphrase(null)}
+                            >
+                                Hide
+                            </Button>
+                        </div>
+                    ) : null}
+
+                    {revealMutation.isError ? (
+                        <p role="alert" className="mt-2 text-xs text-state-danger">
+                            {errorMessage(revealMutation.error, 'Could not show the passphrase.')}
+                        </p>
+                    ) : null}
                 </PanelBody>
             </Panel>
 
@@ -213,6 +264,10 @@ export function BackupsPanel() {
                     onClose={() => setPassphraseOpen(false)}
                     onSaved={() => {
                         setPassphraseOpen(false);
+                        // Drop any revealed value — it's the OLD passphrase now, and
+                        // leaving it on screen after a change is actively misleading.
+                        setRevealedPassphrase(null);
+                        revealMutation.reset();
                         queryClient.invalidateQueries({ queryKey: SCHEDULE_KEY });
                     }}
                 />

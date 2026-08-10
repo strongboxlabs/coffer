@@ -472,9 +472,9 @@ public sealed class BalanceMergeHideSyncTests
             // covers what an MD-imported QIF row looks like today.
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 INSERT INTO txn_headers
-                    (id, ledger_id, origin, provider_key, external_id, payee, posted_at, created_at)
+                    (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, created_at)
                 VALUES ({loserId}, {s.Ledger.LedgerId}, 'file_import', 'qif', 'md-1',
-                        'Test Bank', '2026-04-30 00:00:00+00'::timestamptz,
+                        'Test Bank', '2026-04-30 00:00:00+00'::timestamptz,'2026-04-30 00:00:00+00'::timestamptz,
                         '2026-04-22 12:00:00+00'::timestamptz);
                 INSERT INTO txn_legs
                     (id, header_id, ledger_id, account_id, posting_index, amount)

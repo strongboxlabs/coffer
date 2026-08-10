@@ -2,6 +2,8 @@
 // Authenticated-admin restore (ADR-0071 D3) is here too; the bootstrap (pre-auth)
 // restore + `coffer-api restore` remain for their cases.
 
+import { startAuthentication } from '@simplewebauthn/browser';
+
 import type { BackupKekCheck, BackupRetention, BackupSchedule, BackupSummary } from '../types/backup';
 import { request, requestBlob, requestMultipart } from './_request';
 
@@ -51,6 +53,36 @@ export function setBackupPassphrase(passphrase: string): Promise<void> {
 }
 
 /**
+ * Reveal the stored backup passphrase (ADR-0092 D7), behind a fresh passkey
+ * assertion — the same step-up the master-KEK reveal uses.
+ *
+ * This exists because the passphrase was always recoverable in principle (the
+ * server unseals it on every scheduled backup) while the product offered no way,
+ * so an operator who forgot it accumulated backups that all still succeeded and
+ * were all unrestorable.
+ *
+ * Throws an `ApiError` (422 when no passphrase is set or its ciphertext won't open
+ * under the current KEK; 401 on a failed ceremony) or a DOMException from the
+ * browser prompt. Never cache the result.
+ */
+export async function revealBackupPassphrase(): Promise<string> {
+    const begin = await request<{
+        challengeId: string;
+        assertionOptions: Parameters<typeof startAuthentication>[0]['optionsJSON'];
+    }>('/api/admin/backups/passphrase/reveal/begin', { method: 'POST' });
+
+    const assertionResponse = await startAuthentication({
+        optionsJSON: begin.assertionOptions,
+    });
+
+    const result = await request<{ passphrase: string }>(
+        '/api/admin/backups/passphrase/reveal',
+        { method: 'POST', body: { challengeId: begin.challengeId, assertionResponse } },
+    );
+    return result.passphrase;
+}
+
+/**
  * `POST /api/admin/backups/restore` (ADR-0071 D3) — restore the whole database
  * from an uploaded `.cofferbak`. Destructive: on success (202) the server
  * restarts and everyone is signed out. `confirm` must equal
@@ -62,12 +94,19 @@ export function restoreBackup(
     passphrase: string,
     confirm: string,
     acknowledgeKekMismatch = false,
+    sourceMasterKeyBase64?: string,
 ): Promise<void> {
     const form = new FormData();
     form.append('archive', file, file.name || 'backup.cofferbak');
     form.append('passphrase', passphrase);
     form.append('confirm', confirm);
     if (acknowledgeKekMismatch) form.append('acknowledgeKekMismatch', 'true');
+    // Adopt path (ADR-0092 D4): the source install's master key, so its sealed
+    // secrets carry over instead of being cleared. The server validates it against
+    // the archive's fingerprint before anything destructive happens, so a wrong
+    // paste is refused rather than discovered afterwards.
+    const sourceKey = sourceMasterKeyBase64?.trim();
+    if (sourceKey) form.append('sourceMasterKeyBase64', sourceKey);
     return requestMultipart<void>('/api/admin/backups/restore', form);
 }
 

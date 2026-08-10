@@ -84,9 +84,9 @@ public sealed class PostingInvariantTests
     {
         var id = Guid.NewGuid();
         await conn.ExecuteAsync(@"
-            INSERT INTO txn_headers (id, ledger_id, origin, posted_at,
+            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
                 is_pending, is_hidden, created_at)
-            VALUES (@Id, @LedgerId, 'manual', NOW(),
+            VALUES (@Id, @LedgerId, 'manual', NOW(),NOW(),
                 false, false, NOW());",
             new { Id = id, LedgerId = ledgerId });
         return id;

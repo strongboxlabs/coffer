@@ -85,4 +85,21 @@ public sealed record SetupCompleteResponse(
     DateTime SessionExpiresAt,
     IReadOnlyList<string> RecoveryCodes,
     Guid? LedgerId,
-    string? LedgerName);
+    string? LedgerName,
+    /// <summary>
+    /// The install's master KEK, base64 (ADR-0092 D2). Startup minted it on this
+    /// virgin install; setup is where the operator is first shown it, because it is
+    /// the one moment they are present, verified, and paying attention.
+    ///
+    /// Returned here for the same reason <see cref="RecoveryCodes"/> is, and under
+    /// the same gate: the bootstrap token only exists before the first user, so
+    /// this is a one-time first-run payload. It is also the LESS sensitive of the
+    /// two — recovery codes bypass passkey auth entirely, whereas losing this costs
+    /// three re-establishable secrets. Requiring a second ceremony for the weaker
+    /// secret would be incoherent, and would risk the operator never seeing it if
+    /// that ceremony failed.
+    ///
+    /// Unlike the recovery codes, it CAN be seen again — System → Encryption reveals
+    /// it behind a fresh assertion.
+    /// </summary>
+    string MasterKeyBase64);

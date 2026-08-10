@@ -243,6 +243,58 @@ describe('InvestmentRegisterPage', () => {
         ).toBeInTheDocument();
     });
 
+    it('stacks the check# under the Action and the tax date under the Date', async () => {
+        // Line 2 of the date cell belongs to the date. The check number is an MD
+        // marker qualifying the ACTION ('Auto' / 'EXfr' / 'Xfr' / a cheque number),
+        // so it hangs off the action chip instead. Nothing pinned the previous
+        // arrangement, which is why the swap was invisible to the suite.
+        const txn = makeTxn({
+            id: 't1',
+            checkNumber: 'EXfr',
+            postedAt: '2026-05-01T12:00:00Z',
+            transactedAt: '2026-04-28T12:00:00Z',
+        });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(txn)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+
+        renderPage();
+
+        const checkMarker = await screen.findByText('EXfr');
+        const taxDate = await screen.findByText(/^tax /);
+
+        // The check# shares a cell with the action chip; the tax date with the date.
+        const actionCell = checkMarker.parentElement;
+        expect(actionCell?.textContent).toContain('Buy');
+        expect(actionCell?.textContent).not.toMatch(/^tax /);
+
+        const dateCell = taxDate.parentElement;
+        expect(dateCell?.textContent).toContain('May');
+        expect(dateCell?.textContent).not.toContain('EXfr');
+    });
+
+    it('omits the tax-date line when the tax date is the posted day', async () => {
+        // The common case by far — mig 189 stores transacted_at = posted_at rather
+        // than null, so without this filter every row would carry a redundant line.
+        const txn = makeTxn({
+            id: 't1',
+            postedAt: '2026-05-01T12:00:00Z',
+            transactedAt: '2026-05-01T12:00:00Z',
+        });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(txn)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+
+        renderPage();
+
+        await screen.findByText(/^ETFA/);
+        expect(screen.queryByText(/^tax /)).not.toBeInTheDocument();
+    });
+
     it('clicking the status badge cycles the recon status optimistically', async () => {
         const txn = makeTxn({ id: 't1', status: 'uncleared' });
         vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({

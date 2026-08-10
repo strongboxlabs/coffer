@@ -37,6 +37,14 @@ GH_API="${COFFER_GH_API:-https://api.github.com}"
 GH_TOKEN="${COFFER_GH_TOKEN:-}"
 INSTALL_DIR="${COFFER_DIR:-$HOME/coffer}"
 IMAGE_TAG="${COFFER_IMAGE_TAG:-latest}"
+# The image is derived from the SAME repo this script fetches its config from,
+# because .github/workflows/release.yml publishes to
+# ghcr.io/${{ github.repository_owner }}/coffer — so whoever built the image owns
+# the package. Deriving it means the config and the image cannot come from
+# different accounts, which is exactly what happened when compose defaulted to a
+# hardcoded owner: a private install pulled a public package. Override with
+# COFFER_IMAGE for a mirror or a private registry.
+IMAGE="${COFFER_IMAGE:-ghcr.io/${REPO%%/*}/coffer}"
 TTY_DEV=/dev/tty
 
 info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
@@ -132,22 +140,67 @@ if [ -f "$INSTALL_DIR/.env" ]; then
     ask choice "Choose" "1"
     case "$choice" in
         1) MODE=upgrade ;;
-        2) warn "This permanently deletes the Coffer database volume and $INSTALL_DIR/.env."
+        2) warn "This permanently deletes the Coffer database volume, $INSTALL_DIR/.env and $INSTALL_DIR/secrets/."
            ask wipe_confirm "Type 'wipe' to confirm" ""
            [ "$wipe_confirm" = wipe ] || die "Not confirmed — aborting."
            ( cd "$INSTALL_DIR" && $DOCKER compose down -v ) 2>/dev/null || true
            rm -f "$INSTALL_DIR/.env"
+           # The role passwords live here now. Leaving them behind would hand the
+           # fresh install the OLD passwords for a database that no longer exists,
+           # which fails at first connection rather than obviously.
+           rm -rf "$INSTALL_DIR/secrets"
            MODE=fresh ;;
         *) die "Cancelled." ;;
     esac
 fi
 
 # --------------------------------------------------------- fetch canonical files
-mkdir -p "$INSTALL_DIR/db/init"
+#
+# A token means the operator is installing from a PRIVATE repo — but REPO still
+# defaults to the public mirror, so without COFFER_REPO the script fetches its
+# own config from a different repository than it came from. That combination
+# shipped a stale public compose onto a private-fork host, which then failed
+# interpolation halfway through an upgrade. It is legal (a public repo with a
+# private image is a real case), so this warns rather than refuses.
+if [ -n "$GH_TOKEN" ] && [ "$REPO" = "strongboxlabs/coffer" ]; then
+    warn "Fetching config from the PUBLIC repo ($REPO) while using an auth token."
+    warn "  Installing from a private fork? Re-run with COFFER_REPO=<owner>/<repo>,"
+    warn "  or the compose file you get will be the public mirror's, not yours."
+fi
+
+mkdir -p "$INSTALL_DIR/db/init" "$INSTALL_DIR/scripts"
+
+# Keep the outgoing compose recoverable: it is about to be replaced, it may carry
+# local edits, and it is the rollback if the new one turns out to be wrong for
+# this host.
+compose_backup=""
+if [ -f "$INSTALL_DIR/docker-compose.yml" ]; then
+    compose_backup="$INSTALL_DIR/docker-compose.yml.bak"
+    cp -a "$INSTALL_DIR/docker-compose.yml" "$compose_backup"
+fi
+
 info "Fetching docker-compose.yml + db/init from the repo …"
 fetch docker-compose.yml       "$INSTALL_DIR/docker-compose.yml"       || die "Could not fetch docker-compose.yml (private repo? set COFFER_GH_TOKEN)."
 fetch db/init/00-init-roles.sh "$INSTALL_DIR/db/init/00-init-roles.sh" || die "Could not fetch db/init/00-init-roles.sh (private repo? set COFFER_GH_TOKEN)."
 chmod +x "$INSTALL_DIR/db/init/00-init-roles.sh"
+
+# Ship the pg_hba remediation to the host. It only applies to installs created
+# before scram became the initdb default, and it cannot be run from a repo the
+# host doesn't have — which is every install.sh host, since only compose and
+# db/init land here. Best-effort: an older ref may not carry it.
+fetch scripts/harden-pg-hba.sh "$INSTALL_DIR/scripts/harden-pg-hba.sh" 2>/dev/null \
+    && chmod +x "$INSTALL_DIR/scripts/harden-pg-hba.sh" || true
+
+# Does the compose file interpolate against this host's .env? Every mutation
+# below is gated on this, because the failure it catches is the expensive one:
+# a half-applied upgrade on a live host.
+compose_resolves() { ( cd "$INSTALL_DIR" && $DOCKER compose config -q >/dev/null 2>&1 ); }
+
+restore_compose() {
+    [ -n "$compose_backup" ] && [ -f "$compose_backup" ] || return 0
+    cp -a "$compose_backup" "$INSTALL_DIR/docker-compose.yml"
+    warn "Restored the previous docker-compose.yml."
+}
 
 # ---------------------------------------------------------- config (fresh only)
 if [ "$MODE" = fresh ]; then
@@ -206,6 +259,29 @@ if [ "$MODE" = fresh ]; then
         master_kek="$(openssl rand -base64 32)"
     fi
 
+    # Database role passwords go to FILES, not .env — an env var is readable via
+    # `docker inspect`, /proc/<pid>/environ, child environments and crash dumps,
+    # and these authenticate every query the app makes. docker-compose mounts
+    # them as secrets at /run/secrets/. Same reasoning ADR-0092 D1 applied to the
+    # master KEK.
+    #
+    # The directory is 0700 so other local users can't traverse in; the files
+    # themselves are 0644 because compose (outside swarm) keeps host ownership
+    # and the Postgres entrypoint re-execs as uid 999 before reading
+    # POSTGRES_PASSWORD_FILE — a 0600 file owned by the installing user is not
+    # readable in-container.
+    info "Generating database role passwords into $INSTALL_DIR/secrets/"
+    mkdir -p "$INSTALL_DIR/secrets"
+    chmod 700 "$INSTALL_DIR/secrets"
+    for secret in postgres_password coffer_service_password coffer_app_password; do
+        if [ -s "$INSTALL_DIR/secrets/$secret" ]; then
+            info "  $secret already exists — keeping it."
+        else
+            printf '%s' "$(openssl rand -hex 24)" >"$INSTALL_DIR/secrets/$secret"
+            chmod 644 "$INSTALL_DIR/secrets/$secret"
+        fi
+    done
+
     info "Generating secrets and writing $INSTALL_DIR/.env"
     umask 077
     cat >"$INSTALL_DIR/.env" <<EOF
@@ -213,31 +289,118 @@ if [ "$MODE" = fresh ]; then
 # These secrets are unique to THIS install.
 # !! BACK UP COFFER_MASTER_KEK_BASE64 — without it your encrypted data is
 #    unrecoverable, even with a database backup. !!
+#
+# The three database role passwords are NOT here — they live in ./secrets/ and
+# reach the containers as docker-compose secrets. See docker-compose.yml.
 POSTGRES_USER=coffer
 POSTGRES_DB=coffer
-POSTGRES_PASSWORD=$(openssl rand -hex 24)
-COFFER_SERVICE_PASSWORD=$(openssl rand -hex 24)
-COFFER_APP_PASSWORD=$(openssl rand -hex 24)
 COFFER_MASTER_KEK_BASE64=$master_kek
 COFFER_MASTER_KEK_ID=$master_kek_id
 ASPNETCORE_ENVIRONMENT=Production
 API_PORT=$port
+COFFER_IMAGE=$IMAGE
 COFFER_IMAGE_TAG=$IMAGE_TAG
 COFFER_RP_ID=$rp_id
-# Allowed passkey origins, one per numbered slot (wired to Fido2 Origins__0,
-# __1, … in docker-compose.yml). Slot 0 = the main app. Slot 1 = a second host
-# that runs its own WebAuthn sign-in — e.g. a separate MCP subdomain (ADR-0063);
-# it defaults to the main origin (deduped) when MCP shares the host. For a 3rd,
-# add COFFER_WEB_ORIGIN_2 here + a matching Origins__2. Re-run
-# 'docker compose up -d' after changes.
-COFFER_WEB_ORIGIN_0=$web_origin
-COFFER_WEB_ORIGIN_1=$mcp_origin
+# Where Coffer is reached. Both are allowed passkey origins (Fido2 Origins__0 /
+# __1 in docker-compose.yml); COFFER_MCP_URL additionally tells the admin UI what
+# address to hand an MCP client. When MCP shares the main host these are the same
+# value and dedupe at runtime. Re-run 'docker compose up -d' after changes.
+#
+# The older COFFER_WEB_ORIGIN_0 / _1 still work — compose falls back to them — but
+# they name a slot rather than a role, and the slot's meaning was only ever a
+# convention in a comment. For a third allowed origin, add COFFER_WEB_ORIGIN_2
+# here plus a matching Origins__2.
+COFFER_WEB_URL=$web_origin
+COFFER_MCP_URL=$mcp_origin
 # MCP server (ADR-0063): OAuth-gated read/report access for AI clients (Claude,
-# etc.), off unless enabled. It signs in on COFFER_WEB_ORIGIN_1 above.
+# etc.), off unless enabled. It signs in on COFFER_MCP_URL above.
 COFFER_MCP_ENABLED=$mcp_enabled
 EOF
     chmod 600 "$INSTALL_DIR/.env"
     warn "Master key written to $INSTALL_DIR/.env — back up COFFER_MASTER_KEK_BASE64 now."
+fi
+
+# COFFER_IMAGE is REQUIRED by the compose file fetched above (it has no default —
+# a default would be some specific owner's package, wrong for every other fork).
+# An install created before that carries no such line, so backfill it from the
+# repo this run fetched from. Without this the upgrade would fail interpolation on
+# a variable the operator has never heard of.
+if [ "$MODE" = upgrade ] && ! grep -qE '^COFFER_IMAGE=' "$INSTALL_DIR/.env"; then
+    info "Recording the image ($IMAGE) in .env — compose now requires it explicitly."
+    printf '%s\n' "COFFER_IMAGE=$IMAGE" >>"$INSTALL_DIR/.env"
+fi
+
+# An install created before the role passwords moved into files has them in .env
+# and no secrets/ directory. The compose file fetched above passes only the
+# *_FILE form, so `up` would fail on the missing secret. Move them across, using
+# the values the database already knows — this must not rotate anything.
+#
+# Idempotent, and it runs on the upgrade path specifically: MODE=fresh already
+# generated the files above.
+if [ "$MODE" = upgrade ] && [ ! -s "$INSTALL_DIR/secrets/coffer_app_password" ]; then
+    info "Moving database role passwords out of .env into $INSTALL_DIR/secrets/ …"
+    mkdir -p "$INSTALL_DIR/secrets"
+    chmod 700 "$INSTALL_DIR/secrets"
+    migrated_any=
+    for pair in "POSTGRES_PASSWORD:postgres_password" \
+                "COFFER_SERVICE_PASSWORD:coffer_service_password" \
+                "COFFER_APP_PASSWORD:coffer_app_password"; do
+        var="${pair%%:*}"; file="${pair##*:}"
+        [ -s "$INSTALL_DIR/secrets/$file" ] && continue
+        value="$(grep -E "^${var}=" "$INSTALL_DIR/.env" | head -1 | cut -d= -f2- || true)"
+        [ -n "$value" ] || die "$var is not in $INSTALL_DIR/.env and $INSTALL_DIR/secrets/$file does not exist — cannot upgrade without it."
+        printf '%s' "$value" >"$INSTALL_DIR/secrets/$file"
+        chmod 644 "$INSTALL_DIR/secrets/$file"
+        migrated_any=1
+    done
+    if [ -n "$migrated_any" ]; then
+        # ORDER MATTERS. Writing secrets/ is additive — the old compose ignores
+        # those files, so a host that stops here is still exactly as it was.
+        # Editing .env is NOT reversible in the same way: it is what the old
+        # compose reads, so commenting those lines out while the fetched compose
+        # turns out to be incompatible strands the install with neither source of
+        # passwords. That is precisely what happened on a real upgrade — the
+        # passwords moved, then interpolation failed, and the host was left
+        # half-migrated with `docker compose` unusable.
+        #
+        # So: prove the new compose resolves FIRST, and only then take the old
+        # values away.
+        if ! compose_resolves; then
+            restore_compose
+            info "Left $INSTALL_DIR/.env untouched — your passwords are still there."
+            info "secrets/ was written but nothing reads it yet, so this install is unchanged."
+            echo "" >&2
+            ( cd "$INSTALL_DIR" && $DOCKER compose config 2>&1 | head -5 ) >&2
+            echo "" >&2
+            die "The fetched docker-compose.yml does not resolve against this host's .env (details above).
+     Most likely the config came from a different repo than this script: re-run with
+     COFFER_REPO=<owner>/<repo> pointing at the repo you installed from."
+        fi
+
+        # Comment the old lines out rather than deleting them, so a value is
+        # recoverable if something about the new arrangement is wrong. Compose no
+        # longer reads them, so leaving them live would only mean two copies of
+        # the same secret — the thing being fixed.
+        cp "$INSTALL_DIR/.env" "$INSTALL_DIR/.env.pre-secrets"
+        chmod 600 "$INSTALL_DIR/.env.pre-secrets"
+        sed -E -i.tmp 's@^(POSTGRES_PASSWORD|COFFER_SERVICE_PASSWORD|COFFER_APP_PASSWORD)=@# moved to secrets/ by install.sh: \1=@' \
+            "$INSTALL_DIR/.env"
+        rm -f "$INSTALL_DIR/.env.tmp"
+        warn "Passwords moved to secrets/. Backup at .env.pre-secrets still contains them — delete it once Coffer is confirmed healthy."
+    fi
+fi
+
+# Belt and braces for the paths that skipped the migration above (fresh installs,
+# and upgrades already carrying secrets/). Nothing has been mutated at this point
+# except the compose file, so restoring it puts the host exactly back.
+if ! compose_resolves; then
+    restore_compose
+    echo "" >&2
+    ( cd "$INSTALL_DIR" && $DOCKER compose config 2>&1 | head -5 ) >&2
+    echo "" >&2
+    die "The fetched docker-compose.yml does not resolve against this host's .env (details above).
+     Nothing else was changed. If you installed from a private fork, re-run with
+     COFFER_REPO=<owner>/<repo>."
 fi
 
 # ----------------------------------------------------------------------- run
@@ -249,14 +412,16 @@ if [ -n "$GH_TOKEN" ]; then
     printf '%s' "$GH_TOKEN" | $DOCKER login ghcr.io -u "${COFFER_GH_USER:-${REPO%%/*}}" --password-stdin \
         || die "ghcr login failed — the token needs read:packages."
 fi
-info "Pulling ghcr.io/strongboxlabs/coffer:$IMAGE_TAG …"
+info "Pulling $IMAGE:$IMAGE_TAG …"
 $DOCKER compose pull
 info "Starting Coffer …"
 $DOCKER compose up -d
 
 # --------------------------------------------------------------- wait for health
 port="$(grep -E '^API_PORT=' .env | cut -d= -f2-)"; port="${port:-8080}"
-origin="$(grep -E '^COFFER_WEB_ORIGIN_0=' .env | cut -d= -f2-)"
+# Either name: a host upgraded from an older install still uses the old one.
+origin="$(grep -E '^COFFER_WEB_URL=' .env | cut -d= -f2-)"
+[ -n "$origin" ] || origin="$(grep -E '^COFFER_WEB_ORIGIN_0=' .env | cut -d= -f2-)"
 info "Waiting for the app to answer on http://localhost:$port …"
 # Probe /readyz — the anonymous readiness endpoint (process up AND Postgres
 # reachable). NOT /api/meta/version: that one is authenticated (ADR-0044), so
@@ -276,6 +441,21 @@ echo "  Open:    ${origin:-http://localhost:$port}"
 echo "  First run creates your admin passkey. If it asks for a one-time setup token:"
 echo "    cd $INSTALL_DIR && $DOCKER compose logs api | grep -i bootstrap"
 echo "  Manage:  cd $INSTALL_DIR && $DOCKER compose ps | logs -f api | down | up -d"
+
+# initdb runs exactly once, so an install created before scram became the default
+# keeps `trust` on its socket and loopback no matter what the compose file now
+# says. Detect it and print the fix here — an operator mid-upgrade will not go
+# reading operations.md, and the remediation is useless if they never learn it
+# applies to them.
+if [ -x "$INSTALL_DIR/scripts/harden-pg-hba.sh" ] \
+   && $DOCKER compose exec -T postgres sh -c 'grep -qE "\strust\s*$" /var/lib/postgresql/data/pg_hba.conf' 2>/dev/null; then
+    echo ""
+    warn "This database still allows password-less connections from inside its container."
+    warn "  initdb only runs on a fresh data directory, so the hardened default doesn't"
+    warn "  apply to an existing install. One-time fix, no restart, no downtime:"
+    echo "      sudo bash $INSTALL_DIR/scripts/harden-pg-hba.sh"
+fi
+
 if [ -n "$restoring" ]; then
     echo "  Restore: open the URL, choose 'Restore from a backup', upload your .cofferbak + passphrase."
     echo "           It decrypts under the KEK you provided — no post-install key swap."

@@ -18,13 +18,20 @@ namespace Coffer.Api.Contracts;
 /// restart.</param>
 /// <param name="WritesConfigForced">Whether <c>Api:Mcp:WritesEnabled</c> config
 /// forces writes on regardless of the setting.</param>
+/// <param name="PublicUrl">The address to hand an MCP client. From
+/// <c>Api:Mcp:PublicUrl</c> (<c>COFFER_MCP_URL</c>) when configured, otherwise the
+/// origin of the request being served. Empty only if neither is determinable.
+/// Configured wins because request-derived is wrong for a split-host install: an
+/// admin browsing the main site would otherwise be handed the main address for a
+/// server answering on its own hostname.</param>
 public sealed record McpSettingResponse(
     bool Enabled,
     bool Active,
     bool ConfigForced,
     bool WritesEnabled,
     bool WritesActive,
-    bool WritesConfigForced);
+    bool WritesConfigForced,
+    string PublicUrl);
 
 /// <summary>Request body for setting the MCP runtime toggles.</summary>
 /// <param name="Enabled">Desired MCP master state to persist.</param>

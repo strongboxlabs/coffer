@@ -57,9 +57,9 @@ DECLARE
 BEGIN
     -- Mig 107: origin is icon-level; provider_key is the
     -- per-provider tag. Manual-shape rows leave provider_key NULL.
-    INSERT INTO txn_headers (id, ledger_id, origin, external_id, payee, posted_at)
+    INSERT INTO txn_headers (id, ledger_id, origin, external_id, payee, posted_at, transacted_at)
     VALUES (v_header, 'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa',
-            'manual', p_external, 'single-test', p_posted_at);
+            'manual', p_external, 'single-test', p_posted_at, p_posted_at);
     INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount)
     VALUES
         (gen_random_uuid(), v_header, 'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa', p_cash_id, 0,  p_amount),
@@ -85,9 +85,9 @@ CREATE OR REPLACE FUNCTION regfn_insert_split3(
 DECLARE
     v_header UUID := gen_random_uuid();
 BEGIN
-    INSERT INTO txn_headers (id, ledger_id, origin, external_id, payee, posted_at)
+    INSERT INTO txn_headers (id, ledger_id, origin, external_id, payee, posted_at, transacted_at)
     VALUES (v_header, 'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa',
-            'manual', p_external, 'split-test', p_posted_at);
+            'manual', p_external, 'split-test', p_posted_at, p_posted_at);
     INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount)
     VALUES
         (gen_random_uuid(), v_header, 'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa', p_cash_id, 0,  p_amt1),

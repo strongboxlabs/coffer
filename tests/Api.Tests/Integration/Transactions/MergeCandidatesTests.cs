@@ -66,10 +66,10 @@ public sealed class MergeCandidatesTests
         // surface in the candidate set.
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             INSERT INTO txn_headers
-                (id, ledger_id, origin, provider_key, external_id, payee, posted_at, created_at, needs_review)
+                (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, created_at, needs_review)
             VALUES
                 ({headerId}, {ledger.LedgerId}, 'online_import', 'simplefin', {headerId.ToString()}, {bankPayee},
-                 {postedAt}, {postedAt}, {needsReview});
+                 {postedAt},{postedAt}, {postedAt}, {needsReview});
             INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount)
             VALUES
                 ({bankLegId},         {headerId}, {ledger.LedgerId}, {bankAccountId},        0, {amount}),
@@ -512,10 +512,10 @@ public sealed class MergeCandidatesTests
         {
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 INSERT INTO txn_headers
-                    (id, ledger_id, origin, provider_key, external_id, payee, posted_at, created_at, needs_review)
+                    (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, created_at, needs_review)
                 VALUES
                     ({targetId}, {ledger.LedgerId}, 'online_import', 'simplefin', {targetId.ToString()}, 'Acme',
-                     '2026-03-06', '2026-03-06', false);
+                     '2026-03-06','2026-03-06', '2026-03-06', false);
                 INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount)
                 VALUES
                     ({bankLegId}, {targetId}, {ledger.LedgerId}, {bank.Id},          0, -9),

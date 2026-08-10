@@ -408,7 +408,9 @@ public sealed class IngestOrchestrator
                     Payee = t.Payee ?? t.Description,
                     Memo = t.Payee is not null ? t.Description : null,
                     PostedAt = t.PostedAt,
-                    TransactedAt = t.TransactedAt,
+                    // NOT NULL since mig 189: feeds often omit a transacted date, and
+                    // "no distinct tax date" is stored as the posted date.
+                    TransactedAt = t.TransactedAt ?? t.PostedAt,
                     IsPending = t.Pending,
                     NeedsReview = true,
                     // ExternalId is the universal per-provider dedup
@@ -782,7 +784,8 @@ public sealed class IngestOrchestrator
                 Payee = t.Payee ?? t.Description,
                 Memo = t.Payee is not null ? t.Description : null,
                 PostedAt = t.PostedAt,
-                TransactedAt = t.TransactedAt,
+                // NOT NULL since mig 189 — see the pull path above.
+                TransactedAt = t.TransactedAt ?? t.PostedAt,
                 IsPending = false,                       // OFX statements are post-clear
                 NeedsReview = true,
                 // External_id is the universal dedup key (mig 105);

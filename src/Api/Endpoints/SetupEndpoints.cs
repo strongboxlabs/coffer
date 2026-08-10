@@ -250,6 +250,9 @@ public static class SetupEndpoints
         ProvisioningService provisioning,
         ILoggerFactory loggerFactory,
         IOptions<ApiOptions> apiOptions,
+        // ADR-0092 D2: setup is where the operator is first shown the master key.
+        Coffer.Api.Crypto.MasterKey masterKey,
+        AdminAuditRepository audit,
         CancellationToken cancellationToken)
     {
         // Pre-auth bootstrap flow — service role; the user row itself
@@ -440,6 +443,25 @@ public static class SetupEndpoints
             sessions.CookieName, session.CookieValue,
             sessions.BuildCookieOptions(session.ExpiresAt));
 
+        // Audit the master-key disclosure (ADR-0092 D2), same as a panel reveal.
+        // Best-effort: setup has already committed and the session cookie is out, so
+        // letting an audit-write failure throw here would strand the operator
+        // mid-bootstrap with an account they can't be told the key for. Recorded, not
+        // gated — the opposite call from the reveal endpoint, where nothing has
+        // happened yet and refusing is free.
+        try
+        {
+            await audit.AppendAsync(
+                AdminAuditActions.MasterKeyShownAtSetup, metadata.UserId,
+                "shown during first-run setup", cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            loggerFactory.CreateLogger("Coffer.Api.MasterKey").LogWarning(ex,
+                "Could not record the first-run master-key disclosure in admin_audit_events; "
+                + "continuing — setup itself already succeeded.");
+        }
+
         return Results.Ok(new SetupCompleteResponse(
             UserId: metadata.UserId,
             Username: metadata.Username,
@@ -447,7 +469,8 @@ public static class SetupEndpoints
             SessionExpiresAt: session.ExpiresAt,
             RecoveryCodes: recoveryPlaintext,
             LedgerId: ledgerId,
-            LedgerName: ledgerName));
+            LedgerName: ledgerName,
+            MasterKeyBase64: Convert.ToBase64String(masterKey.KeyBytes)));
     }
 
     /// <summary>

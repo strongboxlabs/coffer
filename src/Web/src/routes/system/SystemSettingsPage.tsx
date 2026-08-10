@@ -7,12 +7,13 @@ import { MainArea, MainPane, TopBar } from '@/components/ui/SidebarLayout';
 
 import { AboutPanel } from './AboutPanel';
 import { BackupsPanel } from './BackupsPanel';
+import { MasterKeyPanel } from './MasterKeyPanel';
 import { McpSettingsPanel } from './McpSettingsPanel';
 import { McpClientsPanel } from './McpClientsPanel';
 import { McpAuditPanel } from './McpAuditPanel';
 import { UsersPanel } from './UsersPanel';
 
-export type SystemTab = 'about' | 'backups' | 'mcp' | 'users';
+export type SystemTab = 'about' | 'backups' | 'encryption' | 'mcp' | 'users';
 
 /**
  * Absent or unrecognised → About, mirroring `coerceSettingsTab` for the
@@ -20,7 +21,7 @@ export type SystemTab = 'about' | 'backups' | 'mcp' | 'users';
  * System section agree with this page on what a valid tab is.
  */
 export function coerceSystemTab(value: unknown): SystemTab {
-    return value === 'backups' || value === 'mcp' || value === 'users'
+    return value === 'backups' || value === 'encryption' || value === 'mcp' || value === 'users'
         ? value
         : 'about';
 }
@@ -28,10 +29,10 @@ export function coerceSystemTab(value: unknown): SystemTab {
 /**
  * `/system` — deployment-wide (non-ledger) settings (ADR-0060). Reached from
  * the gear by the brand. Tabbed like the per-ledger Settings page, but its
- * scope is the whole install: About (version, for everyone) + Backups
- * (admin-only). The Backups tab is hidden for non-admins and the underlying
- * API is RequireAdmin — this page is UX, not the security boundary. Future
- * system tabs (Users, etc.) slot in here.
+ * scope is the whole install: About (version, for everyone) plus the
+ * admin-only tabs — Encryption, Backups, MCP, Users. Those are hidden for
+ * non-admins and the underlying APIs are RequireAdmin — this page is UX, not
+ * the security boundary. Future system tabs slot in here.
  */
 export function SystemSettingsPage() {
     const userQuery = useQuery({ queryKey: ['me'], queryFn: fetchCurrentUser });
@@ -40,6 +41,13 @@ export function SystemSettingsPage() {
     const tabs: ReadonlyArray<{ id: SystemTab; label: string }> = isAdmin
         ? [
               { id: 'about', label: 'About' },
+              // Encryption before Backups: the master key is what makes a backup's
+              // sealed secrets portable, so it's the more fundamental of the two —
+              // and its own tab, not a card under Backups (ADR-0092). The key wraps
+              // bank-feed tokens, the backup passphrase AND the Drive connection, so
+              // filing it under one of the three made "where is my master key?" a
+              // hunt. It also has a lifecycle of its own now (view, rotate).
+              { id: 'encryption', label: 'Encryption' },
               { id: 'backups', label: 'Backups' },
               { id: 'mcp', label: 'MCP' },
               { id: 'users', label: 'Users' },
@@ -115,6 +123,7 @@ export function SystemSettingsPage() {
 
                     {activeTab === 'about' ? <AboutPanel /> : null}
                     {activeTab === 'backups' && isAdmin ? <BackupsPanel /> : null}
+                    {activeTab === 'encryption' && isAdmin ? <MasterKeyPanel /> : null}
                     {activeTab === 'mcp' && isAdmin ? (
                         <div className="space-y-4">
                             <McpSettingsPanel />

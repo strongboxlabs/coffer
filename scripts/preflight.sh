@@ -10,7 +10,7 @@
 # SPEED (2026-06-28): the .NET integration suite is the long pole (~9 min) because
 # 85 of the Api.Tests classes share one xUnit collection (one DB) and run serially.
 # We can't parallelize them IN-PROCESS — ApiFactory mutates process-global env vars
-# (ASPNETCORE_ENVIRONMENT / COFFER_API__DevAuth / Mcp__Enabled / MASTER_KEK) that
+# (ASPNETCORE_ENVIRONMENT / COFFER_API__DevAuth / Mcp__Enabled / MasterKey__Path) that
 # Program.cs reads eagerly at host build, and that's only safe while the collection
 # runs sequentially. So instead we shard at the PROCESS level: build once, then run
 # N `dotnet test --filter` processes in parallel, each with its own env-var space
@@ -59,7 +59,7 @@ PG_USER='coffer'
 PG_PASSWORD='preflight_pw'
 PG_DB='coffer'
 
-ALL_STAGES='schema audit identity web doc test_s1 test_s1b test_s2 test_s3 test_s4 test_importer'
+ALL_STAGES='schema audit identity web doc roundtrip test_s1 test_s1b test_s2 test_s3 test_s4 test_importer'
 
 QUICK=0
 ONLY=''      # empty = run every stage
@@ -131,7 +131,7 @@ stop_dev_processes
 stage_schema() {
     docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
     docker run -d --name "$PG_CONTAINER" \
-        -p "${PG_PORT}:5432" \
+        -p "127.0.0.1:${PG_PORT}:5432" \
         -e POSTGRES_USER="$PG_USER" \
         -e POSTGRES_PASSWORD="$PG_PASSWORD" \
         -e POSTGRES_DB="$PG_DB" \
@@ -262,6 +262,37 @@ stage_doc() {
     return "$fail"
 }
 
+# Job: whole-DB restore-over-populated-DB guard (ADR-0060/0061).
+#
+# Added because its absence had teeth: a change to how the scripts resolve the
+# superuser password broke this guard outright, and the gate stayed green
+# because nothing here ran it. It is the only coverage for
+# BackupService.WipeServiceOwnedObjectsAsync, whose failure mode is a
+# half-applied restore.
+#
+# Unlike every other stage this one needs the DEV STACK, because it exercises
+# the real Postgres container's ownership topology (superuser-owned extensions,
+# non-superuser-owned app objects) rather than an ephemeral throwaway. When the
+# stack isn't up it SKIPS rather than fails — a gate that can't be run without
+# docker compose up first would just get bypassed. The skip is loud, and
+# `skipped` is recorded distinctly from `ok` so a run that didn't cover this
+# can't read as one that did.
+stage_roundtrip() {
+    # DEV_PG_CONTAINER, not PG_CONTAINER — the latter is this script's own
+    # ephemeral schema-lane container and must not be confused with the dev
+    # stack's. Overridable so the skip path is testable without stopping the
+    # dev stack, and so a differently-named stack can still be covered.
+    local dev_pg="${DEV_PG_CONTAINER:-coffer-postgres}"
+    if ! docker inspect "$dev_pg" >/dev/null 2>&1; then
+        echo "SKIPPED: the dev stack is not running (no '$dev_pg' container)."
+        echo "  This guard needs it — it reproduces the ownership topology that broke"
+        echo "  pg_restore --clean, which an ephemeral container doesn't have."
+        echo "  Start it with scripts/dev-up-docker.sh and re-run to cover this."
+        return 3
+    fi
+    PG_CONTAINER="$dev_pg" bash scripts/backup-restore-roundtrip.sh
+}
+
 # --------------------------------------------------------------
 # Orchestration: launch independent stages in the background, build
 # once, then launch the dotnet shards. Each stage logs to its own file
@@ -295,6 +326,7 @@ want audit && launch audit stage_audit
 want identity && launch identity stage_identity
 want web   && launch web   stage_web
 want doc   && launch doc   stage_doc
+want roundtrip && launch roundtrip stage_roundtrip
 
 # Build once (foreground) so every dotnet shard can run --no-build. Pointless when
 # no shard is selected — this is what makes `--only doc` cost seconds, not minutes.
@@ -335,14 +367,22 @@ fi
 # Wait + aggregate.
 # --------------------------------------------------------------
 failures=()
+skipped=()
 [[ "$build_ok" -ne 1 ]] && failures+=("dotnet-build")
 
 for name in "${!PID[@]}"; do
-    if wait "${PID[$name]}"; then
-        elapsed="$(cat "$logdir/$name.time" 2>/dev/null || echo '?')"
+    rc=0
+    wait "${PID[$name]}" || rc=$?
+    elapsed="$(cat "$logdir/$name.time" 2>/dev/null || echo '?')"
+    # rc 3 is the agreed "couldn't run, didn't fail" signal (stage_roundtrip when
+    # the dev stack is down). Tracked separately from ok so the summary can't
+    # imply coverage that never happened.
+    if [[ "$rc" -eq 0 ]]; then
         printf '  %-14s ok    (%ss)\n' "$name" "$elapsed"
+    elif [[ "$rc" -eq 3 ]]; then
+        printf '  %-14s SKIP  (%ss)\n' "$name" "$elapsed"
+        skipped+=("$name")
     else
-        elapsed="$(cat "$logdir/$name.time" 2>/dev/null || echo '?')"
         printf '  %-14s FAIL  (%ss)\n' "$name" "$elapsed"
         failures+=("$name")
     fi
@@ -359,6 +399,14 @@ for name in "${failures[@]}"; do
     cat "$logdir/$name.log" 2>/dev/null || true
 done
 
+# A skipped stage's log explains what wasn't covered, and that is worth reading
+# even on a green run — silence here is what let a broken restore guard sit
+# unnoticed.
+for name in "${skipped[@]}"; do
+    echo "================ $name.log (SKIPPED) ================"
+    cat "$logdir/$name.log" 2>/dev/null || true
+done
+
 wall_end=$(date +%s)
 echo
 echo "wall-clock: $(( wall_end - wall_start ))s"
@@ -369,6 +417,14 @@ if [[ "${#failures[@]}" -eq 0 ]]; then
         # the push gate, and a green subset says nothing about what was skipped.
         echo " PARTIAL OK (stages:$ONLY) -- NOT a push gate"
         echo " Run scripts/preflight.sh with no --only before pushing."
+    elif [[ "${#skipped[@]}" -gt 0 ]]; then
+        # Deliberately does NOT contain the string "PREFLIGHT OK": that is the
+        # push gate, and a stage that could not run has verified nothing. Saying
+        # "OK, with skips" is how a guard ends up trusted without having run —
+        # the exact hole that let a broken restore guard sit unnoticed.
+        echo " PREFLIGHT INCOMPLETE -- did NOT run: ${skipped[*]}"
+        echo " Nothing failed, but those stages verified nothing. See their logs above."
+        echo " For the restore guard: scripts/dev-up-docker.sh, then re-run."
     else
         echo " PREFLIGHT OK -- safe to push"
     fi

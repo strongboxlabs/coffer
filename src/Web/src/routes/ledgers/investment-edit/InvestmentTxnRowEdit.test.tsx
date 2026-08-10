@@ -60,6 +60,7 @@ function miscDraft(amount: number): InvestmentTxnDraft {
     return {
         brokerageAccountId: ACCOUNT_ID,
         postedAt: '2026-05-01',
+        transactedAt: '',
         action: 'misc',
         payee: '',
         memo: '',

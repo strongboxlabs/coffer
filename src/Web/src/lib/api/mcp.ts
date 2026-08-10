@@ -64,6 +64,13 @@ export interface McpSetting {
     writesEnabled: boolean;
     writesActive: boolean;
     writesConfigForced: boolean;
+    /**
+     * Address to give an MCP client. `Api:Mcp:PublicUrl` (`COFFER_MCP_URL`) when
+     * configured, else the origin the request was served on — which is right for
+     * a single-host install and wrong for one whose MCP server answers on its own
+     * hostname, so the configured value wins.
+     */
+    publicUrl: string;
 }
 
 /** Read the MCP runtime toggle (admin only). */
@@ -86,15 +93,34 @@ export function setMcpSetting(enabled: boolean, writesEnabled: boolean): Promise
 /** Mirror of API `McpClientDto` — an OAuth client registered against the MCP AS. */
 export interface McpClient {
     clientId: string;
+    /**
+     * The name the client registered itself under via DCR. Client-supplied, so
+     * every install of a given client reports the same string — two laptops
+     * running Claude are two rows both called "Claude".
+     */
     displayName: string;
     clientType: string;
     redirectUris: string[];
     activeAuthorizations: number;
+    /** Operator-assigned name; shown in preference to `displayName` when set. */
+    label: string | null;
 }
 
 /** List the OAuth clients that can reach `/mcp` (admin only). 404 when MCP is off. */
 export function fetchMcpClients(): Promise<McpClient[]> {
     return request<McpClient[]>('/api/admin/mcp/clients', { method: 'GET' });
+}
+
+/**
+ * Rename a client. Pass null or an empty string to clear the label and fall back
+ * to the client's own registered name. The label lives with the registration, so
+ * revoking and re-registering the client loses it.
+ */
+export function setMcpClientLabel(clientId: string, label: string | null): Promise<void> {
+    return request<void>(`/api/admin/mcp/clients/${encodeURIComponent(clientId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ label }),
+    });
 }
 
 /** Revoke a client — deletes it and its tokens + authorizations (admin only). */

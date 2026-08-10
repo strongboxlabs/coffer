@@ -2,9 +2,12 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 
+using Fido2NetLib;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 
+using Coffer.Api.Contracts;
+using Coffer.Api.Db.Services;
 using Coffer.Api.Tests.Integration.Infra;
 
 using static Coffer.Api.Contracts.BackupContracts;
@@ -93,6 +96,105 @@ public sealed class AdminBackupsEndpointsTests
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
         var list = await resp.Content.ReadFromJsonAsync<List<BackupSummary>>();
         Assert.NotNull(list);   // empty (none created), but a 200 list
+    }
+
+    // --- passphrase reveal (ADR-0092 D7) -----------------------------------
+
+    [Fact]
+    public async Task Passphrase_reveal_is_admin_gated()
+    {
+        var alice = await SyntheticLedger.CreateAsync(_fixture);   // not an admin
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await CookieClientAsync(factory, alice);
+
+        Assert.Equal(HttpStatusCode.Forbidden,
+            (await client.PostAsync("/api/admin/backups/passphrase/reveal/begin", null)).StatusCode);
+
+        using var anonClient = factory.CreateClient(
+            new WebApplicationFactoryClientOptions { HandleCookies = false });
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await anonClient.PostAsync("/api/admin/backups/passphrase/reveal/begin", null)).StatusCode);
+    }
+
+    [Fact]
+    public async Task Passphrase_reveal_refuses_before_the_ceremony_when_none_is_set()
+    {
+        // Fail early rather than making the operator tap their authenticator only to
+        // be told there was nothing to show.
+        await ResetBackupRowAsync();
+        await using var factory = new ApiFactory(_fixture);
+        using var client = AdminClient(factory);
+
+        var resp = await client.PostAsync("/api/admin/backups/passphrase/reveal/begin", null);
+
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
+        Assert.Equal("backup-passphrase-not-set", await CodeOf(resp));
+    }
+
+    [Fact]
+    public async Task Passphrase_reveal_needs_an_assertion_and_is_not_reachable_by_GET()
+    {
+        await ResetBackupRowAsync();
+        await using var factory = new ApiFactory(_fixture);
+        using var client = AdminClient(factory);
+        await client.PutAsJsonAsync("/api/admin/backups/passphrase",
+            new SetBackupPassphraseRequest("correct-horse"));
+
+        // No assertion in the body.
+        var missing = await client.PostAsJsonAsync("/api/admin/backups/passphrase/reveal",
+            new { challengeId = Guid.NewGuid(), assertionResponse = (object?)null });
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, missing.StatusCode);
+        Assert.Equal("master-key-assertion-required", await CodeOf(missing));
+
+        // The secret must never sit in a URL, a referrer, or history.
+        var viaGet = await client.GetAsync("/api/admin/backups/passphrase/reveal");
+        Assert.Equal(HttpStatusCode.NotFound, viaGet.StatusCode);
+        Assert.DoesNotContain("correct-horse", await viaGet.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task A_masterkey_reveal_challenge_cannot_be_redeemed_for_the_passphrase()
+    {
+        // The two step-ups have separate flows so a challenge is good for exactly the
+        // ceremony it was minted for — even though cross-redemption between two admin
+        // step-ups would gain an attacker nothing.
+        await ResetBackupRowAsync();
+        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        await PromoteToAdminAsync(alice);
+        var credential = await alice.AddCredentialAsync();
+
+        var challenges = new ChallengeStore(_fixture.NewServiceFactory());
+        var masterKeyChallenge = await challenges.SaveAsync(
+            ChallengeStore.MasterKeyRevealFlow, alice.UserId,
+            new AssertionOptions { Challenge = new byte[32] }.ToJson(),
+            null, TimeSpan.FromMinutes(2));
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await CookieClientAsync(factory, alice);
+        await client.PutAsJsonAsync("/api/admin/backups/passphrase",
+            new SetBackupPassphraseRequest("correct-horse"));
+
+        var resp = await client.PostAsJsonAsync("/api/admin/backups/passphrase/reveal",
+            new MasterKeyContracts.RevealRequest(
+                masterKeyChallenge,
+                new AuthenticatorAssertionRawResponse
+                {
+                    // Base64URL, not base64 — Fido2NetLib's converter rejects the
+                    // latter outright, which is a binding failure, not a 401.
+                    Id = Convert.ToBase64String(credential.CredentialId)
+                        .TrimEnd('=').Replace('+', '-').Replace('/', '_'),
+                    RawId = credential.CredentialId,
+                    Type = Fido2NetLib.Objects.PublicKeyCredentialType.PublicKey,
+                    Response = new AuthenticatorAssertionRawResponse.AssertionResponse
+                    {
+                        AuthenticatorData = new byte[] { 0 },
+                        ClientDataJson = new byte[] { 0 },
+                        Signature = new byte[] { 0 },
+                    },
+                }));
+
+        Assert.Equal(HttpStatusCode.Unauthorized, resp.StatusCode);
+        Assert.DoesNotContain("correct-horse", await resp.Content.ReadAsStringAsync());
     }
 
     [Fact]

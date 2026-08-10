@@ -423,9 +423,9 @@ public sealed class BulkTransactionsEndpointsTests
             // The feed row carries needs_review=true (awaiting acceptance) so
             // the test proves the soft-hide also clears it (D3).
             await db.Database.ExecuteSqlInterpolatedAsync($@"
-                INSERT INTO txn_headers (id, ledger_id, origin, provider_key, payee, posted_at, external_id, created_at, needs_review)
-                VALUES (gen_random_uuid(), {seed.Ledger.LedgerId}, 'manual',        NULL,        'mine',     '2026-02-01', NULL,    '2026-02-01', false),
-                       (gen_random_uuid(), {seed.Ledger.LedgerId}, 'online_import', 'simplefin', 'feed-row', '2026-02-02', 'ext-1', '2026-02-02', true);");
+                INSERT INTO txn_headers (id, ledger_id, origin, provider_key, payee, posted_at, transacted_at, external_id, created_at, needs_review)
+                VALUES (gen_random_uuid(), {seed.Ledger.LedgerId}, 'manual',        NULL,        'mine',     '2026-02-01','2026-02-01', NULL,    '2026-02-01', false),
+                       (gen_random_uuid(), {seed.Ledger.LedgerId}, 'online_import', 'simplefin', 'feed-row', '2026-02-02','2026-02-02', 'ext-1', '2026-02-02', true);");
         }
 
         // Add legs to each so the resolved view has rows (not strictly

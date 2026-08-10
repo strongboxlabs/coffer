@@ -16,6 +16,13 @@ import { ACTION_LAYOUTS, SHARES_SIGN_RULE, type FieldKey } from './actionLayout'
 export interface InvestmentTxnDraft {
     brokerageAccountId: string | null;
     postedAt: string;                   // ISO-8601 date input (yyyy-mm-dd)
+    /**
+     * Tax / transaction date as a date-input value. Empty string means "no
+     * distinct tax date" — the payload builders send `postedAt` for it, never
+     * null. Same rule the bank editor follows, so there is ONE rule to remember
+     * across both editors.
+     */
+    transactedAt: string;
     action: LedgerInvestmentAction | null;
     payee: string;
     memo: string;
@@ -28,6 +35,21 @@ export interface InvestmentTxnDraft {
     transferAccountId: string | null;
     feeAccountId: string | null;
     feeAmount: number | null;
+}
+
+/**
+ * Seeds the draft's tax-date field from a header. Blank when the tax date is the
+ * posted day — that is the overwhelmingly common case since migration 189 made
+ * `transacted_at` NOT NULL (equal to `posted_at` when there is no distinct tax
+ * date), and showing it prefilled on every row would be noise.
+ */
+export function seedTransactedAt(header: {
+    postedAt: string;
+    transactedAt?: string | null;
+}): string {
+    if (!header.transactedAt) return '';
+    const tax = header.transactedAt.slice(0, 10);
+    return tax === header.postedAt.slice(0, 10) ? '' : tax;
 }
 
 /**
@@ -159,6 +181,11 @@ export function draftToCreateRequest(
     return {
         brokerageAccountId: draft.brokerageAccountId,
         postedAt: new Date(draft.postedAt).toISOString(),
+        // Blank tax date sends the posted date. The investment PATCH is
+        // wholesale-replace, so OMITTING this field is not "leave it alone" — it
+        // clears the stored tax date. Always sending a value is what keeps an
+        // unrelated edit from destroying a tax date the user never touched.
+        transactedAt: new Date(draft.transactedAt || draft.postedAt).toISOString(),
         action: draft.action,
         payee: draft.payee || null,
         memo: draft.memo || null,
@@ -189,6 +216,11 @@ export function draftToPatchRequest(
     return {
         brokerageAccountId: draft.brokerageAccountId,
         postedAt: new Date(draft.postedAt).toISOString(),
+        // Blank tax date sends the posted date. The investment PATCH is
+        // wholesale-replace, so OMITTING this field is not "leave it alone" — it
+        // clears the stored tax date. Always sending a value is what keeps an
+        // unrelated edit from destroying a tax date the user never touched.
+        transactedAt: new Date(draft.transactedAt || draft.postedAt).toISOString(),
         action: draft.action,
         payee: draft.payee || null,
         memo: draft.memo || null,

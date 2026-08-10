@@ -121,6 +121,7 @@ export {
     setMcpSetting,
     fetchMcpClients,
     revokeMcpClient,
+    setMcpClientLabel,
     pruneMcpClients,
     fetchMcpAudit,
     clearMcpAudit,
@@ -157,12 +158,18 @@ export {
     pinBackup,
     unpinBackup,
     setBackupPassphrase,
+    revealBackupPassphrase,
     fetchBackupSchedule,
     saveBackupSchedule,
     fetchBackupRetention,
     setBackupRetention,
     validateRestoreKek,
 } from './api/backup';
+export {
+    fetchMasterKeyStatus,
+    revealMasterKey,
+    rotateMasterKey,
+} from './api/masterKey';
 export {
     fetchDriveSyncStatus,
     startDriveConnect,

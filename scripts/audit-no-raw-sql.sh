@@ -3,12 +3,27 @@
 # with an APPROVED-RAW-SQL-EXCEPTION comment within the preceding
 # few lines.
 #
-# See memory entry `feedback_no_raw_sql_in_api` for the policy: the
-# API data-access layer goes through LINQ + EF; complex SQL lives in
-# Postgres functions/views declared in db/migrations/ and is bound
-# via HasDbFunction. Hits returned by this script are either (a)
-# pre-approved exceptions (tagged) or (b) violations that need to be
-# moved into a Postgres function.
+# The policy is docs/decisions/0005-dapper-and-efcore.md (as realigned
+# in PR 3.6.5): the API data-access layer goes through LINQ + EF;
+# complex SQL lives in Postgres functions/views declared in
+# db/migrations/ and is bound via HasDbFunction. Operational notes —
+# what this script does and does NOT cover — are in the memory entry
+# `feedback_no_raw_sql_in_api`.
+#
+# SCOPE, so a green run isn't over-read: src/Api ONLY.
+#   * src/Importer.Moneydance is deliberately Dapper (ADR-0005:
+#     108k-row bulk inserts, unnest() array params, deferred
+#     constraints). Not audited, not a violation.
+#   * tests/ is not audited — fixtures need DDL (CREATE DATABASE,
+#     GRANT, CREATE EXTENSION, TRUNCATE) that has no EF analogue.
+#
+# Hits returned by this script are either (a) pre-approved exceptions
+# (tagged) or (b) violations. Resolve (b) by moving the SQL into a
+# Postgres function, or — when the code must run BEFORE migrations,
+# where no migration-created function can exist yet — by using plain
+# EF with a narrow catch. Tagging a new exception instead requires
+# explicit sign-off from the repo owner; the bar is high (exactly one
+# exists today, the RLS session interceptor).
 #
 # Usage:
 #   scripts/audit-no-raw-sql.sh          # report + exit 1 on violations
@@ -56,12 +71,18 @@ done
 
 if [[ $violations -gt 0 ]]; then
     echo
-    echo "Each hit must either (a) be moved into a Postgres function"
-    echo "in db/migrations/ and bound via HasDbFunction, or (b) be"
-    echo "tagged with '$TOKEN' + a date + rationale within the"
-    echo "preceding $WINDOW lines, with explicit user sign-off."
+    echo "Resolve each hit, in order of preference:"
+    echo "  (a) move it into a Postgres function in db/migrations/ and"
+    echo "      bind via HasDbFunction;"
+    echo "  (b) if the code must run BEFORE migrations — where no"
+    echo "      migration-created function can exist yet — use plain EF"
+    echo "      with a narrow catch instead;"
+    echo "  (c) tag it '$TOKEN' + date + rationale"
+    echo "      within the preceding $WINDOW lines. (c) requires explicit"
+    echo "      sign-off from the repo owner — do not self-approve."
     echo
-    echo "See: feedback_no_raw_sql_in_api in project memory."
+    echo "Policy: docs/decisions/0005-dapper-and-efcore.md"
+    echo "Scope + operational notes: feedback_no_raw_sql_in_api in project memory."
     exit 1
 fi
 

@@ -16,7 +16,8 @@ import {
     fetchSimilarPayees,
     fetchTags,
 } from '@/lib/api';
-import { shiftDateInputValue, toDateInputValue, todayInputValue } from '@/lib/dates';
+import { toDateInputValue, todayInputValue } from '@/lib/dates';
+import { DateField } from './components/DateField';
 import { formatCurrency } from '@/lib/money';
 import type {
     AccountSummary,
@@ -114,6 +115,14 @@ export type TxnRowMode =
           memo: string | null;
           checkNumber: string | null;
           postedAt: string;
+          /** Tax / transaction date to seed the editor's Tax date field, or null
+           *  when the row has none.
+           *
+           *  REQUIRED, not optional, on purpose: the editor sends transactedAt on
+           *  every save, so a caller that forgot to seed it would silently CLEAR a
+           *  tax date the transaction already had. Optional would have made that a
+           *  runtime data-loss bug; required makes it a compile error. */
+          transactedAt: string | null;
           balanceAfter: number | null;
           /** Slice 2c.6b: header-level tags currently applied to
            *  this transaction. The editor's TagsInput seeds from
@@ -311,6 +320,27 @@ export function TxnRowEdit({
             ? (mode.postedAt ?? todayInputValue())
             : toDateInputValue(mode.postedAt),
     );
+
+    // Empty string means "not set", which the payloads send as null. Deliberately
+    // NOT defaulted to the posted date: writing transactedAt == postedAt on every
+    // transaction would make the column meaningless and would permanently silence
+    // taxDateSubLabel's noise filter, which only renders a second line when the
+    // two dates differ.
+    const [transactedAt, setTransactedAt] = useState(() => {
+        if (mode.kind === 'new' || !mode.transactedAt) return '';
+        const tax = toDateInputValue(mode.transactedAt);
+        // Same noise filter the register's taxDateSubLabel uses: a tax date on the
+        // same calendar day as the posted date carries no information, so show the
+        // field empty rather than echoing the posted date back. The Moneydance
+        // importer sets transacted_at on EVERY row, so without this every imported
+        // transaction would open with a redundant tax date filled in.
+        //
+        // Consequence, accepted: saving such a row untouched normalises the stored
+        // value to null. Nothing is lost — same-day and null render identically and
+        // mean the same thing — and it moves the data toward the cleaner of two
+        // equivalent representations.
+        return tax === toDateInputValue(mode.postedAt) ? '' : tax;
+    });
 
     // Slice 2c.6b: tag set. In edit mode seeds from the row's
     // current tags; in new mode starts empty. The save handler
@@ -564,6 +594,12 @@ export function TxnRowEdit({
         if (mode.kind === 'new') {
             const body: CreateTransactionRequest = {
                 postedAt: `${postedAt}T00:00:00.000Z`,
+                // Blank means "no distinct tax date", which mig 189 stores as the
+                // posted date — NOT null. On the patch path null means "leave this
+                // column alone" (override layer, ADR-0003), so sending null to
+                // clear a tax date would silently do nothing. Same value on both
+                // paths so create and patch cannot drift.
+                transactedAt: `${transactedAt.length === 0 ? postedAt : transactedAt}T00:00:00.000Z`,
                 payee: payee.trim().length === 0 ? null : payee.trim(),
                 memo: headerMemo.trim().length === 0 ? null : headerMemo.trim(),
                 checkNumber:
@@ -598,6 +634,8 @@ export function TxnRowEdit({
             checkNumber:
                 checkNumber.trim().length === 0 ? null : checkNumber.trim(),
             postedAt: `${postedAt}T00:00:00.000Z`,
+            // See the create path: blank is the posted date, never null.
+            transactedAt: `${transactedAt.length === 0 ? postedAt : transactedAt}T00:00:00.000Z`,
             postings: {
                 sourceAccountId: mode.sourceAccountId,
                 items,
@@ -662,34 +700,27 @@ export function TxnRowEdit({
                 >
                     <span />
                     <span />
-                    <label className="flex min-w-0 flex-col gap-1">
-                        <span className="text-[0.625rem] font-semibold uppercase tracking-wider text-text-muted">Date</span>
-                        <input
+                    {/* Date and Tax date stack in ONE grid cell, mirroring how Memo sits
+                        under Payee — so the tax date lands on the second line, aligned with
+                        the memo, and Check # keeps its own column. Two grid cells here made
+                        the top row too tight and truncated the tax input. */}
+                    <div className="flex min-w-0 flex-col gap-2">
+                        <DateField
+                            label="Date"
                             id={dateId}
-                            type="date"
                             value={postedAt}
+                            onChange={setPostedAt}
                             disabled={isSaving}
                             autoFocus
-                            title="Date — keys: t today, y yesterday, +/- shift by day"
-                            onChange={(e) => setPostedAt(e.target.value)}
-                            onKeyDown={(e) => {
-                                if (e.key === 't' || e.key === 'T') {
-                                    e.preventDefault();
-                                    setPostedAt(todayInputValue());
-                                } else if (e.key === 'y' || e.key === 'Y') {
-                                    e.preventDefault();
-                                    setPostedAt(shiftDateInputValue(todayInputValue(), -1));
-                                } else if (e.key === '+' || e.key === '=') {
-                                    e.preventDefault();
-                                    setPostedAt(shiftDateInputValue(postedAt, 1));
-                                } else if (e.key === '-' || e.key === '_') {
-                                    e.preventDefault();
-                                    setPostedAt(shiftDateInputValue(postedAt, -1));
-                                }
-                            }}
-                            className="h-7 w-full rounded border border-border bg-surface px-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                         />
-                    </label>
+                        <DateField
+                            label="Tax date"
+                            value={transactedAt}
+                            onChange={setTransactedAt}
+                            disabled={isSaving}
+                            hint="Blank = same as posted"
+                        />
+                    </div>
                     <label className="flex min-w-0 flex-col gap-1">
                         <span className="text-[0.625rem] font-semibold uppercase tracking-wider text-text-muted">Check #</span>
                         <input
@@ -895,34 +926,27 @@ export function TxnRowEdit({
             >
                 <span />
                 <span />
-                <label className="flex min-w-0 flex-col gap-1">
-                    <span className="text-[0.625rem] font-semibold uppercase tracking-wider text-text-muted">Date</span>
-                    <input
+                {/* Date and Tax date stack in ONE grid cell, mirroring how Memo sits
+                    under Payee — so the tax date lands on the second line, aligned with
+                    the memo, and Check # keeps its own column. Two grid cells here made
+                    the top row too tight and truncated the tax input. */}
+                <div className="flex min-w-0 flex-col gap-2">
+                    <DateField
+                        label="Date"
                         id={dateId}
-                        type="date"
                         value={postedAt}
+                        onChange={setPostedAt}
                         disabled={isSaving}
                         autoFocus
-                        title="Date — keys: t today, y yesterday, +/- shift by day"
-                        onChange={(e) => setPostedAt(e.target.value)}
-                        onKeyDown={(e) => {
-                            if (e.key === 't' || e.key === 'T') {
-                                e.preventDefault();
-                                setPostedAt(todayInputValue());
-                            } else if (e.key === 'y' || e.key === 'Y') {
-                                e.preventDefault();
-                                setPostedAt(shiftDateInputValue(todayInputValue(), -1));
-                            } else if (e.key === '+' || e.key === '=') {
-                                e.preventDefault();
-                                setPostedAt(shiftDateInputValue(postedAt, 1));
-                            } else if (e.key === '-' || e.key === '_') {
-                                e.preventDefault();
-                                setPostedAt(shiftDateInputValue(postedAt, -1));
-                            }
-                        }}
-                        className="h-7 w-full rounded border border-border bg-surface px-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                     />
-                </label>
+                    <DateField
+                        label="Tax date"
+                        value={transactedAt}
+                        onChange={setTransactedAt}
+                        disabled={isSaving}
+                        hint="Blank = same as posted"
+                    />
+                </div>
                 <label className="flex min-w-0 flex-col gap-1">
                     <span className="text-[0.625rem] font-semibold uppercase tracking-wider text-text-muted">Check #</span>
                     <input

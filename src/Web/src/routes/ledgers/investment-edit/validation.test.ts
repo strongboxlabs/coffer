@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { validate, type InvestmentTxnDraft } from './validation';
+import {
+    draftToCreateRequest,
+    draftToPatchRequest,
+    seedTransactedAt,
+    validate,
+    type InvestmentTxnDraft,
+} from './validation';
 
 /**
  * Per-action validation tests against the ADR-0029 matrix. Each test
@@ -18,6 +24,7 @@ function emptyDraft(): InvestmentTxnDraft {
     return {
         brokerageAccountId: BROKERAGE,
         postedAt: '2026-05-21',
+        transactedAt: '',
         action: null,
         payee: '',
         memo: '',
@@ -32,6 +39,64 @@ function emptyDraft(): InvestmentTxnDraft {
         feeAmount: null,
     };
 }
+
+describe('tax date — payload builders', () => {
+    // These builders had NO coverage, which is how a real data-loss bug lived
+    // here: the draft carried no tax date at all, so every PATCH omitted it, and
+    // the investment PATCH is wholesale-replace — an omitted field CLEARS the
+    // stored value. Editing an unrelated field on a transaction with a distinct
+    // tax date silently destroyed that tax date.
+    const buy = (): InvestmentTxnDraft => ({
+        ...emptyDraft(),
+        action: 'buy',
+        securityId: SECURITY,
+        shares: 10,
+        price: 100,
+    });
+
+    it('sends the posted date when no distinct tax date is set', () => {
+        const req = draftToCreateRequest(buy());
+        expect(req.transactedAt).toBe(new Date('2026-05-21').toISOString());
+    });
+
+    it('sends the tax date when one is set', () => {
+        const req = draftToCreateRequest({ ...buy(), transactedAt: '2026-05-18' });
+        expect(req.transactedAt).toBe(new Date('2026-05-18').toISOString());
+    });
+
+    it('PATCH always carries a tax date, so an unrelated edit cannot erase it', () => {
+        // The regression guard. A null/absent transactedAt here is the bug.
+        const req = draftToPatchRequest({ ...buy(), transactedAt: '2026-05-18' });
+        expect(req.transactedAt).toBe(new Date('2026-05-18').toISOString());
+
+        const blank = draftToPatchRequest(buy());
+        expect(blank.transactedAt).toBe(new Date('2026-05-21').toISOString());
+        expect(blank.transactedAt).not.toBeNull();
+    });
+});
+
+describe('seedTransactedAt', () => {
+    it('blanks a tax date that falls on the posted day', () => {
+        // The common case since mig 189 made transacted_at NOT NULL: it equals
+        // posted_at whenever there is no distinct tax date. Prefilling it would
+        // put a redundant value in the field on virtually every row.
+        expect(seedTransactedAt({
+            postedAt: '2026-05-15T00:00:00Z',
+            transactedAt: '2026-05-15T00:00:00Z',
+        })).toBe('');
+    });
+
+    it('keeps a genuinely distinct tax date', () => {
+        expect(seedTransactedAt({
+            postedAt: '2026-05-15T00:00:00Z',
+            transactedAt: '2026-04-28T00:00:00Z',
+        })).toBe('2026-04-28');
+    });
+
+    it('treats a null tax date as blank', () => {
+        expect(seedTransactedAt({ postedAt: '2026-05-15T00:00:00Z', transactedAt: null })).toBe('');
+    });
+});
 
 describe('validate — action gate', () => {
     it('rejects empty action with a single top-level error', () => {

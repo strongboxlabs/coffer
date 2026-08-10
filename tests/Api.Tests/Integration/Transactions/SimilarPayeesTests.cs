@@ -70,10 +70,10 @@ public sealed class SimilarPayeesTests
         // dedup scopes by the anchor row's provider_key.
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             INSERT INTO txn_headers
-                (id, ledger_id, origin, provider_key, external_id, payee, posted_at, created_at, needs_review)
+                (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, created_at, needs_review)
             VALUES
                 ({headerId}, {ledger.LedgerId}, {origin}, {providerKey}, {headerId.ToString()}, {bankPayee},
-                 {postedAt}, {postedAt}, {needsReview});
+                 {postedAt},{postedAt}, {postedAt}, {needsReview});
             INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount)
             VALUES
                 ({bankLegId},     {headerId}, {ledger.LedgerId}, {bankAccountId},     0, {amount}),

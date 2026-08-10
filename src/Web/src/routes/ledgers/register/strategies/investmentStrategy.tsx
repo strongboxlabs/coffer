@@ -4,6 +4,7 @@ import { categoryChipVariant } from '@/lib/categoryChip';
 import { displayAccountPath } from '@/lib/accountPath';
 import { ProvenanceIcon } from '@/components/register/ProvenanceIcon';
 import { formatShares, formatPrice, formatCurrency } from '@/lib/money';
+import { taxDateSubLabel } from '../bank/columns';
 
 /**
  * Investment-register cell renderers (slice A1.c / A1.d). Consumed
@@ -11,7 +12,7 @@ import { formatShares, formatPrice, formatCurrency } from '@/lib/money';
  * its own row component rather than going through a shared dispatch).
  *
  * Slot layout (9-column grid — see `../investment/columns.ts`):
- *   1 status     2 checkbox    3 date + check#    4 Action chip
+ *   1 status     2 checkbox    3 date + tax date   4 Action chip + check#
  *   5 Description (payee + memo)
  *   6 Category | Transfer (line 1)  ·  Fee category (line 2)
  *   7 Security · Shares @ Price            ← new vs bank
@@ -45,9 +46,17 @@ function formatAction(action: string): string {
 
 export const investmentStrategy = {
     renderDateSubLabel(txn: InvestmentRow) {
-        // Investment rows surface MD's investment-specific check_number
-        // marker values (Auto / EXfr / Xfr / numeric) on line 2 of the
-        // date cell.
+        // Tax date, same as the bank register: line 2 of the date cell belongs to
+        // the date. MD's investment-specific check_number markers (Auto / EXfr /
+        // Xfr / numeric) used to live here and now hang off the Action chip, where
+        // they read as what they are — a qualifier on the action, not on the date.
+        const label = taxDateSubLabel(txn);
+        return label ? `tax ${label}` : null;
+    },
+
+    renderActionSubLabel(txn: InvestmentRow) {
+        // MD's investment check_number markers: Auto / EXfr / Xfr, or a plain
+        // cheque number. Displaced from the date cell by the tax date.
         return txn.checkNumber ?? null;
     },
 

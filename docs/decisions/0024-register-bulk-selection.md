@@ -109,7 +109,8 @@ without the other:
   `is_hidden`, `is_merged_into`) and `txn_legs.account_id`.
   Bulk update/delete uses EF Core 8's `ExecuteUpdateAsync` /
   `ExecuteDeleteAsync` — one statement to Postgres, no row
-  enumeration in C# (per [feedback_no_raw_sql_in_api](../../).
+  enumeration in C# (per [ADR-0005](0005-dapper-and-efcore.md) and
+  `feedback_no_raw_sql_in_api` in project memory).
 
 - **API**:
   - [src/Api/Contracts/TransactionWriteDtos.cs](../../src/Api/Contracts/TransactionWriteDtos.cs) — `SelectionRequest`, `SelectionSummary`, `BulkReconStatusRequest/Response`, `BulkDeleteRequest/Response`, `SelectionLimits`.

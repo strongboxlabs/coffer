@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { fetchMcpSetting, setMcpSetting } from '@/lib/api';
@@ -16,6 +17,7 @@ const MCP_SETTING_KEY = ['admin-mcp-setting'] as const;
  */
 export function McpSettingsPanel() {
     const queryClient = useQueryClient();
+    const [copyState, setCopyState] = useState<'idle' | 'copied' | 'unsupported'>('idle');
     const query = useQuery({ queryKey: MCP_SETTING_KEY, queryFn: fetchMcpSetting });
     const mutation = useMutation({
         mutationFn: (next: { enabled: boolean; writesEnabled: boolean }) =>
@@ -81,6 +83,41 @@ export function McpSettingsPanel() {
                                     MCP is forced on by configuration
                                     (<code>COFFER_API__Mcp__Enabled</code>); this toggle can't disable it.
                                 </p>
+                            ) : null}
+
+                            {/* The address to paste into a client. Shown only while MCP is
+                                actually running: an address for a server that isn't
+                                answering is an invitation to debug the wrong thing. */}
+                            {setting.active && setting.publicUrl ? (
+                                <div className="space-y-1 border-t border-border pt-3">
+                                    <div className="text-sm font-medium">Connect a client to</div>
+                                    <div className="flex items-center gap-2">
+                                        <code className="min-w-0 flex-1 truncate rounded-md bg-surface-muted px-2 py-1 text-xs">
+                                            {setting.publicUrl}/mcp
+                                        </code>
+                                        <Button
+                                            variant="secondary"
+                                            onClick={() => {
+                                                // Same approach as the recovery-codes copy: the
+                                                // standard API, and a visible outcome either way.
+                                                // Silent failure here would leave the operator
+                                                // pasting whatever was already on the clipboard.
+                                                navigator.clipboard
+                                                    ?.writeText(`${setting.publicUrl}/mcp`)
+                                                    .then(() => setCopyState('copied'))
+                                                    .catch(() => setCopyState('unsupported'));
+                                            }}
+                                        >
+                                            {copyState === 'copied' ? 'Copied' : 'Copy'}
+                                        </Button>
+                                    </div>
+                                    {copyState === 'unsupported' ? (
+                                        <p className="text-xs text-text-muted">
+                                            Couldn't reach the clipboard — select the address and copy it
+                                            manually.
+                                        </p>
+                                    ) : null}
+                                </div>
                             ) : null}
 
                             {/* Write tools (ADR-0068) — a second, narrower opt-in, only

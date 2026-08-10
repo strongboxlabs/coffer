@@ -359,7 +359,10 @@ public sealed class TransactionsRepository
             payees[i]               = row.Payee;
             memos[i]                = row.Memo;
             postedAts[i]            = row.PostedAt.UtcDateTime;
-            transactedAts[i]        = row.TransactedAt?.UtcDateTime;
+            // NOT NULL since mig 189. MD sets `td` on almost every txn, but
+            // reminder-derived rows carry none — those store the posted date,
+            // which is what "no distinct tax date" means.
+            transactedAts[i]        = (row.TransactedAt ?? row.PostedAt).UtcDateTime;
             checkNumbers[i]         = row.CheckNumber;
             isPendings[i]           = row.IsPending;
             isHiddens[i]            = row.IsHidden;

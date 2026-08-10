@@ -380,7 +380,7 @@ public sealed class OfxIngestTests
                 Origin = "online_import",
                 ProviderKey = "moneydance",        // != "ofx" — the cross-source case
                 Payee = "STARBUCKS",
-                PostedAt = new DateTime(2026, 1, 5, 0, 0, 0, DateTimeKind.Utc),                IsPending = false,
+                PostedAt = new DateTime(2026, 1, 5, 0, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 1, 5, 0, 0, 0, DateTimeKind.Utc),                IsPending = false,
                 NeedsReview = false,
                 ExternalId = "md-coffee-1",        // MD's own id — NOT the OFX FITID
                 OnlineMatchFiId = "021000021",     // preserved OFX BANKID

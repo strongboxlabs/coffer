@@ -163,6 +163,14 @@ export interface SetupCompleteResponse {
     ledgerId: string | null;
     /** Null unless a Demo ledger was requested and its seed succeeded (ADR-0088). */
     ledgerName: string | null;
+    /**
+     * The install's master key, base64 (ADR-0092 D2). Startup minted it on this
+     * virgin install; setup is where the operator is first shown it. Unlike
+     * {@link recoveryCodes} this one CAN be retrieved again — System → Backups
+     * reveals it behind a fresh passkey assertion — so the display gate is a moment
+     * of attention rather than a last chance.
+     */
+    masterKeyBase64: string;
 }
 
 /** Input to {@link performSetup}. */

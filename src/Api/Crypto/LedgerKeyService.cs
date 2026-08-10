@@ -117,8 +117,9 @@ public sealed class LedgerKeyService
     /// Seal <paramref name="plaintext"/> directly under the deployment
     /// master KEK — no per-ledger LEK. For deployment-global secrets that
     /// aren't owned by any single ledger (ADR-0060: the backup passphrase).
-    /// The master KEK lives only in <c>COFFER_MASTER_KEK_BASE64</c> (env),
-    /// never in the DB or a backup, so a stolen ciphertext alone is inert.
+    /// The master KEK lives in its own file (ADR-0092 D1 — the env var it used
+    /// to come from is deprecated and ignored while that file exists), never in
+    /// the DB or a backup, so a stolen ciphertext alone is inert.
     /// Returns <c>nonce || ciphertext || tag</c>.
     /// </summary>
     public byte[] SealWithMasterKey(byte[] plaintext)

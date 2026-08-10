@@ -142,6 +142,8 @@ public sealed class AppDbContext : DbContext
     /// <summary>system_settings (mig 147, ADR-0063 §D8) — deployment-global
     /// key/value settings (e.g. mcp.enabled). Service-role only.</summary>
     internal DbSet<SystemSettingRow> SystemSettings => Set<SystemSettingRow>();
+    // ADR-0092 D2 / migration 191: deployment-level admin audit. Append-only.
+    internal DbSet<AdminAuditEventRow> AdminAuditEvents => Set<AdminAuditEventRow>();
     // ADR-0034 / migration 089: per-(header, account) running balance.
     // Read-only from the API perspective; the header-walk trigger family
     // (mig 090) owns the writes.
@@ -811,6 +813,21 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at");
             b.Property(x => x.UpdatedBy).HasColumnName("updated_by");
             b.HasOne<UserRow>().WithMany().HasForeignKey(x => x.UpdatedBy)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        // Deployment-level admin audit (ADR-0092 D2, migration 191). Append-only:
+        // the entity is init-only and nothing here updates or deletes.
+        modelBuilder.Entity<AdminAuditEventRow>(b =>
+        {
+            b.ToTable("admin_audit_events");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id");
+            b.Property(x => x.OccurredAt).HasColumnName("occurred_at");
+            b.Property(x => x.Action).HasColumnName("action");
+            b.Property(x => x.ActorUserId).HasColumnName("actor_user_id");
+            b.Property(x => x.Detail).HasColumnName("detail");
+            b.HasOne<UserRow>().WithMany().HasForeignKey(x => x.ActorUserId)
                 .OnDelete(DeleteBehavior.SetNull);
         });
 

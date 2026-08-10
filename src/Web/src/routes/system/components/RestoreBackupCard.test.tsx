@@ -77,6 +77,39 @@ describe('RestoreBackupCard', () => {
         expect(spy.mock.calls[1][3]).toBe(true);   // acknowledgeKekMismatch on the retry
     });
 
+    it('accepts a source key instead of the acknowledgement, and passes it through', async () => {
+        // ADR-0092 D4: supplying the source install's key means nothing gets
+        // cleared, so there is nothing to acknowledge losing. The server enforces
+        // the same rule and rejects a key that doesn't match the archive, so this
+        // can't be used to skip the warning with a bogus value.
+        const spy = vi
+            .spyOn(backupApi, 'restoreBackup')
+            .mockRejectedValueOnce(
+                new ApiError(422, 'This backup was sealed under a different Master KEK.', 'backup-kek-mismatch'),
+            )
+            .mockResolvedValueOnce(undefined);
+        const user = userEvent.setup();
+        renderCard();
+
+        await fillValidForm(user);
+        await user.click(screen.getByRole('button', { name: /restore database/i }));
+        expect(await screen.findByText(/different master kek/i)).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /restore database/i })).toBeDisabled();
+
+        const sourceKey = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
+        await user.type(screen.getByLabelText(/source install/i), sourceKey);
+
+        // The acknowledgement checkbox gives way to the key field — they're
+        // alternatives, not both.
+        expect(screen.queryByRole('checkbox', { name: /restore anyway/i })).not.toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /restore database/i })).toBeEnabled();
+
+        await user.click(screen.getByRole('button', { name: /restore database/i }));
+
+        expect(await screen.findByText(/restoring/i)).toBeInTheDocument();
+        expect(spy.mock.calls[1][4]).toBe(sourceKey);   // forwarded to the API
+    });
+
     it('shows the restarting notice on success', async () => {
         vi.spyOn(backupApi, 'restoreBackup').mockResolvedValue(undefined);
         const user = userEvent.setup();

@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
     fetchMcpClients,
     revokeMcpClient,
+    setMcpClientLabel,
     pruneMcpClients,
     type McpClient,
 } from '@/lib/api';
@@ -31,7 +32,19 @@ export function McpClientsPanel() {
         onSuccess: invalidate,
     });
     const prune = useMutation({ mutationFn: () => pruneMcpClients(), onSuccess: invalidate });
+    const relabel = useMutation({
+        mutationFn: (v: { clientId: string; label: string }) =>
+            // Blank clears the label rather than storing an empty name — the row then
+            // falls back to whatever the client registered itself as.
+            setMcpClientLabel(v.clientId, v.label.trim() === '' ? null : v.label.trim()),
+        onSuccess: () => {
+            setEditing(null);
+            invalidate();
+        },
+    });
 
+    const [editing, setEditing] = useState<string | null>(null);
+    const [draft, setDraft] = useState('');
     const [revokeTarget, setRevokeTarget] = useState<McpClient | null>(null);
     const [pruneOpen, setPruneOpen] = useState(false);
 
@@ -71,7 +84,51 @@ export function McpClientsPanel() {
                                     className="flex items-center justify-between gap-4 py-2"
                                 >
                                     <div className="min-w-0 text-sm">
-                                        <div className="font-medium">{c.displayName}</div>
+                                        {editing === c.clientId ? (
+                                            <form
+                                                className="flex items-center gap-2"
+                                                onSubmit={(e) => {
+                                                    e.preventDefault();
+                                                    relabel.mutate({ clientId: c.clientId, label: draft });
+                                                }}
+                                            >
+                                                <input
+                                                    autoFocus
+                                                    aria-label={`Name for ${c.displayName}`}
+                                                    className="w-56 rounded-md border border-border px-2 py-1 text-sm"
+                                                    value={draft}
+                                                    placeholder={c.displayName}
+                                                    onChange={(e) => setDraft(e.target.value)}
+                                                    onKeyDown={(e) => {
+                                                        if (e.key === 'Escape') setEditing(null);
+                                                    }}
+                                                />
+                                                <Button type="submit" size="sm" disabled={relabel.isPending}>
+                                                    Save
+                                                </Button>
+                                                <Button
+                                                    type="button"
+                                                    variant="secondary"
+                                                    size="sm"
+                                                    onClick={() => setEditing(null)}
+                                                >
+                                                    Cancel
+                                                </Button>
+                                            </form>
+                                        ) : (
+                                            <div className="font-medium">
+                                                {c.label ?? c.displayName}
+                                                {/* Registered name kept visible when renamed: the
+                                                    label is the operator's word for it, but the
+                                                    client's own name is what identifies WHICH
+                                                    software connected. */}
+                                                {c.label ? (
+                                                    <span className="ml-2 font-normal text-text-muted">
+                                                        ({c.displayName})
+                                                    </span>
+                                                ) : null}
+                                            </div>
+                                        )}
                                         <div className="truncate text-xs text-text-muted">
                                             {c.clientType} · {c.activeAuthorizations} authorization(s)
                                             {c.redirectUris.length > 0
@@ -80,6 +137,18 @@ export function McpClientsPanel() {
                                         </div>
                                     </div>
                                     <div className="flex shrink-0 items-center gap-2">
+                                        {editing === c.clientId ? null : (
+                                            <Button
+                                                variant="secondary"
+                                                size="sm"
+                                                onClick={() => {
+                                                    setEditing(c.clientId);
+                                                    setDraft(c.label ?? '');
+                                                }}
+                                            >
+                                                Rename
+                                            </Button>
+                                        )}
                                         <Button
                                             variant="danger"
                                             size="sm"

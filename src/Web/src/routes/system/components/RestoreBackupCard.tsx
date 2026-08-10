@@ -31,10 +31,19 @@ export function RestoreBackupCard() {
     const [acknowledgeKek, setAcknowledgeKek] = useState(false);
     const [kekCheck, setKekCheck] = useState<BackupKekCheck | null>(null);
     const [restarting, setRestarting] = useState(false);
+    /** Source install's master key for the adopt path (ADR-0092 D4). Component
+     *  state only — key material never goes in a cache or a URL. */
+    const [sourceKey, setSourceKey] = useState('');
 
     const restoreMutation = useMutation({
-        mutationFn: (vars: { file: File; passphrase: string; confirm: string; ack: boolean }) =>
-            restoreBackup(vars.file, vars.passphrase, vars.confirm, vars.ack),
+        mutationFn: (vars: {
+            file: File;
+            passphrase: string;
+            confirm: string;
+            ack: boolean;
+            sourceKey: string;
+        }) =>
+            restoreBackup(vars.file, vars.passphrase, vars.confirm, vars.ack, vars.sourceKey),
         onSuccess: () => setRestarting(true),
     });
 
@@ -49,11 +58,16 @@ export function RestoreBackupCard() {
         : null;
 
     const confirmOk = confirm.trim().toLowerCase() === RESTORE_CONFIRM_PHRASE;
+    // A supplied source key stands in for the acknowledgement: the point of it is
+    // that nothing gets cleared, so there's nothing to acknowledge losing. The
+    // server applies the same rule, and rejects a key that doesn't match the
+    // archive — so this can't be used to skip the warning with a bogus value.
+    const kekResolved = acknowledgeKek || sourceKey.trim().length > 0;
     const canSubmit =
         file !== null &&
         passphrase.length > 0 &&
         confirmOk &&
-        (!needsKekAck || acknowledgeKek) &&
+        (!needsKekAck || kekResolved) &&
         !restoreMutation.isPending;
 
     if (restarting) {
@@ -153,16 +167,53 @@ export function RestoreBackupCard() {
                                 : 'This backup was sealed under a different Master KEK.'}
                         </p>
                         <p className="text-xs text-text-muted">
-                            Data and passkeys will restore, but the backup passphrase and Google
-                            Drive connection won’t carry over — you’ll re-set them afterward. For a
-                            clean migration, set <code>COFFER_MASTER_KEK_BASE64</code> to the source
-                            install’s value first.
+                            Data and passkeys will restore intact either way. Paste the source
+                            install’s master key below and its sealed secrets carry over too;
+                            leave it empty and they’re cleared — bank feeds, the backup
+                            passphrase, and the Google Drive connection all need re-establishing.
                         </p>
-                        <Checkbox
-                            label="Restore anyway — I'll re-set the backup passphrase and reconnect Google Drive afterward."
-                            checked={acknowledgeKek}
-                            onChange={(e) => setAcknowledgeKek(e.target.checked)}
-                        />
+                        {/* The master key lives on its own tab now (ADR-0092), so point at
+                            it: this warning is exactly when an operator wants to compare
+                            fingerprints, and they shouldn't have to go looking. */}
+                        <p className="text-xs text-text-muted">
+                            <a href="/system?tab=encryption" className="text-accent underline">
+                                System → Encryption
+                            </a>{' '}
+                            shows this install’s key and its fingerprint, if you need to check
+                            which one you’re on.
+                        </p>
+
+                        {/* The clean-migration path (ADR-0092 D4). Offered right here
+                            rather than as separate documentation, because this warning
+                            is the moment the operator learns they need it. The server
+                            checks it against the archive's fingerprint before anything
+                            destructive runs, so a wrong paste is refused up front. */}
+                        <label className="block space-y-1">
+                            <span className="text-xs font-medium text-text">
+                                Source install’s master key (optional)
+                            </span>
+                            <Input
+                                value={sourceKey}
+                                onChange={(e) => setSourceKey(e.target.value)}
+                                placeholder="44-character base64, ending in ="
+                                autoComplete="off"
+                                spellCheck={false}
+                                className="font-mono text-xs"
+                            />
+                        </label>
+
+                        {sourceKey.trim().length === 0 ? (
+                            <Checkbox
+                                label="Restore anyway — I'll re-link my bank feeds, set a new backup passphrase, and reconnect Google Drive afterward."
+                                checked={acknowledgeKek}
+                                onChange={(e) => setAcknowledgeKek(e.target.checked)}
+                            />
+                        ) : (
+                            <p className="text-xs text-text-muted">
+                                With a matching key supplied, nothing is cleared — no
+                                acknowledgement needed.
+                            </p>
+                        )}
                     </div>
                 ) : null}
 
@@ -178,7 +229,13 @@ export function RestoreBackupCard() {
                         className="bg-state-danger hover:bg-state-danger/90"
                         onClick={() =>
                             file &&
-                            restoreMutation.mutate({ file, passphrase, confirm, ack: acknowledgeKek })
+                            restoreMutation.mutate({
+                                file,
+                                passphrase,
+                                confirm,
+                                ack: acknowledgeKek,
+                                sourceKey,
+                            })
                         }
                     >
                         {restoreMutation.isPending ? 'Restoring…' : 'Restore database'}

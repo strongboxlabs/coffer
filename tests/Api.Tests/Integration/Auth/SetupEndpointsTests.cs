@@ -16,6 +16,7 @@ using Coffer.Api.Auth;
 using Coffer.Api.Auth.Webauthn;
 using Coffer.Api.Configuration;
 using Coffer.Api.Db.Entities;
+using Coffer.Api.Db.Repositories;
 using Coffer.Api.Db.Services;
 using Coffer.Api.Tests.Integration.Infra;
 
@@ -328,6 +329,25 @@ public sealed class SetupEndpointsTests
         // No ledger without the demo opt-in (ADR-0088).
         Assert.Equal(JsonValueKind.Null, completeDoc.RootElement.GetProperty("ledgerId").ValueKind);
         Assert.Equal(JsonValueKind.Null, completeDoc.RootElement.GetProperty("ledgerName").ValueKind);
+
+        // The master key comes back too (ADR-0092 D2): startup minted it on this
+        // install and setup is the one moment the operator is present, verified, and
+        // paying attention. Returned under the same one-time bootstrap-token gate as
+        // the recovery codes above, and it is the LESS sensitive of the two.
+        Assert.Equal(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",   // ApiFactory's fixture key
+            completeDoc.RootElement.GetProperty("masterKeyBase64").GetString());
+
+        // …and the disclosure is audited, so "who saw the key" has an answer even
+        // for the unavoidable bootstrap one.
+        await using (var auditDb = _fixture.NewDbContext())
+        {
+            Assert.Contains(
+                await auditDb.AdminAuditEvents.AsNoTracking()
+                    .Where(e => e.Action == AdminAuditActions.MasterKeyShownAtSetup)
+                    .ToListAsync(),
+                e => e.ActorUserId == userId);
+        }
 
         // DB state: user, credential, recovery codes, bootstrap token
         // consumed, and NO ledger grant.

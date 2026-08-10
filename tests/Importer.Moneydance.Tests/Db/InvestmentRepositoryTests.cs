@@ -373,9 +373,9 @@ public sealed class InvestmentRepositoryTests
 
         var headerId = Guid.NewGuid();
         await conn.ExecuteAsync(@"
-            INSERT INTO txn_headers (id, ledger_id, origin, posted_at,
+            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
                 is_pending, is_hidden, action, created_at)
-            VALUES (@Id, @LedgerId, 'manual', NOW(),
+            VALUES (@Id, @LedgerId, 'manual', NOW(),NOW(),
                 false, false, 'misc', NOW());",
             new { Id = headerId, LedgerId = ledgerId });
 
@@ -417,9 +417,9 @@ public sealed class InvestmentRepositoryTests
         foreach (var oldAction in new[] { "interest", "misc_income", "misc_expense" })
         {
             var ex = await Assert.ThrowsAsync<Npgsql.PostgresException>(() => conn.ExecuteAsync(@"
-                INSERT INTO txn_headers (id, ledger_id, origin, posted_at,
+                INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
                     is_pending, is_hidden, action, created_at)
-                VALUES (@Id, @LedgerId, 'manual', NOW(),
+                VALUES (@Id, @LedgerId, 'manual', NOW(),NOW(),
                     false, false, @Action, NOW());",
                 new { Id = Guid.NewGuid(), LedgerId = TestLedger.Id, Action = oldAction }));
             Assert.Equal("23514", ex.SqlState);
@@ -437,9 +437,9 @@ public sealed class InvestmentRepositoryTests
         foreach (var newAction in new[] { "buyx", "sellx", "divx", "misc" })
         {
             await conn.ExecuteAsync(@"
-                INSERT INTO txn_headers (id, ledger_id, origin, posted_at,
+                INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
                     is_pending, is_hidden, action, created_at)
-                VALUES (@Id, @LedgerId, 'manual', NOW(),
+                VALUES (@Id, @LedgerId, 'manual', NOW(),NOW(),
                     false, false, @Action, NOW());",
                 new { Id = Guid.NewGuid(), LedgerId = TestLedger.Id, Action = newAction });
         }
@@ -807,9 +807,9 @@ public sealed class InvestmentRepositoryTests
         await ResetAsync(conn);
 
         var ex = await Assert.ThrowsAsync<PostgresException>(() => conn.ExecuteAsync(@"
-            INSERT INTO txn_headers (id, ledger_id, origin, posted_at,
+            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
                 is_pending, is_hidden, action, created_at)
-            VALUES (@Id, @LedgerId, 'manual', NOW(),
+            VALUES (@Id, @LedgerId, 'manual', NOW(),NOW(),
                 false, false, 'split', NOW());",
             new { Id = Guid.NewGuid(), LedgerId = TestLedger.Id }));
         Assert.Equal("23514", ex.SqlState);    // check_violation
@@ -910,9 +910,9 @@ public sealed class InvestmentRepositoryTests
         var action = quantity > 0 ? "buy" : "sell";
 
         await conn.ExecuteAsync(@"
-            INSERT INTO txn_headers (id, ledger_id, origin, posted_at,
+            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
                 is_pending, is_hidden, action, created_at)
-            VALUES (@Id, @LedgerId, 'manual', @PostedAt,
+            VALUES (@Id, @LedgerId, 'manual', @PostedAt,@PostedAt,
                 false, false, @Action, @PostedAt);",
             new { Id = headerId, LedgerId = ledgerId, PostedAt = posted, Action = action });
 
@@ -998,9 +998,9 @@ public sealed class InvestmentRepositoryTests
         var cashAmount = -holdingsAmount;
 
         await conn.ExecuteAsync(@"
-            INSERT INTO txn_headers (id, ledger_id, origin, posted_at,
+            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
                 is_pending, is_hidden, action, created_at)
-            VALUES (@Id, @LedgerId, 'manual', @PostedAt,
+            VALUES (@Id, @LedgerId, 'manual', @PostedAt,@PostedAt,
                 false, false, 'buy', @PostedAt);",
             new { Id = headerId, LedgerId = ledgerId, PostedAt = posted });
 

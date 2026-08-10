@@ -84,7 +84,9 @@ public static class ReminderMapper
             Payee:               NullIfEmpty(reminder.Description) ?? NullIfEmpty(txn.Description),
             Memo:                NullIfEmpty(reminder.Memo) ?? NullIfEmpty(txn.Memo),
             PostedAt:            postedAt,
-            TransactedAt:        null,
+            // NOT NULL since mig 189: reminders have no MD `td`, so the posted
+            // date stands in for "no distinct tax date".
+            TransactedAt:        postedAt,
             Status:              "uncleared",
             CheckNumber:         NullIfEmpty(txn.CheckNumber),
             IsPending:           false,

@@ -17,6 +17,7 @@ import {
 import { errorMessage } from '@/lib/errorMessage';
 import { usernameProblem } from '@/lib/username';
 import { RecoveryCodes } from '@/components/RecoveryCodes';
+import { SetupMasterKey } from '@/components/SetupMasterKey';
 import { Button } from '@/components/ui/Button';
 import { FieldLabel } from '@/components/ui/FieldLabel';
 import { Input } from '@/components/ui/Input';
@@ -152,8 +153,13 @@ function SetupChooser({ token }: { token: string }) {
                             <span className="block text-sm font-medium text-text">
                                 Set up a new install
                             </span>
+                            {/* No ledger here: ADR-0088 took ledger creation out of setup
+                                ("zero ledgers is a supported landing"), leaving a Demo
+                                ledger as an opt-in box on the form. The old copy still
+                                promised "the first user + ledger", which is a promise the
+                                flow stopped keeping. */}
                             <span className="block text-[0.6875rem] text-text-muted">
-                                Create the first user + ledger and register a passkey.
+                                Create the first user and register a passkey.
                             </span>
                         </button>
 
@@ -200,6 +206,9 @@ function SetupForm({ token, onBack }: SetupFormProps) {
 
     const [ceremonyStarted, setCeremonyStarted] = useState(false);
     const [result, setResult] = useState<SetupCompleteResponse | null>(null);
+    /** Advances the completion panel from the recovery codes to the master key
+     *  (ADR-0092 D2). Two secrets, shown one at a time. */
+    const [savedRecoveryCodes, setSavedRecoveryCodes] = useState(false);
 
     const setupMutation = useMutation({
         mutationFn: performSetup,
@@ -280,10 +289,22 @@ function SetupForm({ token, onBack }: SetupFormProps) {
                                 )}
                             </p>
                         </header>
-                        <RecoveryCodes
-                            codes={result.recoveryCodes}
-                            onAcknowledge={() => navigate({ to: '/' })}
-                        />
+                        {/* Two secrets to save, in order of severity (ADR-0092 D2):
+                            recovery codes first — one-time, and the only way back in
+                            without the authenticator — then the master key, which is
+                            re-viewable later and costs less to lose. Chained rather
+                            than shown together so neither competes for attention. */}
+                        {savedRecoveryCodes ? (
+                            <SetupMasterKey
+                                keyBase64={result.masterKeyBase64}
+                                onAcknowledge={() => navigate({ to: '/' })}
+                            />
+                        ) : (
+                            <RecoveryCodes
+                                codes={result.recoveryCodes}
+                                onAcknowledge={() => setSavedRecoveryCodes(true)}
+                            />
+                        )}
                     </PanelBody>
                 </Panel>
             </main>

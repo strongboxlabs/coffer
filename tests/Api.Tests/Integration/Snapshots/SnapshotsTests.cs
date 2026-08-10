@@ -334,7 +334,7 @@ public sealed class SnapshotsTests
             db.TxnHeaders.Add(new TxnHeaderRow
             {
                 Id = templateId, LedgerId = ledger.LedgerId, Origin = "manual",
-                Payee = "Rent", PostedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+                Payee = "Rent", PostedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),
                 IsRecurringTemplate = true,
             });
             db.RecurringTransactions.Add(new RecurringTransactionRow
@@ -347,7 +347,7 @@ public sealed class SnapshotsTests
             db.TxnHeaders.Add(new TxnHeaderRow
             {
                 Id = occurrenceId, LedgerId = ledger.LedgerId, Origin = "manual",
-                Payee = "Rent", PostedAt = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc),
+                Payee = "Rent", PostedAt = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc),
                 IsRecurringTemplate = false, RecurringTransactionId = seriesId,
             });
             await db.SaveChangesAsync();

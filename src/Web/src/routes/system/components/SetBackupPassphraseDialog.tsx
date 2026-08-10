@@ -11,11 +11,16 @@ import { Modal } from '@/components/ui/Modal';
 const MIN_LENGTH = 8;
 
 /**
- * Set / rotate the backup passphrase (ADR-0060). Two fields (passphrase +
- * confirm) with a prominent unrecoverable-secret warning. The server seals it
- * under the master KEK; the cleartext is never stored. Rotating affects FUTURE
- * backups only — existing artifacts still need the previous passphrase, which
- * the dialog calls out.
+ * Set / rotate the backup passphrase (ADR-0060). Two fields (passphrase + confirm)
+ * with a prominent warning. The server seals it under the master KEK; the cleartext
+ * is never stored. Rotating affects FUTURE backups only — existing artifacts still
+ * need the previous passphrase, which the dialog calls out.
+ *
+ * The warning used to say the passphrase "cannot be recovered". That was never quite
+ * true — the server unseals it on every scheduled backup — and since ADR-0092 D7 it
+ * is plainly false: an admin can look it up behind a passkey prompt. The copy now
+ * draws the line where it actually falls, which is losing the *server*, because a
+ * warning an operator can catch out is one they stop believing.
  */
 export function SetBackupPassphraseDialog({
     isRotate,
@@ -60,9 +65,10 @@ export function SetBackupPassphraseDialog({
                         role="note"
                         className="rounded border border-state-warning/40 bg-state-warning-soft px-3 py-2 text-xs text-text"
                     >
-                        This passphrase encrypts every backup. It <strong>cannot be
-                        recovered</strong> — without it, your backups are unreadable. Store
-                        it somewhere safe.
+                        This passphrase encrypts every backup — without it, your backups
+                        are unreadable. While this install is running you can look it up
+                        again under System → Backups, but a server you've <strong>lost</strong>
+                        can't tell you anything. Store it somewhere separate.
                         {isRotate ? (
                             <span className="mt-1 block">
                                 Changing it affects <strong>future</strong> backups only;

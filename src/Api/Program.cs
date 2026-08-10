@@ -33,6 +33,15 @@ var builder = WebApplication.CreateBuilder(args);
 
 // -- configuration -----------------------------------------------------------
 builder.Configuration.AddEnvironmentVariables(prefix: "COFFER_");
+
+// Role passwords come from files, not the environment (same reasoning as the
+// master key, ADR-0092 D1: an env var is readable via `docker inspect`,
+// /proc/<pid>/environ and crash dumps). This rewrites the connection strings in
+// configuration BEFORE anything binds them, so all dozen-odd consumers across
+// the API, the backup service and the importer see a finished string. Throws on
+// a configured-but-unreadable file rather than starting up passwordless.
+var dbPasswordOutcomes = DbPasswordResolver.ApplyTo(builder.Configuration);
+
 builder.Services
     .AddOptions<ApiOptions>()
     .Bind(builder.Configuration.GetSection(ApiOptions.SectionName))
@@ -266,6 +275,8 @@ builder.Services.AddSingleton(sp =>
 builder.Services.AddScoped<Coffer.Api.Backup.BackupManager>();
 // "Never delete" pins (ADR-0062 ④b+c) — excluded from retention.
 builder.Services.AddScoped<Coffer.Api.Db.Repositories.BackupPinsRepository>();
+// Deployment-level admin audit (ADR-0092 D2) — service-role only, append-only.
+builder.Services.AddScoped<Coffer.Api.Db.Repositories.AdminAuditRepository>();
 // Admin-editable backup retention (ADR-0074) — the single source of truth for
 // local pruning + the Google Drive mirror.
 builder.Services.AddScoped<Coffer.Api.Db.Repositories.BackupSettingsRepository>();
@@ -289,17 +300,95 @@ builder.Services.AddScoped<Coffer.Api.Backup.IBackupDestination>(
     sp => sp.GetRequiredService<Coffer.Api.Backup.Drive.GoogleDriveBackupDestination>());
 
 builder.Services.AddScoped<ChallengeStore>();
+// Step-up gate for deployment-secret disclosures (ADR-0092 D2/D7). Shared by the
+// master-KEK and backup-passphrase reveals so the check can't drift between them.
+builder.Services.AddScoped<Coffer.Api.Auth.Webauthn.FreshAssertionGate>();
 
-// Master KEK (ADR-0026): load once at startup from
-// COFFER_MASTER_KEK_BASE64. Fail-fast on missing / malformed / wrong
-// size — the API refuses to serve rather than silently fall through
-// to a default. Registered as a singleton because the bytes never
-// change at runtime; per-ledger LEK ops go through LedgerKeyService
-// (scoped, since it's pulled into request-scoped repositories).
-builder.Services.AddSingleton(MasterKeyLoader.LoadFromEnvironmentOrThrow());
+// Master KEK (ADR-0026, sourced per ADR-0092 D1): resolved once at startup from
+// the key file at Api:MasterKey:Path, or migrated in from the deprecated
+// COFFER_MASTER_KEK_BASE64 env var (ADR-0092 D6). Fail-fast on missing /
+// malformed / wrong size — the API refuses to serve rather than silently fall
+// through to a default. Registered as a singleton because the bytes never change
+// at runtime; per-ledger LEK ops go through LedgerKeyService (scoped, since it's
+// pulled into request-scoped repositories).
+//
+// The store is registered too: the rotation swap (ADR-0092 D4) and the restore
+// adopt path (D5) write through it, and the setup ceremony (D2) creates the
+// initial key with it.
+var masterKeyStore = new MasterKeyStore(apiOptions.MasterKey.Path);
+builder.Services.AddSingleton(masterKeyStore);
+MasterKeyLoader.KeySource masterKeySource;
+var masterKeyEnvIgnored = false;
+var masterKeyWasMinted = false;
+{
+    var resolution = MasterKeyLoader.Resolve(masterKeyStore);
+    var resolvedKey = resolution.Key;
+    masterKeySource = resolution.Source;
+    masterKeyEnvIgnored = resolution.EnvironmentIgnored;
+
+    if (resolvedKey is null)
+    {
+        // ADR-0092 D3 — no key configured. Legal on a genuinely virgin install
+        // (nothing to strand, so mint one and let the setup ceremony show it);
+        // an operator error otherwise, because minting would orphan the wrapped
+        // set. `--adopt-new-kek` is the deliberate override: the operator has
+        // decided to abandon it. The probe fails CLOSED, so an unreachable
+        // database refuses rather than being mistaken for virgin.
+        Exception? probeFailure = null;
+        var adoptNew = args.Contains("--adopt-new-kek");
+        var hasWrapped = WrappedMaterialProbe.Exists(
+            apiOptions.ServiceConnectionString, ex => probeFailure = ex);
+
+        if (hasWrapped && !adoptNew)
+            throw new InvalidOperationException(
+                $"No master KEK found, and this database already holds KEK-wrapped material"
+                + $"{(probeFailure is null ? "" : $" (could not verify: {probeFailure.Message})")}. "
+                + $"Minting a new key would orphan it. Put the install's existing base64 key at "
+                + $"'{masterKeyStore.Path}' (configure the location with Api:MasterKey:Path), or "
+                + $"re-run with --adopt-new-kek to mint a fresh key and abandon the wrapped "
+                + $"secrets — the SimpleFIN feed tokens, the stored backup passphrase, and the "
+                + $"Google Drive token, all of which can be re-established. "
+                + $"See docs/decisions/0092-kek-lifecycle-in-the-ui.md.");
+
+        var minted = Convert.ToBase64String(
+            System.Security.Cryptography.RandomNumberGenerator.GetBytes(32));
+
+        // Write the id INTO the file, so it is self-describing exactly like the one the
+        // D6 migration and D4 rotation produce. Without it the id silently falls back
+        // to COFFER_MASTER_KEK_ID, which is how `--adopt-new-kek` ended up labelling a
+        // brand-new key with the same id the orphaned rows still carry — one label
+        // naming two different keys, which is misleading precisely when someone is
+        // reading it during an incident.
+        //
+        // On adopt-new-kek the id is bumped for that reason. It stays a best-effort
+        // distinction, not a guarantee: the id is advisory, only rotation reads it, and
+        // whether a blob actually opens is decided by trial-decrypt. Reading the
+        // database's existing ids to guarantee non-collision would be real machinery
+        // bought for a label.
+        var mintedId = adoptNew
+            ? MasterKeyLoader.NextKekId(MasterKeyLoader.ResolveId())
+            : MasterKeyLoader.ResolveId();
+        masterKeyStore.Write(minted, mintedId);
+        resolvedKey = MasterKeyLoader.LoadFromValueOrThrow(
+            minted, mintedId, masterKeyStore.Path);
+        masterKeyWasMinted = true;
+    }
+
+    builder.Services.AddSingleton(resolvedKey);
+}
 builder.Services.AddScoped<LedgerKeyService>();
-// Master-KEK rotation (ADR-0026 §rotation) — operator CLI `coffer-api rotate-kek`.
+// Master-KEK rotation (ADR-0026 §rotation), driven from the admin UI (ADR-0092 D4).
+// The `rotate-kek` CLI it replaced is gone: rotation is routine hygiene rather than
+// disaster recovery, so an operator who can't sign in to reach the UI needs recovery
+// codes, not a rotation. (`restore` stays a CLI command because it genuinely can't be
+// a UI one — it skips migrations, so it works on a schema too broken to serve.)
 builder.Services.AddScoped<KekRotationService>();
+builder.Services.AddScoped<IKekRotationService>(sp => sp.GetRequiredService<KekRotationService>());
+// Rotation ordering: the key-file swap sequenced against the re-wrap (ADR-0092 D4).
+builder.Services.AddScoped<MasterKeyRotationCoordinator>();
+// Post-restore reconciliation (ADR-0092 D5) — runs after every restore so no
+// ciphertext this install can't open survives it.
+builder.Services.AddScoped<KekReconciliationService>();
 
 // SimpleFIN HTTP client (Phase 5 slice 1). Typed via the standard
 // IHttpClientFactory pattern so connection pooling + DNS refresh
@@ -616,6 +705,68 @@ builder.Services.AddRateLimiter(options =>
 
 var app = builder.Build();
 
+// -- master-KEK env-var deprecation (ADR-0092 D6). The key was read from
+// COFFER_MASTER_KEK_BASE64 and written through to the key file, so this boot and
+// every later one work either way. Say so once, loudly enough to act on: the env
+// var is removed a release after this one. Logged here rather than at resolution
+// time because the logging pipeline doesn't exist until the host is built.
+// -- the env var is set but the key file won (ADR-0092 D1). Loud, because the
+// operator plainly believes that variable is doing something: they may have just
+// edited it expecting a key change, or — worse — be looking at a stale value left
+// over from before a rotation. Silence here is what made the original env-first
+// precedence dangerous.
+if (masterKeyEnvIgnored)
+    app.Logger.LogWarning(
+        "{EnvVar} is set but does NOT match the key file at {Path}, and was IGNORED — the file "
+        + "is the source of truth (ADR-0092). If you rotated the key from the UI, the variable is "
+        + "stale: remove it from your .env. If you meant to change the key, write it to the file "
+        + "instead. Leaving a mismatched value here changes nothing and only invites confusion.",
+        MasterKeyLoader.EnvVarName, masterKeyStore.Path);
+
+if (masterKeySource == MasterKeyLoader.KeySource.MigratedFromEnvironment)
+    app.Logger.LogWarning(
+        "Master KEK was read from the deprecated {EnvVar} environment variable and copied to {Path} "
+        + "(ADR-0092). Remove {EnvVar} from your .env — the key file is now the source of truth, and "
+        + "the environment variable stops being read in a future release.",
+        MasterKeyLoader.EnvVarName, masterKeyStore.Path, MasterKeyLoader.EnvVarName);
+
+// -- where the DB role passwords came from. Worth stating for the same reason as
+// the key's source: "which credential is this process actually using" is the
+// first question when a connection is refused, and an install mid-transition has
+// a password in two places.
+foreach (var outcome in dbPasswordOutcomes)
+{
+    if (outcome.InlinePasswordIgnored)
+        app.Logger.LogWarning(
+            "{Role}'s password came from its password file, and the Password= in its connection "
+            + "string was IGNORED. Remove it — the file is the source of truth, and leaving a second "
+            + "copy in the environment defeats the point of moving the secret out of it.",
+            outcome.Role);
+    else if (outcome.FromFile)
+        app.Logger.LogInformation("{Role} authenticates with a password read from its password file.", outcome.Role);
+    else
+        app.Logger.LogWarning(
+            "{Role}'s password is embedded in its connection string, so it is present in this "
+            + "process's environment — readable via `docker inspect`, /proc/<pid>/environ and crash "
+            + "dumps. Move it to a file and point {Key} at it (see scripts/migrate-db-secrets.sh).",
+            outcome.Role,
+            outcome.Role == "coffer_app"
+                ? DbPasswordResolver.AppPasswordFileKey
+                : DbPasswordResolver.ServicePasswordFileKey);
+}
+
+// -- a freshly minted key (ADR-0092 D3). Said at Warning, not Information: on a
+// virgin install this is the moment the key that wraps everything came into
+// existence, and the operator has not seen it yet — the setup ceremony (D2) shows
+// it. If they reached here with --adopt-new-kek instead, the previously wrapped
+// secrets are now unreadable and need re-establishing.
+if (masterKeyWasMinted)
+    app.Logger.LogWarning(
+        "A new master KEK was generated at {Path}. Back it up — it is shown once during setup, "
+        + "and it is what carries sealed secrets (feed tokens, the stored backup passphrase, the "
+        + "Google Drive token) to another install. Your ledger data and passkeys do not depend on it.",
+        masterKeyStore.Path);
+
 // -- bootstrap restore (ADR-0061): if the setup UI staged a backup, apply it
 // BEFORE migrating/serving. RestoreAsync(clean: true) wipes the schema to empty
 // (dropping only the service-role-owned objects; the install-managed extensions
@@ -628,6 +779,123 @@ var app = builder.Build();
 // test fixtures share one database, so a staging marker leaked by a test must
 // never trigger a clean restore (it would DROP the shared schema) at the next
 // WebApplicationFactory boot.
+// -- adopt the source install's KEK (ADR-0092 D4), BEFORE the restore is applied.
+//
+// Ordering is the whole design here. The MasterKey singleton was resolved during
+// DI registration, so this process holds the LOCAL key; applying the restore now
+// would leave D5's reconciliation running under the wrong key and clearing secrets
+// the operator explicitly supplied the key for. So: adopt the key, restart, and let
+// the NEXT boot — whose MasterKey is the adopted one — apply the still-pending
+// restore and reconcile against it.
+//
+// If the supplied key turns out to be wrong (only possible for a v1 archive, which
+// carries no fingerprint for the upload to check), reconciliation on that boot
+// clears what won't open — the same outcome as not supplying a key at all.
+if (!app.Configuration.GetValue<bool>("Migrations:Skip")
+    && BootstrapRestoreStaging.IsPending()
+    && BootstrapRestoreStaging.HasSourceKey())
+{
+    var adoptLogger = app.Services
+        .GetRequiredService<ILoggerFactory>().CreateLogger("Coffer.Api.BootstrapRestore");
+    var sourceKey = BootstrapRestoreStaging.ReadSourceKey()!;
+
+    // The key file may not be writable — the documented read-only injection case
+    // (/run/secrets/…, a projected Kubernetes Secret). Rotation guards this; adoption
+    // must too, and more carefully: a throw here happens BEFORE ClearSourceKey, so the
+    // staged key survives and the next boot tries again — a permanent crash loop that
+    // takes the install down rather than just refusing one operation. Clear the
+    // staging and let the restore proceed WITHOUT adopting: D5 reconciliation then
+    // does the honest thing and reports what it had to abandon.
+    string? archived = null;
+    var adopted = false;
+    try
+    {
+        archived = masterKeyStore.Archive($"{DateTime.UtcNow:yyyyMMddTHHmmssZ}");
+        // NOT the source install's id — we don't have it. The archive carries the key
+        // only, and the operator pastes just that. So the local id is kept, which means
+        // the restored rows' lek_kek_id values (the source's) and this file's id can
+        // disagree. Harmless: the id is advisory, only rotation reads it, and rotation
+        // re-wraps every row regardless of what it says.
+        masterKeyStore.Write(sourceKey, MasterKeyLoader.ResolveId());
+        adopted = true;
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+    {
+        if (archived is not null)
+            try { masterKeyStore.RestoreFromArchive(archived); }
+            catch (Exception restoreEx) when (restoreEx is IOException or UnauthorizedAccessException)
+            {
+                adoptLogger.LogError(restoreEx,
+                    "Could not put the previous key file back after a failed adoption. It is at "
+                    + "{Archive}; restore it to {Path} by hand.", archived, masterKeyStore.Path);
+            }
+        archived = null;
+        adoptLogger.LogError(ex,
+            "Could not adopt the source install's master KEK: the key file at {Path} is not "
+            + "writable (an injected read-only secret?). Continuing WITHOUT it — the restore will "
+            + "apply and reconciliation will clear the secrets that key would have preserved "
+            + "(feeds, backup passphrase, Drive). Put the key in place where that secret is "
+            + "managed and re-upload if you need them carried over.",
+            masterKeyStore.Path);
+    }
+
+    // Shred the staged copy either way — it now lives in the key file, or it never
+    // will, and a leftover makes the next boot retry the adoption forever.
+    BootstrapRestoreStaging.ClearSourceKey();
+
+    if (!adopted)
+        // Nothing was adopted, so there is no new key to load and no reason to bounce.
+        // Fall through to the restore block below, which applies under the local key.
+        adoptLogger.LogWarning("Proceeding with the pending restore under the existing key.");
+
+    // Durable audit (ADR-0092 D2). No actor: this runs at boot, not in a request —
+    // the operator who uploaded the restore is recorded by that action, and there is
+    // no authenticated user here to attribute the adoption to.
+    //
+    // Best-effort, UNLIKE the reveal endpoint where the audit write gates the
+    // response. The tradeoff inverts here: this block runs before migrations, so a
+    // missing or unreachable table would throw, and letting that abort the boot
+    // would leave the install unable to start at all. An unaudited adoption is far
+    // better than a boot loop — and the key file has already been written by this
+    // point, so failing here wouldn't even undo anything.
+    if (adopted)
+    {
+        try
+        {
+            await app.Services.GetRequiredService<Coffer.Api.Db.Repositories.AdminAuditRepository>()
+                .AppendAsync(
+                    Coffer.Api.Db.Repositories.AdminAuditActions.MasterKeyAdopted,
+                    actorUserId: null,
+                    detail: $"adopted the source install's key for a pending restore; previous key "
+                          + $"archived at {archived ?? "(none)"}");
+        }
+        catch (Exception ex)
+        {
+            adoptLogger.LogWarning(ex,
+                "Could not record the KEK adoption in admin_audit_events; continuing — the adoption "
+                + "itself already succeeded.");
+        }
+
+        adoptLogger.LogWarning(
+            "Adopted the source install's master KEK for the pending restore; previous key archived "
+            + "at {Archive}. Exiting so the restore applies under the adopted key on the next boot "
+            + "(compose `restart: unless-stopped` brings the container straight back; restart manually "
+            + "if you're running outside Docker).",
+            archived ?? "(none)");
+
+        // Exit rather than serve-then-stop: this process still holds the OLD key in
+        // memory, and there is no reason to answer requests with it. Nothing has been
+        // applied yet — the restore is still staged — so an exit here is safe to repeat.
+        return 0;
+    }
+    // Adoption failed and was reported. The staged key is gone, so the block below
+    // applies the restore under the existing key on THIS boot; no bounce needed.
+}
+
+// Set when a staged restore was applied on this boot, so the post-migration block
+// below knows to reconcile KEK-wrapped material (ADR-0092 D5).
+var restoreApplied = false;
+
 if (!app.Configuration.GetValue<bool>("Migrations:Skip")
     && BootstrapRestoreStaging.IsPending())
 {
@@ -640,7 +908,15 @@ if (!app.Configuration.GetValue<bool>("Migrations:Skip")
         restoreLogger.LogWarning("Bootstrap restore pending — applying the staged backup over the database…");
         await using (var staged = File.OpenRead(BootstrapRestoreStaging.ArchivePath))
             await restoreSvc.RestoreAsync(staged, BootstrapRestoreStaging.ReadPassphrase(), clean: true);
-        restoreLogger.LogWarning("Bootstrap restore complete; serving the restored database.");
+
+        // Reconciliation (ADR-0092 D5) does NOT run here — it runs after migrations,
+        // below. The restored dump can be older than this build, so querying it with
+        // the current EF model raises 42703 undefined_column; that isn't a
+        // BackupException, so it would escape the filter below and kill the boot —
+        // after `finally` had already cleared the staging, meaning the restore was
+        // applied and reconciliation was silently skipped for good.
+        restoreApplied = true;
+        restoreLogger.LogWarning("Bootstrap restore complete.");
     }
     catch (Exception ex) when (ex is BackupException or BackupDecryptException)
     {
@@ -671,6 +947,40 @@ if (!app.Configuration.GetValue<bool>("Migrations:Skip")
         .GetRequiredService<ILoggerFactory>().CreateLogger("Coffer.Api.Migrations");
     var migrationsDirectory = MigrationsDirectoryLocator.Locate(AppContext.BaseDirectory);
     MigrationRunner.Run(apiOpts.ServiceConnectionString, migrationsDirectory, migrationLogger);
+}
+
+// -- post-restore KEK reconciliation (ADR-0092 D5). AFTER migrations, deliberately:
+// a restored dump can predate this build, and reconciliation queries it through the
+// current EF model, so running it against the un-migrated schema raises 42703
+// undefined_column.
+//
+// Unconditional for a restore, not gated on the upload's fingerprint pre-flight: v1
+// artifacts carry no fingerprint, so gating would skip exactly the backups that
+// couldn't be checked.
+//
+// A failure here does NOT abort the boot. The install would otherwise crash-loop into
+// unavailability, and the state left behind is the same one that existed before D5 —
+// bad, but serving. Logged at Error so it's discoverable rather than silent.
+if (restoreApplied)
+{
+    using var scope = app.Services.CreateScope();
+    var reconcileLogger = scope.ServiceProvider
+        .GetRequiredService<ILoggerFactory>().CreateLogger("Coffer.Api.BootstrapRestore");
+    try
+    {
+        await scope.ServiceProvider
+            .GetRequiredService<KekReconciliationService>()
+            .ReconcileAsync();
+        reconcileLogger.LogWarning("Serving the restored database.");
+    }
+    catch (Exception ex)
+    {
+        reconcileLogger.LogError(ex,
+            "Post-restore KEK reconciliation FAILED. The restore itself succeeded and the server "
+            + "is starting, but secrets sealed under a different master KEK may remain in the "
+            + "database and will fail when a feed sync, scheduled backup, or Drive push touches "
+            + "them. Check the master key, then re-run a restore or re-establish those secrets.");
+    }
 }
 
 // CLI subcommand dispatch (no HTTP host). Runs after migrations so the
@@ -768,11 +1078,19 @@ if (args is ["restore", ..])
                 backupFp, Coffer.Api.Backup.KekFingerprint.Compute(mk.KeyBytes))
             && !args.Contains("--allow-kek-mismatch"))
         {
+            // The remedy names the key FILE, not COFFER_MASTER_KEK_BASE64. ADR-0092
+            // D1 made the file the source of truth and the env var is IGNORED
+            // whenever the file exists — which is every install now. The old wording
+            // sent an operator to set a variable, restart, and find the log telling
+            // them it had been ignored: advice that cannot work, offered at the
+            // moment they are least able to afford a wrong turn.
             await Console.Error.WriteLineAsync(
                 "Refusing: this backup was sealed under a DIFFERENT Master KEK. Data + passkeys "
                 + "restore, but the backup passphrase and Google Drive connection will NOT (re-set "
-                + "them afterward). For a clean migration, set COFFER_MASTER_KEK_BASE64 to the "
-                + "source install's value. Re-run with --allow-kek-mismatch to proceed anyway.");
+                + "them afterward). To carry those across too, put the SOURCE install's key in the "
+                + $"key file at {masterKeyStore.Path} before restoring (ADR-0092 D1 — the file is "
+                + "the source of truth; COFFER_MASTER_KEK_BASE64 is ignored while it exists). "
+                + "Re-run with --allow-kek-mismatch to restore without them.");
             return 2;
         }
     }
@@ -786,13 +1104,46 @@ if (args is ["restore", ..])
     try
     {
         await using (var inStream = File.OpenRead(inPath))
-            await svc.RestoreAsync(inStream, passphrase);
+            // clean: true — wipe the schema to empty first, same as the bootstrap
+            // path. This used to be left at the default (false) on the premise that
+            // the CLI only ever meets a fresh, empty database. It doesn't:
+            // `docker compose up` boots the API, which runs DbUp before an operator
+            // can get a shell, so by the time this executes the schema is fully
+            // migrated and may hold real rows. pg_restore into a populated schema
+            // collides on every existing object and MERGES what it can, which
+            // produces a hybrid database — two of each seeded ledger, hundreds of
+            // ignored "already exists" errors, and a non-zero exit only after the
+            // damage is done.
+            //
+            // Safe in the empty case the old premise imagined: the wipe drops only
+            // service-role-owned objects, so on an empty schema it finds nothing.
+            await svc.RestoreAsync(inStream, passphrase, clean: true);
     }
     catch (Exception ex) when (ex is BackupException or BackupDecryptException)
     {
         await Console.Error.WriteLineAsync($"Restore failed: {ex.Message}");
         return 1;
     }
+
+    // ADR-0092 D5 — same invariant as the bootstrap path: leave no ciphertext
+    // this install can't open. Reported on stdout because the CLI operator has
+    // re-establishment work to do and won't be looking at the app's log.
+    var reconciled = await cliScope.ServiceProvider
+        .GetRequiredService<KekReconciliationService>()
+        .ReconcileAsync();
+    if (reconciled.AnythingChanged)
+    {
+        Console.WriteLine(
+            $"KEK reconciliation: {reconciled.LedgersRekeyed} ledger key(s) replaced, "
+            + $"{reconciled.FeedConnectionsNeedingReauth} feed connection(s) need re-auth"
+            + $"{(reconciled.BackupPassphraseCleared ? ", backup passphrase cleared (schedule disabled)" : "")}"
+            + $"{(reconciled.DriveDisconnected ? ", Google Drive disconnected" : "")}.");
+        Console.WriteLine(
+            "Those secrets were sealed under a different master KEK. Your ledger data and "
+            + "passkeys restored intact — re-link feeds, set a new backup passphrase, and "
+            + "reconnect Drive as needed.");
+    }
+
     Console.WriteLine("Restore complete.");
     return 0;
 }
@@ -803,57 +1154,26 @@ if (args is ["restore", ..])
 // those, so there is nothing to clean, and the Demo ledger is now an opt-in
 // checkbox on the setup form that runs the same import as any other.)
 
-// Master-KEK rotation (ADR-0026 §rotation). Re-wraps every LEK + the backup
-// passphrase from the current KEK (COFFER_MASTER_KEK_BASE64) to a new one
-// (COFFER_MASTER_KEK_NEW_BASE64), atomically. No data is re-encrypted. After it
-// succeeds, set COFFER_MASTER_KEK_BASE64 to the new key and restart.
-if (args is ["rotate-kek", ..])
+// -- unknown subcommand. Every dispatch block above returns, so reaching here with
+// a non-flag first argument means it matched nothing — and the default behaviour
+// was to fall through and START THE HTTP SERVER. That is a bad way to retire a
+// command: `rotate-kek` was removed in ADR-0092 D4, and an operator running it from
+// memory or an old runbook silently got a SECOND API instance against the same
+// database — exactly what scripts/dev-up-docker.sh goes out of its way to prevent.
+//
+// Flags are excluded on purpose: `--adopt-new-kek` (D3) and friends are read by the
+// startup path, not dispatched here, so they must still reach the server.
+if (args.Length > 0 && !args[0].StartsWith('-'))
 {
-    Coffer.Api.Crypto.MasterKey oldKey, newKey;
-    try
-    {
-        oldKey = MasterKeyLoader.LoadFromEnvironmentOrThrow();        // current
-        newKey = MasterKeyLoader.LoadNewFromEnvironmentOrThrow();     // COFFER_MASTER_KEK_NEW_BASE64
-    }
-    catch (Exception ex) when (ex is InvalidOperationException or FormatException or ArgumentException)
-    {
-        await Console.Error.WriteLineAsync(
-            $"rotate-kek: {ex.Message}\n" +
-            "Set COFFER_MASTER_KEK_BASE64 (current) and COFFER_MASTER_KEK_NEW_BASE64 (new).");
-        return 2;
-    }
-
-    var dryRun = args.Contains("--dry-run");
-    using var cliScope = app.Services.CreateScope();
-    var rotation = cliScope.ServiceProvider.GetRequiredService<Coffer.Api.Crypto.KekRotationService>();
-    try
-    {
-        var result = await rotation.RotateAsync(oldKey, newKey, dryRun);
-        if (dryRun)
-        {
-            Console.WriteLine(
-                $"Dry-run OK: {result.LedgersRotated} ledger key(s)" +
-                $"{(result.PassphraseRotated ? " + the backup passphrase" : "")}" +
-                $"{(result.DriveTokenRotated ? " + the Drive OAuth token" : "")} open under the current KEK. No changes written.");
-        }
-        else
-        {
-            Console.WriteLine(
-                $"Rotated {result.LedgersRotated} ledger key(s)" +
-                $"{(result.PassphraseRotated ? " + the backup passphrase" : "")}" +
-                $"{(result.DriveTokenRotated ? " + the Drive OAuth token" : "")} to KEK '{newKey.Id}'.");
-            Console.WriteLine(
-                $"Next: set COFFER_MASTER_KEK_BASE64 to the new key" +
-                $" (and COFFER_MASTER_KEK_ID={newKey.Id}), restart, and re-take backups under the new KEK.");
-        }
-    }
-    catch (Coffer.Api.Crypto.KekRotationException ex)
-    {
-        await Console.Error.WriteLineAsync($"rotate-kek aborted (no changes written): {ex.Message}");
-        return 1;
-    }
-    return 0;
+    await Console.Error.WriteLineAsync(
+        $"coffer-api: unknown subcommand '{args[0]}'.\n"
+        + "Available: bootstrap-token, backup, restore.\n"
+        + "`rotate-kek` was removed in ADR-0092 — rotate the master key from the admin UI "
+        + "(System → Encryption).\n"
+        + "Run with no arguments to start the server.");
+    return 2;
 }
+
 
 // First-run bootstrap. When no WebAuthn credentials exist, mint a
 // one-shot token and log its plaintext exactly once — the operator
@@ -998,6 +1318,9 @@ app.MapSecuritiesEndpoints();
 app.MapQuotesEndpoints();
 app.MapAdminBackupsEndpoints();
 app.MapAdminDriveSyncEndpoints();
+// Master-KEK reveal (ADR-0092 D2) — admin-gated, and the reveal itself needs a
+// fresh passkey assertion on top of the session.
+app.MapAdminMasterKeyEndpoints();
 // Always mapped (independent of mcpEnabled): the admin reads/sets the MCP
 // runtime toggle here even while MCP itself is off (D8).
 app.MapAdminSystemSettingsEndpoints();

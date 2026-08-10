@@ -78,7 +78,14 @@ Run it as your **normal user** (not `sudo` — it escalates internally only wher
 
 > A bare IP over `http` isn't offered: passkeys (Coffer's login) require `https` or `http://localhost`. For remote access without a domain, SSH-tunnel to localhost: `ssh -L 8080:localhost:8080 <host>`.
 >
-> **Back up `~/coffer/.env`'s `COFFER_MASTER_KEK_BASE64`** — without it, encrypted data can't be recovered even from a database backup.
+> **Back up the master key** — without it, the secrets sealed under it (bank-feed
+> tokens, the stored backup passphrase, the Drive connection) can't be recovered.
+> `install.sh` seeds it as `~/coffer/.env`'s `COFFER_MASTER_KEK_BASE64`, but the key
+> moves into its own file on first boot and the file is the source of truth from
+> then on (ADR-0092 D1) — so **after any rotation the `.env` value is stale and
+> backing it up is worse than useless**. Read the current key from **System →
+> Encryption → Show key** instead. Your ledger data and passkeys do not depend on
+> it.
 
 ## Reaching it from the internet
 
@@ -117,8 +124,11 @@ Setup details — `COFFER_RP_ID`, extra origins, proxy headers — are in
 
 ## Running it (development)
 
-Prerequisite: Docker Desktop, and a `.env` (`copy .env.example .env`, then set
-`POSTGRES_PASSWORD`, `COFFER_SERVICE_PASSWORD`, `COFFER_APP_PASSWORD`).
+Prerequisites: Docker Desktop, a `.env` (`copy .env.example .env`), and the three
+database passwords as **files** under `secrets/` — they are deliberately not env
+vars (see [.env.example](.env.example) for why, and for a one-liner that generates
+them). `scripts/migrate-db-secrets.sh` moves them across if you already have them
+in `.env`.
 
 **The one dev path — the Docker stack:**
 
@@ -129,8 +139,9 @@ bash scripts/dev-up-docker.sh
 Brings up the full `docker compose` stack — Postgres + the single-container
 API/SPA on `:8080` — the exact deployment artifact (ADR-0059), built from the
 working tree. It carries `postgresql-client-16` so the whole-DB **backups**
-(ADR-0060) run, and it's prod-parity. `.env` supplies the role passwords, master
-KEK, and feature toggles via `${VAR}` substitution. Idempotent: re-run after a
+(ADR-0060) run, and it's prod-parity. `.env` supplies ports, the master KEK and
+feature toggles via `${VAR}` substitution; the role passwords come from
+`secrets/` as compose secrets rather than the environment. Idempotent: re-run after a
 code change to rebuild + restart (layers cached). On first Postgres start the
 role-init script (`db/init/00-init-roles.sh`) mints `coffer_service` +
 `coffer_app`; the schema lands when the API runs DbUp.
@@ -143,8 +154,11 @@ postgres`):
 ```powershell
 # Terminal 1 — API
 $env:ASPNETCORE_ENVIRONMENT      = "Development"
-$env:COFFER_API__ConnectionString = "Host=localhost;Username=coffer_app;Password=$($env:COFFER_APP_PASSWORD);Database=coffer"
-$env:COFFER_API__ServiceConnectionString = "Host=localhost;Username=coffer_service;Password=$($env:COFFER_SERVICE_PASSWORD);Database=coffer"
+# The passwords live in files, so read them from there rather than from .env.
+$app = Get-Content -Raw secrets/coffer_app_password
+$svc = Get-Content -Raw secrets/coffer_service_password
+$env:COFFER_API__ConnectionString = "Host=localhost;Username=coffer_app;Password=$app;Database=coffer"
+$env:COFFER_API__ServiceConnectionString = "Host=localhost;Username=coffer_service;Password=$svc;Database=coffer"
 dotnet run --project src/Api
 
 # Terminal 2 — Web
@@ -179,7 +193,7 @@ bulk work and the two read-only fidelity diagnostics, not as the normal route. I
 connects as `coffer_service` (BYPASSRLS, for cross-ledger access):
 
 ```powershell
-$env:COFFER_DB_CONNECTION = "Host=localhost;Port=5432;Database=coffer;Username=coffer_service;Password=$($env:COFFER_SERVICE_PASSWORD)"
+$env:COFFER_DB_CONNECTION = "Host=localhost;Port=5432;Database=coffer;Username=coffer_service;Password=$(Get-Content -Raw secrets/coffer_service_password)"
 
 # A target ledger is required (ADR-0088 — there is no implicit default).
 # --ledger-name targets an existing ledger or creates it; --ledger-id <UUID>
@@ -213,7 +227,7 @@ explains.
    client discovers the OAuth server, registers itself (DCR), and walks you
    through sign-in (your existing passkey) + a consent screen granting `coffer.read`.
    Behind a reverse proxy (Traefik), forwarded headers make the OAuth URLs resolve
-   to your public domain — set `COFFER_RP_ID` / `COFFER_WEB_ORIGIN_0` to it.
+   to your public domain — set `COFFER_RP_ID` / `COFFER_WEB_URL` to it.
 3. **Use it:** ask for reports — e.g. *"top 10 spending categories by month in my
    main ledger"* or *"how are my investments doing?"* The numbers are computed by
    Coffer (RLS-scoped to you), never the model. Read tools can't change anything;
@@ -266,6 +280,7 @@ Coffer/
 ├── NuGet.config                     Restricts package sources to nuget.org (hermetic builds)
 ├── docker-compose.yml               postgres 16 + single-container api/spa
 ├── .env.example                     Placeholder env values (real .env is gitignored)
+├── secrets/                         DB role passwords as files, not env vars (gitignored)
 ├── CONTRIBUTING.md                  Contribution policy + how to report bugs
 ├── SECURITY.md                      Vulnerability disclosure
 └── README.md                        This file

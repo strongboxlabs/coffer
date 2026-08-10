@@ -19,26 +19,66 @@
 # idempotent (CREATE if missing, ALTER if present) so a manual re-run
 # is safe too.
 #
-# Required env vars (set in `.env`, surfaced via docker-compose):
-#   COFFER_SERVICE_PASSWORD — password for coffer_service
-#   COFFER_APP_PASSWORD     — password for coffer_app
+# Each password comes from a FILE by preference, falling back to an
+# environment variable:
 #
-# Both are required: the script fails with a clear message if either
-# is unset, so a forgotten env var doesn't silently create roles with
-# empty passwords.
+#   COFFER_SERVICE_PASSWORD_FILE / COFFER_SERVICE_PASSWORD
+#   COFFER_APP_PASSWORD_FILE     / COFFER_APP_PASSWORD
+#
+# The `*_FILE` form is the docker/compose secret convention the Postgres
+# image itself uses (POSTGRES_PASSWORD_FILE), and it exists for the same
+# reason ADR-0092 D1 moved the master KEK out of the environment: an env
+# var is readable via `docker inspect`, /proc/<pid>/environ, any child
+# process's environment and crash dumps.
+#
+# File wins when both are present. That direction is deliberate — during
+# the transition an install has the password in both places, and if the
+# env var won, moving the secret into a file would appear to work while
+# changing nothing.
+#
+# One of the two is required per role: the script fails with a clear
+# message if neither is set, so a forgotten variable doesn't silently
+# create roles with empty passwords.
 
 set -euo pipefail
 
-if [[ -z "${COFFER_SERVICE_PASSWORD:-}" ]]; then
-    echo "00-init-roles.sh: COFFER_SERVICE_PASSWORD env var is not set." >&2
-    echo "Set it in .env (see .env.example) before bringing up Postgres." >&2
-    exit 1
-fi
-if [[ -z "${COFFER_APP_PASSWORD:-}" ]]; then
-    echo "00-init-roles.sh: COFFER_APP_PASSWORD env var is not set." >&2
-    echo "Set it in .env (see .env.example) before bringing up Postgres." >&2
-    exit 1
-fi
+# Resolve one password: $1 = role label, $2 = _FILE var name, $3 = plain
+# var name. Echoes the password; exits non-zero with guidance if neither
+# source yields one.
+resolve_password() {
+    local label="$1" file_var="$2" plain_var="$3"
+    local path="${!file_var:-}" value="${!plain_var:-}"
+
+    if [[ -n "$path" ]]; then
+        if [[ ! -r "$path" ]]; then
+            echo "00-init-roles.sh: $file_var points at '$path', which is not readable." >&2
+            exit 1
+        fi
+        # Command substitution strips trailing newlines, which is exactly the
+        # handling wanted: a file written by echo or an editor ends in one and
+        # it is not part of the password. It leaves leading/trailing SPACES
+        # alone, so a password that legitimately has them survives. This is
+        # what the Postgres image's own *_FILE handling does.
+        value="$(cat "$path")"
+        if [[ -z "$value" ]]; then
+            echo "00-init-roles.sh: the $label password file '$path' is empty." >&2
+            exit 1
+        fi
+        printf '%s' "$value"
+        return 0
+    fi
+
+    if [[ -z "$value" ]]; then
+        echo "00-init-roles.sh: neither $file_var nor $plain_var is set." >&2
+        echo "Point $file_var at a secret file (preferred — see docker-compose.yml)," >&2
+        echo "or set $plain_var in .env (see .env.example)." >&2
+        exit 1
+    fi
+    printf '%s' "$value"
+}
+
+COFFER_SERVICE_PASSWORD="$(resolve_password coffer_service COFFER_SERVICE_PASSWORD_FILE COFFER_SERVICE_PASSWORD)"
+COFFER_APP_PASSWORD="$(resolve_password coffer_app COFFER_APP_PASSWORD_FILE COFFER_APP_PASSWORD)"
 
 # Postgres dollar-quoted string literals (PG §4.1.2.4) are the
 # cleanest way to inject a password that may contain single quotes or

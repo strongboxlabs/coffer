@@ -141,7 +141,7 @@ public static class StressLedger
                 AND name LIKE 'stress-cat-%';
 
             -- ----- Bank activity: two balanced legs per header ------------------
-            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, payee)
+            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at, payee)
             SELECT ('20000000-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
                    p_ledger_id, 'manual',
                    v_base + (i * interval '1 hour'),
@@ -182,7 +182,7 @@ public static class StressLedger
 
             -- ----- Buys: cash out of the brokerage, shares into holdings -------
             -- Header id encodes (security, buy) so ids stay derived, not random.
-            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, payee, action)
+            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at, payee, action)
             -- Buys must ALL land before the sells below: the FIFO walk only offers
             -- a lot whose header is on or before the disposal date, so buys dated
             -- after a sell cannot fund it. Spacing these 90 days apart put most
@@ -234,7 +234,7 @@ public static class StressLedger
 
             -- ----- Sells: disposals, so the FIFO walk has lots to consume -------
             -- Dated after every buy so lot availability is never the constraint.
-            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, payee, action)
+            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at, payee, action)
             SELECT ('50000000-0000-4000-8000-' || lpad(to_hex(s * 1000 + k), 12, '0'))::uuid,
                    p_ledger_id, 'manual',
                    v_base + interval '20 years' + ((s * 7 + k) * interval '1 day'),

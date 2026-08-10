@@ -86,10 +86,38 @@ describe('SystemSettingsPage', () => {
         expect(screen.getAllByText(/retention/i).length).toBeGreaterThan(0);
     });
 
+    it('gives the master key its own Encryption tab, not a card under Backups', async () => {
+        // ADR-0092: the key wraps bank-feed tokens, the backup passphrase AND the
+        // Drive connection, so filing it under one of the three made it a hunt.
+        vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(apiModule, 'fetchBackupSchedule').mockResolvedValue(SCHEDULE_OFF);
+        vi.spyOn(apiModule, 'fetchMasterKeyStatus').mockResolvedValue({
+            kekId: 'v1', path: '/app/data/master.key', fingerprint: 'ABCD',
+        });
+
+        renderSystem(true);
+        const user = userEvent.setup();
+
+        // Not on the Backups tab.
+        await user.click(await screen.findByRole('tab', { name: /backups/i }));
+        expect(await screen.findByText('Backup passphrase')).toBeInTheDocument();
+        expect(screen.queryByRole('heading', { name: /^master key$/i })).not.toBeInTheDocument();
+
+        // On its own tab instead.
+        await user.click(screen.getByRole('tab', { name: /encryption/i }));
+        expect(await screen.findByRole('heading', { name: /^master key$/i })).toBeInTheDocument();
+    });
+
+    it('hides the Encryption tab from a non-admin', () => {
+        renderSystem(false);
+        expect(screen.queryByRole('tab', { name: /encryption/i })).not.toBeInTheDocument();
+    });
+
     it('shows the MCP tab to an admin and renders the toggle', async () => {
         vi.spyOn(apiModule, 'fetchMcpSetting').mockResolvedValue({
             enabled: false, active: false, configForced: false,
             writesEnabled: false, writesActive: false, writesConfigForced: false,
+            publicUrl: 'https://mcp.example.test',
         });
 
         renderSystem(true);

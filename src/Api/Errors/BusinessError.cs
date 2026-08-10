@@ -316,6 +316,15 @@ public static class BusinessError
         // Authenticated-admin restore (ADR-0071 D3/D4).
         public const string BackupRestoreConfirmRequired = "backup-restore-confirm-required";
         public const string BackupKekMismatch            = "backup-kek-mismatch";
+        // Adopt-the-source-key path on restore (ADR-0092 D4).
+        public const string BackupSourceKeyInvalid       = "backup-source-key-invalid";
+
+        // Master-KEK reveal (ADR-0092 D2, admin surface). The reveal requires a
+        // fresh passkey assertion on top of the admin session, so a malformed or
+        // failed ceremony is a distinct code from the login one.
+        public const string MasterKeyAssertionRequired = "master-key-assertion-required";
+        public const string MasterKeyNoCredentials     = "master-key-no-credentials";
+        public const string MasterKeyRotateBlocked    = "master-key-rotate-blocked";
 
         // Google Drive backup sync (ADR-0062, admin surface)
         public const string DriveClientRequired   = "drive-client-required";

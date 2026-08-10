@@ -58,15 +58,23 @@ export function isInvestmentOwnedRow(txn: BankRow): boolean {
 }
 
 /**
- * Returns the short tax-date label to render under the posted date,
- * or `null` when `transactedAt` is missing or falls on the same
- * calendar day as `postedAt`. Same noise-filter MD uses — if the
- * dates match, no second line is shown.
+ * Returns the short tax-date label to render under the posted date, or `null`
+ * when the tax date falls on the same calendar day as `postedAt`.
+ *
+ * Structurally typed rather than tied to BankRow: the investment register renders
+ * the same sub-label, and having it import from `bank/` would be the wrong
+ * dependency direction.
+ *
+ * Since migration 189 `transacted_at` is NOT NULL, so the null branch is
+ * defensive only — kept because the read types still model it as nullable.
  */
-export function taxDateSubLabel(txn: BankRow): string | null {
-    if (txn.transactedAt === null) return null;
-    // UTC-anchored calendar-date strings — same noise filter MD
-    // uses (no sub-label when posted == transacted).
+export function taxDateSubLabel(txn: {
+    postedAt: string;
+    transactedAt?: string | null;
+}): string | null {
+    if (!txn.transactedAt) return null;
+    // UTC-anchored calendar-date strings — same noise filter MD uses (no
+    // sub-label when posted == transacted, which is the common case).
     if (txn.postedAt.slice(0, 10) === txn.transactedAt.slice(0, 10)) return null;
     return formatLedgerDate(txn.transactedAt);
 }

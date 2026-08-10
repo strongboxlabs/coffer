@@ -97,7 +97,9 @@ public sealed class TransactionsRepository
             Memo = memo,
             CheckNumber = checkNumber,
             PostedAt = postedAt,
-            TransactedAt = transactedAt,
+            // NOT NULL since mig 189: a null request value means "no distinct tax
+            // date", which is stored as the posted date.
+            TransactedAt = transactedAt ?? postedAt,
             // Stamped only when the reminder fire path supplies them.
             RecurringTransactionId = recurringTransactionId,
             OccurrenceDate = occurrenceDate,

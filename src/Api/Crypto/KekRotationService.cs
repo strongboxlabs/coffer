@@ -25,7 +25,7 @@ namespace Coffer.Api.Crypto;
 /// a half-rotated DB (some blobs under the old KEK, some under the new) would
 /// be unopenable, so it's all-or-nothing.
 /// </summary>
-public sealed class KekRotationService
+public sealed class KekRotationService : IKekRotationService
 {
     private readonly ServiceDbContextFactory _factory;
     private readonly ILogger<KekRotationService> _logger;
@@ -144,9 +144,13 @@ public sealed class KekRotationService
         }
         catch (CryptographicException ex)
         {
+            // Surfaced verbatim in the admin UI (ADR-0092 D4), so it must not name a
+            // retired env var an operator would then go looking for. The likely cause
+            // is a cross-KEK restore that skipped reconciliation, which D5 handles.
             throw new KekRotationException(
-                $"{what} does not open under the current KEK (id '{oldId}'). " +
-                $"Aborting — is COFFER_MASTER_KEK_BASE64 the key this data was wrapped with?", ex);
+                $"{what} does not open under the current KEK (id '{oldId}'). Aborting — is the "
+                + "master key file the key this data was wrapped with? This usually means a "
+                + "backup from another install was restored without its key.", ex);
         }
     }
 }

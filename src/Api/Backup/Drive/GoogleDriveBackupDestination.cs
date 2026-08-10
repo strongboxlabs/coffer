@@ -96,7 +96,25 @@ public sealed class GoogleDriveBackupDestination : IBackupDestination
     {
         var conn = await _repo.GetConnectionAsync(ct).ConfigureAwait(false)
             ?? throw new DriveOAuthException("Google Drive isn't connected.");
-        var creds = DriveCredentialCodec.Deserialize(_keys.OpenWithMasterKey(conn.OauthCiphertext));
+
+        DriveCredentials creds;
+        try
+        {
+            creds = DriveCredentialCodec.Deserialize(_keys.OpenWithMasterKey(conn.OauthCiphertext));
+        }
+        catch (System.Security.Cryptography.CryptographicException ex)
+        {
+            // The token doesn't open under the current master KEK — a cross-KEK
+            // restore, or a rotation whose new key never reached this process.
+            // Previously this escaped as a raw CryptographicException, unlike the
+            // ingest (IngestOrchestrator) and backup (BackupManager) paths which
+            // both translate it; ADR-0092 D5 closes that gap. Reconciliation
+            // normally clears the blob on restore, so reaching here means the KEK
+            // changed some other way.
+            throw new DriveOAuthException(
+                "The stored Google Drive token could not be opened — has the master KEK changed? "
+                + "Reconnect Google Drive to resume syncing.", ex);
+        }
         return (creds, conn.FolderId);
     }
 

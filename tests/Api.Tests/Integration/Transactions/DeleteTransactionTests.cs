@@ -75,10 +75,10 @@ public sealed class DeleteTransactionTests
         // acceptance — the state that must be cleared on soft-delete (D3).
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             INSERT INTO txn_headers
-                (id, ledger_id, origin, provider_key, external_id, payee, posted_at, needs_review)
+                (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, needs_review)
             VALUES
                 ({headerId}, {ledger.LedgerId}, 'file_import', 'qif',
-                 {externalId}, 'feed-payee', {postedAt}, true);
+                 {externalId}, 'feed-payee', {postedAt},{postedAt}, true);
             INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount)
             VALUES
                 ({fromLegId}, {headerId}, {ledger.LedgerId}, {bankId}, 0, -25.0),

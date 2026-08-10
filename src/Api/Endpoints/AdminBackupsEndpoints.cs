@@ -5,9 +5,12 @@ using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.Logging;
 
 using Coffer.Api.Auth;
+using Coffer.Api.Auth.Webauthn;
 using Coffer.Api.Backup;
+using Coffer.Api.Contracts;
 using Coffer.Api.Crypto;
 using Coffer.Api.Db.Repositories;
+using Coffer.Api.Db.Services;
 using Coffer.Api.Errors;
 using Coffer.Api.Scheduling;
 
@@ -56,6 +59,11 @@ public static class AdminBackupsEndpoints
         // Literal sub-routes before the {id} catch-all (literals win in routing
         // precedence regardless, but declaring them first reads clearly).
         group.MapPut("/passphrase", SetPassphraseAsync);
+        // Reveal the stored passphrase (ADR-0092 D7). POST, not GET, so the secret
+        // never lands in a URL, a referrer, or history — same shape and same step-up
+        // as the master-KEK reveal.
+        group.MapPost("/passphrase/reveal/begin", BeginRevealPassphraseAsync);
+        group.MapPost("/passphrase/reveal", RevealPassphraseAsync);
         group.MapGet("/schedule", GetScheduleAsync);
         group.MapPut("/schedule", PutScheduleAsync);
         group.MapGet("/retention", GetRetentionAsync);
@@ -125,6 +133,70 @@ public static class AdminBackupsEndpoints
         await using (var dest = File.Create(BootstrapRestoreStaging.ArchivePath))
             await file.CopyToAsync(dest, cancellationToken).ConfigureAwait(false);
 
+        // Adopt path (ADR-0092 D4): the operator has the SOURCE install's key and
+        // wants its sealed secrets carried over rather than re-established. Validate
+        // it here — before anything destructive — and stage it for the boot that
+        // adopts it. An empty field means "reconcile instead" (ADR-0092 D5).
+        var sourceKeyRaw = form["sourceMasterKeyBase64"].ToString().Trim();
+        if (sourceKeyRaw.Length > 0)
+        {
+            byte[] sourceKeyBytes;
+            try
+            {
+                sourceKeyBytes = Convert.FromBase64String(sourceKeyRaw);
+            }
+            catch (FormatException)
+            {
+                BootstrapRestoreStaging.Clear();
+                return BusinessError.Problem(BusinessError.Codes.BackupSourceKeyInvalid,
+                    "The source install's master key isn't valid base64. It looks like the output "
+                    + "of `openssl rand -base64 32` — 44 characters ending in '='.");
+            }
+            if (sourceKeyBytes.Length != 32)
+            {
+                BootstrapRestoreStaging.Clear();
+                return BusinessError.Problem(BusinessError.Codes.BackupSourceKeyInvalid,
+                    $"The source install's master key must decode to 32 bytes (got {sourceKeyBytes.Length}).");
+            }
+
+            // Strong check when the archive carries a fingerprint (v2+): the supplied
+            // key must be THE key this backup was sealed under. Catches a
+            // paste-the-wrong-key mistake now rather than after the restore has
+            // replaced everything and the install can't open its own secrets. A v1
+            // archive has no fingerprint to check against, so it proceeds — and if
+            // the key turns out wrong, D5's reconciliation on the post-adopt boot
+            // clears what won't open, which is the same outcome as not supplying one.
+            try
+            {
+                await using var fpStream = File.OpenRead(BootstrapRestoreStaging.ArchivePath);
+                var archiveFingerprint = await BackupCrypto
+                    .ReadKekFingerprintAsync(fpStream, cancellationToken).ConfigureAwait(false);
+                if (archiveFingerprint.Length > 0
+                    && !KekFingerprint.Matches(
+                        archiveFingerprint, KekFingerprint.Compute(sourceKeyBytes)))
+                {
+                    BootstrapRestoreStaging.Clear();
+                    return BusinessError.Problem(BusinessError.Codes.BackupSourceKeyInvalid,
+                        "That key is not the one this backup was sealed under. Check you pasted the "
+                        + "source install's master key — its Encryption tab shows it, or read it from "
+                        + "that install's key file — or leave the field empty to restore without it "
+                        + "(feeds, backup passphrase, and Drive will need re-establishing).");
+                }
+            }
+            catch (BackupDecryptException)
+            {
+                BootstrapRestoreStaging.Clear();
+                return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
+                    "That file isn't a readable Coffer backup.");
+            }
+
+            await BootstrapRestoreStaging.StageSourceKeyAsync(sourceKeyRaw, cancellationToken)
+                .ConfigureAwait(false);
+            // The mismatch acknowledgement below is about restoring WITHOUT the
+            // source key. A verified source key makes it moot.
+            acknowledgeKekMismatch = true;
+        }
+
         // Pre-flight 1 (ADR-0071 D4): KEK fingerprint. A mismatch means the
         // backup's sealed secrets (backup passphrase, Drive token) won't unseal
         // under this install's KEK — a cross-install migration. The data +
@@ -143,10 +215,11 @@ public static class AdminBackupsEndpoints
             {
                 BootstrapRestoreStaging.Clear();
                 return BusinessError.Problem(BusinessError.Codes.BackupKekMismatch,
-                    "This backup was sealed under a different Master KEK. For a clean migration set "
-                    + "COFFER_MASTER_KEK_BASE64 to the source install's value and re-upload; or proceed "
-                    + "anyway — your data and passkeys restore, but you'll need to re-set the backup "
-                    + "passphrase and reconnect Google Drive afterward.");
+                    "This backup was sealed under a different Master KEK. For a clean migration, put "
+                    + "the source install's key file in place (Api:MasterKey:Path) and re-upload; or "
+                    + "proceed anyway — your data and passkeys restore intact, but the secrets sealed "
+                    + "under the old key are cleared afterward: re-link your bank feeds, set a new "
+                    + "backup passphrase, and reconnect Google Drive.");
             }
         }
         catch (BackupDecryptException)
@@ -265,6 +338,76 @@ public static class AdminBackupsEndpoints
         await manager.SetPassphraseAsync(passphrase, currentUser.UserId, cancellationToken)
             .ConfigureAwait(false);
         return Results.NoContent();
+    }
+
+    /// <summary>
+    /// Start the step-up ceremony for a passphrase reveal (ADR-0092 D7).
+    /// </summary>
+    private static async Task<IResult> BeginRevealPassphraseAsync(
+        FreshAssertionGate gate,
+        BackupManager manager,
+        CancellationToken cancellationToken)
+    {
+        // Fail before the ceremony when there is nothing to reveal — otherwise the
+        // operator taps their authenticator only to be told "not configured".
+        if (!await manager.IsPassphraseConfiguredAsync(cancellationToken).ConfigureAwait(false))
+            return BusinessError.Problem(BusinessError.Codes.BackupPassphraseNotSet,
+                "No backup passphrase is set, so there is nothing to show.");
+
+        var begin = await gate
+            .BeginAsync(ChallengeStore.BackupPassphraseRevealFlow, cancellationToken)
+            .ConfigureAwait(false);
+        if (begin.Failure is not null) return begin.Failure;
+
+        return Results.Ok(new MasterKeyContracts.RevealBeginResponse(
+            begin.ChallengeId, begin.Options!));
+    }
+
+    /// <summary>
+    /// Verify the assertion and return the stored backup passphrase (ADR-0092 D7).
+    /// </summary>
+    private static async Task<IResult> RevealPassphraseAsync(
+        MasterKeyContracts.RevealRequest request,
+        HttpContext http,
+        FreshAssertionGate gate,
+        BackupManager manager,
+        ICurrentUserAccessor currentUser,
+        AdminAuditRepository audit,
+        ILoggerFactory loggerFactory,
+        CancellationToken cancellationToken)
+    {
+        var verified = await gate.VerifyAsync(
+            ChallengeStore.BackupPassphraseRevealFlow,
+            request.ChallengeId, request.AssertionResponse, cancellationToken)
+            .ConfigureAwait(false);
+        if (verified.Failure is not null) return verified.Failure;
+
+        string passphrase;
+        try
+        {
+            passphrase = await manager.RevealPassphraseAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (BackupException ex)
+        {
+            // Most likely a cross-KEK restore that left the ciphertext unopenable —
+            // BackupManager already translates that into a readable message.
+            return BusinessError.Problem(BusinessError.Codes.BackupPassphraseNotSet, ex.Message);
+        }
+
+        // Audited BEFORE the secret goes out, same as the master-KEK reveal: an
+        // unaudited disclosure is worse than a failed one.
+        await audit.AppendAsync(
+            AdminAuditActions.BackupPassphraseRevealed, currentUser.UserId,
+            $"credential {verified.Credential!.Id}", cancellationToken).ConfigureAwait(false);
+
+        loggerFactory.CreateLogger("Coffer.Api.Backup").LogWarning(
+            "Backup passphrase revealed to admin {UserId} after a fresh passkey assertion.",
+            currentUser.UserId);
+
+        http.Response.Headers.CacheControl = "no-store, no-cache, must-revalidate";
+        http.Response.Headers.Pragma = "no-cache";
+
+        return Results.Ok(new BackupContracts.RevealPassphraseResponse(passphrase));
     }
 
     private static async Task<IResult> GetScheduleAsync(

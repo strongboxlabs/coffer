@@ -63,9 +63,9 @@ public sealed class ImportValidatorTests
 
         await conn.ExecuteAsync("ALTER TABLE txn_headers DROP CONSTRAINT txn_headers_action_check;");
         await conn.ExecuteAsync(@"
-            INSERT INTO txn_headers (id, ledger_id, origin, posted_at,
+            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
                 is_pending, is_hidden, action, created_at)
-            VALUES (@Id, @LedgerId, 'manual', NOW(),
+            VALUES (@Id, @LedgerId, 'manual', NOW(),NOW(),
                 false, false, 'misc_income', NOW());",
             new { Id = Guid.NewGuid(), LedgerId = ledgerId });
 
@@ -84,9 +84,9 @@ public sealed class ImportValidatorTests
 
         // Header with no legs.
         await conn.ExecuteAsync(@"
-            INSERT INTO txn_headers (id, ledger_id, origin, posted_at,
+            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
                 is_pending, is_hidden, created_at)
-            VALUES (@Id, @LedgerId, 'manual', NOW(),
+            VALUES (@Id, @LedgerId, 'manual', NOW(),NOW(),
                 false, false, NOW());",
             new { Id = Guid.NewGuid(), LedgerId = ledgerId });
 
@@ -128,9 +128,9 @@ public sealed class ImportValidatorTests
                  "dividend_cash", "dividend_reinvest", "divx", "transfer", "misc" })
         {
             await conn.ExecuteAsync(@"
-                INSERT INTO txn_headers (id, ledger_id, origin, posted_at,
+                INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
                     is_pending, is_hidden, action, created_at)
-                VALUES (@Id, @LedgerId, 'manual', NOW(),
+                VALUES (@Id, @LedgerId, 'manual', NOW(),NOW(),
                     false, false, @Action, NOW());",
                 new { Id = Guid.NewGuid(), LedgerId = ledgerId, Action = action });
         }
@@ -159,9 +159,9 @@ public sealed class ImportValidatorTests
 
         var headerId = Guid.NewGuid();
         await conn.ExecuteAsync(@"
-            INSERT INTO txn_headers (id, ledger_id, origin, posted_at,
+            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
                 is_pending, is_hidden, created_at)
-            VALUES (@Id, @LedgerId, 'manual', NOW(),
+            VALUES (@Id, @LedgerId, 'manual', NOW(),NOW(),
                 false, false, NOW());",
             new { Id = headerId, LedgerId = ledgerId });
         // Two legs sharing posting_index 0; they sum to +100, not zero

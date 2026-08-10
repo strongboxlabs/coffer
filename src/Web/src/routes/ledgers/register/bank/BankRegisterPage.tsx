@@ -1527,6 +1527,10 @@ function RegisterTable({
                             memo: canonical.headerMemo,
                             checkNumber: canonical.checkNumber,
                             postedAt: canonical.postedAt,
+                            // Must be seeded: the editor sends transactedAt on
+                            // every save, so an unseeded field would silently
+                            // clear a tax date the transaction already had.
+                            transactedAt: canonical.transactedAt,
                             balanceAfter: canonical.balanceAfter,
                             // Slice 2c.6b: header-level tags. Per
                             // ADR-0009 tags live on the header so any
@@ -1663,6 +1667,8 @@ function RegisterTable({
                         memo: txn.headerMemo,
                         checkNumber: txn.checkNumber,
                         postedAt: txn.postedAt,
+                        // See the split branch: unseeded means saving wipes it.
+                        transactedAt: txn.transactedAt,
                         balanceAfter: txn.balanceAfter,
                         // Slice 2c.6b: header-level tags.
                         tags: txn.tags,

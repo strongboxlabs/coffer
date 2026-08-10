@@ -311,6 +311,7 @@ describe('SetupPage', () => {
             username: 'alice',
             sessionId: '00000000-0000-0000-0000-000000000020',
             sessionExpiresAt: '2026-06-10T00:00:00Z',
+            masterKeyBase64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
             recoveryCodes: codes,
             ledgerId: '00000000-0000-0000-0000-000000000099',
             ledgerName: 'Demo',
@@ -344,12 +345,58 @@ describe('SetupPage', () => {
         expect(continueButton).toBeEnabled();
     });
 
+    it('shows the master key after the recovery codes, then finishes (ADR-0092 D2)', async () => {
+        // Two secrets, chained rather than shown together. Without this step a
+        // first-time operator would have a key they had never seen, in a server-side
+        // location they had no reason to look at.
+        const masterKey = 'Zm9vYmFyYmF6cXV1eGZvb2JhcmJhenF1dXhmb28xMjM=';
+        vi.spyOn(authModule, 'performSetup').mockResolvedValue({
+            userId: '00000000-0000-0000-0000-000000000010',
+            username: 'alice',
+            sessionId: '00000000-0000-0000-0000-000000000020',
+            sessionExpiresAt: '2026-06-10T00:00:00Z',
+            masterKeyBase64: masterKey,
+            recoveryCodes: ['ABCD-1234'],
+            ledgerId: null,
+            ledgerName: null,
+        });
+
+        await renderSetup();
+
+        const user = userEvent.setup();
+        await user.type(await screen.findByLabelText(/username/i), 'alice');
+        await user.type(screen.getByLabelText(/display name/i), 'Alice');
+        await user.type(screen.getByLabelText(/passkey label/i), 'MacBook');
+        await user.click(screen.getByRole('button', { name: /create account/i }));
+
+        // Recovery codes first — the more severe secret, and the one-time one. The
+        // master key must not be on screen competing for attention yet.
+        expect(await screen.findByText(/save your recovery codes/i)).toBeInTheDocument();
+        expect(screen.queryByText(masterKey)).not.toBeInTheDocument();
+
+        await user.click(screen.getByRole('checkbox'));
+        await user.click(screen.getByRole('button', { name: /continue/i }));
+
+        // Then the master key, gated the same way.
+        expect(await screen.findByText(/save your master key/i)).toBeInTheDocument();
+        expect(screen.getByText(masterKey)).toBeInTheDocument();
+        // Says plainly that it can be seen again — a false "last chance" is the kind
+        // of warning operators learn to ignore.
+        expect(screen.getByText(/see this again later/i)).toBeInTheDocument();
+
+        const finish = screen.getByRole('button', { name: /finish setup/i });
+        expect(finish).toBeDisabled();
+        await user.click(screen.getByRole('checkbox'));
+        expect(finish).toBeEnabled();
+    });
+
     it('sends includeDemo=false when the box is left alone', async () => {
         const setupSpy = vi.spyOn(authModule, 'performSetup').mockResolvedValue({
             userId: '00000000-0000-0000-0000-000000000010',
             username: 'alice',
             sessionId: '00000000-0000-0000-0000-000000000020',
             sessionExpiresAt: '2026-06-10T00:00:00Z',
+            masterKeyBase64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
             recoveryCodes: ['ABCD-1234'],
             ledgerId: null,
             ledgerName: null,
@@ -375,6 +422,7 @@ describe('SetupPage', () => {
             username: 'alice',
             sessionId: '00000000-0000-0000-0000-000000000020',
             sessionExpiresAt: '2026-06-10T00:00:00Z',
+            masterKeyBase64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
             recoveryCodes: ['ABCD-1234'],
             ledgerId: '00000000-0000-0000-0000-000000000099',
             ledgerName: 'Demo',
@@ -401,6 +449,7 @@ describe('SetupPage', () => {
             username: 'alice',
             sessionId: '00000000-0000-0000-0000-000000000020',
             sessionExpiresAt: '2026-06-10T00:00:00Z',
+            masterKeyBase64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
             recoveryCodes: ['ABCD-1234'],
             ledgerId: null,
             ledgerName: null,

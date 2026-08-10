@@ -83,10 +83,15 @@ public sealed class BackupService
     }
 
     /// <param name="clean">When true, wipe the target database to an empty
-    /// schema BEFORE restoring — for the bootstrap-UI restore over an
-    /// already-migrated DB (ADR-0061). The CLI path (fresh install, empty DB)
-    /// leaves it false. See <see cref="WipeServiceOwnedObjectsAsync"/> for why
-    /// this is a targeted object drop rather than <c>pg_restore --clean</c>.</param>
+    /// schema BEFORE restoring — for any restore over an already-migrated DB
+    /// (ADR-0061). Both real callers pass <c>true</c>: the bootstrap-UI restore
+    /// and the <c>restore</c> CLI subcommand. The CLI used to leave it false on
+    /// the premise that it only ever ran against a fresh, empty database, which
+    /// is wrong — the API migrates at startup, so the schema exists before an
+    /// operator can invoke the CLI, and restoring into it produced a merged
+    /// hybrid. Leave it false only when the schema is genuinely, verifiably
+    /// empty. See <see cref="WipeServiceOwnedObjectsAsync"/> for why this is a
+    /// targeted object drop rather than <c>pg_restore --clean</c>.</param>
     public async Task RestoreAsync(
         Stream input, string passphrase, bool clean = false, CancellationToken ct = default)
     {
@@ -263,11 +268,27 @@ public sealed class BackupService
     }
 
     /// <summary>
-    /// Drops every table / view / sequence / non-extension function owned by
-    /// the connecting role in the public schema. An extension-provided function
-    /// is skipped via its pg_depend 'e' dependency; everything else the role
-    /// owns goes with CASCADE. See <see cref="WipeServiceOwnedObjectsAsync"/>.
+    /// Drops every table / materialized view / view / sequence / collation /
+    /// non-extension function owned by the connecting role in the public schema.
+    /// An extension-provided function is skipped via its pg_depend 'e'
+    /// dependency; everything else the role owns goes with CASCADE. See
+    /// <see cref="WipeServiceOwnedObjectsAsync"/>.
     /// </summary>
+    /// <remarks>
+    /// This enumerates by OBJECT CLASS, so a migration that introduces a class
+    /// not listed here reintroduces a real bug: the object survives the wipe,
+    /// pg_restore's CREATE for it fails "already exists", and the restore reports
+    /// failure over a database that is actually fine — or worse, the collision
+    /// masks one that isn't. That is not hypothetical; the collation below was
+    /// missing and broke every cross-install CLI restore.
+    /// <para>
+    /// Two classes are here despite the schema having no instance of one of them:
+    /// materialized views, because <c>pg_views</c> structurally excludes them and
+    /// the omission would be invisible until the first one is added. Prove any
+    /// addition with <c>scripts/backup-restore-roundtrip.sh</c>, which seeds one
+    /// of each class and is the regression guard for exactly this.
+    /// </para>
+    /// </remarks>
     private const string WipeSchemaSql =
         """
         DO $wipe$
@@ -276,6 +297,15 @@ public sealed class BackupService
             FOR cmd IN
                 SELECT format('DROP TABLE IF EXISTS %I.%I CASCADE', schemaname, tablename)
                 FROM pg_tables WHERE schemaname = 'public' AND tableowner = current_user
+            LOOP EXECUTE cmd; END LOOP;
+
+            FOR cmd IN
+                SELECT format('DROP MATERIALIZED VIEW IF EXISTS %I.%I CASCADE', n.nspname, c.relname)
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public'
+                  AND c.relkind = 'm'
+                  AND pg_get_userbyid(c.relowner) = current_user
             LOOP EXECUTE cmd; END LOOP;
 
             FOR cmd IN
@@ -298,6 +328,17 @@ public sealed class BackupService
                   AND NOT EXISTS (
                       SELECT 1 FROM pg_depend d
                       WHERE d.objid = p.oid AND d.deptype = 'e')
+            LOOP EXECUTE cmd; END LOOP;
+
+            -- Collations LAST: the tables whose columns use them have to go
+            -- first, or the DROP is blocked by the dependency. (username_ci is
+            -- the one in this schema.)
+            FOR cmd IN
+                SELECT format('DROP COLLATION IF EXISTS %I.%I CASCADE', n.nspname, c.collname)
+                FROM pg_collation c
+                JOIN pg_namespace n ON n.oid = c.collnamespace
+                WHERE n.nspname = 'public'
+                  AND pg_get_userbyid(c.collowner) = current_user
             LOOP EXECUTE cmd; END LOOP;
         END
         $wipe$;

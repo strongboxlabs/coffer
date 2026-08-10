@@ -246,7 +246,8 @@ public sealed class InvestmentTransactionsRepository
             Memo = request.Memo,
             CheckNumber = request.CheckNumber,
             PostedAt = postedAt,
-            TransactedAt = request.TransactedAt,
+            // NOT NULL since mig 189 — see TransactionsRepository.
+            TransactedAt = request.TransactedAt ?? postedAt,
             Action = action,
             // Adjust-at-post fire stamps the occurrence to its series + slot
             // (null for a normal live create).
@@ -615,7 +616,10 @@ public sealed class InvestmentTransactionsRepository
         existing.Memo         = asCreate.Memo;
         existing.CheckNumber  = asCreate.CheckNumber;
         existing.PostedAt     = asCreate.PostedAt;
-        existing.TransactedAt = asCreate.TransactedAt;
+        // NOT NULL since mig 189: a null request value means "no distinct tax
+        // date", stored as the posted date. This is the in-place UPDATE path — the
+        // one the create-path coalesce above does not cover.
+        existing.TransactedAt = asCreate.TransactedAt ?? asCreate.PostedAt;
         existing.Action       = asCreate.Action;
         // Clear the needs-review flag — a successful investment PATCH
         // IS the user's act of approval. Unlike the bank-shape PATCH

@@ -33,10 +33,34 @@ public static class AdminSystemSettingsEndpoints
         return routes;
     }
 
+    /// <summary>
+    /// The address to show an operator for an MCP client: the configured
+    /// <c>Api:Mcp:PublicUrl</c>, else the origin this request arrived on.
+    /// </summary>
+    /// <remarks>
+    /// The fallback is deliberately last. Deriving it from the request is right
+    /// for a single-host install and wrong for a split one — the admin UI is
+    /// browsed on the web host, so a request-derived answer would hand out the web
+    /// address for a server that answers on its own hostname, and it would look
+    /// plausible while being unusable. Configuring <c>COFFER_MCP_URL</c> is what
+    /// makes it correct; the fallback just avoids showing nothing.
+    /// </remarks>
+    private static string ResolveMcpPublicUrl(ApiOptions options, HttpContext http)
+    {
+        var configured = options.Mcp.PublicUrl;
+        if (!string.IsNullOrWhiteSpace(configured)) return configured.TrimEnd('/');
+
+        var request = http.Request;
+        return request.Host.HasValue
+            ? $"{request.Scheme}://{request.Host}"
+            : string.Empty;
+    }
+
     private static async Task<IResult> GetMcpAsync(
         SystemSettingsRepository settings,
         McpRuntimeState runtime,
         IOptions<ApiOptions> apiOptions,
+        HttpContext http,
         CancellationToken cancellationToken)
     {
         var enabled = await settings
@@ -51,7 +75,8 @@ public static class AdminSystemSettingsEndpoints
             ConfigForced: apiOptions.Value.Mcp.Enabled,
             WritesEnabled: writesEnabled,
             WritesActive: runtime.WritesEnabled,
-            WritesConfigForced: apiOptions.Value.Mcp.WritesEnabled));
+            WritesConfigForced: apiOptions.Value.Mcp.WritesEnabled,
+            PublicUrl: ResolveMcpPublicUrl(apiOptions.Value, http)));
     }
 
     private static async Task<IResult> SetMcpAsync(
@@ -60,6 +85,7 @@ public static class AdminSystemSettingsEndpoints
         ICurrentUserAccessor currentUser,
         McpRuntimeState runtime,
         IOptions<ApiOptions> apiOptions,
+        HttpContext http,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -93,6 +119,7 @@ public static class AdminSystemSettingsEndpoints
             ConfigForced: apiOptions.Value.Mcp.Enabled,
             WritesEnabled: request.WritesEnabled,
             WritesActive: runtime.WritesEnabled,
-            WritesConfigForced: apiOptions.Value.Mcp.WritesEnabled));
+            WritesConfigForced: apiOptions.Value.Mcp.WritesEnabled,
+            PublicUrl: ResolveMcpPublicUrl(apiOptions.Value, http)));
     }
 }

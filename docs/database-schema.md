@@ -1468,7 +1468,7 @@ Per-call audit of MCP **write**-tool invocations (migration 170, ADR-0081 D3; tw
 
 ### `drive_sync`
 
-Deployment-wide singleton holding the Google Drive backup-destination config (migration 142, ADR-0062). One row, `id = 1` (CHECK pins it). Service-role only with the same RLS-deny-all posture as `global_scheduled_jobs` — there's no ledger to scope it to. The OAuth blob is sealed under the master KEK (never plaintext) and re-wrapped by `rotate-kek`. ④a populates connect/disconnect + sync status; the `enabled` toggle drives auto-push. The Drive folder MIRRORS the local backup set (ADR-0074) — migration 160 dropped the former Drive-side retention columns, since there is no separate Drive retention.
+Deployment-wide singleton holding the Google Drive backup-destination config (migration 142, ADR-0062). One row, `id = 1` (CHECK pins it). Service-role only with the same RLS-deny-all posture as `global_scheduled_jobs` — there's no ledger to scope it to. The OAuth blob is sealed under the master KEK (never plaintext) and re-wrapped by a master-KEK rotation (System → Encryption, ADR-0092 D4). ④a populates connect/disconnect + sync status; the `enabled` toggle drives auto-push. The Drive folder MIRRORS the local backup set (ADR-0074) — migration 160 dropped the former Drive-side retention columns, since there is no separate Drive retention.
 
 | Column | Type | Constraints / FK | Notes |
 |---|---|---|---|

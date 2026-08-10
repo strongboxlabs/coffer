@@ -46,6 +46,19 @@ else
     pkill -f 'coffer-api' 2>/dev/null || true
 fi
 
+# Reap leftover one-off containers from `docker compose run` (named
+# coffer-api-run-<hash>). These matter beyond tidiness: they hold the coffer_data
+# volume open, so a later `docker compose down -v` reports "Resource is still in use"
+# and removes only SOME volumes — leaving the key file and bootstrap token alive on
+# what you believe is a wiped install. A "virgin install" test that silently isn't
+# virgin is worse than no test, so clear them before every up.
+stray_runs="$(docker ps -aq --filter 'name=coffer-api-run-' 2>/dev/null || true)"
+if [ -n "$stray_runs" ]; then
+    echo "[dev-up-docker] removing leftover 'docker compose run' containers (they pin the data volume)"
+    # shellcheck disable=SC2086 — deliberate word-splitting over the id list.
+    docker rm -f $stray_runs >/dev/null 2>&1 || true
+fi
+
 # Tag the locally-built image with the CANONICAL source version, not whatever
 # COFFER_IMAGE_TAG happens to sit in .env. In dev we always `docker compose build`
 # from source, and compose names the built image `coffer:${COFFER_IMAGE_TAG}` — so a
@@ -57,8 +70,21 @@ fi
 # the build without touching .env (whose value still drives pull-based prod hosts).
 source_version="$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' "$repo_root/src/Api/Api.csproj" | head -1 | tr -d '[:space:]')"
 if [ -n "$source_version" ]; then
+    # Deliberately NOT written back to .env (see above). But that leaves a trap worth
+    # naming out loud: the override only exists inside THIS script's environment, so a
+    # bare `docker compose run/exec/build` typed afterwards falls back to .env's pinned
+    # tag and silently targets a DIFFERENT image. That cost a real debugging session —
+    # a `compose run` picked up a six-version-old image and made a working fix look
+    # broken. Say so whenever the two disagree.
+    pinned_tag="$(sed -n 's/^COFFER_IMAGE_TAG=//p' "$repo_root/.env" | head -1 | tr -d '[:space:]')"
     export COFFER_IMAGE_TAG="$source_version"
     echo "[dev-up-docker] image tag ← Api.csproj <Version> = $source_version"
+    if [ -n "$pinned_tag" ] && [ "$pinned_tag" != "$source_version" ]; then
+        echo "[dev-up-docker] NOTE: .env pins COFFER_IMAGE_TAG=${pinned_tag}, but this stack runs ${source_version}."
+        echo "[dev-up-docker]       A bare 'docker compose run|exec|build' uses .env's value and would"
+        echo "[dev-up-docker]       target a DIFFERENT image. For one-off commands against this stack:"
+        echo "[dev-up-docker]           COFFER_IMAGE_TAG=${source_version} docker compose run --rm api <args>"
+    fi
 else
     echo "[dev-up-docker] WARNING: could not read <Version> from Api.csproj; using COFFER_IMAGE_TAG from .env" >&2
 fi
@@ -90,9 +116,16 @@ fi
 # startup (no-op when already migrated), so give it room. /readyz is the
 # anonymous readiness probe (process up AND Postgres reachable — ADR-0044); it
 # 200s once the API is serving. (Not /api/meta/version, which is authenticated.)
+# Shell redirection, NOT curl's own `-o /dev/null`. On Git Bash with
+# MSYS_NO_PATHCONV=1 set — which callers do set, to stop in-container paths being
+# rewritten for `docker exec` — curl.exe receives a literal /dev/null it cannot
+# write, and exits 23 (write error) on a request that actually returned 200. The
+# probe then reports a dead API for three minutes while the app has been serving
+# since second two. Letting the shell own the redirect keeps curl's exit code
+# about the HTTP call.
 ready=0
 for _ in $(seq 1 180); do
-    if curl -fsS -o /dev/null --max-time 2 "http://localhost:${port}/readyz" 2>/dev/null; then
+    if curl -fsS --max-time 2 "http://localhost:${port}/readyz" >/dev/null 2>&1; then
         ready=1
         break
     fi
@@ -128,4 +161,6 @@ if [ -n "$setup_url" ]; then
 fi
 echo "  Logs:  docker compose logs -f api"
 echo "  Stop:  docker compose down        (keeps the DB volume)"
-echo "  Wipe:  docker compose down -v     (drops the DB volume too)"
+echo "  Wipe:  docker compose down -v --remove-orphans   (drops the DB + data volumes)"
+echo "         --remove-orphans matters: a leftover 'compose run' container pins the"
+echo "         data volume, and down -v then removes only some of them, silently."

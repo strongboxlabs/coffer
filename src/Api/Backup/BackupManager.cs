@@ -119,6 +119,25 @@ public sealed class BackupManager
 
     /// <summary>Open the sealed passphrase, or throw <see cref="BackupException"/>
     /// when none is set / it can't be unsealed.</summary>
+    /// <summary>
+    /// The stored backup passphrase in cleartext (ADR-0092 D7). Callers MUST gate this
+    /// behind <c>FreshAssertionGate</c> and audit it — it is the secret that decrypts
+    /// every artifact this install has produced.
+    /// </summary>
+    /// <remarks>
+    /// Exists because the alternative was worse. The passphrase is sealed under the
+    /// master KEK and the server reads it on every scheduled backup, so it was always
+    /// recoverable in principle; offering no way meant an operator who forgot it
+    /// accumulated backups that all still succeeded and were all unrestorable, with
+    /// nothing in the product saying so. Revealing it to an admin who can already read
+    /// every ledger in plaintext — and who could mint a fresh backup under a known
+    /// passphrase anyway — costs approximately nothing against that.
+    /// </remarks>
+    /// <exception cref="BackupException">No passphrase set, or it doesn't open under
+    /// the current KEK.</exception>
+    public Task<string> RevealPassphraseAsync(CancellationToken ct = default)
+        => ResolvePassphraseAsync(ct);
+
     private async Task<string> ResolvePassphraseAsync(CancellationToken ct)
     {
         var sealed_ = await _schedules.GetPassphraseCiphertextAsync(GlobalJobTypes.Backup, ct)

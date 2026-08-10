@@ -358,7 +358,7 @@ public sealed class InvestmentTransactionsEndpointsTests
                 Origin = "online_import",
                 ProviderKey = "simplefin",
                 Payee = "YOU BOUGHT ACME INDEX FUND S&P 500 ETF (ETFA) Cash",
-                PostedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc),                IsPending = false,
+                PostedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc),                IsPending = false,
                 NeedsReview = true,
                 // mig 105: SimpleFIN id lands on external_id;
                 // OFX columns aren't written by SimpleFIN.
@@ -466,7 +466,7 @@ public sealed class InvestmentTransactionsEndpointsTests
                 Origin = "online_import",
                 ProviderKey = "simplefin",      // feed-imported
                 Payee = "ACME TAX MANAGED CAPITAL APPRC ADMIRAL CL",
-                PostedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc),                NeedsReview = true,
+                PostedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc),                NeedsReview = true,
                 ExternalId = "fitid-gap-fix",
                 // NOTE: NO ingest_action_hint — classifier didn't match.
             });
@@ -537,7 +537,7 @@ public sealed class InvestmentTransactionsEndpointsTests
                 LedgerId = seed.Ledger.LedgerId,
                 Origin = "manual",
                 Payee = "Coffee shop",
-                PostedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc),                // NOTE: NO ingest_action_hint set.
+                PostedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc),                // NOTE: NO ingest_action_hint set.
             });
             db.TxnLegs.Add(new TxnLegRow
             {
@@ -1166,7 +1166,7 @@ public sealed class InvestmentTransactionsEndpointsTests
             LedgerId = seed.Ledger.LedgerId,
             Origin = "manual",
             Action = "buy",
-            PostedAt = asOf,
+            PostedAt = asOf, TransactedAt = asOf,
         });
         var legId = Guid.NewGuid();
         db.TxnLegs.Add(new TxnLegRow

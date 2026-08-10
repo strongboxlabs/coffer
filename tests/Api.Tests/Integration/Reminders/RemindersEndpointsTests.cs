@@ -51,7 +51,7 @@ public sealed class RemindersEndpointsTests
                 ExternalId = "mdreminder:t1",
                 Payee = "Rent",
                 Memo = "to landlord",
-                PostedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),                IsRecurringTemplate = true,
+                PostedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),                IsRecurringTemplate = true,
             });
             db.RecurringTransactions.Add(new RecurringTransactionRow
             {
@@ -113,7 +113,7 @@ public sealed class RemindersEndpointsTests
             {
                 Id = templateId, LedgerId = ledger.LedgerId, Origin = "manual",
                 ExternalId = "mdreminder:t1", Payee = "Rent",
-                PostedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+                PostedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),
                 IsRecurringTemplate = true,
             });
             db.TxnLegs.Add(new TxnLegRow
@@ -210,7 +210,7 @@ public sealed class RemindersEndpointsTests
             {
                 Id = templateId, LedgerId = ledger.LedgerId, Origin = "manual",
                 ExternalId = $"mdreminder:{ledger.LedgerId}", Payee = "Rent",
-                PostedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+                PostedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),
                 IsRecurringTemplate = true,
             });
             db.RecurringTransactions.Add(new RecurringTransactionRow
@@ -224,7 +224,7 @@ public sealed class RemindersEndpointsTests
             {
                 Id = Guid.NewGuid(), LedgerId = ledger.LedgerId, Origin = "manual",
                 Payee = "Rent",
-                PostedAt = fired.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc),
+                PostedAt = fired.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc), TransactedAt = fired.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc),
                 IsRecurringTemplate = false,
                 RecurringTransactionId = seriesId, OccurrenceDate = fired,
             });

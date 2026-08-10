@@ -14,7 +14,7 @@ Day-to-day operational procedures for Coffer. Updated as the system grows.
 
 ### Schema application: DbUp, not initdb
 
-`docker-entrypoint-initdb.d` mounts only `db/init/00-init-roles.sh`, which creates the two RLS roles (`coffer_service`, `coffer_app`) from `COFFER_SERVICE_PASSWORD` / `COFFER_APP_PASSWORD`. The schema itself lands when the API starts and runs DbUp (`MigrationRunner`) against the `ServiceConnectionString` — `coffer_service` owns the tables it creates, which is the precondition for `ENABLE ROW LEVEL SECURITY` in migration 017.
+`docker-entrypoint-initdb.d` mounts only `db/init/00-init-roles.sh`, which creates the two RLS roles (`coffer_service`, `coffer_app`) from `COFFER_SERVICE_PASSWORD_FILE` / `COFFER_APP_PASSWORD_FILE` (compose secrets under `./secrets/` — see [Database exposure and authentication](#database-exposure-and-authentication)), falling back to the `COFFER_SERVICE_PASSWORD` / `COFFER_APP_PASSWORD` env vars when no file is configured. The schema itself lands when the API starts and runs DbUp (`MigrationRunner`) against the `ServiceConnectionString` — `coffer_service` owns the tables it creates, which is the precondition for `ENABLE ROW LEVEL SECURITY` in migration 017.
 
 To rebuild from scratch during development:
 
@@ -45,6 +45,17 @@ Then point the API at the DB with both connection strings configured:
 COFFER_API__ConnectionString=Host=...;Username=coffer_app;Password=...
 COFFER_API__ServiceConnectionString=Host=...;Username=coffer_service;Password=...
 ```
+
+Or keep the passwords out of the environment by leaving `Password=` off and pointing at files instead — the docker path does this by default:
+
+```
+COFFER_API__ConnectionString=Host=...;Username=coffer_app
+COFFER_API__AppPasswordFile=/run/secrets/coffer_app_password
+COFFER_API__ServiceConnectionString=Host=...;Username=coffer_service
+COFFER_API__ServicePasswordFile=/run/secrets/coffer_service_password
+```
+
+Either form works; the file wins if both are present. See [Database exposure and authentication](#database-exposure-and-authentication).
 
 Migration 017 guards role existence up front — a half-provisioned install fails with a clear error message instead of silently granting privileges to roles that don't exist yet.
 
@@ -138,16 +149,23 @@ Coffer ships a built-in **whole-database** backup ([decisions/0060-whole-db-back
 | Aspect | Detail |
 |---|---|
 | Engine | `pg_dump --format=custom --no-owner` (as `coffer_service`, so it reads every row + keeps GRANTs) → chunked AES-256-GCM, keyed by Argon2id over a passphrase. |
-| Passphrase (app/scheduled) | Set once by an admin in **Admin → Backups**; sealed under `COFFER_MASTER_KEK_BASE64` and stored in the DB (never plaintext). Drives both on-demand and scheduled backups. |
+| Passphrase (app/scheduled) | Set once by an admin in **System → Backups**; sealed under the master KEK and stored in the DB (never plaintext). Drives both on-demand and scheduled backups. Viewable again via **Show** behind a passkey prompt (ADR-0092 D5b) — the server unseals it on every scheduled run, so offering no way to look it up only meant a forgotten passphrase silently made every backup unrestorable. |
 | Create | Admin panel (on demand), the daily schedule, or the CLI: `coffer-api backup --out <path>` with `COFFER_BACKUP_PASSPHRASE` set. |
 | Storage | Encrypted `.cofferbak` artifacts under `data/backups/` (the Docker volume), pruned by a tiered GFS policy: daily for `Api:Backup:RetentionDailyDays` (7), then weekly for `RetentionWeeklyWeeks` (8), then monthly for `RetentionMonthlyMonths` (12). On-box is a rolling working set; download via the admin panel to keep long-term copies off-host. |
-| Restore | Three paths. On a **fresh** install (pre-auth): the **bootstrap UI** ([decisions/0061-bootstrap-restore.md](decisions/0061-bootstrap-restore.md)) — the setup screen offers *Restore from a backup*, uploads the `.cofferbak` + passphrase, and applies it on the next boot; or the **operator CLI** `coffer-api restore --in <path> --force` with `COFFER_BACKUP_PASSPHRASE` set (use the CLI for headless DR or backups larger than the ~128 MB upload ceiling). On a **running** install, an **admin** can restore in-app — **System → Backups → Restore** (ADR-0071 D3): upload + passphrase behind a typed-confirmation gate; it stages + restarts like the bootstrap path and signs everyone out. This is the "migrate from another install" path. Migrations are skipped for `restore` (the dump rebuilds the schema). |
+| Restore | Three paths. On a **fresh** install (pre-auth): the **bootstrap UI** ([decisions/0061-bootstrap-restore.md](decisions/0061-bootstrap-restore.md)) — the setup screen offers *Restore from a backup*, uploads the `.cofferbak` + passphrase, and applies it on the next boot; or the **operator CLI** `coffer-api restore --in <path> --force` with `COFFER_BACKUP_PASSPHRASE` set (use the CLI for headless DR or backups larger than the ~128 MB upload ceiling). On a **running** install, an **admin** can restore in-app — **System → Backups → Restore** (ADR-0071 D3): upload + passphrase behind a typed-confirmation gate; it stages + restarts like the bootstrap path and signs everyone out. This is the "migrate from another install" path. Migrations are skipped for `restore` — the dump carries the schema at the version it was taken from, and the next normal boot migrates it forward (a 188-era backup restored onto a 192 build applies 189→192 on that boot). **Every restore path wipes the schema to empty first**, dropping only what the service role owns and leaving install-managed extensions intact; pg_restore into a populated schema collides on every existing object and merges what it can, which is a hybrid of two installs rather than a restore. |
 
-Bring the **same `COFFER_MASTER_KEK_BASE64`** to the recovery host so the restored `wrapped_lek` columns + the sealed backup passphrase decrypt as-is; WebAuthn login survives if the RP id/domain + authenticator are unchanged (see ADR-0060). A cross-install KEK mismatch is caught pre-flight by the **admin-UI restore** (ADR-0071 D4): backups carry a KEK fingerprint, and the restore warns before applying if the target install's KEK differs — set the source's KEK and re-upload for a clean migration, or acknowledge to proceed and re-set the backup passphrase + reconnect Google Drive afterward.
+Bring the **same master key** to the recovery host so the restored `wrapped_lek` columns + the sealed backup passphrase decrypt as-is; WebAuthn login survives if the RP id/domain + authenticator are unchanged (see ADR-0060). A cross-install KEK mismatch is caught pre-flight by the **admin-UI restore** (ADR-0071 D4): backups carry a KEK fingerprint, and the restore warns before applying if the target install's KEK differs.
+
+Since [ADR-0092](decisions/0092-kek-lifecycle-in-the-ui.md) D4 the restore form takes the **source install's master key** directly — paste it and its sealed secrets carry over, and the server checks it against the archive's fingerprint before anything destructive runs, so a wrong paste is refused up front rather than discovered afterwards. Leave it empty and the restore still succeeds: D5 reconciliation then clears what won't open and tells you what to re-establish (bank feeds, the backup passphrase, Google Drive).
 
 Backup encryption is mandatory, per [decisions/0014-encryption-at-rest.md](decisions/0014-encryption-at-rest.md) Layer 2. Plaintext backups are not acceptable — the built-in `.cofferbak` is always passphrase-encrypted.
 
 Restores are not real until tested. Run a periodic restore drill: `coffer-api restore` the latest artifact into a **throwaway** Postgres and confirm a sample of account balances against live. Never `--force`-restore into the live database — it replaces everything.
+
+A drill into a throwaway install hits the cross-KEK guard, because that install minted its own master key: the restore refuses up front (it compares the backup's KEK fingerprint before decrypting anything, so this costs nothing). Two ways through, and they test different things:
+
+- **Copy the live install's key into the throwaway's key file first.** Nothing is refused, and the sealed secrets — backup passphrase, feed tokens, Drive — restore usable. This is what a real migration to new hardware looks like, so it is the drill worth running.
+- **Pass `--allow-kek-mismatch`.** The data and passkeys restore; reconciliation then clears every secret sealed under the other key and prints what it abandoned. Fine for checking balances, but it does not exercise the path you would actually use in a recovery.
 
 ### Provisioning a fresh install
 
@@ -161,7 +179,7 @@ docker compose exec api dotnet coffer-api.dll bootstrap-token
 ```
 
 > **Invoking the operator CLI in the container.** Every `coffer-api <subcommand>`
-> below (`bootstrap-token`, `backup`, `restore`, `rotate-kek`) is reached as
+> below (`bootstrap-token`, `backup`, `restore`) is reached as
 > `docker compose exec api dotnet coffer-api.dll <subcommand>`. The image's
 > ENTRYPOINT is `["dotnet","coffer-api.dll"]` and it ships no apphost binary, so
 > `docker compose exec api coffer-api …` exits 127 with "executable file not
@@ -235,7 +253,16 @@ restore` on the CLI instead of the upload.
      **private** ghcr package, so authenticate first, then pull:
      `docker login ghcr.io -u <user>` (a `read:packages` PAT — keep it in your
      DR kit), then `docker compose pull api`. Pin a version with
-     `COFFER_IMAGE_TAG=<tag>` in `.env` if you don't want `latest`. Built + pushed
+     `COFFER_IMAGE_TAG=<tag>` in `.env` if you don't want `latest`.
+     **`COFFER_IMAGE` must be set** — compose has no default for it, deliberately.
+     `.github/workflows/release.yml` publishes to
+     `ghcr.io/<the building repo's owner>/coffer`, so whoever built the image owns
+     the package and there is no one value that suits every fork; a hardcoded
+     fallback only meant an install could quietly pull from a registry that wasn't
+     its own. `install.sh` derives it from the repo it fetched your config from and
+     writes it to `.env`. On a DR host built by hand, set it yourself — and confirm
+     it *before* you need it, because a recovery is a bad time to discover the
+     image name is wrong. Built + pushed
      by `.github/workflows/release.yml` on a `vX.Y.Z` tag (or manually —
      `docker build` + `docker push ghcr.io/<owner>/coffer:<tag>`).
    - **Or build from source:** also bring `Dockerfile` + `src/`; `docker compose
@@ -268,7 +295,7 @@ restore` on the CLI instead of the upload.
      the box*) or **HTTPS**. Plain `http://<lan-ip>` shows "WebAuthn is not
      supported" — that's the browser disabling the API, not a bug.
    - RP ids **cannot be IP addresses**. For network access, front the box with
-     HTTPS at a **hostname** and set `COFFER_RP_ID` / `COFFER_WEB_ORIGIN_0` to it.
+     HTTPS at a **hostname** and set `COFFER_RP_ID` / `COFFER_WEB_URL` to it.
    - A **roaming key** (YubiKey) is the portable credential; a platform
      authenticator (Windows Hello / Touch ID) stays on its original machine.
    - The security key must be on the machine running the **browser** (it can't
@@ -321,7 +348,7 @@ An optional, off-by-default destination that copies each backup to a folder in *
 
 Notes:
 - Scope is `drive.file` — Coffer can only see/manage files it created, never the rest of your Drive.
-- The sealed token is re-wrapped automatically by `rotate-kek` (see Encryption at rest), so a KEK rotation doesn't break uploads.
+- The sealed token is re-wrapped automatically by a KEK rotation (see Encryption at rest), so rotating doesn't break uploads.
 - **Automatic upload:** turn on **"Automatically upload each new backup to Google Drive"** and every backup (the daily scheduled run + manual creates) is uploaded as `{id}.cofferbak` into the per-install folder. A failure never fails the backup — it's recorded as the card's last-upload error, and a **"Not uploaded recently"** badge appears if auto-upload hasn't succeeded recently.
 - **Drive retention** is independent of local retention (set the daily/weekly/monthly tiers on the card). Pruning is delete-only-once-replaced and never removes the newest artifact.
 - **Pin a backup** ("never delete") from the backups list to exclude it from both local and Drive retention. **Upload all backups now** uploads every local backup not already on Drive (catch-up / first-time backfill).
@@ -338,23 +365,30 @@ A layered model is in effect; full rationale in [decisions/0014-encryption-at-re
 | 1 — Host disk | Whole machine | Required. Use LUKS / BitLocker / FileVault / ZFS native encryption on the host running Docker. The app does not enforce this; the operator must configure it before deploying production data. |
 | 2 — Backups | Off-host backup files | Required when backups exist (see above). |
 | 3 — Application envelope encryption | Bank-feed OAuth tokens and other high-value secrets | Required for the in-scope secrets only; not used for bulk transaction data. |
-| 4 — KEK source | The master key that wraps the per-ledger LEKs (and the sealed backup passphrase) | Configured at deployment time via the `COFFER_MASTER_KEK_BASE64` env var; can graduate to a TPM-sealed or hardware-token-derived KEK without schema change. Rotatable via `coffer-api rotate-kek` (see *Rotating the master KEK*). |
+| 4 — KEK source | The master key that wraps the per-ledger LEKs (and the sealed backup passphrase) | A base64 key **file** at `Api:MasterKey:Path` (default `data/master.key` on the `coffer_data` volume), per ADR-0092 D1. Point `COFFER_MASTER_KEY_PATH` at `/run/secrets/…` or a projected Kubernetes Secret to keep it off the app's volume. `COFFER_MASTER_KEK_BASE64` is deprecated: honoured for one release, copied to the key file on first boot with a warning in the log, then removed. Can still graduate to a TPM-sealed or hardware-derived KEK without schema change. Rotated from the UI — **System → Encryption → Rotate** (see *Rotating the master KEK*); the `rotate-kek` CLI subcommand was removed by ADR-0092. |
 
 PostgreSQL TDE is **not** in scope — the OSS Postgres distribution doesn't provide it, and Layers 1 + 3 cover the realistic threats. Whole-DB column encryption is **explicitly rejected** for bulk data because it breaks indexing and trigram search; see the ADR for the trade-off.
 
 ### Rotating the master KEK
 
-Re-key without re-encrypting data ([decisions/0026-per-ledger-encryption-key.md](decisions/0026-per-ledger-encryption-key.md) §Rotation): envelope encryption means only the *wrappings* change — every `ledgers.wrapped_lek` and the backup passphrase are re-wrapped under the new KEK, in one all-or-nothing transaction. On the running deployment:
+Re-key without re-encrypting data ([decisions/0026-per-ledger-encryption-key.md](decisions/0026-per-ledger-encryption-key.md) §Rotation, as amended by [ADR-0092](decisions/0092-kek-lifecycle-in-the-ui.md) D4): envelope encryption means only the *wrappings* change — every `ledgers.wrapped_lek`, the backup passphrase, and the Drive token are re-wrapped under the new KEK in one all-or-nothing transaction.
 
-1. Generate a new key: `openssl rand -base64 32`.
-2. Dry-run (verifies every blob opens under the *current* key; writes nothing):
-   `COFFER_MASTER_KEK_NEW_BASE64=<new> docker compose run --rm api rotate-kek --dry-run`
-3. Rotate for real:
-   `COFFER_MASTER_KEK_NEW_BASE64=<new> docker compose run --rm api rotate-kek`
-4. Set `COFFER_MASTER_KEK_BASE64=<new>` (and `COFFER_MASTER_KEK_ID=v2`) in `.env`, then `docker compose up -d` to restart on the new key.
-5. **Re-take backups** under the new key and retire the old ones — a `.cofferbak` carries the wrapped LEKs as they were at dump time, so each backup is bound to the KEK era it was taken under (archive the old KEK with old backups, or discard both).
+**Rotation lives in the UI: System → Encryption → Rotate.**
 
-If rotation aborts ("does not open under the current KEK"), nothing was written — confirm `COFFER_MASTER_KEK_BASE64` is actually the current key.
+1. Type `rotate` to confirm. There is no separate check step: rotation's own first action is the dry run — it verifies every wrapped value opens under the *current* key, writes nothing, and refuses before touching anything if any of them don't. If it refuses, the install is already in a mismatched state (a cross-KEK restore, say); fix that first. A check you could forget to run was worse than one you can't.
+2. The new key id is assigned by the server, incrementing the current one (`v1` → `v2`). It isn't a prompt — it's a label nothing depends on, so choosing it was a decision with no consequence in the middle of an operation that has several.
+3. The server generates the key, re-wraps everything, swaps the key file, and **restarts** to load it. The panel waits for the server to come back and confirms when it's running on the new key — no action needed while it does.
+4. **Save the new key.** It's on screen, it's on disk, and it's viewable again later via **Show key** (ADR-0092 D2 — deliberately not show-once), but a server you've lost can't show you anything.
+5. The previous key file is kept alongside the new one (`master.key.<timestamp>.bak`) so a mistaken rotation is reversible. Delete it once you've confirmed the new key works.
+6. **Re-take backups** under the new key and retire the old ones — a `.cofferbak` carries the wrapped LEKs as they were at dump time, so each backup is bound to the KEK era it was taken under (archive the old key with old backups, or discard both).
+
+If `COFFER_MASTER_KEK_BASE64` is still set in `.env`, **remove it**. The key file wins (ADR-0092 D1), so a stale value there is ignored — the startup log says so — and it only invites confusion after a rotation.
+
+> The `rotate-kek` CLI subcommand was removed in ADR-0092. Rotation is routine
+> hygiene rather than disaster recovery, so an operator who can't sign in needs
+> recovery codes, not a rotation. (`restore` remains a CLI command because it
+> genuinely can't be a UI one — it skips migrations, so it works on a schema too
+> broken for the app to serve.)
 
 ---
 
@@ -363,8 +397,97 @@ If rotation aborts ("does not open under the current KEK"), nothing was written 
 - `.env` is gitignored. Real credentials live there only on the host.
 - `.env.example` is committed and contains placeholder values exclusively.
 - OAuth tokens (SimpleFIN, a major brokerage via SimpleFIN/MX) live in the database, **envelope-encrypted** (Layer 3 above) — not in env files.
-- The master KEK (`COFFER_MASTER_KEK_BASE64`) lives in `.env` on the host — encrypted at rest by Layer 1, never written to backups in plaintext, never committed.
+- The master KEK lives in its own file (`data/master.key` on the `coffer_data` volume by default, `0600`), **not** in `.env` — ADR-0092 D1 retired the env var because its value is readable via `docker inspect`, `/proc/<pid>/environ`, child environments and crash dumps. Encrypted at rest by Layer 1, never written to backups in plaintext, never committed. Deliberately on a different volume from `postgres_data`, so one dump can't carry both the wrapped material and the key that opens it.
 - Never log raw tokens, raw CSV/OFX uploads, or full transaction memos at INFO level.
+
+### Database exposure and authentication
+
+Two deliberate settings in `docker-compose.yml`, both about the database refusing
+connections it has no reason to accept:
+
+- **The published Postgres port is bound to `127.0.0.1`.** The application never
+  uses it — the API resolves `postgres` over the compose network — so it exists
+  only for an operator attaching `psql` or a GUI client from the host. Bound to
+  `0.0.0.0` (the earlier default) it offered all three roles to anything that
+  could route to the host. Drop the `ports:` stanza entirely if nothing on the
+  host needs to connect.
+- **Every auth path requires a password**, via
+  `POSTGRES_INITDB_ARGS=--auth-local=scram-sha-256 --auth-host=scram-sha-256`.
+  `initdb`'s defaults are `trust` for the unix socket, `127.0.0.1` and `::1`,
+  which the entrypoint leaves in place — it only appends the `host all all all`
+  rule. That trust isn't reachable from outside the container, but it makes
+  anything running inside it superuser with no credential, which bypasses the
+  RLS boundary the authorization model rests on (`coffer_app` NOBYPASSRLS vs
+  `coffer_service` BYPASSRLS), and it would become a genuine hole if the
+  deployment ever moved to `network_mode: host` or a bare VM.
+
+**Upgrading an existing install:** `initdb` runs exactly once, so an install
+created before this landed still has `trust` in its `PGDATA` — the compose
+setting does nothing for it. Run the one-time remediation:
+
+```bash
+scripts/harden-pg-hba.sh          # or: PG_CONTAINER=… ENV_FILE=… scripts/harden-pg-hba.sh
+```
+
+It rewrites `pg_hba.conf` and reloads (no restart, no downtime), and it is
+idempotent, so it is safe from an upgrade path. It refuses to change anything
+unless `POSTGRES_PASSWORD` and `COFFER_APP_PASSWORD` are proven to authenticate
+first — after the change those passwords are the only way in — and it rolls back
+if verification fails afterward. A half-applied `pg_hba` is how an application
+gets locked out of its own database.
+
+Anything reaching Postgres over the container's socket needs a password once
+this is applied. `scripts/backup-restore-roundtrip.sh` and
+`scripts/harden-pg-hba.sh` therefore read the superuser password from
+`secrets/postgres_password`, falling back to `POSTGRES_PASSWORD` in `.env` for an
+install that predates the move to files. Override with `SECRETS_DIR` when
+targeting a second stack. The preflight schema lane is unaffected — it runs its
+own ephemeral container, which never sees these settings.
+
+#### The passwords themselves live in files, not the environment
+
+All three — the superuser, `coffer_service` and `coffer_app` — are files under
+`./secrets/`, mounted by compose at `/run/secrets/<name>`:
+
+| File | Role | Read by |
+|---|---|---|
+| `secrets/postgres_password` | superuser | the Postgres entrypoint (`POSTGRES_PASSWORD_FILE`) |
+| `secrets/coffer_service_password` | `coffer_service` (BYPASSRLS) | `db/init` at first boot; the API (`Api:ServicePasswordFile`) |
+| `secrets/coffer_app_password` | `coffer_app` (NOBYPASSRLS) | `db/init` at first boot; the API (`Api:AppPasswordFile`) |
+
+Same reasoning ADR-0092 D1 applied to the master KEK: an environment variable is
+readable via `docker inspect`, `/proc/<pid>/environ`, any child process's
+environment and crash dumps, and these authenticate every query the application
+makes. The API injects each password into its connection string at startup
+(`DbPasswordResolver`) before anything binds the configuration, so the dozen-odd
+consumers across the API, the backup service and the importer are unchanged —
+what they receive is a finished connection string. The connection *topology*
+stays in compose in plain sight, because that is what you need to read when a
+connection is refused and none of it is secret.
+
+A configured-but-unreadable password file is a startup failure, not a fallback.
+The alternative is an install that connects with no password — which against a
+Postgres still on `trust` succeeds, and an install that authenticates by
+accident is worse than one that refuses to boot.
+
+Permissions are deliberately `0700` on the directory and `0644` on the files.
+Outside swarm, compose ignores `uid`/`gid`/`mode` and the file keeps its host
+ownership, and the Postgres entrypoint re-execs as `postgres` (uid 999) before
+reading `POSTGRES_PASSWORD_FILE` — so a `0600` file owned by the installing user
+is unreadable in-container. The directory is what keeps other local users out.
+
+**Upgrading an existing install**, whose passwords are still in `.env`:
+
+```bash
+scripts/migrate-db-secrets.sh     # copies .env values into secrets/, comments the .env lines out
+docker compose up -d              # recreates with the file-based secrets
+```
+
+It does not rotate anything — the credentials the database already knows keep
+working, because rotating during a migration would mean two things could fail at
+once with no way to tell which. `scripts/install.sh` does the same automatically
+on its upgrade path. Both leave a `.env.pre-secrets` backup that still contains
+the passwords; delete it once the stack is confirmed healthy.
 
 ---
 
@@ -425,13 +548,19 @@ are browser-driven and usually pass.
   - `COFFER_RP_ID` = the registrable parent domain (e.g. `example.org`) covering
     both hosts. A passkey registered under the parent works on the subdomain with
     **no re-registration** (the RpId is a valid suffix).
-  - `COFFER_WEB_ORIGIN_1` = the subdomain origin (e.g. `https://mcp.example.org`),
+  - `COFFER_MCP_URL` = the subdomain origin (e.g. `https://mcp.example.org`),
     wired to `Api:Fido2:Origins__1`. The OAuth sign-in runs on the subdomain, so
     its origin must be an **allowed origin** — without it, sign-in there fails with
     `origin https://mcp.example.org … not equal to … https://example.org`. Set it in
     `.env` and `docker compose up -d`. (Installs created before this knob existed
     only have `Origins__0`; add the line to the compose or re-run `install.sh` to
     pick up the current one.)
+
+    This is also what the admin UI shows as the address to give a client
+    (ADR-0093). On a split-host install it is the only way for that panel to be
+    right: unset, it falls back to the origin the admin happens to be browsing,
+    which is the **web** host. `COFFER_WEB_ORIGIN_1` still works as a fallback for
+    the origin, but does not feed the displayed address.
 - **Disable the bot protection.** Coffer's real boundary is WebAuthn + RLS +
   off-by-default MCP + OAuth; bot protection is DDoS/noise reduction, not the auth
   layer. Acceptable for a personal, fully passkey-gated install.

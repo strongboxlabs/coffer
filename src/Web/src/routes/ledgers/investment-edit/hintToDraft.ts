@@ -3,7 +3,7 @@ import type {
     LedgerInvestmentAction,
 } from '@/lib/types';
 import { isLinkedAction } from './actionLayout';
-import type { InvestmentTxnDraft } from './validation';
+import { seedTransactedAt, type InvestmentTxnDraft } from './validation';
 
 /**
  * Build an editor draft from a sync-imported bank-shape row carrying
@@ -27,6 +27,8 @@ export function hintToDraft(
     brokerageAccountId: string,
     header: {
         postedAt: string;
+        /** Tax date from the row; blanked below when it is the posted day. */
+        transactedAt?: string | null;
         payee: string | null;
         memo: string | null;
         checkNumber: string | null;
@@ -103,6 +105,7 @@ export function hintToDraft(
     return {
         brokerageAccountId,
         postedAt: ymdFromIso(header.postedAt),
+        transactedAt: seedTransactedAt(header),
         action,
         payee: header.payee ?? '',
         memo: header.memo ?? '',
