@@ -138,7 +138,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
     /// must resolve the same key — but scoped PER PROCESS by pid.
     /// </summary>
     /// <remarks>
-    /// The pid matters: <c>preflight.sh</c> shards the suite across N parallel
+    /// The pid matters: the suite is sharded across N parallel
     /// <c>dotnet test</c> processes precisely because this class mutates
     /// process-global env vars. A single shared filename would have those shards
     /// writing one file concurrently, so a reader could catch a half-written key —

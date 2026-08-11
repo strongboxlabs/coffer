@@ -13,9 +13,12 @@ namespace Coffer.Api.Tests.Integration.Stress;
 
 /// <summary>
 /// The scale lane: snapshot create + restore against a ~50k-transaction,
-/// 200-holding ledger. Excluded from preflight and PR CI by namespace (see
-/// scripts/preflight.sh and scripts/ci-dotnet-shards.sh); run on demand via
-/// <c>scripts/stress-lane.sh</c> or the Stress lane workflow.
+/// 200-holding ledger. Deliberately OUTSIDE the default test run — the
+/// <c>Integration.Stress</c> namespace is excluded from the sharded suite
+/// (<c>scripts/ci-dotnet-shards.sh</c>), because building the fixture takes minutes
+/// and would dominate every ordinary run. Invoke it explicitly by filtering on this
+/// namespace:
+/// <code>dotnet test --filter "FullyQualifiedName~Integration.Stress"</code>
 /// </summary>
 /// <remarks>
 /// <para>This exists because restore latency was completely unmeasured. The ~27s

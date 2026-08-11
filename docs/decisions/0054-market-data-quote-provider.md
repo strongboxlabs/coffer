@@ -154,7 +154,7 @@ config.
 - A Connections / API-key management UI — with the first keyed provider.
 - A `quote_runs` audit table — per ADR-0033 §3, add when failures warrant.
 
-## Slices (each = one PR, preflight-green)
+## Slices (each = one PR, green on CI)
 
 Slice A is delivered as two reviewable PRs (A1 then A2):
 

@@ -14,7 +14,7 @@
          the assembly by the StampGitVersion target below and surfaced
          via GET /api/meta/version. We compose InformationalVersion
          ourselves, so suppress the SDK's automatic +<sha> append. -->
-    <Version>0.44.3</Version>
+    <Version>0.44.5</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 
@@ -63,7 +63,7 @@
   <ItemGroup>
     <PackageReference Include="dbup-postgresql" Version="6.1.5" />
     <PackageReference Include="Fido2.AspNet" Version="4.0.1" />
-    <PackageReference Include="Google.Apis.Drive.v3" Version="1.75.0.4192" />
+    <PackageReference Include="Google.Apis.Drive.v3" Version="1.75.0.4218" />
     <PackageReference Include="Konscious.Security.Cryptography.Argon2" Version="1.3.1" />
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.10" />
     <!-- Pin the transitive Microsoft.OpenApi to a patched version. AspNetCore.OpenApi
@@ -72,7 +72,7 @@
          so the resolver satisfies AspNetCore.OpenApi's floor with it. -->
     <PackageReference Include="Microsoft.OpenApi" Version="2.11.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.10" />
-    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="1.4.1" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.1.0" />
     <PackageReference Include="MR.EntityFrameworkCore.KeysetPagination" Version="1.6.0" />
     <PackageReference Include="Npgsql" Version="10.0.3" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />

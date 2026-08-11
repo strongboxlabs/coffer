@@ -111,5 +111,5 @@ tmp/
 temp/
 .commit-msg.tmp
 .pr-body.tmp
-# scripts/stress-lane.sh keeps the full run here; timings are printed from it.
+# Full output of the on-demand Integration.Stress run; timings are printed from it.
 .stress-lane.log

@@ -201,7 +201,7 @@ Categories are treated exactly like accounts (Coffer will manage them too, later
   hide-on-summary-if-zero, include-in-net-worth, balance adjustment (an
   adjusting transaction, not an account field).
 
-## Implementation slices (each = one PR, preflight-green)
+## Implementation slices (each = one PR, green on CI)
 
 1. **Account editor (API + UI), real types** — create / edit / detail endpoints
    + DTOs + validation + the sectioned editor (identity + details incl. the

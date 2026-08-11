@@ -134,7 +134,7 @@ per-connection panel narrows to that connection's ingest runs.
 - Per-provider rows for a multi-provider quote run (aggregate-per-run for v1).
 - Retention/pruning of old run rows (revisit if the table grows large).
 
-## Slices (each = one PR, preflight-green)
+## Slices (each = one PR, green on CI)
 
 A. **Rename + generalize** — `provider_runs` migration (rename + new columns +
    backfill), entity/repo/endpoint/web/​SPA rename, ingest stamps

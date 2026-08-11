@@ -519,7 +519,7 @@ Postgres image (baking the ~183 migrations into the fixture image) was built and
 benchmarked on the theory that per-shard migration bootstrap was costing ~85-90s.
 It was not: DbUp against a fresh empty container is **~5s** (DDL on empty tables
 is fast). Isolated single-class run came out 12s vs 11s stock — *worse* — and a
-full contended preflight measured 328s against a ~325-362s baseline, dead in the
+a full contended test run measured 328s against a ~325-362s baseline, dead in the
 noise. Shards are bound by **test execution** (233-317s each), not bootstrap. The
 image was abandoned as zero-gain added maintenance. The original ~85-90s figure
 was an assumption that was never measured; measure first.

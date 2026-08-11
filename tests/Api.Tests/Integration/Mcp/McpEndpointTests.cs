@@ -76,4 +76,35 @@ public sealed class McpEndpointTests
         Assert.NotEqual(HttpStatusCode.Unauthorized, response.StatusCode);
         Assert.NotEqual(HttpStatusCode.Forbidden, response.StatusCode);
     }
+
+    /// <summary>
+    /// The transport must stay STATEFUL, i.e. `initialize` must hand back an
+    /// `Mcp-Session-Id`. Program.cs explains why: stateless mode closes the
+    /// server-to-client SSE stream, which makes mcp-remote — the bridge claude.ai
+    /// and Claude Desktop use — reconnect-loop and drop the connector.
+    ///
+    /// This exists because the SDK 1.4.1 -> 2.1.0 bump flipped
+    /// `HttpServerTransportOptions.Stateless` from false to true by DEFAULT. It
+    /// compiled clean with zero warnings and every other MCP test still passed —
+    /// the only symptom would have been a connector that stops working in
+    /// production. An explicit setting can be dropped by a future refactor just as
+    /// easily as a default can change under us, so the behaviour is asserted here
+    /// rather than the option value: a session id is what the client needs, and
+    /// it's what breaks.
+    /// </summary>
+    [Fact]
+    public async Task Initialize_returns_a_session_id_because_the_transport_is_stateful()
+    {
+        await using var factory = new ApiFactory(_fixture).WithMcpEnabled();
+        using var client = factory.CreateClient();
+
+        var response = await client.SendAsync(NewInitialize());
+
+        Assert.True(
+            response.Headers.TryGetValues("Mcp-Session-Id", out var ids),
+            "No Mcp-Session-Id on the initialize response — the MCP transport is "
+                + "running STATELESS. Check HttpServerTransportOptions.Stateless in "
+                + "Program.cs; the SDK's default is true and must be overridden.");
+        Assert.False(string.IsNullOrWhiteSpace(ids!.FirstOrDefault()));
+    }
 }

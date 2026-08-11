@@ -441,7 +441,7 @@ this is applied. `scripts/backup-restore-roundtrip.sh` and
 `scripts/harden-pg-hba.sh` therefore read the superuser password from
 `secrets/postgres_password`, falling back to `POSTGRES_PASSWORD` in `.env` for an
 install that predates the move to files. Override with `SECRETS_DIR` when
-targeting a second stack. The preflight schema lane is unaffected — it runs its
+targeting a second stack. The schema-apply test lane is unaffected — it runs its
 own ephemeral container, which never sees these settings.
 
 #### The passwords themselves live in files, not the environment
@@ -488,6 +488,50 @@ working, because rotating during a migration would mean two things could fail at
 once with no way to tell which. `scripts/install.sh` does the same automatically
 on its upgrade path. Both leave a `.env.pre-secrets` backup that still contains
 the passwords; delete it once the stack is confirmed healthy.
+
+#### Container privileges and connection logging
+
+Both containers run with a reduced kernel privilege set. Nothing here needs
+configuring — it is in `docker-compose.yml`, and `scripts/install.sh` rewrites
+that file on upgrade, so an existing install picks it up on its next
+`docker compose up -d` with no migration step.
+
+| Setting | `postgres` | `api` |
+|---|---|---|
+| `no-new-privileges` | yes | yes |
+| `cap_drop` | `ALL`, then five added back | `ALL`, nothing added back |
+| `mem_limit` | `POSTGRES_MEM_LIMIT` (1g) | `COFFER_API_MEM_LIMIT` (1g) |
+
+Postgres gets `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETUID` and `SETGID` back
+because its entrypoint starts as root to fix ownership on `PGDATA` and the socket
+directory, then re-execs as `postgres` via `gosu`. This is measured, not
+inferred: with a bare `cap_drop: [ALL]` a fresh install dies during `initdb` with
+`chmod: changing permissions of '/var/lib/postgresql/data': Operation not
+permitted`, then `error: failed switching to 'postgres': operation not
+permitted`. With the five restored, `initdb` completes, and `CapEff` on the
+postmaster is `0` — the privilege drop still happens, and the running database
+holds nothing. Everything else (`NET_ADMIN`, `SYS_ADMIN`, `SYS_PTRACE`, `MKNOD`,
+`NET_RAW`, …) is gone.
+
+The API needs none of them: it runs as root start to finish so there is no
+privilege drop to perform, it owns `/app/data` on its own volume so it can write
+the master key and the bootstrap URL without `DAC_OVERRIDE`, it binds 8080 so it
+needs no `NET_BIND_SERVICE`, and the backup path's `pg_dump`/`pg_restore`/`psql`
+are ordinary TCP clients. Verified against a fresh prod-shaped stack that
+bootstrapped, took a backup and restored it with everything dropped.
+
+If you need to debug inside either container with a tool that wants a capability
+(`strace` and `gdb` need `SYS_PTRACE`), add it to that service's `cap_add`
+temporarily rather than removing the stanza.
+
+Postgres also runs with `log_connections=on` and `log_disconnections=on`. With
+scram on every path and RLS as the authorization boundary, the database is the
+last line of defence, and a successful login previously left no trace — there was
+no way to answer "who connected, as which role, from where?" after the fact. The
+log now names the role on every connection (`connection authorized: user=…
+database=…`), which also makes a credential-stuffing attempt against the
+loopback port visible, and records session duration on disconnect. Expect a
+couple of lines per connection; the API pools, so steady-state volume is low.
 
 ---
 

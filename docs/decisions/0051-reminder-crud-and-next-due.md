@@ -104,7 +104,7 @@ investment ship in ONE PR (the user chose this over a bank-first split).
 - Reminders become a first-class in-app object (create / edit / from a posted
   transaction), not just an import artifact — a step toward MD retirement.
 
-## Implementation slices (each = one PR, preflight-green)
+## Implementation slices (each = one PR, green on CI)
 
 A. **`next_due` correctness (backend)** — shared `Coffer.Domain.Reminders`
    (moved expander + `NextDueCalculator`); importer seeds the cursor; API

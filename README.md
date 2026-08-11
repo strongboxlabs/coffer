@@ -272,7 +272,7 @@ Coffer/
 │   └── Importer.Moneydance.Tests/   xUnit (mappers + repositories)
 ├── docs/                            Design, reference, process, ADRs — index: docs/README.md
 ├── .github/
-│   ├── workflows/                   self-hosted sharded CI — schema + no-raw-sql audit + .NET/web tests + doc links
+│   ├── workflows/                   CI — schema + no-raw-sql audit + .NET/web tests + doc links
 │   ├── ISSUE_TEMPLATE/
 │   └── PULL_REQUEST_TEMPLATE.md
 ├── Coffer.slnx                       .NET solution

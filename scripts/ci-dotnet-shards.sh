@@ -7,12 +7,13 @@
 #
 # Default mode suits ONE capable machine: a CI matrix would make the shards run
 # sequentially there and each job would re-pay `dotnet build` (~90s x 6 ~= 9 min of
-# redundant building). So this mirrors scripts/preflight.sh's dotnet-shard harness --
-# build once, then run the shards in parallel across the machine's cores.
+# redundant building). So: build once, then run the shards in parallel across the
+# machine's cores.
 #
-# Shard partition is identical to preflight.sh (namespace-based, balanced by
-# measured run time; S4 is the COMPLEMENT so every Api.Tests test runs in exactly
-# one shard). Assumes a .NET SDK on PATH and the repo checked out.
+# The partition is namespace-based and balanced by measured run time. S4 is the
+# COMPLEMENT of the others, which is what makes the partition total: every
+# Api.Tests test runs in exactly one shard, so adding a namespace cannot silently
+# leave tests unrun. Assumes a .NET SDK on PATH and the repo checked out.
 # =============================================================================
 set -uo pipefail
 
@@ -73,7 +74,9 @@ if ! dotnet build Coffer.slnx --configuration Release >"$logdir/build.log" 2>&1;
     exit 1
 fi
 
-# Shard filters — MUST match scripts/preflight.sh.
+# Shard filters. S4 below is the complement of s1..s3, so these must be edited as a
+# set: narrowing one shard without widening another drops tests from the run
+# silently, and a green result would then mean less than it appears to.
 launch s1 api_shard \
     "FullyQualifiedName~Integration.Transactions&FullyQualifiedName!~Integration.Transactions.MergeCandidates&FullyQualifiedName!~Integration.Transactions.InvestmentTransactionsEndpoints&FullyQualifiedName!~Integration.Transactions.PatchTransaction&FullyQualifiedName!~Integration.Transactions.BulkTransactions&FullyQualifiedName!~Integration.Transactions.BalanceMergeHideSync&FullyQualifiedName!~Integration.Transactions.InKindTransfer"
 launch s1b api_shard \

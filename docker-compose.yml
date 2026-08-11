@@ -40,6 +40,24 @@ services:
       # before this landed keeps trust in its PGDATA — see
       # scripts/harden-pg-hba.sh for the one-time fix.
       POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---auth-local=scram-sha-256 --auth-host=scram-sha-256}
+    # Log every connection and disconnection. With scram everywhere (above) plus
+    # RLS as the authorization boundary, the database is the last line of defence,
+    # and until now a successful login left no trace at all — there was no way to
+    # answer "who connected, as which role, from where?" after the fact. The pair
+    # also makes a credential-stuffing attempt against the published loopback port
+    # visible, and records the session duration a disconnection closes.
+    #
+    # Passed as server flags rather than a mounted postgresql.conf so the image's
+    # own config keeps working; the entrypoint execs whatever `command` supplies.
+    # NOTE: `on` is the boolean form, which is what postgres:16 takes. PG 18 turned
+    # log_connections into a list of aspects but still accepts the boolean as an
+    # alias for all of them, so this survives a major bump.
+    command:
+      - postgres
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
     ports:
       # Loopback-bound on purpose. This published port is not needed by the
       # app at all — the API reaches Postgres as `postgres` over the compose
@@ -68,6 +86,44 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
+    # No setuid/setgid binary inside this container can raise its privileges,
+    # for this process or any child. Cheap, and it closes the usual escalation
+    # step after a compromise of the postgres user.
+    security_opt:
+      - no-new-privileges:true
+    # Drop every capability, then add back exactly the five the image's
+    # entrypoint needs. It starts as root to fix ownership on PGDATA and the
+    # socket dir, then re-execs as `postgres` via gosu — so it needs CHOWN,
+    # DAC_OVERRIDE and FOWNER for the former and SETUID/SETGID for the latter.
+    #
+    # MEASURED, not guessed: with a bare `cap_drop: [ALL]` a FRESH install dies
+    # during init with `chmod: changing permissions of '/var/lib/postgresql/data':
+    # Operation not permitted` followed by `error: failed switching to 'postgres':
+    # operation not permitted` — exit 1, no database. With the five added back,
+    # initdb completes, the server answers queries and `ps` confirms the postmaster
+    # is running as `postgres`, so the gosu privilege drop still happens. What's
+    # gone is everything else: NET_ADMIN, SYS_ADMIN, SYS_PTRACE, MKNOD, NET_RAW…
+    #
+    # If you ever need to diagnose inside this container with a tool that wants a
+    # capability (strace/gdb need SYS_PTRACE), add it here temporarily rather than
+    # deleting the stanza.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+    # Bound the database's memory the way the API's is bounded. Read the tradeoff
+    # before lowering it: unlike .NET (which reads the cgroup limit and collects
+    # harder as it approaches), Postgres does not adapt. Hitting this limit means
+    # the kernel OOM-kills a backend, and the postmaster treats a SIGKILLed backend
+    # as a crash — it restarts the whole cluster and runs crash recovery. So this
+    # is a runaway backstop, not a tuning knob: 1g is comfortable for shared_buffers
+    # (128MB) + maintenance_work_mem during a restore + this install's handful of
+    # connections. If you lower it, lower shared_buffers and work_mem to match.
+    mem_limit: ${POSTGRES_MEM_LIMIT:-1g}
 
   # Single-container API + SPA (ADR-0059). Builds the image from the repo
   # Dockerfile; serves /api and the React bundle same-origin on :8080. Runs
@@ -168,6 +224,18 @@ services:
       # both the wrapped material and the key that opens it.
       - coffer_data:/app/data
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    # Nothing added back here, unlike postgres. This container has no privilege
+    # drop to perform (it runs as root start to finish, so no SETUID/SETGID), it
+    # owns /app/data on its own volume (so no DAC_OVERRIDE or CHOWN to write the
+    # master key, the bootstrap URL or the restore staging), and it binds 8080 —
+    # unprivileged, so no NET_BIND_SERVICE. The backup path shells out to pg_dump,
+    # pg_restore and psql, which are ordinary clients over TCP and need none
+    # either. Verified by a fresh prod-shaped stack that bootstrapped, took a
+    # backup and restored it with this in place.
+    cap_drop:
+      - ALL
     # Hard memory cap for the API container. .NET's GC is cgroup-aware: with a
     # limit set it treats this as total physical memory and caps the managed
     # heap at ~75% of it, collecting aggressively as it nears the cap — so the

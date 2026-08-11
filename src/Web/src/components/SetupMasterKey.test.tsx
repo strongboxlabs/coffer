@@ -61,7 +61,7 @@ describe('SetupMasterKey', () => {
         //
         // `await user.click()` made it a statement about ELAPSED TIME instead: it
         // yields to the event loop, jsdom implements requestAnimationFrame as a
-        // ~16ms timer, and on a loaded machine (the parallel preflight) the
+        // ~16ms timer, and on a loaded machine (a parallel test run) the
         // deferred revoke fired during the click's own internal awaits. The test
         // then failed on a component that was behaving perfectly.
         //

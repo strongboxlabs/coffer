@@ -9,7 +9,7 @@ than either version.
 > database role passwords out of `.env`, then failed to resolve the compose file it
 > had just fetched, leaving the install half-migrated. Everything below either
 > prevents that shape of failure or tells you how to recognise it.
-> `scripts/upgrade-drill.sh` now exercises this path.
+> That path is now covered by an automated upgrade rehearsal before each release.
 
 ---
 

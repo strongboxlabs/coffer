@@ -588,7 +588,7 @@ this same layer, not a parallel one:**
 decomposing by domain (pattern locked in
 [ADR-0030](decisions/0030-domain-pure-code-organization.md), which already split
 `types.ts` + `api.ts`). Do each as a behavior-zero refactor that preserves every
-external symbol and runs preflight green — when next touching the file for a
+external symbol and keeps the test suite green — when next touching the file for a
 feature, not as a standalone "refactor week".*
 
 Current offenders (line counts 2026-07-24):
@@ -605,10 +605,10 @@ Current offenders (line counts 2026-07-24):
 ## Test / CI speed
 
 *Status: no known structural lever left — reopen only with a measurement.* The
-Transactions-shard split (2026-07) cut preflight 613s → 401s; CI build-once +
-parallel shards (`scripts/ci-dotnet-shards.sh`) and the runner Docker reap both
-shipped, collapsing ~1000s of sequential CI toward preflight's ~300s. Preflight now
-runs ~300s wall-clock, bound by test execution across shards (233-317s each).
+Transactions-shard split (2026-07) cut the suite 613s → 401s, and building once
+before running the shards in parallel (`scripts/ci-dotnet-shards.sh`) collapsed
+~1000s of sequential execution to ~300s wall-clock. What remains is bound by test
+execution across the shards (233-317s each), not by orchestration.
 
 Before proposing another optimization here, read
 [engineering-standards.md §9.1](engineering-standards.md#91-sharding-build-once-and-dont-assume-a-matrix-helps):
@@ -713,7 +713,7 @@ turned out to be avoidable:
   multi-split, non-zero opening balance, an account with no legs) — and was itself
   verified by removing the `PARTITION BY` and confirming it failed.
 
-**Measured (the scale lane now exists — `scripts/stress-lane.sh`).** Numbers that
+**Measured (the `Integration.Stress` lane now exists).** Numbers that
 corrected the reasoning above, all on a seeded 50k-transaction / 200-holding ledger:
 
 | Phase | Time |
@@ -751,10 +751,10 @@ with 500 events each.
   correctness-sensitive function in the system. `FifoRecomputeCostTests` keeps the
   figures visible so this can be revisited if the shape of real ledgers changes.
 
-**The stress/boundary lane (built).** `scripts/stress-lane.sh` runs
-`Integration.Stress`, which `preflight.sh` and `ci-dotnet-shards.sh` both exclude
-from the s4 catch-all shard — so a 50k-transaction seed never sits in a PR's
-critical path. Trade-off accepted deliberately: a latency regression will not fail
+**The stress/boundary lane (built).** The `Integration.Stress` namespace is
+excluded from the sharded suite (`scripts/ci-dotnet-shards.sh`), so a
+50k-transaction seed never sits in a PR's critical path; run it on demand with
+`dotnet test --filter "FullyQualifiedName~Integration.Stress"`. Trade-off accepted deliberately: a latency regression will not fail
 the PR that caused it, so run the lane after touching snapshots, the restore
 function, the balance rebuild, or `recompute_holdings_cost_basis`.
 

@@ -489,7 +489,13 @@ if (mcpEnabled)
 {
     var mcpServer = builder.Services
         .AddMcpServer()
-        .WithHttpTransport()
+        // Stateless is pinned, NOT left to the SDK's default: the default flipped
+        // from false to true in SDK 2.0, and stateless is the mode the comment
+        // above describes as breaking mcp-remote. Nothing warned about it — the
+        // 1.4.1 -> 2.1.0 bump built clean with zero warnings and would have
+        // silently dropped the Claude connector at runtime. Reflected off both
+        // packages to confirm: 1.4.1 ships Stateless=False, 2.1.0 ships True.
+        .WithHttpTransport(o => o.Stateless = false)
         // Read tools auto-register via [McpServerToolType] assembly scan.
         .WithToolsFromAssembly(typeof(DiscoveryTools).Assembly);
 

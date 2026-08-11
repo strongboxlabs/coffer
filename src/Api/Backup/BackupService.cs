@@ -184,9 +184,14 @@ public sealed class BackupService
     private async Task ResetInstallDriveStateAsync(
         Dictionary<string, string?> env, string database, CancellationToken ct)
     {
+        // -q so psql's command-status tag doesn't reach the console. stdout is NOT
+        // redirected here (the restore streams through), so without it a bare "DO"
+        // lands in the middle of `coffer-api restore` output — two of them, with
+        // the wipe below — which reads as debug noise escaping in an operator-facing
+        // command. NOTICEs still arrive on stderr, which is captured and surfaced.
         using var proc = StartProcess(
             "psql",
-            [$"--dbname={database}", "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-f", "-"],
+            [$"--dbname={database}", "--no-psqlrc", "-q", "-v", "ON_ERROR_STOP=1", "-f", "-"],
             env,
             redirectStdout: false,
             redirectStdin: true);
@@ -250,7 +255,7 @@ public sealed class BackupService
     {
         using var proc = StartProcess(
             "psql",
-            [$"--dbname={database}", "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-f", "-"],
+            [$"--dbname={database}", "--no-psqlrc", "-q", "-v", "ON_ERROR_STOP=1", "-f", "-"],
             env,
             redirectStdout: false,
             redirectStdin: true);
