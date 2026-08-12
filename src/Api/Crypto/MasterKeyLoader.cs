@@ -21,15 +21,6 @@ namespace Coffer.Api.Crypto;
 public static class MasterKeyLoader
 {
     /// <summary>
-    /// Environment variable carrying the base64-encoded 32-byte master KEK.
-    /// <b>Deprecated</b> by ADR-0092 D1 in favour of <see cref="MasterKeyStore"/>.
-    /// Still honoured for one release and migrated to the file on first boot
-    /// (ADR-0092 D6) so existing deployments upgrade without an <c>.env</c> edit;
-    /// removed a release later.
-    /// </summary>
-    public const string EnvVarName = "COFFER_MASTER_KEK_BASE64";
-
-    /// <summary>
     /// Optional env var naming the current KEK's id (stamped into
     /// <c>ledgers.lek_kek_id</c> on new wraps). Defaults to <c>"v1"</c>. A deprecated
     /// fallback only: rotation mints key and id together into the key file, whose
@@ -50,11 +41,8 @@ public static class MasterKeyLoader
         /// <summary>No key configured anywhere. Legal only on a virgin install
         /// (ADR-0092 D3); the caller decides.</summary>
         None,
-        /// <summary>Read from <see cref="MasterKeyStore"/> — the steady state.</summary>
+        /// <summary>Read from <see cref="MasterKeyStore"/> — the only source.</summary>
         File,
-        /// <summary>Read from the deprecated env var and written through to the
-        /// file (ADR-0092 D6). The caller logs the deprecation.</summary>
-        MigratedFromEnvironment,
     }
 
     /// <summary>
@@ -62,78 +50,60 @@ public static class MasterKeyLoader
     /// </summary>
     /// <param name="Key">The resolved key, or null when nothing is configured.</param>
     /// <param name="Source">Where it came from.</param>
-    /// <param name="EnvironmentIgnored">
-    /// True when <see cref="EnvVarName"/> is set to something OTHER than what the key
-    /// file holds, and was therefore ignored. The caller must warn: an operator who
-    /// edits <c>.env</c> expecting an effect needs to hear that the file now wins.
-    /// </param>
-    public sealed record Resolution(MasterKey? Key, KeySource Source, bool EnvironmentIgnored);
+    public sealed record Resolution(MasterKey? Key, KeySource Source);
 
     /// <summary>
-    /// Resolve the master KEK per ADR-0092 D1. <b>The key file wins.</b> The
-    /// deprecated env var is honoured only when the file holds no key, and is then
-    /// written through to it.
+    /// Resolve the master KEK per ADR-0092 D1: <b>the key file is the only source.</b>
     /// </summary>
     /// <remarks>
-    /// <para>The file has to win, and this was originally the other way round. With
-    /// env-first, a UI rotation (D4) re-wrapped the database under a new key, wrote
-    /// that key to the file — and the next boot silently overwrote it with the stale
-    /// env value, leaving the process holding the OLD key over NEW wraps. The
-    /// restore-adopt path (D4) failed the same way, and worse: boot B would clobber
-    /// the adopted source key, then D5 reconciliation would clear the very secrets
-    /// the operator supplied that key to preserve. Both are silent, and both land on
-    /// the transition path D6 promises will work — so file-first is not a preference,
-    /// it's a correctness requirement once anything can write the file.</para>
+    /// <para>It used to also honour a <c>COFFER_MASTER_KEK_BASE64</c> environment
+    /// variable, migrating it into the file on first boot (ADR-0092 D6) so installs
+    /// predating the file upgraded without an <c>.env</c> edit. That was scoped to one
+    /// release and is gone: an environment variable is readable via
+    /// <c>docker inspect</c>, <c>/proc/&lt;pid&gt;/environ</c>, child environments and
+    /// crash dumps, and keeping a second source alive meant a value in <c>.env</c> that
+    /// looked authoritative, was silently ignored once the file existed, and went stale
+    /// the moment anyone rotated.</para>
     ///
-    /// <para>The upgrade path still works: an operator arriving with a key in
-    /// <c>.env</c> and no file gets it migrated on first boot, no edit and no
-    /// downtime. From then on the file is authoritative — including after a
-    /// rotation, which is the whole point.</para>
+    /// <para>Nothing needs to feed a key in on a fresh install: the caller mints one
+    /// when the database holds no wrapped material (ADR-0092 D3). An install whose key
+    /// only ever lived in <c>.env</c> is not stranded either — it refuses to boot and
+    /// names both remedies: write that key to the key file (losing nothing), or
+    /// <c>--adopt-new-kek</c> to mint a fresh one and re-establish the three sealed
+    /// secrets.</para>
     ///
-    /// <para>A malformed value from EITHER source throws rather than falling through
-    /// to the next one: a typo'd key must be a loud failure, never a silent downgrade
-    /// to "no key configured", which D3 could then resolve by minting a fresh one
-    /// over live wrapped material.</para>
+    /// <para>A malformed value in the file throws rather than falling through to "no
+    /// key configured", which D3 could otherwise resolve by minting a fresh key over
+    /// live wrapped material.</para>
     /// </remarks>
-    /// <exception cref="FormatException">Configured value is not valid base64.</exception>
+    /// <exception cref="FormatException">Stored value is not valid base64.</exception>
     /// <exception cref="ArgumentException">Decoded key is not exactly 32 bytes.</exception>
     public static Resolution Resolve(MasterKeyStore store)
-        => Resolve(store, Environment.GetEnvironmentVariable(EnvVarName), ResolveId());
+        => Resolve(store, ResolveId());
 
     /// <summary>
-    /// Testable core of <see cref="Resolve(MasterKeyStore)"/>: the environment is
-    /// passed in rather than read, so tests don't have to mutate process-global state
-    /// (which races the integration harness, since xUnit runs separate collections in
-    /// parallel).
+    /// Testable core of <see cref="Resolve(MasterKeyStore)"/>: the id fallback is
+    /// passed in rather than read from the environment, so tests don't have to mutate
+    /// process-global state (which races the integration harness, since xUnit runs
+    /// separate collections in parallel).
     /// </summary>
-    public static Resolution Resolve(MasterKeyStore store, string? envKeyValue, string envKeyId)
+    public static Resolution Resolve(MasterKeyStore store, string fallbackKeyId)
     {
         ArgumentNullException.ThrowIfNull(store);
-        ArgumentException.ThrowIfNullOrWhiteSpace(envKeyId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(fallbackKeyId);
 
         var (fromFile, fileId) = store.Read();
         if (!string.IsNullOrWhiteSpace(fromFile))
         {
-            // The file's own id wins over the environment's. Rotation mints key and
-            // id together (ADR-0092 D4), so the pairing on disk is authoritative;
-            // COFFER_MASTER_KEK_ID is a deprecated fallback for a file that predates
-            // the id line.
-            var key = LoadFromValueOrThrow(fromFile, fileId ?? envKeyId, store.Path);
-            var envDiffers = !string.IsNullOrWhiteSpace(envKeyValue)
-                && envKeyValue.Trim() != fromFile.Trim();
-            return new(key, KeySource.File, envDiffers);
+            // The file's own id wins. Rotation and minting write key and id together
+            // (ADR-0092 D4), so the pairing on disk is authoritative; the fallback
+            // covers a file an operator wrote by hand without an `id=` line — which is
+            // now the documented recovery route, so it has to keep working.
+            var key = LoadFromValueOrThrow(fromFile, fileId ?? fallbackKeyId, store.Path);
+            return new(key, KeySource.File);
         }
 
-        if (!string.IsNullOrWhiteSpace(envKeyValue))
-        {
-            // Validate BEFORE persisting, so a malformed env var never lands in the
-            // store and becomes the install's permanent bad state.
-            var key = LoadFromValueOrThrow(envKeyValue, envKeyId, EnvVarName);
-            store.Write(envKeyValue.Trim(), envKeyId);
-            return new(key, KeySource.MigratedFromEnvironment, false);
-        }
-
-        return new(null, KeySource.None, false);
+        return new(null, KeySource.None);
     }
 
     /// <summary>

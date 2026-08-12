@@ -186,9 +186,9 @@ public sealed class BackupService
     {
         // -q so psql's command-status tag doesn't reach the console. stdout is NOT
         // redirected here (the restore streams through), so without it a bare "DO"
-        // lands in the middle of `coffer-api restore` output — two of them, with
-        // the wipe below — which reads as debug noise escaping in an operator-facing
-        // command. NOTICEs still arrive on stderr, which is captured and surfaced.
+        // lands in the middle of the restore's own output — two of them, with the
+        // wipe below — which reads as debug noise escaping. NOTICEs still arrive on
+        // stderr, which is captured and surfaced.
         using var proc = StartProcess(
             "psql",
             [$"--dbname={database}", "--no-psqlrc", "-q", "-v", "ON_ERROR_STOP=1", "-f", "-"],
@@ -285,7 +285,7 @@ public sealed class BackupService
     /// pg_restore's CREATE for it fails "already exists", and the restore reports
     /// failure over a database that is actually fine — or worse, the collision
     /// masks one that isn't. That is not hypothetical; the collation below was
-    /// missing and broke every cross-install CLI restore.
+    /// missing and broke every cross-install restore.
     /// <para>
     /// Two classes are here despite the schema having no instance of one of them:
     /// materialized views, because <c>pg_views</c> structurally excludes them and

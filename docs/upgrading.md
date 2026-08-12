@@ -128,30 +128,45 @@ sudo docker compose exec -T -e PGPASSWORD="$(cat ~/coffer/secrets/postgres_passw
 
 ---
 
-## The master KEK variable, and an order that matters
+## The master key: from `.env` to a file
 
-ADR-0092 moved the master key out of `COFFER_MASTER_KEK_BASE64` into a file. On the
-first boot after upgrading, the value is copied into that file, the file becomes the
-source of truth, and the log tells you to remove the variable.
+ADR-0092 moved the master key out of `COFFER_MASTER_KEK_BASE64` into a file, honouring
+the variable for one release and copying it into the file on first boot.
+[ADR-0094](decisions/0094-restore-is-ui-only-and-the-kek-has-no-env-channel.md) closed
+that window: **the variable is no longer read at all.**
 
-**Do not remove it until the new compose file is in place.** Compose files from
-before that change declare the variable **required** (`:?`), so deleting it while one
-of those is still active breaks interpolation and every `docker compose` command with
-it. The app keeps running — it already has its config — but you cannot manage it.
+**Coming from 0.43.0 or later, there is nothing to do.** Your first boot on 0.43.x
+already wrote the key file, and the file has been authoritative since.
 
-Correct order:
+**Coming from 0.42.x or earlier, do this before upgrading.** Your key exists only in
+`.env`, so the new build finds no key over a database full of wrapped material and
+**refuses to start** — correctly, because minting a fresh key would orphan it. Put the
+key in the file first (the `coffer_data` volume is mounted at `/app/data`):
 
-1. Upgrade (the new compose, where the variable is optional, is now in place).
-2. Save the key from **System → Encryption → Show key**.
-3. Then remove the line, and confirm:
+```bash
+grep '^COFFER_MASTER_KEK_BASE64=' .env | cut -d= -f2- > master.key
+docker compose cp master.key api:/app/data/master.key && rm master.key
+```
+
+Then upgrade. If you find out the hard way — the container refusing to boot — the same
+command fixes it, and the startup error names it too. The fallback it also names,
+`--adopt-new-kek`, mints a fresh key and **abandons** the three sealed secrets (feed
+tokens, stored backup passphrase, Drive connection); it is for when the old key is
+genuinely lost, and it exits after writing so you must remove the flag before starting
+normally. Ledger data and passkeys survive either route.
+
+**Then remove the line from `.env` — but not before the new compose file is in place.**
+Compose files from before ADR-0092 declare the variable **required** (`:?`), so deleting
+it while one of those is active breaks interpolation and every `docker compose` command
+with it. The app keeps running, but you cannot manage it.
 
 ```bash
 sed -i '/^COFFER_MASTER_KEK_BASE64=/d' .env
 sudo docker compose config >/dev/null && echo "compose still resolves"
 ```
 
-Step 2 is not optional. After any rotation the `.env` copy is a key that opens
-nothing, so it is not a backup — the file is.
+Back up the key from **System → Encryption → Show key**, not from `.env` — after a
+rotation the `.env` copy opens nothing, and now nothing reads it either.
 
 ---
 

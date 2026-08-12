@@ -1,6 +1,7 @@
 // Admin whole-DB backup endpoints (ADR-0060), all behind RequireAdmin.
 // Authenticated-admin restore (ADR-0071 D3) is here too; the bootstrap (pre-auth)
-// restore + `coffer-api restore` remain for their cases.
+// restore covers a fresh install. ADR-0094 removed the `coffer-api restore` CLI, so
+// those two are the whole story.
 
 import { startAuthentication } from '@simplewebauthn/browser';
 

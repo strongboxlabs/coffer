@@ -10,7 +10,8 @@ import type { BackupSchedule, BackupSummary } from '@/lib/types';
 // Smoke tests for the admin Backups panel (ADR-0060). Behaviour locked down:
 //   * passphrase-not-set → "Set passphrase" CTA, Create disabled, gated empty state
 //   * passphrase-set + artifacts → "Change", Create enabled, rows with Download
-//   * no Restore affordance (restore is the operator CLI, not the UI)
+//   * the Restore affordance (ADR-0071 D3 put it here; ADR-0094 made the UI the only
+//     restore path)
 
 const SCHEDULE_OFF: BackupSchedule = {
     enabled: false, hourLocal: 3, minuteLocal: 0, timezone: null,

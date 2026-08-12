@@ -14,7 +14,7 @@
          the assembly by the StampGitVersion target below and surfaced
          via GET /api/meta/version. We compose InformationalVersion
          ourselves, so suppress the SDK's automatic +<sha> append. -->
-    <Version>0.44.6</Version>
+    <Version>0.45.0</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 

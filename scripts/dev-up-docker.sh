@@ -20,8 +20,10 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 echo "[dev-up-docker] repo: $repo_root"
 
-# .env is required — docker compose substitutes ${COFFER_MASTER_KEK_BASE64}, the
-# role passwords, etc. from it.
+# .env is required — docker compose substitutes the ports, RP id, feature toggles etc.
+# from it. It does NOT carry the master key (ADR-0094): the API mints one on first boot
+# into data/master.key on the coffer_data volume, so a wiped dev volume gets a new key.
+# The DB role passwords come from secrets/ as compose secrets, not from .env.
 if [ ! -f "$repo_root/.env" ]; then
     echo "[dev-up-docker] .env not found — copy .env.example and fill it in." >&2
     exit 1

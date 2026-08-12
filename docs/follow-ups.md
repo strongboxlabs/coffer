@@ -1,61 +1,28 @@
 # Follow-ups
 
-The whole not-yet-shipped backlog in one place: an ordered **Next** zone (what's
-shipping soon, in ship order) followed by the unordered **Backlog** behind it.
-(Merged from the former `roadmap.md`, 2026-07-24 — one file, one home per item.)
+The open-work backlog in one place: an ordered **Next** zone (what's shipping soon,
+in ship order) followed by the unordered **Backlog** behind it, grouped by area.
 
-**Lifecycle.** Add an item when it's surfaced. **Shipped items are deleted, not
-strikethrough-annotated** — this stays a list of open work, not an audit log (git
-history is the audit log). When you commit to shipping a backlog item next,
-**move** it up into Next — don't copy; an item lives in exactly one zone.
-Bigger-picture phase status lives in [README.md](../README.md)'s table.
+**Lifecycle.** Add an item when it's surfaced. **Shipped items are deleted** — this
+is a list of open work, not an audit log (git history is the audit log). When you
+commit to shipping a backlog item next, **move** it up into Next; an item lives in
+exactly one zone. Bigger-picture phase status lives in [README.md](../README.md)'s
+Status section.
 
 **Zones.**
 - **Next (ordered)** — PR-sized slices intended to ship, in ship order. Each has a
   concrete shape (problem · approach · gating). Delete when it merges.
-- **Backlog (unordered)** — everything below the Next section; shaped or not, no
-  schedule. Grouped by area, not prioritised.
+- **Backlog (unordered)** — grouped by area, not prioritised. Shaped or not, no
+  schedule.
 
-**Status legend.** Each backlog item has a short status line:
+**Status legend.** Most items carry a short status line:
 - *open* — surfaced, no schedule yet.
 - *blocked on X* — waiting on a specific dependency.
-- *partial — N of M done* — partially shipped; the remaining work is captured.
+- *partial* — partially shipped; the remaining work is what's described.
+- *parked* — assessed, deliberately not scheduled, with the condition that would
+  reopen it stated. Not the same as blocked: nothing is in the way.
 
 ---
-
-## Agreed roadmap (2026-07-28, reordered 2026-08-03, in order)
-
-*Empty — every agreed item is delivered or assessed-and-closed. The **Next** zone
-below is the queue; promote from Backlog when the next roadmap is agreed.*
-
-Delivered and removed from this list (git history is the audit log): snapshot
-restore performance (mig 188 + the on-demand scale lane; parked with ~9× timeout
-headroom — see that section), CI
-build-once + runner Docker reap (`scripts/ci-dotnet-shards.sh` + the ci.yml reap
-step; the measured pre-migrated-image dead end is recorded in
-[engineering-standards.md §9.1](engineering-standards.md#91-sharding-build-once-and-dont-assume-a-matrix-helps)),
-the representative reference ledger (#414), and the observability + audit-trail
-gap sweep (only the prod OTLP exporter remains — see Observability below).
-
-**Closed, not deferred — the whole former roadmap #1.** Both halves were assessed
-and closed; do not re-add either. The `holdings_market_value_as_of` unconstrained
-return columns are a **known, accepted** blind spot: the magnitudes needed to
-overflow are not reachable by any plausible portfolio on a ~50-year horizon (kept
-documented under Systemic boundary testing so it reads as a deliberate acceptance,
-not an oversight).
-
-The phantom `$1`-placeholder in-kind transfer corruption exists only in one owner's
-**legacy MD import**, which is import-once: no future import re-triggers it. PR #412 shipped
-a generic importer step that reclassified every such transfer to a non-realizing
-`transfer_shares`; PR #413 reverted it
-because the population is heterogeneous and the blanket rule was actively wrong —
-**orphan `sellx` rows are real sales** whose proceeds field was corrupted to the
-share count, so making them non-realizing *erases real gains*. The rest are true
-paired transfers, money-market $1-NAV, and genuinely cheap securities (a $0.55
-option a loose price filter caught). It needs per-transfer judgment, not product
-code, and was remediated by a one-off personal data scrub deliberately kept out of
-the codebase. A future MD re-import needing correct `$1`-transfer handling is a
-fresh design, not this item.
 
 ## Next (ordered)
 
@@ -80,12 +47,14 @@ provider key.
 *Unordered, grouped by area. Promote an item into **Next** above when you commit
 to shipping it.*
 
-## Secrets handling
 
-### Database credentials still travel by environment variable
+### Secrets handling
+
+#### Database credentials still travel by environment variable
 *open (surfaced 2026-08-06, alongside ADR-0092).*
 
-ADR-0092 moved the master KEK out of `COFFER_MASTER_KEK_BASE64` into a file,
+ADR-0092 moved the master KEK out of `COFFER_MASTER_KEK_BASE64` into a file (and
+ADR-0094 removed the variable outright),
 because an environment variable is readable via `docker inspect`,
 `/proc/<pid>/environ`, child process environments and crash dumps. The database
 credentials still travel exactly that way, so the reasoning now applies unevenly.
@@ -114,7 +83,7 @@ and adoption mutate it) and it is deliberately the one secret kept out of the
 database so it can't ride along in a dump. This is real hardening, not a live
 vulnerability, and it wants its own ADR rather than being bolted on.
 
-### The backup passphrase ceremony is lighter than the master key's
+#### The backup passphrase ceremony is lighter than the master key's
 *open (surfaced 2026-08-06).*
 
 ADR-0092 D5b made the stored backup passphrase revealable behind a fresh assertion,
@@ -127,9 +96,9 @@ artifact — a `.cofferbak` is sealed under it, not under the KEK — the argume
 first-class "save this" moment is arguably stronger there. Needs a shape: probably a
 prompt when backups are first enabled rather than another setup step.
 
-## Localisation
+### Localisation
 
-### Per-user language/culture + a ledger main currency
+#### Per-user language/culture + a ledger main currency
 
 Setup should eventually offer language/culture and a main currency. Two items of
 very different weight, deliberately listed apart — do not ship them as one
@@ -158,9 +127,9 @@ from the ledger's, which pulls in FX rates, historical rates for point-in-time
 valuation, and every existing report/aggregate. Scope it as its own ADR before
 any UI is drawn.
 
-## SPA / register
+### SPA / register
 
-### Tax / transaction date — systemic surface
+#### Tax / transaction date — systemic surface
 
 *Status: partial — `transacted_at` write plumbing + the read-only
 bank `tax {date}` sub-label shipped; remaining: (a) a Tax-date
@@ -184,9 +153,9 @@ posted date when `transactedAt !== postedAt`. The remaining UX loop:
   on investment rows is currently invisible — needs its own
   treatment.
 
-## Bank feeds
+### Bank feeds
 
-### Bulk security-mapping step in the OFX import dialog
+#### Bulk security-mapping step in the OFX import dialog
 
 *Status: open. Captured 2026-06-08 while testing PR #160.*
 
@@ -220,9 +189,9 @@ this table on every read, so every row of the matched ticker
 auto-resolves on the next register fetch. K decisions in one
 batch instead of K trips through the editor.
 
-## Register surface
+### Register surface
 
-### Register non-date scroll affordance
+#### Register non-date scroll affordance
 
 *Status: open. Surfaced 2026-07-14 during the column-sort dev review.*
 
@@ -243,14 +212,14 @@ either feed the virtual list the true total entry count (already available from
 total-count-based thumb in the rail gutter. Windowing-level work; deferred as
 disproportionate to the sort slice.
 
-### Splits editor — optimization / refactor
+#### Splits editor — optimization / refactor
 
 *Status: open. Requested 2026-07-11; shape TBD.*
 
 The multi-split transaction editor wants a perf + code-structure
 pass. Scope to be defined against the current editor.
 
-### Bulk Categorize / Tag actions
+#### Bulk Categorize / Tag actions
 
 *Status: blocked on the bulk override / categorisation write endpoints.*
 
@@ -263,9 +232,9 @@ the recon-status bulk buttons use today.
 
 ---
 
-## Sidebar
+### Sidebar
 
-### Folder accounts (sub-grouping within types)
+#### Folder accounts (sub-grouping within types)
 
 *Status: open. Schema change required.*
 
@@ -297,7 +266,7 @@ up the balance."
 Lean toward (1) — minimum surface area, single field every
 account-aware query already projects.
 
-### Sidebar tab reorder (drag-to-rearrange)
+#### Sidebar tab reorder (drag-to-rearrange)
 
 *Status: open. Schema column already reserved.*
 
@@ -316,7 +285,7 @@ appends new tabs to the end (max+1). Drag-to-reorder needs:
 Land when the user actually wants to reorder — at 2-4 tabs the
 append-order is usually fine.
 
-### Remember last-active sidebar tab across sessions
+#### Remember last-active sidebar tab across sessions
 
 *Status: open. Defer per design discussion.*
 
@@ -328,7 +297,7 @@ per-(user, ledger) UI state including last-active tab,
 collapsed-section state, etc. Land when there's more than one
 preference worth persisting.
 
-### Drop the vestigial counters on `sync_runs`
+#### Drop the vestigial counters on `sync_runs`
 
 *Status: open cleanup. Slice 2c.1 left `txns_merged` / `txns_queued` /
 `txns_skipped` in place on `sync_runs` (always 0 — they're
@@ -338,7 +307,7 @@ dropped the sibling vestigial tables (`pending_transactions`,
 sync_runs counters survived because they live on a table we
 still use. Drop them in a future cleanup.*
 
-### Sync activity log retention
+#### Sync activity log retention
 
 *Status: open. Slice 2c.1 keeps every `sync_runs` row forever. At
 one sync/day that's ~365 rows/year/connection — fine through
@@ -348,7 +317,7 @@ re-evaluate. Likely shape: keep last 90 days verbose, roll
 older runs into a per-month summary row; or simply LIMIT the
 list query and never paginate beyond N. No automation today.*
 
-### Scheduled-sync worker (slice 2d-ish)
+#### Scheduled-sync worker (slice 2d-ish)
 
 *Status: open. The scheduler framework exists (`scheduled_jobs` mig 136 +
 `IScheduledJobHandler` / `IGlobalScheduledJobHandler`, already driving daily
@@ -359,7 +328,7 @@ Today every `sync_runs` row carries a `triggered_by_user_id`; a background
 daily-poll handler would land rows with NULL there. The activity panel + counters
 already accommodate this — no UI change needed when the worker ships.
 
-### Persist failed SimpleFinException runs more granularly
+#### Persist failed SimpleFinException runs more granularly
 
 *Status: open. Slice 2c.1 captures the exception message verbatim
 in `sync_runs.error_message`. Future polish: capture the
@@ -368,7 +337,7 @@ diagnostics-fast-path case where the bank breaks the v2
 contract. Probably as a JSONB column or a child table parallel
 to `sync_run_errors`.*
 
-### Bulk Approve via ADR-0024 selection
+#### Bulk Approve via ADR-0024 selection
 
 *Status: slice 2d. Right-click → Approve handles single rows
 today; the ADR-0024 bulk selection machinery already exists
@@ -376,7 +345,7 @@ and would extend cleanly to a bulk-approve endpoint
 (`POST /api/ledgers/{id}/transactions/bulk-approve` with a
 `SelectionRequest` body).*
 
-### Rule-based auto-categorization on sync
+#### Rule-based auto-categorization on sync
 
 *Status: slice 2d. MD's screenshot shows the yellow
 pending rows already carry categories (Insurance:Automobile,
@@ -389,9 +358,9 @@ the leg insert. Approve flow stays unchanged.*
 
 ---
 
-## Investment data
+### Investment data
 
-### Per-security filter on the register Toolbar
+#### Per-security filter on the register Toolbar
 
 *Status: open. Small SPA-only slice once A1.c (investment register
 row rendering) lands.*
@@ -410,7 +379,7 @@ on the register page endpoint; LINQ `Where` against
 `HoldingsRepository.GetByBrokerageAsync` (already cached for
 the Portfolio View) so no extra round-trip.
 
-### A5 — Edit Lots affordance
+#### A5 — Edit Lots affordance
 
 *Status: queued after A4 (the editor + FIFO lot closure) lands.*
 
@@ -444,7 +413,7 @@ computed; A5 stores the override and the recompute honors it on the next pass.
 `holdings.cost_basis` stays FIFO (Σ open-lot cost) — A5 changes *which* lots are
 consumed, not the basis method.
 
-### Stock-split lot fan-out
+#### Stock-split lot fan-out
 
 *Status: open. Triggers when A4 ships the `split` action button.*
 
@@ -457,9 +426,9 @@ once the editor is in place.
 
 ---
 
-## Multi-user collaboration
+### Multi-user collaboration
 
-### SSE notifications for live edits across users on the same ledger
+#### SSE notifications for live edits across users on the same ledger
 
 *Status: open. Post-multi-user (concurrent-editing) shape.*
 
@@ -495,9 +464,9 @@ connections, idle-timeout config, reverse-proxy buffering).
 
 ---
 
-## Observability
+### Observability
 
-### Prod OTLP tracing exporter
+#### Prod OTLP tracing exporter
 
 *Status: blocked on a collector existing to receive spans. The last open item from
 [ADR-0086](decisions/0086-mcp-write-observability.md); the codebase-wide
@@ -513,9 +482,9 @@ access log appends the business `code` on a rejection); and durable audit rows f
 Moneydance import + snapshot restore (`provider_runs` generalized to
 `ledger_operations`, migration 185, surfaced in Settings→Activity).
 
-## MCP + reporting
+### MCP + reporting
 
-### MCP write/OAuth control-plane (PR C)
+#### MCP write/OAuth control-plane (PR C)
 
 *Status: open. The last of the 2026-07-17 MCP-hardening tracks; PR A (read
 surface) + PR B (investment aggregation) shipped.*
@@ -529,14 +498,14 @@ surface) + PR B (investment aggregation) shipped.*
 (The immediate kill-switch shipped in 0.30.1 — it is now the sole write gate.
 The per-call write audit lives under "MCP per-tool-call audit" below.)
 
-### Budgets + budget-vs-actual
+#### Budgets + budget-vs-actual
 
 *Status: open. The next backend/product slice after historical valuations (PR B, shipped).*
 
 Whole subsystem: schema (amount/category/period) + API + UI + variance report +
 MCP exposure.
 
-### Realistic anonymized demo import
+#### Realistic anonymized demo import
 
 *Status: open. Surfaced during PR B (historical valuations) design. User-requested; PII-safe approach agreed.*
 
@@ -549,7 +518,7 @@ numbers + jittered amounts + shifted dates — nothing real copied, so there is 
 PII to leak. Deterministic C# generator (project stack, no Python); decide
 replace-vs-new + update `DemoSampleImportTests` + provisioning.
 
-### Canned + memorized reports (reuse the MCP reporting layer)
+#### Canned + memorized reports (reuse the MCP reporting layer)
 
 The MCP server (ADR-0063) introduces a reusable reporting layer:
 a serializable **`ReportSpec`** (measure · group-by dims · filters ·
@@ -580,9 +549,9 @@ this same layer, not a parallel one:**
   multi-currency reports. Likely its own ADR when the Reports UI is
   scheduled.
 
-## Code structure
+### Code structure
 
-### Domain-split the remaining mega-files
+#### Domain-split the remaining mega-files
 
 *Status: open, opportunistic. Several files have grown past ~1.2K lines and want
 decomposing by domain (pattern locked in
@@ -602,180 +571,69 @@ Current offenders (line counts 2026-07-24):
 
 ---
 
-## Test / CI speed
+### Testing
 
-*Status: no known structural lever left — reopen only with a measurement.* The
-Transactions-shard split (2026-07) cut the suite 613s → 401s, and building once
-before running the shards in parallel (`scripts/ci-dotnet-shards.sh`) collapsed
-~1000s of sequential execution to ~300s wall-clock. What remains is bound by test
-execution across the shards (233-317s each), not by orchestration.
+#### Boundary cases for the remaining financial suites
+*partial. The foundation shipped; the per-suite sweep is unfinished.*
 
-Before proposing another optimization here, read
-[engineering-standards.md §9.1](engineering-standards.md#91-sharding-build-once-and-dont-assume-a-matrix-helps):
-the pre-migrated-image idea was built, benchmarked and abandoned for zero gain, on
-the strength of a bootstrap cost that had been assumed rather than measured.
+Two prod failures came from tests using kiddie-pool data ($100, 10 shares) that never
+approached the magnitudes where money math breaks, so financial paths now test a
+`{ typical, boundary }` `[Theory]` matrix against
+`tests/Api.Tests/Integration/Infra/Boundary.cs` — one source of truth for the edge
+values, each documenting the limit it probes (12dp fractional shares, which force a
+24dp `qty × unit_cost`; values near the NUMERIC→`decimal` ceiling; the `(25,12)` and
+`(19,2)` column maxima). `SyntheticLedger.AddBoundaryPositionAsync` seeds a large
+fractional position in one call. Realized gains carries its case already.
 
-## Systemic boundary testing for financial data (LOCKED — full audit)
+Still to add, by theme: holdings / net worth, returns (IRR/TWR), in-kind transfer,
+cost-basis recompute, snapshot round-trip, importer money mapping, register
+aggregation, and the backup/restore money round-trip.
 
-**Why.** Two prod failures in one session (mig 180 `unit_cost` precision → 24dp
-`cost_basis_sold` → .NET `decimal` overflow on read; and the snapshot OOM) both
-slipped through because tests used kiddie-pool data ($100, 10 shares) that never
-approached the magnitude/scale boundaries where money math actually breaks. For
-financial data this is unacceptable — test data must mirror real magnitude AND
-push scale/precision to the limits.
+Two ledger-wide invariants also remain unasserted, both aggregation paths where
+magnitude bites: **net worth reconciles** between the overview and the as-of
+valuation feeder (the two compute it by different routes and nothing asserts they
+agree), and **snapshot round-trips correctly at ledger scale** (restore latency is
+asserted; correctness at scale is not). The four invariants that did ship live in
+`ReferenceLedgerInvariantsTests`.
 
-**Decision (2026-07-27).** Full audit: every test touching money, quantity, or an
-aggregation/`decimal`-materialisation path gets a boundary case. Several PRs.
+This complements the schema-drift guards: those catch the *column* side, boundary
+data catches the *code-path* side.
 
-**Foundation (PR 1).**
-- `tests/Api.Tests/Integration/Infra/Boundary.cs` — one source of truth for edge
-  values, each documenting the limit it probes: `FractionalShares` (12dp → forces
-  24dp `qty×unit_cost`), `LargeMoney` / `NearDecimalCeiling` (push NUMERIC→decimal,
-  ~28-29 sig digits), `MaxScaleQuantity` / `MaxMoney` (fit `(25,12)` / `(19,2)`).
-- `SyntheticLedger.AddBoundaryPositionAsync(...)` — seed a representative large
-  fractional position in one call.
-- Convention: financial paths use `[Theory]` with a `{ typical, boundary }` matrix
-  so the boundary runs automatically. Documented in `engineering-standards.md`.
-
-**Sweep (subsequent PRs, by theme).** Add a boundary case to every financial
-suite: realized gains (done: `Large_fractional_position…overflow`), holdings /
-net-worth (Overview), returns (IRR/TWR), in-kind transfer, cost-basis recompute,
-snapshot round-trip, importer money mapping, register/resolved-transaction
-aggregation, backup/restore money round-trip. Scope map: see the Explore pass
-enumerating every `decimal`/`NUMERIC`/`Sum`/`GetDecimal` path.
-
-**Complements the schema drift guards** (`SchemaDriftGuardTests`: unbounded-numeric
-+ precision family) — guards catch the *column* side, boundary data catches the
-*code-path* side. Together they close the overflow/precision class.
-
-**Two end-to-end invariants still unasserted.** The reference-ledger harness
-(`ReferenceLedgerInvariantsTests`, PR #414) ships four ledger-wide invariants —
-every header balances, holdings = Σ open lots for quantity AND cost_basis,
-realized_gains only on disposals, no negative holdings — plus a shape-coverage
-guard. Two from the original end-to-end list did **not** ship and belong in this
-sweep, since both are aggregation paths where magnitude bites:
-
-- **Net worth reconciles** across the overview and the as-of valuation feeder —
-  the two compute it by different routes and nothing asserts they agree.
-- **Snapshot round-trips byte-for-byte** — asserted for restore *correctness*
-  nowhere at ledger scale (restore *latency* is tracked under Snapshot restore
-  performance below).
-
-**Known blind spot, accepted: function return types.** The guard family covers
-table columns only — a `RETURNS TABLE(... NUMERIC)` column is unconstrained even
-when every underlying table column is properly typed, so the guard cannot see it.
-The known instance is `holdings_market_value_as_of`
+**Known limitation, accepted.** The guards cover table columns only, so a
+`RETURNS TABLE(... NUMERIC)` column is unconstrained even when every underlying
+column is properly typed. The known instance is `holdings_market_value_as_of`
 ([172_holdings_value_as_of.sql:41-46](../db/migrations/172_holdings_value_as_of.sql#L41-L46)),
-which declares `quantity NUMERIC, market_value NUMERIC`.
+which declares `quantity NUMERIC, market_value NUMERIC`. Reaching an overflow there
+needs a position no plausible portfolio produces on a ~50-year horizon, so it is
+documented rather than fixed.
 
-**Assessed and accepted — do not re-add as work.** Overflowing .NET `decimal` from
-here needs a 24dp intermediate (12dp quantity × 12dp unit cost) to also reach
-~28-29 significant digits, i.e. a position whose magnitude no plausible portfolio
-reaches on a ~50-year horizon. Unlike migration 180 — a real failure, where the
-*precision* widening alone pushed a live value past the ceiling — no reachable data
-triggers this one. Documented so the gap is a known, deliberate acceptance rather
-than an oversight; revisit only if a real overflow trace appears.
+### Performance
 
-## Snapshot restore performance
+#### Snapshot restore — the payload reinsert path
+*parked, not blocked. Reopen if a real ledger approaches ~200k transactions, or if
+the stress lane's printed restore figure starts climbing.*
 
-*Status: effectively done — not worth further work at current scale. The derived-state
-rebuilds are addressed (mig 188), the walk's cost is measured and demoted, and the
-lane now asserts latency. Remaining ideas are recorded below for if that changes.*
+Restore measures ~65s on a 50k-transaction ledger against a 600s command timeout —
+roughly 9× headroom — and the time goes to the delete+reinsert of an ~85 MB jsonb
+payload (`jsonb_populate_recordset` over ~100k legs plus every sibling table), not to
+the derived-state rebuilds, which were measured and removed (migration 188). The FIFO
+walk was never the bottleneck: ~0.1s per position on the write path.
 
-**Headroom, which is why this is parked.** Restore measures ~65s on a
-50k-transaction ledger against a 600s command timeout — roughly **9× headroom**, so
-a ledger would need to approach half a million transactions before restore timed out
-again. That is far past any personal-finance horizon, and the failure that started
-this (a 30s default timeout, lifted in 0.36.8) cannot recur at these margins.
-Optimising the reinsert path would be tuning something that already works with an
-order of magnitude to spare. Revisit if a real ledger approaches ~200k transactions,
-or if the lane's printed restore figure starts climbing.
+If it is picked up, start with a per-statement breakdown rather than a guess — that
+was the lesson of migration 188, which was sold as the fix for something it barely
+moved. Candidates: `jsonb_to_recordset` with explicit column lists, COPY from a
+set-returning function, or splitting the payload per table so each insert streams.
 
-**Done (mig 188).** A full-ledger restore ran ~27s. Both post-reinsert rebuilds
-turned out to be avoidable:
+**Running the measurements.** The `Integration.Stress` namespace is excluded from the
+sharded suite, so a 50k-transaction seed never sits in a PR's critical path — which
+also means a latency regression won't fail the PR that caused it. Run it on demand
+after touching snapshots, the restore function, the balance rebuild, or
+`recompute_holdings_cost_basis`:
 
-- `recompute_holdings_cost_basis` was rebuilding what the payload already carried.
-  `holdings` and `lots` are captured, so restore reinserted them and the recompute
-  then overwrote them — its only unique output was `realized_gains`. That table is
-  now captured too (it keys on `sell_leg_id`, a captured `txn_legs` row), and the
-  recompute is gone from restore. Safe because restore refuses a cross-schema-version
-  restore, so capture-time and restore-time derivation logic are identical by
-  construction — a coupling mig 188's header documents, since relaxing the version
-  guard would invalidate it.
-- The per-account balance loop was doing dead work: a `DELETE` that could match
-  nothing (restore already cleared the ledger's rows) and a starting-balance lookup
-  that with a `0001-01-01` floor could only resolve to `opening_balance`, once per
-  account — including every category account with no legs, so ≥103 no-op iterations
-  per ledger after ADR-0091. Replaced by `fn_recompute_balances_for_ledger`, one
-  set-based pass. Equivalence is pinned by `LedgerBalanceRecomputeEquivalenceTests`,
-  which compares it against the per-account function over a ledger carrying every
-  predicate that could diverge (override-shifted `posted_at`, hidden, merged-away,
-  multi-split, non-zero opening balance, an account with no legs) — and was itself
-  verified by removing the `PARTITION BY` and confirming it failed.
+```bash
+dotnet test --filter "FullyQualifiedName~Integration.Stress"
+```
 
-**Measured (the `Integration.Stress` lane now exists).** Numbers that
-corrected the reasoning above, all on a seeded 50k-transaction / 200-holding ledger:
-
-| Phase | Time |
-|---|---|
-| seed (set-based, 50k txns) | ~4s |
-| snapshot create | ~3.4s (~85 MB payload) |
-| **restore** | **~65s** |
-| FIFO recompute, whole ledger, 200 holdings × 22 events | ~0.3s |
-| FIFO recompute, whole ledger, 20 holdings × 500 events, 8k lots | ~2.3s |
-| FIFO recompute, one position (what a txn write pays) | ~0.1s |
-
-**The FIFO walk was never the bottleneck.** Mig 188's header originally claimed its
-nested loops "are the ~27s"; measurement says otherwise, and the header now carries
-the correction. Restore's time is the delete+reinsert of an ~85 MB payload. Mig 188
-is still correct on its own terms — it stops re-deriving state the payload already
-carries, removes provably dead work, and makes restore reproduce the snapshot — but
-it was a modest saving sold as the fix.
-
-Note also that breadth and depth are not interchangeable: the walk re-queries the
-open-lot set per event, so cost grows with events × open-lots *within* a holding.
-The 200-holding fixture (22 events each) understates it 7.7× versus 20 holdings
-with 500 events each.
-
-**Remaining.**
-
-- **The payload reinsert path** — where restore's ~65s actually goes: restore
-  `jsonb_populate_recordset`s ~100k legs plus every sibling table out of one jsonb
-  document. *Parked on the headroom above, not blocked.* If it is ever picked up,
-  start with a per-statement breakdown rather than a guess (the lesson from mig 188);
-  candidates are `jsonb_to_recordset` with explicit column lists, COPY from a
-  set-returning function, or splitting the payload per table so each insert streams.
-- **The FIFO walk: deliberately NOT scheduled.** Hoisting its open-lot re-query out
-  of the per-event loop was the expected follow-up; at ~0.1s per position on the
-  write path, it does not currently justify surgery on the most
-  correctness-sensitive function in the system. `FifoRecomputeCostTests` keeps the
-  figures visible so this can be revisited if the shape of real ledgers changes.
-
-**The stress/boundary lane (built).** The `Integration.Stress` namespace is
-excluded from the sharded suite (`scripts/ci-dotnet-shards.sh`), so a
-50k-transaction seed never sits in a PR's critical path; run it on demand with
-`dotnet test --filter "FullyQualifiedName~Integration.Stress"`. Trade-off accepted deliberately: a latency regression will not fail
-the PR that caused it, so run the lane after touching snapshots, the restore
-function, the balance rebuild, or `recompute_holdings_cost_basis`.
-
-`StressLedger` seeds set-based straight into Postgres rather than committing a
-fixture: at 50k transactions the equivalent MD-export JSON would be tens of MB in
-every clone, and this harness is about scale, not import fidelity (the
-representative fixture covers shapes). Ids derive from the row index so runs are
-reproducible, and consistency is established by calling the product's own
-`recompute_holdings_cost_basis` over a seeded graph rather than by the seeder
-asserting what it thinks the answer is — so the seeded ledger satisfies the same
-invariants `ReferenceLedgerInvariantsTests` checks, by construction.
-
-Restore now has its first latency assertion (120s budget against the 600s command
-timeout — deliberately loose, since the lane runs on whatever hardware invokes it;
-the printed timings are the real output). Both stress tests re-assert
-header-balance and holdings-reconcile-with-lots at scale, which already earned
-their keep: the lot-reconciliation assertion caught a fixture bug where buys spread
-90 days apart ran decades past the disposals, leaving positions oversold because
-the FIFO walk can only offer lots dated on or before a sell.
-
-## Process notes
-
-*(Empty. `mockups/` was deleted as planned — the surfaces it referenced have all
-shipped, and it was the last place still carrying a real institution name.)*
+It carries a deliberately loose 120s restore assertion (the lane runs on whatever
+hardware invokes it; the printed timings are the real output) and re-asserts
+header-balance and holdings-reconcile-with-lots at scale.

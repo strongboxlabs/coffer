@@ -1,6 +1,7 @@
 # 0061 — Bootstrap restore: restore-from-backup in the setup UI
 
-Status: Accepted
+Status: Accepted — amended by [ADR-0094](0094-restore-is-ui-only-and-the-kek-has-no-env-channel.md), which removed the
+`coffer-api restore` CLI this ADR kept "for headless DR and very large backups".
 Date: 2026-06-24
 Amends: [ADR-0060](0060-whole-db-backup-and-admin-role.md)
 

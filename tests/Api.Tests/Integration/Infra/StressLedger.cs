@@ -117,18 +117,25 @@ public static class StressLedger
             v_banks   uuid[];
             v_cats    uuid[];
             v_secs    uuid[];
+            -- Six hex digits of the ledger id, mixed into every derived id below.
+            -- Without it the ids depend only on the row index, so seeding a SECOND
+            -- ledger in the same database collides on accounts_pkey — which is what
+            -- happened whenever both stress tests ran in one pass, i.e. whenever
+            -- anyone used the documented `--filter Integration.Stress` command. Ids
+            -- stay derived (reproducible per ledger), just no longer global.
+            v_disc    text := substr(replace(p_ledger_id::text, '-', ''), 1, 6);
         BEGIN
             -- ----- Accounts: a handful of banks, a spread of categories ---------
             INSERT INTO accounts (id, ledger_id, name, account_type, currency_code,
                                   opening_balance, is_active, created_at)
-            SELECT ('10000000-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
+            SELECT ('10' || v_disc || '-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
                    p_ledger_id, 'stress-bank-' || i, 'bank', 'USD',
                    1000 + i, TRUE, v_base
               FROM generate_series(1, 5) i;
 
             INSERT INTO accounts (id, ledger_id, name, account_type, category_kind,
                                   currency_code, opening_balance, is_active, created_at)
-            SELECT ('11000000-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
+            SELECT ('11' || v_disc || '-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
                    p_ledger_id, 'stress-cat-' || i, 'category', 'expense', 'USD',
                    0, TRUE, v_base
               FROM generate_series(1, 20) i;
@@ -142,14 +149,17 @@ public static class StressLedger
 
             -- ----- Bank activity: two balanced legs per header ------------------
             INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at, payee)
-            SELECT ('20000000-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
+            SELECT ('20' || v_disc || '-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
                    p_ledger_id, 'manual',
+                   v_base + (i * interval '1 hour'),
+                   -- transacted_at defaults to the posted date, which is what the
+                   -- product does when nobody sets a tax date (migration 183 / #436).
                    v_base + (i * interval '1 hour'),
                    'stress-payee-' || (i % 500)
               FROM generate_series(1, p_bank_txns) i;
 
             INSERT INTO txn_legs (header_id, account_id, posting_index, amount, ledger_id)
-            SELECT ('20000000-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
+            SELECT ('20' || v_disc || '-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
                    v_banks[1 + (i % array_length(v_banks, 1))],
                    0,
                    -- Vary magnitudes; keep 2dp so ck_txn_legs_amount_scale_2 holds.
@@ -157,7 +167,7 @@ public static class StressLedger
                    p_ledger_id
               FROM generate_series(1, p_bank_txns) i
             UNION ALL
-            SELECT ('20000000-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
+            SELECT ('20' || v_disc || '-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
                    v_cats[1 + (i % array_length(v_cats, 1))],
                    1,
                    round((1 + (i % 977) + (i % 7) / 8.0)::numeric, 2),
@@ -166,7 +176,7 @@ public static class StressLedger
 
             -- ----- Securities + holding shells ---------------------------------
             INSERT INTO securities (id, ledger_id, name, ticker, created_at)
-            SELECT ('30000000-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
+            SELECT ('30' || v_disc || '-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
                    p_ledger_id, 'Stress Security ' || i, 'STR' || i, v_base
               FROM generate_series(1, p_holdings) i;
 
@@ -174,9 +184,9 @@ public static class StressLedger
               FROM securities WHERE ledger_id = p_ledger_id;
 
             INSERT INTO holdings (id, account_id, security_id, ledger_id, quantity, cost_basis, as_of)
-            SELECT ('31000000-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
+            SELECT ('31' || v_disc || '-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
                    p_holdings_account_id,
-                   ('30000000-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
+                   ('30' || v_disc || '-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
                    p_ledger_id, 0, 0, v_base
               FROM generate_series(1, p_holdings) i;
 
@@ -188,8 +198,9 @@ public static class StressLedger
             -- after a sell cannot fund it. Spacing these 90 days apart put most
             -- buys decades past the sells at BuysPerHolding=400 and left holdings
             -- oversold — caught by the lot-reconciliation assertion.
-            SELECT ('40000000-0000-4000-8000-' || lpad(to_hex(s * 1000 + b), 12, '0'))::uuid,
+            SELECT ('40' || v_disc || '-0000-4000-8000-' || lpad(to_hex(s * 1000 + b), 12, '0'))::uuid,
                    p_ledger_id, 'manual',
+                   v_base + ((s * 37 + b * 3) * interval '1 day'),
                    v_base + ((s * 37 + b * 3) * interval '1 day'),
                    'buy-' || s, 'buy'
               FROM generate_series(1, p_holdings) s,
@@ -198,11 +209,11 @@ public static class StressLedger
             INSERT INTO txn_legs (header_id, account_id, posting_index, amount, ledger_id,
                                   security_id, quantity, unit_price, posting_role)
             -- Security side: +cost, fractional quantity (12dp scale exercised).
-            SELECT ('40000000-0000-4000-8000-' || lpad(to_hex(s * 1000 + b), 12, '0'))::uuid,
+            SELECT ('40' || v_disc || '-0000-4000-8000-' || lpad(to_hex(s * 1000 + b), 12, '0'))::uuid,
                    p_holdings_account_id, 0,
                    round((10 * (b + 1) * (1 + (s % 13)))::numeric, 2),
                    p_ledger_id,
-                   ('30000000-0000-4000-8000-' || lpad(to_hex(s), 12, '0'))::uuid,
+                   ('30' || v_disc || '-0000-4000-8000-' || lpad(to_hex(s), 12, '0'))::uuid,
                    round((1.5 + (b % 5) + (s % 3) / 3.0)::numeric, 12),
                    round((10 * (b + 1) * (1 + (s % 13)))::numeric
                          / round((1.5 + (b % 5) + (s % 3) / 3.0)::numeric, 12), 6),
@@ -211,7 +222,7 @@ public static class StressLedger
                    generate_series(1, p_buys_per_holding) b
             UNION ALL
             -- Cash side: -cost.
-            SELECT ('40000000-0000-4000-8000-' || lpad(to_hex(s * 1000 + b), 12, '0'))::uuid,
+            SELECT ('40' || v_disc || '-0000-4000-8000-' || lpad(to_hex(s * 1000 + b), 12, '0'))::uuid,
                    p_brokerage_id, 1,
                    -round((10 * (b + 1) * (1 + (s % 13)))::numeric, 2),
                    p_ledger_id, NULL, NULL, NULL, NULL
@@ -235,8 +246,9 @@ public static class StressLedger
             -- ----- Sells: disposals, so the FIFO walk has lots to consume -------
             -- Dated after every buy so lot availability is never the constraint.
             INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at, payee, action)
-            SELECT ('50000000-0000-4000-8000-' || lpad(to_hex(s * 1000 + k), 12, '0'))::uuid,
+            SELECT ('50' || v_disc || '-0000-4000-8000-' || lpad(to_hex(s * 1000 + k), 12, '0'))::uuid,
                    p_ledger_id, 'manual',
+                   v_base + interval '20 years' + ((s * 7 + k) * interval '1 day'),
                    v_base + interval '20 years' + ((s * 7 + k) * interval '1 day'),
                    'sell-' || s, 'sell'
               FROM generate_series(1, p_holdings) s,
@@ -245,11 +257,11 @@ public static class StressLedger
             INSERT INTO txn_legs (header_id, account_id, posting_index, amount, ledger_id,
                                   security_id, quantity, unit_price, posting_role)
             -- Security side: -proceeds, negative quantity (the disposal).
-            SELECT ('50000000-0000-4000-8000-' || lpad(to_hex(s * 1000 + k), 12, '0'))::uuid,
+            SELECT ('50' || v_disc || '-0000-4000-8000-' || lpad(to_hex(s * 1000 + k), 12, '0'))::uuid,
                    p_holdings_account_id, 0,
                    -round((40 * (1 + (s % 11)))::numeric, 2),
                    p_ledger_id,
-                   ('30000000-0000-4000-8000-' || lpad(to_hex(s), 12, '0'))::uuid,
+                   ('30' || v_disc || '-0000-4000-8000-' || lpad(to_hex(s), 12, '0'))::uuid,
                    -round((2.0 + (k % 3))::numeric, 12),
                    round((40 * (1 + (s % 11)))::numeric
                          / round((2.0 + (k % 3))::numeric, 12), 6),
@@ -258,7 +270,7 @@ public static class StressLedger
                    generate_series(1, p_sells_per_holding) k
             UNION ALL
             -- Cash side: +proceeds.
-            SELECT ('50000000-0000-4000-8000-' || lpad(to_hex(s * 1000 + k), 12, '0'))::uuid,
+            SELECT ('50' || v_disc || '-0000-4000-8000-' || lpad(to_hex(s * 1000 + k), 12, '0'))::uuid,
                    p_brokerage_id, 1,
                    round((40 * (1 + (s % 11)))::numeric, 2),
                    p_ledger_id, NULL, NULL, NULL, NULL

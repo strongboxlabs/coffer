@@ -162,21 +162,20 @@ services:
       COFFER_API__ServiceConnectionString: "Host=postgres;Port=5432;Database=${POSTGRES_DB:-coffer};Username=coffer_service"
       COFFER_API__AppPasswordFile: /run/secrets/coffer_app_password
       COFFER_API__ServicePasswordFile: /run/secrets/coffer_service_password
-      # Master KEK. ADR-0092 D1 moved the key to a FILE (default
-      # data/master.key on the coffer_data volume below); COFFER_MASTER_KEY_PATH
-      # overrides that location — point it at /run/secrets/coffer_kek or a
+      # Master KEK. The key lives in a FILE (ADR-0092 D1) — default
+      # data/master.key on the coffer_data volume below; COFFER_MASTER_KEY_PATH
+      # overrides that location, so point it at /run/secrets/coffer_kek or a
       # projected k8s Secret to keep the key off the app's own volume.
       #
-      # COFFER_MASTER_KEK_BASE64 is DEPRECATED and no longer required: it is
-      # honoured for one release, copied to the key file on first boot, and then
-      # logged as deprecated. Hence `:-` (optional) rather than `:?` (required) —
-      # a fresh install has no env key and gets one from the setup ceremony,
-      # while an upgrading install still passes its existing key through.
+      # There is no env var carrying the key any more (ADR-0094 removed
+      # COFFER_MASTER_KEK_BASE64). The API mints its own on first boot when the
+      # database holds no wrapped material and the setup ceremony shows it once; an
+      # install whose key exists elsewhere supplies it by writing the key file, which
+      # is also how a restore carries a source key across.
       COFFER_API__MasterKey__Path: ${COFFER_MASTER_KEY_PATH:-}
-      COFFER_MASTER_KEK_BASE64: ${COFFER_MASTER_KEK_BASE64:-}
-      # KEK id label stamped on new wraps (ledgers.lek_kek_id). Defaults to v1
-      # (matches MasterKeyLoader); `rotate-kek` bumps it. Passing it here lets a
-      # rotation's new id actually reach the container.
+      # KEK id label stamped on new wraps (ledgers.lek_kek_id) when the key file has
+      # no `id=` line of its own — which only happens for a file an operator wrote by
+      # hand. Minting and rotation both write the id into the file, and that wins.
       COFFER_MASTER_KEK_ID: ${COFFER_MASTER_KEK_ID:-v1}
       # WebAuthn relying party. Defaults suit a localhost install on API_PORT;
       # override for a real domain (RpId = bare host, origin = full URL).

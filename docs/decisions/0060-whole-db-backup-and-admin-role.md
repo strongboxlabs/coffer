@@ -1,6 +1,9 @@
 # 0060 — Whole-DB encrypted backup, admin role, Drive-later
 
-Status: Accepted
+Status: Accepted — the operator CLI
+(`coffer-api restore`) it introduced was removed by
+[ADR-0094](0094-restore-is-ui-only-and-the-kek-has-no-env-channel.md);
+restore is UI-only. Backup creation via the CLI is unchanged.
 
 ## Context
 

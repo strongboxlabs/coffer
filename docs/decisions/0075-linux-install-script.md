@@ -1,6 +1,7 @@
 # 0075 — Self-contained Linux install script
 
-Status: Accepted
+Status: Accepted — amended by [ADR-0094](0094-restore-is-ui-only-and-the-kek-has-no-env-channel.md): the installer no
+longer asks "restoring a backup?" and no longer writes a master key into `.env`.
 Date: 2026-07-10
 Relates: [ADR-0059](0059-deployment-packaging.md), [ADR-0060](0060-whole-db-backup-and-admin-role.md), [ADR-0071](0071-install-provisioning-ui-import-authed-restore.md)
 
@@ -27,12 +28,13 @@ roles from it on first start) — from the repo raw URL into an install dir
 embedding copies in the script) avoids drift. The app itself is the published
 image; no source is needed.
 
-**Private repo/image.** Anonymous `raw.githubusercontent.com` 404s on a private
-repo (and the ghcr package is private too), so when `COFFER_GH_TOKEN` is set the
+**Private fork/image.** The canonical repo and its ghcr image are public and need
+no credentials. For a private fork, anonymous `raw.githubusercontent.com` 404s
+(and the fork's ghcr package is private too), so when `COFFER_GH_TOKEN` is set the
 script fetches its two files via the authenticated GitHub **contents API** (raw
 media type) and `docker login`s to ghcr before pulling. Unset ⇒ anonymous raw +
 no login (public repo, unchanged). The bootstrap one-liner itself must likewise
-be fetched over the API for a private repo — the README shows the exact form.
+be fetched over the API for a private fork — the README shows the exact form.
 `COFFER_REPO` / `COFFER_REPO_REF` / `COFFER_GH_USER` override the owner/name, ref,
 and ghcr login user.
 

@@ -57,6 +57,35 @@ budget-vs-actual** (the biggest unbuilt feature), the generic **CSV ingest
 provider**, and broader **in-app reports** — today's reporting strength is via MCP
 rather than the UI.
 
+## Try it
+
+The shortest path from "curious" to a populated ledger you can click around in.
+You need a Linux host with Docker — a VM, a spare box, a cloud instance — and ~2 GB of
+RAM (the API and Postgres containers are capped at 1 GB each, tunable via
+`COFFER_API_MEM_LIMIT` / `POSTGRES_MEM_LIMIT`). Docker Desktop's WSL2 backend on
+Windows very likely works, since the installer is plain `bash` with no OS gate, but
+that is untested and therefore unclaimed.
+
+1. **Install it.** Run the [one-liner below](#install-linux).
+2. **Answer `localhost`** when it asks how you'll reach Coffer. Nothing to configure,
+   no TLS, no domain.
+3. **Open the `/setup/<token>` link it prints.** Not sitting at the box? Tunnel first:
+   `ssh -L 8080:localhost:8080 <host>`, then use the same URL.
+4. **Register a passkey and tick "Include a Demo ledger."** This is the part worth not
+   skipping — it seeds a worked example through the real import pipeline, so you land
+   on populated registers, holdings and reports instead of an empty hub.
+5. **Save the recovery codes.** They are shown once.
+
+From there: the registers and the investment views are where most of the work is,
+**Ledgers → Import** takes a Moneydance export, and **System → MCP** turns on the
+AI connector if you want it.
+
+Two things to know before you enrol a passkey. Credentials bind to the hostname, so
+`localhost` now and a real domain later means re-enrolling with a recovery code —
+fine for a trial, worth deciding up front for anything you'll keep. And to undo the
+whole thing: `cd ~/coffer && docker compose down -v` removes the containers and both
+volumes.
+
 ## Install (Linux)
 
 Stand up Coffer (app + Postgres) on a fresh Linux host:
@@ -74,20 +103,18 @@ COFFER_GH_TOKEN=$T bash <(curl -fsSL -H "Authorization: Bearer $T" \
   "https://api.github.com/repos/strongboxlabs/coffer/contents/scripts/install.sh?ref=main")
 ```
 
-Run it as your **normal user** (not `sudo` — it escalates internally only where needed, so `~/coffer` + your secrets stay user-owned). Interactive: it checks for Docker (offers to install it), asks how you'll reach Coffer — **localhost** (single machine, `http`, no TLS) or a **domain** (`https`, you front the TLS/reverse-proxy) — and whether this is a fresh install or a restore, then writes `.env` under `~/coffer`, pulls the latest image, and starts it. Re-run any time to upgrade in place or wipe & reinstall. See [ADR-0075](docs/decisions/0075-linux-install-script.md).
+Run it as your **normal user** (not `sudo` — it escalates internally only where needed, so `~/coffer` + your secrets stay user-owned). Interactive: it checks for Docker (offers to install it), asks how you'll reach Coffer — **localhost** (single machine, `http`, no TLS) or a **domain** (`https`, you front the TLS/reverse-proxy) — then writes `.env` under `~/coffer`, pulls the latest image, and starts it. Re-run any time to upgrade in place or wipe & reinstall. See [ADR-0075](docs/decisions/0075-linux-install-script.md).
 
-> **Restoring an existing Coffer?** Answer **yes** to "restoring a backup" and paste that install's `COFFER_MASTER_KEK_BASE64` (+ its id — `v2` etc. if you rotated). Then use **Restore from a backup** on the setup screen; your data decrypts under that KEK with no post-install key-swap.
+> **Restoring an existing Coffer?** Install normally — the installer asks nothing extra and takes no key. Then pick **Restore from a backup** on the setup screen and paste the source install's master key *there*: it is checked against the archive before anything is replaced, and adopted so the sealed secrets come across ([ADR-0094](docs/decisions/0094-restore-is-ui-only-and-the-kek-has-no-env-channel.md)).
 
 > A bare IP over `http` isn't offered: passkeys (Coffer's login) require `https` or `http://localhost`. For remote access without a domain, SSH-tunnel to localhost: `ssh -L 8080:localhost:8080 <host>`.
 >
 > **Back up the master key** — without it, the secrets sealed under it (bank-feed
 > tokens, the stored backup passphrase, the Drive connection) can't be recovered.
-> `install.sh` seeds it as `~/coffer/.env`'s `COFFER_MASTER_KEK_BASE64`, but the key
-> moves into its own file on first boot and the file is the source of truth from
-> then on (ADR-0092 D1) — so **after any rotation the `.env` value is stale and
-> backing it up is worse than useless**. Read the current key from **System →
-> Encryption → Show key** instead. Your ledger data and passkeys do not depend on
-> it.
+> The API mints it on first boot into its own file and the **setup ceremony shows it
+> once**; read it again later from **System → Encryption → Show key**. It is never in
+> `.env` and there is no environment variable for it, so there is no second copy to go
+> stale after a rotation. Your ledger data and passkeys do not depend on it.
 
 ## Reaching it from the internet
 
@@ -103,7 +130,10 @@ serving your finances in the clear.
 
 **You front the TLS.** The container listens on plain HTTP on `:8080` and expects a
 reverse proxy — Caddy, Traefik, nginx, Cloudflare Tunnel — to terminate TLS. Bot
-filtering and volumetric traffic are the proxy's job, not Coffer's.
+filtering and volumetric traffic are the proxy's job, not Coffer's. The forwarded-header
+behaviour, the allowed-origin variables and why `:8080` must not face the internet
+directly are in
+[operations.md → Reaching it from the internet](docs/operations.md#reaching-it-from-the-internet).
 
 **Passkeys bind to the hostname.** Credentials are scoped to `COFFER_RP_ID`, so the
 localhost-vs-domain choice at install time isn't cosmetic: changing the hostname

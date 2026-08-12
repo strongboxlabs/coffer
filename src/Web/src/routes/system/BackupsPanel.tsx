@@ -32,8 +32,8 @@ const SCHEDULE_KEY = ['admin-backup-schedule'] as const;
 /**
  * Admin Backups panel (ADR-0060). Whole-DB encrypted backups: set the
  * passphrase, create / download / delete artifacts, and schedule a daily run.
- * Restore is the operator CLI (`coffer-api restore`) — there's no restore button
- * (it targets a fresh install before auth exists); Download is the bridge.
+ * Restore is here too (ADR-0071 D3) and in the pre-auth setup screen (ADR-0061);
+ * those are the only two paths since ADR-0094 removed the `coffer-api restore` CLI.
  */
 export function BackupsPanel() {
     const queryClient = useQueryClient();
@@ -101,12 +101,8 @@ export function BackupsPanel() {
                 <p className="text-sm text-text-muted">
                     Encrypted whole-database backups. Set a passphrase, create one
                     on demand or schedule a daily run, download the artifact to keep
-                    it off-box, or restore from one below. For headless disaster
-                    recovery,{' '}
-                    <code className="rounded bg-surface-muted px-1 py-0.5 text-[0.75rem]">
-                        coffer-api restore
-                    </code>{' '}
-                    still works too.
+                    it off-box, or restore from one below. A brand-new install restores
+                    from its setup screen instead, before any admin exists.
                 </p>
                 <p className="text-xs text-text-subtle">
                     <strong className="font-medium text-text-muted">Retention</strong>{' '}

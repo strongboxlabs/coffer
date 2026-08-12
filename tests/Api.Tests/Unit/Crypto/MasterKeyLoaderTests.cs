@@ -3,16 +3,16 @@ using Coffer.Api.Crypto;
 namespace Coffer.Api.Tests.Unit.Crypto;
 
 /// <summary>
-/// Pinning the contract of the master-KEK loader (ADR-0026, sourced per ADR-0092 D1):
-/// fail-fast on every departure from the expected shape, and <b>the key file wins</b>
-/// over the deprecated environment variable.
+/// Pinning the contract of the master-KEK loader (ADR-0026, sourced per ADR-0092 D1,
+/// narrowed by ADR-0094): the key file is the only source, and every departure from the
+/// expected shape fails fast.
 /// </summary>
 /// <remarks>
-/// These drive the <c>Resolve(store, envValue, envId)</c> overload rather than setting
-/// the real environment variable. Mutating process-global env here raced the
-/// integration harness — <c>ApiFactory</c> clears the same variable, and xUnit runs
-/// separate collections in parallel — so a unit test could flip it out from under a
-/// host build, or vice versa. Passing the value in removes the shared state entirely.
+/// The <c>COFFER_MASTER_KEK_BASE64</c> env var and its write-through migration are gone
+/// (ADR-0094), so the tests that pinned env-vs-file precedence went with them. The id
+/// fallback is still passed in rather than read from the environment, so nothing here
+/// touches process-global state — that raced the integration harness, which runs in
+/// parallel collections.
 /// </remarks>
 public sealed class MasterKeyLoaderTests : IDisposable
 {
@@ -43,23 +43,23 @@ public sealed class MasterKeyLoaderTests : IDisposable
         var store = NewStore();
         store.Write(Key32Base64);
 
-        var result = MasterKeyLoader.Resolve(store, envKeyValue: null, envKeyId: "v1");
+        var result = MasterKeyLoader.Resolve(store, fallbackKeyId: "v1");
 
         Assert.NotNull(result.Key);
         Assert.Equal(Key32, result.Key!.KeyBytes);
         Assert.Equal("v1", result.Key.Id);
         Assert.Equal(MasterKeyLoader.KeySource.File, result.Source);
-        Assert.False(result.EnvironmentIgnored);
     }
 
     [Fact]
-    public void Prefers_the_files_own_id_over_the_environments()
+    public void Prefers_the_files_own_id_over_the_fallback()
     {
-        // Rotation mints key and id together, so the pairing on disk is authoritative.
+        // Rotation and minting write key and id together, so the pairing on disk is
+        // authoritative and the fallback is not consulted.
         var store = NewStore();
         store.Write(Key32Base64, "v7");
 
-        var result = MasterKeyLoader.Resolve(store, envKeyValue: null, envKeyId: "v1");
+        var result = MasterKeyLoader.Resolve(store, fallbackKeyId: "v1");
 
         Assert.Equal("v7", result.Key!.Id);
     }
@@ -74,18 +74,19 @@ public sealed class MasterKeyLoaderTests : IDisposable
         Directory.CreateDirectory(Path.GetDirectoryName(store.Path)!);
         File.WriteAllText(store.Path, Key32Base64 + "\n");
 
-        var result = MasterKeyLoader.Resolve(store, envKeyValue: null, envKeyId: "v1");
+        var result = MasterKeyLoader.Resolve(store, fallbackKeyId: "v1");
 
         Assert.Equal(Key32, result.Key!.KeyBytes);
         Assert.Equal(MasterKeyLoader.KeySource.File, result.Source);
     }
 
     [Fact]
-    public void Reports_no_key_when_neither_source_is_configured()
+    public void Reports_no_key_when_the_file_holds_none()
     {
         // Not an exception: ADR-0092 D3 lets a virgin install proceed and mint one in
-        // the setup ceremony. Whether "none" is fatal is the caller's gate.
-        var result = MasterKeyLoader.Resolve(NewStore(), envKeyValue: null, envKeyId: "v1");
+        // the setup ceremony. Whether "none" is fatal is the caller's gate — it refuses
+        // if the database already holds wrapped material.
+        var result = MasterKeyLoader.Resolve(NewStore(), fallbackKeyId: "v1");
 
         Assert.Null(result.Key);
         Assert.Equal(MasterKeyLoader.KeySource.None, result.Source);
@@ -99,7 +100,7 @@ public sealed class MasterKeyLoaderTests : IDisposable
         File.WriteAllText(store.Path, "not!valid!base64!at!all!");
 
         Assert.Throws<FormatException>(
-            () => MasterKeyLoader.Resolve(store, envKeyValue: null, envKeyId: "v1"));
+            () => MasterKeyLoader.Resolve(store, fallbackKeyId: "v1"));
     }
 
     [Fact]
@@ -110,119 +111,30 @@ public sealed class MasterKeyLoaderTests : IDisposable
         store.Write(Convert.ToBase64String(new byte[16]));
 
         var ex = Assert.Throws<ArgumentException>(
-            () => MasterKeyLoader.Resolve(store, envKeyValue: null, envKeyId: "v1"));
+            () => MasterKeyLoader.Resolve(store, fallbackKeyId: "v1"));
         Assert.Contains("32 bytes", ex.Message);
     }
 
-    // --- the file wins (ADR-0092 D1) ---------------------------------------
-
     [Fact]
-    public void The_file_wins_over_the_environment_and_the_mismatch_is_reported()
-    {
-        // THE regression this ordering exists to prevent. With env-first, a UI rotation
-        // re-wrapped the database under a new key, wrote it to the file — and the next
-        // boot silently overwrote that with the stale env value, leaving the process
-        // holding the OLD key over NEW wraps. Same failure on restore-adopt, where
-        // reconciliation then cleared the secrets the adopted key was supplied to save.
-        var envKey = new byte[32];
-        envKey[0] = 0xAB;
-        var store = NewStore();
-        store.Write(Key32Base64, "v2");
-
-        var result = MasterKeyLoader.Resolve(
-            store, envKeyValue: Convert.ToBase64String(envKey), envKeyId: "v1");
-
-        Assert.Equal(Key32, result.Key!.KeyBytes);          // the file's key, not the env's
-        Assert.Equal("v2", result.Key.Id);
-        Assert.Equal(MasterKeyLoader.KeySource.File, result.Source);
-        // The caller warns: an operator who set that variable believes it does something.
-        Assert.True(result.EnvironmentIgnored);
-        // And the file is left exactly as it was — no write-through clobber.
-        Assert.Equal(Key32Base64, store.ReadRaw());
-    }
-
-    [Fact]
-    public void A_matching_environment_value_is_not_reported_as_ignored()
-    {
-        // The ordinary post-migration state: .env still holds the key that was written
-        // through to the file. Nothing is wrong, so nothing should be said.
-        var store = NewStore();
-        store.Write(Key32Base64);
-
-        var result = MasterKeyLoader.Resolve(store, envKeyValue: Key32Base64, envKeyId: "v1");
-
-        Assert.False(result.EnvironmentIgnored);
-    }
-
-    [Fact]
-    public void A_malformed_environment_value_is_ignored_when_the_file_has_a_key()
-    {
-        // File-first means a typo in .env can't take an install down.
-        var store = NewStore();
-        store.Write(Key32Base64);
-
-        var result = MasterKeyLoader.Resolve(
-            store, envKeyValue: "not!valid!base64!", envKeyId: "v1");
-
-        Assert.Equal(Key32, result.Key!.KeyBytes);
-        Assert.True(result.EnvironmentIgnored);
-    }
-
-    // --- env-var transition (ADR-0092 D6) ----------------------------------
-
-    [Fact]
-    public void Migrates_the_deprecated_env_var_when_the_file_is_empty()
-    {
-        var store = NewStore();
-
-        var result = MasterKeyLoader.Resolve(store, envKeyValue: Key32Base64, envKeyId: "v1");
-
-        Assert.Equal(Key32, result.Key!.KeyBytes);
-        Assert.Equal(MasterKeyLoader.KeySource.MigratedFromEnvironment, result.Source);
-        Assert.False(result.EnvironmentIgnored);
-        // Written through with its id, so the NEXT boot resolves from the file even if
-        // the operator removes the variable — which is the whole point of D6.
-        var (key, id) = store.Read();
-        Assert.Equal(Key32Base64, key);
-        Assert.Equal("v1", id);
-    }
-
-    [Fact]
-    public void A_malformed_env_var_throws_when_there_is_no_file_to_fall_back_on()
-    {
-        // The dangerous alternative: treating a typo'd value as "no key", which D3
-        // could then resolve by minting a fresh one over live wrapped material.
-        Assert.Throws<FormatException>(() => MasterKeyLoader.Resolve(
-            NewStore(), envKeyValue: "not!valid!base64!at!all!", envKeyId: "v1"));
-    }
-
-    [Fact]
-    public void A_malformed_env_var_is_not_written_to_the_store()
-    {
-        // Validate-before-persist: a bad value must never become the install's
-        // permanent on-disk state.
-        var store = NewStore();
-
-        Assert.Throws<ArgumentException>(() => MasterKeyLoader.Resolve(
-            store, envKeyValue: Convert.ToBase64String(new byte[16]), envKeyId: "v1"));
-        Assert.False(store.Exists());
-    }
-
-    [Fact]
-    public void Whitespace_only_env_var_is_treated_as_unset()
-    {
-        var store = NewStore();
-        store.Write(Key32Base64);
-
-        var result = MasterKeyLoader.Resolve(store, envKeyValue: "   ", envKeyId: "v1");
-
-        Assert.Equal(Key32, result.Key!.KeyBytes);
-        Assert.Equal(MasterKeyLoader.KeySource.File, result.Source);
-        Assert.False(result.EnvironmentIgnored);
-    }
-
-    [Fact]
-    public void Rejects_a_blank_env_id()
+    public void Rejects_a_blank_fallback_id()
         => Assert.Throws<ArgumentException>(
-            () => MasterKeyLoader.Resolve(NewStore(), envKeyValue: null, envKeyId: "  "));
+            () => MasterKeyLoader.Resolve(NewStore(), fallbackKeyId: "  "));
+
+    [Fact]
+    public void Uses_the_fallback_id_for_a_hand_written_file_with_no_id_line()
+    {
+        // ADR-0094 makes this the documented recovery route for an install whose key
+        // only ever lived in .env: write the key to the file by hand. Such a file has no
+        // `id=` line, so the fallback has to keep working — it is the difference between
+        // recovering and being told to abandon the sealed secrets.
+        var store = NewStore();
+        Directory.CreateDirectory(Path.GetDirectoryName(store.Path)!);
+        File.WriteAllText(store.Path, Key32Base64 + Environment.NewLine);
+
+        var result = MasterKeyLoader.Resolve(store, fallbackKeyId: "v3");
+
+        Assert.Equal(Key32, result.Key!.KeyBytes);
+        Assert.Equal("v3", result.Key.Id);
+        Assert.Equal(MasterKeyLoader.KeySource.File, result.Source);
+    }
 }

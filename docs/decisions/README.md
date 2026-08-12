@@ -97,6 +97,7 @@ ADRs capture material design decisions at the time they are made. Format: [MADR]
 | [0091](0091-one-category-taxonomy.md) | One category taxonomy: the demo export is the source of truth, the starter catalogue is generated from it, parity is tested | Accepted |
 | [0092](0092-kek-lifecycle-in-the-ui.md) | Master KEK moves from env var to a file at a configurable path; first run generates + shows it; rotation and restore become UI-driven; a restore leaves no unopenable ciphertext | Proposed (amends 0014, 0026) |
 | [0093](0093-mcp-connection-identity.md) | Naming the MCP connection: `COFFER_WEB_URL`/`COFFER_MCP_URL` replace positional origin slots (old names still resolve); `Api:Mcp:PublicUrl` surfaces the client address in the admin UI, falling back to the request origin; operator labels on DCR clients in OpenIddict's `Properties` bag | Accepted |
+| [0094](0094-restore-is-ui-only-and-the-kek-has-no-env-channel.md) | Restore keeps only its two UI paths (the `coffer-api restore` CLI is removed and the multipart ceiling raised to 4 GiB); `install.sh` stops prompting for a source KEK; `COFFER_MASTER_KEK_BASE64` is removed so the key file is the only source; `--adopt-new-kek` mints and exits | Accepted (amends 0060, 0061, 0075, 0092) |
 
 ## Rules
 

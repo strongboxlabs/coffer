@@ -118,13 +118,12 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
             _mcpEnabled ? "true" : "false");
         // ADR-0026 + ADR-0092 D1 — Program.cs resolves the master KEK eagerly at
         // startup and fails fast if it finds none. Point Api:MasterKey:Path at a
-        // fixture key file so every host build starts, and CLEAR the deprecated
-        // env var: it still takes precedence during the D6 transition, so leaving
-        // it set would mean the suite exercises the migration path forever and
-        // never the file path that is actually the steady state.
+        // fixture key file so every host build starts. The COFFER_MASTER_KEK_BASE64
+        // clearing that used to sit here is gone with the variable itself (ADR-0094) —
+        // the key file is the only source, so there is nothing left to take precedence
+        // over it.
         Environment.SetEnvironmentVariable(
             "COFFER_API__MasterKey__Path", EnsureFixtureKeyFile());
-        Environment.SetEnvironmentVariable("COFFER_MASTER_KEK_BASE64", null);
     }
 
     /// <summary>Deterministic fixture KEK — 32 zero bytes. The test container

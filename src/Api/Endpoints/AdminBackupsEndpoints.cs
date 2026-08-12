@@ -26,7 +26,8 @@ namespace Coffer.Api.Endpoints;
 /// Restore (ADR-0071 D3, amending ADR-0060) is now also an authenticated-admin
 /// action here: it reuses the ADR-0061 stage → restart → apply-at-boot machinery
 /// behind a typed-confirmation gate + the ADR-0071 D4 KEK check. The bootstrap
-/// (pre-auth) restore and <c>coffer-api restore</c> remain for their cases.
+/// (pre-auth) restore remains for a fresh install with no admin to authenticate as;
+/// the <c>coffer-api restore</c> CLI was removed by ADR-0094.
 ///
 ///   * POST   /api/admin/backups/restore    — restore from an uploaded .cofferbak
 ///   * POST   /api/admin/backups/restore/validate — pre-flight KEK-compat check (ADR-0074)
@@ -107,8 +108,9 @@ public static class AdminBackupsEndpoints
             return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
                 "Send multipart/form-data with 'archive', 'passphrase', and 'confirm'.");
 
-        // Lift Kestrel's per-request cap; a whole-DB backup can be sizeable (the
-        // ~128 MB multipart limit is the UI ceiling, CLI restore for anything larger).
+        // Lift Kestrel's per-request cap; a whole-DB backup can be sizeable. The
+        // multipart form limit is raised to 4 GiB in Program.cs (ADR-0094) — this is
+        // the only restore path now, so it cannot be the narrower one.
         var sizeFeature = request.HttpContext.Features.Get<IHttpMaxRequestBodySizeFeature>();
         if (sizeFeature is { IsReadOnly: false }) sizeFeature.MaxRequestBodySize = null;
 

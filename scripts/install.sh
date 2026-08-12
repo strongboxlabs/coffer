@@ -5,9 +5,10 @@
 #   Public repo:
 #     bash <(curl -fsSL https://raw.githubusercontent.com/strongboxlabs/coffer/main/scripts/install.sh)
 #
-#   Private repo/image (classic PAT with `repo` + `read:packages`) — anonymous
-#   raw 404s on a private repo, so fetch the script itself over the authenticated
-#   API and pass the same token in so its internal fetches + ghcr login work:
+#   Private fork/image (classic PAT with `repo` + `read:packages`) — anonymous
+#   raw 404s when the source is not public, so fetch the script itself over the
+#   authenticated API and pass the same token in so its internal fetches + ghcr
+#   login work. The canonical repo and image are PUBLIC; this is for a fork:
 #     T=<pat>; COFFER_GH_TOKEN=$T bash <(curl -fsSL -H "Authorization: Bearer $T" \
 #       -H "Accept: application/vnd.github.raw" \
 #       "https://api.github.com/repos/strongboxlabs/coffer/contents/scripts/install.sh?ref=main")
@@ -20,7 +21,7 @@
 # (https) install you front it with your own proxy or tunnel.
 #
 # Overridable via env: COFFER_DIR (install dir, default ~/coffer),
-# COFFER_IMAGE_TAG (default latest), COFFER_GH_TOKEN (private repo/image auth),
+# COFFER_IMAGE_TAG (default latest), COFFER_GH_TOKEN (private fork/image auth),
 # COFFER_REPO (owner/name, default strongboxlabs/coffer), COFFER_REPO_REF (default main),
 # COFFER_GH_USER (ghcr login user, default the repo owner), COFFER_REPO_RAW.
 #
@@ -30,8 +31,9 @@ REPO="${COFFER_REPO:-strongboxlabs/coffer}"
 REPO_REF="${COFFER_REPO_REF:-main}"
 REPO_RAW="${COFFER_REPO_RAW:-https://raw.githubusercontent.com/$REPO/$REPO_REF}"
 GH_API="${COFFER_GH_API:-https://api.github.com}"
-# Optional token for a PRIVATE repo/image. When set, the config files are fetched
-# via the authenticated GitHub contents API (anonymous raw 404s on private repos)
+# Optional token for a PRIVATE fork/image. Not needed for the canonical source,
+# which is public and pulls anonymously. When set, the config files are fetched
+# via the authenticated GitHub contents API (anonymous raw 404s on private forks)
 # and we log in to ghcr before pulling. A classic PAT needs `repo` +
 # `read:packages`; leave unset for a public repo (unchanged behaviour).
 GH_TOKEN="${COFFER_GH_TOKEN:-}"
@@ -78,19 +80,9 @@ ask() {  # ask VAR "prompt" "default"
 }
 yesno() { local __a; printf '%s [y/N]: ' "$1"; IFS= read -r __a <"$TTY_DEV" || __a=; [ "$__a" = y ] || [ "$__a" = Y ]; }
 
-# validate_kek VALUE — true when VALUE is base64 decoding to exactly 32 bytes
-# (the master-KEK contract, ADR-0014 / MasterKeyLoader). Rejects a malformed or
-# wrong-length key at prompt time rather than in a post-start boot crash.
-validate_kek() {
-    local n
-    n=$(printf '%s' "$1" | base64 -d 2>/dev/null | wc -c) || n=0
-    [ "$n" -eq 32 ]
-}
-
 # ------------------------------------------------------------------ privileges
 # Run this as your NORMAL user, not `sudo bash …`: under sudo $HOME becomes
-# root's, so ~/coffer + your .env (which holds the master KEK) would land in
-# /root, root-owned. We escalate with sudo only where it's actually needed —
+# root's, so ~/coffer + your secrets would land in /root, root-owned. We escalate with sudo only where it's actually needed —
 # installing Docker, and docker itself when you're not in the 'docker' group.
 if [ "$(id -u)" -eq 0 ]; then
     SUDO=""
@@ -131,7 +123,6 @@ command -v curl    >/dev/null 2>&1 || die "curl is required. Install it and re-r
 
 # --------------------------------------------------------------- existing install
 MODE=fresh
-restoring=            # set to 1 below when the operator chooses to restore a backup
 if [ -f "$INSTALL_DIR/.env" ]; then
     warn "An existing Coffer install was found at $INSTALL_DIR."
     echo "  1) Upgrade in place  — keep your data, pull the latest image, restart"
@@ -156,7 +147,7 @@ fi
 
 # --------------------------------------------------------- fetch canonical files
 #
-# A token means the operator is installing from a PRIVATE repo — but REPO still
+# A token means the operator is installing from a PRIVATE fork — but REPO still
 # defaults to the public mirror, so without COFFER_REPO the script fetches its
 # own config from a different repository than it came from. That combination
 # shipped a stale public compose onto a private-fork host, which then failed
@@ -180,8 +171,8 @@ if [ -f "$INSTALL_DIR/docker-compose.yml" ]; then
 fi
 
 info "Fetching docker-compose.yml + db/init from the repo …"
-fetch docker-compose.yml       "$INSTALL_DIR/docker-compose.yml"       || die "Could not fetch docker-compose.yml (private repo? set COFFER_GH_TOKEN)."
-fetch db/init/00-init-roles.sh "$INSTALL_DIR/db/init/00-init-roles.sh" || die "Could not fetch db/init/00-init-roles.sh (private repo? set COFFER_GH_TOKEN)."
+fetch docker-compose.yml       "$INSTALL_DIR/docker-compose.yml"       || die "Could not fetch docker-compose.yml (private fork? set COFFER_GH_TOKEN)."
+fetch db/init/00-init-roles.sh "$INSTALL_DIR/db/init/00-init-roles.sh" || die "Could not fetch db/init/00-init-roles.sh (private fork? set COFFER_GH_TOKEN)."
 chmod +x "$INSTALL_DIR/db/init/00-init-roles.sh"
 
 # Ship the pg_hba remediation to the host. It only applies to installs created
@@ -241,23 +232,20 @@ if [ "$MODE" = fresh ]; then
         mcp_enabled=false; mcp_origin="$web_origin"
     fi
 
-    # Fresh install → a new random master KEK. RESTORING another install's data →
-    # reuse THAT install's KEK; a fresh one can't decrypt restored data (ADR-0014),
-    # which otherwise forces a manual key-swap after install. Take it up front.
-    master_kek_id=v1
-    echo ""
-    if yesno "Are you RESTORING a backup from another Coffer install"; then
-        restoring=1
-        warn "Restored data opens ONLY under the exact master key it was wrapped with."
-        while :; do
-            ask master_kek "Paste that install's COFFER_MASTER_KEK_BASE64" ""
-            validate_kek "$master_kek" && break
-            warn "Not a 32-byte base64 key (what 'openssl rand -base64 32' produces). Try again."
-        done
-        ask master_kek_id "Its KEK id — COFFER_MASTER_KEK_ID ('v1' unless you rotated, then 'v2', …)" "v1"
-    else
-        master_kek="$(openssl rand -base64 32)"
-    fi
+    # No master KEK is written here. The API mints its own on first boot when the
+    # database holds no wrapped material (ADR-0092 D3) and writes it to the key file
+    # on the coffer_data volume, which is the single source of truth; the setup
+    # ceremony then shows it so the operator can back it up.
+    #
+    # The COFFER_MASTER_KEK_BASE64 prompt this replaced (ADR-0094) was wrong twice
+    # over. It seeded a deprecated env var readable via `docker inspect` and
+    # /proc/<pid>/environ, which went stale the moment anyone rotated from the UI --
+    # so the value an operator was told to back up became the wrong one silently. And
+    # for a RESTORE it took the source key at the one moment nothing could check it:
+    # no archive is present at install time, so a typo or a wrong-era key was accepted
+    # here and only discovered after the restore had replaced everything. The restore
+    # form takes that key instead (ADR-0092 D4) and validates it at upload against the
+    # archive's KEK fingerprint, refusing before anything destructive runs.
 
     # Database role passwords go to FILES, not .env — an env var is readable via
     # `docker inspect`, /proc/<pid>/environ, child environments and crash dumps,
@@ -287,15 +275,14 @@ if [ "$MODE" = fresh ]; then
     cat >"$INSTALL_DIR/.env" <<EOF
 # Coffer — generated by install.sh (ADR-0075) on $(date -u +%Y-%m-%dT%H:%M:%SZ).
 # These secrets are unique to THIS install.
-# !! BACK UP COFFER_MASTER_KEK_BASE64 — without it your encrypted data is
-#    unrecoverable, even with a database backup. !!
+# The master key is NOT here (ADR-0094): the API mints it on first boot into its own
+# file on the coffer_data volume, and the setup ceremony shows it once so you can back
+# it up. Read it later from System -> Encryption -> Show key.
 #
 # The three database role passwords are NOT here — they live in ./secrets/ and
 # reach the containers as docker-compose secrets. See docker-compose.yml.
 POSTGRES_USER=coffer
 POSTGRES_DB=coffer
-COFFER_MASTER_KEK_BASE64=$master_kek
-COFFER_MASTER_KEK_ID=$master_kek_id
 ASPNETCORE_ENVIRONMENT=Production
 API_PORT=$port
 COFFER_IMAGE=$IMAGE
@@ -317,7 +304,9 @@ COFFER_MCP_URL=$mcp_origin
 COFFER_MCP_ENABLED=$mcp_enabled
 EOF
     chmod 600 "$INSTALL_DIR/.env"
-    warn "Master key written to $INSTALL_DIR/.env — back up COFFER_MASTER_KEK_BASE64 now."
+    warn "The setup page will show this install's master key ONCE — back it up then."
+    warn "  (Later: System → Encryption → Show key. Without it, bank-feed tokens, the"
+    warn "   stored backup passphrase and the Drive connection can't be recovered.)"
 fi
 
 # COFFER_IMAGE is REQUIRED by the compose file fetched above (it has no default —
@@ -456,7 +445,6 @@ if [ -x "$INSTALL_DIR/scripts/harden-pg-hba.sh" ] \
     echo "      sudo bash $INSTALL_DIR/scripts/harden-pg-hba.sh"
 fi
 
-if [ -n "$restoring" ]; then
-    echo "  Restore: open the URL, choose 'Restore from a backup', upload your .cofferbak + passphrase."
-    echo "           It decrypts under the KEK you provided — no post-install key swap."
-fi
+echo "  Restoring an existing Coffer? Open the URL, choose 'Restore from a backup',"
+echo "  and upload the .cofferbak + its passphrase + that install's master key. The key"
+echo "  is checked against the archive before anything is replaced."
