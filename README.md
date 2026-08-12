@@ -24,8 +24,10 @@ work with your ledger without letting a model near the arithmetic.
   only, and HTTPS is structural rather than advisory.
 - **Double-entry underneath** — every flow is a balanced posting pair, so balances,
   FIFO cost basis and realized gains reconcile instead of drifting.
-- **Your keys** — encryption at rest under a key you hold, encrypted backups,
-  optional Drive sync, no third-party analytics.
+- **Your keys** — encrypted backups and envelope-encrypted secrets (feed tokens, the
+  backup passphrase) under a master key you hold and rotate; optional Drive sync, no
+  third-party analytics. Transaction rows are not column-encrypted — host disk
+  encryption is yours to configure ([the layered model](docs/operations.md#encryption-at-rest)).
 
 Licensed [AGPL-3.0](LICENSE) — running a modified copy as a network service means
 publishing your changes to its users. Published as periodic source snapshots from a
@@ -110,9 +112,16 @@ back in. Decide the public name before you enrol.
 
 **What it has, honestly:** no passwords anywhere (so no password reset flow to
 attack, and nothing reusable to leak), per-ledger PostgreSQL row-level security as
-the authorization boundary, encryption at rest under a key you hold, encrypted
-backups, and no third-party analytics in the UI — tracing stays local unless you
-configure an exporter.
+the authorization boundary, encrypted backups, high-value secrets envelope-encrypted
+under a master key you hold and rotate, and no third-party analytics in the UI —
+tracing stays local unless you configure an exporter.
+
+**What that doesn't include:** the application does not encrypt transaction rows.
+Column encryption for bulk data was rejected deliberately (it breaks indexing and
+trigram search) and OSS PostgreSQL has no TDE, so confidentiality of the ledger at
+rest is host disk encryption — LUKS/BitLocker/FileVault — which you configure and
+Coffer neither enforces nor checks. The layered model is spelled out in
+[operations.md](docs/operations.md#encryption-at-rest).
 
 **What it hasn't had: an external security review.** This is one maintainer's work,
 unaudited by anyone else. The precautions above are the boring, well-understood
@@ -233,18 +242,28 @@ explains.
    Coffer (RLS-scoped to you), never the model. Read tools can't change anything;
    the write tools (below) stay off unless you deliberately enable them.
 
-**Tools.** Discovery: `list_ledgers`, `list_accounts`, `list_securities`.
-Transactions: `transaction_summary` (income/expense/net by category·account·payee,
-over time, with category-tree rollup), `list_transactions` (line drill — filter by
-account/category/payee/amount/text, sort, page), `net_worth`. Investments:
-`holdings_snapshot`, `account_portfolio`, `allocation` (by asset class / region /
-vehicle, with multi-asset look-through), `investment_income`, `realized_gains`
-(FIFO), `returns` (money-weighted IRR), `price_history`,
-`find_in_kind_transfer_candidates`. All read-only, USD.
+**Read tools (19).** Discovery: `list_ledgers`, `list_accounts`, `list_securities`,
+`list_tags`. Transactions: `transaction_summary` (income/expense/net by
+category·account·payee, over time, with category-tree rollup), `list_transactions`
+(line drill — filter by account/category/payee/amount/text, sort, page), `net_worth`,
+`net_worth_history`. Investments: `holdings_snapshot`, `account_portfolio`,
+`allocation` (by asset class / region / vehicle, with multi-asset look-through),
+`investment_income`, `realized_gains` (FIFO), `returns` (money-weighted IRR),
+`activity`, `price_history`, `find_in_kind_transfer_candidates`. Reminders:
+`list_upcoming_reminders`. All read-only, USD.
 
-**AI-assisted writes (ADR-0081, off by default).** For cleanup, MCP can also expose
-*write* tools — set / merge / delete / recategorize / convert, plus a bulk
-`set_transaction_tags`. They stay off behind two keys: a deployment-wide **AI-writes**
+There is deliberately no general write API here: nothing over MCP can create or delete
+a transaction, or change an amount or a date. The write surface is taxonomy and
+metadata cleanup only.
+
+**AI-assisted writes (21 tools, ADR-0081, off by default).** Categories:
+`create_category`, `rename_category`, `reparent_category`, `merge_category`,
+`delete_category`, `set_transaction_category`, `set_split_posting_category`. Tags:
+`set_transaction_tags` (bulk), `rename_tag`, `merge_tags`, `delete_tag`,
+`cleanup_unused_tags`. Securities: `update_security`, `merge_securities`,
+`set_security_classification`, `set_security_components`. Prices: `add_price`,
+`update_price`, `delete_price`. Accounts: `set_account_taxstatus`. Investments:
+`convert_in_kind_transfer`. They stay off behind two keys: a deployment-wide **AI-writes**
 switch (a hot kill-switch — turn it off and it takes effect immediately, no restart)
 AND a `coffer.write` grant an admin opts a token/client into. A `coffer.read` token
 can never write. Every write is audited under **System → MCP → AI write activity**
@@ -296,6 +315,7 @@ code is held to are in
 
 ## License
 
-The repository does not currently carry a license. All rights reserved by the
-author. The code is hosted privately on GitHub; if it ever goes public, a
-license file will be added at that time.
+[AGPL-3.0](LICENSE). Running a modified copy as a network service means publishing
+your changes to its users. Published as periodic source snapshots from a private
+development repository — see [Contributing](#contributing) for what that means for
+patches.
