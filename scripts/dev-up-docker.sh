@@ -20,6 +20,16 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 echo "[dev-up-docker] repo: $repo_root"
 
+# Publish Postgres on the host for the dev loop. The base docker-compose.yml does not
+# (a production install reaches it over the compose network), but the manual fallback in
+# the README runs the API natively and connects to localhost:5432. Setting COMPOSE_FILE
+# here means the scripted path needs no .env edit; a bare `docker compose ...` needs the
+# same two lines in .env, which .env.example documents.
+if [ -z "${COMPOSE_FILE:-}" ]; then
+    export COMPOSE_PATH_SEPARATOR=:
+    export COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml
+fi
+
 # .env is required — docker compose substitutes the ports, RP id, feature toggles etc.
 # from it. It does NOT carry the master key (ADR-0094): the API mints one on first boot
 # into data/master.key on the coffer_data volume, so a wiped dev volume gets a new key.

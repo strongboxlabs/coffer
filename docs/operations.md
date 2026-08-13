@@ -5,145 +5,40 @@ it, protect it, recover it, keep it running, diagnose it. Reference material tha
 only matters for edge deployments is at the bottom, deliberately out of the path of
 someone standing an install up for the first time.
 
-> **Not here.** Running Coffer for *development* — the Docker dev stack, the Vite
-> fallback — is in the [README](../README.md#running-it-development). Moving a live
-> install between versions has its own doc, [upgrading.md](upgrading.md). The
-> standards the code is held to are in
+> **Where the line is.** The [README](../README.md) covers the path to a working,
+> signed-in install: choosing how you'll reach it, the per-platform install procedures,
+> first run, and enrolling a passkey. **This document covers everything after that, plus
+> anything that goes wrong.** If a subject appears in both, one of them is wrong.
+>
+> Also elsewhere: development (the Docker dev stack, the Vite fallback) in the
+> [README](../README.md#running-it-development); version-to-version moves in
+> [upgrading.md](upgrading.md); the standards the code is held to in
 > [engineering-standards.md](engineering-standards.md).
 
 ---
 
-## Install and first run
+## Installing
 
-`scripts/install.sh` is the install path ([ADR-0075](decisions/0075-linux-install-script.md)).
-It is interactive and idempotent: run it on a fresh Linux host to install, and re-run
-it later to upgrade in place or to wipe and reinstall.
+Installing is in the **[README](../README.md#install)** — the three per-platform
+procedures, the first-run ceremony and enrolling the first passkey. This document picks
+up once you are signed in.
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/strongboxlabs/coffer/main/scripts/install.sh)
-```
-
-Run it as your **normal user**, not under `sudo` — it escalates internally only where
-it must, so `~/coffer` and your secrets stay user-owned. It checks for Docker (and
-offers to install it), asks how you will reach Coffer, asks whether this is a fresh
-install or a restore, writes `~/coffer/.env`, pulls the image and starts the stack.
-No credentials are needed: the repo and its ghcr image are public.
-
-**The answer that costs most to change is how you will reach it.** Passkeys bind to a
-hostname (`COFFER_RP_ID`), so choosing **localhost** and later moving to a domain
-invalidates every enrolled credential: everyone signs in with a recovery code once and
-re-enrols. Recoverable, then — but it burns a code per user, and it is genuinely
-unrecoverable for anyone who never saved theirs. Ledger data is untouched either way.
-Worth settling before more than one person enrols. See [Reaching it from the
-internet](#reaching-it-from-the-internet).
-
-The thing that *is* unrecoverable is losing the master key: the secrets sealed under it
-(bank-feed tokens, the stored backup passphrase, the Drive connection) cannot be
-reconstructed without it. See [Encryption at rest](#encryption-at-rest).
-
-**Restoring rather than installing?** Install normally — there is nothing to answer
-differently, and no key to supply up front (ADR-0094). Then choose **Restore from a
-backup** on the setup screen and paste the source install's master key *there*, where
-it is checked against the archive's KEK fingerprint before anything is replaced. Full
-procedure: [Disaster recovery](#disaster-recovery-restore-onto-a-new-machine).
-
-### First-run setup ceremony
-
-A fresh DB has no users. The first time the API starts against an
-empty `webauthn_credentials` table it mints a one-shot **bootstrap
-token** and logs the plaintext URL exactly once at INFO level:
-
-```
-First-run bootstrap: open http://localhost:5173/setup/<token> in your
-browser within 30 minutes to register the first passkey.
-```
-
-Operator copies the URL into a browser. The setup ceremony walks
-through:
-
-1. **Create or restore** (`/setup/<token>`) — confirms the token is valid
-   and unconsumed, then offers "Set up a new install" or "Restore from a
-   backup" (ADR-0061).
-2. **Account form** — username, display name, passkey label, and one
-   optional box: **Include a Demo ledger** (ADR-0088). No ledger is
-   created unless it's ticked; there is no ledger picker.
-3. **Passkey registration** — WebAuthn ceremony against the operator's
-   authenticator, with origin pinned to `Api.Fido2.Origins` (see
-   `appsettings.Development.json` for the dev allow-list).
-4. **Recovery codes** — one-shot, never re-displayable. The
-   ceremony gates "Continue" on an explicit acknowledgement
-   checkbox.
-5. **Continue** — drops the user at the ledger hub (`/`), which lists the
-   ledgers they can access and offers **New ledger** / **Import from
-   Moneydance**. With no Demo ledger that list is empty, which is the
-   expected first-run state.
-
-The token is single-use and time-boxed (30-minute default, configurable
-via `Api.Bootstrap.TokenLifetime`). A consumed or expired token returns
-a `bootstrap-token-invalid` ProblemDetails; restart the API with the
-DB still empty to get a fresh token, or hand-mint one in
-`bootstrap_tokens` if you know what you're doing.
-
-Subsequent API starts no-op the bootstrap step — if any
-`webauthn_credentials` row exists, no token is minted. Recovery from a
-"locked out" state (lost device + lost recovery codes) is the
-DB-superuser path: truncate `webauthn_credentials`, restart the API,
-register a new passkey via a fresh ceremony.
-
-The setup form asks for a username, display name and passkey label, plus one
-optional box: **Include a Demo ledger**, which seeds a worked example through the
-normal Moneydance import pipeline. Leave it unticked and setup creates **no
-ledger at all** — you land on the ledger hub and pick **New ledger** or **Import
-from Moneydance** there.
-
-Every ledger created empty (the hub's "New ledger" dialog) seeds a starter
-category tree by default (ADR-0071 D5). The Demo ledger doesn't — it brings its
-own categories with the dataset.
-
-> Removed in ADR-0088: `scripts/provision.sh` and the `coffer-api provision
-> --mode <clean|demo>` subcommand. They shaped install state before the first
-> user existed, which only made sense while migrations seeded placeholder
-> `Default`/`Demo` ledgers. Migration 186 drops those, so there is nothing left
-> to shape.
-
-
-### Reissuing the setup token
-
-`install.sh` prints the one-shot `/setup/<token>` link on a fresh install. On an
-existing install with no users yet, reissue it with:
-
-```bash
-docker compose exec api dotnet coffer-api.dll bootstrap-token
-```
-
-> **Invoking the operator CLI in the container.** Every `coffer-api <subcommand>`
-> below (`bootstrap-token`, `backup`) is reached as
-> `docker compose exec api dotnet coffer-api.dll <subcommand>`. The image's
-> ENTRYPOINT is `["dotnet","coffer-api.dll"]` and it ships no apphost binary, so
-> `docker compose exec api coffer-api …` exits 127 with "executable file not
-> found in $PATH".
+What the installer leaves behind, for orientation: `~/coffer/.env` (ports, hostname,
+image, feature toggles), `~/coffer/secrets/` (the three database role passwords as
+files), `~/coffer/docker-compose.yml` + `db/init/`, and two Docker volumes — the
+database, and `coffer_data` where backups and the master key live.
 
 ---
 
-## Reaching it from the internet
+## Reaching it: proxy and origin configuration
 
-Coffer is meant to be reachable remotely, and the login mechanism constrains how.
+**Which shape to run — this machine, tunnelled, or a domain over HTTPS — is a decision,
+and it is in the [README](../README.md#reaching-it) with the trade-offs.** What follows
+is how to configure the third one correctly once you have chosen it.
 
-**You terminate TLS; the container does not.** It listens on plain HTTP on `:8080`
-and expects a reverse proxy in front — Caddy, Traefik, nginx, a Cloudflare Tunnel.
-Bot filtering and volumetric traffic are the proxy's job.
-
-**HTTPS is structural, not advisory.** Login is WebAuthn, which browsers only expose
-in a secure context, so Coffer cannot be served over plain `http` to a remote browser
-and still be usable. Either front it with HTTPS at a hostname, or reach
-`http://localhost` on the box itself and tunnel in from elsewhere:
-
-```bash
-ssh -L 8080:localhost:8080 <host>
-```
-
-A bare IP over `http` is not an option for the same reason — it is not a secure
-context and passkeys will not be offered.
+**You terminate TLS; the container does not.** It listens on plain HTTP on `:8080` and
+expects a reverse proxy in front — Caddy, Traefik, nginx, a Cloudflare Tunnel. Bot
+filtering and volumetric traffic are the proxy's job.
 
 ### Proxy headers
 
@@ -172,6 +67,8 @@ With no proxy setting those headers it is a no-op.
 `install.sh` writes the first three for you from the answer you gave it. If you move
 Coffer to a different hostname, change `COFFER_RP_ID` **and** re-enrol passkeys — the
 recovery-code path exists for exactly that transition.
+
+---
 
 ---
 
@@ -276,7 +173,9 @@ Plaintext backups are not acceptable — the built-in `.cofferbak` is always
 passphrase-encrypted.
 
 Restores are not real until tested. Run a periodic drill: stand up a **throwaway**
-install (a second host, or the same host with a different project name and ports),
+install (a second host, or the same host with a different install directory, port and
+`COFFER_CONTAINER_PREFIX` — the prefix matters, because container names are global to
+a Docker engine even though Compose scopes volumes and networks per project),
 restore the latest artifact into it through the setup screen, and confirm a sample of
 account balances against live. Never restore into the live install as a test — every
 restore path replaces everything.
@@ -302,14 +201,24 @@ app boots on the restored DB). Compose-based; ordering matters — **restore
 before the API server ever starts** on the fresh DB, or the server migrates the
 empty DB and collides with the restore.
 
-**Fast path — `install.sh` (recommended; handles Docker, the config files, the
-KEK, and the start-order for you).** From your DR kit you need three things — the
-`.cofferbak` artifact, its passphrase, and the backup's
-the source install's **master key** (+ its id). **No credentials are needed** — the repo and
-its ghcr image are public, so the installer fetches its config anonymously and pulls
-the image without a login. (Recovering an install built from a *private fork* is the
-one exception: add a classic PAT with `repo` + `read:packages` and see the README's
-private-fork one-liner.) On the fresh box:
+**Fast path — `install.sh` (recommended; it handles Docker, the config files and the
+start order for you).**
+
+Your DR kit needs **two** things: the `.cofferbak` artifact and its passphrase. That is
+the whole requirement — the archive is encrypted under the passphrase, and your ledgers,
+accounts, transactions and passkeys all come back with it.
+
+The source install's **master key** is a *third, optional* item, and it is worth keeping
+because of what it saves rather than what it rescues: supply it and the secrets sealed
+under it come across intact — the SimpleFIN feed tokens, the stored backup passphrase and
+the Google Drive connection. Without it the restore still completes and reconciliation
+tells you which of those three to re-establish. No data depends on it.
+
+**No credentials are needed** — the repo and its ghcr image are public, so the installer
+fetches its config anonymously and pulls the image without a login. (Recovering an install
+built from a *private fork* is the one exception: add a classic PAT with `repo` +
+`read:packages` — see [upgrading.md](upgrading.md#installing-from-a-private-fork).) On
+the fresh box:
 
 1. **Run the installer** (README's one-liner). Answer its prompts: install Docker
    (yes, if asked) and how you'll reach Coffer (**localhost**, or your **domain** —
@@ -317,7 +226,7 @@ private-fork one-liner.) On the fresh box:
    `.env`, pulls the image, and starts an empty install. It does not ask about
    restoring and takes no key: the install mints a throwaway one, which the restore
    replaces (ADR-0094).
-2. **Restore.** Open the setup URL it prints → **Restore from a backup** → upload your
+2. **Restore.** Open the setup link the installer printed → **Restore from a backup** → upload your
    `.cofferbak` + passphrase, and paste the source install's **master key** in the
    source-key field. It is validated against the archive's KEK fingerprint *before*
    anything destructive runs, then adopted, so the sealed secrets come across too. Leave
@@ -326,9 +235,11 @@ private-fork one-liner.) On the fresh box:
 3. **Sign in.** A passkey works if the RP id is unchanged; otherwise **Use a
    recovery code**, then add a fresh passkey. Confirm ledgers + balances.
 
-Backup over the ~128 MB UI upload cap, or a headless host? Use the compose-level
-steps below — the same thing the installer does, by hand, with `coffer-api
-restore` on the CLI instead of the upload.
+Not using `install.sh` — k8s, your own orchestration, a host you'd rather configure by
+hand? The compose-level steps below are the same sequence, done manually. The upload
+ceiling is no longer a reason to prefer them: it is 4 GiB (ADR-0094), and if a *proxy*
+in front of Coffer caps the body, raise it there or restore over `http://localhost` with
+nothing in the path.
 
 **On the source install — export an artifact:**
 
@@ -336,10 +247,11 @@ restore` on the CLI instead of the upload.
    `docker compose run --rm -e COFFER_BACKUP_PASSPHRASE='…' api backup --out
    /app/data/dr.cofferbak`).
 2. Get the `.cofferbak` off-box (the panel's **Download**, or
-   `docker compose cp api:/app/data/dr.cofferbak ./`). Keep three things safe and
-   **separate**: the artifact, its passphrase, and the **master key** — read the current
-   one from **System → Encryption → Show key**, since a rotation changes it and the
-   archive is bound to the era it was taken under.
+   `docker compose cp api:/app/data/dr.cofferbak ./`). Keep the artifact and its
+   passphrase safe and **separate** — those two are what a restore requires. Keep the
+   **master key** too if you want the sealed secrets to survive the move: read the
+   current one from **System → Encryption → Show key**, since a rotation changes it and
+   each archive is bound to the KEK era it was taken under.
 
 **On the new machine — manual restore (compose-level fallback):**
 
@@ -348,9 +260,9 @@ restore` on the CLI instead of the upload.
    takes it. Fetch the two
    files straight from the public repo (`raw.githubusercontent.com`). Recovering a
    *private fork* is the exception: fetch them with a `repo`-scoped PAT via the
-   GitHub contents API, since anonymous raw 404s there — the README's private-fork
-   one-liner does exactly this via `install.sh` + `COFFER_GH_TOKEN`, and the same
-   PAT (add `read:packages`) covers a ghcr login. The API image comes one of two
+   GitHub contents API, since anonymous raw 404s there
+   ([upgrading.md](upgrading.md#installing-from-a-private-fork) has the exact form), and
+   the same PAT (add `read:packages`) covers a ghcr login. The API image comes one of two
    ways:
    - **Pull the prebuilt image (preferred — no build toolchain).** The canonical
      package is public, so `docker compose pull api` needs no login. (A fork's
@@ -395,18 +307,9 @@ restore` on the CLI instead of the upload.
    nothing in front of it, which is also the shortest DR path.
 4. After the restart it serves on `:8080` with a fully-migrated schema from the dump.
 5. **Sign in — WebAuthn has hard requirements:**
-   - The page must be a **secure context**: `http://localhost` (a browser *on
-     the box*) or **HTTPS**. Plain `http://<lan-ip>` shows "WebAuthn is not
-     supported" — that's the browser disabling the API, not a bug.
-   - RP ids **cannot be IP addresses**. For network access, front the box with
-     HTTPS at a **hostname** and set `COFFER_RP_ID` / `COFFER_WEB_URL` to it.
-   - A **roaming key** (YubiKey) is the portable credential; a platform
-     authenticator (Windows Hello / Touch ID) stays on its original machine.
-   - The security key must be on the machine running the **browser** (it can't
-     be used over SSH). On Linux, grant the key to your user — udev rule
-     `KERNEL=="hidraw*", ATTRS{idVendor}=="1050", MODE="0660", GROUP="plugdev", TAG+="uaccess"`,
-     add yourself to `plugdev`, replug — and use a **non-Snap** browser (Snap
-     Chromium/Firefox can't reach USB keys).
+   - The requirements are the same as any other install — secure context, no IP
+     addresses as RP ids, and on Linux no OS authenticator to fall back on. See
+     [Signing in](../README.md#signing-in) rather than a second copy of them here.
    - If the RP id changed from the source install, the old credential won't
      validate (a passkey is bound to the RP id it was created under). Click
      **"Use a recovery code"** on the sign-in page, enter your username + one
@@ -430,6 +333,7 @@ the fresh recovery host, never the live one.
 | Restore errors beyond the two extension warnings | Wrong passphrase or a truncated `.cofferbak` (re-copy in binary mode); verify the file size matches the source. |
 | App shows empty/garbled data after restore | The master key doesn't match the source's — it must be byte-identical. Supply it in the restore form's source-key field, where it is checked against the archive's fingerprint first. |
 | "WebAuthn is not supported in this browser" | Insecure context — use `http://localhost` on the box or serve HTTPS (see step 5). |
+| Scanning the QR with a phone fails when the phone tries to save the passkey | Expected on a `localhost` install: the cross-device flow needs a real HTTPS hostname as the RP id. On Linux there is no platform authenticator to fall back on — use a USB security key, or tunnel to `localhost` from a laptop and use its Hello / Touch ID, or move to the domain install (see step 5). |
 
 ### Off-host: Google Drive sync
 
@@ -571,6 +475,44 @@ fail because the API is unhealthy, not because something in the auth layer is.
 ---
 
 ## Diagnostics and troubleshooting
+
+### Attaching psql
+
+The database is not published to the host — the API reaches it over the compose network
+(see the note in `docker-compose.yml`). Exec into it instead:
+
+```bash
+cd ~/coffer && docker compose exec postgres psql -U coffer -d coffer
+```
+
+A GUI client can't reach into a container and needs a published port; the repo's
+`docker-compose.dev.yml` overlay is the supported way to add one, bound to 127.0.0.1.
+
+
+### The setup link expired, or was consumed before anyone signed in
+
+`install.sh` prints the one-shot `/setup/<token>` link itself on a fresh install: the API
+logs that line once and never again, so the installer asks the running container for it
+rather than leaving you to find it. If it printed a bare URL instead, the install either
+already has a user or never answered — then the line is in the log:
+
+```bash
+docker compose logs api | grep -i bootstrap
+```
+
+On an install whose token has expired or been consumed while there is still no user,
+mint a fresh one:
+
+```bash
+docker compose exec api dotnet coffer-api.dll bootstrap-token
+```
+
+> **Invoking the operator CLI in the container.** Every `coffer-api <subcommand>`
+> below (`bootstrap-token`, `backup`) is reached as
+> `docker compose exec api dotnet coffer-api.dll <subcommand>`. The image's
+> ENTRYPOINT is `["dotnet","coffer-api.dll"]` and it ships no apphost binary, so
+> `docker compose exec api coffer-api …` exits 127 with "executable file not
+> found in $PATH".
 
 ### Verify + heal stored balances against the canonical recompute
 

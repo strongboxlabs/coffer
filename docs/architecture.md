@@ -165,9 +165,13 @@ See [decisions/0006-simplefin-over-plaid.md](decisions/0006-simplefin-over-plaid
 
 > **Note:** Design the app to gracefully handle a 'needs re-auth' state for the brokerage. Surface it clearly in the UI and make re-auth a one-click prompt rather than a silent failure.
 
-### 2.5 Deployment — Traefik + internet access
+### 2.5 Deployment — localhost, or a reverse proxy for remote access
 
-The app is exposed to the internet via Traefik, enabling access from a phone or any browser outside the home network.
+Two supported shapes, chosen at install time. **One machine** is the default and a
+complete deployment: `http://localhost` on the host, nothing published beyond it, every
+feature working. The diagram below is the **other** shape — opt-in remote access, where
+a reverse proxy (Traefik here) terminates TLS so the same install is reachable from a
+phone or a browser outside the home network. Nothing in the architecture requires it.
 
 ```mermaid
 flowchart LR

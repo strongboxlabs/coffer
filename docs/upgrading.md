@@ -49,13 +49,25 @@ a second install at `/root/coffer`, plus a root-owned `secrets/` you cannot read
 ### Installing from a private fork
 
 `install.sh` fetches its config — `docker-compose.yml`, `db/init/` — from
-`COFFER_REPO`, which **defaults to the public mirror**. If you fetched the script
-itself from your own fork, set the variable too, or you get your script and someone
-else's compose file:
+`COFFER_REPO`, which **defaults to the public repo**. If you fetched the script itself
+from your own fork, set the variable too, or you get your script and someone else's
+compose file:
 
 ```bash
 COFFER_REPO=<owner>/<repo> COFFER_GH_TOKEN=<pat> bash install.sh
 ```
+
+**Getting the script in the first place**, when the fork is private: anonymous
+`raw.githubusercontent.com` returns 404, so fetch it over the authenticated contents
+API and pass the same token through, which also covers the ghcr login for the image:
+
+```bash
+T='ghp_your_classic_pat'
+COFFER_GH_TOKEN=$T COFFER_REPO=<owner>/<repo> bash <(curl -fsSL -H "Authorization: Bearer $T" -H "Accept: application/vnd.github.raw"   "https://api.github.com/repos/<owner>/<repo>/contents/scripts/install.sh?ref=main")
+```
+
+Fetch to a file first if you'd rather see a failure than have an empty script piped
+into bash — a DNS or token problem otherwise runs nothing, silently.
 
 A PAT needs `repo` (private config) and `read:packages` (private image). The script
 warns when a token is present but `COFFER_REPO` is still the default.

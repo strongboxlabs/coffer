@@ -24,6 +24,17 @@
          test SDK project audits the transitive, so pin it to the patched 10.0.10
          (patch-level bump). Remove once the toolchain's floor moves past it. -->
     <PackageReference Include="System.Security.Cryptography.Xml" Version="10.0.10" />
+    <!-- Same treatment for the transitive SSH.NET, and the same reason to keep the
+         audit strict rather than make an exception. It arrives through
+         Testcontainers.PostgreSql 4.13.0 (the latest — upstream has not moved yet) at
+         2025.1.0, which GHSA-q939-rpr3-3284 flags high: ScpClient's recursive download
+         doesn't validate remote-supplied filenames, so a hostile SCP server can write
+         outside the target directory. Nothing here uses ScpClient — Testcontainers
+         pulls SSH.NET in for its port-forwarding path — so the practical exposure is
+         nil, which is exactly the argument that would have us suppress NU1903 and
+         quietly carry a known-vulnerable package. Pinned to the patched 2026.0.0
+         instead. Remove once Testcontainers' own floor moves past it. -->
+    <PackageReference Include="SSH.NET" Version="2026.0.0" />
   </ItemGroup>
 
   <ItemGroup>

@@ -345,10 +345,11 @@ describe('SetupPage', () => {
         expect(continueButton).toBeEnabled();
     });
 
-    it('shows the master key after the recovery codes, then finishes (ADR-0092 D2)', async () => {
-        // Two secrets, chained rather than shown together. Without this step a
-        // first-time operator would have a key they had never seen, in a server-side
-        // location they had no reason to look at.
+    it('lands on the welcome screen after the recovery codes (ADR-0095)', async () => {
+        // Setup gates on the codes alone. The master key follows on the welcome
+        // screen — without it a first-time operator would have a key they had never
+        // seen, in a server-side location they had no reason to look at, but it is not
+        // a secret worth blocking the hub on.
         const masterKey = 'Zm9vYmFyYmF6cXV1eGZvb2JhcmJhenF1dXhmb28xMjM=';
         vi.spyOn(authModule, 'performSetup').mockResolvedValue({
             userId: '00000000-0000-0000-0000-000000000010',
@@ -377,17 +378,16 @@ describe('SetupPage', () => {
         await user.click(screen.getByRole('checkbox'));
         await user.click(screen.getByRole('button', { name: /continue/i }));
 
-        // Then the master key, gated the same way.
-        expect(await screen.findByText(/save your master key/i)).toBeInTheDocument();
+        // Then the welcome screen: the key, the backups advice, and no second gate.
+        expect(await screen.findByText(/you're set up/i)).toBeInTheDocument();
         expect(screen.getByText(masterKey)).toBeInTheDocument();
+        expect(screen.getByText(/then set up backups/i)).toBeInTheDocument();
         // Says plainly that it can be seen again — a false "last chance" is the kind
         // of warning operators learn to ignore.
-        expect(screen.getByText(/see this again later/i)).toBeInTheDocument();
-
-        const finish = screen.getByRole('button', { name: /finish setup/i });
-        expect(finish).toBeDisabled();
-        await user.click(screen.getByRole('checkbox'));
-        expect(finish).toBeEnabled();
+        expect(screen.getByText(/not a last chance/i)).toBeInTheDocument();
+        // No acknowledgement to tick, and nothing disabled behind one.
+        expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /get started/i })).toBeEnabled();
     });
 
     it('sends includeDemo=false when the box is left alone', async () => {
@@ -463,11 +463,16 @@ describe('SetupPage', () => {
         await user.type(screen.getByLabelText(/passkey label/i), 'MacBook');
         await user.click(screen.getByRole('button', { name: /create account/i }));
 
-        // Zero ledgers is the normal path now, so the success screen must
-        // point somewhere rather than naming a ledger that doesn't exist.
-        expect(
-            await screen.findByText(/create a ledger or import one/i),
-        ).toBeInTheDocument();
+        // Zero ledgers is the normal path now, so the flow must point somewhere rather
+        // than naming a ledger that doesn't exist. That guidance moved from the header
+        // to the welcome screen (ADR-0095), where it sits with the other next steps
+        // instead of competing with the recovery codes.
+        expect(await screen.findByText(/save your recovery codes/i)).toBeInTheDocument();
+        await user.click(screen.getByRole('checkbox'));
+        await user.click(screen.getByRole('button', { name: /continue/i }));
+
+        expect(await screen.findByText(/add your first ledger/i)).toBeInTheDocument();
+        expect(screen.getByText(/import a Moneydance export/i)).toBeInTheDocument();
     });
 
     // --- Create-vs-Restore choice (ADR-0061) ---------------------------

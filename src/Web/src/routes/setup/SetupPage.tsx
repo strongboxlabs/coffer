@@ -17,7 +17,7 @@ import {
 import { errorMessage } from '@/lib/errorMessage';
 import { usernameProblem } from '@/lib/username';
 import { RecoveryCodes } from '@/components/RecoveryCodes';
-import { SetupMasterKey } from '@/components/SetupMasterKey';
+import { WelcomePanel } from '@/components/WelcomePanel';
 import { Button } from '@/components/ui/Button';
 import { FieldLabel } from '@/components/ui/FieldLabel';
 import { Input } from '@/components/ui/Input';
@@ -56,7 +56,10 @@ import { BrandHeader } from '@/components/ui/BrandHeader';
  *   5. /complete sets the cookie + returns recovery codes, and the Demo
  *      ledger if one was seeded. RecoveryCodes panel gates onward
  *      navigation behind explicit user acknowledgement.
- *   6. After acknowledgement, navigate to `/` — the ledger hub.
+ *   6. After acknowledgement, the WelcomePanel shows the master key and points at
+ *      backups (ADR-0095). Setup itself ends at the codes: they are the one secret
+ *      that cannot be recovered, so they are the only one it gates on.
+ *   7. Continue → `/`, the ledger hub.
  */
 export function SetupPage() {
     const { token } = useParams({ strict: false }) as { token: string };
@@ -281,23 +284,20 @@ function SetupForm({ token, onBack }: SetupFormProps) {
                                         </span>{' '}
                                         ledger.
                                     </>
-                                ) : (
-                                    <>
-                                        Next, create a ledger or import one from
-                                        Moneydance.
-                                    </>
-                                )}
+                                ) : null}
                             </p>
                         </header>
-                        {/* Two secrets to save, in order of severity (ADR-0092 D2):
-                            recovery codes first — one-time, and the only way back in
-                            without the authenticator — then the master key, which is
-                            re-viewable later and costs less to lose. Chained rather
-                            than shown together so neither competes for attention. */}
+                        {/* Setup gates on ONE secret: the recovery codes, which are
+                            one-time and the only way back in without the
+                            authenticator. The master key follows on the welcome
+                            screen (ADR-0095) — it is re-viewable, costs three
+                            reconnections rather than any data, and can only be
+                            explained next to the backups advice it belongs with. */}
                         {savedRecoveryCodes ? (
-                            <SetupMasterKey
+                            <WelcomePanel
                                 keyBase64={result.masterKeyBase64}
-                                onAcknowledge={() => navigate({ to: '/' })}
+                                hasLedger={result.ledgerName !== null}
+                                onContinue={() => navigate({ to: '/' })}
                             />
                         ) : (
                             <RecoveryCodes

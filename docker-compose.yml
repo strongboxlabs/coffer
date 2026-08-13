@@ -1,7 +1,13 @@
 services:
   postgres:
     image: postgres:16
-    container_name: coffer-postgres
+    # Prefixed so a second install on the same Docker engine doesn't collide.
+    # Compose already scopes NETWORKS and VOLUMES by project name, but a pinned
+    # container_name is global: a throwaway restore drill, or a dev stack beside a
+    # real install, failed with "container name is already in use" while every other
+    # resource was cleanly separated. Defaults to the old value, so existing installs
+    # and the scripts that default to `coffer-postgres` are unaffected.
+    container_name: ${COFFER_CONTAINER_PREFIX:-coffer}-postgres
     environment:
       # Superuser — the docker-entrypoint creates this role on first
       # container start. The init script under db/init mints the two
@@ -58,16 +64,19 @@ services:
       - log_connections=on
       - -c
       - log_disconnections=on
-    ports:
-      # Loopback-bound on purpose. This published port is not needed by the
-      # app at all — the API reaches Postgres as `postgres` over the compose
-      # network — it exists so an operator can attach psql or a GUI client
-      # from the host. Bound to 0.0.0.0 it put the database on every interface
-      # of the host, offering all three roles to anything that could route to
-      # it, unauthenticated-rate-limited and outside every application-level
-      # control. Override POSTGRES_PORT to move it; drop this stanza entirely
-      # if nothing on the host needs to connect.
-      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    # No published port, deliberately. The app never needs one — the API reaches
+    # Postgres as `postgres` over the compose network — and an unpublished port is a
+    # listening socket that cannot be misconfigured, plus one less thing for a second
+    # install on the same host to collide with.
+    #
+    # For ad-hoc SQL, exec into it rather than publishing:
+    #   docker compose exec postgres psql -U coffer -d coffer
+    #
+    # A GUI client (pgAdmin, DataGrip) cannot reach into a container and does need a
+    # host port. Add docker-compose.dev.yml to your COMPOSE_FILE (see .env.example) or
+    # write the three-line ports stanza into a docker-compose.override.yml. Bind it to
+    # 127.0.0.1: on 0.0.0.0 this put the database on every interface of the host,
+    # offering all three roles to anything that could route to it.
     secrets:
       - postgres_password
       - coffer_service_password
@@ -146,7 +155,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: coffer-api
+    container_name: ${COFFER_CONTAINER_PREFIX:-coffer}-api
     depends_on:
       postgres:
         condition: service_healthy

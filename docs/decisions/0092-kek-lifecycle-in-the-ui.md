@@ -2,7 +2,9 @@
 
 * Status: Accepted — D6's one-release `COFFER_MASTER_KEK_BASE64` window closed and the
   variable is gone; see [ADR-0094](0094-restore-is-ui-only-and-the-kek-has-no-env-channel.md), which also
-  carries out D4's stated replacement of the `install.sh` prompt.
+  carries out D4's stated replacement of the `install.sh` prompt. D2's placement of the
+  key inside the setup ceremony is superseded by [ADR-0095](0095-master-key-moves-to-a-welcome-screen.md):
+  setup gates on the recovery codes alone and a welcome screen carries the key.
 * Date: 2026-08-06
 * Amends: [ADR-0014](0014-encryption-at-rest.md) §Layer 4 and
   [ADR-0026](0026-per-ledger-encryption-key.md) §Master KEK source + §Rotation

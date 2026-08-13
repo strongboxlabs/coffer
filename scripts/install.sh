@@ -80,6 +80,29 @@ ask() {  # ask VAR "prompt" "default"
 }
 yesno() { local __a; printf '%s [y/N]: ' "$1"; IFS= read -r __a <"$TTY_DEV" || __a=; [ "$__a" = y ] || [ "$__a" = Y ]; }
 
+# free_port FIRST — echo the first free TCP port at or above FIRST (up to +20).
+#
+# Why this exists: a second install on the same host collides on PUBLISHED PORTS, the
+# same way it used to collide on container names. Compose scopes names and volumes per
+# project but a host port is global, so a dev stack or a restore drill already holding
+# 8080/5432 makes `up` fail with "port is already allocated" AFTER the install has
+# written its config — which reads like a Coffer bug rather than an occupied port.
+#
+# bash's /dev/tcp probe rather than ss/lsof/netstat: those are variously absent on a
+# minimal Ubuntu, differently-flagged on macOS, and one more thing to require. A
+# successful connect means something is listening, so the port is taken.
+free_port() {
+    local candidate=$1 limit=$(( $1 + 20 ))
+    while [ "$candidate" -lt "$limit" ]; do
+        if ! (exec 3<>"/dev/tcp/127.0.0.1/$candidate") 2>/dev/null; then
+            printf '%s' "$candidate"; return 0
+        fi
+        exec 3>&- 2>/dev/null || true
+        candidate=$(( candidate + 1 ))
+    done
+    printf '%s' "$1"   # nothing free nearby: keep the default and let compose say so
+}
+
 # ------------------------------------------------------------------ privileges
 # Run this as your NORMAL user, not `sudo bash …`: under sudo $HOME becomes
 # root's, so ~/coffer + your secrets would land in /root, root-owned. We escalate with sudo only where it's actually needed —
@@ -93,10 +116,50 @@ else
     SUDO=""
 fi
 
+# ---------------------------------------------------------------- environment
+# Three supported places to run this, and they differ ONLY in how Docker gets
+# there. Everything after this point is identical, which is why this is a
+# detection step rather than three scripts.
+#
+#   linux  — native. We can install Docker via get.docker.com.
+#   wsl    — WSL2 on Windows. Docker comes from Docker Desktop on the WINDOWS
+#            side via WSL integration; running get.docker.com in here would
+#            install a second daemon that fights the first.
+#   macos  — Docker Desktop, installed by hand (get.docker.com has no macOS
+#            path). Homebrew could do it, but silently installing a GUI app that
+#            wants privileges is not something a curl-to-bash should decide.
+case "$(uname -s)" in
+    Darwin) PLATFORM=macos ;;
+    Linux)
+        # WSL_DISTRO_NAME is set by WSL itself; /proc/version is the fallback for
+        # a non-login shell where the environment hasn't been populated.
+        if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
+            PLATFORM=wsl
+        else
+            PLATFORM=linux
+        fi ;;
+    *) die "Unsupported platform: $(uname -s). Coffer installs on Linux, WSL2 (Windows) or macOS." ;;
+esac
+info "Platform: $PLATFORM"
+
+# On WSL, refuse to install onto the Windows filesystem. /mnt/c is a 9p mount:
+# the exec bit on db/init/00-init-roles.sh does not survive it, so Postgres
+# silently skips the role-init script and the API then fails to connect with a
+# "role does not exist" that points nowhere near the cause. It is also markedly
+# slower. The Linux-side home directory has neither problem.
+if [ "$PLATFORM" = wsl ]; then
+    case "$INSTALL_DIR" in
+        /mnt/*) die "On WSL, install inside the Linux filesystem, not $INSTALL_DIR.
+    A /mnt/... path drops the exec bit on db/init/00-init-roles.sh, so the database
+    roles never get created and the API fails to connect. Use the default (~/coffer)
+    or set COFFER_DIR to another path under \$HOME." ;;
+    esac
+fi
+
 # --------------------------------------------------------------------- Docker
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     info "Docker + Compose present."
-else
+elif [ "$PLATFORM" = linux ]; then
     warn "Docker (with the Compose plugin) was not found."
     if yesno "Install Docker now via https://get.docker.com${SUDO:+ (uses sudo)}?"; then
         curl -fsSL https://get.docker.com | ${SUDO:+$SUDO }sh || die "Docker install failed."
@@ -104,6 +167,17 @@ else
     else
         die "Docker is required. Install it and re-run."
     fi
+elif [ "$PLATFORM" = wsl ]; then
+    die "Docker isn't reachable from this WSL distro.
+    Install Docker Desktop for Windows, then in Docker Desktop:
+      Settings -> General  : tick 'Use the WSL 2 based engine'
+      Settings -> Resources -> WSL integration : enable '${WSL_DISTRO_NAME:-this distro}'
+    Then re-run this script. Do NOT install Docker inside WSL separately — you
+    would end up with two daemons and containers you can't see from Windows."
+else
+    die "Docker isn't installed.
+    Install Docker Desktop for Mac (https://docs.docker.com/desktop/install/mac-install/),
+    start it, wait for the whale icon to settle, then re-run this script."
 fi
 
 # Daemon access: prefer running docker WITHOUT sudo; fall back to sudo (e.g. a
@@ -114,8 +188,12 @@ if ! docker info >/dev/null 2>&1; then
     if [ -n "$SUDO" ] && $SUDO docker info >/dev/null 2>&1; then
         DOCKER="$SUDO docker"
         warn "Using 'sudo docker' — your user isn't in the 'docker' group yet. To drop the sudo later: 'sudo usermod -aG docker $USER', then log out/in."
-    else
+    elif [ "$PLATFORM" = linux ]; then
         die "Can't reach the Docker daemon. Start it ('sudo systemctl start docker') or add your user to the 'docker' group (log out/in), then re-run."
+    else
+        die "Can't reach the Docker daemon. Start Docker Desktop, wait for it to report
+    'running', then re-run. (On WSL, also check Settings -> Resources -> WSL
+    integration has '${WSL_DISTRO_NAME:-this distro}' enabled.)"
     fi
 fi
 command -v openssl >/dev/null 2>&1 || die "openssl is required (secret generation). Install it and re-run."
@@ -227,7 +305,9 @@ if [ "$MODE" = fresh ]; then
             ask mcp_origin "MCP origin URL (the host MCP clients reach)" "https://mcp.$domain"
         fi
     else
-        ask port "Port" "8080"
+        api_default="$(free_port 8080)"
+        [ "$api_default" = 8080 ] ||             warn "8080 is in use on this host — suggesting $api_default instead."
+        ask port "Port" "$api_default"
         web_origin="http://localhost:$port"; rp_id="localhost"
         mcp_enabled=false; mcp_origin="$web_origin"
     fi
@@ -270,6 +350,11 @@ if [ "$MODE" = fresh ]; then
         fi
     done
 
+    # Compose lowercases and strips the project name it derives from the directory;
+    # mirror that so the prefix and the project agree.
+    container_prefix="$(basename "$INSTALL_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
+    [ -n "$container_prefix" ] || container_prefix=coffer
+
     info "Generating secrets and writing $INSTALL_DIR/.env"
     umask 077
     cat >"$INSTALL_DIR/.env" <<EOF
@@ -283,8 +368,21 @@ if [ "$MODE" = fresh ]; then
 # reach the containers as docker-compose secrets. See docker-compose.yml.
 POSTGRES_USER=coffer
 POSTGRES_DB=coffer
+# Postgres is NOT published to the host by default: the API reaches it over the compose
+# network, and an unpublished port is one less listening socket and one less thing to
+# collide with a second install. For ad-hoc SQL you do not need it published at all:
+#   docker compose exec postgres psql -U coffer -d coffer
+# To publish it for a GUI client (pgAdmin, DataGrip), which cannot reach into a
+# container, add the dev overlay and a port — see .env.example in the repo. Nothing
+# here needs it.
 ASPNETCORE_ENVIRONMENT=Production
 API_PORT=$port
+# Container names are prefixed with this so a second install on the same Docker
+# engine (a restore drill, a dev stack beside a real one) doesn't collide on a
+# global container name while its volumes and network are properly scoped. Derived
+# from the install directory, which is also what Compose derives the project name
+# from — so ~/coffer keeps the historical coffer-api / coffer-postgres exactly.
+COFFER_CONTAINER_PREFIX=$container_prefix
 COFFER_IMAGE=$IMAGE
 COFFER_IMAGE_TAG=$IMAGE_TAG
 COFFER_RP_ID=$rp_id
@@ -304,9 +402,11 @@ COFFER_MCP_URL=$mcp_origin
 COFFER_MCP_ENABLED=$mcp_enabled
 EOF
     chmod 600 "$INSTALL_DIR/.env"
-    warn "The setup page will show this install's master key ONCE — back it up then."
-    warn "  (Later: System → Encryption → Show key. Without it, bank-feed tokens, the"
-    warn "   stored backup passphrase and the Drive connection can't be recovered.)"
+    info "The master key is minted by the app on first boot, not written here."
+    info "  Setup hands it to you on the welcome screen; keep a copy (System →"
+    info "  Encryption → Show key reads it again). Without it, bank-feed tokens, the"
+    info "  stored backup passphrase and the Drive connection don't survive a move to"
+    info "  another install — your ledgers and passkeys do not depend on it."
 fi
 
 # COFFER_IMAGE is REQUIRED by the compose file fetched above (it has no default —
@@ -426,9 +526,37 @@ echo ""
 if [ -n "$up" ]; then info "Coffer is up."; else
     warn "It didn't answer within ~2 min — check 'cd $INSTALL_DIR && $DOCKER compose logs -f api'."
 fi
-echo "  Open:    ${origin:-http://localhost:$port}"
-echo "  First run creates your admin passkey. If it asks for a one-time setup token:"
-echo "    cd $INSTALL_DIR && $DOCKER compose logs api | grep -i bootstrap"
+# First-run setup URL. The API logs a one-shot /setup/<token> link once and never
+# again, and telling the operator to go grep it out of `compose logs` is not a
+# one-command install — it is a one-command install followed by homework, at the
+# only moment they have nothing to compare it against. dev-up-docker.sh has fetched
+# and printed this for a while; there was no reason the user-facing path was the
+# worse one.
+#
+# Silent on an install that already has a user: `bootstrap-token` refuses once setup
+# is done, and its complaint would be noise on every upgrade re-run. NB
+# `dotnet coffer-api.dll`, not `coffer-api` — the image ENTRYPOINT is
+# ["dotnet","coffer-api.dll"] with no apphost on PATH. The subcommand also emits DbUp
+# lines on stdout, hence grepping for the URL rather than taking the whole output.
+setup_url=
+if [ -n "$up" ]; then
+    setup_url="$($DOCKER compose exec -T api dotnet coffer-api.dll bootstrap-token 2>/dev/null \
+        | grep -oE 'https?://[^[:space:]]+/setup/[^[:space:]]+' | head -1 || true)"
+fi
+
+if [ -n "$setup_url" ]; then
+    echo "  Open this ONCE to create your admin passkey:"
+    echo "    $setup_url"
+    echo ""
+    echo "  Straight after that you'll get a welcome screen with this install's master"
+    echo "  key to save, and a pointer to set up backups."
+else
+    echo "  Open:    ${origin:-http://localhost:$port}"
+    # Either already set up, or the app never answered — in both cases the link is
+    # not ours to print, so say where it lives.
+    echo "  If it asks for a one-time setup token:"
+    echo "    cd $INSTALL_DIR && $DOCKER compose logs api | grep -i bootstrap"
+fi
 echo "  Manage:  cd $INSTALL_DIR && $DOCKER compose ps | logs -f api | down | up -d"
 
 # initdb runs exactly once, so an install created before scram became the default
@@ -446,5 +574,6 @@ if [ -x "$INSTALL_DIR/scripts/harden-pg-hba.sh" ] \
 fi
 
 echo "  Restoring an existing Coffer? Open the URL, choose 'Restore from a backup',"
-echo "  and upload the .cofferbak + its passphrase + that install's master key. The key"
-echo "  is checked against the archive before anything is replaced."
+echo "  and upload the .cofferbak + its passphrase. Add that install's master key too if"
+echo "  you have it — it carries the sealed secrets across, and is checked against the"
+echo "  archive first. Without it the restore still works; three things need re-linking."
