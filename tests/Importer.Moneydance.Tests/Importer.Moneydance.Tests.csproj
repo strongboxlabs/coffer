@@ -15,6 +15,19 @@
     <PackageReference Include="Testcontainers.PostgreSql" Version="4.13.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <!-- Pin the transitive SSH.NET to the patched version, same as Api.Tests does and
+         for the same reason: Testcontainers.PostgreSql 4.13.0 (the latest) resolves
+         2025.1.0, which GHSA-q939-rpr3-3284 flags high — ScpClient's recursive download
+         doesn't validate remote-supplied filenames. Nothing here uses ScpClient; it
+         arrives through Testcontainers' port-forwarding path. Audit warnings are errors,
+         so carrying it fails the build.
+
+         This project was missed when Api.Tests was pinned, and a local build did NOT
+         catch it: NuGet audits at RESTORE time, and this project's restore was cached,
+         so no fresh audit ran. Public CI restores clean and failed every shard. If you
+         touch either pin, verify with a forced restore rather than an incremental build.
+         Remove both once Testcontainers' own floor moves past it. -->
+    <PackageReference Include="SSH.NET" Version="2026.0.0" />
   </ItemGroup>
 
   <ItemGroup>
