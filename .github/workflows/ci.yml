@@ -152,6 +152,12 @@ jobs:
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
 
+      # High-and-above only: moderate/low in a dev toolchain would fail CI constantly
+      # for code that never reaches a user. `npm ci --no-audit` above is for speed, so
+      # without this step nothing checks at all.
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
       - name: Typecheck
         run: npm run typecheck
 
