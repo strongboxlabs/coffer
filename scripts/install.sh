@@ -223,6 +223,51 @@ if [ -f "$INSTALL_DIR/.env" ]; then
     esac
 fi
 
+# ------------------------------------------------- foreign-volume guard (fresh only)
+#
+# Compose derives its project name from the install DIRECTORY, and volumes are named
+# <project>_postgres_data / <project>_coffer_data. Two different installs whose
+# directories share a basename therefore share volumes on the same Docker engine — and
+# that is not hypothetical: a WSL install at ~/coffer met the volumes a Windows checkout
+# of .../Coffer created weeks earlier, because Docker Desktop shares one engine across
+# both.
+#
+# The failure that produces is genuinely hard to read. Postgres runs db/init only on an
+# EMPTY data directory, so the adopted database keeps the other install's role passwords
+# while this .env has freshly generated ones. The API then crash-loops on
+# `28P01 password authentication failed for user "coffer_service"` — an authentication
+# error that says nothing about the actual cause, three minutes after the install
+# appeared to be going fine.
+#
+# So: on a FRESH install, if those volumes already exist, stop before touching anything.
+container_prefix="$(basename "$INSTALL_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
+[ -n "$container_prefix" ] || container_prefix=coffer
+
+if [ "$MODE" = fresh ]; then
+    existing_vols=''
+    for v in "${container_prefix}_postgres_data" "${container_prefix}_coffer_data"; do
+        $DOCKER volume inspect "$v" >/dev/null 2>&1 && existing_vols="$existing_vols $v"
+    done
+    if [ -n "$existing_vols" ]; then
+        warn "Docker already has volumes for the compose project '$container_prefix':"
+        for v in $existing_vols; do echo "      $v"; done
+        die "A fresh install here would REUSE that data instead of creating its own.
+    Postgres only initialises roles on an empty data directory, so it would keep the
+    other install's passwords while this one generates new ones — the API then fails
+    with '28P01 password authentication failed'.
+
+    Pick one:
+      * Install somewhere else, which changes the project name and gets its own volumes:
+            COFFER_DIR=\$HOME/coffer-$(date +%m%d) bash \$0
+      * If those volumes are genuinely disposable, remove them first:
+            $DOCKER volume rm$existing_vols
+      * If this IS your install, keep its .env and secrets/ so re-running offers
+        'upgrade in place' or 'wipe & reinstall' rather than treating it as fresh.
+
+    Nothing was changed."
+    fi
+fi
+
 # --------------------------------------------------------- fetch canonical files
 #
 # A token means the operator is installing from a PRIVATE fork — but REPO still
@@ -352,9 +397,6 @@ if [ "$MODE" = fresh ]; then
 
     # Compose lowercases and strips the project name it derives from the directory;
     # mirror that so the prefix and the project agree.
-    container_prefix="$(basename "$INSTALL_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
-    [ -n "$container_prefix" ] || container_prefix=coffer
-
     info "Generating secrets and writing $INSTALL_DIR/.env"
     umask 077
     cat >"$INSTALL_DIR/.env" <<EOF

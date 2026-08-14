@@ -268,18 +268,21 @@ A passkey has to live somewhere, and where decides how smooth this is:
 | Where it's stored | Works on | Notes |
 |---|---|---|
 | **Operating system** — Windows Hello, Touch ID / iCloud Keychain, Google Password Manager | Windows, macOS, iOS, Android | Nothing to install. Synced ones survive a dead device. **Linux has no equivalent.** |
-| **Browser extension** — Bitwarden, 1Password, Proton Pass | Anywhere the extension runs, Linux included | The practical answer on Linux desktop if you don't own a hardware key. Verify it will store a credential for your install's hostname before you rely on it. |
+| **Browser extension** — Bitwarden, 1Password, Proton Pass | Anywhere the extension runs, Linux included | The answer on Linux desktop if you don't own a hardware key. Verified with Bitwarden against a `localhost` install — it stores a credential for that hostname and signs in with it, so no udev setup and no second machine are needed. |
 | **Hardware key** — YubiKey and similar | Everywhere, including Linux | The most portable: one key works across machines and operating systems. Best practice is to keep **two** and enrol both, which is how you avoid a lost key becoming a recovery-code event — though recovery codes cover you either way. |
 
 **On Linux, plan this before installing.** Linux browsers have no OS authenticator, so
 enrolling the first passkey needs one of:
 
-- a **hardware key** plugged into the machine running the browser — it can't be reached
-  over SSH, and on Linux your user needs access to it: udev rule
-  `KERNEL=="hidraw*", ATTRS{idVendor}=="1050", MODE="0660", GROUP="plugdev", TAG+="uaccess"`,
-  add yourself to `plugdev`, replug. Use a **non-Snap** browser — Snap Chromium and
-  Firefox can't reach USB keys at all;
-- a **passkey-capable browser extension** on that machine;
+- a **hardware key** plugged into the machine running the browser — it cannot be reached
+  over SSH, and on Linux it needs one piece of setup that isn't obvious. See
+  [Enrolling a hardware key on Linux](#enrolling-a-hardware-key-on-linux) below;
+- a **passkey-capable browser extension** on that machine — Bitwarden and similar act as
+  passkey providers where the OS doesn't. Verified with Bitwarden on a `localhost`
+  install: it stores the credential and signs in with it, which makes this the least
+  fiddly Linux route since it needs no device permissions at all. Enable
+  *"Ask to save and use passkeys"* in the extension's settings, or it never intercepts
+  the request and Chrome goes straight to its own dialog;
 - **or an SSH tunnel from a Windows or Mac laptop**, using that machine's
   authenticator:
   ```bash
@@ -287,8 +290,53 @@ enrolling the first passkey needs one of:
   ```
   The browser sees `http://localhost:8080` either way, so the origin still matches.
 
-A headless Linux host with no hardware key and no tunnel cannot complete setup, because
-setup requires enrolling a passkey. That's the one combination to avoid walking into.
+A **headless** Linux host is the one combination to avoid walking into: no local browser
+means no extension and no local hardware key, so without a tunnel there is nothing to
+enrol with, and setup cannot complete. A Linux host with a desktop has two working routes
+(extension or hardware key) and needs neither a second machine nor a phone.
+
+### Enrolling a hardware key on Linux
+
+Verified on Ubuntu with a YubiKey and Chrome. The failure it prevents looks like the
+browser not detecting the key at all: Chrome offers *"Use your security key"*, you touch
+it, and nothing happens.
+
+The cause is device permissions, not detection. Chrome opens `/dev/hidraw*`, and the
+default rules hand that device to whoever holds the **active local seat** via `uaccess`.
+If the console is sitting at the login greeter, or the browser is running from a session
+that isn't the local seat, the ACL belongs to `gdm` and your user cannot open the node:
+
+```bash
+getfacl /dev/hidraw0 | grep '^user:'
+#   user:gdm:rw-     <- the problem: not you
+```
+
+Two ways out. **If you are physically at the machine**, log in graphically as yourself
+and run the browser from that desktop — the seat is then yours and it works with no
+configuration. **Otherwise**, grant access by group instead of by seat:
+
+```bash
+echo 'KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", MODE="0660", GROUP="plugdev"'   | sudo tee /etc/udev/rules.d/99-yubikey.rules
+sudo udevadm control --reload && sudo udevadm trigger
+sudo usermod -aG plugdev $USER
+```
+
+Then **log out of the desktop and back in** — group membership only applies to new
+sessions, and an already-running browser keeps its old groups, so skipping this makes it
+look as though the rule did nothing. Confirm both halves before retrying:
+
+```bash
+ls -l /dev/hidraw0            # want: crw-rw---- root plugdev
+id -nG | tr ' ' '
+' | grep plugdev
+```
+
+Two things that are *not* problems. A key reporting as `1050:0402` (U2F-only mode rather
+than the default `0407`) enrols fine — Coffer requests no resident key and leaves
+authenticator attachment unset, so both U2F and FIDO2 keys are acceptable. And if your
+browser is snap-packaged, check `snap connections firefox | grep u2f` rather than assuming
+it can't work; the `u2f-devices` interface exists, and only a missing connection is a
+blocker.
 
 **Your phone can only be enrolled on an HTTPS install at a real hostname.** The QR /
 cross-device flow tunnels the ceremony to the phone, and phone credential managers
