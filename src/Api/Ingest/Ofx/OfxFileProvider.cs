@@ -1,3 +1,5 @@
+using System.Globalization;
+
 using OfxNet;
 using OfxNet.Investments;
 using OfxNet.Investments.Securities;
@@ -335,9 +337,16 @@ public sealed class OfxFileProvider : IFileProvider
     /// Skipped (with preview warning):
     /// <list type="bullet">
     ///   <item><c>TRANSFER</c>, <c>JRNLSEC</c>, <c>JRNLFUND</c> — share-only / inter-subaccount moves</item>
-    ///   <item><c>BUYOPT</c> / <c>SELLOPT</c> / <c>CLOSUREOPT</c> — options (ADR-0027 declined)</item>
+    ///   <item><c>CLOSUREOPT</c> — options (ADR-0027 declined)</item>
     ///   <item><c>SPLIT</c> — stock splits route through the security-splits surface, not the txn editor</item>
     /// </list>
+    /// <c>BUYOPT</c> / <c>SELLOPT</c> are the exception ADR-0027's
+    /// "options declined" wording doesn't cover: OfxNet models them as
+    /// <c>OfxBuyInvestment</c> / <c>OfxSellInvestment</c> subclasses,
+    /// so the buy/sell arms below claim them before any options check
+    /// could run, and they import as plain buys/sells. Left as-is —
+    /// no option data has been seen in a real file, and changing it
+    /// is an ADR-0027 amendment, not a mapper tweak.
     /// </remarks>
     private static IngestedTransaction? MapInvestmentTransaction(
         OfxInvestmentTransaction txn,
@@ -360,7 +369,7 @@ public sealed class OfxFileProvider : IFileProvider
             // so the user knows N rows weren't imported and why.
             errors.Add(new IngestError(
                 Code: "ofx_investment_type_unsupported",
-                Message: $"Investment transaction type '{txn.GetType().Name}' is not supported in this slice; row skipped (FITID {txn.InstitutionId}).",
+                Message: DescribeUnsupported(txn, secListIndex),
                 ConnectionId: null,
                 AccountId: null));
             return null;
@@ -409,6 +418,102 @@ public sealed class OfxFileProvider : IFileProvider
             UnitPrice: ExtractUnitPrice(txn),
             Fee: ExtractFee(txn));
     }
+
+    /// <summary>
+    /// Build the preview warning for a row whose OFX aggregate this
+    /// slice doesn't import. The user has to find the row on their
+    /// statement to judge whether the skip matters, so the message
+    /// leads with the wire tag and the row's identity — security,
+    /// units, trade date. It deliberately drops two things the old
+    /// message led with: the OfxNet runtime class name, which is an
+    /// implementation detail no statement shows, and the FITID, which
+    /// some institutions assemble out of a hundred characters of
+    /// concatenated internal keys (a 401(k) recordkeeper in the wild
+    /// emits contract number + amount + date + CUSIP + units + price
+    /// + a DB2 timestamp) and which is unreadable in a preview list.
+    /// </summary>
+    private static string DescribeUnsupported(
+        OfxInvestmentTransaction txn,
+        IReadOnlyDictionary<string, OfxSecurity> secListIndex)
+    {
+        var (tag, reason) = UnsupportedKind(txn);
+
+        var identity = new List<string>(3);
+        if (ResolveTicker(UnsupportedSecurity(txn), secListIndex) is { } security)
+            identity.Add(security);
+        if (UnsupportedUnits(txn) is { } units)
+        {
+            // 12dp matches txn_legs.quantity's scale; the format trims
+            // trailing zeros so whole-share rows stay readable.
+            identity.Add($"{units.ToString("0.############", CultureInfo.InvariantCulture)} units");
+        }
+        identity.Add(txn.TradeDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+
+        return $"OFX {tag} row skipped ({string.Join(", ", identity)}). {reason}";
+    }
+
+    /// <summary>
+    /// The OFX wire tag and the human reason this slice skips it, for
+    /// each aggregate <see cref="ClassifyInvestmentTransaction"/>
+    /// leaves unclassified. Note that <c>BUYOPT</c> / <c>SELLOPT</c>
+    /// are NOT here: OfxNet models them as
+    /// <c>OfxBuyInvestment</c> / <c>OfxSellInvestment</c> subclasses,
+    /// so the classifier's buy/sell arms already claim them.
+    /// </summary>
+    private static (string Tag, string Reason) UnsupportedKind(
+        OfxInvestmentTransaction txn) => txn switch
+    {
+        OfxTransfer transfer => (
+            transfer.TransferAction is { Length: > 0 } direction
+                ? $"TRANSFER ({direction})"
+                : "TRANSFER",
+            "Share-only moves aren't imported in this slice."),
+        OfxJournalSecurity => (
+            "JRNLSEC",
+            "Share-only moves between sub-accounts aren't imported in this slice."),
+        OfxJournalFund => (
+            "JRNLFUND",
+            "Cash moves between sub-accounts aren't imported in this slice."),
+        OfxOptionClosure => (
+            "CLOSUREOPT",
+            "Options are outside the ADR-0027 action catalog."),
+        OfxSplit => (
+            "SPLIT",
+            "Stock splits are recorded on the security, not in the register."),
+        _ => (
+            txn.GetType().Name,
+            "This OFX aggregate is outside the ADR-0027 action catalog."),
+    };
+
+    /// <summary>
+    /// Security reference on a skipped row, for the warning text.
+    /// Separate from <see cref="ClassifyInvestmentTransaction"/>,
+    /// which returns null for these types precisely because they
+    /// produce no transaction.
+    /// </summary>
+    private static OfxSecurityId? UnsupportedSecurity(
+        OfxInvestmentTransaction txn) => txn switch
+    {
+        OfxTransfer transfer      => transfer.Security,
+        OfxJournalSecurity jrnl   => jrnl.Security,
+        OfxOptionClosure closure  => closure.Security,
+        OfxSplit split            => split.Security,
+        _                         => null,
+    };
+
+    /// <summary>
+    /// Share count on a skipped row, for the warning text. Null for
+    /// the aggregates that carry no <c>UNITS</c> (JRNLFUND is a cash
+    /// move; SPLIT carries ratio fields instead).
+    /// </summary>
+    private static decimal? UnsupportedUnits(
+        OfxInvestmentTransaction txn) => txn switch
+    {
+        OfxTransfer transfer      => transfer.Units,
+        OfxJournalSecurity jrnl   => jrnl.Units,
+        OfxOptionClosure closure  => closure.Units,
+        _                         => null,
+    };
 
     /// <summary>
     /// Classify an OFX investment transaction into an ADR-0027

@@ -105,7 +105,11 @@ public static class AccountMapper
             ProviderRawPayload: string.IsNullOrEmpty(acct.RawJson) ? null : acct.RawJson,
             // ADR-0066: best-guess tax treatment from the account name; seed-once,
             // the user refines in the editor.
-            TaxStatus: InferTaxStatus(acct.Name, accountType)),
+            TaxStatus: InferTaxStatus(acct.Name, accountType),
+            // ADR-0050 / mig 127: the Start Date MD records for every account.
+            // Categories have no opening balance, so a start date is meaningless
+            // for them — leave it null rather than carrying MD's value across.
+            OpenedOn: accountType == "category" ? null : acct.OpenedOn),
             Skip: null);
     }
 

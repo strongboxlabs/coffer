@@ -31,6 +31,16 @@ RUN npm run build
 # ('amd64' / 'arm64'), which is exactly what `dotnet publish -a` expects.
 FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS api
 ARG TARGETARCH
+# Build identity (ADR-0044), passed in rather than read from git: .dockerignore
+# excludes .git, so the stamping target inside this stage has no repo to ask and
+# used to fall back to "nogit" / build 0. Every published image therefore reported
+# 0.62.0+nogit — able to name its release but not the commit behind it, and
+# indistinguishable from any other image of the same release. The release workflow
+# supplies these from the tagged commit. Left empty (a local `docker build`), the
+# csproj falls back to consulting git, then to the old defaults.
+ARG SOURCE_COMMIT_SHA=
+ARG SOURCE_COMMIT_COUNT=
+ARG SOURCE_COMMIT_DATE=
 WORKDIR /src
 COPY global.json ./
 # Publish the API project only; restore pulls just its transitive project
@@ -41,7 +51,7 @@ COPY src/ ./src/
 # box (ADR-0088); data/ is otherwise dockerignored, with data/samples carved
 # back in.
 COPY data/samples ./data/samples
-RUN dotnet publish src/Api/Api.csproj -c Release -a "$TARGETARCH" -o /publish
+RUN dotnet publish src/Api/Api.csproj -c Release -a "$TARGETARCH" -o /publish       -p:GitShortSha="$SOURCE_COMMIT_SHA"       -p:GitCommitCount="$SOURCE_COMMIT_COUNT"       -p:GitCommitDate="$SOURCE_COMMIT_DATE"
 
 # --- Stage 3: runtime -------------------------------------------------------
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime

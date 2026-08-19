@@ -64,6 +64,7 @@ public sealed class AccountsReportingRepository
                 a.CurrencyCode,
                 a.IsActive,
                 a.TaxStatus,
+                a.OpenedOn,
                 a.HoldingsAccountId,
             })
             .ToListAsync(cancellationToken)
@@ -90,7 +91,7 @@ public sealed class AccountsReportingRepository
                 return new AccountInfo(
                     a.Id, a.Name, a.AccountType, a.CategoryKind, a.ParentId,
                     a.CurrencyCode, a.IsActive, balance,
-                    AccountClassifier.Classify(a.AccountType), a.TaxStatus);
+                    AccountClassifier.Classify(a.AccountType), a.TaxStatus, a.OpenedOn);
             })
             .OrderBy(a => a.Name, StringComparer.Ordinal)
             .ToList();
@@ -172,18 +173,57 @@ public sealed class AccountsReportingRepository
                 $"That range and interval would produce more than {MaxHistoryPoints} points; " +
                 "widen the interval (quarter/year) or narrow the range.");
 
-        var points = new List<NetWorthHistoryPoint>(dates.Count);
-        foreach (var t in dates)
-        {
-            var holdings = await _db.HoldingsMarketValueAsOf(ledgerId, t, null, null)
-                .ToListAsync(cancellationToken).ConfigureAwait(false);
-            var balances = await _db.AccountBalanceAsOf(ledgerId, t, null)
-                .ToListAsync(cancellationToken).ConfigureAwait(false);
+        // Both feeders answer for EVERY period end in one call. This used to ask each
+        // of them once per point inside the loop below — the same O(instants) round
+        // trips that made a whole-ledger TWR cost ~60 s before migrations 200/201,
+        // and the reason MaxHistoryPoints exists at all.
+        // TRUNCATED TO MICROSECONDS, and the same truncated values are used as the
+        // dictionary keys below. PeriodEnds yields nextStart.AddTicks(-1), i.e.
+        // 23:59:59.9999999 — but timestamptz is microsecond-precision, so that value
+        // is rounded on the way into Postgres and the as_of coming back is NOT the
+        // DateTime that was sent. Keying on a round-tripped timestamp silently missed
+        // every lookup and reported a net worth of zero for every point.
+        var instants = dates
+            .Select(d =>
+            {
+                var utc = d.Kind == DateTimeKind.Utc ? d : DateTime.SpecifyKind(d, DateTimeKind.Utc);
+                return new DateTime(utc.Ticks - (utc.Ticks % 10), DateTimeKind.Utc);
+            })
+            .ToArray();
 
-            var balanceByAccount = balances.ToDictionary(b => b.AccountId, b => b.Balance);
-            var holdingsValueBySibling = holdings
-                .GroupBy(h => h.AccountId)
-                .ToDictionary(g => g.Key, g => g.Sum(x => x.MarketValue));
+        var holdingsRows = await _db.HoldingsMarketValueAsOfSet(ledgerId, instants, null)
+            .Select(r => new { r.AsOf, r.AccountId, r.MarketValue, r.PricedFrom })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+
+        var holdingsByInstant = holdingsRows
+            .GroupBy(r => r.AsOf)
+            .ToDictionary(
+                g => g.Key,
+                g => g.GroupBy(x => x.AccountId)
+                      .ToDictionary(a => a.Key, a => a.Sum(x => x.MarketValue)));
+
+        // Unpriced positions per instant — the same count the per-instant loop
+        // produced, now derived from the one batched read.
+        var unpricedByInstant = holdingsRows
+            .Where(r => r.PricedFrom == "none" && netWorthSiblings.Contains(r.AccountId))
+            .GroupBy(r => r.AsOf)
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        var balancesByInstant = (await _db.AccountBalanceAsOfInstants(ledgerId, instants, null)
+                .Select(r => new { r.AsOf, r.AccountId, r.Balance })
+                .ToListAsync(cancellationToken).ConfigureAwait(false))
+            .GroupBy(r => r.AsOf)
+            .ToDictionary(g => g.Key, g => g.ToDictionary(x => x.AccountId, x => x.Balance));
+
+        var points = new List<NetWorthHistoryPoint>(dates.Count);
+        for (var i = 0; i < dates.Count; i++)
+        {
+            var t = dates[i];
+            var key = instants[i];
+            var balanceByAccount = balancesByInstant.GetValueOrDefault(key)
+                                   ?? new Dictionary<Guid, decimal>();
+            var holdingsValueBySibling = holdingsByInstant.GetValueOrDefault(key)
+                                         ?? new Dictionary<Guid, decimal>();
 
             var netWorth = 0m;
             foreach (var a in accounts)
@@ -194,8 +234,7 @@ public sealed class AccountsReportingRepository
                 netWorth += bal;   // liabilities are stored negative → straight sum
             }
 
-            var unpriced = holdings
-                .Count(h => h.PricedFrom == "none" && netWorthSiblings.Contains(h.AccountId));
+            var unpriced = unpricedByInstant.GetValueOrDefault(key);
             points.Add(new NetWorthHistoryPoint(t, netWorth, unpriced));
         }
 

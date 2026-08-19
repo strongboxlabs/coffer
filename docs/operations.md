@@ -482,8 +482,15 @@ The database is not published to the host — the API reaches it over the compos
 (see the note in `docker-compose.yml`). Exec into it instead:
 
 ```bash
-cd ~/coffer && docker compose exec postgres psql -U coffer -d coffer
+cd ~/coffer && docker compose exec postgres   sh -c 'PGPASSWORD=$(cat /run/secrets/postgres_password) psql -U coffer -d coffer'
 ```
+
+The password is read from the docker secret **inside** the container, so it never
+reaches your shell history. On an install created before the scram hardening above,
+initdb left `trust` on the local socket and a bare `psql -U coffer -d coffer` still
+works — `scripts/harden-pg-hba.sh` is the one-time fix. Use the `coffer` superuser for
+diagnostics: `coffer_app` is `NOBYPASSRLS`, so outside a request `app.user_id` is
+unset and every scoped table returns **zero rows with no error**.
 
 A GUI client can't reach into a container and needs a published port; the repo's
 `docker-compose.dev.yml` overlay is the supported way to add one, bound to 127.0.0.1.

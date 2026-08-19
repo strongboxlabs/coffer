@@ -26,7 +26,306 @@ Status section.
 
 ## Next (ordered)
 
+### Immediates
+
+Pulled up out of Backlog on 2026-08-17, ahead of the CSV slices. The as-of valuation
+work is finished — `holdings_snapshot` answers at any instant, cost basis included,
+and the duplicate as-of feeders are collapsed to one implementation each. What
+remains here is the same defect class, freshly re-evidenced.
+
+### Tests that cannot fail — two slices
+
+**The mutation sweep ran on 2026-08-17. Result: no survivors.** Thirteen targeted
+mutations were applied across the financial paths, each reverted after one focused
+test run:
+
+| mutated rule | caught by |
+|---|---|
+| transfer_shares disposal gate removed | 5 tests |
+| long-term boundary 1 year -> 1 day | 1 |
+| merged-header exclusion removed | 1 |
+| fee folding for is_trade_commission disabled | 1 (commission endpoints) |
+| posted-at override ignored | 2 |
+| seq tie-break dropped | 9 |
+| category posting-role qualifier removed | 5 |
+| excludedBrokerageCash forced to zero | 3 |
+| trade-price tier never consulted | 11 |
+| split back-adjustment of observed price removed | 1 |
+| in-kind leg de-duplication removed | 3 |
+| as-of basis swapped for current basis | 1 |
+| importer minor-unit scaling /100 -> /10 | 31 |
+| overview portfolio value dropped | 1 |
+
+So the fear behind this item — that the financial assertions were weaker than they
+looked — did NOT hold where it could be tested by breaking one rule at a time. That
+narrows the work rather than expanding it.
+
+One methodological note worth keeping: fee folding first read as SURVIVED because the
+filter in use did not include the commission endpoint tests. A mutation surviving a
+NARROW filter says nothing; it has to be re-run wide before it counts as a finding.
+
+**What the sweep cannot reach.** A single-rule mutation cannot find a missing
+CROSS-CHECK: break one side and that side's own tests fail, so the absence of an
+agreement assertion never shows up. Both such gaps were confirmed absent by
+inspection, and both are now written:
+
+- **Net worth reconciliation** -> `Reporting/NetWorthReconciliationTests.cs`. The
+  overview reads current balances and the holdings projection; the history series
+  replays legs through the as-of feeder. Each had tests pinning its own numbers,
+  which is precisely why a divergence between them was invisible. It failed on its
+  first run with a 15,500 gap - the seed populated legs but not the projection, so
+  the test found the fixture trap before it could find a real one.
+- **Snapshot round-trip at ledger scale** -> `Stress/SnapshotRestoreLatencyTests.cs`
+  now reads every money aggregate before and after the restore and asserts equality.
+  It previously asserted latency and row COUNTS only: a restore that reinserted every
+  row with a corrupted amount satisfied every assertion in the test.
+
+Both slices below remain open; the sweep narrowed them rather than closing them.
+
+#### Assertions that cannot fail
+*swept 2026-08-18. Four instances found and fixed; detectors and their false-positive
+rates recorded below so a re-sweep does not start from scratch.*
+
+`Snapshot_payload_is_captured_server_side_in_content_json` asserted the captured
+payload with `Assert.Contains("\"accounts\"", row.ContentJson!)` — the presence of a
+*key*, which is equally true of `"accounts": []`. It would have passed against an
+entirely empty snapshot, and it did: the test resolved `LedgerSnapshotsRepository`
+straight out of a DI scope, so there was no request context, so `app.user_id` was
+unset, so RLS filtered every in-scope table to zero rows. The test captured nothing
+and asserted that it had captured something. Found only because migration 193 changed
+where the payload lives and forced the assertion to be rewritten.
+
+The general shape — asserting on structure rather than content, and exercising a
+request-scoped path outside a request — is worth grepping for. Anything that reaches
+an RLS-protected table must go through the endpoint (`AuthedClientAsync`) or the
+service-role context deliberately; resolving a repository from a bare scope silently
+sees nothing.
+
+**The sweep ran on 2026-08-18.** Mechanical detectors over every `[Fact]`/`[Theory]`:
+methods with no effective assertion, HTTP tests that never inspect body OR database,
+and assertions on JSON *key* presence. Raw counts were useless — 16 "no assertion"
+hits were all `Assert*` HELPER calls or a brace-parser tripping over C# raw strings,
+and 85 "never reads the body" hits were overwhelmingly tests that verify the DATABASE
+instead, which is the stronger assertion. Naive detectors here produce ~95% noise.
+
+What survived was one coherent shape: **idempotency tests that assert only the repeat
+call's status code**. Of 19 such tests, 16 verify resulting state; three did not, and
+all three are now rewritten and mutation-verified — each mutation was caught by the
+rewritten test and by NOTHING else, so each gap was real:
+
+| test | was | mutation it now catches |
+|---|---|---|
+| `SessionsRepositoryTests.Revoke_is_idempotent` | zero assertions — called Revoke twice and passed if neither threw | dropping `RevokedAt == null` re-stamps `revoked_at`, silently rewriting when a session was revoked |
+| `AccountGroupsEndpointsTests.Member_remove_is_idempotent` | removed a NON-member and asserted 204 — the no-op case named idempotency | dropping the account filter deletes every member of the group |
+| `FeedConnectionsSyncTests.Delete_feed_mapping_is_idempotent…` | deleted a mapping that never existed, asserted 204, never read the columns | dropping the account filter unmaps every account in the ledger |
+
+Note the pattern in all three: they exercised the *no-op* case, which is the easy half,
+and never the repeat-on-real-state case. "Idempotent" names a property about what is
+LEFT BEHIND, so a test that never looks at the leftovers cannot assert it.
+
+Also fixed: the two remaining `factory.Services.CreateScope()` sites
+(`SnapshotsTests` auto-snapshot pair) now build the repository over the service-role
+context, the way `SnapshotJobHandler` does in production. They passed only because the
+snapshot tables carry no RLS policies yet — so the pattern was both a wrong mirror of
+production and a latent break waiting on "RLS on the snapshot tables" below.
+
+#### Boundary cases for the remaining financial suites
+*partial. The foundation shipped 2026-08-18 — this entry previously CLAIMED it had,
+naming `Boundary.cs` and `AddBoundaryPositionAsync`, and neither existed. Two of eight
+themes converted; six remain.*
+
+Two prod failures came from tests using kiddie-pool data ($100, 10 shares) that never
+approached the magnitudes where money math breaks, so financial paths now test a
+`{ typical, boundary }` `[Theory]` matrix against
+`tests/Api.Tests/Integration/Infra/Boundary.cs` — one source of truth for the edge
+values, each documenting the limit it probes (12dp fractional shares, which force a
+24dp `qty × unit_cost`; values near the NUMERIC→`decimal` ceiling; the `(25,12)` and
+`(19,2)` column maxima). `SyntheticLedger.AddBoundaryPositionAsync` seeds a large
+fractional position in one call. Realized gains carries its case already.
+
+**Converted so far, and what it caught.** Realized gains (the existing case,
+parameterised) and holdings / net worth. The second one FAILED on its first run, which
+is the whole argument for the item:
+
+`NetWorthReconciliationTests` asserts the overview and the history series agree. They
+did — at whole-share magnitudes. At a 12dp fractional position they differed by 8
+millionths of a dollar, because the two compute a position's market value at different
+scales. The feeder bounds its output (`ROUND(v_qty * v_price, 4)`, mig 172:183, and
+mig 200 by construction) because an unconstrained NUMERIC has to survive the trip into
+`System.Decimal`, which throws rather than truncating. The overview multiplied in C#,
+where a `decimal` product keeps the SUM of its operands' scales — `(25,12)` quantity
+times `(19,4)` price runs to 16 decimal places. Whole shares have no fractional part to
+round, so every existing fixture agreed by construction and the cross-check could not
+fail.
+
+Fixed by defining it once: `ReportingScale.MarketValue(quantity, price)` at 4dp, used
+by both C# call sites. A sweep for the same shape found a second one —
+`HoldingsRepository:153` computed the same unrounded product for the holdings list.
+(`InvestmentTransactionsRepository:1665` also multiplies quantity by a unit cost but
+already rounds to 2dp, and it is a lot cost rather than a market value, so it stays.)
+
+Cost-basis recompute (`CostBasisRecomputeBoundaryTests`) passes at both magnitudes —
+no finding, which is migrations 182 / 204 / 205 doing their job from the seeding side
+rather than only from a schema guard. It also asserts the recompute is idempotent,
+since a scale bug that rounded on each pass would drift further every run.
+
+Returns (`ReturnsBoundaryTests`) passes at both magnitudes. Worth recording what it
+cost to write, because two plausible expectations were both wrong: **TWR is annualized
+over the covered days and returned as a FRACTION, not a percentage** — a 25% price
+move over 144 days reads as `0.7605`, i.e. 76% annualized on a 365-day year, and
+solving `ln(1+twr)/ln(ratio)` gives exactly `365/144` for both cases. And the two
+boundary cases do NOT share a price ratio (1.25 vs 1.111), so "a return is scale-free
+therefore both magnitudes must agree" is false as the fixture stands. The test derives
+its expectation from each case's own ratio and the engine's OWN reported
+`TimeWeightedCoveredDays`, so it survives a change to the window.
+
+That second point is FIXED rather than noted: `Typical` moves 180 -> 200 and
+`LargeFractional` 8.10 -> 9.00, both exactly 10/9, so **cross-magnitude invariance is
+now a real property** — the same price move yields the same percentage at any size,
+assertable without modelling the code under test. `ReturnsBoundaryTests` uses it, and
+`BoundaryFixtureTests` enforces it so a case added later cannot silently break it (it
+also checks each case's declared `Basis`/`Proceeds` against the arithmetic, so a test
+asserting those is asserting a real figure).
+
+In-kind transfer (`InKindTransferBoundaryTests`) passes at both magnitudes, and
+finding out why it first didn't exposed a real limitation of the seeding helper:
+**`AddBoundaryPositionAsync` writes no `lots` rows.** Migration 202 made the FIFO walk
+pure, so `recompute_holdings_cost_basis` derives lots in memory and persists only
+quantity, cost basis and realized gains — the `lots` table is written by the
+investment-transaction WRITE PATH and by snapshot restore. A raw-seeded position
+therefore has correct holdings and basis but nothing for a lot-consuming endpoint to
+find, and `transfer_shares` rejects it with
+`investment-txn-transfer-shares-insufficient`. The helper now documents this, and
+tests exercising a lot-consuming endpoint buy through the API instead.
+
+Snapshot round-trip (`SnapshotMoneyRoundTripTests`) passes at both magnitudes. It
+lives in the NORMAL lane deliberately: the stress lane already compares money at
+ledger scale, but `Integration.Stress` is excluded from both the CI shards and
+preflight, so that one only runs when invoked by hand. This one runs on every push.
+It guards against vacuity explicitly — the fixture must hold non-zero basis, lots and
+realized gains, and the post-snapshot mutation must actually change them — so
+`before == after` cannot hold because nothing ever happened.
+
+Importer money mapping (`MoneyMappingBoundaryTests`) passes. `MinorUnitsToDecimal` —
+the one line where every Moneydance money figure ENTERS the system — had no direct
+test at all; the mutation sweep's `/100 -> /10` was caught by 31 tests only because the
+resulting figures were absurd, not because anything asserted the scale. It now pins
+the scale directly, and pins the importer's own ceiling: `long.MaxValue / 100` is
+~92.2 quadrillion against the money column's ~99.9, so the headroom is real and
+recorded rather than rediscovered.
+
+The two test assemblies are independent, so `Boundary.cs` is **linked** into
+`Importer.Moneydance.Tests` rather than copied — duplicating the edge values is how
+they drift, and a case added for the API suites would otherwise silently not apply
+where money enters.
+
+Register aggregation (`RegisterAggregationBoundaryTests`) passes. `balance_after` is a
+running SUM over every prior leg, so it is the one figure whose error ACCUMULATES —
+invisible at three figures, compounding over a decade of rows — and the existing
+coverage used -10 / -20 / -30, where any plausible bug still gives the right answer.
+The balance is asserted after EACH row rather than only at the end, since a drift that
+cancels out by the final row would otherwise pass.
+
+Backup/restore money round-trip: **done, and it found the same gap the snapshot test
+had.** `scripts/backup-restore-roundtrip.sh` built synthetic `parent`/`child` tables
+with no money column at all and asserted row COUNTS — so it proved the
+wipe-then-restore MECHANISM while a restore that reinserted every row with a corrupted
+amount would have passed. It now seeds `NUMERIC(19,2)` / `NUMERIC(25,12)` values at the
+column maxima and a 12dp fractional quantity, and compares a full-scale digest of every
+value before and after. Verified live: a post-restore read truncating to 4dp fails it
+with a printed diff.
+
+**All eight themes are complete.** The sweep found two real defects (the `MarketValue`
+divergence between the overview and the history series, and this one) plus one gap in
+the test foundation itself (`AddBoundaryPositionAsync` writes no `lots`). On the evidence of theme two, expect each to surface
+its own scale or magnitude disagreement rather than simply passing.
+
+Two ledger-wide invariants that were listed here as unasserted SHIPPED on
+2026-08-18: **net worth reconciles** between the overview and the valuation feeder
+(`NetWorthReconciliationTests`) and **snapshot round-trips correctly at ledger
+scale** (`SnapshotRestoreLatencyTests` now compares every money aggregate across the
+restore, where it previously asserted latency and row counts only). Neither carries a
+`{ typical, boundary }` matrix yet, so both remain in scope for the magnitude sweep
+above even though the agreement itself is now pinned. The four invariants that
+shipped earlier live in `ReferenceLedgerInvariantsTests`.
+
+This complements the schema-drift guards: those catch the *column* side, boundary
+data catches the *code-path* side.
+
+**Known limitation, accepted.** The guards cover table columns only, so a
+`RETURNS TABLE(... NUMERIC)` column is unconstrained even when every underlying
+column is properly typed. The known instances are `holdings_market_value_as_of`
+([172_holdings_value_as_of.sql:41-46](../db/migrations/172_holdings_value_as_of.sql#L41-L46)),
+which declares `quantity NUMERIC, market_value NUMERIC`, plus the two batched feeders
+that inherit the same declarations by construction: `holdings_market_value_as_of_set`
+(mig 200) and `account_balance_as_of_instants` (mig 201). Reaching an overflow there
+needs a position no plausible portfolio produces on a ~50-year horizon, so it is
+documented rather than fixed.
+
+### Next in line — MCP + reporting
+
+The reporting and MCP surface was closed out on 2026-08-17 (returns engine, response
+provenance, allocation reconciliation, the batched valuation feeders and the removal
+of the TWR boundary cap). What remains in this area is ADJACENT rather than a
+continuation of that work — none of it extends the returns engine — so it sits behind
+the immediates above but ahead of everything still in Backlog.
+
+### Budgets + budget-vs-actual
+
+*Status: open. The next backend/product slice after historical valuations (PR B, shipped).*
+
+Whole subsystem: schema (amount/category/period) + API + UI + variance report +
+MCP exposure.
+
+### Realistic anonymized demo import
+
+*Status: open. Surfaced during PR B (historical valuations) design. User-requested; PII-safe approach agreed.*
+
+The current `data/samples/moneydance-export-demo.json` is all-uncleared +
+investment-only, which masked the reconciliation + valuation cases (it misled the
+ADR-0082 recon work). Build a realistic demo by **synthesize-on-structure**: read
+the real export ONLY for structure (account-graph topology, txn shapes,
+stat/splittype distributions) and emit synthetic names/payees/tickers/account
+numbers + jittered amounts + shifted dates — nothing real copied, so there is no
+PII to leak. Deterministic C# generator (project stack, no Python); decide
+replace-vs-new + update `DemoSampleImportTests` + provisioning.
+
+### Canned + memorized reports (reuse the MCP reporting layer)
+
+The MCP server (ADR-0063) introduces a reusable reporting layer:
+a serializable **`ReportSpec`** (measure · group-by dims · filters ·
+period · top-N · detail) + a **`ReportingRepository`** that aggregates
+over the override-aware `resolved_transactions` view, plus the
+investment read tools. **A future in-app Reports feature must sit on
+this same layer, not a parallel one:**
+
+- **Canned reports** (Moneydance parity target — Expenses, Income,
+  Income & Expenses (+Detailed), Budget, Cash Flow, Net Worth, Account
+  Balances, Tag Summary, Transfers, Portfolio, Asset Allocation, Cost
+  Basis, Capital Gains, Investment Performance, Transactions /
+  Transaction Filter, Reconciliation, Missing Checks, …) collapse to
+  ~4 reusable primitives: transaction aggregation (category/tag/payee ×
+  time), balances-over-time, investment roll-ups, and transaction
+  query/filter. Build the MCP layer so each canned report is a preset
+  `ReportSpec` rendered by a SPA Reports page — not new query code.
+- **"Memorized" reports** = a persisted `ReportSpec` (same pattern as
+  saved views / `user_preferences`), so users save + re-run report
+  configs. The MCP tool params and the saved-report model share the
+  one spec shape.
+- MD's report **settings dialog** (date range, source-account select,
+  tag filter, include-transfers, tax-related, include liability/loan,
+  income/expense category tree) is the filter surface the `ReportSpec`
+  should anticipate — v1 MCP exposes a subset; the spec is shaped for
+  all of it so canned reports need no parallel model.
+- v2 returns (IRR/TWR) feeds Investment Performance; v3 FX unblocks
+  multi-currency reports. Likely its own ADR when the Reports UI is
+  scheduled.
+
 ### CSV Phase 5 — generic ingest provider (ADR-0031)
+
+*Position note: this and Phase 6 were the whole of Next before 2026-08-17. They are
+still committed work, placed last here only because the items above were explicitly
+ranked ahead of them — not because the CSV slice was reassessed.*
 
 `GenericCsvProvider` reading a `feed_csv_mappings` config (column map + date
 format + sign convention + header rows), extending the same `IngestOrchestrator`
@@ -47,6 +346,25 @@ provider key.
 *Unordered, grouped by area. Promote an item into **Next** above when you commit
 to shipping it.*
 
+
+### RLS on the snapshot tables
+*open. Pre-existing; surfaced while writing migration 193, deliberately not bundled
+with it.*
+
+`ledger_snapshots` has no row-level security. Fifty-three tables in the schema enable
+it; that one does not — and it holds a complete copy of every row of a ledger, the
+same rows its source tables protect with RLS. `ledger_snapshot_parts` (migration 193)
+follows the same posture rather than introducing a second, subtly different one for
+the same data. Both are gated only by the API's `LedgerAuthorizer`, so anything that
+reaches the database as `coffer_app` outside that gate reads any ledger's full
+contents.
+
+Adding RLS to both is a behaviour change to an existing table, needs a policy keyed
+through `ledger_id` → `user_ledger_grants` like its siblings, and has to be checked
+against the capture and restore functions (which run as the caller, not as
+`SECURITY DEFINER` — so a policy that the request context does not satisfy would make
+snapshots silently capture nothing, exactly the failure mode described under
+"Assertions that cannot fail").
 
 ### Secrets handling
 
@@ -223,7 +541,7 @@ pass. Scope to be defined against the current editor.
 
 *Status: blocked on the bulk override / categorisation write endpoints.*
 
-The bulk-action footer in `RegisterPage.tsx` reserves `Categorize…`
+The bulk-action footer in `register/bank/BankRegisterPage.tsx` reserves `Categorize…`
 and `Tag…` buttons (rendered disabled today). Wiring waits on the
 bulk override / categorisation endpoints — neither exists yet.
 Once those API surfaces land, the buttons gain handlers that
@@ -466,6 +784,34 @@ connections, idle-timeout config, reverse-proxy buffering).
 
 ### Observability
 
+#### Notify on missed or failed scheduled jobs
+*open. Migration 194 records the state; nothing surfaces or announces it.*
+
+The snapshot/backup outage ran for roughly two days without a single signal. The
+only thing a human could have noticed was an unrelated-looking 500 from
+`/oauth/authorize`, and the only record was `LogError` lines inside a container.
+Snapshots stopped for ~68 hours and backups for ~47, both silently.
+
+Migration 194 added the raw material — `consecutive_failures`, `last_error`,
+`last_failure_at` on both `scheduled_jobs` and `global_scheduled_jobs`, and
+`SchedulerRunner` disables a job after five consecutive failures. None of that is
+surfaced or pushed anywhere. What is missing:
+
+- **Surface it.** The schedule panels should show last outcome, consecutive
+  failures and `last_error`, and mark an auto-disabled job distinctly from one a
+  user turned off — right now those are indistinguishable in the UI.
+- **A missed-run check, not just a failed-run one.** Failure counting only fires
+  when a handler is dispatched and throws. A job that never ran at all — worker
+  dead, container down, `next_run_at` NULL, row disabled by the threshold — has no
+  failures recorded and looks healthy. The check that matters is "`last_run_at` is
+  older than the schedule implies", which catches both.
+- **Announce it.** Email via the existing notification path, or the health endpoint
+  reporting degraded so an external monitor sees it. A backup that has not
+  succeeded in 48 hours deserves to interrupt someone; anything that only writes
+  to a log we do not read is not a notification.
+- **Consider a floor on backup age** as the highest-value single alert — that is
+  the one whose absence actually costs data.
+
 #### Prod OTLP tracing exporter
 
 *Status: blocked on a collector existing to receive spans. The last open item from
@@ -481,73 +827,6 @@ business-outcome logging (`BusinessError.Problem` tags `HttpContext.Items` and t
 access log appends the business `code` on a rejection); and durable audit rows for
 Moneydance import + snapshot restore (`provider_runs` generalized to
 `ledger_operations`, migration 185, surfaced in Settings→Activity).
-
-### MCP + reporting
-
-#### MCP write/OAuth control-plane (PR C)
-
-*Status: open. The last of the 2026-07-17 MCP-hardening tracks; PR A (read
-surface) + PR B (investment aggregation) shipped.*
-
-- Enforce `coffer.read` scope → genuine read-only tokens (today decorative; any
-  token can call every write tool once writes are on).
-- OAuth/DCR client list + revoke + prune UI (today only manual tokens are
-  manageable; a claude.ai OAuth client can't be seen/revoked without DB access).
-- Rate-limit anonymous DCR (`/oauth/register`; bounded only by the 50-cap).
-
-(The immediate kill-switch shipped in 0.30.1 — it is now the sole write gate.
-The per-call write audit lives under "MCP per-tool-call audit" below.)
-
-#### Budgets + budget-vs-actual
-
-*Status: open. The next backend/product slice after historical valuations (PR B, shipped).*
-
-Whole subsystem: schema (amount/category/period) + API + UI + variance report +
-MCP exposure.
-
-#### Realistic anonymized demo import
-
-*Status: open. Surfaced during PR B (historical valuations) design. User-requested; PII-safe approach agreed.*
-
-The current `data/samples/moneydance-export-demo.json` is all-uncleared +
-investment-only, which masked the reconciliation + valuation cases (it misled the
-ADR-0082 recon work). Build a realistic demo by **synthesize-on-structure**: read
-the real export ONLY for structure (account-graph topology, txn shapes,
-stat/splittype distributions) and emit synthetic names/payees/tickers/account
-numbers + jittered amounts + shifted dates — nothing real copied, so there is no
-PII to leak. Deterministic C# generator (project stack, no Python); decide
-replace-vs-new + update `DemoSampleImportTests` + provisioning.
-
-#### Canned + memorized reports (reuse the MCP reporting layer)
-
-The MCP server (ADR-0063) introduces a reusable reporting layer:
-a serializable **`ReportSpec`** (measure · group-by dims · filters ·
-period · top-N · detail) + a **`ReportingRepository`** that aggregates
-over the override-aware `resolved_transactions` view, plus the
-investment read tools. **A future in-app Reports feature must sit on
-this same layer, not a parallel one:**
-
-- **Canned reports** (Moneydance parity target — Expenses, Income,
-  Income & Expenses (+Detailed), Budget, Cash Flow, Net Worth, Account
-  Balances, Tag Summary, Transfers, Portfolio, Asset Allocation, Cost
-  Basis, Capital Gains, Investment Performance, Transactions /
-  Transaction Filter, Reconciliation, Missing Checks, …) collapse to
-  ~4 reusable primitives: transaction aggregation (category/tag/payee ×
-  time), balances-over-time, investment roll-ups, and transaction
-  query/filter. Build the MCP layer so each canned report is a preset
-  `ReportSpec` rendered by a SPA Reports page — not new query code.
-- **"Memorized" reports** = a persisted `ReportSpec` (same pattern as
-  saved views / `user_preferences`), so users save + re-run report
-  configs. The MCP tool params and the saved-report model share the
-  one spec shape.
-- MD's report **settings dialog** (date range, source-account select,
-  tag filter, include-transfers, tax-related, include liability/loan,
-  income/expense category tree) is the filter surface the `ReportSpec`
-  should anticipate — v1 MCP exposes a subset; the spec is shaped for
-  all of it so canned reports need no parallel model.
-- v2 returns (IRR/TWR) feeds Investment Performance; v3 FX unblocks
-  multi-currency reports. Likely its own ADR when the Reports UI is
-  scheduled.
 
 ### Code structure
 
@@ -570,42 +849,6 @@ Current offenders (line counts 2026-07-24):
 - `SecurityDetailPage.tsx` (~1190) — split panels into siblings; keep dialogs with their owning panel.
 
 ---
-
-### Testing
-
-#### Boundary cases for the remaining financial suites
-*partial. The foundation shipped; the per-suite sweep is unfinished.*
-
-Two prod failures came from tests using kiddie-pool data ($100, 10 shares) that never
-approached the magnitudes where money math breaks, so financial paths now test a
-`{ typical, boundary }` `[Theory]` matrix against
-`tests/Api.Tests/Integration/Infra/Boundary.cs` — one source of truth for the edge
-values, each documenting the limit it probes (12dp fractional shares, which force a
-24dp `qty × unit_cost`; values near the NUMERIC→`decimal` ceiling; the `(25,12)` and
-`(19,2)` column maxima). `SyntheticLedger.AddBoundaryPositionAsync` seeds a large
-fractional position in one call. Realized gains carries its case already.
-
-Still to add, by theme: holdings / net worth, returns (IRR/TWR), in-kind transfer,
-cost-basis recompute, snapshot round-trip, importer money mapping, register
-aggregation, and the backup/restore money round-trip.
-
-Two ledger-wide invariants also remain unasserted, both aggregation paths where
-magnitude bites: **net worth reconciles** between the overview and the as-of
-valuation feeder (the two compute it by different routes and nothing asserts they
-agree), and **snapshot round-trips correctly at ledger scale** (restore latency is
-asserted; correctness at scale is not). The four invariants that did ship live in
-`ReferenceLedgerInvariantsTests`.
-
-This complements the schema-drift guards: those catch the *column* side, boundary
-data catches the *code-path* side.
-
-**Known limitation, accepted.** The guards cover table columns only, so a
-`RETURNS TABLE(... NUMERIC)` column is unconstrained even when every underlying
-column is properly typed. The known instance is `holdings_market_value_as_of`
-([172_holdings_value_as_of.sql:41-46](../db/migrations/172_holdings_value_as_of.sql#L41-L46)),
-which declares `quantity NUMERIC, market_value NUMERIC`. Reaching an overflow there
-needs a position no plausible portfolio produces on a ~50-year horizon, so it is
-documented rather than fixed.
 
 ### Performance
 

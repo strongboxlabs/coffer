@@ -83,18 +83,28 @@ public sealed class RealizedGainsTests
         Assert.Equal(2000m, holding.CostBasis);
     }
 
-    [Fact]
-    public async Task Large_fractional_position_realized_gains_reads_without_decimal_overflow()
+    /// <summary>
+    /// Realized gains read back correctly at BOTH magnitudes (<see cref="Boundary"/>).
+    /// </summary>
+    /// <remarks>
+    /// Regression for mig 182. The FIFO recompute computes
+    /// <c>cost_basis_sold = consumed_qty × unit_cost</c>. Both are NUMERIC(25,12)
+    /// (quantity always; unit_cost since mig 180), so a FRACTIONAL-share lot times a
+    /// 12dp unit_cost yields up to 24 decimal places. At a 7-figure position that is
+    /// ~30 significant digits — past .NET decimal's ceiling — so before mig 182
+    /// (unconstrained numeric columns) the recompute stored the 24dp value and
+    /// RealizedGainsAsync threw System.OverflowException reading it back (the prod
+    /// `realized_gains` failure). mig 182 constrains the money columns to
+    /// NUMERIC(19,2), so the value is stored 2dp and reads fine.
+    /// <para>
+    /// The typical case runs the same assertions at whole shares and three-figure
+    /// money, so a failure distinguishes "broken at scale" from "broken everywhere".
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [MemberData(nameof(Boundary.Positions), MemberType = typeof(Boundary))]
+    public async Task Realized_gains_read_without_decimal_overflow(Boundary.Position p)
     {
-        // Regression for mig 182 — representative magnitude, not a kiddie-pool.
-        // The FIFO recompute computes cost_basis_sold = consumed_qty × unit_cost.
-        // Both are NUMERIC(25,12) (quantity always; unit_cost since mig 180), so a
-        // FRACTIONAL-share lot times a 12dp unit_cost yields up to 24 decimal places.
-        // At a 7-figure position that is ~30 significant digits — past .NET decimal's
-        // ceiling — so before mig 182 (unconstrained numeric columns) the recompute
-        // stored the 24dp value and RealizedGainsAsync threw System.OverflowException
-        // reading it back (the prod `realized_gains` failure). mig 182 constrains the
-        // money columns to NUMERIC(19,2), so the value is stored 2dp and reads fine.
         var ledger = await SyntheticLedger.CreateAsync(_fixture);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var security = await ledger.AddSecurityAsync("Bond Fund", "BND");
@@ -114,27 +124,27 @@ public sealed class RealizedGainsTests
             Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
         }
 
-        // 123,456.789012 fractional shares (12dp) → basis ~ $1,000,000.09 → unit_cost
-        // ~8.10 carries 12 decimals (the basis doesn't divide evenly), then the full
-        // sale's cost_basis_sold = 123456.789012 × unit_cost(12dp) is a 24dp, 7-figure
-        // value — the overflow boundary.
-        await Trade("buy", 123456.789012m, 8.10m, new DateTime(2020, 1, 1, 12, 0, 0, DateTimeKind.Utc));
-        await Trade("sell", -123456.789012m, 9.00m, new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc));
+        // Buy the whole position, then sell all of it, so cost_basis_sold consumes the
+        // lot in full — the multiplication that overflowed.
+        await Trade("buy",   p.Quantity, p.BuyPrice,  new DateTime(2020, 1, 1, 12, 0, 0, DateTimeKind.Utc));
+        await Trade("sell", -p.Quantity, p.SellPrice, new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc));
 
         // The read itself is the regression: pre-mig-182 this line threw OverflowException.
         var realized = await new InvestmentReportingRepository(_fixture.NewDbContext())
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
         var row = Assert.Single(realized.Rows);
 
-        // Money is stored at 2dp (no 24dp noise survived) ...
-        Assert.Equal(Math.Round(row.Proceeds, 2), row.Proceeds);
-        Assert.Equal(Math.Round(row.CostBasisSold, 2), row.CostBasisSold);
-        Assert.Equal(Math.Round(row.RealizedGain, 2), row.RealizedGain);
-        // ... and equals proceeds − cost, in the right 7-figure ballpark (±1¢ for the
-        // 12dp unit_cost round-trip). basis = round(123456.789012 × 8.10) = 999,999.99;
-        // proceeds = round(123456.789012 × 9.00) = 1,111,111.10.
-        Assert.True(Math.Abs(row.CostBasisSold - 999999.99m) <= 0.01m, $"cost {row.CostBasisSold}");
-        Assert.True(Math.Abs(row.Proceeds - 1111111.10m) <= 0.01m, $"proceeds {row.Proceeds}");
+        // Money is stored at MoneyScale (no 24dp noise survived) ...
+        Assert.Equal(Math.Round(row.Proceeds, Boundary.MoneyScale), row.Proceeds);
+        Assert.Equal(Math.Round(row.CostBasisSold, Boundary.MoneyScale), row.CostBasisSold);
+        Assert.Equal(Math.Round(row.RealizedGain, Boundary.MoneyScale), row.RealizedGain);
+        // ... and matches the expected totals. The tolerance is a cent only where the
+        // basis doesn't divide evenly, because unit_cost is re-derived from the stored
+        // 2dp basis and the recomputed total can land either side.
+        Assert.True(Math.Abs(row.CostBasisSold - p.Basis) <= p.Tolerance,
+            $"{p.Name}: cost {row.CostBasisSold}, expected {p.Basis}");
+        Assert.True(Math.Abs(row.Proceeds - p.Proceeds) <= p.Tolerance,
+            $"{p.Name}: proceeds {row.Proceeds}, expected {p.Proceeds}");
         Assert.Equal(row.Proceeds - row.CostBasisSold, row.RealizedGain);
     }
 
@@ -186,5 +196,55 @@ public sealed class RealizedGainsTests
         Assert.Equal(500m, row.RealizedGainShortTerm);
         Assert.Equal(2000m, realized.TotalRealizedGainLongTerm);
         Assert.Equal(500m, realized.TotalRealizedGainShortTerm);
+    }
+
+    /// <summary>
+    /// Every stored realized-gains figure must be bounded to the money scale. The
+    /// columns are plain NUMERIC — nothing in the schema constrains them — and the
+    /// values are products of a division (take x unit_cost, unit_cost = amount /
+    /// quantity), a shape Postgres will take past 30 digits. System.Decimal holds
+    /// 28-29 and Npgsql throws rather than truncate, which is precisely how
+    /// holdings_snapshot broke in 0.63.0. Asserted so the property is enforced
+    /// rather than being a lucky feature of the current data.
+    /// </summary>
+    [Fact]
+    public async Task Stored_realized_gains_are_bounded_to_the_money_scale()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var bank = await ledger.AddBankAccountAsync("Checking");
+        var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
+        var holdings = brokerage.HoldingsAccountId!.Value;
+        var sec = await ledger.AddSecurityAsync("Fractional", "FRC");
+
+        // Large, non-terminating, and consumed fractionally — the shape that pushes
+        // take x unit_cost past the decimal limit.
+        await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, 500_000_000m, new DateTime(2020, 1, 10, 0, 0, 0, DateTimeKind.Utc));
+        await ledger.AddHoldingAsync(holdings, sec, 0m, 0m);
+        await ledger.AddInvestmentBuyAsync(
+            brokerage.Id, holdings, sec, 7.000000000001m, 14_285_714.285714m, new DateTime(2020, 1, 10, 0, 0, 0, DateTimeKind.Utc));
+        await ledger.AddInvestmentBuyAsync(
+            brokerage.Id, holdings, sec, -3.333333333333m, 40_000_000m, new DateTime(2022, 6, 1, 0, 0, 0, DateTimeKind.Utc));
+        await ledger.RecomputeHoldingsAsync();
+
+        await using var conn = _fixture.OpenServiceConnection();
+        var rows = (await Dapper.SqlMapper.QueryAsync<string>(conn,
+            """
+            SELECT unnest(ARRAY[
+                proceeds::text, cost_basis_sold::text, realized_gain::text,
+                proceeds_lt::text, cost_basis_sold_lt::text, realized_gain_lt::text])
+            FROM realized_gains WHERE ledger_id = @l
+            """, new { l = ledger.LedgerId })).ToList();
+
+        Assert.NotEmpty(rows);
+        foreach (var v in rows)
+        {
+            var dot = v.IndexOf('.');
+            var scale = dot < 0 ? 0 : v.Length - dot - 1;
+            Assert.True(scale <= 4, $"stored money value {v} has scale {scale}, expected <= 4");
+            // And it must round-trip into a decimal, which is the failure that started this.
+            Assert.True(decimal.TryParse(v, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out _),
+                $"stored value {v} does not fit System.Decimal");
+        }
     }
 }

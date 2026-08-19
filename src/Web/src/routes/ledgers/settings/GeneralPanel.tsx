@@ -6,9 +6,10 @@ import {
     deleteLedger,
     fetchVisibleLedgers,
     renameLedger,
-    verifyBalanceHealth,
+    checkLedgerConsistency,
+    repairProjection,
 } from '@/lib/api';
-import type { BalanceHealthReport } from '@/lib/types';
+import type { LedgerConsistencyReport, ProjectionConsistency, ConsistencyMismatch } from '@/lib/types';
 import { errorMessage } from '@/lib/errorMessage';
 import { invalidateLedgerRegister } from '@/lib/registerInvalidation';
 import { Button } from '@/components/ui/Button';
@@ -72,18 +73,22 @@ export function GeneralPanel({ ledgerId }: { ledgerId: string }) {
         ? errorMessage(deleteMutation.error, 'Could not delete the ledger.')
         : null;
 
-    // Verify-and-heal balance sweep (POST /balances/health). One round-trip
-    // per account; the recompute side-effect heals any drift in place. Sits
-    // on the ledger scope, not per-connection — drift can come from any writer.
-    const balanceHealthMutation = useMutation({
-        mutationFn: () => verifyBalanceHealth(ledgerId),
+    // The CHECK is read-only, so it invalidates nothing — running it must not
+    // disturb an open register. It used to heal as a side effect of checking,
+    // which is why checking and repairing are separate actions now.
+    const consistencyMutation = useMutation({
+        mutationFn: () => checkLedgerConsistency(ledgerId),
+    });
+
+    // One repair per projection, because every projection the report names has a
+    // repair — the UI must never show a problem with no way to fix it. A repair
+    // rewrites stored rows, so the register surface refetches, and the check
+    // re-runs so the user sees the result rather than being told to look again.
+    const repairMutation = useMutation({
+        mutationFn: (projection: string) => repairProjection(ledgerId, projection),
         onSuccess: () => {
-            // Drift heal rewrote balance rows — refresh the register surface. A
-            // mounted register now reloads immediately via the ADR-0079 canonical
-            // key (this already invalidated ['register', ledgerId], but nothing
-            // honored it, so an open register stayed stale), and account balances
-            // refetch too.
             invalidateLedgerRegister(queryClient, ledgerId);
+            consistencyMutation.mutate();
         },
     });
 
@@ -145,32 +150,49 @@ export function GeneralPanel({ ledgerId }: { ledgerId: string }) {
                 <PanelBody className="space-y-3">
                     <div className="flex items-start justify-between gap-3">
                         <p className="text-sm text-text-muted">
-                            Verify every stored balance against a fresh recompute
-                            and heal any drift in place. Ledger-wide; safe to run
-                            anytime.
+                            Compare every stored figure against a fresh calculation
+                            from the transactions — balances, holdings, realized
+                            gains and posting counts. Read-only: it reports what
+                            disagrees and changes nothing.
                         </p>
                         <Button
                             type="button"
                             variant="secondary"
                             className="shrink-0"
-                            onClick={() => balanceHealthMutation.mutate()}
-                            disabled={balanceHealthMutation.isPending}
+                            onClick={() => consistencyMutation.mutate()}
+                            disabled={consistencyMutation.isPending}
                         >
-                            {balanceHealthMutation.isPending
-                                ? 'Verifying…'
-                                : 'Verify balances'}
+                            {consistencyMutation.isPending
+                                ? 'Checking…'
+                                : 'Check consistency'}
                         </Button>
                     </div>
-                    {balanceHealthMutation.isError ? (
+                    {consistencyMutation.isError ? (
                         <p role="alert" className="text-sm text-state-danger">
                             {errorMessage(
-                                balanceHealthMutation.error,
-                                'Could not verify balances.',
+                                consistencyMutation.error,
+                                'Could not check consistency.',
                             )}
                         </p>
                     ) : null}
-                    {balanceHealthMutation.data ? (
-                        <BalanceHealthSummary report={balanceHealthMutation.data} />
+                    {consistencyMutation.data ? (
+                        <ConsistencySummary
+                            report={consistencyMutation.data}
+                            onRepair={(projection) => repairMutation.mutate(projection)}
+                            repairing={
+                                repairMutation.isPending
+                                    ? repairMutation.variables ?? null
+                                    : null
+                            }
+                        />
+                    ) : null}
+                    {repairMutation.isError ? (
+                        <p role="alert" className="text-sm text-state-danger">
+                            {errorMessage(
+                                repairMutation.error,
+                                'Could not repair.',
+                            )}
+                        </p>
                     ) : null}
                 </PanelBody>
             </Panel>
@@ -231,63 +253,88 @@ export function GeneralPanel({ ledgerId }: { ledgerId: string }) {
     );
 }
 
-function BalanceHealthSummary({ report }: { report: BalanceHealthReport }) {
-    // verify-and-heal result. Healthy → green badge with the rows checked.
-    // Drift detected → warning palette with the per-row breakdown so the user
-    // can see WHICH balance row was stale and by how much. The recompute
-    // side-effect already healed; this panel is informational + diagnostic.
-    if (report.healthy) {
-        return (
-            <div className="rounded border border-state-success/40 bg-state-success-soft p-3 text-sm text-state-success">
-                <p className="font-medium">
-                    Balances healthy — <strong>{report.rowsChecked}</strong>{' '}
-                    row{report.rowsChecked === 1 ? '' : 's'} verified across{' '}
-                    <strong>{report.accountsChecked}</strong> account
-                    {report.accountsChecked === 1 ? '' : 's'}.
-                </p>
-            </div>
-        );
-    }
+/** Human labels for the projection keys the API returns. */
+const PROJECTION_LABELS: Record<string, string> = {
+    balances: 'Running balances',
+    holdings: 'Holdings and cost basis',
+    realized_gains: 'Realized gains',
+    posting_counts: 'Posting counts',
+};
+
+/**
+ * The consistency report, one row per projection, each with its own repair.
+ *
+ * Every projection the report names is repairable — showing a problem with no way
+ * to fix it is what left a data scrub's damage unrepaired for months while ad-hoc
+ * SQL was written to look at it. Repair appears only where something disagrees, so
+ * it is never the first button anyone presses.
+ */
+function ConsistencySummary({
+    report,
+    onRepair,
+    repairing,
+}: {
+    report: LedgerConsistencyReport;
+    onRepair: (projection: string) => void;
+    repairing: string | null;
+}) {
     return (
-        <div className="rounded border border-state-warning/40 bg-state-warning-soft p-3 text-sm text-state-warning">
-            <p className="font-medium">
-                Healed <strong>{report.driftedCount}</strong> drifted balance
-                row{report.driftedCount === 1 ? '' : 's'} of{' '}
-                {report.rowsChecked} checked.
-            </p>
-            <p className="mt-1 text-xs">
-                The values below were stored incorrectly and have now been
-                recomputed in place.
-            </p>
-            <table className="mt-2 w-full text-xs">
-                <thead className="text-left opacity-80">
-                    <tr>
-                        <th className="pr-3 font-medium">Account</th>
-                        <th className="pr-3 font-medium">Posted</th>
-                        <th className="pr-3 text-right font-medium">Stored</th>
-                        <th className="pr-3 text-right font-medium">Corrected</th>
-                        <th className="text-right font-medium">Diff</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {report.drifted.map((d) => (
-                        <tr key={d.headerId}>
-                            <td className="pr-3">{d.accountName}</td>
-                            <td className="pr-3">{d.postedAt.slice(0, 10)}</td>
-                            <td className="pr-3 text-right tabular-nums">
-                                {d.storedBefore.toFixed(2)}
-                            </td>
-                            <td className="pr-3 text-right tabular-nums">
-                                {d.recomputedAfter.toFixed(2)}
-                            </td>
-                            <td className="text-right tabular-nums">
-                                {d.diff > 0 ? '+' : ''}
-                                {d.diff.toFixed(2)}
-                            </td>
-                        </tr>
-                    ))}
-                </tbody>
-            </table>
+        <div className="space-y-2">
+            {report.projections.map((p: ProjectionConsistency) => {
+                const label = PROJECTION_LABELS[p.projection] ?? p.projection;
+                const tone = p.healthy
+                    ? 'border-state-success/40 bg-state-success-soft text-state-success'
+                    : 'border-state-warning/40 bg-state-warning-soft text-state-warning';
+                return (
+                    <div key={p.projection} className={`rounded border p-3 text-sm ${tone}`}>
+                        <div className="flex items-start justify-between gap-3">
+                            <div>
+                                <p className="font-medium">
+                                    {label} —{' '}
+                                    {p.healthy ? (
+                                        <>
+                                            healthy, <strong>{p.checked}</strong> checked
+                                        </>
+                                    ) : (
+                                        <>
+                                            <strong>{p.mismatchedCount}</strong> of{' '}
+                                            {p.checked} disagree
+                                        </>
+                                    )}
+                                </p>
+                                {!p.healthy && p.mismatches.length > 0 ? (
+                                    <ul className="mt-1 space-y-0.5 text-xs">
+                                        {p.mismatches.slice(0, 5).map((m: ConsistencyMismatch, i: number) => (
+                                            <li key={`${m.scope}-${m.field}-${i}`}>
+                                                {m.scope} · {m.field}: stored {m.stored},
+                                                expected {m.expected}
+                                            </li>
+                                        ))}
+                                        {p.mismatchedCount > 5 ? (
+                                            <li>
+                                                …and {p.mismatchedCount - 5} more
+                                            </li>
+                                        ) : null}
+                                    </ul>
+                                ) : null}
+                            </div>
+                            {!p.healthy ? (
+                                <Button
+                                    type="button"
+                                    variant="secondary"
+                                    className="shrink-0"
+                                    onClick={() => onRepair(p.projection)}
+                                    disabled={repairing !== null}
+                                >
+                                    {repairing === p.projection
+                                        ? 'Repairing…'
+                                        : `Repair ${label.toLowerCase()}`}
+                                </Button>
+                            ) : null}
+                        </div>
+                    </div>
+                );
+            })}
         </div>
     );
 }

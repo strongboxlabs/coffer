@@ -76,6 +76,64 @@ public sealed record MdItem(
     }
 
     /// <summary>
+    /// Moneydance encodes calendar dates as a <c>yyyyMMdd</c> integer
+    /// (<c>20260101</c> = 2026-01-01) — the shape used by <c>date_created</c> on
+    /// accounts and <c>sdt</c> on reminders. Returns <c>null</c> when the key is
+    /// missing, zero (MD's "unset"), or not a real date, rather than guessing.
+    /// </summary>
+    /// <remarks>
+    /// MD may carry the same instant twice — <c>date_created</c> as this integer
+    /// and <c>creation_date</c> as epoch milliseconds (see
+    /// <see cref="GetMdEpochDate"/>). Prefer this one where present: it is
+    /// already a calendar date and needs no conversion at all. It is NOT always
+    /// present, so callers should fall back.
+    /// </remarks>
+    public DateOnly? GetMdDate(string key) => ParseMdDate(GetInt(key));
+
+    /// <summary>
+    /// A Moneydance epoch-milliseconds timestamp read as a calendar date — the
+    /// shape of <c>creation_date</c> on accounts.
+    /// </summary>
+    /// <remarks>
+    /// Taking the UTC date is safe rather than a guess: MD stamps these at local
+    /// NOON (they land on 16:00/17:00Z for a US-Eastern file), which is exactly
+    /// the convention that keeps the calendar day stable under conversion. On a
+    /// real 781-account export, all 64 accounts carrying BOTH fields agree
+    /// between this UTC date and <c>date_created</c> — and they still agree
+    /// across every offset from UTC-12 to UTC+2, so no local timezone is needed
+    /// to land on the right day.
+    /// </remarks>
+    public DateOnly? GetMdEpochDate(string key)
+    {
+        var millis = GetLong(key);
+        if (millis is null or 0) return null;
+        try
+        {
+            return DateOnly.FromDateTime(
+                DateTimeOffset.FromUnixTimeMilliseconds(millis.Value).UtcDateTime);
+        }
+        catch (ArgumentOutOfRangeException) { return null; }
+    }
+
+    /// <summary>
+    /// The shared <c>yyyyMMdd</c> rule behind <see cref="GetMdDate"/>, for
+    /// callers that already hold the raw integer.
+    /// </summary>
+    public static DateOnly? ParseMdDate(int? yyyymmdd)
+    {
+        if (yyyymmdd is null or 0) return null;
+        var v = yyyymmdd.Value;
+        var year = v / 10000;
+        var month = (v / 100) % 100;
+        var day = v % 100;
+        if (year < 1900 || year > 9999) return null;
+        if (month is < 1 or > 12) return null;
+        if (day is < 1 or > 31) return null;
+        try { return new DateOnly(year, month, day); }
+        catch (ArgumentOutOfRangeException) { return null; }
+    }
+
+    /// <summary>
     /// Moneydance encodes booleans as one of: "y"/"n", "yes"/"no", "1"/"0",
     /// "true"/"false". A missing key returns <c>null</c>; an unrecognized
     /// value returns <c>null</c> rather than guessing.

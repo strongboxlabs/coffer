@@ -204,12 +204,114 @@ stable under the chosen sort) with `hasMore` + `nextCursor`.
    migration-172 feeder, item 10), so a contribution moves value and flow together
    and never distorts the return. IRR (XIRR over the dated external flows +
    start/end value) is the headline. TWR chains sub-period returns across the
-   external-flow instants, valued the same way, and returns `null` + a reason when
-   a sub-period's invested base is non-positive or there are more flow dates than
-   can be valued (never a wrong number). Both are **live** as of Track-2 historical
-   valuations. External cash flow = a transfer between a brokerage and a real
-   outside account; internally-reinvested dividends and in-brokerage trades are not
-   external. Since-inception starts from value 0 at the first external flow.
+   external-flow instants, valued the same way. **Either figure returns `null` +
+   its own reason** rather than a wrong number — TWR when no sub-period had an
+   invested base at all, IRR when
+   the window has no elapsed time, the flows are single-signed, or they offset
+   exactly. A null rate always carries a reason and a non-null rate never does;
+   consumers must not read `null` as zero.
+
+   TWR is annualized over the time actually **invested**. Sub-periods with a
+   non-positive base are skipped rather than fatal: a stretch holding nothing has
+   no return to contribute, so voiding the chain over one discards a well-defined
+   answer. Voiding it was the original rule, and on a real ledger it blanked every
+   account funded after the window opened or emptied before it closed — six of
+   nine, including both sides of every rollover. The covered span therefore ships
+   with the rate (`timeWeightedCoveredYears`, plus its outer bounds), because
+   annualizing a short stretch magnifies it and a ten-month figure must never be
+   readable as a five-year one. A total market loss is NOT a skipped period: the
+   base stays positive and the ending value is 0, which is a real −100% factor.
+
+   **There is no boundary cap.** `MaxReturnsBoundaries` (400) refused a
+   time-weighted figure past 400 external-flow instants, which on a real five-year
+   ledger meant the headline whole-portfolio TWR was unavailable — not slow,
+   unavailable. It existed because a boundary valuation replayed the ledger twice,
+   once for holdings and once for cash. Migrations 200 and 201 made both batched:
+   the requested instants are merged into the leg, price and balance streams as
+   pseudo-rows, so each is one sort plus one window pass and a whole report costs
+   two queries rather than two per boundary. On the stress lane, 390 boundaries
+   went from **10,889 ms to 159 ms**, and per-boundary cost now FALLS as boundaries
+   grow (0.41 ms at 390 against 0.83 ms at 100) because it no longer scales per
+   boundary. The constant was deleted rather than raised — it had been set from a
+   bad measurement three times, and a boundary count cannot express a time budget
+   anyway, since per-boundary cost scales with accounts in scope.
+
+   `returns_cost_estimate` remains, reporting the flow-instant count from the same
+   scope resolution the real call uses, in well under a second. It no longer
+   reports a ceiling because there is none. A per-request cap override was asked
+   for and declined: it would have promoted an internal constant into public API
+   that outlived it, and it never bought what it appeared to — over the old ceiling
+   the engine refused TWR outright rather than approximating it, so a lower cap
+   bought a faster null, not a coarser number.
+
+   Two further fields exist because a summary that forces the consumer to
+   reconstruct its parts gets reconstructed wrongly. At ledger scope, `accounts[]`
+   lists every brokerage in scope with its start and end value — the rows sum to
+   the report's own totals — so a caller never has to guess which accounts a window
+   spans; guessing by current balance drops precisely the accounts a rollover
+   emptied. And `netContributions` ships with `contributionsIn` +
+   `contributionsOut` (which add to it exactly) and a per-source split, because a
+   net is equally consistent with one large movement and with two offsetting ones,
+   and a reader holding one salient event will bind the number to it.
+
+   Every reporting response carries `computedAt` and `engineVersion`
+   (`semver+sha` — real in published images since the container stamping fix
+   recorded in ADR-0044; it read `semver+nogit` when first shipped, which named
+   the release but not the commit and so could not tell two builds apart). A consumer assembling one report from several calls has no
+   other way to tell a fresh figure from one carried over, and a published report
+   showed four accounts as "n/a" for a figure the engine had returned minutes
+   earlier. A stamp does not prevent that reuse; it makes it detectable.
+
+   `allocation` takes an `asOfUtc` and values through the SAME feeder `returns`
+   uses, rather than the current holdings projection. Its total is securities
+   only, so it also reports `excludedBrokerageCash` — cash has no asset class to
+   bucket — and the identity `totalMarketValue + excludedBrokerageCash ==
+   returns.endValue` holds at the same instant. Those two totals differed by
+   $5,339 across two published reports with nothing in either response to explain
+   it. It further reports `undecomposedMultiAssets`: a `multi_asset` security with
+   no `security_components` cannot be looked through, and one such fund at 66% of
+   a portfolio showed equity at 8.5% against a true 35% — silently, because the
+   chart looked plausible. The flag is dimension-independent by design; a warning
+   that appears and vanishes as the caller switches dimensions is one nobody
+   trusts. Both are **live** as of Track-2
+   historical valuations. Since-inception anchors on the first external flow —
+   value is 0 before it — or, when the scope has no external flow at all, on the
+   first activity anywhere in scope. Falling back to the window END instead
+   collapsed the window to zero length, where every figure is undefined; assets
+   that arrive without a cash flow (in-kind transfer, category posting) are
+   absorbed into the start value rather than read as return. Only a scope with
+   no activity at all yields a zero-length window.
+
+   **External cash flow is scope-relative** — a brokerage leg facing a real
+   account *outside the reported scope's perimeter* (the scoped brokerages plus
+   their holdings siblings). The same rollover between two brokerages is therefore
+   INTERNAL at ledger scope, where it nets to zero, and EXTERNAL at account scope,
+   where it is a real withdrawal from the source and a real contribution to the
+   destination. Classifying by counterparty *account type* instead — treating
+   every `investment` counterparty as internal at both scopes — made an account
+   funded entirely by rollover report the whole balance step as performance, and
+   is the bug this rule replaces. A "brokerage" here is any investment account
+   that is not some other account's holdings sibling, whether or not it has a
+   sibling of its own: a cash-only account that never held a position still takes
+   transfers. Internally-reinvested dividends and in-brokerage trades face the
+   holdings sibling, which is inside the perimeter at every scope, so they are
+   never external. An **in-kind share transfer** (`transfer_shares`) is external
+   when its HEADER spans the perimeter, which is a header-level test rather than
+   a counterparty one: every leg of such a header faces an account inside its own
+   brokerage, so the value crosses accounts while each leg looks internal. The
+   flow is the sum of the header's in-scope legs — a contribution at the
+   destination, a withdrawal at the source, zero at ledger scope. Without it one
+   real transfer put an account at +258%/yr and its counterpart at -10.9%/yr
+   simultaneously. A **category** counterparty is external only when the leg's
+   `posting_role` is `transfer`. Roles `income` (dividends, interest — and
+   investment expenses, since ADR-0027 stamps both `inc` and `exp` splittypes
+   `income` and puts direction in the sign) and `fee` are the portfolio's own
+   earnings and costs, so they stay inside the return on a net-of-fees basis.
+   Treating the counterparty TYPE as the answer is wrong whichever way it is set:
+   excluding every category made an employer retirement contribution read as
+   investment skill, while including them would have reclassified a real ledger's
+   entire $879k dividend-and-interest history as contributed money. ADR-0027
+   already draws the line — `posting_role` is the marker and the truth.
 6. `transaction_summary` (generalize) — add `groupBy=category|account|payee`
    (default `category`, the v1 behavior) and `rollup` for category/account
    **trees** (parent total includes descendants); rows carry `parentId`.

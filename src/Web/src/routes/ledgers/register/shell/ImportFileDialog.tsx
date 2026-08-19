@@ -114,14 +114,18 @@ export function ImportFileDialog({
         if (fileInputRef.current) fileInputRef.current.value = '';
     }
 
+    // The panel is a height-capped flex column so each step's body is
+    // the single scroll region: header and footer stay pinned and the
+    // primary button is always reachable, however many accounts or
+    // warnings the file produces. The cap subtracts the backdrop's p-4.
     return (
         <Modal
             open
             onClose={onClose}
             titleId="import-file-title"
-            className="max-w-lg overflow-hidden"
+            className="flex max-h-[calc(100vh-2rem)] max-w-lg flex-col overflow-hidden"
         >
-            <header className="border-b border-border px-4 py-3">
+            <header className="shrink-0 border-b border-border px-4 py-3">
                 <h2 id="import-file-title" className="text-base font-semibold">Import statement file</h2>
             </header>
 
@@ -199,7 +203,7 @@ function PickStep({
 }) {
     return (
         <>
-            <div className="space-y-3 p-4">
+            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
                 <p className="text-sm text-text-muted">
                     Choose a statement file exported from your bank,
                     brokerage, or retirement-plan provider. Supported
@@ -226,7 +230,7 @@ function PickStep({
                     </p>
                 ) : null}
             </div>
-            <footer className="flex justify-end gap-2 border-t border-border bg-surface-muted/30 px-4 py-2">
+            <footer className="flex shrink-0 justify-end gap-2 border-t border-border bg-surface-muted/30 px-4 py-2">
                 <Button type="button" variant="secondary" size="sm" onClick={onCancel}>
                     Cancel
                 </Button>
@@ -271,7 +275,7 @@ function PreviewStep({
         && accountsByImportable.unsupported.length === 0;
     return (
         <>
-            <div className="space-y-3 p-4">
+            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
                 {preview.accounts.length === 0 ? (
                     <p className="text-sm text-state-danger" role="alert">
                         The file contained no recognizable account blocks.
@@ -344,8 +348,10 @@ function PreviewStep({
                 )}
                 {preview.errors.length > 0 ? (
                     <div className="rounded border border-state-warn/40 bg-state-warn-soft px-3 py-2 text-xs">
-                        <p className="font-medium">Preview warnings:</p>
-                        <ul className="mt-1 list-disc pl-4">
+                        <p className="font-medium">
+                            Preview warnings ({preview.errors.length}):
+                        </p>
+                        <ul className="mt-1 max-h-40 list-disc overflow-y-auto pl-4">
                             {preview.errors.map((e, i) => (
                                 <li key={i}>
                                     <span className="font-mono">{e.code}</span>: {e.message}
@@ -360,7 +366,7 @@ function PreviewStep({
                     </p>
                 ) : null}
             </div>
-            <footer className="flex justify-end gap-2 border-t border-border bg-surface-muted/30 px-4 py-2">
+            <footer className="flex shrink-0 justify-end gap-2 border-t border-border bg-surface-muted/30 px-4 py-2">
                 <Button type="button" variant="secondary" size="sm" onClick={onCancel}>
                     Cancel
                 </Button>
@@ -398,7 +404,7 @@ function ResultStep({
     const imported = result.transactionsForReview + result.alreadyKnown;
     return (
         <>
-            <div className="space-y-2 p-4 text-sm">
+            <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-4 text-sm">
                 <p>
                     <span className="text-state-success">✓</span> Imported{' '}
                     <strong>{imported}</strong> transaction
@@ -420,8 +426,10 @@ function ResultStep({
                 </ul>
                 {result.errors.length > 0 ? (
                     <div className="rounded border border-state-warn/40 bg-state-warn-soft px-3 py-2 text-xs">
-                        <p className="font-medium">Import warnings:</p>
-                        <ul className="mt-1 list-disc pl-4">
+                        <p className="font-medium">
+                            Import warnings ({result.errors.length}):
+                        </p>
+                        <ul className="mt-1 max-h-40 list-disc overflow-y-auto pl-4">
                             {result.errors.map((e, i) => (
                                 <li key={i}>
                                     <span className="font-mono">{e.code}</span>: {e.message}
@@ -431,7 +439,7 @@ function ResultStep({
                     </div>
                 ) : null}
             </div>
-            <footer className="flex justify-end gap-2 border-t border-border bg-surface-muted/30 px-4 py-2">
+            <footer className="flex shrink-0 justify-end gap-2 border-t border-border bg-surface-muted/30 px-4 py-2">
                 <Button type="button" variant="ghost" size="sm" onClick={onImportAnother}>
                     Import another
                 </Button>

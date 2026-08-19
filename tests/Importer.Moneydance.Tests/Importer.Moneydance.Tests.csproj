@@ -11,10 +11,10 @@
 
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="10.0.1" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
-    <PackageReference Include="Testcontainers.PostgreSql" Version="4.13.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.9.0" />
+    <PackageReference Include="Testcontainers.PostgreSql" Version="4.14.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.0" />
     <!-- Pin the transitive SSH.NET to the patched version, same as Api.Tests does and
          for the same reason: Testcontainers.PostgreSql 4.13.0 (the latest) resolves
          2025.1.0, which GHSA-q939-rpr3-3284 flags high — ScpClient's recursive download
@@ -32,6 +32,18 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      The boundary magnitudes are ONE source of truth, and the two test assemblies
+      are independent, so the file is linked rather than copied. Duplicating the
+      edge values is how they drift: a case added for the API suites would silently
+      not apply here, and the importer is precisely where a money figure ENTERS the
+      system. Boundary.cs depends only on xunit, so it links cleanly.
+    -->
+    <Compile Include="..\Api.Tests\Integration\Infra\Boundary.cs"
+             Link="Infra\Boundary.cs" />
   </ItemGroup>
 
   <ItemGroup>

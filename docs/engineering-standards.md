@@ -386,6 +386,26 @@ A test that needs the same ledger across phases of arrange/act builds it once an
 
 ---
 
+### 5.2.1 Financial paths test a `{ typical, boundary }` matrix
+
+Two production failures came from tests seeded with kiddie-pool data — $100, 10 shares — that never approached the magnitudes where money math breaks. The code was wrong at scale and every test passed, because no test asked a question big enough to get the wrong answer.
+
+So **a test touching money, a quantity, or a `decimal` materialisation path is a `[Theory]` over `Boundary.Positions`, not a `[Fact]` at a comfortable size**:
+
+```csharp
+[Theory]
+[MemberData(nameof(Boundary.Positions), MemberType = typeof(Boundary))]
+public async Task Something_holds(Boundary.Position p) { ... }
+```
+
+`tests/Api.Tests/Integration/Infra/Boundary.cs` is the single source of truth for the magnitudes, and every value in it is tied to a **column precision verified against the migration that set it** — never a round number chosen for looking large. `SyntheticLedger.AddBoundaryPositionAsync` seeds a position at a given magnitude in one call (holdings row, buy, and recompute together — doing only some of the three silently leaves the projection empty).
+
+Why fractional quantities specifically: a `decimal` product keeps the **sum of its operands' scales**, so a `NUMERIC(25,12)` quantity times a `NUMERIC(19,4)` price runs to 16 decimal places. Whole shares divide evenly and never grow the scale, so a whole-share fixture cannot reach the failure. This is not a hypothetical — it is how the net-worth cross-check between the overview and the history series passed while the two routes disagreed.
+
+The complement is the schema-drift guards (`SchemaDriftGuardTests`): those catch the *column* side, boundary data catches the *code-path* side.
+
+---
+
 ### 5.3 API error envelopes — RFC 9457 ProblemDetails with a `code` discriminator
 
 Every non-success API response is `application/problem+json` (RFC 9457). Within that envelope, **business-rule rejections use HTTP 422 Unprocessable Entity with a stable `code` extension** that the client dispatches on. Status codes carry only the transport-layer meaning:

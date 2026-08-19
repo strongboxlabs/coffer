@@ -11,6 +11,28 @@ namespace Coffer.Importer.Moneydance.Db;
 /// </summary>
 public sealed class DbConnectionFactory
 {
+    /// <summary>
+    /// Dapper cannot bind <see cref="DateOnly"/> parameters on its own — it
+    /// throws <c>NotSupportedException: The member … of type System.DateOnly
+    /// cannot be used as a parameter value</c> — so
+    /// <see cref="DapperDateOnlyHandler"/> must be registered before any
+    /// importer command runs. Registering it here, at the one gateway every
+    /// importer DB path opens its connection through, means no host can forget.
+    ///
+    /// It previously lived only in the CLI entry point and the importer test
+    /// fixture, so the API had it registered nowhere. That went unnoticed
+    /// because the only DateOnly parameter was
+    /// <c>recurring_transactions.start_date</c> and the bundled demo export
+    /// carries no reminders — an API-side import of a real file with reminders
+    /// would have hit it. Seeding accounts.opened_on made every account carry a
+    /// DateOnly, which turned a latent failure into a certain one and is how it
+    /// finally surfaced.
+    ///
+    /// Register() is idempotent, so the CLI and test fixture calling it too is
+    /// harmless.
+    /// </summary>
+    static DbConnectionFactory() => DapperDateOnlyHandler.Register();
+
     public const string EnvVarName = "COFFER_DB_CONNECTION";
 
     private readonly string _connectionString;

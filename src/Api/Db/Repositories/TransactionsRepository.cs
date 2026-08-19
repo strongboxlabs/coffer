@@ -599,8 +599,8 @@ public sealed class TransactionsRepository
     /// Slice 2c.6c — Tier 1 similar-payee recall. For a row imported
     /// from any provider, find prior approved rows in the same ledger
     /// from the SAME provider whose raw bank payee EXACTLY matches the
-    /// current row's, then surface the <c>(payee, category)</c> pairs
-    /// the user previously chose on those rows so the editor can
+    /// current row's, then surface the <c>(payee, counterparty)</c>
+    /// pairs the user previously chose on those rows so the editor can
     /// offer one-click categorization of recurring charges.
     ///
     /// <para>Provider scope: anchored on <see
@@ -610,18 +610,37 @@ public sealed class TransactionsRepository
     /// rows have NULL provider_key per the mig-107 CHECK and are
     /// excluded from both sides — recall is a feed-row concern.</para>
     ///
+    /// <para>Account scope: recall is oriented around the anchor's
+    /// MONEY-SIDE account — the leg whose account isn't a category.
+    /// An un-accepted feed row is always
+    /// <c>(real account, Uncategorized)</c> by construction (the
+    /// ingest orchestrator parks every counterparty leg on
+    /// Uncategorized; only the Accept PATCH moves it), so exactly one
+    /// leg qualifies. Candidates must post to that same account, and
+    /// the suggested counterparty is the candidate's OTHER leg.</para>
+    ///
+    /// <para>Keying off the money side — rather than filtering
+    /// candidates to an <c>account_type = 'category'</c> leg — is what
+    /// lets a TRANSFER participate. A recurring charge the user
+    /// settles as "→ PayFlex FSA" has two real-account legs and no
+    /// category leg at all; under the old filter such a row could
+    /// never be recalled, which silently blanked the panel for anyone
+    /// whose history for a payee was all transfers. Both shapes are
+    /// valid counterparties in the editor's AccountCategoryPicker, so
+    /// both belong here.</para>
+    ///
     /// <para>Returns empty when: the header doesn't exist or
     /// doesn't belong to the ledger; the header is a manual row
     /// (null provider_key); the bank payee is null/empty; or no
     /// matching prior rows exist.</para>
     ///
-    /// <para>Only single-posting prior rows participate (exactly
-    /// one category-type counterparty leg). Split-target recall is
-    /// out of scope for this slice — the multi-leg structure
-    /// doesn't fit the one-chip = one-pair shape.</para>
+    /// <para>Only single-posting prior rows participate (exactly two
+    /// legs). Split-target recall is out of scope for this slice —
+    /// the multi-leg structure doesn't fit the one-chip = one-pair
+    /// shape.</para>
     ///
     /// <para>Aggregation: GROUP BY
-    /// <c>(resolved_payee, category_account_id)</c>; sort by use
+    /// <c>(resolved_payee, counterparty_account_id)</c>; sort by use
     /// count desc, last_used_at desc; cap at
     /// <paramref name="limit"/>.</para>
     /// </summary>
@@ -632,10 +651,11 @@ public sealed class TransactionsRepository
         CancellationToken cancellationToken = default)
     {
         // 1. Read the anchor — the current row's raw bank payee, its
-        //    provider_key (the recall scope), and its resolved (payee,
-        //    category) so we can dedupe suggestions that already match
-        //    the saved state on THIS row (no point suggesting what's
-        //    already there). Anchored on the canonical payee, not the
+        //    provider_key (the recall scope), its money-side account
+        //    (the recall axis), and its resolved (payee, counterparty)
+        //    so we can dedupe suggestions that already match the saved
+        //    state on THIS row (no point suggesting what's already
+        //    there). Anchored on the canonical payee, not the
         //    override: the override is what we're trying to RECALL,
         //    not the key we search by. Manual rows (null provider_key)
         //    are excluded — recall is a feed-row concern, and the
@@ -656,10 +676,14 @@ public sealed class TransactionsRepository
                         .Where(o => o.HeaderId == h.Id)
                         .Select(o => (bool?)o.IsHidden).FirstOrDefault() ?? h.IsHidden) == false
                 && h.IsMergedInto == null
-            from cpLeg in _db.TxnLegs
-            where cpLeg.HeaderId == h.Id
-            join cpAccount in _db.Accounts on cpLeg.AccountId equals cpAccount.Id
-            where cpAccount.AccountType == "category"
+            // The money side — the leg that isn't a category. The
+            // NeedsReview gate above guarantees an un-accepted feed
+            // row, which lands as (real account, Uncategorized), so
+            // exactly one leg qualifies.
+            from moneyLeg in _db.TxnLegs
+            where moneyLeg.HeaderId == h.Id
+            join moneyAccount in _db.Accounts on moneyLeg.AccountId equals moneyAccount.Id
+            where moneyAccount.AccountType != "category"
             let overridePayee = _db.TxnHeaderOverrides
                 .Where(o => o.HeaderId == h.Id)
                 .Select(o => o.Payee)
@@ -669,7 +693,13 @@ public sealed class TransactionsRepository
                 BankPayee = h.Payee!,
                 ProviderKey = h.ProviderKey!,
                 ResolvedPayee = overridePayee ?? h.Payee!,
-                CurrentCategoryAccountId = (Guid?)cpAccount.Id,
+                SourceAccountId = moneyAccount.Id,
+                // Whatever the other leg currently points at —
+                // Uncategorized on a freshly ingested row.
+                CurrentCounterpartyAccountId = _db.TxnLegs
+                    .Where(l => l.HeaderId == h.Id && l.AccountId != moneyAccount.Id)
+                    .Select(l => (Guid?)l.AccountId)
+                    .FirstOrDefault(),
             })
             .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -700,11 +730,16 @@ public sealed class TransactionsRepository
                 && h.IsMergedInto == null
             // Single-posting prior rows only (exactly 2 legs).
             where _db.TxnLegs.Count(l => l.HeaderId == h.Id) == 2
-            // Find the category-type counterparty leg on this row.
+            // ...posted on the anchor's money-side account, so
+            // "counterparty" means the same thing on both rows.
+            where _db.TxnLegs.Any(l => l.HeaderId == h.Id
+                                    && l.AccountId == anchor.SourceAccountId)
+            // The candidate's OTHER leg is the suggestion: a category
+            // account on an ordinary expense, a real account on a
+            // transfer. The editor's AccountCategoryPicker takes both.
             from leg in _db.TxnLegs
-            where leg.HeaderId == h.Id
+            where leg.HeaderId == h.Id && leg.AccountId != anchor.SourceAccountId
             join account in _db.Accounts on leg.AccountId equals account.Id
-            where account.AccountType == "category"
             // Override.payee falls back to the raw bank payee.
             let overridePayee = _db.TxnHeaderOverrides
                 .Where(o => o.HeaderId == h.Id)
@@ -713,8 +748,8 @@ public sealed class TransactionsRepository
             select new
             {
                 ResolvedPayee = overridePayee ?? h.Payee!,
-                CategoryAccountId = account.Id,
-                CategoryAccountName = account.Name,
+                CounterpartyAccountId = account.Id,
+                CounterpartyAccountName = account.Name,
                 // Effective posted_at so the "last used" recency reflects
                 // the curated date, not the raw feed date.
                 PostedAt = _db.TxnHeaderOverrides
@@ -725,17 +760,17 @@ public sealed class TransactionsRepository
             .ConfigureAwait(false);
 
         return rows
-            .GroupBy(r => new { r.ResolvedPayee, r.CategoryAccountId, r.CategoryAccountName })
+            .GroupBy(r => new { r.ResolvedPayee, r.CounterpartyAccountId, r.CounterpartyAccountName })
             // Drop the suggestion if it already matches THIS row's
-            // saved (resolved-payee, category) pair — there's
+            // saved (resolved-payee, counterparty) pair — there's
             // nothing to apply.
             .Where(g =>
                 g.Key.ResolvedPayee != anchor.ResolvedPayee
-                || g.Key.CategoryAccountId != anchor.CurrentCategoryAccountId)
+                || g.Key.CounterpartyAccountId != anchor.CurrentCounterpartyAccountId)
             .Select(g => new SimilarPayeeDto(
                 g.Key.ResolvedPayee,
-                g.Key.CategoryAccountId,
-                g.Key.CategoryAccountName,
+                g.Key.CounterpartyAccountId,
+                g.Key.CounterpartyAccountName,
                 g.Count(),
                 g.Max(r => r.PostedAt)))
             .OrderByDescending(s => s.UseCount)

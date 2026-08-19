@@ -150,12 +150,14 @@ public sealed class HoldingsRepository
             var hasPrice = latestBySecurity.TryGetValue(r.SecurityId, out var px);
             decimal? currentPrice = hasPrice ? px!.Price : null;
             DateOnly? priceAsOf = hasPrice ? px!.PriceDate : null;
-            decimal? currentValue = hasPrice ? r.Quantity * px!.Price : null;
-            decimal? unrealized  = hasPrice ? currentValue - r.CostBasis : null;
-            decimal? percent     = hasPrice && r.CostBasis != 0m
-                ? unrealized!.Value / r.CostBasis * 100m
+            decimal? currentValue = hasPrice
+                ? ReportingScale.MarketValue(r.Quantity, px!.Price)
                 : null;
-            var costPerShare = r.Quantity != 0m ? r.CostBasis / r.Quantity : 0m;
+            decimal? unrealized  = hasPrice ? currentValue - r.CostBasis : null;
+            decimal? percent     = hasPrice
+                ? ReportingScale.PercentOrNull(unrealized!.Value, r.CostBasis)
+                : null;
+            var costPerShare = ReportingScale.PerShare(r.CostBasis, r.Quantity);
 
             positions.Add(new PositionDto(
                 SecurityId: r.SecurityId,
@@ -176,9 +178,7 @@ public sealed class HoldingsRepository
         }
 
         var summaryUnrealized = totalPortfolioValue - totalCostBasis;
-        var summaryPercent = totalCostBasis != 0m
-            ? summaryUnrealized / totalCostBasis * 100m
-            : 0m;
+        var summaryPercent = ReportingScale.Percent(summaryUnrealized, totalCostBasis);
 
         // Stable ordering for the UI: ticker ascending, with no-ticker
         // securities sorting after tickered ones (rare; happens for

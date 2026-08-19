@@ -18,6 +18,7 @@ import type { LedgerSummary } from '@/lib/types';
 //   * owner sees enabled rename/delete; Save calls renameLedger
 //   * a non-owner (viewer) has both disabled
 //   * delete is gated behind a typed-name confirmation before it fires
+//   * balance CHECK is read-only and REPAIR only appears once drift is found
 
 const LEDGER_ID = '00000000-0000-0000-0000-000000000010';
 
@@ -104,5 +105,78 @@ describe('GeneralPanel', () => {
         await user.click(confirm);
 
         await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith(LEDGER_ID));
+    });
+});
+
+describe('GeneralPanel — consistency maintenance', () => {
+    beforeEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    const clean = {
+        healthy: true,
+        projections: [
+            { projection: 'balances', healthy: true, checked: 120, mismatchedCount: 0, mismatches: [] },
+            { projection: 'holdings', healthy: true, checked: 8, mismatchedCount: 0, mismatches: [] },
+            { projection: 'realized_gains', healthy: true, checked: 8, mismatchedCount: 0, mismatches: [] },
+            { projection: 'posting_counts', healthy: true, checked: 60, mismatchedCount: 0, mismatches: [] },
+        ],
+    };
+
+    // Every projection the report names must be repairable from the UI, and repair
+    // must never be the first button available — that pairing is the whole point.
+    it('offers a repair for each disagreeing projection, and none when clean', async () => {
+        const check = vi.spyOn(apiModule, 'checkLedgerConsistency').mockResolvedValue(clean);
+        const repair = vi.spyOn(apiModule, 'repairProjection').mockResolvedValue(
+            clean.projections[3],
+        );
+
+        mockLedger('owner');
+        renderPanel();
+        const user = userEvent.setup();
+
+        const checkButton = await screen.findByRole('button', { name: /check consistency/i });
+        expect(screen.queryByRole('button', { name: /^repair/i })).toBeNull();
+
+        await user.click(checkButton);
+        await waitFor(() => expect(check).toHaveBeenCalledWith(LEDGER_ID));
+
+        // A clean report offers nothing to repair.
+        expect(screen.queryByRole('button', { name: /^repair/i })).toBeNull();
+        expect(repair).not.toHaveBeenCalled();
+
+        // Two projections disagreeing → a repair button for each of those two only.
+        check.mockResolvedValue({
+            healthy: false,
+            projections: [
+                { projection: 'balances', healthy: true, checked: 120, mismatchedCount: 0, mismatches: [] },
+                {
+                    projection: 'holdings', healthy: false, checked: 8, mismatchedCount: 1,
+                    mismatches: [{
+                        scope: 'Brokerage / sec', field: 'cost_basis',
+                        stored: 100, expected: 90, diff: -10,
+                    }],
+                },
+                { projection: 'realized_gains', healthy: true, checked: 8, mismatchedCount: 0, mismatches: [] },
+                {
+                    projection: 'posting_counts', healthy: false, checked: 60, mismatchedCount: 17,
+                    mismatches: [{
+                        scope: 'header abc', field: 'header_total_postings',
+                        stored: 2, expected: 1, diff: -1,
+                    }],
+                },
+            ],
+        });
+        await user.click(checkButton);
+
+        await screen.findByRole('button', { name: /repair holdings and cost basis/i });
+        const postingRepair = screen.getByRole('button', { name: /repair posting counts/i });
+        // The healthy ones get no button.
+        expect(screen.queryByRole('button', { name: /repair running balances/i })).toBeNull();
+        expect(screen.queryByRole('button', { name: /repair realized gains/i })).toBeNull();
+
+        await user.click(postingRepair);
+        await waitFor(() =>
+            expect(repair).toHaveBeenCalledWith(LEDGER_ID, 'posting_counts'));
     });
 });

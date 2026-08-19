@@ -913,17 +913,72 @@ public sealed class FeedConnectionsSyncTests
         Assert.Null(row.ExternalId);
     }
 
+    /// <summary>
+    /// Unmapping is a no-op on an already-unmapped account, and a REPEATED unmap on a
+    /// mapped one must not touch a sibling account's binding.
+    /// </summary>
+    /// <remarks>
+    /// This asserted only the 204 from deleting a mapping that never existed. The
+    /// binding columns were never read, and no other account was in play, so an
+    /// unmap that cleared every account in the ledger passed unnoticed.
+    /// </remarks>
     [Fact]
     public async Task Delete_feed_mapping_is_idempotent_on_an_already_unmapped_account()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var bank = await ledger.AddBankAccountAsync("checking");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
-        using var client = await AuthedClientAsync(factory, ledger);
+        var setup = await ConnectAsync("""
+            {"connections":[],"errlist":[],"accounts":[
+              {"id":"sf-1","conn_id":"c-A","name":"Checking",
+               "currency":"USD","balance":"0.00","transactions":[]},
+              {"id":"sf-2","conn_id":"c-A","name":"Savings",
+               "currency":"USD","balance":"0.00","transactions":[]}
+            ]}
+            """);
+        await using var factory = setup.Factory;
+        using var client = await AuthedClientAsync(factory, setup.Ledger);
 
-        var response = await client.DeleteAsync(
-            $"/api/ledgers/{ledger.LedgerId}/accounts/{bank.Id}/feed-mapping");
-        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        var bank = await setup.Ledger.AddBankAccountAsync("checking");
+        var sibling = await setup.Ledger.AddBankAccountAsync("savings");
+
+        // Never-mapped account: unmapping is a success and leaves it unmapped.
+        var never = await client.DeleteAsync(
+            $"/api/ledgers/{setup.Ledger.LedgerId}/accounts/{bank.Id}/feed-mapping");
+        Assert.Equal(HttpStatusCode.NoContent, never.StatusCode);
+        await AssertMappingAsync(bank.Id, connectionId: null, externalId: null);
+
+        // Bind both, then unmap ONE of them twice.
+        foreach (var (account, external) in new[] { (bank.Id, "sf-1"), (sibling.Id, "sf-2") })
+        {
+            var bind = await client.SendAsync(new HttpRequestMessage(
+                HttpMethod.Patch,
+                $"/api/ledgers/{setup.Ledger.LedgerId}/accounts/{account}/feed-mapping")
+                {
+                    Content = JsonContent.Create(new PatchAccountFeedMappingRequest
+                    {
+                        FeedConnectionId = setup.Connection.Id,
+                        SimpleFinAccountId = external,
+                    }),
+                });
+            Assert.Equal(HttpStatusCode.NoContent, bind.StatusCode);
+        }
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            var unmap = await client.DeleteAsync(
+                $"/api/ledgers/{setup.Ledger.LedgerId}/accounts/{bank.Id}/feed-mapping");
+            Assert.Equal(HttpStatusCode.NoContent, unmap.StatusCode);
+
+            await AssertMappingAsync(bank.Id, connectionId: null, externalId: null);
+            // The sibling's binding is the one a widened unmap would take with it.
+            await AssertMappingAsync(sibling.Id, setup.Connection.Id, "sf-2");
+        }
+    }
+
+    private async Task AssertMappingAsync(Guid accountId, Guid? connectionId, string? externalId)
+    {
+        await using var db = _fixture.NewDbContext();
+        var row = await db.Accounts.AsNoTracking().SingleAsync(a => a.Id == accountId);
+        Assert.Equal(connectionId, row.FeedConnectionId);
+        Assert.Equal(externalId, row.ExternalId);
     }
 
     [Fact]

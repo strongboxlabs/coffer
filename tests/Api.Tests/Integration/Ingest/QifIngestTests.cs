@@ -114,6 +114,11 @@ public sealed class QifIngestTests
         YGROWTH FUND(AAAA)
         Q2.000
         ^
+        D04/02/2024
+        NVest
+        YGROWTH FUND(AAAA)
+        Q0.000980392
+        ^
         """;
 
     // -------------------------------------------------------------
@@ -138,9 +143,28 @@ public sealed class QifIngestTests
         Assert.Equal("qif", account.ProviderAccountId);
         Assert.Equal("investment", account.AccountType);
         Assert.Null(account.Currency);
-        // 4 supported (Buy, ShrsOut, Sell, ReinvDiv); StkSplit skipped.
+        // 4 supported (Buy, ShrsOut, Sell, ReinvDiv); StkSplit + Vest skipped.
         Assert.Equal(4, account.TransactionCount);
-        Assert.Contains(preview.Errors, e => e.Code == "qif_investment_action_unsupported");
+
+        // The warning has to let the user find the row on their own
+        // statement, so it carries the action token, the ticker, the
+        // quantity and the date, plus why the action was declined
+        // (see DescribeUnsupportedAction).
+        var warnings = preview.Errors
+            .Where(e => e.Code == "qif_investment_action_unsupported")
+            .Select(e => e.Message)
+            .ToList();
+        Assert.Equal(2, warnings.Count);
+        Assert.Contains(
+            "QIF StkSplit row skipped (AAAA, 2 units, 2024-04-01). "
+                + "Stock splits are recorded on the security, not in the register.",
+            warnings);
+        // Fractional quantities keep full 12dp precision without
+        // trailing zeros, matching the OFX provider's formatting.
+        Assert.Contains(
+            "QIF Vest row skipped (AAAA, 0.000980392 units, 2024-04-02). "
+                + "Equity-compensation actions are outside the ADR-0027 action catalog.",
+            warnings);
     }
 
     [Fact]

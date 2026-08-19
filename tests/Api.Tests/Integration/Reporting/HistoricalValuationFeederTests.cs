@@ -40,9 +40,11 @@ public sealed class HistoricalValuationFeederTests
         await ledger.AddSecurityPriceAsync(sec, 6m, Utc(2024, 7, 1));
 
         await using var db = _fixture.NewDbContext();
-        async Task<HoldingsMarketValueAsOfRow?> ValueAt(DateTime asOf) =>
-            (await db.HoldingsMarketValueAsOf(ledger.LedgerId, asOf, holdings, sec).ToListAsync())
-            .SingleOrDefault();
+        // Via the batched feeder with a one-element instant array — the per-instant
+        // form was dropped in mig 203, since a single instant is a set of one.
+        async Task<HoldingsMarketValueAsOfSetRow?> ValueAt(DateTime asOf) =>
+            (await db.HoldingsMarketValueAsOfSet(ledger.LedgerId, [asOf], [holdings]).ToListAsync())
+            .SingleOrDefault(r => r.SecurityId == sec);
 
         // (a) After the buy, before the split, no feed price yet: 100 shares,
         //     priced from the TRADE ($10) → $1,000.
@@ -87,7 +89,7 @@ public sealed class HistoricalValuationFeederTests
 
         await using var db = _fixture.NewDbContext();
         async Task<decimal> BalanceAt(DateTime asOf) =>
-            (await db.AccountBalanceAsOf(ledger.LedgerId, asOf, checking.Id).ToListAsync())
+            (await db.AccountBalanceAsOfInstants(ledger.LedgerId, [asOf], [checking.Id]).ToListAsync())
             .Single().Balance;
 
         Assert.Equal(0m,   await BalanceAt(Utc(2024, 1, 1)));    // before any txn → opening
@@ -113,7 +115,7 @@ public sealed class HistoricalValuationFeederTests
 
         await using var db = _fixture.NewDbContext();
         async Task<decimal> BalanceAt(DateTime asOf) =>
-            (await db.AccountBalanceAsOf(ledger.LedgerId, asOf, checking.Id).ToListAsync())
+            (await db.AccountBalanceAsOfInstants(ledger.LedgerId, [asOf], [checking.Id]).ToListAsync())
             .Single().Balance;
 
         // At 2024-03-01 the overridden txn's effective date (Dec 31) is still in the

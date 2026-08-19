@@ -470,13 +470,19 @@ public sealed record BulkMoveAccountResponse(int Moved);
 /// <c>txn_headers.payee</c> + <c>provider_key</c> and finds prior
 /// approved rows from THE SAME PROVIDER where that exact raw value
 /// matches. For each such prior row, the SPA gets back the user's
-/// chosen <c>(payee, category)</c> pair — clicking the suggestion
+/// chosen <c>(payee, counterparty)</c> pair — clicking the suggestion
 /// in the editor pre-fills both into the form so the user can
 /// categorize a recurring bank charge in one click. Manual rows
 /// (null provider_key) participate as neither anchor nor candidate.</para>
 ///
+/// <para>The counterparty is whatever sits on the prior row's other
+/// leg, relative to the anchor's money-side account: a category on an
+/// ordinary expense, a real account when the user settles the charge
+/// as a TRANSFER. Both are things the editor's AccountCategoryPicker
+/// accepts, so both are recallable.</para>
+///
 /// <para>Aggregated server-side: grouped by
-/// <c>(resolved_payee, category_account_id)</c>, ordered by use
+/// <c>(resolved_payee, counterparty_account_id)</c>, ordered by use
 /// count then recency, capped at a small N. Only single-posting
 /// prior rows participate — splits are excluded as Tier 1 candidates
 /// (their multi-leg structure doesn't fit the one-chip = one-pair
@@ -486,18 +492,18 @@ public sealed record BulkMoveAccountResponse(int Moved);
 /// <param name="Payee">The resolved payee text the user chose on
 /// prior rows (override.payee falling back to the raw bank
 /// payee). What the suggestion offers to populate.</param>
-/// <param name="CategoryAccountId">The category-side leg's account
-/// id on the prior rows. Always a <c>category</c>-type account by
-/// construction.</param>
+/// <param name="CounterpartyAccountId">The other leg's account id on
+/// the prior rows — a <c>category</c> account or, on a transfer, a
+/// real one.</param>
 /// <param name="UseCount">Number of prior rows where the user
-/// chose this <c>(payee, category)</c> pair. Suggestions sort by
+/// chose this <c>(payee, counterparty)</c> pair. Suggestions sort by
 /// this descending then by recency.</param>
 /// <param name="LastUsedAt">The latest <c>posted_at</c> among the
 /// matching prior rows. Tie-breaker.</param>
 public sealed record SimilarPayeeDto(
     string Payee,
-    Guid CategoryAccountId,
-    string CategoryAccountName,
+    Guid CounterpartyAccountId,
+    string CounterpartyAccountName,
     int UseCount,
     DateTime LastUsedAt);
 

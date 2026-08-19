@@ -128,13 +128,14 @@ export interface SimilarPayeeDto {
     /** The resolved payee text from prior approved rows
      *  (`override.payee` falling back to the raw bank payee). */
     payee: string;
-    /** Counterparty leg's account id on the prior rows — always
-     *  a category-type account. Drives the editor's category
-     *  picker on chip click. */
-    categoryAccountId: string;
-    categoryAccountName: string;
+    /** Counterparty leg's account id on the prior rows — a category
+     *  on an ordinary expense, a real account when the user settled
+     *  those rows as transfers. Drives the editor's
+     *  AccountCategoryPicker on chip click, which takes either. */
+    counterpartyAccountId: string;
+    counterpartyAccountName: string;
     /** How many prior approved bank rows used this `(payee,
-     *  category)` pair. Displayed as `(×N)` on the chip when
+     *  counterparty)` pair. Displayed as `(×N)` on the chip when
      *  >1. */
     useCount: number;
     /** ISO-8601 UTC. Tie-breaker on sort; not surfaced in the

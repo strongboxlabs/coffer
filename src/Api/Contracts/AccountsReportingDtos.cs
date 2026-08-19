@@ -18,7 +18,12 @@ public sealed record AccountInfo(
     bool IsActive,
     decimal? Balance,
     string Class,
-    string? TaxStatus);
+    string? TaxStatus,
+    /// <summary>The account's Start Date — the as-of date of its opening balance
+    /// (mig 127 / ADR-0050). Null when unknown, which is every account imported
+    /// before the Moneydance importer began seeding it. Null for categories,
+    /// which have no opening balance.</summary>
+    DateOnly? OpenedOn);
 
 /// <summary>One line in the net-worth breakdown.</summary>
 public sealed record NetWorthLine(

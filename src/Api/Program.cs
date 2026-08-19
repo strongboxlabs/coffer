@@ -619,6 +619,7 @@ builder.Services.AddScoped<AccountGroupsRepository>();
 builder.Services.AddScoped<FeedConnectionsRepository>();
 builder.Services.AddScoped<LedgerOperationsRepository>();
 builder.Services.AddScoped<RegisterRepository>();
+builder.Services.AddScoped<LedgerConsistencyRepository>();
 builder.Services.AddScoped<PayeesRepository>();
 builder.Services.AddScoped<TransactionsRepository>();
 builder.Services.AddScoped<TagsRepository>();

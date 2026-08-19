@@ -20,7 +20,9 @@ public static class AccountsTools
         "List a ledger's accounts (and optionally categories): id, name, type, " +
         "categoryKind, parentId (the category tree — real accounts are flat), " +
         "currency, active flag, class ('asset' | 'liability' | 'none'), taxStatus " +
-        "('taxable' | 'tax_deferred' | 'tax_free' | 'other'; null = unknown), and balance. " +
+        "('taxable' | 'tax_deferred' | 'tax_free' | 'other'; null = unknown), openedOn " +
+        "(the account's Start Date — the as-of date of its opening balance; null when " +
+        "unknown, and null for categories), and balance. " +
         "Balances are Overview-consistent — investment accounts include holdings " +
         "market value (cash + positions), not just cash. Categories have a null " +
         "balance (they carry flows; use transaction_summary). Excludes internal " +

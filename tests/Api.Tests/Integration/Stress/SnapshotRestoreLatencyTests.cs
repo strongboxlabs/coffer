@@ -76,6 +76,11 @@ public sealed class SnapshotRestoreLatencyTests
         // Systemic invariants must hold at scale, not just in the small fixture.
         await AssertLedgerIsConsistentAsync(ledger.LedgerId);
 
+        // Money BEFORE the round trip. The counts below prove the graph came back;
+        // only this proves the VALUES did. A restore that reinserted every row with a
+        // corrupted amount would satisfy every other assertion in this test.
+        var moneyBefore = await ReadMoneyAsync(ledger.LedgerId);
+
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
@@ -101,6 +106,14 @@ public sealed class SnapshotRestoreLatencyTests
         var afterCounts = await ReadCountsAsync(ledger.LedgerId);
         Assert.Equal(counts, afterCounts);
         await AssertLedgerIsConsistentAsync(ledger.LedgerId);
+
+        // Correctness at scale, not just latency and row counts: every money total
+        // must come back identical to the cent.
+        var moneyAfter = await ReadMoneyAsync(ledger.LedgerId);
+        _output.WriteLine(
+            $"money:   legs {moneyAfter.LegAmount:N2}  basis {moneyAfter.CostBasis:N2}  " +
+            $"qty {moneyAfter.Quantity:N6}  gains {moneyAfter.RealizedGain:N2}");
+        Assert.Equal(moneyBefore, moneyAfter);
 
         // Measure, don't assert: how long the FIFO recompute that mig 188 removed
         // from restore actually takes at this scale. Two reasons to keep this here
@@ -130,6 +143,30 @@ public sealed class SnapshotRestoreLatencyTests
             $"SELECT recompute_holdings_cost_basis({ledgerId})");
         watch.Stop();
         return watch.Elapsed;
+    }
+
+    // A record CLASS, not a struct: EF's ad-hoc SqlQuery mapping requires a
+    // non-interface reference type. Records still give the value equality the
+    // before/after comparison relies on.
+    private sealed record Money(
+        decimal LegAmount, decimal CostBasis, decimal Quantity,
+        decimal RealizedGain, decimal Balances);
+
+    /// <summary>Every money aggregate a restore could silently corrupt.</summary>
+    private async Task<Money> ReadMoneyAsync(Guid ledgerId)
+    {
+        await using var db = _fixture.NewServiceFactory().Create();
+        db.Database.SetCommandTimeout(600);
+        return await db.Database.SqlQuery<Money>($"""
+            SELECT
+              (SELECT COALESCE(SUM(amount), 0)      FROM txn_legs        WHERE ledger_id = {ledgerId}) AS "LegAmount",
+              (SELECT COALESCE(SUM(cost_basis), 0)  FROM holdings        WHERE ledger_id = {ledgerId}) AS "CostBasis",
+              (SELECT COALESCE(SUM(quantity), 0)    FROM holdings        WHERE ledger_id = {ledgerId}) AS "Quantity",
+              (SELECT COALESCE(SUM(realized_gain),0) FROM realized_gains WHERE ledger_id = {ledgerId}) AS "RealizedGain",
+              (SELECT COALESCE(SUM(balance_after),0) FROM txn_header_account_balances b
+                 JOIN txn_headers h ON h.id = b.header_id
+                WHERE h.ledger_id = {ledgerId}) AS "Balances"
+            """).SingleAsync();
     }
 
     private readonly record struct Counts(int Headers, int Legs, int Holdings, int Lots, int Gains);

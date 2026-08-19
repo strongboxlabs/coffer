@@ -14,6 +14,20 @@ public sealed record MdAcct(
     bool IsInactive,
     bool IsHidden,
     long? StartingBalance,
+    /// <summary>
+    /// The account's Start Date — the as-of date of <see cref="StartingBalance"/>.
+    /// Seeds <c>accounts.opened_on</c> (migration 127 / ADR-0050). NULL when MD
+    /// recorded neither source field.
+    /// </summary>
+    /// <remarks>
+    /// MD records this two ways and is inconsistent about which: on a real
+    /// 781-account export, <c>creation_date</c> (epoch millis) appears on 181
+    /// accounts including ALL 50 investment accounts, while <c>date_created</c>
+    /// (yyyyMMdd) appears on only 64. Reading just the tidier integer would have
+    /// left most accounts NULL, so take it when present and fall back to the
+    /// epoch field — the two agree wherever both exist.
+    /// </remarks>
+    DateOnly? OpenedOn,
     string? Comment,
     string? AccountUrl,
     string? BankAccountNumber,
@@ -75,6 +89,7 @@ public sealed record MdAcct(
             IsInactive: item.GetBool("is_inactive") ?? false,
             IsHidden: item.GetBool("hide") ?? false,
             StartingBalance: item.GetLong("sbal"),
+            OpenedOn: item.GetMdDate("date_created") ?? item.GetMdEpochDate("creation_date"),
             Comment: item.GetString("comment"),
             AccountUrl: item.GetString("account_url"),
             BankAccountNumber: item.GetString("bank_account_number"),

@@ -5,6 +5,7 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 
 using Coffer.Api.Contracts;
 using Coffer.Api.Db.Entities;
@@ -47,6 +48,27 @@ public sealed class SnapshotsTests
     // -----------------------------------------------------------------
     // Walker round-trip + restore atomicity
     // -----------------------------------------------------------------
+
+    /// <summary>
+    /// The auto-snapshot repo, built the way PRODUCTION builds it: over the
+    /// service-role context the scheduler hands to <c>SnapshotJobHandler</c>.
+    /// </summary>
+    /// <remarks>
+    /// These two tests previously resolved the repository out of
+    /// <c>factory.Services.CreateScope()</c>. That is the app-role context with no
+    /// request behind it, so <c>ICurrentUserAccessor.IsAuthenticated</c> is false,
+    /// <c>app.user_id</c> is never set, and RLS is fail-closed on every scoped table
+    /// — the exact shape that made
+    /// <c>Snapshot_payload_is_captured_server_side_in_content_json</c> capture
+    /// nothing and assert that it had captured something. It happens to work here
+    /// only because the snapshot tables do not carry RLS policies YET (see
+    /// "RLS on the snapshot tables" in follow-ups), so the pattern is a latent break
+    /// as well as a wrong mirror of production: the auto-snap path is the scheduler,
+    /// which runs service-role precisely because the app role would see no ledgers.
+    /// </remarks>
+    private LedgerSnapshotsRepository AutoSnapshotRepo() =>
+        new(_fixture.NewDbContext(),
+            NullLogger<LedgerSnapshotsRepository>.Instance);
 
     [Fact]
     public async Task Create_then_restore_round_trips_the_ledger_state()
@@ -149,12 +171,17 @@ public sealed class SnapshotsTests
     }
 
     [Fact]
-    public async Task Snapshot_payload_is_captured_server_side_in_content_json()
+    public async Task Snapshot_payload_is_captured_server_side_in_chunked_parts()
     {
-        // mig 179 (OOM fix): the in-scope graph is captured directly into
-        // content_json (jsonb, server-side) and restored from there — it never
-        // enters managed memory, so create no longer OOMs on large ledgers. The
-        // legacy gzip `content` stays empty for v2 snapshots.
+        // mig 179 captured the in-scope graph into content_json (jsonb) so it never
+        // entered managed memory. That fixed an API-side OOM and left a Postgres-side
+        // one: the whole document was still built as one value, measured at 2.49 GB of
+        // backend anon memory for a 184 MB artifact, which the kernel OOM-killed.
+        //
+        // mig 193 (v3): rows are captured per table in chunks into
+        // ledger_snapshot_parts, so peak memory tracks chunk size rather than ledger
+        // size. content_json is left NULL and the legacy gzip `content` stays empty —
+        // presence of parts rows is the v3 gate.
         var ledger = await SyntheticLedger.CreateAsync(_fixture);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
@@ -162,24 +189,178 @@ public sealed class SnapshotsTests
             bank.Id, dining.Id, -25m,
             new DateTime(2026, 5, 5, 12, 0, 0, DateTimeKind.Utc), payee: "lunch");
 
+        // Created through the endpoint, NOT by resolving the repository directly.
+        // Capture reads the in-scope tables as coffer_app, and those tables carry
+        // RLS keyed on app.user_id — which only a real request sets. Calling the
+        // repository straight out of a DI scope captures a payload with every key
+        // present and every array empty. The v2 version of this test did exactly
+        // that and still passed, because it only asserted the "accounts" KEY was
+        // present, which is equally true of "accounts": []. It would have passed
+        // against an entirely empty snapshot.
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
-        using var scope = factory.Services.CreateScope();
-        var repo = scope.ServiceProvider.GetRequiredService<LedgerSnapshotsRepository>();
+        using var client = await AuthedClientAsync(factory, ledger);
 
-        var created = await repo.CreateAsync(
-            ledger.LedgerId, "auto", UserRow.SystemUserId, description: null);
-        Assert.Equal(LedgerSnapshotsRepository.CreateOutcome.Created, created.Outcome);
-        Assert.True(created.Row!.ContentSizeUncompressed > 0);
+        var createResp = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots", new CreateSnapshotRequest("baseline"));
+        Assert.Equal(HttpStatusCode.OK, createResp.StatusCode);
+        var created = (await createResp.Content.ReadFromJsonAsync<CreateSnapshotResponse>())!.Snapshot!;
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = _fixture.NewDbContext();   // service role: sees past RLS
         var row = await db.LedgerSnapshots.AsNoTracking()
-            .Where(s => s.Id == created.Row!.Id)
+            .Where(s => s.Id == created.Id)
             .Select(s => new { s.ContentJson, s.Content, s.ContentSizeUncompressed })
             .SingleAsync();
-        Assert.NotNull(row.ContentJson);                    // v2: graph in content_json
-        Assert.Contains("\"accounts\"", row.ContentJson!);  // it holds the in-scope graph
-        Assert.Empty(row.Content);                          // legacy gzip content unused
+        Assert.Null(row.ContentJson);        // v3: the payload lives in parts, not here
+        Assert.Empty(row.Content);           // legacy gzip content unused
         Assert.True(row.ContentSizeUncompressed > 0);
+
+        var snapshotId = created.Id;
+
+        // Every table fn_ledger_snapshot_payload declares got a part — including the
+        // ones that are empty for this ledger, because capture always writes seq=0.
+        // That completeness is what mig 188's realized_gains assertion relies on: it
+        // distinguishes an absent key from an empty '[]'.
+        var missingParts = await db.Database.SqlQueryRaw<string>(
+            """
+            SELECT t AS "Value"
+              FROM unnest(fn_ledger_snapshot_part_names()) AS t
+             WHERE NOT EXISTS (SELECT 1 FROM ledger_snapshot_parts p
+                                WHERE p.snapshot_id = {0} AND p.part_name = t)
+            """, snapshotId).ToListAsync();
+        Assert.Empty(missingParts);
+
+        // ...and nothing was written that the payload does not declare, so capture
+        // and restore cannot disagree about the key set.
+        var unexpectedParts = await db.Database.SqlQueryRaw<string>(
+            """
+            SELECT DISTINCT p.part_name AS "Value"
+              FROM ledger_snapshot_parts p
+             WHERE p.snapshot_id = {0}
+               AND NOT (p.part_name = ANY (fn_ledger_snapshot_part_names()))
+            """, snapshotId).ToListAsync();
+        Assert.Empty(unexpectedParts);
+
+        // The chunks carry the actual rows.
+        var accountsPart = await db.Database.SqlQueryRaw<string>(
+            """
+            SELECT content::text AS "Value"
+              FROM ledger_snapshot_parts
+             WHERE snapshot_id = {0} AND part_name = 'accounts' AND seq = 0
+            """, snapshotId).SingleAsync();
+        Assert.Contains("checking", accountsPart);
+    }
+
+    [Fact]
+    public async Task A_pre_migration_v2_snapshot_still_restores()
+    {
+        // Migration 193 made capture produce v3 (chunked parts), which means every
+        // other test in this file exercises the v3 path and NOTHING exercises v2 —
+        // even though 193 also modified the v2 restore function, extracting its
+        // delete block into fn_ledger_snapshot_clear so both paths share one FK
+        // ordering. Preflight passed with the v2 branch at zero coverage.
+        //
+        // That matters because an install upgrading to 193 keeps its existing v2
+        // snapshots (nothing is rewritten in place), and those restore through the
+        // refactored function. The snapshot you would reach for if an upgrade went
+        // badly is exactly the one whose path was untested.
+        //
+        // So: capture normally (v3), convert the row to a genuine v2 snapshot, and
+        // restore it through the real endpoint. fn_ledger_snapshot_parts_payload is
+        // the reassembly helper 193 added for diagnostics; here it manufactures the
+        // single content_json document v2 stored, byte-order-identical to what mig
+        // 179's capture would have written.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var dining = await ledger.AddCategoryAsync("Dining");
+        await ledger.AddTransactionPairAsync(
+            bank.Id, dining.Id, -25m,
+            new DateTime(2026, 5, 5, 12, 0, 0, DateTimeKind.Utc), payee: "lunch");
+        await ledger.AddTransactionPairAsync(
+            bank.Id, dining.Id, -12m,
+            new DateTime(2026, 5, 6, 12, 0, 0, DateTimeKind.Utc), payee: "coffee");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var createResp = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots", new CreateSnapshotRequest("v2-shaped"));
+        Assert.Equal(HttpStatusCode.OK, createResp.StatusCode);
+        var snap = (await createResp.Content.ReadFromJsonAsync<CreateSnapshotResponse>())!.Snapshot!;
+
+        // Rewrite it into the v2 format: payload in content_json, no parts rows.
+        await using (var svc = _fixture.NewDbContext())
+        {
+            await svc.Database.ExecuteSqlRawAsync(
+                """
+                UPDATE ledger_snapshots
+                   SET content_json = fn_ledger_snapshot_parts_payload({0})
+                 WHERE id = {0};
+                """, snap.Id);
+            await svc.Database.ExecuteSqlRawAsync(
+                "DELETE FROM ledger_snapshot_parts WHERE snapshot_id = {0};", snap.Id);
+
+            var shape = await svc.LedgerSnapshots.AsNoTracking()
+                .Where(s => s.Id == snap.Id)
+                .Select(s => new { HasJson = s.ContentJson != null, s.Content.Length })
+                .SingleAsync();
+            Assert.True(shape.HasJson);   // v2: document present
+            Assert.Equal(0, shape.Length); // and NOT v1 — no gzip bytes, so the
+                                           // format probe must route it server-side
+        }
+
+        // Mutate after the snapshot so the restore has something to undo.
+        await ledger.AddTransactionPairAsync(
+            bank.Id, dining.Id, -100m,
+            new DateTime(2026, 5, 7, 12, 0, 0, DateTimeKind.Utc), payee: "post-snapshot row");
+        await using (var db = _fixture.NewDbContext())
+        {
+            Assert.Equal(3, await db.TxnHeaders.AsNoTracking()
+                .CountAsync(h => h.LedgerId == ledger.LedgerId));
+        }
+
+        var restoreResp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots/{snap.Id}/restore", content: null);
+        Assert.Equal(HttpStatusCode.NoContent, restoreResp.StatusCode);
+
+        await using (var db = _fixture.NewDbContext())
+        {
+            Assert.Equal(2, await db.TxnHeaders.AsNoTracking()
+                .CountAsync(h => h.LedgerId == ledger.LedgerId));
+            // Balances rebuilt by fn_recompute_balances_for_ledger via the v2 path.
+            Assert.Equal(2, await db.TxnHeaderAccountBalances.AsNoTracking()
+                .CountAsync(b => b.AccountId == bank.Id));
+        }
+    }
+
+    [Fact]
+    public async Task Capture_and_restore_agree_on_the_table_set()
+    {
+        // mig 193 necessarily keeps two lists: fn_ledger_snapshot_part_names() in
+        // capture order, and fn_ledger_snapshot_insert_order() in forward-FK order,
+        // because capture order is not safe for inserts. Two lists that must stay in
+        // step are a latent trap — add a table to the payload, forget the restore
+        // list, and every restore silently drops it with nothing failing. The
+        // per-part assertions elsewhere catch a missing PART, not a missing INSERT.
+        //
+        // Asserting set equality here is what closes that gap. Order deliberately
+        // is not compared: the two orders differing is the entire point.
+        await using var db = _fixture.NewDbContext();
+        var mismatched = await db.Database.SqlQueryRaw<string>(
+            """
+            SELECT t AS "Value" FROM (
+                SELECT unnest(fn_ledger_snapshot_part_names()) AS t
+                EXCEPT
+                SELECT unnest(fn_ledger_snapshot_insert_order())
+            ) missing_from_restore
+            UNION ALL
+            SELECT t FROM (
+                SELECT unnest(fn_ledger_snapshot_insert_order()) AS t
+                EXCEPT
+                SELECT unnest(fn_ledger_snapshot_part_names())
+            ) missing_from_capture
+            """).ToListAsync();
+
+        Assert.Empty(mismatched);
     }
 
     [Fact]
@@ -416,14 +597,11 @@ public sealed class SnapshotsTests
     public async Task Auto_snapshot_at_cap_evicts_oldest_auto_then_inserts()
     {
         var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
 
         // Seed 5 auto-snaps via the repo directly (the HTTP endpoint
         // only creates kind=manual; auto-creation is the scheduler's
         // job, which we exercise here through the same repo).
-        using var scope = factory.Services.CreateScope();
-        var repo = scope.ServiceProvider
-            .GetRequiredService<LedgerSnapshotsRepository>();
+        var repo = AutoSnapshotRepo();
 
         var firstAuto = await repo.CreateAsync(
             ledger.LedgerId, "auto", UserRow.SystemUserId, description: null);
@@ -473,9 +651,7 @@ public sealed class SnapshotsTests
 
         // Auto-create must skip (no auto-snap to evict; manual snaps
         // are protected by ADR-0037 retention rule).
-        using var scope = factory.Services.CreateScope();
-        var repo = scope.ServiceProvider
-            .GetRequiredService<LedgerSnapshotsRepository>();
+        var repo = AutoSnapshotRepo();
         var result = await repo.CreateAsync(
             ledger.LedgerId, "auto", UserRow.SystemUserId, description: null);
         Assert.Equal(

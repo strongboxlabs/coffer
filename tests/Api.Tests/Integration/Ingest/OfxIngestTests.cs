@@ -442,8 +442,9 @@ public sealed class OfxIngestTests
 
     /// <summary>
     /// OFX investment statement covering one of each supported
-    /// transaction type plus one skipped type (TRANSFER), with a
-    /// SECLIST entry resolving the security's CUSIP to a ticker.
+    /// transaction type plus two skipped TRANSFERs — one whole-unit
+    /// IN, one fractional OUT — with a SECLIST entry resolving the
+    /// security's CUSIP to a ticker.
     /// Synthesised — no real account names, FIIDs, or CUSIPs.
     /// </summary>
     private const string OfxInvestmentStatement = """
@@ -559,6 +560,20 @@ public sealed class OfxIngestTests
         <TFERACTION>IN
         <POSTYPE>LONG
         </TRANSFER>
+        <TRANSFER>
+        <INVTRAN>
+        <FITID>INV-FITID-XFR-2
+        <DTTRADE>20260131
+        </INVTRAN>
+        <SECID>
+        <UNIQUEID>FAKE0001
+        <UNIQUEIDTYPE>CUSIP
+        </SECID>
+        <SUBACCTSEC>OTHER
+        <UNITS>-0.000980392
+        <TFERACTION>OUT
+        <POSTYPE>LONG
+        </TRANSFER>
         </INVTRANLIST>
         </INVSTMTRS>
         </INVSTMTTRNRS>
@@ -598,11 +613,34 @@ public sealed class OfxIngestTests
         Assert.Equal("investment", inv.AccountType);
         Assert.Equal("inv:brokerX:INV-0001", inv.ProviderAccountId);
         // 4 supported (BUY/SELL/INCOME/REINVEST) + 0 INVBANKTRAN + 0
-        // skipped (TRANSFER warns but isn't counted toward import).
+        // skipped (both TRANSFERs warn but aren't counted toward import).
         Assert.Equal(4, inv.TransactionCount);
         // TRANSFER surfaces as a warning so the user knows it was
         // skipped — slice 2 does not yet support share-only moves.
-        Assert.Contains(preview.Errors, e => e.Code == "ofx_investment_type_unsupported");
+        var warnings = preview.Errors
+            .Where(e => e.Code == "ofx_investment_type_unsupported")
+            .Select(e => e.Message)
+            .ToList();
+        Assert.Equal(2, warnings.Count);
+
+        // The warning has to let the user find the row on their own
+        // statement, so it carries the wire tag + direction, the
+        // resolved ticker, the units and the trade date — and NOT the
+        // OfxNet class name or the FITID (see DescribeUnsupported).
+        Assert.Contains(
+            "OFX TRANSFER (IN) row skipped (FAKE, 1 units, 2026-01-25). "
+                + "Share-only moves aren't imported in this slice.",
+            warnings);
+        // Fractional units keep full 12dp precision without trailing
+        // zeros — a sub-cent residual sweep is the real-world shape
+        // that motivated the message (a 401(k) recordkeeper moving
+        // 0.00098 shares out).
+        Assert.Contains(
+            "OFX TRANSFER (OUT) row skipped (FAKE, -0.000980392 units, 2026-01-31). "
+                + "Share-only moves aren't imported in this slice.",
+            warnings);
+        Assert.DoesNotContain(warnings, m => m.Contains("OfxTransfer", StringComparison.Ordinal));
+        Assert.DoesNotContain(warnings, m => m.Contains("INV-FITID-XFR", StringComparison.Ordinal));
     }
 
     [Fact]

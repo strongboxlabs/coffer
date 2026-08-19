@@ -47,11 +47,24 @@ image tag (`ghcr.io/<owner>/coffer:<semver>`). MAJOR.MINOR.PATCH by impact
 tag, the About-panel version, and the git tag (`v<semver>`) in lockstep,
 so "what's deployed" is never ambiguous. See the maintainer release process.
 Rationale: a container tag that doesn't match the build version inside it
-is a lie — the image says `0.2.0` while About says `0.1.0`. Note the
-caveat below: container images build `.git`-less, so the build-number /
-SHA axes degrade to `0` / `nogit` in shipped images; **semver is the
-axis that carries meaning for a published image**, which is why it must
-move on every build.
+is a lie — the image says `0.2.0` while About says `0.1.0`. Semver must
+therefore move on every build.
+
+**Superseded caveat (fixed 2026-08-17).** This decision originally accepted
+that container images build `.git`-less — `.dockerignore` excludes it, and
+rightly so — leaving the build-number and SHA axes at `0` / `nogit` in every
+shipped image, with semver as the only axis carrying meaning. That held for
+as long as the axes were only feeding an About panel. It stopped being
+acceptable once reporting responses began carrying `engineVersion`
+(ADR-0063) to let a consumer tell a stale figure from a current one: an
+identity that reads `0.62.0+nogit` names the release but not the commit, so
+every image of a release is indistinguishable — which is the one job that
+field has. The values are now PASSED IN rather than discovered: the
+stamping target skips a git call when the corresponding property is already
+set, the Dockerfile takes `SOURCE_COMMIT_SHA` / `_COUNT` / `_DATE` as build
+args, and the release workflow supplies them from the tagged commit (with
+`fetch-depth: 0`, since a shallow clone reports a commit count of 1). A
+local `docker build` that passes nothing still degrades exactly as before.
 
 **Transport.** `GET /api/meta/version` returns the two server-side axes
 (API + DB). It is **authenticated** — unlike the anonymous `/healthz` /
@@ -61,9 +74,14 @@ callers. The SPA supplies its own (UI) axis from the build-time
 constants; it needs no fetch for that row.
 
 **Build-time stamping** is guarded on both sides: every git call has a
-fallback (build `0` / commit `nogit` / `dev`), so a `.git`-less build —
-e.g. a Docker layer without the repo — degrades gracefully instead of
-failing the build.
+fallback (build `0` / commit `nogit` / `dev`), so a `.git`-less build that
+supplies nothing degrades gracefully instead of failing the build. Each
+value is also OVERRIDABLE — set `GitShortSha`, `GitCommitCount` or
+`GitCommitDate` and that git call is skipped — which is how a container
+build gets a real identity without `.git` in its context. The fallbacks
+deliberately test the VALUE, not the git exit code: a skipped `Exec` leaves
+its exit code empty, and testing `!= '0'` would overwrite a supplied SHA
+with `nogit`.
 
 ## Consequences
 

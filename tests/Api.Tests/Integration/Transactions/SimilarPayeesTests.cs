@@ -14,7 +14,9 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// <c>GET /api/ledgers/{ledgerId}/transactions/{headerId}/similar-payees</c>
 /// — slice 2c.6c Tier 1 recall. Anchors on the current row's raw
 /// bank payee; returns prior approved bank-feed rows' chosen
-/// <c>(payee, category)</c> pairs aggregated by use count.
+/// <c>(payee, counterparty)</c> pairs aggregated by use count. The
+/// counterparty is the prior row's non-money-side leg, so a category
+/// and a transfer destination are both recallable.
 /// </summary>
 [Collection(ApiCollection.Name)]
 public sealed class SimilarPayeesTests
@@ -47,11 +49,15 @@ public sealed class SimilarPayeesTests
     /// it true. <paramref name="origin"/> defaults to
     /// <c>online_import</c> for SimpleFIN; pass <c>file_import</c>
     /// for OFX/CSV. Returns the header id.
+    ///
+    /// <para><paramref name="counterpartyAccountId"/> is any account
+    /// — a category on an ordinary expense row, a second real
+    /// account when the row is a transfer.</para>
     /// </summary>
     private async Task<Guid> SeedBankFeedAsync(
         SyntheticLedger ledger,
         Guid bankAccountId,
-        Guid categoryAccountId,
+        Guid counterpartyAccountId,
         decimal amount,
         DateTime postedAt,
         string bankPayee,
@@ -62,7 +68,7 @@ public sealed class SimilarPayeesTests
     {
         var headerId = Guid.NewGuid();
         var bankLegId = Guid.NewGuid();
-        var categoryLegId = Guid.NewGuid();
+        var counterpartyLegId = Guid.NewGuid();
         await using var db = _fixture.NewDbContext();
         // external_id required for SimpleFIN-origin rows (mig 105 CHECK);
         // file_import rows also keep an external_id for provider dedup.
@@ -76,8 +82,8 @@ public sealed class SimilarPayeesTests
                  {postedAt},{postedAt}, {postedAt}, {needsReview});
             INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount)
             VALUES
-                ({bankLegId},     {headerId}, {ledger.LedgerId}, {bankAccountId},     0, {amount}),
-                ({categoryLegId}, {headerId}, {ledger.LedgerId}, {categoryAccountId}, 0, {-amount});");
+                ({bankLegId},          {headerId}, {ledger.LedgerId}, {bankAccountId},          0, {amount}),
+                ({counterpartyLegId},  {headerId}, {ledger.LedgerId}, {counterpartyAccountId},  0, {-amount});");
         if (overridePayee is not null)
         {
             await db.Database.ExecuteSqlInterpolatedAsync($@"
@@ -119,9 +125,125 @@ public sealed class SimilarPayeesTests
         var suggestions = (await response.Content.ReadFromJsonAsync<List<SimilarPayeeDto>>())!;
         var single = Assert.Single(suggestions);
         Assert.Equal("Starbucks Coffee", single.Payee);
-        Assert.Equal(coffee.Id, single.CategoryAccountId);
-        Assert.Equal("Coffee", single.CategoryAccountName);
+        Assert.Equal(coffee.Id, single.CounterpartyAccountId);
+        Assert.Equal("Coffee", single.CounterpartyAccountName);
         Assert.Equal(1, single.UseCount);
+    }
+
+    [Fact]
+    public async Task Recalls_a_transfer_counterparty_when_prior_rows_have_no_category_leg()
+    {
+        // Regression: recall used to require the prior row to carry an
+        // `account_type = 'category'` leg. A recurring charge the user
+        // always settles as a TRANSFER (checking → FSA) has two
+        // real-account legs and no category leg at all, so every prior
+        // row was filtered out and the chip row silently never
+        // rendered — exactly the case where recall is most useful.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var checking = await ledger.AddBankAccountAsync("checking");
+        var fsa = await ledger.AddBankAccountAsync("PayFlex FSA");
+        var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
+
+        // Prior approved row: settled as a transfer to the FSA account.
+        await SeedBankFeedAsync(
+            ledger, checking.Id, fsa.Id, 242.85m,
+            new DateTime(2026, 4, 1, 12, 0, 0, DateTimeKind.Utc),
+            bankPayee: "INSPIRA-AMERICAN", needsReview: false,
+            overridePayee: "Inspira American");
+
+        // Fresh feed row on the same account, still parked on
+        // Uncategorized the way ingest leaves it.
+        var currentId = await SeedBankFeedAsync(
+            ledger, checking.Id, uncategorized.Id, 99.98m,
+            new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
+            bankPayee: "INSPIRA-AMERICAN", needsReview: true);
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+        var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
+            Url(ledger.LedgerId, currentId)))!;
+
+        var single = Assert.Single(suggestions);
+        Assert.Equal("Inspira American", single.Payee);
+        Assert.Equal(fsa.Id, single.CounterpartyAccountId);
+        Assert.Equal("PayFlex FSA", single.CounterpartyAccountName);
+        Assert.Equal(1, single.UseCount);
+    }
+
+    [Fact]
+    public async Task Ranks_transfer_and_category_suggestions_together()
+    {
+        // Transfers and categories are the same kind of suggestion to
+        // the editor's AccountCategoryPicker, so they compete in one
+        // use-count ordering rather than living in separate tiers.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var checking = await ledger.AddBankAccountAsync("checking");
+        var fsa = await ledger.AddBankAccountAsync("PayFlex FSA");
+        var medical = await ledger.AddCategoryAsync("Medical");
+        var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
+
+        // Two transfer settlements, one category settlement.
+        for (var i = 0; i < 2; i++)
+        {
+            await SeedBankFeedAsync(
+                ledger, checking.Id, fsa.Id, 100m,
+                new DateTime(2026, 3, i + 1, 12, 0, 0, DateTimeKind.Utc),
+                bankPayee: "INSPIRA-AMERICAN", needsReview: false,
+                overridePayee: "Inspira American");
+        }
+        await SeedBankFeedAsync(
+            ledger, checking.Id, medical.Id, 50m,
+            new DateTime(2026, 4, 1, 12, 0, 0, DateTimeKind.Utc),
+            bankPayee: "INSPIRA-AMERICAN", needsReview: false,
+            overridePayee: "Inspira Medical");
+
+        var currentId = await SeedBankFeedAsync(
+            ledger, checking.Id, uncategorized.Id, 75m,
+            new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
+            bankPayee: "INSPIRA-AMERICAN", needsReview: true);
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+        var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
+            Url(ledger.LedgerId, currentId)))!;
+
+        Assert.Equal(2, suggestions.Count);
+        Assert.Equal(fsa.Id, suggestions[0].CounterpartyAccountId);
+        Assert.Equal(2, suggestions[0].UseCount);
+        Assert.Equal(medical.Id, suggestions[1].CounterpartyAccountId);
+        Assert.Equal(1, suggestions[1].UseCount);
+    }
+
+    [Fact]
+    public async Task Excludes_prior_rows_posted_to_a_different_money_side_account()
+    {
+        // "Counterparty" is only meaningful relative to an account, so
+        // recall is scoped to the anchor's money side. A prior row for
+        // the same payee on a DIFFERENT account would otherwise
+        // suggest a pairing the user never made on this one — and on a
+        // transfer it could even suggest the anchor's own account.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var checking = await ledger.AddBankAccountAsync("checking");
+        var otherCard = await ledger.AddBankAccountAsync("other card");
+        var coffee = await ledger.AddCategoryAsync("Coffee");
+        var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
+
+        await SeedBankFeedAsync(
+            ledger, otherCard.Id, coffee.Id, -4m,
+            new DateTime(2026, 4, 1, 12, 0, 0, DateTimeKind.Utc),
+            bankPayee: "STARBUCKS", needsReview: false,
+            overridePayee: "Starbucks Coffee");
+
+        var currentId = await SeedBankFeedAsync(
+            ledger, checking.Id, uncategorized.Id, -4m,
+            new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
+            bankPayee: "STARBUCKS", needsReview: true);
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+        var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
+            Url(ledger.LedgerId, currentId)))!;
+        Assert.Empty(suggestions);
     }
 
     [Fact]

@@ -134,6 +134,129 @@ public sealed class SchedulerRunnerTests
         Assert.True(job.NextRunAt > now);
     }
 
+    [Fact]
+    public async Task Failing_job_advances_and_records_the_failure()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5));
+        var handlers = new Dictionary<string, IScheduledJobHandler>
+        {
+            [JobTypes.QuoteRefresh] = new ThrowingHandler(JobTypes.QuoteRefresh, "quotes exploded"),
+        };
+
+        var now = DateTime.UtcNow;
+        await using var db = _fixture.NewDbContext();
+        await new SchedulerRunner().RunDueAsync(db, handlers, now, NullLogger.Instance, default);
+
+        await using var read = _fixture.NewDbContext();
+        var job = await read.ScheduledJobs.AsNoTracking()
+            .SingleAsync(j => j.LedgerId == ledger.LedgerId);
+        Assert.True(job.NextRunAt > now);              // failure does not mean "retry next tick"
+        Assert.Equal(1, job.ConsecutiveFailures);
+        Assert.Contains("quotes exploded", job.LastError);
+        Assert.NotNull(job.LastFailureAt);
+        Assert.True(job.Enabled);                      // one failure is not enough to disable
+    }
+
+    /// <summary>
+    /// The mig-194 regression test. A handler that leaves the connection unusable
+    /// used to cost us the advance — the runner applied next_run_at in memory and
+    /// persisted it after the loop, over the context the handler had just wrecked,
+    /// so the row stayed due and re-fired every tick. The advance is now committed
+    /// before dispatch, so it survives even though the post-run bookkeeping cannot
+    /// be written.
+    /// </summary>
+    [Fact]
+    public async Task Job_that_poisons_the_connection_still_advances()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5));
+        var handlers = new Dictionary<string, IScheduledJobHandler>
+        {
+            [JobTypes.QuoteRefresh] = new ConnectionPoisoningHandler(JobTypes.QuoteRefresh),
+        };
+
+        var now = DateTime.UtcNow;
+        await using var db = _fixture.NewDbContext();
+        // Must not throw: the runner absorbs the unwritable outcome and gives up
+        // on the tick rather than propagating.
+        await new SchedulerRunner().RunDueAsync(db, handlers, now, NullLogger.Instance, default);
+
+        await using var read = _fixture.NewDbContext();
+        var job = await read.ScheduledJobs.AsNoTracking()
+            .SingleAsync(j => j.LedgerId == ledger.LedgerId);
+        Assert.True(job.NextRunAt > now);
+        // The failure bookkeeping is the part that is legitimately lost here — the
+        // connection was gone. The advance is what matters, and it held.
+    }
+
+    [Fact]
+    public async Task Failure_at_the_threshold_disables_the_job()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5),
+            consecutiveFailures: SchedulerRunner.DisableAfterConsecutiveFailures - 1);
+        var handlers = new Dictionary<string, IScheduledJobHandler>
+        {
+            [JobTypes.QuoteRefresh] = new ThrowingHandler(JobTypes.QuoteRefresh, "again"),
+        };
+
+        await using var db = _fixture.NewDbContext();
+        await new SchedulerRunner().RunDueAsync(
+            db, handlers, DateTime.UtcNow, NullLogger.Instance, default);
+
+        await using var read = _fixture.NewDbContext();
+        var job = await read.ScheduledJobs.AsNoTracking()
+            .SingleAsync(j => j.LedgerId == ledger.LedgerId);
+        Assert.Equal(SchedulerRunner.DisableAfterConsecutiveFailures, job.ConsecutiveFailures);
+        Assert.False(job.Enabled);
+    }
+
+    [Fact]
+    public async Task Success_clears_earlier_failures()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5),
+            consecutiveFailures: 3);
+        var handlers = new Dictionary<string, IScheduledJobHandler>
+        {
+            [JobTypes.QuoteRefresh] = new SpyHandler(JobTypes.QuoteRefresh),
+        };
+
+        await using var db = _fixture.NewDbContext();
+        await new SchedulerRunner().RunDueAsync(
+            db, handlers, DateTime.UtcNow, NullLogger.Instance, default);
+
+        await using var read = _fixture.NewDbContext();
+        var job = await read.ScheduledJobs.AsNoTracking()
+            .SingleAsync(j => j.LedgerId == ledger.LedgerId);
+        Assert.Equal(0, job.ConsecutiveFailures);
+        Assert.Null(job.LastError);
+        Assert.True(job.Enabled);
+    }
+
+    [Fact]
+    public async Task Failing_global_job_advances_and_records_the_failure()
+    {
+        await ResetGlobalRowAsync();
+        await SeedGlobalJobAsync(GlobalJobTypes.Backup, DateTime.UtcNow.AddMinutes(-5));
+        var handlers = new Dictionary<string, IGlobalScheduledJobHandler>
+        {
+            [GlobalJobTypes.Backup] = new ThrowingGlobalHandler(GlobalJobTypes.Backup, "pg_dump died"),
+        };
+
+        var now = DateTime.UtcNow;
+        await using var db = _fixture.NewDbContext();
+        await new SchedulerRunner().RunDueGlobalAsync(db, handlers, now, NullLogger.Instance, default);
+
+        await using var read = _fixture.NewDbContext();
+        var job = await read.GlobalScheduledJobs.AsNoTracking()
+            .SingleAsync(j => j.JobType == GlobalJobTypes.Backup);
+        Assert.True(job.NextRunAt > now);
+        Assert.Equal(1, job.ConsecutiveFailures);
+        Assert.Contains("pg_dump died", job.LastError);
+    }
+
     private async Task ResetGlobalRowAsync()
     {
         await using var db = _fixture.NewDbContext();   // service role
@@ -154,7 +277,8 @@ public sealed class SchedulerRunnerTests
         await db.SaveChangesAsync();
     }
 
-    private async Task SeedJobAsync(SyntheticLedger ledger, string jobType, DateTime nextRunAt)
+    private async Task SeedJobAsync(
+        SyntheticLedger ledger, string jobType, DateTime nextRunAt, int consecutiveFailures = 0)
     {
         await using var db = ledger.NewDbContext();
         db.ScheduledJobs.Add(new ScheduledJobRow
@@ -166,6 +290,7 @@ public sealed class SchedulerRunnerTests
             MinuteLocal = 0,
             ConfiguredByUserId = ledger.UserId,
             NextRunAt = DateTime.SpecifyKind(nextRunAt, DateTimeKind.Utc),
+            ConsecutiveFailures = consecutiveFailures,
         });
         await db.SaveChangesAsync();
     }
@@ -193,6 +318,56 @@ public sealed class SchedulerRunnerTests
         {
             Calls++;
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class ThrowingHandler : IScheduledJobHandler
+    {
+        private readonly string _message;
+        public ThrowingHandler(string jobType, string message)
+            => (JobType, _message) = (jobType, message);
+        public string JobType { get; }
+
+        public Task RunAsync(AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken ct)
+            => throw new InvalidOperationException(_message);
+    }
+
+    private sealed class ThrowingGlobalHandler : IGlobalScheduledJobHandler
+    {
+        private readonly string _message;
+        public ThrowingGlobalHandler(string jobType, string message)
+            => (JobType, _message) = (jobType, message);
+        public string JobType { get; }
+
+        public Task RunAsync(AppDbContext db, CancellationToken ct)
+            => throw new InvalidOperationException(_message);
+    }
+
+    /// <summary>
+    /// Stands in for the real failure: a handler that leaves the context unable to
+    /// write. It opens a transaction, fails a statement inside it (so Postgres marks
+    /// the transaction aborted), and leaves it open — every later command on that
+    /// connection then errors, exactly as they did against a database in crash
+    /// recovery. Any subsequent SaveChanges must fail for this test to mean anything.
+    /// </summary>
+    private sealed class ConnectionPoisoningHandler : IScheduledJobHandler
+    {
+        public ConnectionPoisoningHandler(string jobType) => JobType = jobType;
+        public string JobType { get; }
+
+        public async Task RunAsync(
+            AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken ct)
+        {
+            await db.Database.BeginTransactionAsync(ct);
+            try
+            {
+                await db.Database.ExecuteSqlRawAsync("SELECT 1/0", ct);
+            }
+            catch
+            {
+                // Intentionally swallowed: the aborted transaction is the point.
+            }
+            throw new InvalidOperationException("handler died with the connection aborted");
         }
     }
 }

@@ -218,7 +218,7 @@ public sealed class QifFileProvider : IFileProvider
         {
             errors.Add(new IngestError(
                 Code: "qif_investment_action_unsupported",
-                Message: $"QIF investment action '{rawAction}' is not supported in this slice; row skipped (date {r.Date:yyyy-MM-dd}).",
+                Message: DescribeUnsupportedAction(rawAction, r),
                 ConnectionId: null,
                 AccountId: null));
             return null;
@@ -283,6 +283,66 @@ public sealed class QifFileProvider : IFileProvider
             Pending: false,
             ProviderAccountId: SingleAccountKey);
     }
+
+    /// <summary>
+    /// Build the preview warning for a record whose <c>N</c> action
+    /// this slice doesn't import. Mirrors the OFX provider's
+    /// <c>DescribeUnsupported</c>: the user has to find the row on
+    /// their own statement to judge whether the skip matters, so the
+    /// message carries the row's identity — security, quantity, date —
+    /// not just the action token and the date.
+    /// </summary>
+    private static string DescribeUnsupportedAction(string rawAction, QifRecordBuilder r)
+    {
+        var token = rawAction.Trim();
+        var (securityName, tickerHint) = SplitSecurity(r.Security);
+
+        var identity = new List<string>(3);
+        if ((tickerHint ?? NullIfEmpty(securityName)) is { } security)
+            identity.Add(security);
+        if (r.Quantity is { } quantity)
+        {
+            // 12dp matches txn_legs.quantity's scale; the format trims
+            // trailing zeros so whole-share rows stay readable.
+            identity.Add($"{quantity.ToString("0.############", CultureInfo.InvariantCulture)} units");
+        }
+        // HandleRecord drops dateless records before they reach the
+        // mapper, so identity is never empty — the date is always here.
+        if (r.Date is { } date)
+            identity.Add(date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+
+        var subject = token.Length > 0 ? token : "(no action)";
+        return $"QIF {subject} row skipped ({string.Join(", ", identity)}). "
+            + UnsupportedActionReason(token);
+    }
+
+    /// <summary>
+    /// Why this slice skips a given QIF action. The recognised-but-
+    /// declined codes get a specific reason; anything else falls back
+    /// to the catalog line. Codes here are deliberately NOT routed to
+    /// actions — several (<c>RtrnCap</c>, <c>XIn</c> / <c>XOut</c>)
+    /// have ADR-0027 equivalents the OFX provider already maps, and
+    /// closing that gap is a classification change, not message text.
+    /// </summary>
+    private static string UnsupportedActionReason(string qifAction) =>
+        qifAction.ToUpperInvariant() switch
+        {
+            "" => "The record carries no action (N) field.",
+            "STKSPLIT" =>
+                "Stock splits are recorded on the security, not in the register.",
+            "REMINDERTXN" =>
+                "Reminder placeholders aren't transactions.",
+            "SHTSELL" or "CVRSHRT" =>
+                "Short sales are outside the ADR-0027 action catalog.",
+            "GRANT" or "VEST" or "EXERCISE" or "EXERCISX" or "EXPIRE" =>
+                "Equity-compensation actions are outside the ADR-0027 action catalog.",
+            "XIN" or "XOUT" or "CONTRIBX" or "WITHDRWX" =>
+                "Cash transfers inside an investment section aren't imported in this slice.",
+            "RTRNCAP" or "RTRNCAPX" =>
+                "Return of capital isn't imported in this slice.",
+            _ =>
+                "This QIF action is outside the ADR-0027 action catalog.",
+        };
 
     /// <summary>
     /// Map a QIF investment action code (the <c>N</c> field) to an

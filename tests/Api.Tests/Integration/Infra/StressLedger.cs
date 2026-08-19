@@ -30,11 +30,17 @@ public static class StressLedger
     /// <param name="Holdings">Distinct securities held, each its own holding.</param>
     /// <param name="BuysPerHolding">Open lots created per holding.</param>
     /// <param name="SellsPerHolding">Disposals per holding — these drive the FIFO walk.</param>
+    /// <param name="HeaderPayloadBytes">
+    /// Approximate size of each bank header's <c>provider_raw_payload</c>. Real
+    /// imported headers carry the verbatim Moneydance JSON and measured ~2.3 KB
+    /// on a production ledger; 0 reproduces the old thin-row shape for A/B work.
+    /// </param>
     public readonly record struct Scale(
         int BankTxns,
         int Holdings,
         int BuysPerHolding,
-        int SellsPerHolding)
+        int SellsPerHolding,
+        int HeaderPayloadBytes = 2304)
     {
         /// <summary>Total transaction headers this scale produces.</summary>
         public int TotalTxns => BankTxns + (Holdings * (BuysPerHolding + SellsPerHolding));
@@ -80,7 +86,8 @@ public static class StressLedger
     {
         // The brokerage (and its sibling holdings account) come from the real
         // helper so the account shape matches what the product creates.
-        var broker = await ledger.AddInvestmentAccountAsync("stress-brokerage", cancellationToken)
+        var broker = await ledger
+            .AddInvestmentAccountAsync("stress-brokerage", cancellationToken: cancellationToken)
             .ConfigureAwait(false);
 
         await using var db = fixture.NewServiceFactory().Create();
@@ -90,8 +97,26 @@ public static class StressLedger
         await db.Database.ExecuteSqlInterpolatedAsync(
             $@"SELECT stress_seed_ledger(
                    {ledger.LedgerId}, {broker.Id}, {broker.HoldingsAccountId!.Value},
-                   {scale.BankTxns}, {scale.Holdings}, {scale.BuysPerHolding}, {scale.SellsPerHolding})",
+                   {scale.BankTxns}, {scale.Holdings}, {scale.BuysPerHolding}, {scale.SellsPerHolding},
+                   {scale.HeaderPayloadBytes})",
             cancellationToken).ConfigureAwait(false);
+
+        // A bulk-seeded table has no statistics until autovacuum catches up, which
+        // it will not do inside a test run. The planner then works from defaults —
+        // measured here as 22 estimated rows against 50,000 actual — and picks
+        // plans no production database would pick.
+        //
+        // This is not a detail. Comparing migration 193's ctid keyset against 197's
+        // primary-key keyset on the unanalyzed table showed the two within noise of
+        // each other, because both fell back to a bitmap scan plus a 159 MB
+        // external-merge sort. After ANALYZE the same comparison is 555 ms vs
+        // 39 ms, and 197's index scan appears. Anything this lane concludes about
+        // query PLANS is only as good as the statistics behind them.
+        await db.Database.ExecuteSqlRawAsync(
+            "ANALYZE accounts; ANALYZE securities; ANALYZE txn_headers; " +
+            "ANALYZE txn_legs; ANALYZE holdings; ANALYZE lots;",
+            cancellationToken).ConfigureAwait(false);
+
         return startedAt.Elapsed;
     }
 
@@ -108,7 +133,8 @@ public static class StressLedger
             p_bank_txns           integer,
             p_holdings            integer,
             p_buys_per_holding    integer,
-            p_sells_per_holding   integer
+            p_sells_per_holding   integer,
+            p_header_payload_bytes integer DEFAULT 2304
         ) RETURNS void
         LANGUAGE plpgsql
         AS $fn$
@@ -148,14 +174,43 @@ public static class StressLedger
                 AND name LIKE 'stress-cat-%';
 
             -- ----- Bank activity: two balanced legs per header ------------------
-            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at, payee)
+            -- provider_raw_payload carries the verbatim Moneydance `txn` JSON on
+            -- every imported header (mig 109 / ADR-0035 §3), and it dominates row
+            -- width: a real ledger measured 97 MB of jsonb across 42,785 headers,
+            -- ~2.3 KB each. Seeding six thin columns produced rows an order of
+            -- magnitude narrower, which is not a smaller version of production —
+            -- it is a different shape, and it hides every cost that scales with
+            -- payload width. Snapshot capture is exactly such a cost.
+            --
+            -- The md5 chain is deliberate: repeated literal padding compresses to
+            -- almost nothing in TOAST and would restore the very shape this is
+            -- trying to avoid.
+            INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
+                                     payee, provider_raw_payload)
             SELECT ('20' || v_disc || '-0000-4000-8000-' || lpad(to_hex(i), 12, '0'))::uuid,
                    p_ledger_id, 'manual',
                    v_base + (i * interval '1 hour'),
                    -- transacted_at defaults to the posted date, which is what the
                    -- product does when nobody sets a tax date (migration 183 / #436).
                    v_base + (i * interval '1 hour'),
-                   'stress-payee-' || (i % 500)
+                   'stress-payee-' || (i % 500),
+                   CASE WHEN p_header_payload_bytes <= 0 THEN NULL ELSE
+                     jsonb_build_object(
+                       'obj_type', 'txn',
+                       'id',       md5(i::text),
+                       'acct',     md5((i * 7)::text),
+                       'dt',       to_char(v_base + (i * interval '1 hour'), 'YYYYMMDD'),
+                       'amt',      (i % 100000),
+                       'desc',     'stress-payee-' || (i % 500),
+                       'splits',   jsonb_build_array(
+                                     jsonb_build_object('acct', md5((i * 3)::text),
+                                                        'amt',  (i % 1000)),
+                                     jsonb_build_object('acct', md5((i * 11)::text),
+                                                        'amt', -(i % 1000))),
+                       'raw',      (SELECT string_agg(md5((i * 1000 + g)::text), '')
+                                      FROM generate_series(
+                                             1, greatest(1, p_header_payload_bytes / 32)) g))
+                   END
               FROM generate_series(1, p_bank_txns) i;
 
             INSERT INTO txn_legs (header_id, account_id, posting_index, amount, ledger_id)

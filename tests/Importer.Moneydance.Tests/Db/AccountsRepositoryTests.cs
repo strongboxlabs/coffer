@@ -104,6 +104,65 @@ public sealed class AccountsRepositoryTests
         Assert.Equal("https://northwind.example",   roundTrip.AccountUrl);
     }
 
+    // ---- opened_on: seed-once, unlike the other MD-owned columns ----------
+
+    [Fact]
+    public async Task Upsert_persists_the_account_start_date()
+    {
+        await using var connection = _fixture.OpenConnection();
+        await TruncateAsync(connection);
+
+        var repo = new AccountsRepository(connection);
+        var row = Bank("md-bank-opened") with { OpenedOn = new DateOnly(2018, 3, 14) };
+
+        await repo.UpsertByExternalIdAsync(row);
+
+        Assert.Equal(new DateOnly(2018, 3, 14),
+            (await repo.GetByExternalIdAsync(TestLedger.Id, "md-bank-opened"))!.OpenedOn);
+    }
+
+    [Fact]
+    public async Task Reimport_backfills_a_missing_start_date()
+    {
+        await using var connection = _fixture.OpenConnection();
+        await TruncateAsync(connection);
+
+        var repo = new AccountsRepository(connection);
+        // First run predates the importer reading date_created — opened_on NULL.
+        await repo.UpsertByExternalIdAsync(Bank("md-bank-backfill"));
+        Assert.Null((await repo.GetByExternalIdAsync(TestLedger.Id, "md-bank-backfill"))!.OpenedOn);
+
+        // Re-import now supplies it; the account should pick it up.
+        await repo.UpsertByExternalIdAsync(
+            Bank("md-bank-backfill") with { OpenedOn = new DateOnly(2018, 3, 14) });
+
+        Assert.Equal(new DateOnly(2018, 3, 14),
+            (await repo.GetByExternalIdAsync(TestLedger.Id, "md-bank-backfill"))!.OpenedOn);
+    }
+
+    [Fact]
+    public async Task Reimport_does_not_overwrite_a_start_date_already_set_in_coffer()
+    {
+        await using var connection = _fixture.OpenConnection();
+        await TruncateAsync(connection);
+
+        var repo = new AccountsRepository(connection);
+        await repo.UpsertByExternalIdAsync(
+            Bank("md-bank-edited") with { OpenedOn = new DateOnly(2018, 3, 14) });
+
+        // The user corrects it in the account editor (ADR-0050: MD seeds it,
+        // Coffer owns it afterwards) — MD must not clobber that on the next run.
+        await connection.ExecuteAsync(
+            "UPDATE accounts SET opened_on = @d WHERE external_id = 'md-bank-edited';",
+            new { d = new DateOnly(2011, 7, 1) });
+
+        await repo.UpsertByExternalIdAsync(
+            Bank("md-bank-edited") with { OpenedOn = new DateOnly(2018, 3, 14) });
+
+        Assert.Equal(new DateOnly(2011, 7, 1),
+            (await repo.GetByExternalIdAsync(TestLedger.Id, "md-bank-edited"))!.OpenedOn);
+    }
+
     [Fact]
     public async Task Upsert_inserts_a_bank_account()
     {

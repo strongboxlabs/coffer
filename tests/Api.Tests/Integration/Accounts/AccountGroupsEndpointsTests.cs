@@ -223,20 +223,53 @@ public sealed class AccountGroupsEndpointsTests
             doc.RootElement.GetProperty("code").GetString());
     }
 
+    /// <summary>
+    /// Removing a member twice must leave the group holding exactly the OTHER
+    /// members — both the no-op case and the repeat case, state checked each time.
+    /// </summary>
+    /// <remarks>
+    /// This previously removed an account that was never a member and asserted only
+    /// the 204. That tested the no-op case and named it idempotency, while checking
+    /// nothing about the group: a remove that deleted every member row, or the wrong
+    /// one, returns 204 just as happily. The membership listing is the assertion.
+    /// </remarks>
     [Fact]
     public async Task Member_remove_is_idempotent()
     {
         var ledger = await SyntheticLedger.CreateAsync(_fixture);
         var bank = await ledger.AddBankAccountAsync("checking");
+        var keep = await ledger.AddBankAccountAsync("savings");
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var groupId = await CreateGroupAsync(client, ledger.LedgerId, "Pinned");
+
         // Removing a non-member is still a success — the endpoint is
         // idempotent so the SPA can fire-and-forget on right-click.
-        var response = await client.DeleteAsync(
+        var absent = await client.DeleteAsync(
             $"/api/ledgers/{ledger.LedgerId}/account-groups/{groupId}/members/{bank.Id}");
-        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, absent.StatusCode);
+
+        foreach (var id in new[] { bank.Id, keep.Id })
+        {
+            var add = await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/account-groups/{groupId}/members/{id}",
+                content: null);
+            Assert.Equal(HttpStatusCode.NoContent, add.StatusCode);
+        }
+
+        // Remove the same member twice; the second call must change nothing.
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            var remove = await client.DeleteAsync(
+                $"/api/ledgers/{ledger.LedgerId}/account-groups/{groupId}/members/{bank.Id}");
+            Assert.Equal(HttpStatusCode.NoContent, remove.StatusCode);
+
+            var rows = (await (await client.GetAsync(
+                $"/api/ledgers/{ledger.LedgerId}/account-groups"))
+                .Content.ReadFromJsonAsync<AccountGroupSummary[]>())!;
+            Assert.Equal([keep.Id], rows.Single().MemberAccountIds);
+        }
     }
 
     [Fact]

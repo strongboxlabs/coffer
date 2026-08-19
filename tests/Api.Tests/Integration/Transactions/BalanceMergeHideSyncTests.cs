@@ -928,8 +928,8 @@ public sealed class BalanceMergeHideSyncTests
         await PostTxnAsync(s, 20, -20m);
         await PostTxnAsync(s, 30, -30m);
 
-        var resp = await s.Client.PostAsync(
-            $"/api/ledgers/{s.Ledger.LedgerId}/balances/health", content: null);
+        var resp = await s.Client.GetAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/balances/health");
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
         var report = await resp.Content.ReadFromJsonAsync<BalanceHealthReport>();
@@ -942,15 +942,19 @@ public sealed class BalanceMergeHideSyncTests
     }
 
     // ===================================================================
-    // Health endpoint — drift detection + heal. Corrupt a balance row
-    // by writing directly to the DB (bypassing the interceptor — this
-    // simulates a writer that skipped the recompute, which IS the
-    // bug class this endpoint exists to catch). Call /balances/health.
-    // Expect: drifted list contains the corrupted row, and a second
-    // read of the underlying row shows the healed value.
+    // Drift detection, then repair — two deliberate steps since mig 206.
+    // Corrupt a balance row by writing directly to the DB (bypassing the
+    // interceptor — this simulates a writer that skipped the recompute,
+    // which IS the bug class these endpoints exist to catch).
+    //
+    // GET /balances/health must REPORT the drift and leave it in place;
+    // POST /balances/repair is what fixes it. Before mig 206 the check
+    // healed as a side effect, so there was no way to see drift without
+    // erasing it — on a real ledger that meant a diagnostic silently
+    // rewriting 2,741 rows.
     // ===================================================================
     [Fact]
-    public async Task BalancesHealth_detects_drift_and_heals_row()
+    public async Task BalancesHealth_detects_drift_then_repair_heals_row()
     {
         var s = await SetUpAsync();
         await using var _ = s.Factory;
@@ -970,8 +974,8 @@ public sealed class BalanceMergeHideSyncTests
         }
         Assert.Equal(989m, await ReadBalanceAsync(s, headerId));
 
-        var resp = await s.Client.PostAsync(
-            $"/api/ledgers/{s.Ledger.LedgerId}/balances/health", content: null);
+        var resp = await s.Client.GetAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/balances/health");
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
         var report = await resp.Content.ReadFromJsonAsync<BalanceHealthReport>();
@@ -986,7 +990,20 @@ public sealed class BalanceMergeHideSyncTests
         Assert.Equal(-10m, drift.RecomputedAfter);
         Assert.Equal(-999m, drift.Diff);
 
-        // Heal step: the row should now be the correct -10.
+        // The check REPORTED the drift and left it alone.
+        Assert.Equal(989m, await ReadBalanceAsync(s, headerId));
+
+        // Repair is the separate, deliberate step that fixes it.
+        var repair = await s.Client.PostAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/balances/repair", content: null);
+        Assert.Equal(HttpStatusCode.OK, repair.StatusCode);
         Assert.Equal(-10m, await ReadBalanceAsync(s, headerId));
+
+        // And a re-check agrees there is nothing left, which only holds
+        // because both share one implementation of the rules.
+        var after = await (await s.Client.GetAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/balances/health"))
+            .Content.ReadFromJsonAsync<BalanceHealthReport>();
+        Assert.True(after!.Healthy);
     }
 }

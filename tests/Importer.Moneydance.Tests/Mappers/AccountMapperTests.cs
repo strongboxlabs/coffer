@@ -340,5 +340,38 @@ public sealed class AccountMapperTests
         Assert.Null(row.InstitutionName);
         Assert.Null(row.RoutingNumber);
         Assert.Null(row.AccountUrl);
+        Assert.Null(row.OpenedOn);
+    }
+
+    // ---- opened_on (ADR-0050 / mig 127) -----------------------------------
+
+    [Fact]
+    public void Map_carries_the_md_start_date_onto_the_row()
+    {
+        var md = AcctFromJson("""
+            {"obj_type":"acct","id":"a-inv","name":"Brokerage A","type":"v",
+             "currid":"USD","sbal":"100000","date_created":"20180314"}
+            """);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+
+        Assert.NotNull(result.Row);
+        Assert.Equal(new DateOnly(2018, 3, 14), result.Row!.OpenedOn);
+    }
+
+    [Fact]
+    public void Map_drops_the_start_date_for_categories()
+    {
+        // A category's opening balance is forced to 0 by a CHECK constraint, so
+        // the as-of date of that balance carries no meaning — even when MD has one.
+        var md = AcctFromJson("""
+            {"obj_type":"acct","id":"c-1","name":"Groceries","type":"e",
+             "currid":"USD","date_created":"20180314"}
+            """);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+
+        Assert.NotNull(result.Row);
+        Assert.Equal("category", result.Row!.AccountType);
+        Assert.Equal(0m, result.Row.OpeningBalance);
+        Assert.Null(result.Row.OpenedOn);
     }
 }

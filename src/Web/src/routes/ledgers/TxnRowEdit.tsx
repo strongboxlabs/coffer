@@ -752,7 +752,7 @@ export function TxnRowEdit({
                                 onApply={(s) => {
                                     setPayee(s.payee);
                                     patchPosting(onlyPosting.key, {
-                                        counterpartyId: s.categoryAccountId,
+                                        counterpartyId: s.counterpartyAccountId,
                                     });
                                 }}
                             />
@@ -1515,10 +1515,13 @@ function TagsInput({
 // template. Static at row-open (per design — no typeahead refetch).
 // Renders nothing when there are no suggestions (server returns []
 // for non-bank-feed rows, missing payees, or no matches). Clicking a
-// chip applies its (payee, category) pair to the form draft —
+// chip applies its (payee, counterparty) pair to the form draft —
 // counterparty path resolution goes through the editor's existing
 // accountPaths lookup so the Typeahead's display matches the format
-// the rest of the form expects.
+// the rest of the form expects. The counterparty is a category on an
+// ordinary expense and a real account when the prior rows were
+// settled as transfers; accountPaths covers every account in the
+// ledger, so both render the same way.
 
 function SimilarPayeesPanel({
     suggestions,
@@ -1536,20 +1539,20 @@ function SimilarPayeesPanel({
         <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1 pt-0.5 text-[0.625rem]">
             <span className="text-text-subtle">Similar:</span>
             {suggestions.map((s) => {
-                const categoryLabel =
-                    accountPaths.get(s.categoryAccountId) ?? s.categoryAccountName;
+                const counterpartyLabel =
+                    accountPaths.get(s.counterpartyAccountId) ?? s.counterpartyAccountName;
                 return (
                     <button
-                        key={`${s.payee}::${s.categoryAccountId}`}
+                        key={`${s.payee}::${s.counterpartyAccountId}`}
                         type="button"
                         disabled={disabled}
                         onClick={() => onApply(s)}
-                        title={`Apply payee "${s.payee}" + category "${categoryLabel}" (used ${s.useCount}×)`}
+                        title={`Apply payee "${s.payee}" → "${counterpartyLabel}" (used ${s.useCount}×)`}
                         className="inline-flex items-baseline gap-1 rounded border border-border bg-surface px-1.5 py-0.5 text-text hover:border-accent hover:bg-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
                     >
                         <span className="font-medium">{s.payee}</span>
                         <span className="text-text-subtle">→</span>
-                        <span>{categoryLabel}</span>
+                        <span>{counterpartyLabel}</span>
                         {s.useCount > 1 ? (
                             <span className="text-text-subtle">×{s.useCount}</span>
                         ) : null}

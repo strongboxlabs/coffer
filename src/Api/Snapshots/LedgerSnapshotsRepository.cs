@@ -258,14 +258,25 @@ public sealed class LedgerSnapshotsRepository
         _db.Database.SetCommandTimeout(SnapshotOpTimeoutSeconds);
 
         // Probe metadata only — never SELECT the (potentially hundreds-of-MB)
-        // payload here. `IsV2` = the graph lives in content_json (mig 179).
+        // payload here.
+        //
+        // The discriminator is v1-vs-server-side, not v2-vs-v1. Since mig 193
+        // there are two server-side formats — v2 (content_json) and v3 (rows in
+        // ledger_snapshot_parts) — and v3 leaves content_json NULL, so the old
+        // `ContentJson != null` probe would route every new snapshot into the v1
+        // gzip branch and gunzip an empty byte array. Only v1 carries bytes in
+        // `content` (v2 and v3 both write Array.Empty<byte>()), so testing that
+        // is exact, translates to a cheap length() with no payload transfer, and
+        // fails safe: a partially written v3 goes server-side and raises a clear
+        // "neither v3 parts nor v2 content_json" rather than silently mis-reading
+        // an empty gzip.
         var snap = await _db.LedgerSnapshots.AsNoTracking()
             .Where(s => s.Id == snapshotId)
             .Select(s => new
             {
                 s.LedgerId,
                 s.SchemaVersion,
-                IsV2 = s.ContentJson != null,
+                IsLegacyV1 = s.Content.Length > 0,
             })
             .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -290,11 +301,12 @@ public sealed class LedgerSnapshotsRepository
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (snap.IsV2)
+            if (!snap.IsLegacyV1)
             {
-                // v2 (mig 179): the graph lives in content_json; the restore
-                // function reads it + reuses the restore body ENTIRELY server-side,
-                // so nothing is materialised in the API — OOM-proof at any size.
+                // Server-side restore (mig 179 v2 / mig 193 v3). The stored
+                // procedure picks the format itself: v3 replays chunks one at a
+                // time, v2 reads content_json. Either way nothing is materialised
+                // in the API — OOM-proof at any size.
                 await _db.LedgerSnapshotRestoreStored(snapshotId, ledgerId)
                     .Select(r => r.LedgerId)
                     .FirstAsync(cancellationToken)

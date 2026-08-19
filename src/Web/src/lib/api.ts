@@ -15,7 +15,7 @@
 export { ApiError, request } from './api/_request';
 export { fetchCurrentUser } from './api/auth';
 export { fetchVersion } from './api/meta';
-export { fetchVisibleLedgers, verifyBalanceHealth, createLedger, renameLedger, deleteLedger } from './api/ledger';
+export { fetchVisibleLedgers, checkBalanceHealth, repairBalances, checkLedgerConsistency, repairProjection, createLedger, renameLedger, deleteLedger } from './api/ledger';
 export { fetchLedgerMembers, setLedgerMemberRole, removeLedgerMember } from './api/member';
 export type { LedgerMember } from './types/member';
 export { fetchAdminUsers, setUserDisabled, setUserAdmin } from './api/adminUsers';

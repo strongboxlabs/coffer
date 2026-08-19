@@ -171,8 +171,27 @@ account back to active) and generalizes it: any in-Coffer edit survives re-impor
   categories.
 - `loan_terms` is seeded via `INSERT … ON CONFLICT (account_id) DO NOTHING` —
   filled once (incl. for already-imported loan accounts on the next run), then
-  Coffer-owned. `accounts.opened_on` (Start Date) is seeded from MD's creation
-  date.
+  Coffer-owned. `accounts.opened_on` (Start Date) is seeded from the MD `acct`
+  item's creation stamp, which MD writes **two ways, inconsistently**:
+  `date_created` (a `yyyyMMdd` int) and `creation_date` (epoch millis). Take the
+  int when present, else the epoch field — on a real 781-account export the int
+  covers 64 accounts while the epoch field covers 181, including all 50
+  investment accounts, so reading only the tidier one leaves most accounts NULL.
+  Reading the epoch field as a UTC date is safe rather than a guess: MD stamps
+  it at local noon (16:00/17:00Z for a US-Eastern file), and all 64 accounts
+  carrying both fields agree, at every offset from UTC-12 to UTC+2.
+  `loan_terms.first_payment_date` derives from the same stamp and takes the same
+  two-source read. Seed-once on the same terms as `loan_terms`: the upsert applies
+  `COALESCE(accounts.opened_on, EXCLUDED.opened_on)`, never clobbering a value the
+  user has since set in the editor. Categories get NULL — their opening balance is
+  forced to 0, so its as-of date is meaningless.
+
+  **This reaches new ledgers only.** MD import is a one-shot bootstrap of a fresh
+  ledger; there is no re-import onto an existing one, so the upsert's conflict
+  path is defensive rather than a backfill route. Ledgers imported before the
+  importer read the stamp are backfilled by **migration 196**, which mines the
+  same two fields out of `accounts.provider_raw_payload` — the verbatim MD `acct`
+  JSON that migration 110 (ADR-0035 §3) already persists on every imported row.
 
 Categories are treated exactly like accounts (Coffer will manage them too, later).
 
@@ -209,7 +228,9 @@ Categories are treated exactly like accounts (Coffer will manage them too, later
    No schema change. Independently valuable.
 2. **`loan_terms` schema + `opened_on` / opening-balance + importer** — table +
    EF entity + DbUp migration (incl. the `opened_on` date column and exposing
-   opening-balance editing) + importer population from MD `obj_type:"o"`. Tests.
+   opening-balance editing) + importer population from the MD `acct` item's
+   `date_created` (loan terms come from `type:"o"` accounts specifically).
+   Tests.
 3. **Loan Terms editor block + opening balance / opened-on** — the editor's
    loan sub-form (REQUIRED on loan accounts) + opening-balance and opened-on
    fields (editable on create AND edit); the create/edit API reads/writes

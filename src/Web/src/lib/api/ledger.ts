@@ -1,6 +1,11 @@
 // Ledger-level endpoints.
 
-import type { BalanceHealthReport, LedgerSummary } from '../types/ledger';
+import type {
+    LedgerConsistencyReport,
+    ProjectionConsistency,
+    BalanceHealthReport,
+    LedgerSummary,
+} from '../types/ledger';
 import { request } from './_request';
 
 /**
@@ -45,17 +50,62 @@ export function deleteLedger(id: string): Promise<void> {
 }
 
 /**
- * POST /api/ledgers/{id}/balances/health — verify-and-heal sweep
- * over every txn_header_account_balances row in the ledger. Returns
- * which rows were drifted (and have now been healed by the
- * side-effecting recompute). UI surface: the "Verify balances"
- * button on the feed-connections page.
+ * GET /api/ledgers/{id}/balances/health — READ-ONLY check of every
+ * txn_header_account_balances row against the pure walk (mig 206).
+ * Reports which rows disagree and changes nothing.
+ *
+ * This was a POST that healed as a side effect of checking, because the
+ * only implementation of the rules lived inside the recompute's
+ * DELETE + INSERT. Asking rewrote the answer — on one ledger, 2,741 rows
+ * silently. Checking and repairing are now two deliberate actions.
  */
-export function verifyBalanceHealth(
+export function checkBalanceHealth(
     ledgerId: string,
 ): Promise<BalanceHealthReport> {
     return request<BalanceHealthReport>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/balances/health`,
+    );
+}
+
+/**
+ * POST /api/ledgers/{id}/balances/repair — rebuild every stored running
+ * balance from the legs. The user chooses this explicitly, after a check
+ * has reported drift; it is the remedy for a writer that mutated legs
+ * without invoking the recompute, not something to run speculatively.
+ */
+export function repairBalances(
+    ledgerId: string,
+): Promise<BalanceHealthReport> {
+    return request<BalanceHealthReport>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/balances/repair`,
+        { method: 'POST' },
+    );
+}
+
+/**
+ * GET /api/ledgers/{id}/balances/consistency — READ-ONLY check of every derived
+ * projection (balances, holdings, realized gains, posting counts). Writes nothing.
+ */
+export function checkLedgerConsistency(
+    ledgerId: string,
+): Promise<LedgerConsistencyReport> {
+    return request<LedgerConsistencyReport>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/balances/consistency`,
+    );
+}
+
+/**
+ * POST /api/ledgers/{id}/balances/consistency/{projection}/repair — rebuild one
+ * projection, touching only what the check reported. Every projection the report
+ * names has a repair, so the UI never surfaces a problem with no way to fix it.
+ */
+export function repairProjection(
+    ledgerId: string,
+    projection: string,
+): Promise<ProjectionConsistency> {
+    return request<ProjectionConsistency>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/balances/consistency/`
+        + `${encodeURIComponent(projection)}/repair`,
         { method: 'POST' },
     );
 }

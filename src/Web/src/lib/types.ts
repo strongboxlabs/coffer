@@ -19,6 +19,9 @@ export type { ApiVersion, DbVersion, VersionResponse } from './types/meta';
 export type {
     BalanceHealthDriftDto,
     BalanceHealthReport,
+    LedgerConsistencyReport,
+    ProjectionConsistency,
+    ConsistencyMismatch,
     LedgerSummary,
 } from './types/ledger';
 export type {

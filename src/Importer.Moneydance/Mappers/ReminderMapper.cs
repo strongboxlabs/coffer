@@ -1,5 +1,6 @@
 using Coffer.Domain.Reminders;
 using Coffer.Importer.Moneydance.Db;
+using Coffer.Importer.Moneydance.Json;
 using Coffer.Importer.Moneydance.Json.Typed;
 using Coffer.Importer.Moneydance.Pipeline;
 
@@ -174,19 +175,9 @@ public static class ReminderMapper
 
     private static MapResult Skip(SkipReason reason) => new(null, [], null, reason);
 
-    private static DateOnly? ParseMdDateOnly(int? yyyymmdd)
-    {
-        if (yyyymmdd is null or 0) return null;
-        var v = yyyymmdd.Value;
-        var year  = v / 10000;
-        var month = (v / 100) % 100;
-        var day   = v % 100;
-        if (year < 1900 || year > 9999) return null;
-        if (month is < 1 or > 12) return null;
-        if (day is < 1 or > 31) return null;
-        try { return new DateOnly(year, month, day); }
-        catch (ArgumentOutOfRangeException) { return null; }
-    }
+    // The yyyyMMdd rule is MD-wide (reminders' `sdt`, accounts' `date_created`),
+    // so it lives on MdItem and both callers share it.
+    private static DateOnly? ParseMdDateOnly(int? yyyymmdd) => MdItem.ParseMdDate(yyyymmdd);
 
     private static string? NullIfEmpty(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null : value;

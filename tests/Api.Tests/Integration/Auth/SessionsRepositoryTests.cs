@@ -1,5 +1,7 @@
 using System.Security.Cryptography;
 
+using Microsoft.EntityFrameworkCore;
+
 using Coffer.Api.Db.Repositories;
 using Coffer.Api.Tests.Integration.Infra;
 
@@ -140,17 +142,49 @@ public sealed class SessionsRepositoryTests
             $"last_seen_at should advance: was {initial:o}, now {refreshed.LastSeenAt:o}");
     }
 
+    /// <summary>
+    /// Idempotent means the second revoke changes NOTHING — specifically that it
+    /// leaves the original <c>revoked_at</c> in place.
+    /// </summary>
+    /// <remarks>
+    /// This test asserted nothing at all: it called Revoke twice and passed as long
+    /// as neither call threw. The property that actually matters lives in the
+    /// repository's `RevokedAt == null` predicate — drop it and the second call
+    /// re-stamps `revoked_at` to a later time, silently rewriting when the session
+    /// was revoked. Nothing threw, so the old test could not tell the difference.
+    /// </remarks>
     [Fact]
     public async Task Revoke_is_idempotent()
     {
         var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
         var repo = new SessionsRepository(_fixture.NewServiceFactory());
 
         var inserted = await repo.InsertAsync(
             ledger.UserId, FreshHash(), null, DateTime.UtcNow.AddDays(30));
+        // A second session that must be left alone — a revoke that widened its
+        // predicate would take this one with it.
+        var bystander = await repo.InsertAsync(
+            ledger.UserId, FreshHash(), null, DateTime.UtcNow.AddDays(30));
+
         await repo.RevokeAsync(inserted.Id);
-        await repo.RevokeAsync(inserted.Id);   // second call: no-op
+
+        await using var db = _fixture.NewDbContext();
+        var firstRevokedAt = (await db.AuthSessions.AsNoTracking()
+            .SingleAsync(s => s.Id == inserted.Id)).RevokedAt;
+        Assert.NotNull(firstRevokedAt);
+
+        // Clock has to move, or "unchanged" would hold trivially.
+        await Task.Delay(20);
+        await repo.RevokeAsync(inserted.Id);   // second call: must be a no-op
+
+        await using var db2 = _fixture.NewDbContext();
+        var after = await db2.AuthSessions.AsNoTracking()
+            .SingleAsync(s => s.Id == inserted.Id);
+        Assert.Equal(firstRevokedAt, after.RevokedAt);
+
+        var untouched = await db2.AuthSessions.AsNoTracking()
+            .SingleAsync(s => s.Id == bystander.Id);
+        Assert.Null(untouched.RevokedAt);
     }
 
     [Fact]

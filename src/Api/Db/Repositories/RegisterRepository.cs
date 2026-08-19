@@ -970,6 +970,83 @@ public sealed class RegisterRepository
     }
 
     /// <summary>
+    /// Check every stored running balance against the pure walk — WITHOUT
+    /// writing anything.
+    /// </summary>
+    /// <remarks>
+    /// The counterpart to <see cref="VerifyAndHealBalancesAsync"/>, which heals
+    /// as a side effect of checking. That was the only option while the sole
+    /// implementation of the running-sum rules lived inside the recompute's
+    /// DELETE + INSERT: the only way to learn whether a balance was right was to
+    /// overwrite it. In practice it meant asking a diagnostic question silently
+    /// rewrote thousands of rows.
+    /// <para>
+    /// Migration 206 extracted <c>account_balance_walk</c>, so the question can
+    /// now be asked directly. Same rules as the writer — one implementation, so
+    /// this cannot drift from what a repair would produce — seeded from the
+    /// account's opening balance rather than from stored state, since stored
+    /// state is precisely what is under test.
+    /// </para>
+    /// </remarks>
+    public async Task<BalanceHealthReport> CheckBalancesAsync(
+        Guid ledgerId,
+        CancellationToken cancellationToken = default)
+    {
+        var accounts = await _db.Accounts.AsNoTracking()
+            .Where(a => a.LedgerId == ledgerId
+                        && _db.TxnLegs.Any(l => l.AccountId == a.Id && l.LedgerId == ledgerId))
+            .Select(a => new { a.Id, a.Name, a.OpeningBalance })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var stored = (await _db.TxnHeaderAccountBalances.AsNoTracking()
+            .Where(b => b.LedgerId == ledgerId)
+            .Select(b => new { b.AccountId, b.HeaderId, b.BalanceAfter })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false))
+            .ToDictionary(b => (b.AccountId, b.HeaderId), b => b.BalanceAfter);
+
+        // The dawn of time: the walk takes the whole account so the comparison
+        // never inherits a stored figure it is meant to be verifying.
+        var earliest = new DateTime(1, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        var drifted = new List<BalanceHealthDriftDto>();
+        var rowsChecked = 0;
+        foreach (var account in accounts)
+        {
+            var walked = await _db
+                .AccountBalanceWalk(account.Id, earliest, account.OpeningBalance)
+                .Select(w => new { w.HeaderId, w.PostedAt, w.BalanceAfter })
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            foreach (var row in walked)
+            {
+                rowsChecked++;
+                if (stored.TryGetValue((account.Id, row.HeaderId), out var before)
+                    && before != row.BalanceAfter)
+                {
+                    drifted.Add(new BalanceHealthDriftDto(
+                        AccountId: account.Id,
+                        AccountName: account.Name,
+                        HeaderId: row.HeaderId,
+                        PostedAt: row.PostedAt,
+                        StoredBefore: before,
+                        RecomputedAfter: row.BalanceAfter,
+                        Diff: row.BalanceAfter - before));
+                }
+            }
+        }
+
+        return new BalanceHealthReport(
+            Healthy: drifted.Count == 0,
+            AccountsChecked: accounts.Count,
+            RowsChecked: rowsChecked,
+            DriftedCount: drifted.Count,
+            Drifted: drifted);
+    }
+
+    /// <summary>
     /// Return every leg of the given header across ALL accounts, in
     /// posting-index order. Used by the investment editor's
     /// re-open path so <c>legsToDraft</c> can find the off-account

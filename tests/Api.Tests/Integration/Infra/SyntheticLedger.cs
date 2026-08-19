@@ -187,7 +187,9 @@ public sealed class SyntheticLedger
     /// <c>accounts</c> (no parent, no category_kind, opening_balance 0).
     /// </summary>
     public async Task<AccountRow> AddBankAccountAsync(
-        string name, CancellationToken cancellationToken = default)
+        string name,
+        decimal openingBalance = 0m,
+        CancellationToken cancellationToken = default)
     {
         var row = new AccountRow
         {
@@ -196,7 +198,7 @@ public sealed class SyntheticLedger
             Name = name,
             AccountType = "bank",
             CurrencyCode = "USD",
-            OpeningBalance = 0m,
+            OpeningBalance = openingBalance,
             IsActive = true,
         };
         await using var db = NewDbContext();
@@ -212,20 +214,43 @@ public sealed class SyntheticLedger
     /// call <see cref="AddHoldingAsync"/> with its
     /// <see cref="AccountRow.HoldingsAccountId"/> to drop position rows.
     /// </summary>
+    /// <param name="withHoldingsSibling">
+    /// Pass <c>false</c> to mint a brokerage with <c>holdings_account_id</c> NULL —
+    /// a cash-only investment account that has never held a position (an emptied
+    /// rollover stub, a CD, a sweep account). It is still a brokerage: it takes
+    /// transfers, so reporting must classify them. Returns a row whose
+    /// <see cref="AccountRow.HoldingsAccountId"/> is null.
+    /// </param>
+    /// <param name="openingBalance">
+    /// Starting balance, as of <paramref name="openedOn"/>. Moneydance ledgers
+    /// usually leave this 0 and carry all history as transactions, but an account
+    /// CAN be opened with a balance — and returns treats the two cases
+    /// differently, so tests need both.
+    /// </param>
+    /// <param name="openedOn">
+    /// The account's Start Date (mig 127 / ADR-0050) — the as-of date of
+    /// <paramref name="openingBalance"/>.
+    /// </param>
     public async Task<AccountRow> AddInvestmentAccountAsync(
-        string name, CancellationToken cancellationToken = default)
+        string name,
+        bool withHoldingsSibling = true,
+        decimal openingBalance = 0m,
+        DateOnly? openedOn = null,
+        CancellationToken cancellationToken = default)
     {
-        var holdingsSibling = new AccountRow
-        {
-            Id = Guid.NewGuid(),
-            LedgerId = LedgerId,
-            Name = $"{name} Holdings",
-            AccountType = "investment",
-            CurrencyCode = "USD",
-            OpeningBalance = 0m,
-            IsActive = true,
-            IsSystem = true,
-        };
+        var holdingsSibling = withHoldingsSibling
+            ? new AccountRow
+            {
+                Id = Guid.NewGuid(),
+                LedgerId = LedgerId,
+                Name = $"{name} Holdings",
+                AccountType = "investment",
+                CurrencyCode = "USD",
+                OpeningBalance = 0m,
+                IsActive = true,
+                IsSystem = true,
+            }
+            : null;
         var brokerage = new AccountRow
         {
             Id = Guid.NewGuid(),
@@ -233,12 +258,13 @@ public sealed class SyntheticLedger
             Name = name,
             AccountType = "investment",
             CurrencyCode = "USD",
-            OpeningBalance = 0m,
+            OpeningBalance = openingBalance,
+            OpenedOn = openedOn,
             IsActive = true,
-            HoldingsAccountId = holdingsSibling.Id,
+            HoldingsAccountId = holdingsSibling?.Id,
         };
         await using var db = NewDbContext();
-        db.Accounts.Add(holdingsSibling);
+        if (holdingsSibling is not null) db.Accounts.Add(holdingsSibling);
         db.Accounts.Add(brokerage);
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return brokerage;
@@ -256,6 +282,65 @@ public sealed class SyntheticLedger
     /// is rounded to 2dp (the mig-159 money CHECK); pass whole-cent qty×price for
     /// exact test math. <paramref name="postedAt"/> must be UTC.
     /// </summary>
+    /// <summary>
+    /// Seed an in-kind share transfer (<c>action='transfer_shares'</c>, ADR-0065):
+    /// securities move between two brokerages with NO cash leg. Four legs, and
+    /// every one of them faces an account inside its OWN brokerage — which is
+    /// precisely why reporting could not see the value crossing accounts:
+    /// <code>
+    ///   source sibling   -> source brokerage    -(qty*price)   shares out
+    ///   source brokerage -> source sibling                0
+    ///   dest sibling     -> dest brokerage      +(qty*price)   shares in
+    ///   dest brokerage   -> dest sibling                  0
+    /// </code>
+    /// The two accounts are joined only by the shared header. Raw-SQL seed, like
+    /// the other investment helpers; recomputes both brokerages' balances.
+    /// </summary>
+    public async Task<Guid> AddTransferSharesAsync(
+        Guid sourceBrokerageId,
+        Guid sourceHoldingsId,
+        Guid destBrokerageId,
+        Guid destHoldingsId,
+        Guid securityId,
+        decimal quantity,
+        decimal unitPrice,
+        DateTime postedAt,
+        CancellationToken cancellationToken = default)
+    {
+        var headerId = Guid.NewGuid();
+        var value = decimal.Round(quantity * unitPrice, 2);
+
+        await using var db = NewDbContext();
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken)
+                                                       .ConfigureAwait(false);
+        await db.Database.ExecuteSqlInterpolatedAsync($@"
+            INSERT INTO txn_headers (id, ledger_id, origin, action, payee, posted_at, transacted_at, created_at)
+            VALUES ({headerId}, {LedgerId}, 'manual', 'transfer_shares', 'in-kind transfer',
+                    {postedAt}, {postedAt}, {postedAt});
+            INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount,
+                                  security_id, quantity, unit_price, posting_role)
+            VALUES
+                ({Guid.NewGuid()}, {headerId}, {LedgerId}, {sourceHoldingsId},  0, {-value},
+                 {securityId}, {-quantity}, {unitPrice}, 'security'),
+                ({Guid.NewGuid()}, {headerId}, {LedgerId}, {sourceBrokerageId}, 0, 0,
+                 NULL, NULL, NULL, 'security'),
+                ({Guid.NewGuid()}, {headerId}, {LedgerId}, {destHoldingsId},    0, {value},
+                 {securityId}, {quantity}, {unitPrice}, 'security'),
+                ({Guid.NewGuid()}, {headerId}, {LedgerId}, {destBrokerageId},   0, 0,
+                 NULL, NULL, NULL, 'security');",
+            cancellationToken).ConfigureAwait(false);
+
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $@"SELECT fn_recompute_balances_for_account({sourceBrokerageId}, '0001-01-01'::timestamptz);
+               SELECT fn_recompute_balances_for_account({sourceHoldingsId},  '0001-01-01'::timestamptz);
+               SELECT fn_recompute_balances_for_account({destBrokerageId},   '0001-01-01'::timestamptz);
+               SELECT fn_recompute_balances_for_account({destHoldingsId},    '0001-01-01'::timestamptz);",
+            cancellationToken).ConfigureAwait(false);
+
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return headerId;
+    }
+
     public async Task<Guid> AddInvestmentBuyAsync(
         Guid brokerageAccountId,
         Guid holdingsAccountId,
@@ -295,6 +380,81 @@ public sealed class SyntheticLedger
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return holdingsLegId;
+    }
+
+    /// <summary>
+    /// Seed one <see cref="Boundary.Position"/> as a real, projected position — the
+    /// holdings row, the buy, and the recompute — in a single call.
+    /// </summary>
+    /// <remarks>
+    /// The three steps are together because doing two of them is a trap that has
+    /// already cost a debugging session: <see cref="RecomputeHoldingsAsync"/> REFRESHES
+    /// existing <c>holdings</c> rows rather than discovering positions from legs, so
+    /// seeding a buy and recomputing silently leaves the projection empty. A test that
+    /// then compares a projection-reading path against a leg-replaying path fails on
+    /// the fixture rather than on the invariant it meant to check.
+    /// <para>
+    /// <b>KNOWN LIMITATION — this seeds no <c>lots</c> rows.</b> Migration 202 made the
+    /// FIFO walk pure, so <c>recompute_holdings_cost_basis</c> derives lots in memory
+    /// and persists only quantity, cost basis and realized gains; the <c>lots</c> table
+    /// is written by the investment-transaction WRITE PATH
+    /// (<c>InvestmentTransactionsRepository</c>) and by snapshot restore. A position
+    /// seeded here therefore has correct holdings and basis but nothing for a
+    /// lot-consuming endpoint to find, and <c>transfer_shares</c> rejects it with
+    /// <c>investment-txn-transfer-shares-insufficient</c>.
+    /// </para>
+    /// <para>
+    /// So: use this for tests that READ a valuation (net worth, returns, cost basis).
+    /// A test that exercises an endpoint consuming lots must buy through the API
+    /// instead — see <c>InKindTransferBoundaryTests</c>, which does exactly that.
+    /// </para>
+    /// </remarks>
+    public async Task<Guid> AddBoundaryPositionAsync(
+        Guid brokerageAccountId,
+        Guid holdingsAccountId,
+        Guid securityId,
+        Boundary.Position position,
+        DateTime postedAt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(position);
+
+        await AddHoldingAsync(holdingsAccountId, securityId, quantity: 0m, costBasis: 0m,
+                              cancellationToken).ConfigureAwait(false);
+        var legId = await AddInvestmentBuyAsync(
+            brokerageAccountId, holdingsAccountId, securityId,
+            position.Quantity, position.BuyPrice, postedAt, cancellationToken)
+            .ConfigureAwait(false);
+        await RecomputeHoldingsAsync(cancellationToken).ConfigureAwait(false);
+        return legId;
+    }
+
+    /// <summary>
+    /// Recompute the <c>holdings</c> / <c>lots</c> projection from the legs, the way
+    /// an API write path does.
+    /// </summary>
+    /// <remarks>
+    /// Necessary because migration 104 DROPPED the holdings triggers. In the app the
+    /// projection is kept in step by an EF <c>SaveChangesInterceptor</c>
+    /// (<c>HoldingsRecomputeInterceptor</c>), which fires once per <c>SaveChanges</c>
+    /// — but these fixtures seed by raw SQL, which never reaches the ChangeTracker,
+    /// so nothing fires. That is a property of the FIXTURES, not a hole in the app:
+    /// the API writes only through EF, which the no-raw-SQL audit enforces.
+    /// <para>
+    /// It REFRESHES existing rows rather than discovering positions — the function
+    /// loops over <c>holdings</c> and re-derives each from the legs, so a
+    /// (holdings-account, security) pair with legs but no row is not picked up. The
+    /// write path creates the row; a raw seed must too, via
+    /// <see cref="AddHoldingAsync"/>. Seeding buys alone and calling this returns 0
+    /// and changes nothing, which is exactly what a first attempt at it did.
+    /// </para>
+    /// </remarks>
+    public async Task RecomputeHoldingsAsync(CancellationToken cancellationToken = default)
+    {
+        await using var db = NewDbContext();
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $"SELECT recompute_holdings_cost_basis({LedgerId}, NULL, NULL);",
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -510,12 +670,20 @@ public sealed class SyntheticLedger
     /// (hide, mark merged, set check number, tag) pass either leg id;
     /// the helper resolves it to the header internally.
     /// </remarks>
+    /// <param name="postingRole">
+    /// Optional <c>txn_legs.posting_role</c> for BOTH legs — <c>income</c>,
+    /// <c>fee</c>, <c>transfer</c> or <c>security</c> (ADR-0027). Null leaves it
+    /// unset, which is what a plain cash transfer carries. Reporting keys on this
+    /// to tell a dividend from a contribution when both face a category, so tests
+    /// covering that distinction must set it.
+    /// </param>
     public async Task<(Guid FromTxnId, Guid ToTxnId)> AddTransactionPairAsync(
         Guid fromAccountId,
         Guid toAccountId,
         decimal amount,
         DateTime postedAt,
         string payee = "test-payee",
+        string? postingRole = null,
         CancellationToken cancellationToken = default)
     {
         var headerId = Guid.NewGuid();
@@ -541,10 +709,10 @@ public sealed class SyntheticLedger
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             INSERT INTO txn_headers (id, ledger_id, origin, payee, posted_at, transacted_at, created_at)
             VALUES ({headerId}, {LedgerId}, 'manual', {payee}, {postedAt}, {postedAt}, {postedAt});
-            INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount)
+            INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount, posting_role)
             VALUES
-                ({fromLegId}, {headerId}, {LedgerId}, {fromAccountId}, 0, {amount}),
-                ({toLegId},   {headerId}, {LedgerId}, {toAccountId},   0, {-amount});",
+                ({fromLegId}, {headerId}, {LedgerId}, {fromAccountId}, 0, {amount},  {postingRole}),
+                ({toLegId},   {headerId}, {LedgerId}, {toAccountId},   0, {-amount}, {postingRole});",
             cancellationToken).ConfigureAwait(false);
 
         // Mig 102: balance triggers retired; the interceptor sits on
@@ -669,6 +837,58 @@ public sealed class SyntheticLedger
             )
             ON CONFLICT (header_id) DO UPDATE SET is_hidden = TRUE;",
             cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Re-run <c>fn_recompute_balances_for_account</c> over the given accounts from
+    /// the beginning of time. The seed helpers recompute at insert, but the
+    /// override helpers (<see cref="HideTransactionAsync"/>,
+    /// <see cref="SetHeaderOverrideAsync"/>, <see cref="MarkTransactionMergedAsync"/>)
+    /// write raw SQL that the BalanceRecomputeInterceptor never sees — so a test
+    /// that hides or re-dates an event and then asserts on a BALANCE (rather than
+    /// on the register) must call this in between. Migration 103 gave the recompute
+    /// its <c>is_hidden</c> filter; it only takes effect on the next run.
+    /// </summary>
+    /// <summary>
+    /// Rebuild the denormalised posting counts (mig 120) for every header in the
+    /// ledger, the way an EF save would.
+    /// </summary>
+    /// <remarks>
+    /// Raw-SQL seeds never reach <c>LegDerivedRecomputeInterceptor</c>, so the
+    /// counts stay at the column default of 1 while the legs say otherwise. That
+    /// is the same shape as the production incident these fixtures now help test
+    /// for — a write that bypassed the ChangeTracker and left a projection stale —
+    /// so a fixture that leaves it behind is producing data production could not.
+    /// </remarks>
+    public async Task RecomputePostingCountsAsync(CancellationToken cancellationToken = default)
+    {
+        await using var db = NewDbContext();
+        var headerIds = await db.TxnHeaders.AsNoTracking()
+            .Where(h => h.LedgerId == LedgerId)
+            .Select(h => h.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        foreach (var headerId in headerIds)
+        {
+            _ = await db.RecomputePostingCountsForHeader(headerId)
+                .Select(r => r.HeaderId)
+                .FirstAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+    }
+
+    public async Task RecomputeBalancesAsync(
+        IEnumerable<Guid> accountIds, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(accountIds);
+        await using var db = NewDbContext();
+        foreach (var accountId in accountIds)
+        {
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $"SELECT fn_recompute_balances_for_account({accountId}, '0001-01-01'::timestamptz);",
+                cancellationToken).ConfigureAwait(false);
+        }
     }
 
     /// <summary>

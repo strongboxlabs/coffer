@@ -58,4 +58,8 @@ public sealed record AccountRow(
     /// <summary>ADR-0066: best-guess tax treatment seeded from the account name
     /// (taxable / tax_deferred / tax_free / other); NULL when not inferable.
     /// Seed-once — the user refines it in the editor.</summary>
-    string? TaxStatus = null);
+    string? TaxStatus = null,
+    /// <summary>ADR-0050 / mig 127: the account's Start Date, from MD's
+    /// <c>date_created</c>. Seed-once — a value already in Coffer survives
+    /// re-import, since the editor owns the field afterwards.</summary>
+    DateOnly? OpenedOn = null);

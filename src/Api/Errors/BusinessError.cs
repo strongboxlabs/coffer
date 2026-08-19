@@ -103,6 +103,9 @@ public static class BusinessError
         public const string ScheduleInvalid = "schedule-invalid";
         public const string ScheduleJobTypeUnknown = "schedule-job-type-unknown";
 
+        /// <summary>A consistency repair named a projection the report does not cover.</summary>
+        public const string ConsistencyProjectionUnknown = "consistency-projection-unknown";
+
         // Accounts / register
         public const string AccountNotInLedger          = "account-not-in-ledger";
         // Inactive-accounts slice: system accounts (holdings siblings,

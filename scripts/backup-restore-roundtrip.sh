@@ -158,6 +158,20 @@ CREATE TABLE parent (id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
                      name text COLLATE name_ci);
 CREATE TABLE child  (id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
                      parent_id uuid NOT NULL REFERENCES parent(id));
+-- Money, at the precisions the real schema uses (NUMERIC(19,2) for money since
+-- mig 182, NUMERIC(25,12) for quantity since mig 180). Until this existed the
+-- roundtrip proved the wipe-then-restore MECHANISM but asserted only row COUNTS
+-- -- a restore that reinserted every row with a corrupted amount passed. The
+-- values are the boundary magnitudes: the money column maximum, and a 12dp
+-- fractional quantity whose product with a price is what overflows a decimal.
+CREATE TABLE money_check (id int PRIMARY KEY,
+                          amount   numeric(19,2)  NOT NULL,
+                          quantity numeric(25,12) NOT NULL);
+INSERT INTO money_check VALUES
+  (1,   99999999999999999.99, 9999999999999.999999999999),
+  (2,           9999999999.99,        123456.789012000000),
+  (3,  -99999999999999999.99,       -123456.789012000000),
+  (4,                    0.01,             0.000000000001);
 -- A MATERIALIZED VIEW: pg_views structurally excludes these, so the wipe needs
 -- its own pg_class relkind='m' pass and nothing would reveal its absence until
 -- the first migration added one.
@@ -172,7 +186,12 @@ SQL
 
 PARENTS=$(owner_exec psql -tAX -U "$OWNER" -d "$TESTDB" -c "SELECT count(*) FROM parent;")
 CHILDREN=$(owner_exec psql -tAX -U "$OWNER" -d "$TESTDB" -c "SELECT count(*) FROM child;")
+# Digest of every money value, at full scale. One string compared before and after
+# catches a changed VALUE, a lost ROW and a truncated SCALE in a single assertion,
+# and prints the difference when it fires.
+MONEY=$(owner_exec psql -tAX -U "$OWNER" -d "$TESTDB"   -c "SELECT string_agg(id||':'||amount||':'||quantity, '|' ORDER BY id) FROM money_check;")
 echo "   seeded: parent=$PARENTS child=$CHILDREN"
+echo "   money:  $MONEY"
 
 echo "== backup: pg_dump -Fc --no-owner =="
 docker exec -i -e PGPASSWORD="$OWNER_PW" "$PG_CONTAINER" \
@@ -230,6 +249,7 @@ C2=$(owner_exec psql -tAX -U "$OWNER" -d "$TESTDB" -c "SELECT count(*) FROM chil
 STALE=$(owner_exec psql -tAX -U "$OWNER" -d "$TESTDB" -c "SELECT count(*) FROM parent WHERE name='STALE-ROW';")
 LIVEONLY=$(owner_exec psql -tAX -U "$OWNER" -d "$TESTDB" -c "SELECT to_regclass('public.only_in_live') IS NOT NULL;")
 HASH_OK=$(owner_exec psql -tAX -U "$OWNER" -d "$TESTDB" -c "SELECT length(hashit('x'))=64;")
+MONEY2=$(owner_exec psql -tAX -U "$OWNER" -d "$TESTDB"   -c "SELECT string_agg(id||':'||amount||':'||quantity, '|' ORDER BY id) FROM money_check;")
 
 fail=0
 [ "$P2" = "$PARENTS" ]   || { echo "   !! parent count $P2 != $PARENTS" >&2; fail=1; }
@@ -237,8 +257,14 @@ fail=0
 [ "$STALE" = "0" ]       || { echo "   !! stale row survived" >&2; fail=1; }
 [ "$LIVEONLY" = "f" ]    || { echo "   !! divergent 'only_in_live' table survived" >&2; fail=1; }
 [ "$HASH_OK" = "t" ]     || { echo "   !! restored function can't reach pgcrypto" >&2; fail=1; }
+[ "$MONEY2" = "$MONEY" ] || {
+    echo "   !! money did not round-trip" >&2
+    echo "      before: $MONEY" >&2
+    echo "      after:  $MONEY2" >&2
+    fail=1
+}
 [ "$fail" = "0" ] || exit 1
 
-echo "   OK: parent=$P2 child=$C2, stale gone, divergent table gone, extension fn works."
+echo "   OK: parent=$P2 child=$C2, money exact, stale gone, divergent table gone, extension fn works."
 echo
 echo "PASS: restore over a populated DB is clean and deterministic."

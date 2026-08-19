@@ -60,7 +60,7 @@ public static class TransactionsEndpoints
         group.MapPost("/{headerId:guid}/move-account", MoveAccountAsync);
         // Slice 2c.6c: per-row similar-payees recall (Tier 1 —
         // exact-match on raw bank payee from prior approved bank
-        // rows). Returns ≤5 (payee, category) suggestions the
+        // rows). Returns ≤5 (payee, counterparty) suggestions the
         // editor renders as one-click chips.
         // Full leg set for a single header — across ALL accounts, not
         // just the requesting account's register. The investment
@@ -741,11 +741,13 @@ public static class TransactionsEndpoints
     /// <c>GET /api/ledgers/{ledgerId}/transactions/{headerId}/similar-payees</c>
     /// — slice 2c.6c Tier 1. Returns up to 5
     /// <see cref="SimilarPayeeDto"/> suggestions for the editor's
-    /// "Similar payees" chip row: the <c>(payee, category)</c>
+    /// "Similar payees" chip row: the <c>(payee, counterparty)</c>
     /// pairs the user previously chose on prior approved rows from
     /// the same provider as this row, whose raw bank payee exactly
-    /// matches this row's. Empty list when there's no anchor (manual
-    /// row, missing payee, no prior matches).
+    /// matches this row's. The counterparty may be a category or —
+    /// when the prior rows were settled as transfers — a real
+    /// account. Empty list when there's no anchor (manual row,
+    /// missing payee, no prior matches).
     /// </summary>
     private const int SimilarPayeesLimit = 5;
     private const int MergeCandidatesLimit = 5;

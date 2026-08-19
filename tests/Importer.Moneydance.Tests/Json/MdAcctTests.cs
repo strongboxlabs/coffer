@@ -78,6 +78,117 @@ public sealed class MdAcctTests
         Assert.True(inactiveChild.IsInactive);
     }
 
+    // ---- date_created → OpenedOn (ADR-0050 / mig 127) ---------------------
+    //
+    // MD records a Start Date for every account and the column has existed since
+    // migration 127, but the importer never read it — so every imported account
+    // had opened_on NULL while the schema doc and ADR-0050 both claimed it was
+    // "seeded from MD on import".
+
+    [Fact]
+    public void Reads_the_account_start_date_from_date_created()
+    {
+        var item = ReadOnlyAcct("""
+            {
+              "obj_type": "acct", "id": "inv-1", "name": "Demo Investment Account",
+              "type": "v", "currid": "USD",
+              "date_created": "20260101",
+              "creation_date": "1767286800000"
+            }
+            """);
+
+        // Both present and in agreement — the tidy integer wins, no conversion.
+        Assert.Equal(new DateOnly(2026, 1, 1), MdAcct.From(item).OpenedOn);
+    }
+
+    [Fact]
+    public void Falls_back_to_creation_date_when_date_created_is_absent()
+    {
+        // MD is inconsistent about which it writes. On a real 781-account export,
+        // creation_date covers 181 accounts (including all 50 investment ones)
+        // while date_created covers only 64 — so reading the integer alone would
+        // have left most accounts NULL.
+        var item = ReadOnlyAcct("""
+            {
+              "obj_type": "acct", "id": "inv-2", "name": "Brokerage",
+              "type": "v", "currid": "USD",
+              "creation_date": "1767286800000"
+            }
+            """);
+
+        Assert.Equal(new DateOnly(2026, 1, 1), MdAcct.From(item).OpenedOn);
+    }
+
+    [Fact]
+    public void Epoch_start_dates_are_stable_across_timezones()
+    {
+        // MD stamps creation_date at LOCAL NOON — 1767286800000 is 17:00Z, i.e.
+        // 12:00 US-Eastern. That convention is what makes taking the UTC date
+        // safe: the instant sits far enough from either midnight that no
+        // plausible offset moves it onto an adjacent day. Verified on the real
+        // export: all 64 accounts carrying both fields agree, at every offset
+        // from UTC-12 to UTC+2.
+        var noonEastern = ReadOnlyAcct("""
+            {"obj_type":"acct","id":"a","name":"x","type":"v","currid":"USD",
+             "creation_date":"1767286800000"}
+            """);
+        Assert.Equal(new DateOnly(2026, 1, 1), MdAcct.From(noonEastern).OpenedOn);
+
+        // The same wall-clock date stamped during daylight time (16:00Z).
+        var noonEasternDst = ReadOnlyAcct("""
+            {"obj_type":"acct","id":"b","name":"y","type":"v","currid":"USD",
+             "creation_date":"1751385600000"}
+            """);
+        Assert.Equal(new DateOnly(2025, 7, 1), MdAcct.From(noonEasternDst).OpenedOn);
+    }
+
+    [Theory]
+    [InlineData("\"date_created\": \"0\"")]         // MD's "unset"
+    [InlineData("\"date_created\": \"\"")]          // empty
+    [InlineData("\"date_created\": \"20261301\"")]  // month 13
+    [InlineData("\"date_created\": \"20260230\"")]  // 30 February
+    [InlineData("\"date_created\": \"not-a-date\"")]
+    [InlineData("\"creation_date\": \"0\"")]        // unset on the epoch field too
+    [InlineData("\"creation_date\": \"\"")]
+    [InlineData("\"creation_date\": \"not-a-number\"")]
+    // A malformed integer must not stop the fallback from rescuing the epoch one.
+    [InlineData("\"date_created\": \"garbage\", \"creation_date\": \"0\"")]
+    [InlineData("\"name\": \"no date at all\"")]    // both keys absent
+    public void Leaves_the_start_date_null_when_md_has_no_usable_one(string field)
+    {
+        var item = ReadOnlyAcct($$"""
+            {
+              "obj_type": "acct", "id": "a-1", "name": "x",
+              "type": "b", "currid": "USD",
+              {{field}}
+            }
+            """);
+
+        Assert.Null(MdAcct.From(item).OpenedOn);
+    }
+
+    [Fact]
+    public void Loan_first_payment_date_uses_the_same_two_source_read()
+    {
+        // MdLoanFields derives FirstPaymentDate from the account's creation
+        // stamp and read only `date_created`. On a real export just 2 of 6 loans
+        // carry that field, so the other 4 amortized with no first-payment date.
+        var item = ReadOnlyAcct("""
+            {
+              "obj_type": "acct", "id": "loan-1", "name": "Mortgage",
+              "type": "o", "currid": "USD",
+              "creation_date": "1767286800000",
+              "int_rate": "0.035", "num_payments": "360", "pmts_per_year": "12"
+            }
+            """);
+
+        var acct = MdAcct.From(item);
+        Assert.NotNull(acct.Loan);
+        Assert.Equal(new DateOnly(2026, 1, 1), acct.Loan!.FirstPaymentDate);
+        // And the account's own Start Date comes from the same stamp.
+        Assert.Equal(new DateOnly(2026, 1, 1), acct.OpenedOn);
+    }
+
     [Fact]
     public void Throws_when_obj_type_is_wrong()
     {

@@ -721,6 +721,9 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.NextRunAt).HasColumnName("next_run_at");
             b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+            b.Property(x => x.ConsecutiveFailures).HasColumnName("consecutive_failures");
+            b.Property(x => x.LastError).HasColumnName("last_error");
+            b.Property(x => x.LastFailureAt).HasColumnName("last_failure_at");
             b.HasOne<LedgerRow>().WithMany().HasForeignKey(x => x.LedgerId)
                 .OnDelete(DeleteBehavior.Cascade);
             b.HasOne<UserRow>().WithMany().HasForeignKey(x => x.ConfiguredByUserId)
@@ -746,6 +749,9 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.NextRunAt).HasColumnName("next_run_at");
             b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+            b.Property(x => x.ConsecutiveFailures).HasColumnName("consecutive_failures");
+            b.Property(x => x.LastError).HasColumnName("last_error");
+            b.Property(x => x.LastFailureAt).HasColumnName("last_failure_at");
             b.HasOne<UserRow>().WithMany().HasForeignKey(x => x.ConfiguredByUserId)
                 .OnDelete(DeleteBehavior.SetNull);
         });
@@ -1601,23 +1607,57 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.SecurityId).HasColumnName("upserted_security_id");
         });
 
-        // holdings_market_value_as_of + account_balance_as_of (migration 172)
-        // result types — the as-of valuation feeder (ADR-0063 v2 / Track-2
-        // historical valuations: net-worth-over-time + true TWR).
-        modelBuilder.Entity<HoldingsMarketValueAsOfRow>(b =>
+        // Migration 202 — FIFO cost basis as of an instant, from the same walk the
+        // recompute persists.
+        modelBuilder.Entity<HoldingsCostBasisAsOfRow>(b =>
         {
             b.HasNoKey();
             b.Property(x => x.AccountId).HasColumnName("account_id");
             b.Property(x => x.SecurityId).HasColumnName("security_id");
             b.Property(x => x.Quantity).HasColumnName("quantity");
-            b.Property(x => x.MarketValue).HasColumnName("market_value");
-            b.Property(x => x.PricedFrom).HasColumnName("priced_from");
+            b.Property(x => x.CostBasis).HasColumnName("cost_basis");
         });
-        modelBuilder.Entity<AccountBalanceAsOfRow>(b =>
+        // Migration 206 — the PURE running-balance walk. Keyless: it writes
+        // nothing, so a consistency check can ask what a balance should be
+        // without overwriting it to find out.
+        modelBuilder.Entity<AccountBalanceWalkRow>(b =>
         {
             b.HasNoKey();
+            b.Property(x => x.HeaderId).HasColumnName("header_id");
+            b.Property(x => x.PostedAt).HasColumnName("posted_at");
+            b.Property(x => x.Seq).HasColumnName("seq");
+            b.Property(x => x.NetAmount).HasColumnName("net_amount");
+            b.Property(x => x.BalanceAfter).HasColumnName("balance_after");
+        });
+        // Migration 206 — per-disposal realized gains from the same pure walk.
+        modelBuilder.Entity<RealizedGainWalkRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.SellLegId).HasColumnName("sell_leg_id");
+            b.Property(x => x.SoldAt).HasColumnName("sold_at");
+            b.Property(x => x.Quantity).HasColumnName("quantity");
+            b.Property(x => x.Proceeds).HasColumnName("proceeds");
+            b.Property(x => x.CostBasisSold).HasColumnName("cost_basis_sold");
+            b.Property(x => x.RealizedGain).HasColumnName("realized_gain");
+        });
+        // Migration 201 — cash balances for many instants in one pass.
+        modelBuilder.Entity<AccountBalanceAsOfInstantRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.AsOf).HasColumnName("as_of");
             b.Property(x => x.AccountId).HasColumnName("account_id");
             b.Property(x => x.Balance).HasColumnName("balance");
+        });
+        // Migration 200 — the batched form. Same columns plus the instant.
+        modelBuilder.Entity<HoldingsMarketValueAsOfSetRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.AsOf).HasColumnName("as_of");
+            b.Property(x => x.AccountId).HasColumnName("account_id");
+            b.Property(x => x.SecurityId).HasColumnName("security_id");
+            b.Property(x => x.Quantity).HasColumnName("quantity");
+            b.Property(x => x.MarketValue).HasColumnName("market_value");
+            b.Property(x => x.PricedFrom).HasColumnName("priced_from");
         });
 
         // ledger_snapshot_payload (migration 111) result type. Returns
@@ -1732,19 +1772,41 @@ public sealed class AppDbContext : DbContext
                     types: new[] { typeof(Guid), typeof(Guid), typeof(DateOnly), typeof(decimal) })!)
             .HasName("security_price_upsert_from_trade");
 
-        // Migration 172 — see HoldingsMarketValueAsOf / AccountBalanceAsOf
-        // methods below. The as-of valuation feeder (ADR-0063 v2 historical
-        // valuations): net-worth-over-time + true TWR.
+        // Migration 200 — the instant-SET form of the holdings feeder. A caller
+        // valuing many instants must use this: the single-instant function replays
+        // every position's full leg + split history per call, so N instants replay
+        // the ledger N times. It is what made a whole-portfolio TWR cost ~60 s.
         modelBuilder
             .HasDbFunction(typeof(AppDbContext)
-                .GetMethod(nameof(HoldingsMarketValueAsOf), InternalInstance,
-                    types: new[] { typeof(Guid), typeof(DateTime), typeof(Guid?), typeof(Guid?) })!)
-            .HasName("holdings_market_value_as_of");
+                .GetMethod(nameof(HoldingsMarketValueAsOfSet), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(DateTime[]), typeof(Guid[]) })!)
+            .HasName("holdings_market_value_as_of_set");
+        // Migration 201 — the instant-SET form of the balance feeder. Together with
+        // mig 200 this is what let MaxReturnsBoundaries be deleted: a whole-ledger
+        // TWR now costs two queries rather than two per boundary.
         modelBuilder
             .HasDbFunction(typeof(AppDbContext)
-                .GetMethod(nameof(AccountBalanceAsOf), InternalInstance,
-                    types: new[] { typeof(Guid), typeof(DateTime), typeof(Guid?) })!)
-            .HasName("account_balance_as_of");
+                .GetMethod(nameof(AccountBalanceAsOfInstants), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(DateTime[]), typeof(Guid[]) })!)
+            .HasName("account_balance_as_of_instants");
+        // Migration 202 — the as-of read side of the shared FIFO walk.
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(HoldingsCostBasisAsOf), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(DateTime), typeof(Guid[]) })!)
+            .HasName("holdings_cost_basis_as_of");
+
+        // Migration 206 — pure walks, the read-only counterparts of the writers.
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(AccountBalanceWalk), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(DateTime), typeof(decimal) })!)
+            .HasName("account_balance_walk");
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(RealizedGainsWalk), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(Guid) })!)
+            .HasName("realized_gains_walk");
 
         // Migration 102 — see RecomputeBalancesForAccount method below.
         // Wrapper over fn_recompute_balances_for_account so every API
@@ -1991,27 +2053,62 @@ public sealed class AppDbContext : DbContext
         FromExpression(() => SecurityPriceUpsertFromTrade(ledgerId, securityId, day, price));
 
     /// <summary>
-    /// Maps to <c>holdings_market_value_as_of(p_ledger_id, p_as_of,
-    /// p_account_id, p_security_id)</c> (migration 172). Per (holdings-sibling
-    /// account, security), the split-adjusted quantity held at the instant and
-    /// its market value (feed close ≤ instant, else the latest trade execution
-    /// price ≤ instant). The as-of valuation feeder for net-worth-over-time and
-    /// true time-weighted return (ADR-0063 v2). <paramref name="asOf"/> must be
-    /// UTC (timestamptz binding).
+    /// Maps to
+    /// <c>holdings_market_value_as_of_set(p_ledger_id, p_as_ofs, p_account_ids)</c>
+    /// (migration 200) — the same valuation as
+    /// the per-instant feeder it replaced (dropped in mig 203) for MANY instants at once, each
+    /// row tagged with the instant it belongs to.
+    /// <para>
+    /// Use this for any caller that values more than one instant. The
+    /// single-instant function replays each position's entire leg + split history
+    /// per call; asking it 420 times replays the ledger 420 times, which measured
+    /// ~139 ms per instant and was the whole reason a TWR boundary cap existed.
+    /// Instants must be UTC (timestamptz binding).
+    /// </para>
     /// </summary>
-    internal IQueryable<HoldingsMarketValueAsOfRow> HoldingsMarketValueAsOf(
-        Guid ledgerId, DateTime asOf, Guid? accountId, Guid? securityId) =>
-        FromExpression(() => HoldingsMarketValueAsOf(ledgerId, asOf, accountId, securityId));
-
+    /// <para>
+    /// <paramref name="accountIds"/> is NULL for every holdings account in the
+    /// ledger and a set to restrict. An EMPTY array means no accounts and returns
+    /// nothing — the two are not interchangeable, and reading empty as "all" would
+    /// silently value the whole ledger for a caller that asked for none.
+    /// </para>
     /// <summary>
-    /// Maps to <c>account_balance_as_of(p_ledger_id, p_as_of, p_account_id)</c>
-    /// (migration 172) — the date-bounded twin of the
-    /// <c>account_current_balances</c> view (mig 133): each account's register
-    /// balance as of the instant. <paramref name="asOf"/> must be UTC.
+    /// Maps to
+    /// <c>account_balance_as_of_instants(p_ledger_id, p_as_ofs, p_account_ids)</c>
+    /// (migration 201) — the mig-199 balances for MANY instants in one pass, each
+    /// row tagged with its instant. Use this wherever more than one instant is
+    /// needed: the per-instant form re-runs a LATERAL per account every call.
+    /// Instants must be UTC (timestamptz binding).
     /// </summary>
-    internal IQueryable<AccountBalanceAsOfRow> AccountBalanceAsOf(
-        Guid ledgerId, DateTime asOf, Guid? accountId) =>
-        FromExpression(() => AccountBalanceAsOf(ledgerId, asOf, accountId));
+    /// <summary>
+    /// Maps to
+    /// <c>holdings_cost_basis_as_of(p_ledger_id, p_as_of, p_account_ids)</c>
+    /// (migration 202) — FIFO cost basis and quantity per (holdings-account,
+    /// security) as of an instant, via the same <c>holdings_fifo_walk</c> that
+    /// <c>recompute_holdings_cost_basis</c> persists. One algorithm, so an as-of
+    /// basis and the stored basis cannot disagree.
+    /// </summary>
+    internal IQueryable<HoldingsCostBasisAsOfRow> HoldingsCostBasisAsOf(
+        Guid ledgerId, DateTime asOf, Guid[]? accountIds) =>
+        FromExpression(() => HoldingsCostBasisAsOf(ledgerId, asOf, accountIds));
+
+    /// <summary>The pure running-balance walk (mig 206). Writes nothing.</summary>
+    internal IQueryable<AccountBalanceWalkRow> AccountBalanceWalk(
+        Guid accountId, DateTime fromPostedAt, decimal startingBalance) =>
+        FromExpression(() => AccountBalanceWalk(accountId, fromPostedAt, startingBalance));
+
+    /// <summary>Per-disposal realized gains from the pure FIFO walk (mig 206).</summary>
+    internal IQueryable<RealizedGainWalkRow> RealizedGainsWalk(
+        Guid accountId, Guid securityId) =>
+        FromExpression(() => RealizedGainsWalk(accountId, securityId));
+
+    internal IQueryable<AccountBalanceAsOfInstantRow> AccountBalanceAsOfInstants(
+        Guid ledgerId, DateTime[] asOfs, Guid[]? accountIds) =>
+        FromExpression(() => AccountBalanceAsOfInstants(ledgerId, asOfs, accountIds));
+
+    internal IQueryable<HoldingsMarketValueAsOfSetRow> HoldingsMarketValueAsOfSet(
+        Guid ledgerId, DateTime[] asOfs, Guid[]? accountIds) =>
+        FromExpression(() => HoldingsMarketValueAsOfSet(ledgerId, asOfs, accountIds));
 
     /// <summary>
     /// Maps to <c>ledger_snapshot_payload(p_ledger_id)</c> in

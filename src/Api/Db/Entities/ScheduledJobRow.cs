@@ -21,4 +21,11 @@ internal sealed class ScheduledJobRow
     public DateTime? NextRunAt { get; set; }
     public DateTime CreatedAt { get; init; }
     public DateTime UpdatedAt { get; set; }
+    /// <summary>Consecutive handler failures (mig 194); 0 on success. Drives the
+    /// backoff and auto-disable in <c>SchedulerRunner</c>.</summary>
+    public int ConsecutiveFailures { get; set; }
+    /// <summary>Truncated message of the newest failure (mig 194) — never a stack
+    /// trace or payload; this is surfaced in the SPA.</summary>
+    public string? LastError { get; set; }
+    public DateTime? LastFailureAt { get; set; }
 }

@@ -138,7 +138,7 @@ public sealed class OverviewRepository
             CostBasis: portfolioCost,
             UnrealizedGain: portfolioValue - portfolioCost,
             PercentChange: portfolioCost != 0m
-                ? (portfolioValue - portfolioCost) / portfolioCost * 100m
+                ? ReportingScale.Percent(portfolioValue - portfolioCost, portfolioCost)
                 : 0m);
 
         return new LedgerOverviewDto(

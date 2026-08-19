@@ -37,13 +37,13 @@ public sealed class AccountsRepository
                                   is_system, holdings_account_id,
                                   notes, account_number,
                                   institution_name, routing_number, account_url,
-                                  provider_raw_payload, tax_status)
+                                  provider_raw_payload, tax_status, opened_on)
             VALUES (@Id, @LedgerId, @ParentId, @Name, @AccountType, @CategoryKind,
                     @CurrencyCode, @OpeningBalance, @IsActive, @ExternalId,
                     @IsSystem, @HoldingsAccountId,
                     @Notes, @AccountNumber,
                     @InstitutionName, @RoutingNumber, @AccountUrl,
-                    @ProviderRawPayload::jsonb, @TaxStatus)
+                    @ProviderRawPayload::jsonb, @TaxStatus, @OpenedOn)
             ON CONFLICT (ledger_id, external_id) WHERE external_id IS NOT NULL
             DO UPDATE SET
                 parent_id           = EXCLUDED.parent_id,
@@ -61,7 +61,13 @@ public sealed class AccountsRepository
                 -- Mig 110 / ADR-0035 §3: refresh provider payload on
                 -- conflict — latest MD export is authoritative for the
                 -- account's source metadata.
-                provider_raw_payload = EXCLUDED.provider_raw_payload
+                provider_raw_payload = EXCLUDED.provider_raw_payload,
+                -- ADR-0050 / mig 127: seed-once, unlike the columns above.
+                -- MD owns the Start Date only until Coffer has one — the
+                -- account editor owns the field afterwards, so COALESCE keeps
+                -- a user's edit and still backfills accounts imported before
+                -- this column was populated.
+                opened_on            = COALESCE(accounts.opened_on, EXCLUDED.opened_on)
                 -- is_system + holdings_account_id are set-once and stay
                 -- pinned across re-runs. The AccountMapper (which feeds
                 -- this upsert) always supplies HoldingsAccountId=null and
@@ -136,13 +142,13 @@ public sealed class AccountsRepository
                                   is_system, holdings_account_id,
                                   notes, account_number,
                                   institution_name, routing_number, account_url,
-                                  provider_raw_payload)
+                                  provider_raw_payload, opened_on)
             VALUES (@Id, @LedgerId, @ParentId, @Name, @AccountType, @CategoryKind,
                     @CurrencyCode, @OpeningBalance, @IsActive, @ExternalId,
                     @IsSystem, @HoldingsAccountId,
                     @Notes, @AccountNumber,
                     @InstitutionName, @RoutingNumber, @AccountUrl,
-                    @ProviderRawPayload::jsonb)
+                    @ProviderRawPayload::jsonb, @OpenedOn)
             RETURNING id;
             """;
         var insertedId = await _connection.ExecuteScalarAsync<Guid>(new CommandDefinition(
@@ -277,7 +283,8 @@ public sealed class AccountsRepository
                    routing_number       AS RoutingNumber,
                    account_url          AS AccountUrl,
                    provider_raw_payload::text AS ProviderRawPayload,
-                   tax_status           AS TaxStatus
+                   tax_status           AS TaxStatus,
+                   opened_on            AS OpenedOn
             FROM accounts
             WHERE ledger_id = @ledgerId AND external_id = @externalId;
             """;
