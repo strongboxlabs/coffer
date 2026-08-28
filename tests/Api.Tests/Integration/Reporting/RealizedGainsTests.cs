@@ -247,4 +247,63 @@ public sealed class RealizedGainsTests
                 $"stored value {v} does not fit System.Decimal");
         }
     }
+
+    [Fact]
+    public async Task Realized_gain_is_rounded_once_to_the_scale_its_column_has()
+    {
+        // Migration 205 rounded realized_gains money to 4dp; mig 182 had already
+        // narrowed those columns to NUMERIC(19,2), so Postgres rounded a SECOND time on
+        // assignment and double rounding shifted the stored value by a cent whenever the
+        // tail sat in the band where the two orders disagree. Mig 209 rounds once, at the
+        // column's own scale.
+        //
+        // On a real 586-disposal ledger this hit ~0.5% of rows, which is exactly why
+        // mig 205's four fixtures missed it — its own header records that they "all
+        // produced clean 2dp values". So this fixture is built to land IN the band
+        // rather than near it:
+        //
+        //   buy  1 share        @ $100  -> unit cost exactly 100.00
+        //   sell 0.1000496 sh   @ $100  -> proceeds round(10.00496, 2) = 10.00
+        //                                  basis    0.1000496 x 100   = 10.00496
+        //                                  gain     10.00 - 10.00496  = -0.00496
+        //
+        //   ROUND(-0.00496, 4) = -0.0050 -> stored in (19,2) -> -0.01   (the old bug)
+        //   ROUND(-0.00496, 2) = -0.00   -> stored            ->  0.00   (correct)
+        //
+        // The odd share count is the whole point; a round quantity cannot reach the band.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
+        var security = await ledger.AddSecurityAsync("Fractional Fund", "FRAC");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        async Task Trade(string action, decimal shares, decimal price, DateTime at)
+        {
+            var resp = await client.PostAsJsonAsync(
+                $"/api/ledgers/{ledger.LedgerId}/investment-transactions",
+                new CreateInvestmentTransactionRequest
+                {
+                    BrokerageAccountId = brokerage.Id,
+                    Action = action,
+                    SecurityId = security,
+                    Shares = shares,
+                    Price = price,
+                    PostedAt = at,
+                });
+            Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+        }
+
+        await Trade("buy", 1m, 100m, new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc));
+        await Trade("sell", -0.1000496m, 100m, new DateTime(2026, 2, 1, 12, 0, 0, DateTimeKind.Utc));
+
+        await using var db = _fixture.NewDbContext();
+        var stored = await db.RealizedGains.AsNoTracking()
+            .Where(r => r.LedgerId == ledger.LedgerId && r.SecurityId == security)
+            .Select(r => r.RealizedGain)
+            .SingleAsync();
+
+        // 0.00, not -0.01. Rounding twice is the only way to reach -0.01 from -0.00496.
+        Assert.Equal(0.00m, stored);
+    }
 }

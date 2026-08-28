@@ -428,6 +428,17 @@ function rotatedItems(rotated: MasterKeyRotation): string[] {
     }
     if (rotated.backupPassphraseRotated) items.push('your backup passphrase');
     if (rotated.driveTokenRotated) items.push('your Google Drive connection');
+    // Without this an install whose ONLY sealed material is delivery URLs — no
+    // bank-feed connection, no backup passphrase, no Drive — was told "nothing was
+    // stored under the old key, so only the key changed" by the very rotation that
+    // had just re-wrapped them.
+    if (rotated.notificationTargetsRotated > 0) {
+        items.push(
+            rotated.notificationTargetsRotated === 1
+                ? 'the URL for 1 notification target'
+                : `the URLs for ${rotated.notificationTargetsRotated} notification targets`,
+        );
+    }
     return items;
 }
 

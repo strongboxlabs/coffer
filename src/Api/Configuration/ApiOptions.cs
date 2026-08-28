@@ -109,6 +109,27 @@ public sealed class ApiOptions
     public int AuditRetentionDays { get; init; } = 180;
 
     /// <summary>
+    /// Days of notification-event history to keep — <c>system_events</c> (ADR-0096) and
+    /// <c>ledger_events</c> — before <c>AuditRetentionService</c> prunes older rows.
+    /// Default 365. 0 or less disables pruning (retain indefinitely). Bound from
+    /// <c>Api:EventRetentionDays</c>.
+    /// </summary>
+    /// <remarks>
+    /// A separate knob from <see cref="AuditRetentionDays"/>, and longer, because the two
+    /// answer different questions. The audit logs answer "what happened recently"; the
+    /// event log answers "how long has this been going wrong", and a year lets someone
+    /// compare this January's backup failures with last January's.
+    ///
+    /// Growth does not force the issue: roughly one row per enabled job per ledger per
+    /// day, so a three-ledger install with everything on accrues a few thousand rows a
+    /// year — under a megabyte, and the reads are bounded top-N index scans that do not
+    /// care about table size. This exists so the table has a stated lifetime rather than
+    /// growing silently forever, which is the only honest default for an append-only log
+    /// nothing was deleting.
+    /// </remarks>
+    public int EventRetentionDays { get; init; } = 365;
+
+    /// <summary>
     /// Master-KEK file location (ADR-0092 D1). Bound from <c>Api:MasterKey</c>.
     /// </summary>
     public MasterKeyFileOptions MasterKey { get; init; } = new();

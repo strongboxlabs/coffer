@@ -5,24 +5,31 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Transactions;
 
 /// <summary>
-/// Migration 188 replaced snapshot restore's per-account balance loop —
-/// <c>fn_recompute_balances_for_account(a, '0001-01-01')</c> once per account —
-/// with a single set-based pass, <c>fn_recompute_balances_for_ledger</c>.
+/// The stored running balances are exactly what the walk derives.
 /// </summary>
 /// <remarks>
-/// <para>The two must agree exactly, so this compares them against each other
-/// rather than against hand-computed numbers: the per-account function is the
-/// reference implementation and remains the incremental path used by the write
-/// triggers. A rewrite of a money-balance rebuild is not something to take on
-/// trust, and "the totals look right" would not catch an ordering or partitioning
-/// error.</para>
-/// <para>The ledger is built to exercise every predicate the function carries,
-/// because those are where a set-based rewrite can silently diverge: a non-zero
-/// opening balance (the running total's starting point), an override-shifted
-/// <c>posted_at</c> that reorders the running total, a hidden header and a
-/// merged-away header (both excluded), a multi-split touching one account twice on
-/// a single header, and an account with no legs at all — the case the old loop
-/// paid for on every ledger and produced nothing for.</para>
+/// <para>
+/// This file used to compare <c>fn_recompute_balances_for_ledger</c> against a loop over
+/// <c>fn_recompute_balances_for_account</c>, calling the latter "the reference
+/// implementation". Migration 211 made that comparison a TAUTOLOGY on purpose: both are
+/// now thin persists over one <c>balance_walk</c>, so there is no second implementation
+/// left to disagree.
+/// </para>
+/// <para>
+/// Which is the point. A test that watches two copies of an algorithm agree makes the
+/// duplication permanent and only alarms after they drift — and migration 206 rewrote
+/// one copy while this test was the sole guard. So the assertion moved to the property
+/// that survives refactoring: what the WRITER stored equals what the READ-ONLY walk
+/// says, which is also exactly what the consistency checker compares. Both entry points
+/// are still exercised, so re-forking them would still be caught.
+/// </para>
+/// <para>
+/// The fixture is unchanged and is the valuable part: a non-zero and per-account
+/// opening balance, an override that moves a header EARLIER so the running total must
+/// re-order, a hidden header and a merged-away one (both excluded), a multi-split
+/// touching one account twice on a single header, and an account with no legs at all.
+/// Those are the shapes where a rewrite silently diverges.
+/// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
 public sealed class LedgerBalanceRecomputeEquivalenceTests
@@ -45,7 +52,7 @@ public sealed class LedgerBalanceRecomputeEquivalenceTests
     }
 
     [Fact]
-    public async Task Set_based_ledger_rebuild_matches_the_per_account_loop()
+    public async Task Stored_balances_equal_what_the_walk_derives_by_either_route()
     {
         var ledger = await SyntheticLedger.CreateAsync(_fixture);
 
@@ -94,18 +101,23 @@ public sealed class LedgerBalanceRecomputeEquivalenceTests
             [(groceries.Id, -30m), (rent.Id, -70m)],
             new DateTime(2024, 2, 14, 0, 0, 0, DateTimeKind.Utc));
 
-        // Reference: clear, then run the per-account loop exactly as pre-188
-        // restore did.
+        // Both entry points, so re-forking them would still be caught.
         var viaLoop = await RebuildAndReadAsync(ledger.LedgerId, useSetBased: false);
-
-        // Candidate: clear, then one set-based pass.
         var viaSetBased = await RebuildAndReadAsync(ledger.LedgerId, useSetBased: true);
 
-        // Guard against a vacuous pass — if both rebuilds produced nothing, the
-        // comparison would succeed while proving nothing.
+        // Guard against a vacuous pass — a comparison over two empty lists succeeds
+        // while proving nothing.
         Assert.NotEmpty(viaLoop);
         Assert.Equal(viaLoop.Count, viaSetBased.Count);
         Assert.Equal(viaLoop, viaSetBased);
+
+        // THE PROPERTY THAT MATTERS: what was written equals what the read-only walk
+        // derives. This is the same comparison the consistency checker makes, so a
+        // writer that stops agreeing with the walk fails here rather than surfacing
+        // later as drift a user has to notice.
+        var walked = await WalkAsync(ledger.LedgerId);
+        Assert.NotEmpty(walked);
+        Assert.Equal(walked, viaSetBased);
 
         // And the shapes built above are genuinely represented, so the predicates
         // were actually exercised.
@@ -125,6 +137,24 @@ public sealed class LedgerBalanceRecomputeEquivalenceTests
         await using var db = _fixture.NewServiceFactory().Create();
         await db.Database.ExecuteSqlInterpolatedAsync(
             $"UPDATE accounts SET opening_balance = {openingBalance} WHERE id = {accountId}");
+    }
+
+    /// <summary>
+    /// What balance_walk says the balances are, read-only, seeded per account from its
+    /// own opening balance at the 0001-01-01 floor — the whole-ledger shape.
+    /// </summary>
+    private async Task<List<BalanceRow>> WalkAsync(Guid ledgerId)
+    {
+        await using var db = _fixture.NewServiceFactory().Create();
+        return await db.Database
+            .SqlQuery<BalanceRow>($@"
+                SELECT w.header_id     AS ""HeaderId"",
+                       w.account_id    AS ""AccountId"",
+                       w.balance_after AS ""BalanceAfter"",
+                       w.net_amount    AS ""NetAmount""
+                  FROM balance_walk({ledgerId}, NULL, '0001-01-01'::timestamptz, NULL) w
+                 ORDER BY w.account_id, w.header_id")
+            .ToListAsync();
     }
 
     /// <summary>

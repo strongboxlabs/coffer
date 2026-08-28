@@ -74,6 +74,7 @@ public static class MasterKeyContracts
         int LedgersRotated,
         bool BackupPassphraseRotated,
         bool DriveTokenRotated,
+        int NotificationTargetsRotated,
         string? PreviousKeyArchivedAt,
         bool RestartPending);
 }

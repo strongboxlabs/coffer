@@ -71,6 +71,10 @@ internal sealed class ReconcileCommand : AsyncCommand<ReconcileCommand.Settings>
             return 1;
         }
 
+        // Adopt the parsed document so it is released on every later exit
+        // path; MdExport owns the JsonDocument every MdItem is a view into.
+        using var owned = export;
+
         DbConnectionFactory factory;
         try
         {

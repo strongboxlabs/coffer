@@ -54,7 +54,7 @@ public sealed class MdItemReaderTests
         Assert.Equal("Cash", acct.GetString("name"));
         Assert.Equal("b", acct.GetString("type"));
         Assert.Equal("1d3b7c05", acct.GetString("currid"));
-        Assert.True(acct.Fields.ContainsKey("ts"));
+        Assert.True(acct.Has("ts"));
     }
 
     [Fact]

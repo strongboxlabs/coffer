@@ -54,6 +54,17 @@ public sealed class SchemaDriftGuardTests
         "invites",                   // access (ADR-0083): not wiped by a data rollback
         "user_ledger_grants",        // access (ADR-0083): who can see the ledger
         "user_preferences",          // per-user UI settings
+        // Notification history (ADR-0096). Same class as ledger_operations and
+        // mcp_tool_invocations: a record of what was ANNOUNCED, not ledger data.
+        // Restoring it would resurrect stale notices ("drift found" that has since
+        // been repaired) and erase newer ones — a rollback must not rewrite what you
+        // were already told.
+        "ledger_events",
+        // Delivery configuration (ADR-0096), excluded for the same reason as
+        // feed_connections: it must survive a data rollback. There is also a security
+        // edge — capturing it would let restoring an old snapshot re-enable a target
+        // the user deliberately removed, and re-arm a webhook URL they had revoked.
+        "ledger_notification_subscribers",
     };
 
     private static readonly Regex SafeIdent = new("^[a-z_][a-z0-9_]*$", RegexOptions.Compiled);

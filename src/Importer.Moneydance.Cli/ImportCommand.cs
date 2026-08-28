@@ -79,6 +79,10 @@ internal sealed class ImportCommand : AsyncCommand<ImportCommand.Settings>
             return 1;
         }
 
+        // Adopt the parsed document so it is released on every later exit
+        // path; MdExport owns the JsonDocument every MdItem is a view into.
+        using var owned = export;
+
         // ADR-0071 D2: the pipeline itself lives in MoneydanceImportService, shared
         // with the API. This command is the CLI adapter — parse, render, exit code.
         var service = new MoneydanceImportService();

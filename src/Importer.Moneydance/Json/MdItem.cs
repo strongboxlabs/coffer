@@ -8,38 +8,68 @@ namespace Coffer.Importer.Moneydance.Json;
 /// item carries an <c>id</c> and an <c>obj_type</c> discriminator; the rest
 /// of its fields are heterogeneous and dependent on the type. Typed view
 /// records (<see cref="Typed.MdAcct"/>, <see cref="Typed.MdTxn"/>, etc.)
-/// extract their fields from <see cref="Fields"/> via the helpers on this
-/// type.
+/// extract their fields via the <c>GetXxx</c> helpers on this type.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Moneydance stores almost everything as JSON strings — including numbers
 /// (<c>"samt": "-30062"</c>) and booleans (<c>"is_inactive": "y"</c>). The
 /// <c>GetXxx</c> helpers normalize the most common encodings; callers stay
 /// allocation-free for the success path.
+/// </para>
+/// <para>
+/// <see cref="Fields"/> holds JsonElements that are VIEWS into the export's single
+/// parsed <see cref="JsonDocument"/> — never <c>Clone()</c>s of it. Clone is what
+/// caused the OOM this design replaced: it allocates an independent
+/// <c>JsonDocument</c> (object + byte buffer + metadata db) per field, and a real
+/// 80.5 MB export has 1,737,198 fields. Not cloning is the whole fix; the
+/// dictionary itself was never the problem.
+/// </para>
+/// <para>
+/// The dictionary IS load-bearing for speed, and this was measured the hard way.
+/// An earlier attempt dropped it and read fields straight off the item's element
+/// via <c>TryGetProperty</c>. That is a LINEAR SCAN of the item's properties, and
+/// a transaction with many splits carries a hundred-plus fields which
+/// <c>MdTxn.ExtractSplits</c> then probes one at a time — quadratic per item. It
+/// cut memory to 286 MB but took the same real import from 29 seconds to 442.
+/// O(1) lookup is worth its ~80 MB.
+/// </para>
+/// <para>
+/// CONSEQUENCE: an item is only readable while the owning <see cref="MdExport"/>
+/// is undisposed. Reading after disposal throws <see cref="ObjectDisposedException"/>.
+/// The export therefore owns the document and callers must keep it alive for the
+/// whole import — see <see cref="MdExport"/>.
+/// </para>
 /// </remarks>
 public sealed record MdItem(
     string Id,
     string ObjType,
+    /// <summary>
+    /// This item's fields, as views into the export's document. Valid only while
+    /// the owning <see cref="MdExport"/> is alive.
+    /// </summary>
     IReadOnlyDictionary<string, JsonElement> Fields,
     /// <summary>
-    /// Raw JSON text for this item exactly as it appears in the MD
-    /// export — captured at parse time via `JsonElement.GetRawText()`.
-    /// Mig 109 / ADR-0035 §3: persisted on `txn_headers.provider_raw_payload`
-    /// for `txn` items so future classifier refinements can be pure
-    /// SQL against the JSONB column instead of needing the source file.
-    /// Empty string when the source element wasn't captured (test
-    /// fixtures constructed by hand).
+    /// Raw JSON text for this item exactly as it appears in the MD export.
+    /// Mig 109 / ADR-0035 §3: persisted on <c>provider_raw_payload</c> so future
+    /// classifier refinements can be pure SQL against the JSONB column instead of
+    /// needing the source file. Empty for the obj_types that never persist it, and
+    /// for items constructed by hand in tests.
     /// </summary>
     string RawJson = "")
 {
+    /// <summary>Field names present on this item, in document order.</summary>
+    public IEnumerable<string> FieldNames => Fields.Keys;
+
     public bool Has(string key) => Fields.ContainsKey(key);
 
-    public JsonElement? GetElement(string key) =>
-        Fields.TryGetValue(key, out var element) ? element : null;
-
+    /// <summary>
+    /// The field's string value, or <c>null</c> if the key is absent or its
+    /// value was not a JSON string.
+    /// </summary>
     public string? GetString(string key) =>
-        Fields.TryGetValue(key, out var element) && element.ValueKind == JsonValueKind.String
-            ? element.GetString()
+        Fields.TryGetValue(key, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
             : null;
 
     /// <summary>

@@ -21,11 +21,19 @@ namespace Coffer.Api.Tests.Integration.Crypto;
 /// won't open under B) is covered by <see cref="Unit.Crypto.LedgerKeyServiceTests"/>.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class KekRotationServiceTests
+public sealed class KekRotationServiceTests : IAsyncLifetime
 {
     private readonly PostgresFixture _fixture;
 
     public KekRotationServiceTests(PostgresFixture fixture) => _fixture = fixture;
+
+    /// <summary>
+    /// Rotation reads two tables nothing isolates; a rotation test has to control them.
+    /// Full rationale on <see cref="NotificationTargetReset"/>.
+    /// </summary>
+    public Task InitializeAsync() => NotificationTargetReset.ClearAsync(_fixture);
+
+    public Task DisposeAsync() => Task.CompletedTask;
 
     // ApiFactory pins the test KEK to 32 zero bytes; match it so the existing
     // ledgers stay openable through the rotation.

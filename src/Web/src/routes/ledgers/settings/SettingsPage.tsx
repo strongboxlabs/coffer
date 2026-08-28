@@ -12,6 +12,7 @@ import { FeedConnectionsPanel } from './FeedConnectionsPanel';
 import { MarketDataPanel } from './MarketDataPanel';
 import { DashboardLayoutPanel } from './DashboardLayoutPanel';
 import { ActivityPanel } from './ActivityPanel';
+import { NotificationsPanel } from './NotificationsPanel';
 import { SETTINGS_TABS, coerceSettingsTab, type SettingsTab } from './settingsTabs';
 
 /**
@@ -107,6 +108,9 @@ export function SettingsPage() {
                     {tab === 'snapshots' ? <SnapshotsPanel ledgerId={ledgerId} /> : null}
                     {tab === 'feeds' ? <FeedConnectionsPanel ledgerId={ledgerId} /> : null}
                     {tab === 'quotes' ? <MarketDataPanel ledgerId={ledgerId} /> : null}
+                    {tab === 'notifications' ? (
+                        <NotificationsPanel ledgerId={ledgerId} />
+                    ) : null}
                     {tab === 'activity' ? <ActivityPanel ledgerId={ledgerId} /> : null}
                     {tab === 'dashboard' ? <DashboardLayoutPanel ledgerId={ledgerId} /> : null}
                 </div>

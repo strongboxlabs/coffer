@@ -9,8 +9,10 @@ import {
     fetchFeedConnectionAccounts,
     fetchFeedConnections,
     fetchSyncRunDetail,
+    fetchSchedule,
     fetchSyncRuns,
     mapAccountToFeed,
+    saveSchedule,
     syncAllConnections,
     syncFeedConnection,
     unbindAccountFromFeed,
@@ -32,6 +34,7 @@ import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { IconButton } from '@/components/ui/IconButton';
 import { Input } from '@/components/ui/Input';
 import { Panel, PanelBody, PanelHead } from '@/components/ui/Panel';
+import { ScheduleControl } from '@/components/ScheduleControl';
 
 /**
  * Per-ledger SimpleFIN connection management.
@@ -316,6 +319,31 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
             {syncAllMutation.data ? (
                 <SyncAllSummary aggregate={syncAllMutation.data} />
             ) : null}
+
+            <Panel className="mb-6">
+                <PanelHead>
+                    <span className="text-sm font-semibold">Sync automatically</span>
+                </PanelHead>
+                <PanelBody className="space-y-2">
+                    <ScheduleControl
+                        queryKey={['schedule', ledgerId, 'feed-sync']}
+                        load={() => fetchSchedule(ledgerId, 'feed-sync')}
+                        save={(body) => saveSchedule(ledgerId, 'feed-sync', body)}
+                        label="Sync every connection once a day"
+                        note="skips connections that need reconnecting"
+                    />
+                    {/* Said, not implied. The scheduler stores an hour and a minute and
+                        always advances by a day, so daily is genuinely all that can be
+                        expressed — and someone expecting intra-day refreshes would
+                        otherwise discover the gap by finding stale balances. */}
+                    <p className="text-xs text-text-muted">
+                        Once a day, at the time you pick. More frequent syncing is not
+                        available yet. A connection that needs reconnecting is skipped
+                        rather than retried, so it will not use up your bank&apos;s
+                        patience — reconnect it here and the next run picks it up.
+                    </p>
+                </PanelBody>
+            </Panel>
 
             <Panel className="mb-6">
                 <PanelHead>

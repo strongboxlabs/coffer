@@ -114,26 +114,74 @@ public sealed class KekRotationService : IKekRotationService
             }
         }
 
+        // Notification delivery configs (mig 207 / 208, ADR-0096 D8). Sealed under the
+        // master KEK exactly like the two above, and omitted from this loop when they
+        // were added — so rotating the key left every delivery target holding
+        // ciphertext nothing could open. The subsystem then fails in the one way it
+        // exists to prevent: alerts stop, and the only trace is a per-target last_error
+        // on a settings page nobody visits until they wonder why it went quiet.
+        //
+        // Both scopes, in one pass. A rotation that fixed the deployment's targets and
+        // left every ledger's own targets broken would be worse than one that missed
+        // both, because it would look like it worked.
+        var subscribersRotated = 0;
+        foreach (var row in await db.NotificationSubscribers
+                     .Where(t => t.ConfigCiphertext.Length > 0)
+                     .ToListAsync(ct).ConfigureAwait(false))
+        {
+            var pt = OpenOrThrow(oldKeys, row.ConfigCiphertext, oldKey.Id,
+                $"notification target '{row.DisplayName}'");
+            try
+            {
+                if (!dryRun) row.ConfigCiphertext = newKeys.SealWithMasterKey(pt);
+                subscribersRotated++;
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(pt);
+            }
+        }
+
+        foreach (var row in await db.LedgerNotificationSubscribers
+                     .Where(t => t.ConfigCiphertext.Length > 0)
+                     .ToListAsync(ct).ConfigureAwait(false))
+        {
+            var pt = OpenOrThrow(oldKeys, row.ConfigCiphertext, oldKey.Id,
+                $"ledger notification target '{row.DisplayName}'");
+            try
+            {
+                if (!dryRun) row.ConfigCiphertext = newKeys.SealWithMasterKey(pt);
+                subscribersRotated++;
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(pt);
+            }
+        }
+
         if (dryRun)
         {
             await tx.RollbackAsync(ct).ConfigureAwait(false);
             _logger.LogInformation(
-                "KEK rotation dry-run OK: {Ledgers} ledger key(s) + passphrase={Pass} + driveToken={Drive} open under KEK '{Old}'.",
-                rotated, passphraseRotated, driveTokenRotated, oldKey.Id);
+                "KEK rotation dry-run OK: {Ledgers} ledger key(s) + passphrase={Pass} + "
+                + "driveToken={Drive} + {Targets} notification target(s) open under KEK '{Old}'.",
+                rotated, passphraseRotated, driveTokenRotated, subscribersRotated, oldKey.Id);
         }
         else
         {
             await db.SaveChangesAsync(ct).ConfigureAwait(false);
             await tx.CommitAsync(ct).ConfigureAwait(false);
             _logger.LogInformation(
-                "KEK rotation complete: re-wrapped {Ledgers} ledger key(s){Pass}{Drive} from '{Old}' to '{New}'.",
+                "KEK rotation complete: re-wrapped {Ledgers} ledger key(s){Pass}{Drive}"
+                + " + {Targets} notification target(s) from '{Old}' to '{New}'.",
                 rotated,
                 passphraseRotated ? " + the backup passphrase" : "",
                 driveTokenRotated ? " + the Drive OAuth token" : "",
-                oldKey.Id, newKey.Id);
+                subscribersRotated, oldKey.Id, newKey.Id);
         }
 
-        return new RotationResult(rotated, passphraseRotated, driveTokenRotated, dryRun);
+        return new RotationResult(
+            rotated, passphraseRotated, driveTokenRotated, subscribersRotated, dryRun);
     }
 
     private static byte[] OpenOrThrow(LedgerKeyService keys, byte[] sealedBytes, string oldId, string what)
@@ -157,7 +205,11 @@ public sealed class KekRotationService : IKekRotationService
 
 /// <summary>Outcome of a rotation run.</summary>
 public sealed record RotationResult(
-    int LedgersRotated, bool PassphraseRotated, bool DriveTokenRotated, bool DryRun);
+    int LedgersRotated,
+    bool PassphraseRotated,
+    bool DriveTokenRotated,
+    int NotificationTargetsRotated,
+    bool DryRun);
 
 /// <summary>Thrown when rotation can't proceed (a blob won't open under the
 /// supplied current KEK); the transaction is rolled back.</summary>

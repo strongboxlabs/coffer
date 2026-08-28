@@ -52,7 +52,8 @@ internal sealed class AuditCommand : Command<AuditCommand.Settings>
 
         AnsiConsole.MarkupLine(
             $"Loading [cyan]{Path.GetFileName(path)}[/] …");
-        var export = MdItemReader.ReadFile(path);
+        // Releases the parsed document (~520 MB for a large export) on exit.
+        using var export = MdItemReader.ReadFile(path);
         var txns = export.AllItems.Where(i => i.ObjType == "txn").ToList();
         AnsiConsole.MarkupLine(
             $"  {export.AllItems.Count:N0} items, {txns.Count:N0} txns\n");
@@ -134,7 +135,7 @@ internal sealed class AuditCommand : Command<AuditCommand.Settings>
             }
 
             // Heuristic 2: attachment-shaped fields on any item type.
-            foreach (var k in item.Fields.Keys)
+            foreach (var k in item.FieldNames)
             {
                 var kl = k.ToLowerInvariant();
                 if (kl.StartsWith("attach") || kl.Contains("file_ref")
@@ -391,7 +392,7 @@ internal sealed class AuditCommand : Command<AuditCommand.Settings>
         var keyCounts = new SortedDictionary<string, int>(StringComparer.Ordinal);
         foreach (var t in txns)
         {
-            foreach (var k in t.Fields.Keys)
+            foreach (var k in t.FieldNames)
             {
                 var kl = k.ToLowerInvariant();
                 if (kl.StartsWith("udf.") || kl.StartsWith("custom_") || kl.StartsWith("user_"))
@@ -458,7 +459,7 @@ internal sealed class AuditCommand : Command<AuditCommand.Settings>
         var unknownCounts = new SortedDictionary<string, int>(StringComparer.Ordinal);
         foreach (var t in txns)
         {
-            foreach (var k in t.Fields.Keys)
+            foreach (var k in t.FieldNames)
             {
                 if (known.Contains(k)) continue;
                 // Skip split-indexed keys

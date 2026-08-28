@@ -23,6 +23,19 @@ public enum IngestFailureReason
     /// partial index <c>uq_sync_runs_one_running_per_connection</c>
     /// fired.</summary>
     SyncInProgress,
+    /// <summary>
+    /// The provider itself faulted: unreachable host, non-2xx, malformed payload.
+    /// </summary>
+    /// <remarks>
+    /// Returned rather than thrown, and that is the whole point of this member. A
+    /// <c>SimpleFinException</c> used to escape <c>RunPullAsync</c> — so a single sync
+    /// answered 500 (the orchestrator's own comment claimed 422; nothing mapped it), and
+    /// worse, sync-all aborted its entire loop on the first unreachable bank, silently
+    /// skipping every other connection on the ledger. That contradicted
+    /// <c>SyncAllAsync</c>'s own documented promise that "per-connection failures
+    /// shouldn't cascade".
+    /// </remarks>
+    ProviderFault,
 }
 
 /// <summary>

@@ -81,12 +81,19 @@ public sealed class IngestOrchestrator
     /// sync to one bank-side account on this connection (slice
     /// 2c.3 per-account endpoint). Pull provider scopes its fetch;
     /// orchestrator also defensively narrows its dispatch loop.</param>
+    /// <param name="triggeredVia">
+    /// How this run was provoked — <c>manual</c> or <c>scheduled</c>. It lands on the
+    /// ledger_operations row, which is what the Activity timeline reads, so a scheduled
+    /// run labelled "manual" would be the log telling the reader something untrue about
+    /// who did it.
+    /// </param>
     public async Task<IngestPullOutcome> RunPullAsync(
         Guid ledgerId,
         Guid connectionId,
         Guid triggeredByUserId,
         string? accountIdFilter = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string triggeredVia = "manual")
     {
         // API-layer concurrency fast-path (slice 2c.2). Acquired
         // before any DB work so two requests against the same
@@ -152,7 +159,7 @@ public sealed class IngestOrchestrator
             LedgerId = ledgerId,
             Family = "ingest",
             ProviderKey = keyMaterial.Connection.Provider,
-            TriggeredVia = "manual",
+            TriggeredVia = triggeredVia,
             FeedConnectionId = connectionId,
             TriggeredByUserId = triggeredByUserId,
             Status = "running",
@@ -218,14 +225,28 @@ public sealed class IngestOrchestrator
         }
         catch (SimpleFinException ex)
         {
-            // Provider-side HTTP / parse fault. Stamp the run, then
-            // rethrow so the endpoint's existing error mapping
-            // (→ 422) still fires.
+            // Provider-side HTTP / parse fault. Stamp the run and return a TYPED failure
+            // rather than rethrowing.
+            //
+            // It used to rethrow, with a comment claiming the endpoint mapped it to 422.
+            // Nothing did: there is no SimpleFinException handler on the sync path, so it
+            // reached UseExceptionHandler and the caller got a 500. And in the sync-all
+            // loop it was worse than a wrong status code — the exception unwound the whole
+            // loop, so one unreachable bank silently skipped every other connection on
+            // the ledger, in direct contradiction of that endpoint's own documented
+            // promise that per-connection failures do not cascade.
+            //
+            // Fixed here rather than in the loop because the loop is not the only caller
+            // that must not unwind: the scheduled sync added next has exactly the same
+            // requirement, and a rule stated in two places is a rule that will drift.
             run.Status = "failed";
             run.ErrorMessage = ex.Message;
             run.CompletedAt = DateTime.UtcNow;
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            throw;
+            _logger.LogWarning(ex,
+                "Ingest pull for connection {ConnectionId} failed: the provider faulted.",
+                connectionId);
+            return IngestPullOutcome.Fail(IngestFailureReason.ProviderFault);
         }
 
         // Defensive 403 path: provider detected revoked / expired

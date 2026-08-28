@@ -28,12 +28,28 @@ namespace Coffer.Api.Tests.Integration.Crypto;
 /// later host build resolves.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class MasterKeyRotationCoordinatorTests : IDisposable
+public sealed class MasterKeyRotationCoordinatorTests : IDisposable, IAsyncLifetime
 {
     private readonly PostgresFixture _fixture;
     private readonly string _dir = Directory.CreateTempSubdirectory("coffer-rotate").FullName;
 
     public MasterKeyRotationCoordinatorTests(PostgresFixture fixture) => _fixture = fixture;
+
+    /// <summary>
+    /// Step 1 of a coordinated rotation is a DRY-RUN rotation, so this class reads every
+    /// table the rotation service reads and has to arrange them the same way
+    /// <see cref="KekRotationServiceTests"/> does. Full rationale on
+    /// <see cref="NotificationTargetReset"/>.
+    /// </summary>
+    /// <remarks>
+    /// The symptom was indirect enough to be worth recording: leftover subscriber rows
+    /// made the dry run throw, the coordinator turned that into
+    /// <c>Refusal.Blocked</c>, and four tests failed asserting on a refusal reason rather
+    /// than on anything to do with notifications.
+    /// </remarks>
+    public Task InitializeAsync() => NotificationTargetReset.ClearAsync(_fixture);
+
+    public Task DisposeAsync() => Task.CompletedTask;
 
     public void Dispose()
     {
@@ -251,7 +267,7 @@ public sealed class MasterKeyRotationCoordinatorTests : IDisposable
         public Task<RotationResult> RotateAsync(
             MasterKey oldKey, MasterKey newKey, bool dryRun, CancellationToken ct = default)
             => dryRun
-                ? Task.FromResult(new RotationResult(0, false, false, true))
+                ? Task.FromResult(new RotationResult(0, false, false, 0, true))
                 : throw new InvalidOperationException("simulated re-wrap failure");
     }
 }

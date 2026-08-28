@@ -182,3 +182,10 @@ export type {
     EditReminderRequest,
     EditInvestmentReminderRequest,
 } from './types/reminder';
+export type {
+    NotificationProvider,
+    NotificationSubscriber,
+    NotificationSubscribersResponse,
+    SystemEvent,
+    LedgerNotificationSettings,
+} from './types/notification';

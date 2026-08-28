@@ -188,7 +188,23 @@ public sealed class YahooFinanceQuoteProvider : IQuotePullProvider
 
             return new QuoteEntry(
                 sec.SecurityId,
-                decimal.Round(price, 12),
+                // 4, matching security_prices.price NUMERIC(19,4) — not 12.
+                //
+                // Rounding finer than the destination column rounds TWICE, and here the
+                // second rounding happens where nobody can see it. The visible cost is
+                // not a wrong price but change detection that never converges:
+                // QuoteOrchestrator compares this value against the one read back from
+                // the column, so a 12dp value never equals its own stored 4dp form, and
+                // every refetch rewrites the row and counts an update that changed
+                // nothing. Yahoo closes are float-derived (mig 155 cites 7.150000095367
+                // from this same `fetch` source), so the 5th decimal is normally
+                // non-zero and this fired essentially every time.
+                //
+                // Mig 155 narrowed the column on the stated premise that "current
+                // producers already round to 4dp" — true of the SimpleFIN provider and
+                // the Moneydance importer, but this provider predates it and was never
+                // revisited. Same shape as mig 205 vs realized_gains (see mig 209).
+                decimal.Round(price, 4),
                 DateTime.SpecifyKind(asOfDate, DateTimeKind.Utc),
                 sec.CurrencyCode,
                 PriceSource.Fetch);

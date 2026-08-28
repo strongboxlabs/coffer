@@ -45,6 +45,13 @@ public static class WrappedMaterialProbe
         db => db.Ledgers.Any(l => l.WrappedLek != null),
         db => db.GlobalScheduledJobs.Any(j => j.PassphraseCiphertext != null),
         db => db.DriveSync.Any(d => d.OauthCiphertext != null),
+
+        // Delivery target URLs, both scopes. Length > 0 rather than a null check
+        // because config_ciphertext is BYTEA NOT NULL: reconciliation empties it to
+        // retire a blob this install cannot open, and an empty array is "no wrapped
+        // material here", not "wrapped material of length zero".
+        db => db.NotificationSubscribers.Any(t => t.ConfigCiphertext.Length > 0),
+        db => db.LedgerNotificationSubscribers.Any(t => t.ConfigCiphertext.Length > 0),
     ];
 
     /// <summary>

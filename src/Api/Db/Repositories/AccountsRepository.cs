@@ -1210,6 +1210,31 @@ public sealed class AccountsRepository
                 cancellationToken)
             .ConfigureAwait(false);
 
+        // An opening balance is the SEED of every stored running balance on this
+        // account, so changing it invalidates all of them — and nothing else would
+        // notice. ExecuteUpdateAsync bypasses the ChangeTracker, so
+        // LegDerivedRecomputeInterceptor never sees this write; and even on a
+        // SaveChanges path it would not help, because its switch matches only
+        // TxnLegRow / TxnHeaderRow and the two override rows, never AccountRow.
+        // Migration 088 dropped the last trigger on `accounts`.
+        //
+        // Left alone, every balance_after on the account stays seeded from the OLD
+        // figure — wrong in the register, on the dashboard, and in net-worth history —
+        // and it does not self-heal, because the incremental recompute seeds from the
+        // last stored row before its anchor and so inherits the stale value. Only a
+        // manual repair cleared it. MergeCategoryAsync in this same class already does
+        // exactly this after its own ExecuteUpdate; this path simply never did.
+        //
+        // Anchored at 0001-01-01, the same floor VerifyAndHealBalancesAsync uses: the
+        // seed feeds the FIRST header onward, so a partial window would leave the
+        // earlier rows carrying the old opening figure.
+        if (openingBalance != cur.OpeningBalance)
+        {
+            await _recompute.RecomputeAsync(
+                [(accountId, new DateTime(1, 1, 1, 0, 0, 0, DateTimeKind.Utc))],
+                cancellationToken).ConfigureAwait(false);
+        }
+
         if (request.LoanTerms is { } loanTerms)
             await UpsertLoanTermsAsync(ledgerId, accountId, loanTerms, cancellationToken).ConfigureAwait(false);
 

@@ -11,9 +11,16 @@ import { MasterKeyPanel } from './MasterKeyPanel';
 import { McpSettingsPanel } from './McpSettingsPanel';
 import { McpClientsPanel } from './McpClientsPanel';
 import { McpAuditPanel } from './McpAuditPanel';
+import { NotificationsPanel } from './NotificationsPanel';
 import { UsersPanel } from './UsersPanel';
 
-export type SystemTab = 'about' | 'backups' | 'encryption' | 'mcp' | 'users';
+export type SystemTab =
+    | 'about'
+    | 'backups'
+    | 'encryption'
+    | 'mcp'
+    | 'notifications'
+    | 'users';
 
 /**
  * Absent or unrecognised → About, mirroring `coerceSettingsTab` for the
@@ -21,7 +28,8 @@ export type SystemTab = 'about' | 'backups' | 'encryption' | 'mcp' | 'users';
  * System section agree with this page on what a valid tab is.
  */
 export function coerceSystemTab(value: unknown): SystemTab {
-    return value === 'backups' || value === 'encryption' || value === 'mcp' || value === 'users'
+    return value === 'backups' || value === 'encryption' || value === 'mcp'
+        || value === 'notifications' || value === 'users'
         ? value
         : 'about';
 }
@@ -50,6 +58,9 @@ export function SystemSettingsPage() {
               { id: 'encryption', label: 'Encryption' },
               { id: 'backups', label: 'Backups' },
               { id: 'mcp', label: 'MCP' },
+              // Next to Backups on purpose: the first thing it reports on is whether
+              // a backup actually happened, and the two are read together.
+              { id: 'notifications', label: 'Notifications' },
               { id: 'users', label: 'Users' },
           ]
         : [{ id: 'about', label: 'About' }];
@@ -124,6 +135,9 @@ export function SystemSettingsPage() {
                     {activeTab === 'about' ? <AboutPanel /> : null}
                     {activeTab === 'backups' && isAdmin ? <BackupsPanel /> : null}
                     {activeTab === 'encryption' && isAdmin ? <MasterKeyPanel /> : null}
+                    {activeTab === 'notifications' && isAdmin ? (
+                        <NotificationsPanel />
+                    ) : null}
                     {activeTab === 'mcp' && isAdmin ? (
                         <div className="space-y-4">
                             <McpSettingsPanel />

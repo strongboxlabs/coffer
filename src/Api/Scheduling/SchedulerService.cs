@@ -82,7 +82,8 @@ public sealed class SchedulerService : BackgroundService
         var handlers = scope.ServiceProvider.GetServices<IScheduledJobHandler>()
             .ToDictionary(h => h.JobType, StringComparer.Ordinal);
         var count = await _runner
-            .RunDueAsync(db, handlers, now, _logger, cancellationToken)
+            .RunDueAsync(db, handlers, now, _logger, cancellationToken,
+                scope.ServiceProvider.GetRequiredService<Notifications.NotificationPublisher>())
             .ConfigureAwait(false);
 
         // Global (non-ledger) jobs share this one loop — e.g. the whole-DB
@@ -95,5 +96,39 @@ public sealed class SchedulerService : BackgroundService
 
         if (count > 0)
             _logger.LogInformation("SchedulerService ran {Count} due job(s).", count);
+
+        // MONITORS, not jobs. Deliberately not entries in global_scheduled_jobs:
+        // there is nothing to configure, and nobody should be able to disable the
+        // thing whose whole purpose is noticing that the configurable jobs stopped.
+        // Their own publishes are throttled, so running on every tick costs a
+        // directory listing and announces at most once per window.
+        //
+        // Failures here are swallowed on purpose: a monitor that throws must not
+        // take down the tick that runs the real jobs.
+        try
+        {
+            await scope.ServiceProvider
+                .GetRequiredService<Notifications.BackupAgeMonitor>()
+                .CheckAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Backup-age monitor failed; will retry next tick.");
+        }
+
+        try
+        {
+            var drifted = await scope.ServiceProvider
+                .GetRequiredService<Notifications.ConsistencyMonitor>()
+                .CheckAllAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (drifted > 0)
+                _logger.LogWarning("{Count} ledger(s) have projection drift.", drifted);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Consistency monitor failed; will retry next tick.");
+        }
     }
 }

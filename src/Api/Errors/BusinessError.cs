@@ -105,6 +105,8 @@ public static class BusinessError
 
         /// <summary>A consistency repair named a projection the report does not cover.</summary>
         public const string ConsistencyProjectionUnknown = "consistency-projection-unknown";
+        /// <summary>A notification target named a provider this build does not have.</summary>
+        public const string NotificationProviderUnknown = "notification-provider-unknown";
 
         // Accounts / register
         public const string AccountNotInLedger          = "account-not-in-ledger";
@@ -275,6 +277,10 @@ public static class BusinessError
         public const string FeedMappingConnectionMismatch    = "feed-mapping-connection-mismatch";
         public const string SyncRunNotInLedger               = "sync-run-not-in-ledger";
         public const string FeedSyncInProgress               = "feed-sync-in-progress";
+        /// <summary>The bank/provider faulted — unreachable, non-2xx, or malformed
+        /// payload. Distinct from needs_reauth, which is actionable by reconnecting;
+        /// this one usually resolves itself.</summary>
+        public const string FeedSyncProviderFault            = "feed-sync-provider-fault";
         public const string AccountNotBoundToFeed            = "account-not-bound-to-feed";
         public const string SyncFromDateInFuture             = "sync-from-date-in-future";
 

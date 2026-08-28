@@ -644,6 +644,20 @@ are browser-driven and usually pass.
   never committed. Deliberately on a different volume from `postgres_data`, so one dump
   can't carry both the wrapped material and the key that opens it.
 - Never log raw tokens, raw CSV/OFX uploads, or full transaction memos at INFO level.
+- **OpenIddict token keys** (`src/Api/data/openiddict/signing.pem`, `encryption.key`)
+  are generated per install on first start and are gitignored. A container install keeps
+  them on its own volume; the image ships no `/app/data`, so it always mints its own. A
+  NATIVE run writes them into `src/Api/data/` — its content root — which is why that
+  path is ignored and why `scripts/maintainer/check-no-key-material.sh` fails preflight
+  if anything under it becomes tracked.
+
+  These two files were tracked and published in earlier snapshots, so **treat that key
+  pair as public**. Container installs were never affected (own volume, own keys). A
+  native install that started from a public clone signed and validated OAuth tokens with
+  a key anyone can read: delete both files and restart to mint a fresh pair. Doing so
+  invalidates outstanding OpenIddict access and refresh tokens, so MCP clients must
+  re-authorize — web sign-in is unaffected, because cookie sessions are database-backed
+  and independent of these keys.
 
 #### Database exposure and authentication
 

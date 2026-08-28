@@ -236,6 +236,73 @@ public sealed class SchedulerRunnerTests
     }
 
     [Fact]
+    public async Task A_degraded_run_records_the_reason_without_counting_as_a_failure()
+    {
+        // The middle state, and the reason it exists. A job that RAN but did not do its
+        // work is neither a failure nor a success: counting it as a failure would
+        // auto-disable a daily refresh after five flaky days (losing more than it
+        // protects), and counting it as a success is what let a total provider outage
+        // look healthy in the first place.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5),
+            consecutiveFailures: 3);
+        var handlers = new Dictionary<string, IScheduledJobHandler>
+        {
+            [JobTypes.QuoteRefresh] = new SpyHandler(JobTypes.QuoteRefresh)
+            {
+                Outcome = JobRunOutcome.Degraded("No quote provider succeeded: yahoo timed out"),
+            },
+        };
+
+        var now = DateTime.UtcNow;
+        await using var db = _fixture.NewDbContext();
+        await new SchedulerRunner().RunDueAsync(
+            db, handlers, now, NullLogger.Instance, default);
+
+        await using var read = _fixture.NewDbContext();
+        var job = await read.ScheduledJobs.AsNoTracking()
+            .SingleAsync(j => j.LedgerId == ledger.LedgerId);
+
+        // It ran: the streak resets and the job stays enabled...
+        Assert.Equal(0, job.ConsecutiveFailures);
+        Assert.True(job.Enabled);
+        Assert.True(job.NextRunAt > now);
+
+        // ...but the reason survives, because "it ran" is not the same as "it worked"
+        // and the difference has to be visible somewhere other than a container log.
+        Assert.Contains("yahoo timed out", job.LastError);
+        Assert.NotNull(job.LastFailureAt);
+    }
+
+    [Fact]
+    public async Task A_degraded_run_never_reaches_the_auto_disable_threshold()
+    {
+        // Directly pins the rule the auto-disable would otherwise break: a ledger holding
+        // one delisted ticker degrades every single day, and must never lose the job for
+        // it. Seeded one short of the threshold so a single miscount would trip it.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5),
+            consecutiveFailures: SchedulerRunner.DisableAfterConsecutiveFailures - 1);
+        var handlers = new Dictionary<string, IScheduledJobHandler>
+        {
+            [JobTypes.QuoteRefresh] = new SpyHandler(JobTypes.QuoteRefresh)
+            {
+                Outcome = JobRunOutcome.Degraded("a provider failed"),
+            },
+        };
+
+        await using var db = _fixture.NewDbContext();
+        await new SchedulerRunner().RunDueAsync(
+            db, handlers, DateTime.UtcNow, NullLogger.Instance, default);
+
+        await using var read = _fixture.NewDbContext();
+        var job = await read.ScheduledJobs.AsNoTracking()
+            .SingleAsync(j => j.LedgerId == ledger.LedgerId);
+        Assert.True(job.Enabled);
+        Assert.Equal(0, job.ConsecutiveFailures);
+    }
+
+    [Fact]
     public async Task Failing_global_job_advances_and_records_the_failure()
     {
         await ResetGlobalRowAsync();
@@ -301,10 +368,14 @@ public sealed class SchedulerRunnerTests
         public string JobType { get; }
         public List<(Guid Ledger, Guid User)> Calls { get; } = new();
 
-        public Task RunAsync(AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken ct)
+        /// <summary>What this spy reports; Ok unless a test says otherwise.</summary>
+        public JobRunOutcome Outcome { get; init; } = JobRunOutcome.Ok();
+
+        public Task<JobRunOutcome> RunAsync(
+            AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken ct)
         {
             Calls.Add((ledgerId, configuredByUserId));
-            return Task.CompletedTask;
+            return Task.FromResult(Outcome);
         }
     }
 
@@ -328,7 +399,8 @@ public sealed class SchedulerRunnerTests
             => (JobType, _message) = (jobType, message);
         public string JobType { get; }
 
-        public Task RunAsync(AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken ct)
+        public Task<JobRunOutcome> RunAsync(
+            AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken ct)
             => throw new InvalidOperationException(_message);
     }
 
@@ -355,7 +427,7 @@ public sealed class SchedulerRunnerTests
         public ConnectionPoisoningHandler(string jobType) => JobType = jobType;
         public string JobType { get; }
 
-        public async Task RunAsync(
+        public async Task<JobRunOutcome> RunAsync(
             AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken ct)
         {
             await db.Database.BeginTransactionAsync(ct);

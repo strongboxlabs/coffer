@@ -2,7 +2,23 @@
 // from @testing-library/jest-dom (toBeInTheDocument, toHaveValue,
 // toBeDisabled, etc.) so component tests read idiomatically.
 import '@testing-library/jest-dom/vitest';
+import { configure } from '@testing-library/react';
 import { vi } from 'vitest';
+
+// testing-library's findBy*/waitFor default to a 1000ms timeout. That is a race
+// against however long the component takes to render its first data-dependent
+// element, and on a loaded machine the machine wins: a CI run that took 1111s
+// against a normal ~500s failed RegisterRouter's `findByRole('columnheader')`
+// while the same test passed in isolation, in the full local suite, and on a
+// re-run. A false red is worse than a slow test — it trains everyone to re-run
+// the gate instead of reading it.
+//
+// Raised globally rather than per call site because there is nothing special
+// about that one assertion: 67 test files use findBy* the same way, so a
+// one-line fix there would just relocate the flake. The cost is only paid when a
+// test genuinely fails (it then takes 5s to say so, not 1s); passing tests
+// resolve as soon as the element appears and are unaffected.
+configure({ asyncUtilTimeout: 5000 });
 import type * as React from 'react';
 import { createElement, forwardRef, useImperativeHandle } from 'react';
 

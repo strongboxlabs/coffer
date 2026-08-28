@@ -203,15 +203,17 @@ public static class AdminMasterKeyEndpoints
         await audit.AppendAsync(
             AdminAuditActions.MasterKeyRotated, currentUser.UserId,
             $"'{currentKey.Id}' -> '{newId}'; {result.LedgersRotated} ledger key(s), "
-            + $"passphrase={result.PassphraseRotated}, driveToken={result.DriveTokenRotated}",
+            + $"passphrase={result.PassphraseRotated}, driveToken={result.DriveTokenRotated}, "
+            + $"notificationTargets={result.NotificationTargetsRotated}",
             cancellationToken).ConfigureAwait(false);
 
         loggerFactory.CreateLogger("Coffer.Api.MasterKey").LogWarning(
             "Master KEK rotated to '{NewId}' by admin {UserId}: {Ledgers} ledger key(s), "
-            + "passphrase={Pass}, driveToken={Drive}. Previous key archived at {Archive}. "
-            + "Restarting to load the new key.",
+            + "passphrase={Pass}, driveToken={Drive}, notificationTargets={Targets}. "
+            + "Previous key archived at {Archive}. Restarting to load the new key.",
             newId, currentUser.UserId, result.LedgersRotated, result.PassphraseRotated,
-            result.DriveTokenRotated, outcome.PreviousKeyArchivedAt ?? "(none)");
+            result.DriveTokenRotated, result.NotificationTargetsRotated,
+            outcome.PreviousKeyArchivedAt ?? "(none)");
 
         // The MasterKey singleton is immutable by design (ADR-0092 D2), so the only
         // way to pick up the new key is a restart — the same mechanism the bootstrap
@@ -227,6 +229,7 @@ public static class AdminMasterKeyEndpoints
             LedgersRotated: result.LedgersRotated,
             BackupPassphraseRotated: result.PassphraseRotated,
             DriveTokenRotated: result.DriveTokenRotated,
+            NotificationTargetsRotated: result.NotificationTargetsRotated,
             PreviousKeyArchivedAt: outcome.PreviousKeyArchivedAt,
             RestartPending: true));
     }

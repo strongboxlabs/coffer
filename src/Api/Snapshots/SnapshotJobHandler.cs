@@ -22,13 +22,35 @@ public sealed class SnapshotJobHandler : IScheduledJobHandler
 
     public string JobType => JobTypes.Snapshot;
 
-    public async Task RunAsync(
+    /// <summary>
+    /// Creates the auto snapshot, and reports a skipped one as <c>Degraded</c>.
+    /// </summary>
+    /// <remarks>
+    /// The result used to be discarded. <c>SkippedDueToFullPool</c> means all five slots
+    /// hold manual snaps, so auto coverage has silently paused — the ledger keeps
+    /// reporting a healthy daily job while its snapshots stop advancing, which is exactly
+    /// the state a dead-man's switch is supposed to catch and would not have.
+    /// </remarks>
+    public async Task<JobRunOutcome> RunAsync(
         AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken cancellationToken)
     {
         var repo = new LedgerSnapshotsRepository(
             db, _loggers.CreateLogger<LedgerSnapshotsRepository>());
-        await repo.CreateAsync(
+        var result = await repo.CreateAsync(
             ledgerId, kind: "auto", createdByUserId: configuredByUserId,
             description: null, cancellationToken).ConfigureAwait(false);
+
+        return result.Outcome switch
+        {
+            LedgerSnapshotsRepository.CreateOutcome.Created => JobRunOutcome.Ok(),
+            LedgerSnapshotsRepository.CreateOutcome.SkippedDueToFullPool => JobRunOutcome.Degraded(
+                "Automatic snapshot skipped: all five slots hold manual snapshots. "
+                + "Delete one to resume automatic coverage."),
+            // AtCap is the MANUAL rejection path and cannot arrive here; treated as
+            // degraded rather than ignored, because a new enum member reaching this
+            // switch silently would be the same class of bug as the discarded result.
+            _ => JobRunOutcome.Degraded(
+                "Automatic snapshot did not run: " + result.Outcome + "."),
+        };
     }
 }

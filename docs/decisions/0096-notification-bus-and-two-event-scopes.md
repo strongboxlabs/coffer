@@ -139,6 +139,44 @@ take the install offline over a cosmetic discrepancy. Consistency belongs to
 `system_events` and a heartbeat topic, not to a probe an orchestrator uses to
 decide whether to route requests.
 
+### D7 — Subscribers are PROVIDERS, and they come in two capability classes
+
+Delivery is pluggable, on the `IQuotePullProvider` pattern already proven here
+(ADR-0033): an `INotificationSubscriber` declares a `SubscriberKey` and a
+`DisplayName`, the registry is DI, and the publisher routes. There is no reason to
+invent a second provider pattern for the same shape of problem.
+
+The part that is NOT cosmetic is that providers divide by capability:
+
+| class | examples | detects absence |
+|---|---|---|
+| **heartbeat** | healthchecks.io (self-hosted or SaaS), Uptime Kuma push | **yes** — pinged on success, alerts on silence |
+| **message** | ntfy, Discord, Slack, generic webhook | no — delivers what it is given |
+
+Only a heartbeat provider delivers the guarantee D5 exists for. A message provider
+cannot notice that nothing arrived, because noticing requires something outside the
+deployment to be counting.
+
+So the interface **declares its class**, and the configuration surface **warns when
+no heartbeat-capable subscriber is configured**. Without that warning, provider
+choice becomes a way to opt out of the entire point of this ADR by accident:
+someone wires up a Discord webhook, sees test messages arrive, believes they are
+covered, and has silently kept the 68-hour failure mode.
+
+### D8 — Subscriber credentials are sealed in the database, not docker secrets
+
+A provider URL or token is stored in a `notification_subscribers` row, sealed with
+the master key via `LedgerKeyService.OpenWithMasterKey` — the pattern Drive sync
+already uses for its outbound OAuth blob.
+
+Not the `secrets/` docker-secret pattern, despite that being where the database
+passwords live, and the distinction is worth stating because it looked like the
+obvious answer: **docker secrets are for credentials the application needs BEFORE
+it can read a database.** Postgres passwords qualify. A webhook URL does not — it
+is a user-configurable integration, added and changed at runtime, and one file per
+provider neither scales past the first nor survives adding a second without a
+container restart.
+
 ## Consequences
 
 * Two tables and one bus: more moving parts than a single stream, bought
@@ -152,6 +190,12 @@ decide whether to route requests.
   stated plainly in the docs rather than papered over.
 * `ledger_operations` keeps its shape, so nothing existing has to be migrated to
   land D2–D4.
+* Provider choice is the user's, but the heartbeat warning (D7) means the trade is
+  visible rather than silent: configure only message providers and the product says
+  what has been given up.
+* Two subscribers ship first — `healthchecks` and a generic `webhook` — because
+  building one of each class immediately exercises the D7 split rather than leaving
+  it theoretical until the second provider arrives.
 
 ## Alternatives considered
 
@@ -170,6 +214,12 @@ fit without exactly the nullable-scope hole above.
 secret to manage. Rejected on D5: it cannot detect the failure that prompted the
 ADR. It is the design that was already in place, and it produced 68 hours of
 silence.
+
+**A single hardcoded provider (healthchecks.io).** Less machinery, and it covers
+the guarantee. Rejected: a self-hoster may already run Uptime Kuma, ntfy or nothing
+at all, and hardcoding one SaaS into the only alerting path makes the product's
+reliability story depend on someone else's business. The provider pattern costs an
+interface and a registry, both of which already exist for quotes.
 
 **Email as the first channel.** More familiar than a heartbeat service, and it
 pushes. Deferred rather than rejected: it needs SMTP configuration and

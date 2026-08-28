@@ -214,6 +214,17 @@ public sealed class MoneydanceImportService : IMoneydanceImportService
         // seed explicitly (the per-ledger analogue of the mig-177 backfill).
         Advance(await TradePriceSeedStep.RunAsync(connection, importContext, cancellationToken).ConfigureAwait(false));
         Advance(await ReminderImportStep.RunAsync(connection, importContext, ImportSource, cancellationToken).ConfigureAwait(false));
+        // Everything above wrote its rows inside this transaction, so the planner
+        // still holds PRE-IMPORT statistics: on a fresh install it believes
+        // txn_legs has a few dozen rows when it now has six figures. The two
+        // recompute steps below are the first statements big enough to care, and a
+        // plan chosen for a 72-row table does not survive contact with 100k. ANALYZE
+        // inside a transaction sees this transaction's own uncommitted rows, which
+        // is exactly what makes it usable here (VACUUM would not be).
+        await connection.ExecuteAsync(new CommandDefinition(
+            "ANALYZE txn_headers, txn_legs, txn_header_overrides, txn_leg_overrides, accounts;",
+            cancellationToken: cancellationToken)).ConfigureAwait(false);
+
         // The importer uses Dapper / raw SQL, so the API's recompute interceptors
         // never see these writes — explicit recompute per the ADR-0032/0034/0046
         // call-site contract for non-EF paths.

@@ -44,6 +44,7 @@ export interface MasterKeyRotation {
     ledgersRotated: number;
     backupPassphraseRotated: boolean;
     driveTokenRotated: boolean;
+    notificationTargetsRotated: number;
     /** Where the previous key file was moved, so a mistaken rotation is
      *  reversible. Null when there was no prior file. */
     previousKeyArchivedAt: string | null;

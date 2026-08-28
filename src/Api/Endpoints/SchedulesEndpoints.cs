@@ -83,6 +83,13 @@ public static class SchedulesEndpoints
     }
 
     // Sensible default time-of-day per job type (used only when no row exists).
-    private static int DefaultHour(string jobType) =>
-        jobType == JobTypes.Snapshot ? 3 : 19;
+    private static int DefaultHour(string jobType) => jobType switch
+    {
+        JobTypes.Snapshot => 3,
+        // Early morning: overnight postings have settled, and it is well clear of the
+        // 19:00 quote refresh so a ledger running both does not fire two outbound bursts
+        // at once.
+        JobTypes.FeedSync => 6,
+        _ => 19,
+    };
 }

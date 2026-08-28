@@ -62,13 +62,15 @@ public sealed class KekReconciliationService
         int LedgersRekeyed,
         int FeedConnectionsNeedingReauth,
         bool BackupPassphraseCleared,
-        bool DriveDisconnected)
+        bool DriveDisconnected,
+        int NotificationTargetsDisabled)
     {
         /// <summary>True when anything was abandoned, i.e. the restore crossed a
         /// KEK boundary.</summary>
         public bool AnythingChanged =>
             LedgersRekeyed > 0 || FeedConnectionsNeedingReauth > 0
-            || BackupPassphraseCleared || DriveDisconnected;
+            || BackupPassphraseCleared || DriveDisconnected
+            || NotificationTargetsDisabled > 0;
     }
 
     /// <summary>
@@ -84,12 +86,14 @@ public sealed class KekReconciliationService
         var (ledgersRekeyed, feedsCleared) = await ReconcileLedgersAsync(db, ct).ConfigureAwait(false);
         var passphraseCleared = await ReconcileBackupPassphraseAsync(db, ct).ConfigureAwait(false);
         var driveDisconnected = await ReconcileDriveAsync(db, ct).ConfigureAwait(false);
+        var targetsDisabled = await ReconcileNotificationTargetsAsync(db, ct).ConfigureAwait(false);
 
         await db.SaveChangesAsync(ct).ConfigureAwait(false);
         await tx.CommitAsync(ct).ConfigureAwait(false);
 
         var result = new ReconciliationResult(
-            ledgersRekeyed, feedsCleared, passphraseCleared, driveDisconnected);
+            ledgersRekeyed, feedsCleared, passphraseCleared, driveDisconnected,
+            targetsDisabled);
 
         if (result.AnythingChanged)
             // Warning, not Information: the operator has re-establishment work to
@@ -98,9 +102,10 @@ public sealed class KekReconciliationService
             _logger.LogWarning(
                 "KEK reconciliation after restore: {Ledgers} ledger key(s) replaced, "
                 + "{Feeds} feed connection(s) flagged needs_reauth, backup passphrase cleared={Pass}, "
+                + "{Targets} notification target(s) disabled, "
                 + "Drive disconnected={Drive}. These secrets were sealed under a different master KEK "
                 + "and could not be carried over; ledger data and passkeys are unaffected.",
-                ledgersRekeyed, feedsCleared, passphraseCleared, driveDisconnected);
+                ledgersRekeyed, feedsCleared, passphraseCleared, targetsDisabled, driveDisconnected);
         else
             _logger.LogInformation(
                 "KEK reconciliation after restore: everything opens under this install's master KEK.");
@@ -205,6 +210,88 @@ public sealed class KekReconciliationService
         }
 
         return disconnected;
+    }
+
+    /// <summary>
+    /// Disable any delivery target whose sealed config this install's KEK cannot open,
+    /// recording why on the row.
+    /// </summary>
+    /// <remarks>
+    /// Same treatment as the Drive token above, for the same reason: a target left
+    /// enabled with unopenable ciphertext fails on every publish, forever, and the only
+    /// trace is a per-target last_error on a page nobody opens until they wonder why it
+    /// went quiet. Off with a stated reason is the honest state until an admin re-enters
+    /// the URL.
+    /// <para>
+    /// The ciphertext is EMPTIED, and that detail is load-bearing. An earlier version
+    /// kept it, reasoning that an unopenable blob is not a secret this install can leak
+    /// and that the row should still show what kind of target it was. Both halves of
+    /// that are true and the conclusion was still wrong: <c>KekRotationService</c>
+    /// selects on <c>config_ciphertext</c> length with no <c>is_enabled</c> filter and
+    /// calls <c>OpenOrThrow</c>, so a retained foreign blob aborts every later master-key
+    /// rotation — permanently, and with an error telling the operator to do the very
+    /// reconciliation they already did. Worse on the ledger-scope table, where the only
+    /// delete route requires a grant on that ledger, so a deployment admin without one
+    /// has no way to remove the row at all.
+    /// </para>
+    /// <para>
+    /// The two sibling reconcilers above avoid this by setting their blob to
+    /// <c>null</c>, which rotation's null guards then skip. These columns are BYTEA NOT
+    /// NULL, so the equivalent is an empty array — which satisfies the constraint,
+    /// keeps the row and its display name, and makes rotation's <c>Length &gt; 0</c>
+    /// filter skip it. Same invariant as the siblings: after reconciliation the
+    /// database holds no ciphertext this install cannot open.
+    /// </para>
+    /// <para>
+    /// Both scopes. Reconciling the deployment's targets and leaving every ledger's own
+    /// targets silently broken would be worse than doing neither, because the panel
+    /// would look reconciled.
+    /// </para>
+    /// </remarks>
+    private async Task<int> ReconcileNotificationTargetsAsync(
+        AppDbContext db, CancellationToken ct)
+    {
+        const string Reason =
+            "Disabled during restore: this target's URL was sealed under a different "
+            + "master KEK and could not be carried over. Re-enter it to resume delivery.";
+
+        var disabled = 0;
+
+        // Not filtered on IsEnabled. A target an admin had already switched off still
+        // carries a blob rotation will choke on, and this method is the only thing that
+        // retires it. Filtering on IsEnabled would also skip exactly the rows a previous
+        // run produced, so a re-restore onto a third install would leave the invariant
+        // unmet. Rows whose ciphertext is already empty are skipped by the length guard,
+        // which is what makes a second run a no-op.
+        foreach (var row in await db.NotificationSubscribers
+                     .Where(t => t.ConfigCiphertext.Length > 0)
+                     .ToListAsync(ct).ConfigureAwait(false))
+        {
+            if (CanOpen(row.ConfigCiphertext)) continue;
+
+            row.ConfigCiphertext = [];
+            row.IsEnabled = false;
+            row.LastError = Reason;
+            row.LastFailureAt = DateTime.UtcNow;
+            row.UpdatedAt = DateTime.UtcNow;
+            disabled++;
+        }
+
+        foreach (var row in await db.LedgerNotificationSubscribers
+                     .Where(t => t.ConfigCiphertext.Length > 0)
+                     .ToListAsync(ct).ConfigureAwait(false))
+        {
+            if (CanOpen(row.ConfigCiphertext)) continue;
+
+            row.ConfigCiphertext = [];
+            row.IsEnabled = false;
+            row.LastError = Reason;
+            row.LastFailureAt = DateTime.UtcNow;
+            row.UpdatedAt = DateTime.UtcNow;
+            disabled++;
+        }
+
+        return disabled;
     }
 
     /// <summary>

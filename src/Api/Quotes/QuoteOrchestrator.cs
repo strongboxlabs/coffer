@@ -31,6 +31,13 @@ namespace Coffer.Api.Quotes;
 /// </remarks>
 public sealed class QuoteOrchestrator
 {
+    /// <summary>
+    /// Decimal places <c>security_prices.price</c> stores — NUMERIC(19,4), mig 155.
+    /// Named rather than inlined so the reason a quote is rounded is the column, not
+    /// a number someone picked.
+    /// </summary>
+    private const int PriceScale = 4;
+
     private readonly AppDbContext _db;
     private readonly IReadOnlyDictionary<string, IQuotePullProvider> _pullProviders;
     private readonly IReadOnlyDictionary<string, IQuotePushProvider> _pushProviders;
@@ -215,7 +222,11 @@ public sealed class QuoteOrchestrator
                     allErrors.Add(new QuoteError(
                         SecurityId: null,
                         Ticker: string.Empty,
-                        Code: "provider-exception",
+                        // Shared with the scheduled handler, which classifies a run
+                        // carrying this code as degraded rather than successful. A
+                        // string literal in both places is one rename away from a
+                        // dead-man's switch that silently goes back to lying.
+                        Code: Scheduling.QuoteRefreshJobHandler.ProviderExceptionCode,
                         Message: $"{key}: {ex.Message}"));
                 }
             }
@@ -329,8 +340,26 @@ public sealed class QuoteOrchestrator
             var existingByKey = existing.ToDictionary(
                 p => (p.SecurityId, Day: p.PriceDate), p => p);
 
-            foreach (var (key, q) in perKey)
+            foreach (var (key, entry) in perKey)
             {
+                // Normalize to the STORED scale before anything compares or writes it.
+                // security_prices.price is NUMERIC(19,4) (mig 155), so a provider that
+                // hands over more decimals gets rounded by Postgres on assignment — and
+                // then the value in memory no longer equals the value in the column.
+                // That breaks change detection rather than the price: the comparison
+                // below never matches, so every refetch rewrites the row and counts an
+                // update that changed nothing. A Yahoo close is float-derived (mig 155
+                // cites 7.150000095367 from that same `fetch` source), so it fired
+                // essentially every time.
+                //
+                // Rounded HERE, at the single write path, rather than trusting each
+                // provider to remember: mig 155 narrowed the column on the premise that
+                // "current producers already round to 4dp", and the premise was already
+                // stale — the Yahoo provider predated it. Three providers each restating
+                // one rule is three chances to get it wrong; this is the one place all
+                // of them converge.
+                var q = entry with { Price = decimal.Round(entry.Price, PriceScale) };
+
                 if (existingByKey.TryGetValue(key, out var existingRow))
                 {
                     // Source-priority upsert (ADR-0070 D2): overwrite the day's

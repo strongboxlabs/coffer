@@ -9,6 +9,7 @@ export const SETTINGS_TAB_IDS = [
     'snapshots',
     'feeds',
     'quotes',
+    'notifications',
     'activity',
     'dashboard',
 ] as const;
@@ -21,6 +22,9 @@ export const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; label: string }> = 
     { id: 'snapshots', label: 'Snapshots' },
     { id: 'feeds', label: 'Bank feeds' },
     { id: 'quotes', label: 'Quotes' },
+    // Before Activity: Activity is the log of what happened, this is where you
+    // say who gets told about it.
+    { id: 'notifications', label: 'Notifications' },
     { id: 'activity', label: 'Activity' },
     { id: 'dashboard', label: 'Dashboard' },
 ];

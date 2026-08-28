@@ -23,6 +23,14 @@ public sealed class LedgerConsistencyRepository
 {
     private const int MaxMismatchesPerProjection = 100;
 
+    /// <summary>
+    /// "As of the end of time" — the check's horizon must match the writer's, and the
+    /// writer has none. Named rather than inlined so a reader sees the intent instead
+    /// of wondering why a consistency check cares about the year 9999.
+    /// </summary>
+    private static readonly DateTime NoHorizon =
+        DateTime.SpecifyKind(DateTime.MaxValue, DateTimeKind.Utc);
+
     private readonly AppDbContext _db;
     private readonly RegisterRepository _register;
     private readonly HoldingsRecomputeService _holdings;
@@ -88,7 +96,21 @@ public sealed class LedgerConsistencyRepository
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        var walked = (await _db.HoldingsCostBasisAsOf(ledgerId, DateTime.UtcNow, null)
+        // NO upper bound, because the WRITER has none. recompute_holdings_cost_basis
+        // calls holdings_fifo_walk(account, security, NULL) — every event, whenever
+        // posted — so stored holdings include future-dated ones. Asking here for
+        // "as of now" compared stored-including-future against expected-excluding-
+        // future, and a scheduled transaction is a first-class state (the register's
+        // whole "scheduled" tab is headers posted after now). One future-dated trade
+        // therefore reported drift the repair could not fix: the repair walks
+        // unbounded, re-stores the same values, and the next check reports the same
+        // mismatch, forever.
+        //
+        // A check must expect exactly what the writer produces. The bound is a
+        // non-nullable parameter on the EF binding, so "no bound" is expressed as the
+        // maximum representable instant; the SQL's own comparisons are
+        // `posted_at <= p_as_of`, which that satisfies for every real event.
+        var walked = (await _db.HoldingsCostBasisAsOf(ledgerId, NoHorizon, null)
             .Select(r => new { r.AccountId, r.SecurityId, r.Quantity, r.CostBasis })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false))

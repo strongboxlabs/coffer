@@ -619,6 +619,31 @@ builder.Services.AddScoped<AccountGroupsRepository>();
 builder.Services.AddScoped<FeedConnectionsRepository>();
 builder.Services.AddScoped<LedgerOperationsRepository>();
 builder.Services.AddScoped<RegisterRepository>();
+
+// ---------------------------------------------------------------------------
+// Notifications (ADR-0096). One publish path, pluggable delivery.
+//
+// Subscribers are PROVIDERS on the same shape as the quote providers: a stable
+// key, a display name, and a declared capability. The capability is not
+// decoration — only a Heartbeat provider can report what did NOT happen, because
+// noticing silence needs something outside the deployment to be counting. A
+// message-only webhook says nothing when the container is dead, which is the
+// failure that cost 68 hours.
+// ---------------------------------------------------------------------------
+builder.Services.AddHttpClient<Coffer.Api.Notifications.INotificationSubscriber,
+    Coffer.Api.Notifications.Providers.HealthchecksSubscriber>(c =>
+    {
+        // Short: a heartbeat ping that hangs must not hold up the job reporting it.
+        c.Timeout = TimeSpan.FromSeconds(10);
+    });
+builder.Services.AddHttpClient<Coffer.Api.Notifications.INotificationSubscriber,
+    Coffer.Api.Notifications.Providers.WebhookSubscriber>(c =>
+    {
+        c.Timeout = TimeSpan.FromSeconds(10);
+    });
+builder.Services.AddScoped<Coffer.Api.Notifications.NotificationPublisher>();
+builder.Services.AddScoped<Coffer.Api.Notifications.BackupAgeMonitor>();
+builder.Services.AddScoped<Coffer.Api.Notifications.ConsistencyMonitor>();
 builder.Services.AddScoped<LedgerConsistencyRepository>();
 builder.Services.AddScoped<PayeesRepository>();
 builder.Services.AddScoped<TransactionsRepository>();
@@ -654,6 +679,10 @@ builder.Services.AddScoped<Coffer.Api.Scheduling.IScheduledJobHandler,
     Coffer.Api.Quotes.Scheduling.QuoteRefreshJobHandler>();
 builder.Services.AddScoped<Coffer.Api.Scheduling.IScheduledJobHandler,
     Coffer.Api.Snapshots.SnapshotJobHandler>();
+// Bank feed sync on a schedule (mig 215). IngestOrchestrator is already scoped, and the
+// handler is resolved per tick inside the worker's own scope.
+builder.Services.AddScoped<Coffer.Api.Scheduling.IScheduledJobHandler,
+    Coffer.Api.Ingest.FeedSyncJobHandler>();
 // Global (non-ledger) job handlers — the same worker scans global_scheduled_jobs
 // (mig 139) and dispatches these (ADR-0060: whole-DB backup).
 builder.Services.AddScoped<Coffer.Api.Scheduling.IGlobalScheduledJobHandler,
@@ -1216,6 +1245,10 @@ app.UseRateLimiter();
 // OpenAPI document at /openapi/v1.json (the .NET 10 default).
 app.MapOpenApi();
 
+// Deployment-scope notifications (ADR-0096). Unconditional: nothing here depends
+// on the MCP server being enabled, and a backup heartbeat must publish regardless.
+app.MapAdminNotificationsEndpoints();
+app.MapLedgerNotificationsEndpoints();
 app.MapHealthEndpoints();
 app.MapMetaEndpoints();
 app.MapAuthEndpoints();

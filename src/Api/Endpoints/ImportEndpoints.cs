@@ -39,7 +39,13 @@ public static class ImportEndpoints
         var parseError = TryParse(file!, out var export);
         if (parseError is not null) return parseError;
 
-        return Results.Ok(ToPreviewDto(service.Preview(export!)));
+        // Preview is entirely inline, so this scope owns the parsed document and
+        // must release it — an 80 MB export costs ~520 MB of it. ToPreviewDto
+        // materializes its counts, so the DTO outlives the export safely.
+        using (export)
+        {
+            return Results.Ok(ToPreviewDto(service.Preview(export!)));
+        }
     }
 
     /// <summary>Create the named new ledger and kick off the background import.</summary>
@@ -54,6 +60,10 @@ public static class ImportEndpoints
         var parseError = TryParse(file!, out var export);
         if (parseError is not null) return parseError;
 
+        // Ownership of the parsed export passes to the runner here — including on
+        // the rejected path, where the runner disposes it. Do NOT wrap this in a
+        // using: the import is fire-and-forget and outlives this request, so
+        // disposing here would tear the document out from under it.
         var jobId = runner.Start(currentUser.UserId, ledgerName!, export!);
         if (jobId is null)
             return BusinessError.Problem(BusinessError.Codes.ImportAlreadyRunning,
@@ -114,6 +124,22 @@ public static class ImportEndpoints
         {
             return BusinessError.Problem(BusinessError.Codes.ImportParseFailed,
                 $"Could not read the Moneydance export: {ex.Message}");
+        }
+        catch (OutOfMemoryException)
+        {
+            // Not a recovery strategy — a translation. A held export costs roughly
+            // 6.5x the file size (measured: 80.5 MB in, 522 MB retained), and when
+            // that exceeded the container the user got the generic "An error occurred
+            // while processing your request" from the global handler, with the actual
+            // cause visible only as one log line inside a container. Whatever else is
+            // true, an operator needs to be told which knob to turn. Nothing is left
+            // half-written: the parse either produced a document or it did not.
+            var budget = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+            return BusinessError.Problem(BusinessError.Codes.ImportParseFailed,
+                $"This export ({file.Length / 1048576} MB) needs about "
+                + $"{file.Length * 13 / 2 / 1048576} MB of memory to import, and this "
+                + $"server has {budget / 1048576} MB in total. Raise the API container's "
+                + "memory limit (COFFER_API_MEM_LIMIT) and retry.");
         }
     }
 

@@ -144,6 +144,20 @@ public sealed class AppDbContext : DbContext
     internal DbSet<SystemSettingRow> SystemSettings => Set<SystemSettingRow>();
     // ADR-0092 D2 / migration 191: deployment-level admin audit. Append-only.
     internal DbSet<AdminAuditEventRow> AdminAuditEvents => Set<AdminAuditEventRow>();
+
+    /// <summary>Deployment-scope notifications (mig 207, ADR-0096 D1).</summary>
+    internal DbSet<SystemEventRow> SystemEvents => Set<SystemEventRow>();
+
+    /// <summary>Configured notification delivery targets (mig 207, ADR-0096 D7).</summary>
+    internal DbSet<NotificationSubscriberRow> NotificationSubscribers =>
+        Set<NotificationSubscriberRow>();
+
+    /// <summary>Ledger-scope notifications (mig 208, ADR-0096 D1).</summary>
+    internal DbSet<LedgerEventRow> LedgerEvents => Set<LedgerEventRow>();
+
+    /// <summary>A ledger's own delivery targets, for mode 'own' (mig 208).</summary>
+    internal DbSet<LedgerNotificationSubscriberRow> LedgerNotificationSubscribers =>
+        Set<LedgerNotificationSubscriberRow>();
     // ADR-0034 / migration 089: per-(header, account) running balance.
     // Read-only from the API perspective; the header-walk trigger family
     // (mig 090) owns the writes.
@@ -835,6 +849,81 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.Detail).HasColumnName("detail");
             b.HasOne<UserRow>().WithMany().HasForeignKey(x => x.ActorUserId)
                 .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        // Migration 207 — deployment-scope notifications (ADR-0096 D1). No
+        // ledger_id: this table is about the installation, so its rows outlive
+        // every ledger and its authorization question is admin, not grant.
+        modelBuilder.Entity<SystemEventRow>(b =>
+        {
+            b.ToTable("system_events");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
+            b.Property(x => x.OccurredAt).HasColumnName("occurred_at").ValueGeneratedOnAdd();
+            b.Property(x => x.Severity).HasColumnName("severity");
+            b.Property(x => x.Topic).HasColumnName("topic");
+            b.Property(x => x.EventKey).HasColumnName("event_key");
+            b.Property(x => x.Summary).HasColumnName("summary");
+            b.Property(x => x.DetailJson).HasColumnName("detail").HasColumnType("jsonb");
+        });
+
+        // Migration 207 — delivery targets. config_ciphertext is sealed with the
+        // master key (ADR-0096 D8); nothing here ever holds it in plain text.
+        modelBuilder.Entity<NotificationSubscriberRow>(b =>
+        {
+            b.ToTable("notification_subscribers");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
+            b.Property(x => x.SubscriberKey).HasColumnName("subscriber_key");
+            b.Property(x => x.DisplayName).HasColumnName("display_name");
+            b.Property(x => x.IsEnabled).HasColumnName("is_enabled");
+            b.Property(x => x.MinSeverity).HasColumnName("min_severity");
+            b.Property(x => x.Topics).HasColumnName("topics");
+            b.Property(x => x.Monitors).HasColumnName("monitors");
+            b.Property(x => x.ConfigCiphertext).HasColumnName("config_ciphertext");
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+            b.Property(x => x.LastSuccessAt).HasColumnName("last_success_at");
+            b.Property(x => x.LastFailureAt).HasColumnName("last_failure_at");
+            b.Property(x => x.LastError).HasColumnName("last_error");
+            b.Property(x => x.ConsecutiveFailures).HasColumnName("consecutive_failures");
+        });
+
+        // Migration 208 — the ledger half. Same shape as the system tables plus a
+        // ledger_id, and RLS-gated by grant rather than admin.
+        modelBuilder.Entity<LedgerEventRow>(b =>
+        {
+            b.ToTable("ledger_events");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
+            b.Property(x => x.LedgerId).HasColumnName("ledger_id");
+            b.Property(x => x.OccurredAt).HasColumnName("occurred_at").ValueGeneratedOnAdd();
+            b.Property(x => x.Severity).HasColumnName("severity");
+            b.Property(x => x.Topic).HasColumnName("topic");
+            b.Property(x => x.EventKey).HasColumnName("event_key");
+            b.Property(x => x.Summary).HasColumnName("summary");
+            b.Property(x => x.DetailJson).HasColumnName("detail").HasColumnType("jsonb");
+        });
+
+        modelBuilder.Entity<LedgerNotificationSubscriberRow>(b =>
+        {
+            b.ToTable("ledger_notification_subscribers");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
+            b.Property(x => x.LedgerId).HasColumnName("ledger_id");
+            b.Property(x => x.SubscriberKey).HasColumnName("subscriber_key");
+            b.Property(x => x.DisplayName).HasColumnName("display_name");
+            b.Property(x => x.IsEnabled).HasColumnName("is_enabled");
+            b.Property(x => x.MinSeverity).HasColumnName("min_severity");
+            b.Property(x => x.Topics).HasColumnName("topics");
+            b.Property(x => x.Monitors).HasColumnName("monitors");
+            b.Property(x => x.ConfigCiphertext).HasColumnName("config_ciphertext");
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+            b.Property(x => x.LastSuccessAt).HasColumnName("last_success_at");
+            b.Property(x => x.LastFailureAt).HasColumnName("last_failure_at");
+            b.Property(x => x.LastError).HasColumnName("last_error");
+            b.Property(x => x.ConsecutiveFailures).HasColumnName("consecutive_failures");
         });
 
         // ----- Investment surface (read-only at this layer) ----------

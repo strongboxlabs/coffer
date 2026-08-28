@@ -35,4 +35,5 @@ public sealed class LedgerRow
     /// <see cref="CreatedAt"/>: the LEK can rotate without the
     /// ledger row itself being touched.</summary>
     public DateTime? LekCreatedAt { get; set; }
+
 }

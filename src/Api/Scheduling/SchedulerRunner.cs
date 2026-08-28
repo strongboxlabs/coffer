@@ -42,12 +42,18 @@ public sealed class SchedulerRunner
     /// trace — the column is surfaced in the SPA.</summary>
     private const int MaxErrorLength = 500;
 
+    /// <param name="publisher">
+    /// Emits each finished run as its monitor's signal. Optional so the runner stays
+    /// constructible in tests that are not about notifications; when it is null the jobs
+    /// run exactly as before and nothing is announced.
+    /// </param>
     public async Task<int> RunDueAsync(
         AppDbContext db,
         IReadOnlyDictionary<string, IScheduledJobHandler> handlers,
         DateTime nowUtc,
         ILogger logger,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Notifications.NotificationPublisher? publisher = null)
     {
         var due = await db.ScheduledJobs
             .Where(j => j.Enabled && j.NextRunAt != null && j.NextRunAt <= nowUtc)
@@ -78,9 +84,11 @@ public sealed class SchedulerRunner
             }
 
             Exception? failure = null;
+            var outcome = JobRunOutcome.Ok();
             try
             {
-                await handler.RunAsync(db, job.LedgerId, job.ConfiguredByUserId, cancellationToken)
+                outcome = await handler
+                    .RunAsync(db, job.LedgerId, job.ConfiguredByUserId, cancellationToken)
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -95,7 +103,41 @@ public sealed class SchedulerRunner
                     job.JobType, job.LedgerId);
             }
 
-            ApplyOutcome(job, failure, nowUtc, logger, job.JobType, job.LedgerId.ToString());
+            ApplyOutcome(
+                job, failure, outcome, nowUtc, logger, job.JobType, job.LedgerId.ToString());
+
+            // One signal per run, emitted HERE rather than in the handlers: a handler
+            // that forgot to emit would produce precisely the silence its monitor exists
+            // to detect, and this point is reached by the run that threw as well as the
+            // one that returned.
+            //
+            // Announcing must never cost a job. A publisher that throws — an unreachable
+            // webhook, a DNS failure — has already been recorded against the subscriber
+            // row, and letting it escape here would abandon the rest of the tick over a
+            // notification.
+            if (publisher is not null)
+            {
+                var signal = JobMonitorSignal.For(job.JobType, outcome, failure);
+                if (signal is not null)
+                {
+                    try
+                    {
+                        await publisher
+                            .PublishLedgerAsync(job.LedgerId, signal, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex,
+                            "Could not announce {JobType} for ledger {LedgerId}; the job "
+                            + "itself is unaffected.", job.JobType, job.LedgerId);
+                    }
+                }
+            }
 
             // Bookkeeping only — the advance is already durable. If this save
             // fails the connection is probably gone, so abandon the tick and let
@@ -162,7 +204,11 @@ public sealed class SchedulerRunner
                 logger.LogError(ex, "Global scheduled job {JobType} failed; continuing.", job.JobType);
             }
 
-            ApplyOutcome(job, failure, nowUtc, logger, job.JobType, ledgerId: null);
+            // Global handlers have no outcome channel: the backup job already publishes
+            // its own Success/Failure signal directly (DailyBackupJobHandler), so there
+            // is nothing here for a third state to describe.
+            ApplyOutcome(
+                job, failure, JobRunOutcome.Ok(), nowUtc, logger, job.JobType, ledgerId: null);
 
             if (!await TrySaveAsync(db, logger, cancellationToken).ConfigureAwait(false))
                 break;
@@ -172,14 +218,35 @@ public sealed class SchedulerRunner
     }
 
     /// <summary>
-    /// Records success (reset the counter) or failure (increment, capture the
-    /// message, disable at the threshold) on either job shape.
+    /// Records success (reset the counter), a degraded run (keep the counter, keep the
+    /// reason), or failure (increment, capture the message, disable at the threshold).
     /// </summary>
+    /// <remarks>
+    /// Degraded sits between the two on purpose. It resets the consecutive-failure count
+    /// — the job DID run, and auto-disabling a daily refresh because one provider was
+    /// flaky for five days loses more than it protects — but it keeps last_error
+    /// populated so the reason is visible rather than logged, and it must never be
+    /// reported upward as a success. See <see cref="JobRunResult"/> for why a two-state
+    /// model was not enough.
+    /// </remarks>
     private static void ApplyOutcome(
-        object row, Exception? failure, DateTime nowUtc, ILogger logger,
+        object row, Exception? failure, JobRunOutcome outcome, DateTime nowUtc, ILogger logger,
         string jobType, string? ledgerId)
     {
         int failures;
+        if (failure is null && outcome.Result == JobRunResult.Degraded)
+        {
+            SetFailureState(
+                row, 0, Truncate(outcome.Message ?? "Ran with degraded results.", MaxErrorLength),
+                nowUtc, enabled: null);
+            logger.LogWarning(
+                "Scheduled job {JobType}{LedgerSuffix} completed with degraded results: {Reason}",
+                jobType,
+                ledgerId is null ? string.Empty : $" for ledger {ledgerId}",
+                outcome.Message);
+            return;
+        }
+
         if (failure is null)
         {
             SetFailureState(row, 0, lastError: null, lastFailureAt: null, enabled: null);

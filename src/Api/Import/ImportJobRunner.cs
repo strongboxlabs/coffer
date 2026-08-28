@@ -45,6 +45,12 @@ public sealed class ImportJobRunner
     /// <paramref name="ledgerName"/>, owned by <paramref name="userId"/>. Returns
     /// the job id, or null when the user already has an import running.
     /// </summary>
+    /// <param name="export">
+    /// TAKES OWNERSHIP. The export holds the parsed JSON document — ~520 MB for a
+    /// large file — and this method disposes it on every path: at the end of the
+    /// background run, or immediately if the job is rejected. Callers must not
+    /// dispose it themselves and must not use it after this returns.
+    /// </param>
     public Guid? Start(Guid userId, string ledgerName, MdExport export)
     {
         var job = new ImportJob
@@ -56,7 +62,13 @@ public sealed class ImportJobRunner
         };
 
         if (!_registry.TryStart(job))
+        {
+            // Nothing will ever run, so nothing else would release the document.
+            // Rejection is a routine, retryable outcome ("an import is already
+            // running"), so leaking here would leak once per impatient retry.
+            export.Dispose();
             return null;
+        }
 
         // Fire-and-forget: the import outlives the HTTP request. Failures are
         // captured on the job, never thrown into the void.
@@ -66,6 +78,10 @@ public sealed class ImportJobRunner
 
     private async Task RunAsync(ImportJob job, MdExport export)
     {
+        // This is the sole owner of the parsed document from here on — the request
+        // that parsed it has already returned. Items are views into it, so it has
+        // to survive the whole import and be released on every exit path.
+        using var owned = export;
         try
         {
             var factory = new DbConnectionFactory(_serviceConnectionString);

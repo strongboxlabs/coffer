@@ -47,7 +47,8 @@ public sealed class ProvisioningService
         Guid ownerUserId,
         CancellationToken cancellationToken = default)
     {
-        var export = LoadDemoExport();
+        // Inline and awaited to completion, so this scope owns the parsed document.
+        using var export = LoadDemoExport();
 
         // Long command timeout for the bulk COMMIT; connect as coffer_service.
         var factory = new DbConnectionFactory(_serviceConnectionString);

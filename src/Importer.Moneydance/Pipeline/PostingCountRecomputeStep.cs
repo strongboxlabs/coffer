@@ -44,21 +44,29 @@ internal sealed class PostingCountRecomputeStep
         var updated = await _connection.ExecuteAsync(
             new CommandDefinition(
                 """
-                WITH htp AS (
-                    SELECT header_id, COUNT(DISTINCT posting_index) AS total
-                      FROM txn_legs WHERE ledger_id = @ledgerId GROUP BY header_id
-                ), aph AS (
+                WITH per_pair AS (
                     SELECT header_id, account_id, COUNT(DISTINCT posting_index) AS cnt
                       FROM txn_legs WHERE ledger_id = @ledgerId GROUP BY header_id, account_id
+                ), per_header AS (
+                    SELECT header_id, COUNT(DISTINCT posting_index) AS total
+                      FROM txn_legs WHERE ledger_id = @ledgerId GROUP BY header_id
                 )
+                -- per_header is joined to per_pair DIRECTLY. It used to be
+                -- `FROM htp, aph` with both tied only to `l` — no predicate between
+                -- the two aggregates — which left "materialize the cross product"
+                -- as a legal plan. On a real 74k-item import that is 42k x 84k
+                -- rows, and the planner picked it: the statement ran past the 600s
+                -- command timeout, every time, at 100% CPU on one core. Joining
+                -- them on header_id makes that plan unrepresentable rather than
+                -- merely unlikely.
                 UPDATE txn_legs l
-                   SET header_total_postings      = htp.total,
-                       account_postings_on_header = aph.cnt
-                  FROM htp, aph
-                 WHERE l.ledger_id = @ledgerId
-                   AND htp.header_id = l.header_id
-                   AND aph.header_id = l.header_id
-                   AND aph.account_id = l.account_id;
+                   SET header_total_postings      = per_header.total,
+                       account_postings_on_header = per_pair.cnt
+                  FROM per_pair
+                  JOIN per_header ON per_header.header_id = per_pair.header_id
+                 WHERE l.ledger_id  = @ledgerId
+                   AND l.header_id  = per_pair.header_id
+                   AND l.account_id = per_pair.account_id;
                 """,
                 new { ledgerId = context.LedgerId },
                 cancellationToken: cancellationToken))

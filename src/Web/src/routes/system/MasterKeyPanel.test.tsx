@@ -188,6 +188,35 @@ describe('MasterKeyPanel', () => {
             .toBeInTheDocument();
     });
 
+    it('does not claim nothing was stored when only delivery URLs were', async () => {
+        // The install with no bank-feed connection, no backup passphrase and no Drive,
+        // but two notification targets. Before the count reached this component,
+        // rotatedItems() came back empty and the panel said "Nothing was stored under
+        // the old key, so only the key changed" — immediately after re-wrapping both
+        // URLs. A false statement produced by the rotation itself.
+        stubStatus();
+        vi.spyOn(masterKeyApi, 'rotateMasterKey').mockResolvedValue({
+            keyBase64: 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=',
+            kekId: 'v2',
+            ledgersRotated: 0,
+            backupPassphraseRotated: false,
+            driveTokenRotated: false,
+            notificationTargetsRotated: 2,
+            previousKeyArchivedAt: '/app/data/master.key.20260806T120000Z.bak',
+            restartPending: true,
+        });
+
+        const user = userEvent.setup();
+        renderPanel();
+
+        await screen.findByText('v1');
+        await user.type(screen.getByLabelText(/to confirm/i), 'rotate');
+        await user.click(screen.getByRole('button', { name: /rotate master key/i }));
+
+        expect(await screen.findByText(/URLs for 2 notification targets/i)).toBeTruthy();
+        expect(screen.queryByText(/nothing was stored under the old key/i)).toBeNull();
+    });
+
     it('names what moved in operator terms, not API counters', async () => {
         // Was "Re-wrapped 3 ledger keys, the backup passphrase" — jargon, and a bare
         // count of something an operator has no concept of.
@@ -198,6 +227,7 @@ describe('MasterKeyPanel', () => {
             ledgersRotated: 3,
             backupPassphraseRotated: true,
             driveTokenRotated: false,
+            notificationTargetsRotated: 0,
             previousKeyArchivedAt: '/app/data/master.key.20260807T120000Z.bak',
             restartPending: true,
         });
@@ -265,6 +295,7 @@ describe('MasterKeyPanel', () => {
             ledgersRotated: 2,
             backupPassphraseRotated: true,
             driveTokenRotated: false,
+            notificationTargetsRotated: 0,
             previousKeyArchivedAt: '/app/data/master.key.20260806T120000Z.bak',
             restartPending: true,
         });
