@@ -537,7 +537,7 @@ public sealed class AccountsRepository
         {
             _ = await _db.RecomputeHoldingsForBrokerage(holdingsAccountId)
                 .Select(r => r.RecomputedCount)
-                .FirstAsync(cancellationToken)
+                .SingleAsync(cancellationToken)
                 .ConfigureAwait(false);
         }
 

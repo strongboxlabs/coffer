@@ -927,7 +927,7 @@ public sealed class RegisterRepository
         {
             _ = await _db.RecomputeBalancesForAccount(accountId, earliest)
                 .Select(r => r.AccountId)
-                .FirstAsync(cancellationToken)
+                .SingleAsync(cancellationToken)
                 .ConfigureAwait(false);
         }
 

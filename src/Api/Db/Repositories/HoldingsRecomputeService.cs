@@ -48,9 +48,21 @@ public sealed class HoldingsRecomputeService
             // EF's HasDbFunction binding requires us to materialise the
             // result; the row is discarded — the side effect on
             // holdings + lots is the point.
+            //
+            // SingleAsync, not FirstAsync. The function is RETURN QUERY SELECT
+            // p_account_id (mig 104), so it yields exactly one row and Single
+            // states that. First said only "take whichever comes back", which EF
+            // then flagged on every call: "The query uses the 'First' operator
+            // without 'OrderBy'... may lead to unpredictable results." That
+            // warning was a false alarm — a one-row function has nothing to order
+            // — but it was logged in a path that REWRITES MONEY, and a money path
+            // whose every run prints an ignorable warning is a path where a real
+            // one goes unread. Single also enforces the invariant instead of
+            // assuming it: were the function ever widened, this throws rather
+            // than silently recomputing against an arbitrary row.
             _ = await _db.RecomputeHoldingsForAccountSecurity(accountId, securityId)
                 .Select(r => r.AccountId)
-                .FirstAsync(cancellationToken)
+                .SingleAsync(cancellationToken)
                 .ConfigureAwait(false);
         }
     }

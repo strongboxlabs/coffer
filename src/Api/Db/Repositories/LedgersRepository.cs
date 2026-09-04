@@ -147,7 +147,7 @@ public sealed class LedgersRepository
         {
             await db.LedgerDelete(ledgerId)
                 .Select(r => r.LedgerId)
-                .FirstAsync(cancellationToken)
+                .SingleAsync(cancellationToken)
                 .ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }

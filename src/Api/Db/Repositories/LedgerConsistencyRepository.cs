@@ -335,7 +335,7 @@ public sealed class LedgerConsistencyRepository
             {
                 _ = await _db.RecomputePostingCountsForHeader(headerId)
                     .Select(r => r.HeaderId)
-                    .FirstAsync(cancellationToken)
+                    .SingleAsync(cancellationToken)
                     .ConfigureAwait(false);
             }
 

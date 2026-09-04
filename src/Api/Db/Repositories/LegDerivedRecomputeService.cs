@@ -67,9 +67,14 @@ public sealed class LegDerivedRecomputeService
             // EF's HasDbFunction binding requires us to materialise the
             // result; the row is discarded — the side effect on
             // txn_header_account_balances is the point.
+            //
+            // SingleAsync for the reason spelled out in HoldingsRecomputeService:
+            // mig 102 is RETURN QUERY SELECT p_account_id, so one row is the
+            // contract, and First made EF warn about ordering on every call in a
+            // path that rewrites balances.
             _ = await _db.RecomputeBalancesForAccount(accountId, fromPostedAt)
                 .Select(r => r.AccountId)
-                .FirstAsync(cancellationToken)
+                .SingleAsync(cancellationToken)
                 .ConfigureAwait(false);
         }
     }
