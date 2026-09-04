@@ -29,6 +29,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # Full history: the identity step below counts commits, and a shallow
+          # clone would report 1 for every release.
+          fetch-depth: 0
+
+      # Stamped into the assembly because .git is dockerignored — without these the
+      # image cannot identify its own commit, and the csproj's git fallback bakes
+      # "fatal: not a git repository" into the version string instead.
+      - name: Resolve build identity
+        id: ident
+        run: |
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "count=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(git log -1 --format=%cd --date=short)" >> "$GITHUB_OUTPUT"
 
       # arm64 emulation for the runtime stage only. The two build stages are pinned
       # to $BUILDPLATFORM in the Dockerfile and run natively, so QEMU is used just
@@ -84,6 +98,10 @@ jobs:
           # natively, and PGDG publishes postgresql-client-16 for arm64 on noble (the
           # aspnet:10.0 base), which the runtime stage needs.
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            SOURCE_COMMIT_SHA=${{ steps.ident.outputs.sha }}
+            SOURCE_COMMIT_COUNT=${{ steps.ident.outputs.count }}
+            SOURCE_COMMIT_DATE=${{ steps.ident.outputs.date }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
