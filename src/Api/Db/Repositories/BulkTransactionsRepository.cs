@@ -469,15 +469,30 @@ internal sealed class BulkTransactionsRepository
         // Hard-delete manual rows (external_id IS NULL). CASCADE on
         // txn_legs / txn_header_overrides / txn_leg_overrides /
         // txn_header_tags handles the cleanup.
+        // A REMINDER OCCURRENCE IS NEVER HARD-DELETED, here as on the single-delete
+        // path (TransactionsRepository.DeleteAsync).
+        //
+        // The (recurring_transaction_id, occurrence_date) stamp on the row IS the slot's
+        // idempotency key (mig 218). Hard-deleting takes the stamp with it, the slot
+        // reads un-acted, and reminder-auto-post (mig 219) posts it straight back on the
+        // next tick — a loop the user cannot escape. The single-delete path was fixed for
+        // this and bulk delete was missed, so selecting auto-posted occurrences in the
+        // register and deleting them resurrected every one of them.
         var hardDeleted = await query
-            .Where(h => h.ExternalId == null)
+            .Where(h => h.ExternalId == null
+                        && (h.RecurringTransactionId == null || h.OccurrenceDate == null
+                            || h.IsRecurringTemplate))
             .ExecuteDeleteAsync(cancellationToken)
             .ConfigureAwait(false);
 
         // Soft-hide everything else. Re-source / re-sync upserts
         // back into the same row but leaves is_hidden alone.
+        // Everything else soft-hides: feed-sourced rows (external_id set) AND reminder
+        // occurrences, which keep their stamp so the slot stays consumed.
         var softHidden = await query
-            .Where(h => h.ExternalId != null)
+            .Where(h => h.ExternalId != null
+                        || (h.RecurringTransactionId != null && h.OccurrenceDate != null
+                            && !h.IsRecurringTemplate))
             .ExecuteUpdateAsync(
                 setters => setters
                     .SetProperty(h => h.IsHidden, _ => true)

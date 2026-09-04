@@ -87,8 +87,13 @@ public sealed class SchedulerRunner
             var outcome = JobRunOutcome.Ok();
             try
             {
+                // The SAME instant that decided this row was due, and computed its next
+                // slot, also decides the job's "today". Reading a clock inside a handler
+                // would let those disagree across a midnight boundary.
                 outcome = await handler
-                    .RunAsync(db, job.LedgerId, job.ConfiguredByUserId, cancellationToken)
+                    .RunAsync(
+                        db, job.LedgerId, job.ConfiguredByUserId,
+                        new JobRunClock(nowUtc, job.Timezone), cancellationToken)
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -103,7 +108,7 @@ public sealed class SchedulerRunner
                     job.JobType, job.LedgerId);
             }
 
-            ApplyOutcome(
+            var justDisabled = ApplyOutcome(
                 job, failure, outcome, nowUtc, logger, job.JobType, job.LedgerId.ToString());
 
             // One signal per run, emitted HERE rather than in the handlers: a handler
@@ -137,6 +142,33 @@ public sealed class SchedulerRunner
                             + "itself is unaffected.", job.JobType, job.LedgerId);
                     }
                 }
+
+                // Second event, and only on the tick that gives up. disabled_reason
+                // answers "why is this off now" and is erased the moment someone
+                // re-enables; this is what survives, in ledger_events.
+                if (justDisabled && failure is not null)
+                {
+                    try
+                    {
+                        await publisher
+                            .PublishLedgerAsync(
+                                job.LedgerId,
+                                DisabledEvent(
+                                    job.JobType, GetConsecutiveFailures(job), failure),
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex,
+                            "Could not announce that {JobType} was disabled for ledger "
+                            + "{LedgerId}; the job is still off.", job.JobType, job.LedgerId);
+                    }
+                }
             }
 
             // Bookkeeping only — the advance is already durable. If this save
@@ -163,7 +195,11 @@ public sealed class SchedulerRunner
         IReadOnlyDictionary<string, IGlobalScheduledJobHandler> handlers,
         DateTime nowUtc,
         ILogger logger,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        // Optional and last, mirroring the per-ledger overload: every existing caller
+        // and test keeps compiling, and a caller that does not supply one simply gets
+        // no announcement rather than a null-reference at 3am.
+        Notifications.NotificationPublisher? publisher = null)
     {
         var due = await db.GlobalScheduledJobs
             .Where(j => j.Enabled && j.NextRunAt != null && j.NextRunAt <= nowUtc)
@@ -207,8 +243,35 @@ public sealed class SchedulerRunner
             // Global handlers have no outcome channel: the backup job already publishes
             // its own Success/Failure signal directly (DailyBackupJobHandler), so there
             // is nothing here for a third state to describe.
-            ApplyOutcome(
+            var justDisabled = ApplyOutcome(
                 job, failure, JobRunOutcome.Ok(), nowUtc, logger, job.JobType, ledgerId: null);
+
+            // Deployment scope, so this one goes to system_events rather than a
+            // ledger's log. The backup job publishes its own per-run signal; nothing
+            // announced the moment the scheduler stopped running it at all, which is
+            // the outage that matters most here — a deployment whose backups have
+            // silently ended.
+            if (publisher is not null && justDisabled && failure is not null)
+            {
+                try
+                {
+                    await publisher
+                        .PublishAsync(
+                            DisabledEvent(job.JobType, GetConsecutiveFailures(job), failure),
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex,
+                        "Could not announce that global job {JobType} was disabled; it is "
+                        + "still off.", job.JobType);
+                }
+            }
 
             if (!await TrySaveAsync(db, logger, cancellationToken).ConfigureAwait(false))
                 break;
@@ -229,7 +292,14 @@ public sealed class SchedulerRunner
     /// reported upward as a success. See <see cref="JobRunResult"/> for why a two-state
     /// model was not enough.
     /// </remarks>
-    private static void ApplyOutcome(
+    /// <returns>
+    /// True when THIS run is the one that switched the job off, so the caller can
+    /// announce the disable. The disable is a different event from the run's own
+    /// failure signal: the run failing is routine until it is not, and the moment the
+    /// scheduler gives up is the one a person needs to see. It is also the only durable
+    /// record — disabled_reason is current state and clears on re-enable.
+    /// </returns>
+    private static bool ApplyOutcome(
         object row, Exception? failure, JobRunOutcome outcome, DateTime nowUtc, ILogger logger,
         string jobType, string? ledgerId)
     {
@@ -238,26 +308,56 @@ public sealed class SchedulerRunner
         {
             SetFailureState(
                 row, 0, Truncate(outcome.Message ?? "Ran with degraded results.", MaxErrorLength),
-                nowUtc, enabled: null);
+                nowUtc, enabled: null, disabledReason: null);
             logger.LogWarning(
                 "Scheduled job {JobType}{LedgerSuffix} completed with degraded results: {Reason}",
                 jobType,
                 ledgerId is null ? string.Empty : $" for ledger {ledgerId}",
                 outcome.Message);
-            return;
+            return false;
         }
 
         if (failure is null)
         {
-            SetFailureState(row, 0, lastError: null, lastFailureAt: null, enabled: null);
-            return;
+            // disabledReason cleared as well: a run that succeeded is not a job anyone
+            // is still holding off. It should already be null (a disabled job does not
+            // run), so this is belt and braces against a row that was re-enabled by a
+            // path that forgot to clear it.
+            SetFailureState(
+                row, 0, lastError: null, lastFailureAt: null, enabled: null,
+                disabledReason: null);
+            return false;
         }
 
         failures = GetConsecutiveFailures(row) + 1;
         var message = Truncate(failure.Message, MaxErrorLength);
-        var disable = failures >= DisableAfterConsecutiveFailures;
 
-        SetFailureState(row, failures, message, nowUtc, disable ? false : null);
+        // REMINDER AUTO-POST HAS NO DISABLED STATE.
+        //
+        // Auto-disable protects a job whose repeated failure is itself harmful — a
+        // backup hammering a full disk, a sync retrying a dead endpoint. Posting a
+        // reminder is not that: a failed fire writes nothing and costs nothing, and the
+        // occurrence stays on the calendar for a person to act on.
+        //
+        // Switching it off would create the failure this whole area was fixed for twice
+        // over: reminders quietly stop posting, and the user finds out from a missing
+        // transaction. Worse, the job is switched ON by ticking Auto-post on a reminder
+        // and by nothing else — there is no switch to find — so a disabled row would be
+        // a state with no way out.
+        //
+        // Failures are still counted, still stamped in last_error, and still published
+        // to the monitor. They just never stop it trying.
+        var disable = failures >= DisableAfterConsecutiveFailures
+                      && jobType != JobTypes.ReminderAutoPost;
+
+        SetFailureState(
+            row, failures, message, nowUtc,
+            disable ? false : null,
+            // Stamped only when this run is the one that switches the job off. mig 216:
+            // `enabled = FALSE` has three authors and used to record none of them, so a
+            // job the scheduler gave up on was indistinguishable from one an operator
+            // meant to leave off.
+            disable ? ScheduleDisableReasons.ConsecutiveFailures : null);
 
         if (disable)
         {
@@ -269,7 +369,39 @@ public sealed class SchedulerRunner
                 failures,
                 message);
         }
+
+        return disable;
     }
+
+    /// <summary>
+    /// The announcement that a job has been switched off, as distinct from the run that
+    /// failed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>MonitorSignal.None</c>, deliberately. The run's own signal was already
+    /// published a moment earlier and a dead-man's switch counts signals; emitting a
+    /// second Failure for the same tick would report two outages where there was one.
+    /// This event exists to be READ — in the bell, in the event log, by a subscriber
+    /// filtering on the scheduler topic — not to drive a check.
+    /// </para>
+    /// <para>
+    /// The exception is described, never quoted, for the same reason every other
+    /// published summary is: this text reaches whatever URL an operator configured.
+    /// </para>
+    /// </remarks>
+    private static Notifications.NotificationEvent DisabledEvent(
+        string jobType, int failures, Exception failure) =>
+        new(
+            Severity: Notifications.NotificationSeverity.Critical,
+            Topic: Notifications.NotificationTopics.Scheduler,
+            EventKey: "scheduler.job-disabled",
+            Summary: $"Scheduled {jobType} has been switched OFF after {failures} "
+                + $"consecutive failures. It will not run again until it is re-enabled. "
+                + Notifications.PublishedFailure.Describe(failure),
+            Detail: Notifications.PublishedFailure.DetailFor(failure),
+            Monitor: null,
+            Signal: Notifications.MonitorSignal.None);
 
     private static int GetConsecutiveFailures(object row) => row switch
     {
@@ -279,7 +411,8 @@ public sealed class SchedulerRunner
     };
 
     private static void SetFailureState(
-        object row, int failures, string? lastError, DateTime? lastFailureAt, bool? enabled)
+        object row, int failures, string? lastError, DateTime? lastFailureAt, bool? enabled,
+        string? disabledReason)
     {
         switch (row)
         {
@@ -287,12 +420,14 @@ public sealed class SchedulerRunner
                 j.ConsecutiveFailures = failures;
                 j.LastError = lastError;
                 j.LastFailureAt = lastFailureAt;
+                j.DisabledReason = disabledReason;
                 if (enabled is not null) j.Enabled = enabled.Value;
                 break;
             case Db.Entities.GlobalScheduledJobRow g:
                 g.ConsecutiveFailures = failures;
                 g.LastError = lastError;
                 g.LastFailureAt = lastFailureAt;
+                g.DisabledReason = disabledReason;
                 if (enabled is not null) g.Enabled = enabled.Value;
                 break;
         }

@@ -177,6 +177,40 @@ is a user-configurable integration, added and changed at runtime, and one file p
 provider neither scales past the first nor survives adding a second without a
 container restart.
 
+### D9 — Coverage is one-directional, so a switch on a stopped job is reported separately
+
+The ledger coverage map answers one question: *of the jobs this ledger runs, which
+have a switch watching them?* It is keyed on the ledger's ENABLED jobs on purpose
+(D5's cry-wolf rule — a ledger with snapshots off must not be warned that nothing
+watches its snapshots).
+
+That keying has a blind spot, and it is not a bug in the map so much as the shape
+of the question. A switch bound to a job that is **not** enabled matches no key.
+It does not appear as uncovered; it does not appear at all. And nothing else
+reports it either, because the job never runs and therefore never pings. The
+result is a check that can only ever read "never", with no surface anywhere
+saying why.
+
+This is not hypothetical: a real deployment's bank-feed check sat at "never" for
+months. The heartbeat URL was configured correctly, the handler was registered,
+the monitor keys matched on both sides — the feed-sync schedule had simply never
+been switched on, and every part of the system was silent about the combination.
+
+So the API returns both halves. `LedgerMonitorStatus` carries the coverage map
+*and* `WatchingNothing` — monitors a switch is bound to whose job is not enabled
+here — and the settings panel renders a warning for each, with opposite advice:
+one says *add a switch*, the other says *turn the job on or remove the switch*.
+
+`consistency` is excluded from the second list. It is the declared non-job
+monitor (it runs every tick and cannot be disabled), so testing it for an enabled
+`scheduled_jobs` row would find none and flag the one monitor that always runs —
+precisely the false warning D5 exists to prevent.
+
+The general rule this instance teaches: a coverage metric computed over one set
+cannot report the elements that fall outside that set, and those elements are
+often the interesting ones. Asking "what did the denominator exclude?" is worth
+doing every time a system reports coverage.
+
 ## Consequences
 
 * Two tables and one bus: more moving parts than a single stream, bought

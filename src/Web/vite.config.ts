@@ -28,11 +28,25 @@ const pkg = JSON.parse(
     readFileSync(path.resolve(__dirname, 'package.json'), 'utf8'),
 ) as { version: string };
 
+// The container build has no .git, so git() would degrade every published image
+// to build 0 / commit "dev" — which made the About panel's "matching UI and API
+// build numbers confirm both were built from the same commit" impossible to
+// satisfy anywhere it mattered. The Dockerfile now passes the same three values
+// the API stage receives, so prefer those and keep git for a local build.
+//
+// Read via a helper rather than `??`, because an unset Docker ARG arrives as an
+// EMPTY STRING, not undefined: `process.env.X ?? git(...)` would take the empty
+// string and stamp the bundle with nothing at all.
+function stamped(name: string, fallback: () => string): string {
+    const value = process.env[name];
+    return value !== undefined && value !== '' ? value : fallback();
+}
+
 const appVersion = {
     version: pkg.version,
-    build: Number(git('rev-list --count HEAD', '0')),
-    commit: git('rev-parse --short HEAD', 'dev'),
-    commitDate: git('log -1 --format=%cd --date=short', ''),
+    build: Number(stamped('SOURCE_COMMIT_COUNT', () => git('rev-list --count HEAD', '0'))),
+    commit: stamped('SOURCE_COMMIT_SHA', () => git('rev-parse --short HEAD', 'dev')),
+    commitDate: stamped('SOURCE_COMMIT_DATE', () => git('log -1 --format=%cd --date=short', '')),
 };
 
 // Vite config for the Coffer SPA (ADR-0007). Two notable bits:

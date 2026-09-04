@@ -419,7 +419,7 @@ public sealed class NotificationPublisher
     /// a job_type row can outlive the build that knew about it.
     /// </para>
     /// </remarks>
-    public async Task<IReadOnlyDictionary<string, bool>> LedgerMonitorCoverageAsync(
+    public async Task<LedgerMonitorStatus> LedgerMonitorStatusAsync(
         Guid ledgerId,
         CancellationToken cancellationToken = default)
     {
@@ -446,12 +446,36 @@ public sealed class NotificationPublisher
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        return NotificationMonitors.Ledger
+        var coverage = NotificationMonitors.Ledger
             .Where(m => enabledJobs.Contains(m, StringComparer.Ordinal))
             .ToDictionary(
                 m => m,
                 m => bound.Contains(m, StringComparer.Ordinal),
                 StringComparer.Ordinal);
+
+        // The half the coverage map throws away, and the one that produced a real check
+        // reading "Never" for months. Coverage answers "of the jobs you run, which are
+        // watched" — so a switch bound to a job that is NOT enabled matches no key and
+        // disappears from the answer entirely. Nothing then reports it: the job is not
+        // running so it never pings, and the panel has no row for it to be missing from.
+        //
+        // MonitorScopeTests already names this failure one level up ("a dropdown entry
+        // that can never go green teaches its owner the panel lies"). The same is true of
+        // a BOUND switch that can never go green, and it is worse, because a heartbeat
+        // subscriber eventually alerts on inactivity — a dead-man's switch watching
+        // something that was never alive.
+        //
+        // Iterates the registry rather than `bound` on purpose: stable order for the UI,
+        // and a monitor string that outlived the build that knew it is not reported as a
+        // stopped job. Consistency is excluded because it is the declared non-job monitor
+        // — it runs on every tick and cannot be switched off, so it is never idle.
+        var watchingNothing = NotificationMonitors.Ledger
+            .Where(m => !string.Equals(m, NotificationMonitors.Consistency, StringComparison.Ordinal))
+            .Where(m => bound.Contains(m, StringComparer.Ordinal))
+            .Where(m => !enabledJobs.Contains(m, StringComparer.Ordinal))
+            .ToList();
+
+        return new LedgerMonitorStatus(coverage, watchingNothing);
     }
 
     /// <summary>
@@ -542,3 +566,20 @@ public sealed class NotificationPublisher
                    "Subscriber config for '" + subscriberKey + "' is empty.");
     }
 }
+
+/// <summary>
+/// What this ledger's dead-man's switches are actually doing: which of its running jobs
+/// are watched, and which switches are watching a job that does not run.
+/// </summary>
+/// <param name="Coverage">
+/// This ledger's ENABLED scheduled jobs, each mapped to whether a switch is bound to it.
+/// </param>
+/// <param name="WatchingNothing">
+/// Monitors a switch IS bound to whose job is not enabled on this ledger. These are the
+/// checks that can only ever read "Never", and the reason is never visible from either
+/// end: the job is off, so nothing pings, and coverage cannot mention it because coverage
+/// is keyed on jobs that run.
+/// </param>
+public sealed record LedgerMonitorStatus(
+    IReadOnlyDictionary<string, bool> Coverage,
+    IReadOnlyList<string> WatchingNothing);

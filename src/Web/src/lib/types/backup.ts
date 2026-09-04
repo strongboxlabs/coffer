@@ -38,4 +38,11 @@ export interface BackupSchedule {
     /** Whether an admin has set the backup passphrase. The schedule can't be
      *  enabled (and a backup can't run) until this is true. */
     passphraseConfigured: boolean;
+    /** Same three health fields the per-ledger Schedule carries, with the same
+     *  caveats: lastRunAt is attempted-not-succeeded, and lastError can be set on a
+     *  run that did not fail. */
+    consecutiveFailures: number;
+    lastError: string | null;
+    lastFailureAt: string | null;
+    disabledReason: string | null;
 }

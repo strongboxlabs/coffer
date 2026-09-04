@@ -93,6 +93,40 @@ if grep -qE '^(POSTGRES_PASSWORD|COFFER_SERVICE_PASSWORD|COFFER_APP_PASSWORD)=' 
     info "Delete that backup once the stack is confirmed healthy — it still contains the passwords."
 else
     info "$ENV_FILE has no password lines left to comment out."
+
+    # A LATER run is where the backup gets cleaned up, and the delay is the
+    # point. The first run must keep it: if anything about the file-based
+    # arrangement is wrong, that copy is how an operator gets their passwords
+    # back. By the time this script runs again the stack has been up on secrets/
+    # — the .env lines are already commented and the files below are non-empty —
+    # so the recovery window has served its purpose.
+    #
+    # Leaving it forever was the actual behaviour, and it defeated the migration:
+    # the whole point is that a password in a file beside the compose file is
+    # less exposed than one in .env, and .env.pre-secrets is a cleartext copy of
+    # all three sitting in the same directory. Two docs told the operator to
+    # delete it by hand. Nothing checked whether they had.
+    if [ -f "$ENV_FILE.pre-secrets" ]; then
+        complete=1
+        for f in postgres_password coffer_service_password coffer_app_password; do
+            [ -s "$SECRETS_DIR/$f" ] || complete=0
+        done
+        if [ "$complete" -eq 1 ]; then
+            # Overwrite before unlinking. rm alone leaves the plaintext readable
+            # in freed blocks; this is best-effort on a journalling or
+            # copy-on-write filesystem, but it is strictly better than not
+            # trying, and shred is not present everywhere.
+            if command -v shred >/dev/null 2>&1; then
+                shred -u "$ENV_FILE.pre-secrets" 2>/dev/null || rm -f "$ENV_FILE.pre-secrets"
+            else
+                dd if=/dev/zero of="$ENV_FILE.pre-secrets"                    bs=1 count="$(wc -c <"$ENV_FILE.pre-secrets")" conv=notrunc >/dev/null 2>&1 || true
+                rm -f "$ENV_FILE.pre-secrets"
+            fi
+            info "removed $ENV_FILE.pre-secrets — the migration is complete, so the cleartext backup is no longer needed."
+        else
+            info "keeping $ENV_FILE.pre-secrets: $SECRETS_DIR/ is incomplete, so the backup is still the only copy of some passwords."
+        fi
+    fi
 fi
 
 info "done — $migrated written, $skipped already present."

@@ -1779,7 +1779,26 @@ public sealed class TransactionsRepository
         if (header.Action is not null)
             return DeleteOutcome.HeaderNotBankShape;
 
-        if (header.ExternalId is null)
+        // A REMINDER OCCURRENCE IS NEVER HARD-DELETED, even though it has no
+        // external_id.
+        //
+        // The (recurring_transaction_id, occurrence_date) stamp on this row IS the slot's
+        // idempotency key (mig 218). Hard-deleting takes the stamp with it, so the slot
+        // reads un-acted again — and reminder-auto-post (mig 219) posts it straight back
+        // on the next tick. Delete it again, it comes back: a loop the user cannot escape,
+        // caused by a delete path that predates the existence of a timer.
+        //
+        // Soft-hiding keeps the stamp, so the slot stays consumed and the agenda keeps
+        // showing it as scheduled (GetUpcomingAsync's fired-rows query does not filter
+        // is_hidden). The transaction leaves the register exactly as a soft-deleted feed
+        // transaction does, and UnhideAsync is already the undo — no new concept, and no
+        // one-way door needing an un-skip that does not exist yet.
+        var isReminderOccurrence =
+            header.RecurringTransactionId is not null
+            && header.OccurrenceDate is not null
+            && !header.IsRecurringTemplate;
+
+        if (header.ExternalId is null && !isReminderOccurrence)
         {
             _db.TxnHeaders.Remove(header);
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);

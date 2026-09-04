@@ -37,6 +37,12 @@ export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PG_CONTAINER="${PG_CONTAINER:-coffer-postgres}"
+
+# How to reach the daemon. install.sh computes `sudo docker` when the invoking
+# user is not in the docker group, and now runs this script itself; hardcoding
+# `docker` meant it would fail on exactly those hosts. Unquoted on use, so a
+# two-word value splits the way it must.
+DOCKER="${DOCKER:-docker}"
 ENV_FILE="${ENV_FILE:-.env}"
 env_path="$repo_root/$ENV_FILE"
 HBA=/var/lib/postgresql/data/pg_hba.conf
@@ -57,7 +63,7 @@ read_credential() {
     read_env "$var"
 }
 
-docker inspect "$PG_CONTAINER" >/dev/null 2>&1 || die "container '$PG_CONTAINER' not found."
+$DOCKER inspect "$PG_CONTAINER" >/dev/null 2>&1 || die "container '$PG_CONTAINER' not found."
 [ -f "$env_path" ] || [ -d "$SECRETS_DIR" ] || die "neither $ENV_FILE nor $SECRETS_DIR found at $repo_root."
 
 SUPERUSER="${POSTGRES_USER:-$(read_env POSTGRES_USER)}"; SUPERUSER="${SUPERUSER:-coffer}"
@@ -67,7 +73,7 @@ APP_PW="$(read_credential coffer_app_password COFFER_APP_PASSWORD)"
 [ -n "$SU_PW" ] || die "no superuser password found (looked in $SECRETS_DIR/postgres_password, then POSTGRES_PASSWORD in $ENV_FILE)."
 
 # Already done? Only non-comment lines count.
-if ! docker exec "$PG_CONTAINER" grep -qE '^\s*(local|host)\s.*\strust\s*$' "$HBA"; then
+if ! $DOCKER exec "$PG_CONTAINER" grep -qE '^\s*(local|host)\s.*\strust\s*$' "$HBA"; then
     info "no trust rules present — already hardened, nothing to do."
     exit 0
 fi
@@ -76,60 +82,60 @@ fi
 # all` rule, which is ALREADY scram — so authenticating there proves the password
 # is right. Testing over 127.0.0.1 or the socket would prove nothing while those
 # are still trust: any password, including a wrong one, succeeds under trust.
-pg_ip="$(docker exec "$PG_CONTAINER" hostname -i | tr -d '\r' | awk '{print $1}')"
+pg_ip="$($DOCKER exec "$PG_CONTAINER" hostname -i | tr -d '\r' | awk '{print $1}')"
 [ -n "$pg_ip" ] || die "could not determine the container's own IP."
 
 info "verifying the superuser password over a scram path ($pg_ip) before changing anything…"
-docker exec -e PGPASSWORD="$SU_PW" "$PG_CONTAINER" \
+$DOCKER exec -e PGPASSWORD="$SU_PW" "$PG_CONTAINER" \
     psql -w -h "$pg_ip" -U "$SUPERUSER" -d "$PGDB" -tAc 'select 1' >/dev/null 2>&1 \
     || die "POSTGRES_PASSWORD in $ENV_FILE does not authenticate. Fix that first — after this change it is the only way in."
 
 if [ -n "$APP_PW" ]; then
-    docker exec -e PGPASSWORD="$APP_PW" "$PG_CONTAINER" \
+    $DOCKER exec -e PGPASSWORD="$APP_PW" "$PG_CONTAINER" \
         psql -w -h "$pg_ip" -U coffer_app -d "$PGDB" -tAc 'select 1' >/dev/null 2>&1 \
         || die "COFFER_APP_PASSWORD does not authenticate — the API would break. Fix that first."
     info "coffer_app authenticates too."
 fi
 
 info "current trust rules:"
-docker exec "$PG_CONTAINER" grep -E '^\s*(local|host)\s.*\strust\s*$' "$HBA" | sed 's/^/    /'
+$DOCKER exec "$PG_CONTAINER" grep -E '^\s*(local|host)\s.*\strust\s*$' "$HBA" | sed 's/^/    /'
 
 # Keep a copy. It stays in PGDATA; it is inert (only the live file is consulted)
 # and it is what the rollback below restores.
-docker exec "$PG_CONTAINER" cp "$HBA" "$BACKUP"
+$DOCKER exec "$PG_CONTAINER" cp "$HBA" "$BACKUP"
 
 rollback() {
     info "rolling back to $BACKUP…"
-    docker exec "$PG_CONTAINER" cp "$BACKUP" "$HBA" || true
-    docker exec -e PGPASSWORD="$SU_PW" "$PG_CONTAINER" \
+    $DOCKER exec "$PG_CONTAINER" cp "$BACKUP" "$HBA" || true
+    $DOCKER exec -e PGPASSWORD="$SU_PW" "$PG_CONTAINER" \
         psql -w -h "$pg_ip" -U "$SUPERUSER" -d postgres -tAc 'select pg_reload_conf()' >/dev/null 2>&1 || true
 }
 
 # Swap the auth method on every trust rule. Anchored to end-of-line so it can
 # only ever rewrite the METHOD column, never a database or role called "trust".
-docker exec "$PG_CONTAINER" sed -i -E 's/^([[:space:]]*(local|host)[[:space:]].*[[:space:]])trust[[:space:]]*$/\1scram-sha-256/' "$HBA" \
+$DOCKER exec "$PG_CONTAINER" sed -i -E 's/^([[:space:]]*(local|host)[[:space:]].*[[:space:]])trust[[:space:]]*$/\1scram-sha-256/' "$HBA" \
     || { rollback; die "rewrite failed."; }
 
-docker exec -e PGPASSWORD="$SU_PW" "$PG_CONTAINER" \
+$DOCKER exec -e PGPASSWORD="$SU_PW" "$PG_CONTAINER" \
     psql -w -h "$pg_ip" -U "$SUPERUSER" -d postgres -tAc 'select pg_reload_conf()' >/dev/null \
     || { rollback; die "reload failed."; }
 
 # Verify the new state: password required on the socket, and still working with
 # one. A rollback on failure matters more than the failure message — a half-
 # applied pg_hba is how you lock an app out of its own database.
-if docker exec "$PG_CONTAINER" psql -w -U "$SUPERUSER" -d "$PGDB" -tAc 'select 1' >/dev/null 2>&1; then
+if $DOCKER exec "$PG_CONTAINER" psql -w -U "$SUPERUSER" -d "$PGDB" -tAc 'select 1' >/dev/null 2>&1; then
     rollback; die "socket still accepts a password-less connection — rolled back."
 fi
-docker exec -e PGPASSWORD="$SU_PW" "$PG_CONTAINER" \
+$DOCKER exec -e PGPASSWORD="$SU_PW" "$PG_CONTAINER" \
     psql -w -U "$SUPERUSER" -d "$PGDB" -tAc 'select 1' >/dev/null 2>&1 \
     || { rollback; die "socket rejects the correct password — rolled back."; }
 
 if [ -n "$APP_PW" ]; then
-    docker exec -e PGPASSWORD="$APP_PW" "$PG_CONTAINER" \
+    $DOCKER exec -e PGPASSWORD="$APP_PW" "$PG_CONTAINER" \
         psql -w -h "$pg_ip" -U coffer_app -d "$PGDB" -tAc 'select 1' >/dev/null 2>&1 \
         || { rollback; die "coffer_app can no longer connect — rolled back."; }
 fi
 
 info "done — every path requires a password now. Remaining rules:"
-docker exec "$PG_CONTAINER" sh -c "grep -vE '^\s*#|^\s*\$' $HBA" | sed 's/^/    /'
+$DOCKER exec "$PG_CONTAINER" sh -c "grep -vE '^\s*#|^\s*\$' $HBA" | sed 's/^/    /'
 info "previous file kept at $BACKUP inside the container (inert)."

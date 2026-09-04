@@ -90,6 +90,11 @@ public static class SchedulesEndpoints
         // 19:00 quote refresh so a ledger running both does not fire two outbound bursts
         // at once.
         JobTypes.FeedSync => 6,
+        // Between the 03:00 snapshot and the 06:00 feed sync: the snapshot is a stable
+        // pre-dawn picture taken before the day's reminders land, and the reminders exist
+        // before bank data arrives or anyone looks at a balance. Without an arm here it
+        // would silently default to 19:00 and post the day's rent in the evening.
+        JobTypes.ReminderAutoPost => 5,
         _ => 19,
     };
 }

@@ -71,6 +71,45 @@ public sealed class QifIngestTests
     /// fund code; memos carry the trailing pad spaces the exporter
     /// emits (the parser trims them).
     /// </summary>
+    /// <summary>
+    /// A Fidelity-NetBenefits-shaped workplace plan: the cash moves that
+    /// make up most of a real plan statement — ContribX / WithdrwX for
+    /// payroll and hardship, XIn / XOut for rollovers — plus a RtrnCap.
+    /// Every one of these used to be dropped with a skip warning, which
+    /// left the account's cash balance wrong and made the missing rows
+    /// look like the user's own oversight.
+    /// Synthesised — no real plan, fund, or participant data.
+    /// </summary>
+    private const string WorkplacePlanCashQif = """
+        !Type:Invst
+        D01/15/2024
+        NContribX
+        T250.00
+        MPayroll contribution
+        ^
+        D02/15/2024
+        NWithdrwX
+        T100.00
+        MHardship withdrawal
+        ^
+        D03/15/2024
+        NXIn
+        T75.00
+        MRollover in
+        ^
+        D04/15/2024
+        NXOut
+        T50.00
+        MRollover out
+        ^
+        D05/15/2024
+        NRtrnCap
+        YBOND FUND(BBBB)
+        T30.00
+        MReturn of capital
+        ^
+        """;
+
     private const string InvestmentQif = """
         !Type:Invst
         D01/05/2024
@@ -293,6 +332,78 @@ public sealed class QifIngestTests
         Assert.Equal(-500.00m, cashByDate["2024-01-05"]);
         Assert.Equal(600.00m, cashByDate["2024-03-14"]);
         Assert.Equal(0m, cashByDate["2024-03-31"]);
+    }
+
+    [Fact]
+    public async Task Workplace_plan_cash_moves_import_instead_of_warning()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var resp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/qif/preview",
+            FileUpload(WorkplacePlanCashQif));
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var preview = await resp.Content.ReadFromJsonAsync<FileIngestPreviewResponse>();
+        Assert.NotNull(preview);
+        var account = Assert.Single(preview!.Accounts);
+
+        // All five: four cash moves take the bank shape, RtrnCap
+        // classifies as a cash distribution like the OFX RETOFCAP.
+        Assert.Equal(5, account.TransactionCount);
+
+        // And nothing is skipped. This is the half worth asserting
+        // explicitly: the old behaviour was a SUCCESSFUL import that
+        // silently contained none of these rows, so a count alone would
+        // have passed against a preview that warned five times.
+        Assert.DoesNotContain(preview.Errors,
+            e => e.Code == "qif_investment_action_unsupported");
+    }
+
+    [Fact]
+    public async Task Workplace_plan_contributions_land_cash_in_and_withdrawals_cash_out()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var plan = await ledger.AddInvestmentAccountAsync("plan");
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var resp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/qif/import",
+            FileUpload(WorkplacePlanCashQif, accountId: plan.Id, providerAccountId: "qif"));
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        await using var db = _fixture.NewDbContext();
+        var headers = await db.TxnHeaders.AsNoTracking()
+            .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif")
+            .ToListAsync();
+        var headerIds = headers.Select(h => h.Id).ToList();
+        var legs = await db.TxnLegs.AsNoTracking()
+            .Where(l => headerIds.Contains(l.HeaderId) && l.AccountId == plan.Id)
+            .Join(db.TxnHeaders.AsNoTracking(), l => l.HeaderId, h => h.Id,
+                (l, h) => new { h.PostedAt, h.IngestActionHint, l.Amount })
+            .ToListAsync();
+        var byDate = legs.ToDictionary(
+            x => x.PostedAt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+
+        // Direction is knowable from the action alone here, unlike the
+        // security actions that fall back to a positive magnitude.
+        Assert.Equal(250.00m, byDate["2024-01-15"].Amount);   // ContribX
+        Assert.Equal(-100.00m, byDate["2024-02-15"].Amount);  // WithdrwX
+        Assert.Equal(75.00m, byDate["2024-03-15"].Amount);    // XIn
+        Assert.Equal(-50.00m, byDate["2024-04-15"].Amount);   // XOut
+
+        // Bank shape means no investment action hint — these are cash,
+        // not security events, and an action here would put them in
+        // front of the FIFO walk.
+        Assert.Null(byDate["2024-01-15"].IngestActionHint);
+        Assert.Null(byDate["2024-04-15"].IngestActionHint);
+
+        // Return of capital keeps its security and its action.
+        Assert.Equal(30.00m, byDate["2024-05-15"].Amount);
+        Assert.Equal("dividend_cash", byDate["2024-05-15"].IngestActionHint);
     }
 
     [Fact]

@@ -2,8 +2,9 @@ import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link, useParams } from '@tanstack/react-router';
 
-import { fetchVisibleLedgers } from '@/lib/api';
+import { fetchSchedule, fetchVisibleLedgers, saveSchedule } from '@/lib/api';
 import { Breadcrumb } from '@/components/ui/Breadcrumb';
+import { ScheduleControl } from '@/components/ScheduleControl';
 import { MainArea, MainPane, TopBar } from '@/components/ui/SidebarLayout';
 
 import { RemindersListPanel } from './RemindersListPanel';
@@ -49,6 +50,27 @@ export function RemindersPage() {
                             Recurring transactions that post on a schedule.
                         </p>
                     </header>
+
+                    {/*
+                        HERE rather than in Settings, where every other ScheduleControl
+                        lives. The other scheduled jobs — quotes, snapshots, feed sync —
+                        have no per-item counterpart, so Settings is the only place they
+                        could be. This one does: a reminder carries its own "Auto-post /
+                        N days before", and that switch does nothing until the ledger's
+                        job is also on. Putting the two on different pages is how a user
+                        ticks Auto-post, waits for rent to post itself, and finds out it
+                        never did.
+                    */}
+                    <div className="rounded border border-border bg-surface p-3">
+                        <ScheduleControl
+                            queryKey={['schedule', ledgerId, 'reminder-auto-post']}
+                            load={() => fetchSchedule(ledgerId, 'reminder-auto-post')}
+                            save={(body) => saveSchedule(ledgerId, 'reminder-auto-post', body)}
+                            label="Due reminders post automatically each day"
+                            note="only reminders that set their own Auto-post option"
+                            enabledElsewhere
+                        />
+                    </div>
 
                     <nav role="tablist" aria-label="Reminders views"
                         className="flex items-end border-b border-border text-xs">

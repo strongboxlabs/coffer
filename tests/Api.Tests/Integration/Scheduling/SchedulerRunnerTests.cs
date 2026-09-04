@@ -80,7 +80,7 @@ public sealed class SchedulerRunnerTests
         await using var db = _fixture.NewDbContext();
 
         await new SnapshotJobHandler(NullLoggerFactory.Instance)
-            .RunAsync(db, ledger.LedgerId, ledger.UserId, default);
+            .RunAsync(db, ledger.LedgerId, ledger.UserId, new JobRunClock(DateTime.UtcNow, "UTC"), default);
 
         await using var read = _fixture.NewDbContext();
         var autos = await read.LedgerSnapshots.AsNoTracking()
@@ -210,6 +210,39 @@ public sealed class SchedulerRunnerTests
             .SingleAsync(j => j.LedgerId == ledger.LedgerId);
         Assert.Equal(SchedulerRunner.DisableAfterConsecutiveFailures, job.ConsecutiveFailures);
         Assert.False(job.Enabled);
+
+        // WHO switched it off. Without this, the row is indistinguishable from one an
+        // operator turned off, which is the whole of mig 216.
+        Assert.Equal(ScheduleDisableReasons.ConsecutiveFailures, job.DisabledReason);
+    }
+
+    /// <summary>
+    /// A failure BELOW the threshold must not claim the job was disabled.
+    /// </summary>
+    /// <remarks>
+    /// The paired negative for the assertion above. A reason stamped on every failure
+    /// would satisfy that test and label a job that is still running as switched off.
+    /// </remarks>
+    [Fact]
+    public async Task A_failure_below_the_threshold_leaves_the_job_enabled_and_unlabelled()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5),
+            consecutiveFailures: SchedulerRunner.DisableAfterConsecutiveFailures - 2);
+        var handlers = new Dictionary<string, IScheduledJobHandler>
+        {
+            [JobTypes.QuoteRefresh] = new ThrowingHandler(JobTypes.QuoteRefresh, "not yet"),
+        };
+
+        await using var db = _fixture.NewDbContext();
+        await new SchedulerRunner().RunDueAsync(
+            db, handlers, DateTime.UtcNow, NullLogger.Instance, default);
+
+        await using var read = _fixture.NewDbContext();
+        var job = await read.ScheduledJobs.AsNoTracking()
+            .SingleAsync(j => j.LedgerId == ledger.LedgerId);
+        Assert.True(job.Enabled);
+        Assert.Null(job.DisabledReason);
     }
 
     [Fact]
@@ -233,6 +266,7 @@ public sealed class SchedulerRunnerTests
         Assert.Equal(0, job.ConsecutiveFailures);
         Assert.Null(job.LastError);
         Assert.True(job.Enabled);
+        Assert.Null(job.DisabledReason);
     }
 
     [Fact]
@@ -372,7 +406,7 @@ public sealed class SchedulerRunnerTests
         public JobRunOutcome Outcome { get; init; } = JobRunOutcome.Ok();
 
         public Task<JobRunOutcome> RunAsync(
-            AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken ct)
+            AppDbContext db, Guid ledgerId, Guid configuredByUserId, JobRunClock clock, CancellationToken ct)
         {
             Calls.Add((ledgerId, configuredByUserId));
             return Task.FromResult(Outcome);
@@ -400,7 +434,7 @@ public sealed class SchedulerRunnerTests
         public string JobType { get; }
 
         public Task<JobRunOutcome> RunAsync(
-            AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken ct)
+            AppDbContext db, Guid ledgerId, Guid configuredByUserId, JobRunClock clock, CancellationToken ct)
             => throw new InvalidOperationException(_message);
     }
 
@@ -428,7 +462,7 @@ public sealed class SchedulerRunnerTests
         public string JobType { get; }
 
         public async Task<JobRunOutcome> RunAsync(
-            AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken ct)
+            AppDbContext db, Guid ledgerId, Guid configuredByUserId, JobRunClock clock, CancellationToken ct)
         {
             await db.Database.BeginTransactionAsync(ct);
             try

@@ -178,6 +178,11 @@ public sealed class KekReconciliationService
 
             job.PassphraseCiphertext = null;
             job.Enabled = false;
+            // The third author of `enabled = FALSE`, and the reason it is a text column
+            // rather than an auto-disabled flag (mig 216): this is neither the operator
+            // nor the five-strike rule, and a panel that said "the scheduler disabled
+            // this" would be telling the reader to go looking for a failing job.
+            job.DisabledReason = Scheduling.ScheduleDisableReasons.KeyMaterialMissing;
             job.UpdatedAt = DateTime.UtcNow;
             cleared = true;
         }

@@ -514,13 +514,20 @@ public static class AdminBackupsEndpoints
     private static BackupSummary ToSummary(BackupFileInfo info, bool pinned) =>
         new(info.Id, info.SizeBytes, info.CreatedAtUtc, pinned);
 
+    // Named, for the reason ScheduleDto's projection is: this record now has optional
+    // trailing parameters, and positional construction would map the wrong values the
+    // first time one is inserted rather than appended.
     private static BackupScheduleResponse ToScheduleResponse(GlobalScheduleState state) =>
         new(
-            state.Schedule.Enabled,
-            state.Schedule.HourLocal,
-            state.Schedule.MinuteLocal,
-            state.Schedule.Timezone,
-            state.Schedule.LastRunAt,
-            state.Schedule.NextRunAt,
-            state.PassphraseConfigured);
+            Enabled: state.Schedule.Enabled,
+            HourLocal: state.Schedule.HourLocal,
+            MinuteLocal: state.Schedule.MinuteLocal,
+            Timezone: state.Schedule.Timezone,
+            LastRunAt: state.Schedule.LastRunAt,
+            NextRunAt: state.Schedule.NextRunAt,
+            PassphraseConfigured: state.PassphraseConfigured,
+            ConsecutiveFailures: state.Schedule.ConsecutiveFailures,
+            LastError: state.Schedule.LastError,
+            LastFailureAt: state.Schedule.LastFailureAt,
+            DisabledReason: state.Schedule.DisabledReason);
 }

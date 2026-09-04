@@ -21,8 +21,22 @@ WORKDIR /web
 COPY src/Web/package.json src/Web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY src/Web/ ./
-# Vite git-stamps the build but guards a .git-less context (ADR-0044), so it
-# builds fine here where .git is dockerignored.
+# The SAME three build args the API stage takes. Without them the SPA's About row
+# reads "build 0 - dev" in every image ever published: vite.config.ts stamps the
+# bundle by shelling out to git, .git is dockerignored, and its guard degrades
+# rather than failing (ADR-0044).
+#
+# That guard is right — a build should not fail for want of a git checkout — but
+# the fallback made the About panel promise something it could never deliver. The
+# panel says matching UI and API build numbers confirm both layers came from one
+# commit; the API row is stamped from these args and the UI row was hardcoded to
+# 0/dev, so the comparison could only ever succeed in a local dev build from a
+# working tree, which is the one place nobody needs it. In every deployment it was
+# guaranteed to look mismatched.
+ARG SOURCE_COMMIT_SHA=
+ARG SOURCE_COMMIT_COUNT=
+ARG SOURCE_COMMIT_DATE=
+ENV SOURCE_COMMIT_SHA=$SOURCE_COMMIT_SHA SOURCE_COMMIT_COUNT=$SOURCE_COMMIT_COUNT SOURCE_COMMIT_DATE=$SOURCE_COMMIT_DATE
 RUN npm run build
 
 # --- Stage 2: publish the API ----------------------------------------------

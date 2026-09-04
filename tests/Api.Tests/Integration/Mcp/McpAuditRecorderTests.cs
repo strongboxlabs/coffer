@@ -26,7 +26,7 @@ public sealed class McpAuditRecorderTests
     public McpAuditRecorderTests(PostgresFixture fixture) => _fixture = fixture;
 
     private McpAuditRecorder NewRecorder() =>
-        new(new ServiceDbContextFactory(Options.Create(
+        new(PostgresFixture.ServiceFactoryFor(Options.Create(
             new ApiOptions { ServiceConnectionString = _fixture.ServiceConnectionString })));
 
     private async Task<McpToolInvocationRow> ReadRowAsync(Guid id)

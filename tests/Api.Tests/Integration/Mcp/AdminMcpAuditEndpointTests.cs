@@ -26,7 +26,7 @@ public sealed class AdminMcpAuditEndpointTests
     public AdminMcpAuditEndpointTests(PostgresFixture fixture) => _fixture = fixture;
 
     private McpAuditRecorder Recorder() =>
-        new(new ServiceDbContextFactory(Options.Create(
+        new(PostgresFixture.ServiceFactoryFor(Options.Create(
             new ApiOptions { ServiceConnectionString = _fixture.ServiceConnectionString })));
 
     [Fact]

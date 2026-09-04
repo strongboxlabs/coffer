@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Routing;
 using Coffer.Api.Auth;
 using Coffer.Api.Contracts;
 using Coffer.Api.Db.Repositories;
+using Coffer.Api.Scheduling;
 using Coffer.Api.Errors;
 using Coffer.Domain.Reminders;
 
@@ -37,6 +38,7 @@ public static class RemindersEndpoints
         group.MapPatch("/{reminderId:guid}/investment", EditInvestmentAsync);
         group.MapPatch("/{reminderId:guid}/active", SetActiveAsync);
         group.MapPost("/{reminderId:guid}/skip", SkipAsync);
+        group.MapDelete("/{reminderId:guid}/skip", UnskipAsync);
         group.MapPost("/{reminderId:guid}/fire", FireAsync);
         group.MapPost("/{reminderId:guid}/fire/bank", FireBankAsync);
         group.MapPost("/{reminderId:guid}/fire/investment", FireInvestmentAsync);
@@ -115,7 +117,8 @@ public static class RemindersEndpoints
         // Clone the template verbatim (no edits). Adjust-at-post goes through
         // /fire/bank or /fire/investment.
         var result = await reminders.FireAsync(
-            ledgerId, reminderId, request.OccurrenceDate, currentUser.UserId, cancellationToken)
+                ledgerId, reminderId, request.OccurrenceDate, currentUser.UserId,
+                Coffer.Api.Reminders.ReminderCatchUp.SkipEarlierUnacted, cancellationToken)
             .ConfigureAwait(false);
 
         return result.Outcome switch
@@ -132,6 +135,10 @@ public static class RemindersEndpoints
             RemindersRepository.FireOutcome.OccurrenceSkipped =>
                 BusinessError.Problem(BusinessError.Codes.ReminderOccurrenceSkipped,
                     "That occurrence was skipped; un-skip it before firing."),
+            RemindersRepository.FireOutcome.EstimateUnavailableForFire =>
+                BusinessError.Problem(BusinessError.Codes.ReminderEstimateNotEligible,
+                    "This reminder estimates its amount and there is nothing to estimate "
+                    + "from yet. Post it with an explicit amount, or turn the estimate off."),
             _ => Results.StatusCode(500),
         };
     }
@@ -188,6 +195,10 @@ public static class RemindersEndpoints
             RemindersRepository.FireOutcome.ShapeMismatch =>
                 BusinessError.Problem(BusinessError.Codes.ReminderShapeMismatch,
                     "This is an investment reminder; use the investment fire route."),
+            RemindersRepository.FireOutcome.EstimateUnavailableForFire =>
+                BusinessError.Problem(BusinessError.Codes.ReminderEstimateNotEligible,
+                    "This reminder estimates its amount and there is nothing to estimate "
+                    + "from yet. Post it with an explicit amount, or turn the estimate off."),
             _ => Results.StatusCode(500),
         };
     }
@@ -234,6 +245,10 @@ public static class RemindersEndpoints
                     "This is a bank reminder; use the bank fire route."),
             RemindersRepository.FireOutcome.ShapeFailure =>
                 InvestmentFailureProblem(result.InvestmentFailure!.Value),
+            RemindersRepository.FireOutcome.EstimateUnavailableForFire =>
+                BusinessError.Problem(BusinessError.Codes.ReminderEstimateNotEligible,
+                    "This reminder estimates its amount and there is nothing to estimate "
+                    + "from yet. Post it with an explicit amount, or turn the estimate off."),
             _ => Results.StatusCode(500),
         };
     }
@@ -279,6 +294,7 @@ public static class RemindersEndpoints
         LedgersRepository ledgers,
         AccountsRepository accounts,
         RemindersRepository reminders,
+        SchedulesRepository schedules,
         RecurrenceExpander expander,
         CancellationToken cancellationToken)
     {
@@ -289,6 +305,14 @@ public static class RemindersEndpoints
             return recurrenceRejection;
         if (PostingValidation.ValidatePostings(request.Postings, request.SourceAccountId) is { } postingRejection)
             return postingRejection;
+
+        // Estimates are single-posting, non-loan only (mig 220). A manual bank create is
+        // never a loan series — those come from the loan route — so the posting count is
+        // the whole check here.
+        if (RejectIneligibleEstimate(
+                request.EstimateSampleCount, request.Postings.Count, isLoanReminder: false)
+            is { } estimateRejection)
+            return estimateRejection;
 
         if (await NotVisibleAsync(ledgers, currentUser, ledgerId, cancellationToken).ConfigureAwait(false) is { } gate)
             return gate;
@@ -305,6 +329,10 @@ public static class RemindersEndpoints
             return accountsRejection;
 
         var result = await reminders.CreateBankAsync(ledgerId, request, cancellationToken).ConfigureAwait(false);
+        await EnableAutoPostIfRequestedAsync(
+                ledgerId, request.AutoCommitDaysBefore, currentUser.UserId, schedules,
+                cancellationToken)
+            .ConfigureAwait(false);
         return await CreatedDetailAsync(ledgerId, result.ReminderId!.Value, reminders, cancellationToken)
             .ConfigureAwait(false);
     }
@@ -320,6 +348,7 @@ public static class RemindersEndpoints
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         RemindersRepository reminders,
+        SchedulesRepository schedules,
         RecurrenceExpander expander,
         CancellationToken cancellationToken)
     {
@@ -333,6 +362,10 @@ public static class RemindersEndpoints
             return gate;
 
         var result = await reminders.CreateInvestmentAsync(ledgerId, request, cancellationToken).ConfigureAwait(false);
+        await EnableAutoPostIfRequestedAsync(
+                ledgerId, request.AutoCommitDaysBefore, currentUser.UserId, schedules,
+                cancellationToken)
+            .ConfigureAwait(false);
         if (result.Outcome == RemindersRepository.CreateOutcome.ShapeFailure)
         {
             var (code, message) = InvestmentTransactionsEndpoints.MapFailure(result.InvestmentFailure!.Value);
@@ -354,6 +387,7 @@ public static class RemindersEndpoints
         LedgersRepository ledgers,
         AccountsRepository accounts,
         RemindersRepository reminders,
+        SchedulesRepository schedules,
         RecurrenceExpander expander,
         CancellationToken cancellationToken)
     {
@@ -362,6 +396,10 @@ public static class RemindersEndpoints
         var hasField = request.Rrule is not null || request.StartDate is not null
             || request.ClearEndDate || request.EndDate is not null
             || request.ClearAutoCommit || request.AutoCommitDaysBefore is not null
+            // Mig 220. Omitting these made a PATCH that only enables estimation read as
+            // an EMPTY patch and get rejected — the field existed on the DTO and was
+            // unreachable through the endpoint.
+            || request.ClearEstimate || request.EstimateSampleCount is not null
             || request.Payee is not null || request.Memo is not null
             || request.CheckNumber is not null || request.Postings is not null;
         if (!hasField)
@@ -396,6 +434,10 @@ public static class RemindersEndpoints
         }
 
         var result = await reminders.EditBankAsync(ledgerId, reminderId, request, cancellationToken).ConfigureAwait(false);
+        await EnableAutoPostIfRequestedAsync(
+                ledgerId, request.AutoCommitDaysBefore, currentUser.UserId, schedules,
+                cancellationToken)
+            .ConfigureAwait(false);
         return await EditOutcomeResultAsync(ledgerId, reminderId, result, reminders, cancellationToken)
             .ConfigureAwait(false);
     }
@@ -411,6 +453,7 @@ public static class RemindersEndpoints
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         RemindersRepository reminders,
+        SchedulesRepository schedules,
         RecurrenceExpander expander,
         CancellationToken cancellationToken)
     {
@@ -435,6 +478,10 @@ public static class RemindersEndpoints
             return gate;
 
         var result = await reminders.EditInvestmentAsync(ledgerId, reminderId, request, cancellationToken).ConfigureAwait(false);
+        await EnableAutoPostIfRequestedAsync(
+                ledgerId, request.AutoCommitDaysBefore, currentUser.UserId, schedules,
+                cancellationToken)
+            .ConfigureAwait(false);
         if (result.Outcome == RemindersRepository.EditOutcome.ShapeFailure)
         {
             var (code, message) = InvestmentTransactionsEndpoints.MapFailure(result.InvestmentFailure!.Value);
@@ -467,6 +514,45 @@ public static class RemindersEndpoints
         return outcome == RemindersRepository.ActiveOutcome.Ok
             ? Results.NoContent()
             : BusinessError.Problem(BusinessError.Codes.ReminderNotInLedger, "Reminder not found in this ledger.");
+    }
+
+    /// <summary>
+    /// <c>DELETE /{reminderId}/skip?occurrenceDate=</c> — undo a skip.
+    /// </summary>
+    /// <remarks>
+    /// The occurrence comes from the QUERY STRING rather than a body: DELETE with a body
+    /// is poorly supported by intermediaries and awkward for callers, and the slot is an
+    /// identifier here rather than a payload.
+    /// </remarks>
+    private static async Task<IResult> UnskipAsync(
+        Guid ledgerId,
+        Guid reminderId,
+        DateOnly occurrenceDate,
+        ICurrentUserAccessor currentUser,
+        LedgersRepository ledgers,
+        RemindersRepository reminders,
+        CancellationToken cancellationToken)
+    {
+        if (await NotVisibleAsync(ledgers, currentUser, ledgerId, cancellationToken).ConfigureAwait(false) is { } gate)
+            return gate;
+
+        var result = await reminders.UnskipAsync(
+            ledgerId, reminderId, occurrenceDate, cancellationToken).ConfigureAwait(false);
+        return result.Outcome switch
+        {
+            RemindersRepository.UnskipOutcome.Ok =>
+                Results.Ok(new UnskipReminderResponse(occurrenceDate, result.NextDueDate)),
+            RemindersRepository.UnskipOutcome.NotFound =>
+                BusinessError.Problem(BusinessError.Codes.ReminderNotInLedger, "Reminder not found in this ledger."),
+            RemindersRepository.UnskipOutcome.NotMaterialized =>
+                BusinessError.Problem(BusinessError.Codes.ReminderNotMaterialized,
+                    "Reminder has no template yet — re-import it from Moneydance."),
+            // Not an error worth a distinct code: the caller asked for a state the slot is
+            // already in, and answering 200 keeps un-skip idempotent the way skip is.
+            RemindersRepository.UnskipOutcome.NotSkipped =>
+                Results.Ok(new UnskipReminderResponse(occurrenceDate, result.NextDueDate)),
+            _ => Results.StatusCode(500),
+        };
     }
 
     /// <summary>
@@ -534,6 +620,102 @@ public static class RemindersEndpoints
         return null;
     }
 
+    /// <summary>
+    /// A reminder asking to be auto-posted turns the ledger's auto-post job ON, if it is
+    /// not configured yet.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Ticking "Auto-post / N days before" IS the opt-in. Requiring a second switch
+    /// elsewhere before that tick did anything reproduced the very defect ADR-0097 set
+    /// out to remove: a user told their rent posts itself, and nothing acting on it. The
+    /// reminders page still owns WHEN the job runs; it no longer owns whether.
+    /// </para>
+    /// <para>
+    /// Create-if-absent only — <see cref="SchedulesRepository.EnsureCreatedEnabledAsync"/>
+    /// never flips an existing row, so editing a reminder cannot restart a job the
+    /// scheduler auto-disabled after five failures, nor one an operator paused.
+    /// </para>
+    /// <para>
+    /// Called on the four write paths that can set the field (bank/investment ×
+    /// create/edit) rather than inside the repository, so the coupling from reminders to
+    /// scheduling is visible at the call site instead of buried in a write.
+    /// </para>
+    /// </remarks>
+    /// <summary>
+    /// Reject an estimate the series cannot honour (migration 220).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Server-side on every write path, not hidden in the UI.</b> The SPA hides the
+    /// control too, but a hidden control is a courtesy and this is the invariant: the
+    /// resolver refuses to produce an estimate for these shapes, so storing the flag
+    /// would leave a reminder configured to estimate and permanently unable to.
+    /// </para>
+    /// <para>
+    /// <b>Two exclusions, one predicate.</b> A SPLIT has no single amount to estimate —
+    /// distributing one averaged number across several postings would need an invented
+    /// rule for which leg absorbs the difference. A LOAN payment is computed from its
+    /// terms and current balance, which is real information; letting an average of the
+    /// last three override it is a straight downgrade, and two overrides racing for one
+    /// field is how one silently wins.
+    /// </para>
+    /// <para>
+    /// Rejected rather than silently dropped, for the reason auto-post had to be fixed: a
+    /// control that accepts input and does nothing with it is worse than one that refuses.
+    /// </para>
+    /// </remarks>
+    /// <param name="postingCount">
+    /// Null when the request does not touch postings — on a PATCH that means the stored
+    /// template stands, so the caller supplies its posting count instead.
+    /// </param>
+    private static IResult? RejectIneligibleEstimate(
+        int? estimateSampleCount, int? postingCount, bool isLoanReminder)
+    {
+        if (estimateSampleCount is not { } n) return null;
+
+        if (n is < 1 or > 24)
+        {
+            return BusinessError.Problem(
+                BusinessError.Codes.ReminderEstimateRangeInvalid,
+                "estimateSampleCount must be between 1 and 24.");
+        }
+
+        if (isLoanReminder)
+        {
+            return BusinessError.Problem(
+                BusinessError.Codes.ReminderEstimateNotEligible,
+                "A loan reminder's amount is computed from the loan's terms and current "
+                + "balance, so it cannot be estimated from past occurrences.");
+        }
+
+        if (postingCount is { } count && count > 1)
+        {
+            return BusinessError.Problem(
+                BusinessError.Codes.ReminderEstimateNotEligible,
+                "A reminder with a split has no single amount to estimate. Remove the "
+                + "split, or set the amount manually.");
+        }
+
+        return null;
+    }
+
+    private static Task EnableAutoPostIfRequestedAsync(
+        Guid ledgerId, int? autoCommitDaysBefore, Guid configuredByUserId,
+        SchedulesRepository schedules, CancellationToken cancellationToken) =>
+        autoCommitDaysBefore is null
+            ? Task.CompletedTask
+            : schedules.EnsureCreatedEnabledAsync(
+                ledgerId, JobTypes.ReminderAutoPost, AutoPostDefaultHour,
+                configuredByUserId, DateTime.UtcNow, cancellationToken);
+
+    /// <summary>
+    /// 05:00 local. After the 03:00 snapshot, so that is a stable pre-dawn picture taken
+    /// before the day's reminders land, and before the 06:00 feed sync, so the day's
+    /// reminders exist before bank data arrives or anyone looks at a balance.
+    /// </summary>
+    private const int AutoPostDefaultHour = 5;
+
     private static async Task<IResult> CreatedDetailAsync(
         Guid ledgerId, Guid reminderId, RemindersRepository reminders, CancellationToken ct)
     {
@@ -558,6 +740,11 @@ public static class RemindersEndpoints
         RemindersRepository.EditOutcome.EndBeforeStart =>
             BusinessError.Problem(BusinessError.Codes.ReminderEndBeforeStart,
                 "The resulting endDate would be before startDate."),
+        RemindersRepository.EditOutcome.EstimateNotEligible =>
+            BusinessError.Problem(BusinessError.Codes.ReminderEstimateNotEligible,
+                "Only a single-posting, non-loan reminder can estimate its amount. A "
+                + "split has no single amount to estimate, and a loan payment is computed "
+                + "from its terms and current balance."),
         _ => Results.StatusCode(500),
     };
 }

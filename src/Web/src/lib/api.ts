@@ -191,6 +191,7 @@ export {
     fetchReminderDetail,
     setReminderActive,
     skipReminder,
+    unskipReminder,
     fireReminder,
     fireReminderBank,
     fireReminderInvestment,

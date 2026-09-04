@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Link } from '@tanstack/react-router';
 
 import {
     fetchLedgerNotificationProviders,
@@ -13,6 +14,24 @@ import type { NotificationProvider, NotificationSubscriber } from '@/lib/types';
 import { errorMessage } from '@/lib/errorMessage';
 import { Button } from '@/components/ui/Button';
 import { Panel, PanelBody, PanelHead } from '@/components/ui/Panel';
+
+/**
+ * `NotificationTopics` (src/Api/Notifications/NotificationEvent.cs:40-51) in English.
+ *
+ * The API's vocabulary is a contract, not prose: a subscriber filters on `consistency`
+ * and `consistency.drift` keys the repair link in the events list, so the translation
+ * happens here at the point of reading rather than at the API, where renaming would
+ * break both. An unrecognised topic renders exactly as the API sent it — a subject this
+ * build has not been taught should look unfamiliar, not invisible.
+ */
+const SUBJECT_WORDS: Record<string, string> = {
+    backup: 'Backups',
+    snapshot: 'Snapshots',
+    sync: 'Account sync',
+    quotes: 'Price quotes',
+    consistency: 'Data consistency',
+    scheduler: 'Scheduled jobs',
+};
 
 /**
  * Per-ledger notifications (ADR-0096): adopt the deployment's targets, or name this
@@ -61,7 +80,12 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                 // operation it offers, deleting the right row.
                 displayName: displayName.trim() || undefined,
                 url,
-                minSeverity,
+                // The default, not whatever was last picked while a message provider was
+                // selected. The field is hidden for a heartbeat, and storing a value the
+                // owner cannot see and the router never reads is how a row starts
+                // disagreeing with the screen that created it. Mirrors the deployment
+                // panel, which already did this.
+                minSeverity: chosen?.detectsAbsence ? 'warning' : minSeverity,
                 monitors: chosen?.detectsAbsence ? monitors : undefined,
             }),
         onSuccess: () => {
@@ -80,12 +104,32 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
     const events = useQuery({
         queryKey: ['ledger-events', ledgerId],
         queryFn: () => fetchLedgerEvents(ledgerId),
+        // Same as the two queries above, and for a reason this one felt: without it a
+        // failed fetch spends the whole retry window showing "Loading…", so the
+        // role="alert" branch that distinguishes a broken request from a quiet ledger
+        // is correct and effectively delayed.
+        retry: false,
     });
+
+    // "Is anything wrong RIGHT NOW" is the question this panel is opened to ask, and a
+    // flat chronological list cannot answer it — a drift fixed last week and one raised
+    // a minute ago are the same row shape. Counted here so the panel head can answer it
+    // before the reader starts reading rows.
+    const openProblems = (events.data ?? []).filter((e) => e.resolvedAt === null);
+    const openCount = openProblems.length;
+    // One critical among four warnings must not be reported in amber.
+    const openIsCritical = openProblems.some((e) => e.severity === 'critical');
 
     const coverage = settings.data?.monitorCoverage ?? {};
     const uncovered = Object.keys(coverage)
         .filter((m) => !coverage[m])
         .sort();
+
+    // The inverse of `uncovered`, and not derivable from it. Coverage is keyed on the
+    // jobs this ledger RUNS, so a switch bound to a job that is switched off matches no
+    // key and appears nowhere above. That is the state a real "Coffer Bank Feed" check
+    // sat in: bound, never pinged, with nothing on this page saying why.
+    const watchingNothing = settings.data?.monitorsWatchingNothing ?? [];
 
     const chosen = providers.data?.find((p) => p.subscriberKey === subscriberKey);
 
@@ -150,6 +194,24 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                         </p>
                     ) : null}
 
+                    {/* Gated the same way as the warning above, for the same reason: a
+                        failed background refetch must not downgrade a known problem to
+                        silence. This one is the opposite complaint — a switch exists and
+                        watches a job that is not scheduled, so it can never be pinged and
+                        a heartbeat service will eventually call it down. */}
+                    {settings.data !== undefined && watchingNothing.length > 0 ? (
+                        <p
+                            role="alert"
+                            className="rounded border border-state-warning/40 bg-state-warning-soft p-2 text-xs text-state-warning"
+                        >
+                            Watching a job that is not scheduled:{' '}
+                            {watchingNothing.join(', ')}. These checks will never be
+                            pinged, so they stay at &quot;never&quot; and a heartbeat
+                            service will eventually report them as down. Either turn the
+                            job on or remove the switch.
+                        </p>
+                    ) : null}
+
                     {/* The state someone lands in by adding nothing. Distinguished from a
                         failed load above: no targets is a fact, a failed request is not.
                         Saying nothing here would be the strongest possible claim
@@ -178,7 +240,7 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                         {settings.data?.subscribers.map((s: NotificationSubscriber) => (
                             <div
                                 key={s.id}
-                                className="flex items-start justify-between gap-3 border-b border-border-subtle pb-2 last:border-0"
+                                className="flex items-start justify-between gap-3 border-b border-border pb-2 last:border-0"
                             >
                                 <div className="text-sm">
                                     <p className="font-medium">
@@ -187,8 +249,30 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                                             ({s.subscriberKey})
                                         </span>
                                     </p>
+                                    {/* Two kinds of target, described in their own
+                                        terms. A dead-man's switch is not routed by
+                                        severity or topic: Wants() branches on capability
+                                        FIRST and the heartbeat arm returns on monitor
+                                        name and signal without ever reading MinSeverity,
+                                        so "at warning and above" stated a filter that
+                                        does not exist on this row.
+                                        
+                                        It was not merely decorative, it was backwards. A
+                                        successful run publishes at info, which is BELOW
+                                        a warning floor — if that line were true every
+                                        success ping would be dropped and the check would
+                                        go red from inactivity. It reads "warning" only
+                                        because the create form posts its hidden default.
+                                        
+                                        The deployment panel fixed this already; this was
+                                        the un-updated copy of the same markup. */}
                                     <p className="text-xs text-text-muted">
-                                        at {s.minSeverity} and above
+                                        {s.monitors
+                                            ? `watches ${s.monitors} · pings on success, /fail on failure`
+                                            : `at ${s.minSeverity} and above` +
+                                              (s.topics && s.topics.length > 0
+                                                  ? ` · ${s.topics.join(', ')}`
+                                                  : ' · all topics')}
                                     </p>
                                     {s.consecutiveFailures > 0 ? (
                                         <p className="mt-1 text-xs text-state-danger">
@@ -220,7 +304,7 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                         <label className="block text-sm">
                             <span className="text-text-muted">Provider</span>
                             <select
-                                className="mt-1 w-full rounded border border-border-subtle bg-surface p-2"
+                                className="mt-1 w-full rounded border border-border bg-surface p-2"
                                 value={subscriberKey}
                                 onChange={(e) => setSubscriberKey(e.target.value)}
                             >
@@ -246,7 +330,7 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                             <label className="block text-sm">
                                 <span className="text-text-muted">Watches</span>
                                 <select
-                                    className="mt-1 w-full rounded border border-border-subtle bg-surface p-2"
+                                    className="mt-1 w-full rounded border border-border bg-surface p-2"
                                     value={monitors}
                                     onChange={(e) => setMonitors(e.target.value)}
                                 >
@@ -274,7 +358,7 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                             <span className="text-text-muted">Name</span>
                             <input
                                 type="text"
-                                className="mt-1 w-full rounded border border-border-subtle bg-surface p-2"
+                                className="mt-1 w-full rounded border border-border bg-surface p-2"
                                 value={displayName}
                                 onChange={(e) => setDisplayName(e.target.value)}
                                 placeholder="e.g. Discord — household"
@@ -285,7 +369,7 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                             <span className="text-text-muted">URL</span>
                             <input
                                 type="url"
-                                className="mt-1 w-full rounded border border-border-subtle bg-surface p-2"
+                                className="mt-1 w-full rounded border border-border bg-surface p-2"
                                 value={url}
                                 onChange={(e) => setUrl(e.target.value)}
                                 placeholder="https://…"
@@ -307,7 +391,7 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                             <label className="block text-sm">
                                 <span className="text-text-muted">Send at</span>
                                 <select
-                                    className="mt-1 w-full rounded border border-border-subtle bg-surface p-2"
+                                    className="mt-1 w-full rounded border border-border bg-surface p-2"
                                     value={minSeverity}
                                     onChange={(e) => setMinSeverity(e.target.value)}
                                 >
@@ -341,6 +425,31 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
             <Panel>
                 <PanelHead>
                     <span className="font-medium">Recent problems</span>
+                    {/* The glance-level answer, where the eye lands before it
+                        reaches the list. Said only once the fetch has actually
+                        returned rows: a count is a claim, and a pending or failed
+                        query has no standing to make one — which is also what keeps
+                        the error and empty branches below unchanged. */}
+                    {!events.isError &&
+                    events.data !== undefined &&
+                    events.data.length > 0 ? (
+                        openCount > 0 ? (
+                            <span
+                                className={
+                                    openIsCritical
+                                        ? 'rounded border border-state-danger/40 bg-state-danger-soft px-1.5 py-0.5 text-xs font-medium text-state-danger'
+                                        : 'rounded border border-state-warning/40 bg-state-warning-soft px-1.5 py-0.5 text-xs font-medium text-state-warning'
+                                }
+                            >
+                                {openCount} open
+                            </span>
+                        ) : (
+                            /* Deliberately not the same sentence as the empty
+                               state below, because it is not the same fact:
+                               things went wrong here and were fixed. */
+                            <span className="text-xs text-text-muted">Nothing open</span>
+                        )
+                    ) : null}
                 </PanelHead>
                 <PanelBody>
                     {/* Warnings and problems only, and the copy says so — otherwise an
@@ -366,54 +475,164 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                             listed here.
                         </p>
                     ) : (
-                        <ul className="space-y-1 text-sm">
-                            {events.data.map((e) => (
-                                <li
-                                    key={e.id}
-                                    /* A resolved problem is still shown — vanishing is its
-                                       own kind of lie — but it must not read as current.
-                                       Muted, not hidden. */
-                                    className={
-                                        e.resolvedAt
-                                            ? 'flex gap-2 text-text-muted line-through decoration-1'
-                                            : 'flex gap-2'
-                                    }
-                                >
-                                    {/* WHEN, first. A list headed "recent problems" with no
-                                        times reads as a list of CURRENT problems, and the
-                                        two are not the same thing: the first real row this
-                                        panel ever showed was a six-day-old drift warning
-                                        that had already been resolved, indistinguishable
-                                        from one raised a minute ago. Recording that
-                                        something went wrong without recording when is
-                                        half a fact. */}
-                                    <time
-                                        dateTime={e.occurredAt}
-                                        className="shrink-0 tabular-nums text-text-muted"
+                        <ul className="divide-y divide-border">
+                            {events.data.map((e) => {
+                                const settled = e.resolvedAt !== null;
+                                /* Colour drains on settle rather than striking the row
+                                   out. text-decoration propagates to descendants that
+                                   cannot opt out, which is how the green "resolved"
+                                   badge ended up crossed out by the resolution it was
+                                   announcing. Draining does the same job better:
+                                   scanning the severity column, colour means STILL
+                                   OPEN, so settling a problem removes it from the scan
+                                   without removing it from the list.
+
+                                   The third branch is not decoration. The endpoint
+                                   filters `info` out today, so it is unreachable — but
+                                   the two-branch version this replaces painted an info
+                                   row amber the day that filter is loosened to show
+                                   all-clears. The sibling system panel already has all
+                                   three; this one had drifted. */
+                                const tone = settled
+                                    ? 'text-text-subtle'
+                                    : e.severity === 'critical'
+                                      ? 'text-state-danger'
+                                      : e.severity === 'warning'
+                                        ? 'text-state-warning'
+                                        : 'text-text-muted';
+                                return (
+                                    <li
+                                        key={e.id}
+                                        /* Fixed gutter, not shrink-to-fit: every summary
+                                           starts at the same x whatever the severity
+                                           word is, so the sentences read as one column
+                                           and the classification as another. 7rem is
+                                           measured against the longest subject word
+                                           ("Data consistency") at text-xs, not derived;
+                                           a longer one wraps inside the gutter rather
+                                           than pushing the summaries right, which is the
+                                           correct failure mode. minmax(0,1fr) is
+                                           load-bearing — without it a three-sentence
+                                           scheduler critical refuses to wrap. */
+                                        className="grid grid-cols-[7rem_minmax(0,1fr)] items-baseline gap-x-3 gap-y-1 py-2.5 first:pt-0 last:pb-0"
                                     >
-                                        {formatLedgerDateTime(e.occurredAt)}
-                                    </time>
-                                    <span
-                                        className={
-                                            e.severity === 'critical'
-                                                ? 'text-state-danger'
-                                                : 'text-state-warning'
-                                        }
-                                    >
-                                        {e.severity}
-                                    </span>
-                                    <span className="text-text-muted">{e.topic}</span>
-                                    <span>{e.summary}</span>
-                                    {e.resolvedAt ? (
-                                        <span className="shrink-0 text-xs text-state-success">
-                                            resolved
+                                        {/* Gutter, line 1: how bad. The house
+                                            micro-label recipe (FieldLabel.tsx:17).
+                                            `uppercase` is CSS only — the DOM text stays
+                                            the raw DTO value, so no severity word is
+                                            invented and every text query still matches
+                                            what the API sent. */}
+                                        <span
+                                            className={`text-[0.625rem] font-semibold uppercase tracking-wider ${tone}`}
+                                        >
+                                            {e.severity}
                                         </span>
-                                    ) : null}
-                                </li>
-                            ))}
+
+                                        {/* Content, line 1: what happened. The primary
+                                            line, the only one at body size, and the only
+                                            one that gets to wrap. */}
+                                        <p
+                                            className={
+                                                settled
+                                                    ? 'text-sm leading-snug text-text-muted'
+                                                    : 'text-sm leading-snug text-text'
+                                            }
+                                        >
+                                            {e.summary}
+                                        </p>
+
+                                        {/* Gutter, line 2: which area, in words. `topic`
+                                            is a filter key in the API contract, not
+                                            English — a subscriber filters on
+                                            `consistency` and `consistency.drift` keys
+                                            the repair link below, so the translation
+                                            belongs here at the point of reading rather
+                                            than at the API where renaming would break
+                                            both. An unrecognised topic renders as sent:
+                                            a subject this build has not been taught
+                                            should look unfamiliar, not invisible. */}
+                                        <span className="text-xs text-text-subtle">
+                                            {SUBJECT_WORDS[e.topic] ?? e.topic}
+                                        </span>
+
+                                        {/* Content, line 2: when, whether settled, and
+                                            the fix. Demoted by size and position, not by
+                                            grey alone. */}
+                                        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-xs text-text-muted">
+                                            {/* WHEN, kept. A list headed "recent
+                                                problems" with no times reads as a list of
+                                                CURRENT problems, and the two are not the
+                                                same thing: the first real row this panel
+                                                ever showed was a six-day-old drift
+                                                warning that had already been resolved,
+                                                indistinguishable from one raised a minute
+                                                ago. */}
+                                            <time
+                                                dateTime={e.occurredAt}
+                                                className="tabular-nums"
+                                            >
+                                                {formatLedgerDateTime(e.occurredAt)}
+                                            </time>
+
+                                            {e.resolvedAt ? (
+                                                /* resolvedAt is a real server-derived
+                                                   instant (the first matching all-clear
+                                                   after the problem) that the UI was
+                                                   throwing away to print a bare word.
+                                                   "Resolved" with no when is half a
+                                                   fact — the same failure the occurredAt
+                                                   note above exists to prevent.
+
+                                                   The word stays alone in its own
+                                                   element: the test anchors on
+                                                   /^resolved$/i and that is worth keeping
+                                                   exact, so the instant goes in a sibling
+                                                   time element rather than into the
+                                                   span. */
+                                                <span className="inline-flex items-baseline gap-1 text-state-success">
+                                                    <span>resolved</span>
+                                                    <time
+                                                        dateTime={e.resolvedAt}
+                                                        className="tabular-nums text-text-muted"
+                                                    >
+                                                        {formatLedgerDateTime(e.resolvedAt)}
+                                                    </time>
+                                                </span>
+                                            ) : null}
+
+                                            {/* An unresolved drift finding carries its
+                                                own fix. The scheduled monitor already
+                                                found the problem; without this the reader
+                                                is told their projections drifted and then
+                                                has to re-run the check by hand on another
+                                                tab to see what and repair it. `check`
+                                                makes General run it on arrival.
+
+                                                Only while unresolved: offering to
+                                                re-check something the report has since
+                                                called healthy invites a walk over every
+                                                position for nothing. */}
+                                            {e.eventKey === 'consistency.drift' &&
+                                            !e.resolvedAt ? (
+                                                <Link
+                                                    to="/ledgers/$ledgerId/settings"
+                                                    params={{ ledgerId }}
+                                                    search={{ check: true } as never}
+                                                    className="font-medium text-accent underline underline-offset-2 hover:text-accent-hover"
+                                                >
+                                                    Check and repair
+                                                </Link>
+                                            ) : null}
+                                        </div>
+                                    </li>
+                                );
+                            })}
                         </ul>
                     )}
-                    <p className="mt-2 text-xs text-text-muted">
+                    {/* Ruled off the list. Without the rule it reads as a final row —
+                        which is the one reading this caption must not have, since it is
+                        the sentence saying the list above is not coverage. */}
+                    <p className="mt-3 border-t border-border pt-2 text-xs text-text-muted">
                         A list you have to open cannot tell you the app stopped running.
                         That is what a heartbeat target is for.
                     </p>

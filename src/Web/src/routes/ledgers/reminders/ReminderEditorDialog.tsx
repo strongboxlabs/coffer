@@ -96,6 +96,10 @@ export function ReminderEditorDialog({
             startDate: detail.startDate,
             endDate: detail.endDate,
             autoCommitDaysBefore: detail.autoCommitDaysBefore,
+            // Mig 220. Seeded from the stored series so opening the editor shows what is
+            // configured rather than resetting it to "as entered" — and so saving without
+            // touching this section does not silently turn estimating off.
+            estimateSampleCount: detail.estimate?.requestedSampleCount ?? null,
         });
         setScheduleSeeded(true);
     }, [isEdit, detail, scheduleSeeded]);
@@ -136,11 +140,23 @@ export function ReminderEditorDialog({
         }
         return null;
     }
+    // Mig 220: only a single-posting, non-loan BANK series can estimate.
+    //
+    // A loan reminder's amount is computed from its terms and current balance — real
+    // information an average would degrade — and a split has no single amount to
+    // estimate. The server rejects both regardless; this only decides whether to offer
+    // the control, so a user is not shown an option that would be refused.
+    const estimateEligible =
+        kind === 'bank'
+        && !(detail?.isLoanReminder ?? false)
+        && (bankPrefill?.prefill.postings?.length ?? 1) <= 1;
+
     const recurrenceFields = () => ({
         rrule: buildRrule(schedule.recurrence),
         startDate: schedule.startDate,
         endDate: schedule.endDate,
         autoCommitDaysBefore: schedule.autoCommitDaysBefore,
+        estimateSampleCount: schedule.estimateSampleCount,
     });
 
     const saveBank = useMutation({
@@ -151,6 +167,11 @@ export function ReminderEditorDialog({
                     rrule: r.rrule, startDate: r.startDate,
                     clearEndDate: r.endDate === null, endDate: r.endDate,
                     clearAutoCommit: r.autoCommitDaysBefore === null, autoCommitDaysBefore: r.autoCommitDaysBefore,
+                    // Mig 220. A null estimateSampleCount means "unchanged" on this PATCH,
+                    // so turning estimation OFF needs the explicit clear — otherwise
+                    // switching back to "As entered" would silently leave it on.
+                    clearEstimate: r.estimateSampleCount === null,
+                    estimateSampleCount: r.estimateSampleCount,
                     payee: body.payee, memo: body.memo, checkNumber: body.checkNumber,
                     postings: { sourceAccountId: body.sourceAccountId, items: body.postings },
                 });
@@ -158,6 +179,7 @@ export function ReminderEditorDialog({
             return createReminderBank(ledgerId, {
                 rrule: r.rrule, startDate: r.startDate, endDate: r.endDate,
                 autoCommitDaysBefore: r.autoCommitDaysBefore,
+                estimateSampleCount: r.estimateSampleCount,
                 payee: body.payee, memo: body.memo, checkNumber: body.checkNumber,
                 sourceAccountId: body.sourceAccountId, postings: body.postings,
             });
@@ -273,7 +295,12 @@ export function ReminderEditorDialog({
                                     </p>
                                 ) : null}
                                 <div className="mt-1">
-                                    <RecurrenceBuilder value={schedule} onChange={setSchedule} disabled={submitting} />
+                                    <RecurrenceBuilder
+                                        value={schedule}
+                                        onChange={setSchedule}
+                                        disabled={submitting}
+                                        estimateEligible={estimateEligible}
+                                    />
                                 </div>
                             </div>
 

@@ -20,8 +20,14 @@ public static class RemindersTools
         "outflow, positive = inflow), and reminderId. 'kind' is 'reminder' (due, not " +
         "yet posted — what's coming up), 'scheduled' (already posted for that date), or " +
         "'skipped' (a skipped slot); filter to 'reminder' for the true agenda of what's " +
-        "still owed. Ordered by date. Amounts in the ledger's currency (USD). Use " +
-        "list_ledgers first to resolve ledgerId.")]
+        "still owed. Ordered by date. Amounts in the ledger's currency (USD). " +
+        "IMPORTANT: when 'estimate' is present and its 'amount' is non-null, the " +
+        "occurrence's amount is an ESTIMATE — the average of the last N committed " +
+        "occurrences of that series, with 'availableSampleCount' saying how many it " +
+        "averaged. Report it as approximate rather than as a known figure. When " +
+        "'estimate.amount' is null the series asked for an estimate and could not have " +
+        "one ('unavailableReason' says why) and the amount shown is the reminder's " +
+        "template figure. Use list_ledgers first to resolve ledgerId.")]
     public static async Task<IReadOnlyList<UpcomingOccurrence>> ListUpcomingReminders(
         RemindersRepository repository,
         [Description("Ledger id (GUID) from list_ledgers.")] Guid ledgerId,

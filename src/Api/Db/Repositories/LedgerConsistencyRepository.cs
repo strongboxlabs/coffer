@@ -142,6 +142,31 @@ public sealed class LedgerConsistencyRepository
     /// rounded rows differ by up to a cent per disposal, and an ad-hoc query that
     /// got this wrong reported thirty rows of drift that did not exist.
     /// </remarks>
+    /// <summary>
+    /// Per-disposal realized gains, against the pure walk (mig 206, widened by 217).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// PER ROW, and across every money column, because the two obvious shortcuts each
+    /// hide the drift they exist to find. This compared <c>SUM(realized_gain)</c> per
+    /// (account, security), which is blind twice over: two disposals drifting +0.01 and
+    /// -0.01 in the same position sum to zero and report healthy, and the three
+    /// long-term columns were not compared at all — the walk did not return them until
+    /// mig 217, so a ledger whose entire short/long tax split had been zeroed would have
+    /// passed. Those columns are NOT NULL DEFAULT 0, so that is a silent write rather
+    /// than an error, which is exactly how it would have happened.
+    /// </para>
+    /// <para>
+    /// The comparison is over the INTERSECTION on <c>sell_leg_id</c> — rows that exist
+    /// on both sides — and deliberately does not report rows present in one and not the
+    /// other. The walk legitimately omits disposals on hidden headers, on merged headers
+    /// (mig 163) and on <c>transfer_shares</c> actions (ADR-0065 D1), so an install
+    /// carrying legacy rows of those shapes would light up with drift that no repair can
+    /// resolve. This file already records what that costs: cry wolf once and the check
+    /// gets ignored forever. Row-set divergence is a real question and wants its own
+    /// answer, not a false positive bolted onto this one.
+    /// </para>
+    /// </remarks>
     private async Task<ProjectionConsistency> CheckRealizedGainsAsync(
         Guid ledgerId, CancellationToken cancellationToken)
     {
@@ -155,27 +180,67 @@ public sealed class LedgerConsistencyRepository
         var mismatches = new List<ConsistencyMismatch>();
         foreach (var p in positions)
         {
-            var storedSum = await _db.RealizedGains.AsNoTracking()
+            var stored = await _db.RealizedGains.AsNoTracking()
                 .Where(g => g.AccountId == p.AccountId && g.SecurityId == p.SecurityId)
-                .SumAsync(g => g.RealizedGain, cancellationToken)
+                .Select(g => new
+                {
+                    g.SellLegId,
+                    g.Proceeds,
+                    g.CostBasisSold,
+                    g.RealizedGain,
+                    g.ProceedsLt,
+                    g.CostBasisSoldLt,
+                    g.RealizedGainLt,
+                })
+                .ToListAsync(cancellationToken)
                 .ConfigureAwait(false);
 
-            var walkedSum = await _db.RealizedGainsWalk(p.AccountId, p.SecurityId)
-                .SumAsync(g => g.RealizedGain, cancellationToken)
+            var walked = await _db.RealizedGainsWalk(p.AccountId, p.SecurityId)
+                .ToListAsync(cancellationToken)
                 .ConfigureAwait(false);
 
-            if (storedSum != walkedSum)
+            var walkedByLeg = walked
+                .GroupBy(w => w.SellLegId)
+                .ToDictionary(g => g.Key, g => g.First());
+
+            var accountName = names.GetValueOrDefault(p.AccountId, "(account)");
+            foreach (var row in stored)
             {
-                mismatches.Add(new ConsistencyMismatch(
-                    Scope: names.GetValueOrDefault(p.AccountId, "(account)") + " / " + p.SecurityId,
-                    Field: "realized_gain",
-                    Stored: storedSum,
-                    Expected: walkedSum,
-                    AccountId: p.AccountId,
-                    SecurityId: p.SecurityId));
+                if (!walkedByLeg.TryGetValue(row.SellLegId, out var w)) continue;
+
+                // One mismatch per COLUMN, not one per row: a reader fixing this needs
+                // to know that the long-term split drifted rather than that "the row"
+                // did, and the two have different causes.
+                Compare("proceeds", row.Proceeds, w.Proceeds);
+                Compare("cost_basis_sold", row.CostBasisSold, w.CostBasisSold);
+                Compare("realized_gain", row.RealizedGain, w.RealizedGain);
+                Compare("proceeds_lt", row.ProceedsLt, w.ProceedsLt);
+                Compare("cost_basis_sold_lt", row.CostBasisSoldLt, w.CostBasisSoldLt);
+                Compare("realized_gain_lt", row.RealizedGainLt, w.RealizedGainLt);
+
+                // No cap here even though only MaxMismatchesPerProjection are
+                // displayed: Build reports mismatches.Count as the TOTAL, so
+                // stopping early would make a badly drifted ledger report exactly
+                // 100 and understate itself at the moment it most needs not to.
+                void Compare(string field, decimal storedValue, decimal expected)
+                {
+                    if (storedValue == expected) return;
+                    mismatches.Add(new ConsistencyMismatch(
+                        Scope: accountName + " / " + p.SecurityId + " / " + row.SellLegId,
+                        Field: field,
+                        Stored: storedValue,
+                        Expected: expected,
+                        AccountId: p.AccountId,
+                        SecurityId: p.SecurityId));
+                }
             }
         }
 
+        // POSITIONS examined, not disposals compared. Briefly changed to the latter on
+        // the reasoning that the unit of comparison had moved to the row — wrong, and an
+        // existing vacuity guard said so: a position holding shares it has never sold is
+        // still a position this check looked at, and reporting 0 for a healthy ledger
+        // that simply has not sold anything reads as "this projection did nothing".
         return Build(ConsistencyProjections.RealizedGains, positions.Count, mismatches);
     }
 

@@ -19,6 +19,7 @@ import {
     setAccountSyncFromDate,
 } from '@/lib/api';
 import { errorMessage } from '@/lib/errorMessage';
+import { formatRelative } from '@/lib/ledgerOperationDisplay';
 import { invalidateLedgerRegister } from '@/lib/registerInvalidation';
 import type {
     AccountSummary,
@@ -795,6 +796,54 @@ function ConnectionAccountsList({
     );
 }
 
+/**
+ * How long an account may go unseen in a provider pull before the row says so.
+ *
+ * Seven days rather than one or two: a pull happens daily at most, providers have bad
+ * days, and a badge that cries wolf every time a bank has an outage gets ignored — at
+ * which point it is worse than absent. A week is comfortably longer than any transient
+ * failure and comfortably shorter than a person noticing missing transactions on their
+ * own.
+ */
+const STALE_ACCOUNT_DAYS = 7;
+
+/**
+ * Says when the provider last returned this account.
+ *
+ * The column has been written since the feed work landed and rendered nowhere, so the
+ * failure it exists to expose — a bank quietly dropping an account from its listing —
+ * presented as transactions that simply stopped arriving, which is the hardest shape to
+ * notice in a register that never claimed to be complete.
+ *
+ * DELIBERATELY NOT "this account was removed". A total connection failure returns no
+ * accounts at all, so every row on that connection goes stale together and a per-row
+ * message cannot tell the two apart. The connection's own status and last-synced time
+ * (rendered one level up) are what disambiguate, so this says only what it knows: when
+ * the provider last mentioned it.
+ */
+function isStale(lastSeenAt: string): boolean {
+    // Outside the component on purpose. react-hooks/purity forbids reading the clock
+    // in a render body, and rightly: the result changes without a state change, so
+    // React cannot know when to re-render it. Same shape as formatRelative below, and
+    // the same accepted limitation — a row that goes stale while the panel is open
+    // updates on the next fetch or remount, not on a timer. For a seven-day threshold
+    // that is not worth an interval.
+    const ageMs = Date.now() - new Date(lastSeenAt).getTime();
+    return Number.isFinite(ageMs) && ageMs >= STALE_ACCOUNT_DAYS * 24 * 60 * 60 * 1000;
+}
+
+function StaleAccountNote({ lastSeenAt }: { lastSeenAt: string }) {
+    if (!isStale(lastSeenAt)) return null;
+    return (
+        <span
+            role="status"
+            className="ml-2 rounded bg-state-warning-soft px-1.5 py-0.5 text-[0.6875rem] text-state-warning"
+        >
+            Not seen since {formatRelative(lastSeenAt)}
+        </span>
+    );
+}
+
 function ConnectionAccountRow({
     account,
     mappableAccounts,
@@ -839,6 +888,7 @@ function ConnectionAccountRow({
                             {' '}· {account.orgName}
                         </span>
                     ) : null}
+                    <StaleAccountNote lastSeenAt={account.lastSeenAt} />
                 </span>
                 {bound ? (
                     <>
@@ -1017,18 +1067,6 @@ function statusClass(status: string): string {
     }
 }
 
-function formatRelative(iso: string): string {
-    const then = new Date(iso).getTime();
-    const now = Date.now();
-    const diffSec = Math.max(1, Math.round((now - then) / 1000));
-    if (diffSec < 60) return `${diffSec}s ago`;
-    const diffMin = Math.round(diffSec / 60);
-    if (diffMin < 60) return `${diffMin}m ago`;
-    const diffHr = Math.round(diffMin / 60);
-    if (diffHr < 48) return `${diffHr}h ago`;
-    const diffDay = Math.round(diffHr / 24);
-    return `${diffDay}d ago`;
-}
 
 // ---------------------------------------------------------------------------
 // Sync activity panel (slice 2c.1) — per-connection collapsed-by-default

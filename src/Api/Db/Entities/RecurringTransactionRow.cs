@@ -56,6 +56,23 @@ internal sealed class RecurringTransactionRow
     /// lets the agenda/list compute the series AMOUNT as the net of the template
     /// legs on this account (Moneydance parity). NULL on a custom reminder with
     /// no single source and on pre-125 rows until re-import/edit sets it.</summary>
+    /// <summary>
+    /// Migration 220. NULL = the template amount is used as-is. N = the amount shown and
+    /// posted is the average of the last N committed, non-hidden occurrences of this
+    /// series — fewer if fewer exist, and none at all rather than a guess from nothing.
+    /// </summary>
+    /// <remarks>
+    /// One nullable column rather than a bool plus an int, the same convention
+    /// <see cref="AutoCommitDaysBefore"/> uses: there is no representable state
+    /// "estimating from an unset N".
+    /// <para>
+    /// Only meaningful for a single-posting, non-loan, bank-shape series. A split has no
+    /// single amount to estimate, and a loan payment is computed from its terms and
+    /// current balance — real information an average would only degrade.
+    /// </para>
+    /// </remarks>
+    public int? EstimateSampleCount { get; set; }
+
     public Guid? SourceAccountId { get; set; }
 
     public DateOnly StartDate { get; set; }

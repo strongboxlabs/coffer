@@ -22,6 +22,28 @@ export interface ReminderSummary {
     isActive: boolean;
     isLoanReminder: boolean;
     origin: string;
+    /** Mig 220: the series' estimate, when it asked for one. */
+    estimate?: ReminderEstimate | null;
+}
+
+/**
+ * An estimated amount, present only on a series that asked for one (mig 220).
+ *
+ * `amount` non-null means the surface's own amount IS this estimate.
+ * `amount` null means the series asked and could not have one — `unavailableReason`
+ * says why, and the amount shown is the reminder's template figure.
+ */
+export interface ReminderEstimate {
+    requestedSampleCount: number;
+    /** How many occurrences it actually averaged: at most the requested count. */
+    availableSampleCount: number;
+    amount: number | null;
+    /**
+     * Stable codes, rendered differently by each surface:
+     * 'no-history' | 'zero-estimate' | 'sign-mismatch' | 'has-split' |
+     * 'loan-driven' | 'not-bank-shape' | 'no-source-account'
+     */
+    unavailableReason: string | null;
 }
 
 export type UpcomingKind = 'scheduled' | 'reminder' | 'skipped';
@@ -42,6 +64,8 @@ export interface UpcomingOccurrence {
      * this occurrence's date, acting will catch-up (skip) earlier occurrences —
      * the form warns inline (ADR-0047 §9.2). */
     seriesNextDue: string | null;
+    /** Mig 220. Null on a FIRED occurrence: that carries the real committed figure. */
+    estimate?: ReminderEstimate | null;
 }
 
 export type ReminderKind = 'bank' | 'investment';
@@ -76,6 +100,8 @@ export interface ReminderDetail {
     isActive: boolean;
     isLoanReminder: boolean;
     origin: string;
+    /** Mig 220: the series' estimate, when it asked for one. */
+    estimate?: ReminderEstimate | null;
     /** Originating account (mig 125): the bank editor's source / the investment
      * brokerage. Null on a custom / pre-125 series. */
     sourceAccountId: string | null;
@@ -97,6 +123,20 @@ export interface SkipReminderResponse {
      * marked skipped, and the earliest of them ('YYYY-MM-DD' or null). */
     skippedEarlierCount: number;
     skippedEarlierFrom: string | null;
+}
+
+/**
+ * DELETE /reminders/{id}/skip.
+ *
+ * No cascade count, unlike SkipReminderResponse: un-skip touches exactly the slot
+ * asked for. Skipping sweeps earlier un-acted occurrences, and undoing that sweep
+ * would mean guessing which of them the user wanted back — each is independently
+ * un-skippable instead.
+ */
+export interface UnskipReminderResponse {
+    occurrenceDate: string;
+    /** May have moved EARLIER: the restored slot can now be the earliest un-acted one. */
+    nextDueDate: string | null;
 }
 
 export interface FireReminderRequest {
@@ -147,6 +187,10 @@ export interface CreateReminderRequest {
     endDate?: string | null;
     /** null = manual approve; N >= 0 = auto-commit N days before due. */
     autoCommitDaysBefore?: number | null;
+    /** Mig 220. 1-24, or null to leave alone. Single-posting non-loan only. */
+    estimateSampleCount?: number | null;
+    /** Explicit clear, because a null estimateSampleCount means 'unchanged'. */
+    clearEstimate?: boolean;
     payee?: string | null;
     memo?: string | null;
     checkNumber?: string | null;
@@ -161,6 +205,10 @@ export interface CreateInvestmentReminderRequest {
     startDate: string;
     endDate?: string | null;
     autoCommitDaysBefore?: number | null;
+    /** Mig 220. 1-24, or null to leave alone. Single-posting non-loan only. */
+    estimateSampleCount?: number | null;
+    /** Explicit clear, because a null estimateSampleCount means 'unchanged'. */
+    clearEstimate?: boolean;
     transaction: CreateInvestmentTransactionRequest;
 }
 
@@ -180,6 +228,10 @@ export interface EditReminderRequest {
     endDate?: string | null;
     clearAutoCommit?: boolean;
     autoCommitDaysBefore?: number | null;
+    /** Mig 220. 1-24, or null to leave alone. Single-posting non-loan only. */
+    estimateSampleCount?: number | null;
+    /** Explicit clear, because a null estimateSampleCount means 'unchanged'. */
+    clearEstimate?: boolean;
     payee?: string | null;
     memo?: string | null;
     checkNumber?: string | null;
@@ -196,5 +248,9 @@ export interface EditInvestmentReminderRequest {
     endDate?: string | null;
     clearAutoCommit?: boolean;
     autoCommitDaysBefore?: number | null;
+    /** Mig 220. 1-24, or null to leave alone. Single-posting non-loan only. */
+    estimateSampleCount?: number | null;
+    /** Explicit clear, because a null estimateSampleCount means 'unchanged'. */
+    clearEstimate?: boolean;
     transaction?: CreateInvestmentTransactionRequest | null;
 }

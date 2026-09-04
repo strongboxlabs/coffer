@@ -156,7 +156,7 @@ export function NotificationsPanel() {
                     {subscribers.data?.subscribers.map((s: NotificationSubscriber) => (
                         <div
                             key={s.id}
-                            className="flex items-start justify-between gap-3 border-b border-border-subtle pb-2 last:border-0"
+                            className="flex items-start justify-between gap-3 border-b border-border pb-2 last:border-0"
                         >
                             <div className="text-sm">
                                 <p className="font-medium">
@@ -218,7 +218,7 @@ export function NotificationsPanel() {
                     <label className="block text-sm">
                         <span className="text-text-muted">Provider</span>
                         <select
-                            className="mt-1 w-full rounded border border-border-subtle bg-surface p-2"
+                            className="mt-1 w-full rounded border border-border bg-surface p-2"
                             value={subscriberKey}
                             onChange={(e) => setSubscriberKey(e.target.value)}
                         >
@@ -247,7 +247,7 @@ export function NotificationsPanel() {
                         <label className="block text-sm">
                             <span className="text-text-muted">Watches</span>
                             <select
-                                className="mt-1 w-full rounded border border-border-subtle bg-surface p-2"
+                                className="mt-1 w-full rounded border border-border bg-surface p-2"
                                 value={monitors}
                                 onChange={(e) => setMonitors(e.target.value)}
                             >
@@ -268,7 +268,7 @@ export function NotificationsPanel() {
                         </span>
                         <input
                             type="url"
-                            className="mt-1 w-full rounded border border-border-subtle bg-surface p-2"
+                            className="mt-1 w-full rounded border border-border bg-surface p-2"
                             value={url}
                             onChange={(e) => setUrl(e.target.value)}
                             placeholder="https://…"
@@ -302,7 +302,7 @@ export function NotificationsPanel() {
                         <label className="block text-sm">
                             <span className="text-text-muted">Send at</span>
                             <select
-                                className="mt-1 w-full rounded border border-border-subtle bg-surface p-2"
+                                className="mt-1 w-full rounded border border-border bg-surface p-2"
                                 value={minSeverity}
                                 onChange={(e) => setMinSeverity(e.target.value)}
                             >

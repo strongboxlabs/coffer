@@ -185,7 +185,7 @@ function ReminderRow({
                         className={`font-mono text-sm tabular-nums ${
                             r.amount < 0 ? 'text-state-danger' : r.amount > 0 ? 'text-state-success' : 'text-text-muted'}`}
                     >
-                        {formatSignedAmount(r.amount)}
+                        {(r.estimate?.amount != null ? `≈${formatSignedAmount(r.amount)}` : formatSignedAmount(r.amount))}
                     </span>
                     <div className="flex items-center gap-1.5">
                         <Button type="button" variant="ghost" size="sm" disabled={disabled} onClick={onEdit}>

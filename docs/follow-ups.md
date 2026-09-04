@@ -26,6 +26,16 @@ Status section.
 
 ## Next (ordered)
 
+*Re-ranked 2026-08-28 to the maintainer's stated feature priorities; the seven
+numbered slices below are that order verbatim. Two things sit outside the ranking and
+say so: the engineering residue immediately below, which is nearly closed and commits
+no new work, and an unranked tail at the end. Items promoted from Backlog were MOVED,
+not copied — an item lives in exactly one zone.*
+
+*What the ranking changed: **Budgets went from first to last** and **CSV import from
+last to second**. Where that order fights a dependency, the dependency is stated in the
+slice rather than silently reordered.*
+
 ### Immediates
 
 Pulled up out of Backlog on 2026-08-17, ahead of the CSV slices. The as-of valuation
@@ -129,10 +139,64 @@ context, the way `SnapshotJobHandler` does in production. They passed only becau
 snapshot tables carry no RLS policies yet — so the pattern was both a wrong mirror of
 production and a latent break waiting on "RLS on the snapshot tables" below.
 
+#### Mutation-checking a new assertion is a habit, not a rule — and the habit keeps losing
+
+*open. Surfaced 2026-09-01 by three of my own vacuous tests in a single session, two of
+which I wrote AFTER the sweep above.*
+
+The sweep on 2026-08-18 found four assertions that could not fail and fixed them. It did
+not stop new ones being written. Three more appeared on 2026-09-01, and the interesting
+thing about them is not that they existed — it is how they were caught.
+
+| the test | why it could not fail | caught by |
+|---|---|---|
+| `ScheduleControl.test.tsx` — "says nothing alarming about a job a person simply turned off" | the only case in its block with no `await`, so both `queryByText` calls ran on the pending frame where `ScheduleHealth` short-circuits and the DOM is empty | an adversarial review of the release diff, then mutation. It had already SHIPPED, in #504 |
+| a DST endpoint test — PUT a 02:30 schedule, expect 200 | the endpoint passes `DateTime.UtcNow`, so the next 02:30 is almost never the spring-forward date | mutation, minutes after writing it |
+| the service-context recompute tests, as first planned | written over `PostgresFixture.NewServiceDbContext()`, which builds its own bare options independent of the production factory | an adversarial review, BEFORE they were written |
+
+**None of the three would have failed review.** Each reads as a normal, well-named test
+asserting a real property. The first shipped. What they have in common is that the
+assertion is NEGATIVE — "this string is absent", "this returns 200", "no exception" —
+and a negative assertion is true of an empty world, so it passes whenever the code under
+test never actually ran.
+
+**A periodic sweep cleans up; it does not prevent.** Between the sweep and today the
+repo gained two more, at roughly the rate the sweep removed them.
+
+**What to write into `docs/engineering-standards.md`.** The rule is cheap to state and
+cheap to follow: *a new assertion is not finished until it has been observed to fail.*
+The lightweight form is naming, in the PR body, the one-line mutation each new test
+catches — which this repo's commit messages have converged on informally already, and
+which is exactly the discipline that caught the second and third rows above.
+
+Scope it deliberately, or it becomes ceremony nobody does:
+- Assertions on NEW behaviour, not every touched test.
+- **Negative assertions always** — `queryBy*`, `Assert.Null`, `DoesNotContain`,
+  `Assert.Empty`, "expect 200". These are the whole population above.
+- Not required where the test already fails first and is made to pass, which is the same
+  evidence arrived at from the other side.
+
+**A lint rule beats a habit for the React half.** The `ScheduleControl` shape is
+mechanically detectable: a React Testing Library test whose body contains a `queryBy*`
+negative assertion and no `await` / `findBy*` / `waitFor` before it is asserting against
+an unrendered component, essentially always. That is one custom ESLint rule, it would
+have caught the case that shipped, and unlike a written rule it cannot be forgotten. Worth
+pricing before writing more prose.
+
+The C# half has no equivalent one-liner — "would this pass against unmodified code" is
+undecidable in general — so that half stays a stated rule plus the PR-body habit.
+
+**Related, and the reason this is worth doing rather than noting:** every entry in this
+section was found by something other than the test suite. The suite is where these are
+supposed to be caught, and a can't-fail assertion is precisely the defect the suite is
+blind to by construction.
+
 #### Boundary cases for the remaining financial suites
-*partial. The foundation shipped 2026-08-18 — this entry previously CLAIMED it had,
-naming `Boundary.cs` and `AddBoundaryPositionAsync`, and neither existed. Two of eight
-themes converted; six remain.*
+*partial — the theme conversions are DONE; the residue is named at the end of this
+entry. This status line read "Two of eight themes converted; six remain" until
+2026-08-28, while the body two screens below said all of them were complete. The body
+was right: themes five through nine are committed. Corrected rather than deleted,
+because the entry still owns open work.*
 
 Two prod failures came from tests using kiddie-pool data ($100, 10 shares) that never
 approached the magnitudes where money math breaks, so financial paths now test a
@@ -262,35 +326,237 @@ that inherit the same declarations by construction: `holdings_market_value_as_of
 needs a position no plausible portfolio produces on a ~50-year horizon, so it is
 documented rather than fixed.
 
-### Next in line — MCP + reporting
+---
 
-The reporting and MCP surface was closed out on 2026-08-17 (returns engine, response
-provenance, allocation reconciliation, the batched valuation feeders and the removal
-of the TWR boundary cap). What remains in this area is ADJACENT rather than a
-continuation of that work — none of it extends the returns engine — so it sits behind
-the immediates above but ahead of everything still in Backlog.
+### 1 · Reminders
 
-### Budgets + budget-vs-actual
+#### Slice complete: auto-post, un-skip, estimated amounts
 
-*Status: open. The next backend/product slice after historical valuations (PR B, shipped).*
+*closed 2026-09-03 by #512 / #513 / #514 / #516 / #517, released in 0.72.0, 0.72.1 and
+0.73.0. Slice 1 has no open work.*
 
-Whole subsystem: schema (amount/category/period) + API + UI + variance report +
-MCP exposure.
+All three entries are done and their text is deleted rather than annotated — ADR-0097
+carries the auto-post decisions, and a closed entry restating them is a second copy that
+will drift. One heading stays so the slice does not read as untouched.
 
-### Realistic anonymized demo import
+Four things learned here that are NOT in the ADR, because they are about how the work
+went rather than what was decided:
 
-*Status: open. Surfaced during PR B (historical valuations) design. User-requested; PII-safe approach agreed.*
+**The first shape of auto-post reproduced the defect it was built to remove.** It shipped
+in 0.72.0 needing a per-reminder option AND a separate per-ledger switch, so ticking the
+option did nothing, silently — exactly as before, one level up. Found by the maintainer on
+first real use, not by any review pass, and fixed in 0.72.1 by making the tick the whole
+opt-in. A feature whose point is "this should not fail silently" deserves someone actually
+trying it before it is called done.
 
-The current `data/samples/moneydance-export-demo.json` is all-uncleared +
-investment-only, which masked the reconciliation + valuation cases (it misled the
-ADR-0082 recon work). Build a realistic demo by **synthesize-on-structure**: read
-the real export ONLY for structure (account-graph topology, txn shapes,
-stat/splittype distributions) and emit synthetic names/payees/tickers/account
-numbers + jittered amounts + shifted dates — nothing real copied, so there is no
-PII to leak. Deterministic C# generator (project stack, no Python); decide
-replace-vs-new + update `DemoSampleImportTests` + provisioning.
+**Every guard worth having was already doubled**, which made single-mutation tests
+impossible for three properties: skip-respected, no-cross-ledger-write, and the auto-post
+scan's ledger predicate. Each is enforced at two or three layers, so removing any one
+leaves every test green — and for ledger scoping, removing TWO still does, because
+`FireAsync` resolves by `(id, ledgerId)`. The tests record that rather than deleting real
+guards to make a mutation visible. Expect it here; defence in depth and per-guard test
+isolation are in tension, and the depth is worth more.
 
-### Canned + memorized reports (reuse the MCP reporting layer)
+**Two exclusions collapsed into one predicate** on estimates, and the collapse came from
+the maintainer, not the design. Splits have no single amount to estimate; a loan payment
+is computed from its terms and current balance, which an average would only degrade. As
+one eligibility check they are cheap; as two special cases they would have been a rule to
+re-derive at every call site.
+
+**Scope questions belong to the maintainer.** The design pass proposed auto-post SKIP
+estimated reminders on the grounds that a guess should not be committed unattended. That
+was overruled — "let the user worry about it; if it's a problem they'll uncheck it" — and
+the simpler product is the shipped one. The design pass was restarted rather than
+patched, because two of its stated constraints had become false and it would otherwise
+have answered the wrong question well.
+
+### 2 · CSV import
+
+*Promoted from last to second by the 2026-08-28 ranking. Phase 5 is the generic path
+and Phase 6 the hand-coded ones; the ranking now names the two institutions that
+motivated the slice, which the entry previously left abstract.*
+
+#### CSV Phase 5 — generic ingest provider (ADR-0031)
+
+*Position note: this and Phase 6 were the whole of Next before 2026-08-17. They are
+still committed work, placed last here only because the items above were explicitly
+ranked ahead of them — not because the CSV slice was reassessed.*
+
+`GenericCsvProvider` reading a `feed_csv_mappings` config (column map + date
+format + sign convention + header rows), extending the same `IngestOrchestrator`
+as SimpleFIN / OFX / QIF. The column-mapping wizard UI lands here. Resolves the
+CSV slice (file upload, per-institution mappings, hash-based `external_id`).
+
+#### CSV Phase 6 — per-institution ingest providers (ADR-0031)
+
+Hand-coded providers for institutions whose format defeats the generic path (a
+workplace 401(k) plan expected first). Each is a sibling `IFileProvider`
+registered alongside the generic one; the orchestrator dispatches purely on the
+provider key.
+
+**Named targets (2026-08-28).** **Macy's** and the **Fidelity brokerage CSV**, in that
+shape: Macy's is a card statement, so bank-shape rows and the better Phase 5 exercise;
+the Fidelity brokerage CSV is investment-shape and the likelier Phase 6.
+
+**The 401(k) is NOT a CSV problem — and it is closer than this slice.** Fidelity
+NetBenefits exports QIF, and Coffer's QIF importer already exists and was written for
+exactly that dialect: `QifFileProvider`'s own remarks say "a QIF file (at least the
+workplace plan dialect) carries no account header". What stops it is one gap, already
+recorded under **Bank feeds › QIF drops investment actions the OFX provider already
+maps**: `CONTRIBX` and `WITHDRWX` are skipped with "cash transfers inside an investment
+section aren't imported in this slice", and on a 401(k) statement the contributions are
+most of the file.
+
+**Shipped 2026-08-28.** The four arms now route to the bank shape exactly as the OFX
+provider routes `INVBANKTRAN` (`Action: null`, wire-shape), and `RtrnCap` classifies as a
+cash distribution like `RETOFCAP`. So the workplace-plan route needs no new provider, no
+mapping wizard and no schema, and this slice keeps only Macy's and the Fidelity brokerage
+CSV.
+
+**Still owed: confirmation against a real NetBenefits export.** The rows import and the
+signs are pinned by test, but whether a whole plan statement round-trips faithfully — an
+account that reconciles to the plan's own balance — is a different question, and no
+synthetic fixture can answer it.
+
+### 3 · Splits
+
+#### The split edit screen
+
+*Status: open, and now shaped. Requested 2026-07-11 as "perf + code-structure pass,
+scope TBD"; the 2026-08-28 ranking makes it a product slice rather than a refactor.*
+
+The entry sat unshaped for seven weeks because it was recorded as a refactor, and a
+refactor with no stated defect has no acceptance criterion. Ranked as a feature, it
+gets one — and the two known concrete problems are the place to start:
+
+- `TxnRowEdit.tsx` is ~1620 lines and is one of the six files listed under **Domain-split
+  the remaining mega-files**. That entry's own rule is to decompose *when next touching
+  the file for a feature*, and this is that moment. Two commits in one PR: a
+  behaviour-zero decomposition whose gate is the existing test file staying green with
+  no assertion edits, then the feature.
+- Per-posting tags land here (below), which is new UI inside the same editor. Doing the
+  decomposition first is what stops that landing in a 1600-line file.
+
+#### Per-posting tags
+
+*Status: open, ADR first. **Un-parked 2026-08-28** — the ranking commits to the feature,
+which reverses the standing recommendation to delete the placeholder.*
+
+The editor already renders the promise: `<TagsPlaceholder hint="Per-posting tags coming
+soon" />` beside every posting in
+[TxnRowEdit.tsx:1301](../src/Web/src/routes/ledgers/TxnRowEdit.tsx#L1301). Until this
+ranking the honest move was to delete that control, because holding it meant shipping a
+permanent "coming soon" against an ADR nobody was scheduled to write. The ranking
+schedules it, so the control stays and the ADR gets written.
+
+**The ADR is not optional and it is not small.** No `txn_leg_tags` table exists; ADR-0009
+put tags at transaction level and stands unamended, and ADR-0025's "Open questions" now
+reads "None", so the deferral has fallen off the ADR trail entirely. The schema shape is
+already forced by things that will fail closed:
+
+- the table must carry `ledger_id NOT NULL` — `fn_snapshot_write_part` chunks on a
+  generic `WHERE t.ledger_id = $1`, so a snapshot-captured table without that column
+  cannot be captured at all;
+- it must enable RLS with the flattened `user_ledger_grants` policy, like
+  `txn_header_tags`;
+- `SchemaDriftGuardTests.Snapshot_payload_classifies_every_ledger_scoped_table` fails the
+  moment the table exists, so the snapshot decision lands in the same PR — five snapshot
+  bodies plus `fn_ledger_delete`.
+
+Two existing entries resolve when this ships: the importer's per-leg tag collapse (see
+**Moneydance import**), and the inert placeholder above. A rental-property split that
+imports as `{Property A, Property B, Property C}` on one header becomes attributable per
+posting — which is the actual user-facing point of the whole item.
+
+### 4 · Home screen — a richer ledger dashboard
+
+*Status: open. Surfaced 2026-08-28 by the feature ranking. Extends what exists rather
+than replacing it — confirmed as the ledger dashboard, not a cross-ledger landing page.*
+
+`LedgerDetailPage` is already the home screen and already configurable: five widgets
+(`net-worth`, `accounts`, `investments`, `upcoming`, `activity`), reorderable and
+toggleable, persisted per ledger through the `dashboard` preference and edited in
+`DashboardLayoutPanel`. Accounts is pinned visible; the rest are opt-in. So the work is
+not "build a dashboard" — it is that five stacked widgets is a list, not a screen.
+
+Worth settling before building:
+
+- **Which widgets are missing rather than thin.** Budgets-at-a-glance and a cash-flow
+  strip are the obvious candidates, and both are downstream of slices 6 and 7 — so a
+  home screen ranked *above* Reports and Budgets can only build the frame for them now.
+- **Layout, not just order.** Today the preference stores `{ key, visible }` and renders
+  a stack. Widths or a grid mean the stored shape changes, which is a preference
+  migration, not a CSS change. Decide it once, here.
+- **What the screen is FOR.** A summary surface and an attention surface are different
+  products, and the widget set gives no opinion: `upcoming` and `activity` are
+  attention, `net-worth` and `investments` are summary. Picking one makes every later
+  widget decision easy and picking neither makes each one an argument.
+
+### 5 · Accounts organization
+
+*Both items promoted from the Sidebar backlog area by the 2026-08-28 ranking. They are
+one slice: the persisted-tab work is a `user_preferences` shape, and folders are the
+thing most likely to make that preference worth persisting.*
+
+#### Folder accounts (sub-grouping within types)
+
+*Status: open. Schema change required.*
+
+Users want a second level of organization inside each type —
+"Checking" / "Savings" folders inside Banking, "Roth IRA" /
+"Traditional 401(k)" / "Taxable" inside Investments. Folders are
+pure grouping containers, NOT real accounts:
+- no transactions of their own
+- no `currency_code` semantics
+- no clickable register
+- balance computed as `SUM(child.balance)` at render time
+
+A folder is a **distinct schema concept** from a parent account
+that happens to have children. `accounts.parent_id` alone can't
+tell the SPA "render as a folder, suppress the register link, roll
+up the balance."
+
+**Schema options** (surface options before coding):
+
+1. `accounts.is_folder BOOLEAN NOT NULL DEFAULT FALSE` + a trigger
+   forbidding `txn_legs` rows where `is_folder = TRUE`.
+   Minimum-disruption, reuses the accounts table.
+2. New `account_type = 'folder'` discriminator alongside `bank`,
+   `category`, etc. Cleaner type-wise but touches every
+   account-type switch (sidebar, register, importer).
+3. Separate `account_groups` table — folders distinct from
+   accounts. Most "correct" but biggest schema ripple.
+
+Lean toward (1) — minimum surface area, single field every
+account-aware query already projects.
+
+#### Remember last-active sidebar tab across sessions
+
+*Status: open. Defer per design discussion.*
+
+`AuthedSidebar`'s `activeGroupId` resets to "All" on every
+refresh. The user explicitly chose "All by default, no
+localStorage drift" for v1; the deferred path is a
+`user_preferences` table (or JSON column on `users`) that holds
+per-(user, ledger) UI state including last-active tab,
+collapsed-section state, etc. Land when there's more than one
+preference worth persisting.
+
+### 6 · Reports
+
+*The ranked position of the reporting slice. Its three sub-items — transactions;
+cash flow / income-expense / net worth; investment portfolio and performance — are
+already the canned set described below, so the ranking confirms the entry rather than
+changing it.*
+
+**Two dependencies this position does not remove.** The reports layer is specified to
+sit on the MCP `ReportSpec` / `ReportingRepository` layer rather than a parallel one, so
+it inherits whatever that layer can express. And it is worth very little without
+realistic data — see **Realistic anonymized demo import** in the unranked tail, which
+has to precede it. The current demo sample is all-uncleared and investment-only, which
+has already misled reconciliation work once.
+
+#### Canned + memorized reports (reuse the MCP reporting layer)
 
 The MCP server (ADR-0063) introduces a reusable reporting layer:
 a serializable **`ReportSpec`** (measure · group-by dims · filters ·
@@ -321,23 +587,46 @@ this same layer, not a parallel one:**
   multi-currency reports. Likely its own ADR when the Reports UI is
   scheduled.
 
-### CSV Phase 5 — generic ingest provider (ADR-0031)
+### 7 · Budgets + budget-vs-actual
 
-*Position note: this and Phase 6 were the whole of Next before 2026-08-17. They are
-still committed work, placed last here only because the items above were explicitly
-ranked ahead of them — not because the CSV slice was reassessed.*
+*Status: open. The next backend/product slice after historical valuations (PR B, shipped).*
 
-`GenericCsvProvider` reading a `feed_csv_mappings` config (column map + date
-format + sign convention + header rows), extending the same `IngestOrchestrator`
-as SimpleFIN / OFX / QIF. The column-mapping wizard UI lands here. Resolves the
-CSV slice (file upload, per-institution mappings, hash-based `external_id`).
+Whole subsystem: schema (amount/category/period) + API + UI + variance report +
+MCP exposure.
 
-### CSV Phase 6 — per-institution ingest providers (ADR-0031)
+---
 
-Hand-coded providers for institutions whose format defeats the generic path (a
-workplace 401(k) plan expected first). Each is a sibling `IFileProvider`
-registered alongside the generic one; the orchestrator dispatches purely on the
-provider key.
+### Unranked by the feature list
+
+*Two entries the ranking does not cover. Neither is deprioritised — they are inputs to
+the ranked slices rather than slices themselves.*
+
+#### Realistic anonymized demo import
+
+*Status: open. Ranked implicitly by slice 6, which needs it.*
+
+Synthesize-on-structure: read the real export ONLY for structure (account-graph
+topology, txn shapes, stat/splittype distributions) and emit synthetic
+names/payees/tickers/account numbers with jittered amounts and shifted dates — nothing
+real copied, so there is no PII to leak. Deterministic C# generator (project stack, no
+Python); decide replace-vs-new, update `DemoSampleImportTests`, update provisioning.
+
+The reason it moved next to Reports: the current
+`data/samples/moneydance-export-demo.json` is all-uncleared and investment-only, so it
+exercises neither reconciliation nor a cash-flow report. A reports slice tested against
+it would pass while being wrong for every real ledger. **Also gated behind the importer
+work** — `DemoSampleImportTests` asserts against this file's structure, and the
+Moneydance payee/memo slice changes what the importer extracts from it.
+
+#### MCP and reporting adjacencies
+
+*Status: open, no schedule.*
+
+The reporting and MCP surface closed out 2026-08-17 — returns engine, response
+provenance, allocation reconciliation, the batched valuation feeders, the removal of the
+TWR boundary cap. What remains in that area is adjacent rather than a continuation, and
+none of it extends the returns engine. It has no ranked position because the feature
+list does not name it; it collides with nothing, so it can run alongside anything.
 
 ---
 
@@ -365,6 +654,92 @@ against the capture and restore functions (which run as the caller, not as
 `SECURITY DEFINER` — so a policy that the request context does not satisfy would make
 snapshots silently capture nothing, exactly the failure mode described under
 "Assertions that cannot fail").
+
+### Data integrity
+
+*Surfaced 2026-08-28 by a sweep for work recorded outside this file. Each item is a
+correctness obligation someone deferred deliberately, with the deferral written into a
+migration header or a code comment and nowhere else.*
+
+#### Migration 209 fixed the realized-gains writer and left every existing row wrong
+
+*partly done. The prompt shipped; the per-ledger repair state has not.*
+
+[209_realized_gains_round_once.sql:45-50](../db/migrations/209_realized_gains_round_once.sql#L45-L50)
+says it plainly: "NOT BACKFILLED HERE. Existing rows keep their double-rounded values
+until something recomputes them." The reasoning holds — a blanket recompute at migration
+time would rewrite holdings and lots for every pair, a far larger blast radius than the
+cent it corrects — but the consequence was left unowned.
+
+The same header measures it on real data: on a 42k-transaction, 586-disposal ledger three
+rows disagreed with a fresh walk. So on every upgraded install, tax-relevant realized-gain
+figures are a cent off and the consistency report pins `realized_gains` unhealthy until
+someone repairs it PER LEDGER.
+
+**The prompt half is done.** An unresolved `consistency.drift` notification renders "Check
+and repair", linking to the General tab with `?check=true`, which runs the check on arrival
+and offers the per-projection repair inline. Finding Settings, then Maintenance, then the
+button, unaided, is no longer the only route to the fix.
+
+**The state half is open.** Nothing records which ledgers have been repaired, so "done"
+stays invisible: an operator with several ledgers cannot tell one that was repaired from
+one that was never opened, and a report expected to be unhealthy on some unremembered
+subset still trains people to ignore the one signal that matters. Wants a per-ledger repair
+state.
+
+#### The consistency checker skips the one projection written by raw SQL
+
+*open. Documented as a deliberate omission in the DTO.*
+
+[LedgerConsistencyRepository.cs:52-62](../src/Api/Db/Repositories/LedgerConsistencyRepository.cs#L52-L62)
+checks four projections — balances, holdings, realized gains, posting counts. The fifth,
+trade-derived `security_prices`, is left out with a stated reason
+([LedgerConsistencyDtos.cs:72-78](../src/Api/Contracts/LedgerConsistencyDtos.cs#L72-L78)):
+a trade leg seeds a price row, but the per-day source-priority rule makes a MISSING row
+legitimate whenever a manual or fetched price already owns that day, so a naive check
+reports drift that is not there.
+
+That was the right call and it still leaves the hole where the tool's own justification
+points. The checker exists because a raw-SQL scrub silently desynced a projection and the
+register showed wrong figures for months; the uncovered projection is the one written by
+migration 177's rank-gated bulk INSERT — a raw-SQL path that bypasses the EF interceptors
+— and it feeds valuation, allocation and returns. The check is writable, just not naively:
+compare against what the source-priority rule implies for each day, not against row
+presence.
+
+#### The `ledgers` LEK columns never got their NOT NULL follow-up
+
+*open. Promised by migration 035, 180 migrations ago.*
+
+[035_ledger_encryption_key.sql:16-21](../db/migrations/035_ledger_encryption_key.sql#L16-L21)
+ships the columns nullable and states that "a subsequent migration sets NOT NULL once
+backfill is verified complete". Backfill is still lazy-only (`EnsureWrappedLekAsync`, on
+first secret access), so a ledger that has never written a secret can carry a NULL
+`wrapped_lek` indefinitely — and both `KekRotationService` and `KekReconciliationService`
+filter `WrappedLek != null`. A never-backfilled ledger is therefore skipped silently by
+rotation and by reconciliation, both of which then report success. Needs the eager
+backfill the header calls "a follow-up polish", and then the constraint.
+
+#### A snapshot cannot be restored across a schema version
+
+*open, and compounding. ADR-0037 Phase 1.*
+
+Restore refuses when a snapshot's `__schema_migrations` version differs from the live
+database
+([LedgerSnapshotsRepository.cs:293-297](../src/Api/Snapshots/LedgerSnapshotsRepository.cs#L293-L297)),
+returning `SchemaVersionMismatch`. So every migration invalidates every snapshot taken
+before it, and the pre-upgrade snapshot — the one a user takes precisely BECAUSE an
+upgrade is risky — is the one that cannot be restored once the upgrade lands. They find
+out at restore time.
+
+It compounds rather than sitting still: migration 188 made the guard load-bearing for
+correctness rather than mere compatibility, dropping the realized-gains recompute and
+capturing the derived rows in the payload, justified explicitly by "restore REFUSES a
+cross-schema-version restore ... so the derivation logic cannot have changed in between".
+Lifting Phase 1 now means reworking what 188 captured. The cheap half — say so in the UI
+at capture time, so the artifact stops reading as insurance it is not — needs no ADR.
+
+---
 
 ### Secrets handling
 
@@ -471,6 +846,17 @@ posted date when `transactedAt !== postedAt`. The remaining UX loop:
   on investment rows is currently invisible — needs its own
   treatment.
 
+#### Dark mode
+
+*open. The token layer was built for it; the swap never happened.*
+
+ADR-0021 Rule 4 defers dark mode, and [index.css:14](../src/Web/src/index.css#L14) carries
+the matching promissory note — dark mode as "a future ADR + PR that overrides these tokens
+inside a `[data-theme="dark"]` block". No such block exists, and no `prefers-color-scheme`
+rule exists anywhere in the SPA. The expensive half was paid up front, since every colour
+is already indirected through a token, and the condition ADR-0021 set for revisiting
+("after the light system is stable") passed long ago.
+
 ### Bank feeds
 
 #### Bulk security-mapping step in the OFX import dialog
@@ -507,6 +893,38 @@ this table on every read, so every row of the matched ticker
 auto-resolves on the next register fetch. K decisions in one
 batch instead of K trips through the editor.
 
+### Moneydance import
+
+*[moneydance-import-fidelity.md](moneydance-import-fidelity.md) holds the full ranked gap
+list; the two entries below are the ones carrying an open obligation. Both are
+constrained the same way: ADR-0052 D2 makes the importer seed-once, so adding a column
+later is not enough — each needs a PAIRED BACKFILL over the retained raw payload, in the
+same slice.*
+
+*A third entry lived here until 2026-08-28: the collapse of per-leg tags onto the
+header. It moved to **Next › 3 · Splits › Per-posting tags**, because it is not really an
+importer defect — the importer collapses them because there is nowhere to put them, and
+the same backfill-pairing rule applies once `txn_leg_tags` exists.*
+
+#### `ol.orig-payee` / `ol.orig-memo` are dropped on import
+
+*open. Ranked #2 by impact in the fidelity doc.*
+
+Neither `bank_payee` nor `bank_memo` exists anywhere in `db/migrations` or `src`.
+Moneydance keeps both the user's cleaned payee and the bank's original string; Coffer
+keeps one, so years of payee cleanup arrive flattened and the original is unrecoverable
+from the ledger. Columns plus backfill, together.
+
+#### The `isMultiSplit` guard discards single-leg `0.desc`
+
+*open. The fidelity doc calls the fix trivial; it is still there.*
+
+[TransactionMapper.cs:183-196](../src/Importer.Moneydance/Mappers/TransactionMapper.cs#L183-L196)
+computes `var isMultiSplit = emittable.Count > 1;` and keeps the leg memo only when that
+holds — duplicated in `ReminderMapper.cs`. The doc quantifies the loss: a couple thousand
+single-leg events where `txn.desc` is "CONTRIBUTION" and the discarded `0.desc` held the
+fund name, which is exactly the leg-level context an investment register exists to show.
+
 ### Register surface
 
 #### Register non-date scroll affordance
@@ -530,13 +948,6 @@ either feed the virtual list the true total entry count (already available from
 total-count-based thumb in the rail gutter. Windowing-level work; deferred as
 disproportionate to the sort slice.
 
-#### Splits editor — optimization / refactor
-
-*Status: open. Requested 2026-07-11; shape TBD.*
-
-The multi-split transaction editor wants a perf + code-structure
-pass. Scope to be defined against the current editor.
-
 #### Bulk Categorize / Tag actions
 
 *Status: blocked on the bulk override / categorisation write endpoints.*
@@ -551,38 +962,6 @@ the recon-status bulk buttons use today.
 ---
 
 ### Sidebar
-
-#### Folder accounts (sub-grouping within types)
-
-*Status: open. Schema change required.*
-
-Users want a second level of organization inside each type —
-"Checking" / "Savings" folders inside Banking, "Roth IRA" /
-"Traditional 401(k)" / "Taxable" inside Investments. Folders are
-pure grouping containers, NOT real accounts:
-- no transactions of their own
-- no `currency_code` semantics
-- no clickable register
-- balance computed as `SUM(child.balance)` at render time
-
-A folder is a **distinct schema concept** from a parent account
-that happens to have children. `accounts.parent_id` alone can't
-tell the SPA "render as a folder, suppress the register link, roll
-up the balance."
-
-**Schema options** (surface options before coding):
-
-1. `accounts.is_folder BOOLEAN NOT NULL DEFAULT FALSE` + a trigger
-   forbidding `txn_legs` rows where `is_folder = TRUE`.
-   Minimum-disruption, reuses the accounts table.
-2. New `account_type = 'folder'` discriminator alongside `bank`,
-   `category`, etc. Cleaner type-wise but touches every
-   account-type switch (sidebar, register, importer).
-3. Separate `account_groups` table — folders distinct from
-   accounts. Most "correct" but biggest schema ripple.
-
-Lean toward (1) — minimum surface area, single field every
-account-aware query already projects.
 
 #### Sidebar tab reorder (drag-to-rearrange)
 
@@ -603,18 +982,6 @@ appends new tabs to the end (max+1). Drag-to-reorder needs:
 Land when the user actually wants to reorder — at 2-4 tabs the
 append-order is usually fine.
 
-#### Remember last-active sidebar tab across sessions
-
-*Status: open. Defer per design discussion.*
-
-`AuthedSidebar`'s `activeGroupId` resets to "All" on every
-refresh. The user explicitly chose "All by default, no
-localStorage drift" for v1; the deferred path is a
-`user_preferences` table (or JSON column on `users`) that holds
-per-(user, ledger) UI state including last-active tab,
-collapsed-section state, etc. Land when there's more than one
-preference worth persisting.
-
 #### Drop the vestigial counters on `sync_runs`
 
 *Status: open cleanup. Slice 2c.1 left `txns_merged` / `txns_queued` /
@@ -627,24 +994,13 @@ still use. Drop them in a future cleanup.*
 
 #### Sync activity log retention
 
-*Status: open. Slice 2c.1 keeps every `sync_runs` row forever. At
-one sync/day that's ~365 rows/year/connection — fine through
-the personal-use horizon. When daily polling lands (background
-worker, not yet built) or a multi-tenant deployment shows up,
-re-evaluate. Likely shape: keep last 90 days verbose, roll
-older runs into a per-month summary row; or simply LIMIT the
-list query and never paginate beyond N. No automation today.*
-
-#### Scheduled-sync worker (slice 2d-ish)
-
-*Status: open. The scheduler framework exists (`scheduled_jobs` mig 136 +
-`IScheduledJobHandler` / `IGlobalScheduledJobHandler`, already driving daily
-backups + quote refresh); feed sync is manual-trigger only — no feed-sync job
-handler is wired. This item is adding one.*
-
-Today every `sync_runs` row carries a `triggered_by_user_id`; a background
-daily-poll handler would land rows with NULL there. The activity panel + counters
-already accommodate this — no UI change needed when the worker ships.
+*Status: open, and the condition it named has now been met. Slice 2c.1 keeps every
+`sync_runs` row forever. At one sync/day that's ~365 rows/year/connection — fine
+through the personal-use horizon, and this item said to re-evaluate "when daily polling
+lands". It landed: scheduled feed sync shipped in v0.68.0 (`FeedSyncJobHandler` +
+migration 215), so rows now accrue whether or not anyone clicks anything. Likely shape:
+keep last 90 days verbose, roll older runs into a per-month summary row; or simply LIMIT
+the list query and never paginate beyond N. No automation today.*
 
 #### Persist failed SimpleFinException runs more granularly
 
@@ -671,8 +1027,10 @@ Hobbies-Leisure:Entertaining, etc.). That comes from MD's
 rules + payee memory. Today every sync row in Coffer lands on
 the per-ledger "Uncategorized" counterparty. Build a small
 rules engine (payee-substring → category, with priority +
-on/off toggle) and apply it in `SimpleFinSyncService` before
-the leg insert. Approve flow stays unchanged.*
+on/off toggle) and apply it on the orchestrator path
+(`SimpleFinPullProvider` -> `IngestOrchestrator`) before the leg
+insert — `SimpleFinSyncService`, which this item used to name, was
+deleted by ADR-0031 Phase 2. Approve flow stays unchanged.*
 
 ---
 
@@ -744,6 +1102,24 @@ once the editor is in place.
 
 ---
 
+#### `recentPrices[].source` is hard-coded NULL on a premise that expired
+
+*open cleanup. Surfaced 2026-08-28.*
+
+[SecuritiesRepository.cs:127-133](../src/Api/Db/Repositories/SecuritiesRepository.cs#L127-L133)
+projects `new SecurityPricePointDto(p.PriceDate, p.Price, (string?)null)` behind a comment
+stating that "the `security_prices` table doesn't track a free-form source label today".
+It does: migration 130 added `security_prices.source NOT NULL` (ADR-0054 D2), widened by
+migrations 154 and 177, and the SPA already renders it for the richer prices table via
+`priceSourceLabel(p.source)`
+([SecurityDetailPage.tsx:649](../src/Web/src/routes/ledgers/SecurityDetailPage.tsx#L649)).
+
+Only this contract still hands out null, while its own DTO documents the field as a
+"Free-form source label" and the SPA types it `string | null`. Every consumer of the
+security-detail endpoint, MCP clients included, is left unable to tell a manual price
+from a fetched or trade-derived one — from a row that records exactly that. One-line
+projection change; the comment is the real defect, since it reads as current fact.
+
 ### Multi-user collaboration
 
 #### SSE notifications for live edits across users on the same ledger
@@ -784,34 +1160,6 @@ connections, idle-timeout config, reverse-proxy buffering).
 
 ### Observability
 
-#### Notify on missed or failed scheduled jobs
-*open. Migration 194 records the state; nothing surfaces or announces it.*
-
-The snapshot/backup outage ran for roughly two days without a single signal. The
-only thing a human could have noticed was an unrelated-looking 500 from
-`/oauth/authorize`, and the only record was `LogError` lines inside a container.
-Snapshots stopped for ~68 hours and backups for ~47, both silently.
-
-Migration 194 added the raw material — `consecutive_failures`, `last_error`,
-`last_failure_at` on both `scheduled_jobs` and `global_scheduled_jobs`, and
-`SchedulerRunner` disables a job after five consecutive failures. None of that is
-surfaced or pushed anywhere. What is missing:
-
-- **Surface it.** The schedule panels should show last outcome, consecutive
-  failures and `last_error`, and mark an auto-disabled job distinctly from one a
-  user turned off — right now those are indistinguishable in the UI.
-- **A missed-run check, not just a failed-run one.** Failure counting only fires
-  when a handler is dispatched and throws. A job that never ran at all — worker
-  dead, container down, `next_run_at` NULL, row disabled by the threshold — has no
-  failures recorded and looks healthy. The check that matters is "`last_run_at` is
-  older than the schedule implies", which catches both.
-- **Announce it.** Email via the existing notification path, or the health endpoint
-  reporting degraded so an external monitor sees it. A backup that has not
-  succeeded in 48 hours deserves to interrupt someone; anything that only writes
-  to a log we do not read is not a notification.
-- **Consider a floor on backup age** as the highest-value single alert — that is
-  the one whose absence actually costs data.
-
 #### Prod OTLP tracing exporter
 
 *Status: blocked on a collector existing to receive spans. The last open item from
@@ -827,6 +1175,84 @@ business-outcome logging (`BusinessError.Problem` tags `HttpContext.Items` and t
 access log appends the business `code` on a rejection); and durable audit rows for
 Moneydance import + snapshot restore (`provider_runs` generalized to
 `ledger_operations`, migration 185, surfaced in Settings→Activity).
+
+### Documentation drift
+
+*Found 2026-08-28 by a sweep for work recorded outside this file. Grouped because the
+fix is the same in each case — the code moved and the prose did not — and because prose
+drift is the failure mode that costs a reader an hour and produces no error message.*
+
+#### The ADR index contradicts the ADRs it indexes
+
+[decisions/README.md](decisions/README.md) line 69 lists **0063** as *Proposed*; that
+ADR's own header reads "Accepted (v1 = v0.5.0, built + validated end-to-end)" and the MCP
+surface has been live for a dozen minor versions. Line 98 lists **0092** as *Proposed*,
+while 0094 and 0095 — both *Accepted* — are recorded in the same table as amending it.
+Two shipped, security-relevant decisions read as speculation at the entry point a
+maintainer scans first.
+
+#### `glossary.md` and `architecture.md` §6.6 describe the pre-ADR-0022 data model
+
+The glossary's **Counterparty**, **Double-entry / symmetric postings**, **Override**,
+**Pending transaction** and **Resolved view** entries are each written around a
+`transactions` table paired by `counterparty_id`, with edits in `transaction_overrides`
+and unsettled rows in `pending_transactions`. Migration 025 dropped the first three of
+those tables and migration 044 the rest; the model has been headers + legs since
+ADR-0022, which superseded the ADR-0019 those entries still cite as current, and
+`AppDbContext` maps no `transactions` table at all. `architecture.md` compounds it by
+describing `SimpleFinSyncService` as the live sync orchestrator after ADR-0031 Phase 2
+replaced it. A newcomer reading the glossary is reading a schema that no longer exists.
+
+#### Migration 113's header cites a share scale the schema had already dropped
+
+[113_txn_headers_ingest_investment_fields.sql:23](../db/migrations/113_txn_headers_ingest_investment_fields.sql#L23)
+documents shares as `NUMERIC(28,8) per holdings.quantity`. Migration 043 — seventy
+migrations earlier — set that column to `NUMERIC(25,12)`. Cosmetic in isolation, not
+cosmetic as a pattern: migrations 205 and 209 each rounded money at a scale a stale
+header asserted, and the second one put three disposals a cent out on a real ledger. A
+migration header is load-bearing documentation here and wants the same scrutiny as the
+DDL beneath it.
+
+**Decided 2026-08-28: mechanise it, and fix the doc rather than the migration.**
+`engineering-standards.md` §3.1 — "once a migration file is committed to `main`, it is
+never edited" — forbids correcting 113 in place, so the fix is the comment-side twin of
+the guard that already exists for columns (`SchemaDriftGuardTests`): parse `NUMERIC(p,s)`
+claims out of migration comments and compare them against `information_schema`, with 113
+recorded in the guard's allow-list as known-stale so the check does not start permanently
+red. `database-schema.md` carries the correction a reader will actually find. Rejected:
+a corrective `COMMENT ON COLUMN` migration, which fixes one instance and catches none.
+
+#### Two xmldoc `cref`s point at a type ADR-0031 deleted
+
+`SimpleFinClient.cs` carries `<see cref="SimpleFinSyncService"/>` twice (lines 24 and
+188) and no such class exists anywhere in `src/` — Phase 2 replaced it with
+`SimpleFinPullProvider` over `IngestOrchestrator`. Four other files reference it in prose
+comments, two of them correctly flagged as pre-ADR-0031 history and two not.
+
+**Decided 2026-08-28: fix the three by hand now; the compiler flag waits.** Turning on
+`GenerateDocumentationFile` would catch this class automatically, but `Api.csproj`
+already sets `TreatWarningsAsErrors=true`, so switching it on surfaces 36 CS1574 sites
+across 31 distinct cref targets — plus 4 CS1584, 140 CS1573 and 238 CS1587 — all of them
+blocking. That is its own PR, on its own schedule.
+
+#### `GenerateDocumentationFile` is off, so no cref is checked
+
+*parked, with the condition stated. Split out of the entry above on 2026-08-28.*
+
+36 blocking sites is the whole cost, and it is a one-time cost: `SimpleFinSyncService` is
+2 of them, and the rest include `LegDerivedRecomputeService`, `SnapshotScheduler`,
+`LedgerSnapshotSerializer`, `LedgerSnapshotRestorer`, `HoldingsRecomputeInterceptor`,
+`BootstrapTokenService`, `PostingIndex` and `LegSpecKey`. Reopen when someone has an
+afternoon for it — after which every future dangling cref fails the build instead of
+being found by a sweep.
+
+#### `architecture.md` files tax-lot selection under Non-goals
+
+It is queued work — see "A5 — Edit Lots affordance" above, which is exactly this feature.
+The parenthetical marks it deferred, but sitting under a **Non-goals** heading it reads
+as a decision not to build it.
+
+---
 
 ### Code structure
 
@@ -851,6 +1277,70 @@ Current offenders (line counts 2026-07-24):
 ---
 
 ### Performance
+
+#### The consistency monitor runs a full check 96 times a day to announce once
+*open. Surfaced 2026-09-01 while explaining the cadence after the 0.71.0 deploy. The
+set-based shape the fix needs already exists eighty lines up in the same file.*
+
+`ConsistencyMonitor.CheckAllAsync` runs on **every** scheduler tick
+([SchedulerService.cs:127](../src/Api/Scheduling/SchedulerService.cs#L127)), which is
+[15 minutes](../src/Api/Scheduling/SchedulerService.cs#L25). The monitors are
+deliberately not `global_scheduled_jobs` rows — nobody should be able to switch off
+the thing whose whole purpose is noticing that the configurable jobs stopped — and
+that part is right.
+
+What is not is that **only the publish is throttled**.
+[`RepeatAfter` is 24h](../src/Api/Notifications/ConsistencyMonitor.cs#L36), so a
+ledger is announced at most once a day, while the full `CheckAsync` behind it runs 96
+times a day. On a real ledger measured 2026-09-01 that is 103,213 balance rows, 179
+positions and 42,919 posting counts re-verified every fifteen minutes to send at most
+one notification.
+
+**Realized gains is N+1; its neighbour checking the same rows is not.**
+[`CheckRealizedGainsAsync`](../src/Api/Db/Repositories/LedgerConsistencyRepository.cs#L170)
+loops over positions and awaits TWO queries *inside* the loop
+([:181](../src/Api/Db/Repositories/LedgerConsistencyRepository.cs#L181)) — the stored
+rows, then `realized_gains_walk(account, security)`, which replays FIFO lot
+consumption for that pair. 179 positions is 358 sequential round-trips per pass, ~34k
+a day.
+[`CheckHoldingsAsync`](../src/Api/Db/Repositories/LedgerConsistencyRepository.cs#L90),
+eighty lines above it, checks the SAME 179 positions in TWO queries: the stored rows,
+one whole-ledger `holdings_cost_basis_as_of` walk, then a comparison in memory. The
+set-based shape is already proven in this file, against this data, by the projection
+next door.
+
+Migration 217 raised the per-pass cost on purpose: the comparison went from one
+`SUM(realized_gain)` per position to six columns compared per disposal row. That was
+the right trade for correctness — the old shape could not see the long-term split at
+all — but it makes the frequency question worth answering rather than assuming.
+
+**Measure first, and measure the right thing.** The temptation is to time
+`CheckAsync` end to end and call it slow or fine. What decides between the two fixes
+below is the SPLIT: how much of a pass is the 358 round-trips versus the two
+whole-ledger walks. `Integration.Stress` already seeds a 50k-transaction ledger and is
+excluded from the sharded suite, so it is the place to put a per-projection
+breakdown.
+
+**Two levers, and they are not alternatives.**
+
+1. **Make the check cheap.** Give `realized_gains_walk` a whole-ledger overload the
+   way `holdings_cost_basis_as_of` has one, and compare in memory. This is the one to
+   do first: it helps the on-demand button and the scheduled pass equally, it removes
+   an N+1 that grows with the portfolio, and it needs no decision about detection
+   latency.
+2. **Throttle the check to the publish window.** Straightforward, but it trades away
+   early detection for CPU, and it should not be done blind — if lever 1 makes a pass
+   cheap enough, this buys little and costs the one thing the monitor exists for.
+
+**Do not touch the Maintenance button.** It is the on-demand path, and someone
+watching it has asked for exactly this work; any throttle belongs on the tick, not on
+the request.
+
+Worth knowing while measuring: the first tick runs at process start with **no** initial
+delay (`ExecuteAsync` calls `TickAsync` before its first `Task.Delay`), so every
+restart pays a full check immediately. That is a feature on deploy — it is how the
+0.71.0 upgrade surfaced a cent of `cost_basis_sold` drift within seconds of coming up
+— and a cost on a container that is crash-looping.
 
 #### Snapshot restore — the payload reinsert path
 *parked, not blocked. Reopen if a real ledger approaches ~200k transactions, or if
@@ -880,3 +1370,35 @@ dotnet test --filter "FullyQualifiedName~Integration.Stress"
 It carries a deliberately loose 120s restore assertion (the lane runs on whatever
 hardware invokes it; the printed timings are the real output) and re-asserts
 header-balance and holdings-reconcile-with-lots at scale.
+
+
+#### `monthly_account_balances` -- measured, and not needed
+
+*parked with a number, 2026-08-29. Reopen if the figures below change by an order of
+magnitude, or if a caller starts asking for daily points.*
+
+ADR-0008 deferred the materialized view because "the view exists to serve a feature
+(net-worth charts) that doesn't exist yet". That feature shipped and had to be capped at
+600 points, which read like evidence the view was overdue. Nobody had measured it, so the
+deferral kept being re-argued from the same unmeasured premise.
+
+Measured now by `Stress/NetWorthHistoryCostTests`, on the `Default` stress ledger -- 50k
+transactions, ~24 years of horizon, 200 securities:
+
+| series | points | wall | per point |
+|---|---|---|---|
+| monthly, full horizon | 289 | 1.2 s | 4.1 ms |
+| yearly, full horizon | 25 | 0.2 s | 8.8 ms |
+
+**So: do not build it.** The full monthly series a chart would request costs about a
+second, and the 600-point ceiling implies roughly 2.5 s at the very worst. A materialized
+view would add a refresh path, a staleness question, an RLS problem (a matview cannot
+carry RLS and is populated by its owner, so exposing it to `coffer_app` needs a wrapping
+`security_invoker` view) and a new drift surface owing a consistency projection -- to
+optimise something that is not slow.
+
+Note the per-point figures run the *wrong* way: the yearly series costs more per point
+than the monthly one, because fixed setup dominates when there are only 25 points. Any
+future argument from "cost per point" should account for that; total wall time is the
+number that matters.
+

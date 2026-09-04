@@ -107,7 +107,7 @@ public sealed class FeedSyncJobHandler : IScheduledJobHandler
     private static readonly string[] SkippedStatuses = ["needs_reauth", "disconnected"];
 
     public async Task<JobRunOutcome> RunAsync(
-        AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken cancellationToken)
+        AppDbContext db, Guid ledgerId, Guid configuredByUserId, JobRunClock clock, CancellationToken cancellationToken)
     {
         var connections = await db.FeedConnections
             .AsNoTracking()

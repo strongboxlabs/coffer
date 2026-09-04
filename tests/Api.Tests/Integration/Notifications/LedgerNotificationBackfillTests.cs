@@ -1,10 +1,7 @@
 using System.Globalization;
 
-using Microsoft.Extensions.Logging.Abstractions;
-
 using Npgsql;
 
-using Coffer.Api.Migrations;
 using Coffer.Api.Tests.Integration.Infra;
 
 namespace Coffer.Api.Tests.Integration.Notifications;
@@ -39,35 +36,23 @@ public sealed class LedgerNotificationBackfillTests
     /// <summary>
     /// A database migrated to 213 — i.e. an install as it exists in the field today.
     /// </summary>
-    private static string StageAt213(string sourceDir, string workDir)
-    {
-        Directory.CreateDirectory(workDir);
-        foreach (var script in Directory.GetFiles(sourceDir, "*.sql"))
-        {
-            // Everything up to and including 213. Ordinal compare on the numeric
-            // prefix, which every script in this directory carries.
-            var name = Path.GetFileName(script);
-            if (string.CompareOrdinal(name, Mig214) >= 0) continue;
-            File.Copy(script, Path.Combine(workDir, name), overwrite: true);
-        }
-        return workDir;
-    }
-
+    /// <remarks>
+    /// The staging and single-migration mechanics this class originally hand-rolled
+    /// now live in <see cref="UpgradeRehearsal"/>, because three more migrations
+    /// need them. Behaviour is unchanged: stage every script that sorts before 214,
+    /// run them, seed, then apply 214 alone.
+    /// </remarks>
     private async Task<string> FreshDatabaseAt213Async(string dbName, string workDir)
     {
         var connectionString = _fixture.EmptyDatabaseConnectionString(dbName);
-        var source = MigrationsDirectoryLocator.Locate(AppContext.BaseDirectory);
-        MigrationRunner.Run(connectionString, StageAt213(source, workDir), NullLogger.Instance);
+        UpgradeRehearsal.RunStaged(
+            connectionString, UpgradeRehearsal.StageBefore(Mig214, workDir));
         await Task.CompletedTask;
         return connectionString;
     }
 
     private static void ApplyMig214(string connectionString, string workDir)
-    {
-        var source = MigrationsDirectoryLocator.Locate(AppContext.BaseDirectory);
-        File.Copy(Path.Combine(source, Mig214), Path.Combine(workDir, Mig214), overwrite: true);
-        MigrationRunner.Run(connectionString, workDir, NullLogger.Instance);
-    }
+        => UpgradeRehearsal.Apply(connectionString, workDir, Mig214);
 
     private static async Task ExecAsync(string connectionString, string sql)
     {

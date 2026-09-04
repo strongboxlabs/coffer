@@ -66,7 +66,7 @@ public static class JobMonitorSignal
         // passed through — still capped, because the feed handler's version grows with the
         // number of faulted connections.
         var reason = failure is not null
-            ? Describe(failure)
+            ? Coffer.Api.Notifications.PublishedFailure.Describe(failure)
             : Truncate(outcome.Message, MaxReasonLength);
 
         return new NotificationEvent(
@@ -80,32 +80,10 @@ public static class JobMonitorSignal
             // infrastructure data, so a triager gets the useful half without the leak.
             Detail: failure is null
                 ? null
-                : new Dictionary<string, string> { ["error_type"] = failure.GetType().Name },
+                : Coffer.Api.Notifications.PublishedFailure.DetailFor(failure),
             Monitor: jobType,
             Signal: failed ? MonitorSignal.Failure : MonitorSignal.Success);
     }
-
-    /// <summary>
-    /// What KIND of failure this was, in words, with nothing quoted from the exception.
-    /// </summary>
-    /// <remarks>
-    /// Deliberately coarse. The point is to tell a reader whether this is theirs to fix —
-    /// a bank refusing a request is acted on differently from a database error — without
-    /// handing an outbound webhook the hostname it happened against. Anything unrecognised
-    /// says so plainly rather than guessing, because a wrong category is worse than none.
-    /// </remarks>
-    private static string Describe(Exception ex) => ex switch
-    {
-        Coffer.Api.Sync.SimpleFin.SimpleFinException =>
-            "the provider refused the request or answered with something unusable",
-        HttpRequestException or TaskCanceledException or TimeoutException =>
-            "a network request failed or timed out",
-        Npgsql.NpgsqlException or Microsoft.EntityFrameworkCore.DbUpdateException =>
-            "the database rejected the operation",
-        UnauthorizedAccessException or IOException =>
-            "a file could not be read or written",
-        _ => "an unexpected error",
-    } + ". The full message is in the server log.";
 
     /// <summary>
     /// Trims to <paramref name="max"/>, marking that it was trimmed.

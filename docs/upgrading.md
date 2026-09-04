@@ -119,19 +119,26 @@ and both refuse to act unless they can first prove your current credentials work
 COFFER_DIR=~/coffer bash scripts/migrate-db-secrets.sh
 ```
 
-It leaves `.env.pre-secrets` behind, which still contains every password — `shred` it
-once the install is confirmed healthy.
+It leaves `.env.pre-secrets` behind, which still contains every password. **You no
+longer have to remember to remove it:** the NEXT run of the same script deletes it,
+overwriting the file first, once `secrets/` holds all three passwords. The first run
+keeps it deliberately — if anything about the file-based arrangement is wrong, that
+copy is how you get your passwords back — so the cleanup happens one run later
+rather than immediately. Shred it by hand if you would rather not wait.
 
 **`pg_hba` hardening.** `initdb` runs exactly once, so the hardened default in
 `docker-compose.yml` does nothing for an existing database: it keeps `trust` on its
-unix socket and loopback. `install.sh` fetches the remediation and prints the command
-when it detects those rules:
+unix socket and loopback. **`install.sh` now APPLIES the remediation** when it detects
+those rules, rather than printing the command and leaving it to you. No restart, no
+downtime, and nothing is left half-applied: the script proves both roles can
+authenticate before it edits the file and restores the original if they cannot
+afterwards.
+
+If it fails, install.sh says so and prints the command to run by hand:
 
 ```bash
 sudo bash ~/coffer/scripts/harden-pg-hba.sh
-```
-
-No restart, no downtime. Afterwards `psql` needs a password:
+``` Afterwards `psql` needs a password:
 
 ```bash
 sudo docker compose exec -T -e PGPASSWORD="$(cat ~/coffer/secrets/postgres_password)" \

@@ -14,7 +14,7 @@
          the assembly by the StampGitVersion target below and surfaced
          via GET /api/meta/version. We compose InformationalVersion
          ourselves, so suppress the SDK's automatic +<sha> append. -->
-    <Version>0.69.1</Version>
+    <Version>0.74.0</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 
@@ -87,7 +87,7 @@
          10.0.9 pulls 2.0.0, which has GHSA-v5pm-xwqc-g5wc (high: a circular schema
          reference can stack-overflow the OpenAPI parser). Fixed in 2.7.5; same major,
          so the resolver satisfies AspNetCore.OpenApi's floor with it. -->
-    <PackageReference Include="Microsoft.OpenApi" Version="2.12.0" />
+    <PackageReference Include="Microsoft.OpenApi" Version="2.12.2" />
     <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.11" />
     <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0" />
     <PackageReference Include="MR.EntityFrameworkCore.KeysetPagination" Version="1.6.0" />
@@ -101,11 +101,11 @@
          (`OfxFileProvider`) — if upstream stalls, MIT lets us vendor
          `src/OfxNet/` directly into the repo. -->
     <PackageReference Include="OfxNet" Version="1.8.1" />
-    <PackageReference Include="OpenIddict.AspNetCore" Version="7.6.0" />
-    <PackageReference Include="OpenIddict.EntityFrameworkCore" Version="7.6.0" />
-    <PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.17.0" />
-    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.17.0" />
-    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.17.0" />
+    <PackageReference Include="OpenIddict.AspNetCore" Version="7.6.1" />
+    <PackageReference Include="OpenIddict.EntityFrameworkCore" Version="7.6.1" />
+    <PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.18.0" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.18.0" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.18.0" />
   </ItemGroup>
 
   <ItemGroup>

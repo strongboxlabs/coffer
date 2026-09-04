@@ -48,6 +48,33 @@ function renderPanel() {
     );
 }
 
+/**
+ * The panel as reached from a drift notification: same route, arrival flag set.
+ */
+function renderPanelArrivingFromDriftNotice() {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const root = createRootRoute();
+    const settingsRoute = createRoute({
+        getParentRoute: () => root,
+        path: '/',
+        validateSearch: (search: Record<string, unknown>): { check?: true } =>
+            search.check === true || search.check === 'true' ? { check: true } : {},
+        component: () => <GeneralPanel ledgerId={LEDGER_ID} />,
+    });
+    const router = createRouter({
+        routeTree: root.addChildren([settingsRoute]),
+        history: createMemoryHistory({ initialEntries: ['/?check=true'] }),
+        context: { queryClient },
+    });
+    const rendered = render(
+        <QueryClientProvider client={queryClient}>
+            {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+            <RouterProvider router={router as any} />
+        </QueryClientProvider>,
+    );
+    return { ...rendered, router };
+}
+
 function mockLedger(role: string) {
     const ledgers: LedgerSummary[] = [{ id: LEDGER_ID, name: 'Personal', role }];
     vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue(ledgers);
@@ -178,5 +205,30 @@ describe('GeneralPanel — consistency maintenance', () => {
         await user.click(postingRepair);
         await waitFor(() =>
             expect(repair).toHaveBeenCalledWith(LEDGER_ID, 'posting_counts'));
+    });
+
+    it('runs the check on arrival from a drift notification, without a click', async () => {
+        // The other half of "the finding carries its fix". The scheduled monitor already
+        // found the drift; landing on a panel that shows nothing until the reader
+        // re-runs the same check by hand is the gap.
+        const check = vi.spyOn(apiModule, 'checkLedgerConsistency').mockResolvedValue(clean);
+        mockLedger('owner');
+
+        renderPanelArrivingFromDriftNotice();
+
+        await waitFor(() => expect(check).toHaveBeenCalledTimes(1));
+    });
+
+    it('does not run the check when arriving normally', async () => {
+        // The negative half, and the one that matters for cost: the check walks every
+        // position, so a plain visit to General settings must not trigger it. Without
+        // this, a mount effect that ignored the flag would satisfy the test above.
+        const check = vi.spyOn(apiModule, 'checkLedgerConsistency').mockResolvedValue(clean);
+        mockLedger('owner');
+
+        renderPanel();
+
+        await screen.findByRole('button', { name: /check consistency/i });
+        expect(check).not.toHaveBeenCalled();
     });
 });

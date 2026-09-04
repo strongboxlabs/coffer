@@ -191,6 +191,144 @@ public sealed class LedgerConsistencyTests
     }
 
     /// <summary>
+    /// A ledger with one brokerage position and one disposal, written through the API
+    /// so lots and realized_gains come from the real write path rather than a seeded
+    /// shape the walk would disagree with.
+    /// </summary>
+    private async Task<Guid> SeedOneDisposalAsync() => await SeedDisposalsAsync(1);
+
+    /// <summary>Two disposals, so a per-row check has two rows to disagree about.</summary>
+    private async Task<Guid> SeedTwoDisposalsAsync() => await SeedDisposalsAsync(2);
+
+    private async Task<Guid> SeedDisposalsAsync(int sells)
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
+        var sec = await ledger.AddSecurityAsync("Index Fund", "IDX");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var cookie = await ledger.IssueSessionCookieAsync();
+        using var client = factory.CreateClient(
+            new WebApplicationFactoryClientOptions { HandleCookies = false });
+        client.DefaultRequestHeaders.Add("Cookie", $"coffer.session={cookie}");
+
+        async Task TradeAsync(string action, decimal shares, decimal price, DateTime at)
+        {
+            var resp = await client.PostAsJsonAsync(
+                $"/api/ledgers/{ledger.LedgerId}/investment-transactions",
+                new CreateInvestmentTransactionRequest
+                {
+                    BrokerageAccountId = brokerage.Id,
+                    Action = action,
+                    SecurityId = sec,
+                    Shares = shares,
+                    Price = price,
+                    PostedAt = at,
+                });
+            Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+        }
+
+        await TradeAsync("buy", Boundary.Typical.Quantity, Boundary.Typical.BuyPrice,
+            Utc(2026, 1, 10));
+
+        // A quarter per sell, so two disposals still leave the position open and the
+        // walk has something to carry forward.
+        var lot = Boundary.Typical.Quantity / 4m;
+        for (var i = 0; i < sells; i++)
+        {
+            await TradeAsync("sell", -lot, Boundary.Typical.SellPrice, Utc(2026, 6, 10 + i));
+        }
+
+        return ledger.LedgerId;
+    }
+
+    /// <summary>
+    /// Drift in the LONG-TERM columns is reported. It was invisible before mig 217.
+    /// </summary>
+    /// <remarks>
+    /// The check compared <c>SUM(realized_gain)</c> and nothing else, and the walk it
+    /// compares against did not even return the long-term columns — so a ledger whose
+    /// entire short/long tax split had been zeroed reported healthy. Those columns are
+    /// <c>NOT NULL DEFAULT 0</c>, which means the realistic way to destroy them is an
+    /// INSERT that omits them: silent, not an error. This test fails on every commit
+    /// before 217.
+    /// </remarks>
+    [Fact]
+    public async Task Drift_in_the_long_term_split_is_named()
+    {
+        var ledger = await SeedOneDisposalAsync();
+
+        await using (var seed = _fixture.NewDbContext())
+        {
+            // ONLY the long-term column. realized_gain is left correct, so the old
+            // check has nothing at all to notice.
+            var changed = await seed.Database.ExecuteSqlInterpolatedAsync($@"
+                UPDATE realized_gains SET realized_gain_lt = realized_gain_lt + 321.00
+                 WHERE ledger_id = {ledger};");
+            Assert.True(changed > 0, "no realized_gains row to corrupt — fixture is wrong");
+        }
+
+        await using var db = _fixture.NewDbContext();
+        var gains = Assert.Single(
+            (await RepoFor(db).CheckAsync(ledger)).Projections,
+            p => p.Projection == ConsistencyProjections.RealizedGains);
+
+        Assert.False(gains.Healthy, "long-term drift went unreported");
+        Assert.Contains(gains.Mismatches, m => m.Field == "realized_gain_lt");
+        // And it is not being reported as some other column having moved.
+        Assert.DoesNotContain(gains.Mismatches, m => m.Field == "realized_gain");
+
+        await RepoFor(db).RepairAsync(ledger, ConsistencyProjections.RealizedGains);
+
+        await using var recheck = _fixture.NewDbContext();
+        var after = Assert.Single(
+            (await RepoFor(recheck).CheckAsync(ledger)).Projections,
+            p => p.Projection == ConsistencyProjections.RealizedGains);
+        Assert.True(after.Healthy,
+            $"long-term drift survived the repair: {after.MismatchedCount} mismatches");
+    }
+
+    /// <summary>
+    /// Two disposals drifting in OPPOSITE directions are both reported.
+    /// </summary>
+    /// <remarks>
+    /// The other blind spot of a per-pair sum: +0.01 on one row and -0.01 on another
+    /// cancel exactly, and the position reports healthy while both rows are wrong. This
+    /// is not a contrived shape — a rounding defect that pushes values in whichever
+    /// direction the tail falls produces it naturally, which is the class of defect mig
+    /// 209 fixed.
+    /// </remarks>
+    [Fact]
+    public async Task Offsetting_drift_on_two_disposals_does_not_cancel()
+    {
+        var ledger = await SeedTwoDisposalsAsync();
+
+        await using (var seed = _fixture.NewDbContext())
+        {
+            var changed = await seed.Database.ExecuteSqlInterpolatedAsync($@"
+                WITH numbered AS (
+                    SELECT sell_leg_id, ROW_NUMBER() OVER (ORDER BY sell_leg_id) AS rn
+                      FROM realized_gains
+                     WHERE ledger_id = {ledger}
+                )
+                UPDATE realized_gains g
+                   SET realized_gain =
+                           g.realized_gain + CASE WHEN n.rn = 1 THEN 0.01 ELSE -0.01 END
+                  FROM numbered n
+                 WHERE g.sell_leg_id = n.sell_leg_id AND n.rn <= 2;");
+            Assert.Equal(2, changed);
+        }
+
+        await using var db = _fixture.NewDbContext();
+        var gains = Assert.Single(
+            (await RepoFor(db).CheckAsync(ledger)).Projections,
+            p => p.Projection == ConsistencyProjections.RealizedGains);
+
+        Assert.False(gains.Healthy, "offsetting drift cancelled and reported healthy");
+        Assert.Equal(2, gains.Mismatches.Count(m => m.Field == "realized_gain"));
+    }
+
+    /// <summary>
     /// Repairing posting counts fixes them and a re-check comes back clean.
     /// </summary>
     /// <remarks>

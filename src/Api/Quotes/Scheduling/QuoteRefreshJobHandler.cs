@@ -41,7 +41,7 @@ public sealed class QuoteRefreshJobHandler : IScheduledJobHandler
     /// anything else, or the monitor built on top of this cries wolf from day one.
     /// </remarks>
     public async Task<JobRunOutcome> RunAsync(
-        AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken cancellationToken)
+        AppDbContext db, Guid ledgerId, Guid configuredByUserId, JobRunClock clock, CancellationToken cancellationToken)
     {
         var orchestrator = new QuoteOrchestrator(
             db,

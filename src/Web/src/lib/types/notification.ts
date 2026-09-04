@@ -62,4 +62,8 @@ export interface LedgerNotificationSettings {
      *  Keyed on the ledger's own jobs, so a ledger with snapshots off is not warned
      *  about snapshots. */
     monitorCoverage: Record<string, boolean>;
+    /** Monitors a switch IS bound to whose job is not enabled here — checks that can only
+     *  ever read "Never". `monitorCoverage` cannot express these: it is keyed on the jobs
+     *  that run, so a switch on a job that does not run matches no key at all. */
+    monitorsWatchingNothing: string[];
 }

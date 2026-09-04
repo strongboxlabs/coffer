@@ -44,6 +44,11 @@ export interface ScheduleValue {
     startDate: string;                    // 'YYYY-MM-DD'
     endDate: string | null;               // null = never
     autoCommitDaysBefore: number | null;  // null = manual approve; >=0 = auto-commit N days before due
+    /**
+     * null = use the amount typed below; N (1-24) = average the last N committed
+     * occurrences of this series (mig 220).
+     */
+    estimateSampleCount: number | null;
 }
 
 /** Day-of-month (1..31) parsed from a 'YYYY-MM-DD' string; falls back to 1. */
@@ -77,6 +82,7 @@ export function defaultSchedule(startDate: string): ScheduleValue {
         startDate,
         endDate: null,
         autoCommitDaysBefore: null,
+        estimateSampleCount: null,
     };
 }
 
@@ -84,8 +90,18 @@ export function RecurrenceBuilder(props: {
     value: ScheduleValue;
     onChange: (next: ScheduleValue) => void;
     disabled?: boolean;
+    /**
+     * Can this reminder estimate its amount (mig 220)? Single-posting, non-loan only.
+     *
+     * Passed in rather than derived here because this component sees the SCHEDULE, not
+     * the postings — its whole prop surface is value/onChange/disabled, and reaching for
+     * the transaction shape would couple it to the editor that hosts it. The server
+     * rejects the ineligible combination regardless; hiding the control is the courtesy,
+     * not the guard.
+     */
+    estimateEligible?: boolean;
 }): React.JSX.Element {
-    const { value, onChange, disabled = false } = props;
+    const { value, onChange, disabled = false, estimateEligible = false } = props;
     const { recurrence } = value;
     const freqMeta = FREQ_OPTIONS.find((f) => f.value === recurrence.freq) ?? FREQ_OPTIONS[0];
 
@@ -307,6 +323,76 @@ export function RecurrenceBuilder(props: {
                 </div>
             </div>
 
+            {/* Estimated amount (mig 220) */}
+            {estimateEligible ? (
+                <div>
+                    <FieldLabel className="block">Amount</FieldLabel>
+                    <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-text">
+                        <label className="flex items-center gap-1.5">
+                            <input
+                                type="radio"
+                                name="recurrence-amount-mode"
+                                checked={value.estimateSampleCount === null}
+                                disabled={disabled}
+                                onChange={() => onChange({ ...value, estimateSampleCount: null })}
+                            />
+                            <span>As entered</span>
+                        </label>
+                        <label className="flex items-center gap-1.5">
+                            <input
+                                type="radio"
+                                name="recurrence-amount-mode"
+                                checked={value.estimateSampleCount !== null}
+                                disabled={disabled}
+                                onChange={() =>
+                                    onChange({
+                                        ...value,
+                                        // 3 is the default the maintainer specified: enough to
+                                        // smooth a variable bill, short enough to track a real
+                                        // change in it.
+                                        estimateSampleCount: value.estimateSampleCount ?? 3,
+                                    })
+                                }
+                            />
+                            <span>Estimate from history</span>
+                        </label>
+                        {value.estimateSampleCount !== null ? (
+                            <div className="flex items-center gap-2">
+                                <span className="text-text-muted">average of the last</span>
+                                <input
+                                    type="number"
+                                    min={1}
+                                    /* Matches the server CHECK, which REJECTS out of range
+                                       rather than clamping — this column shipped with its
+                                       cap, so there are no legacy rows to keep editable. */
+                                    max={24}
+                                    className={cn(inputClass, 'mt-0 w-16')}
+                                    value={value.estimateSampleCount}
+                                    disabled={disabled}
+                                    aria-label="Occurrences to average"
+                                    onChange={(e) => {
+                                        const n = Number.parseInt(e.target.value, 10);
+                                        onChange({
+                                            ...value,
+                                            estimateSampleCount: Number.isNaN(n)
+                                                ? 1
+                                                : Math.min(24, Math.max(1, n)),
+                                        });
+                                    }}
+                                />
+                                <span className="text-text-muted">occurrences</span>
+                            </div>
+                        ) : null}
+                    </div>
+                    {value.estimateSampleCount !== null ? (
+                        <p className="mt-1 text-[0.6875rem] text-text-subtle">
+                            Until this reminder has posted at least once, the amount entered
+                            below is used.
+                        </p>
+                    ) : null}
+                </div>
+            ) : null}
+
             {/* Auto-commit */}
             <div>
                 <FieldLabel className="block">Posting</FieldLabel>
@@ -341,6 +427,17 @@ export function RecurrenceBuilder(props: {
                             <input
                                 type="number"
                                 min={0}
+                                /*
+                                 * Capped to match ReminderAutoPostLimits, which the
+                                 * server CLAMPS rather than rejects — an existing row
+                                 * above the cap must stay editable, so the bound is
+                                 * enforced where the behaviour happens and mirrored
+                                 * here so nobody sets a number that quietly will not
+                                 * be honoured. Beyond this the transaction is written
+                                 * so far ahead of its due date that the balance drops
+                                 * long before the money leaves.
+                                 */
+                                max={90}
                                 className={cn(inputClass, 'mt-0 w-20')}
                                 value={value.autoCommitDaysBefore}
                                 disabled={disabled}

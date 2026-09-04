@@ -9,6 +9,7 @@ import type {
     SetReminderActiveRequest,
     SkipReminderRequest,
     SkipReminderResponse,
+    UnskipReminderResponse,
     FireReminderRequest,
     FireReminderResponse,
     FireBankReminderRequest,
@@ -59,6 +60,22 @@ export function skipReminder(
 ): Promise<SkipReminderResponse> {
     return request<SkipReminderResponse>(
         `${base(ledgerId)}/${encodeURIComponent(reminderId)}/skip`, { method: 'POST', body });
+}
+
+/**
+ * DELETE /reminders/{id}/skip — restore a suppressed occurrence.
+ *
+ * The date is a query parameter, not a body: DELETE with a body is poorly
+ * supported by intermediaries, and the slot identifies what is being acted on.
+ * Idempotent — un-skipping a slot that is not skipped answers 200.
+ */
+export function unskipReminder(
+    ledgerId: string, reminderId: string, occurrenceDate: string,
+): Promise<UnskipReminderResponse> {
+    return request<UnskipReminderResponse>(
+        `${base(ledgerId)}/${encodeURIComponent(reminderId)}/skip`
+        + `?occurrenceDate=${encodeURIComponent(occurrenceDate)}`,
+        { method: 'DELETE' });
 }
 
 /** POST /reminders/{id}/fire — materialize one occurrence into a committed

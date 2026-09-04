@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
-import { ApiError, fetchUpcomingReminders } from '@/lib/api';
+import { unskipReminder, ApiError, fetchUpcomingReminders } from '@/lib/api';
 import type { UpcomingOccurrence } from '@/lib/types';
 import { formatSignedAmount } from '@/lib/money';
 import {
@@ -27,6 +27,7 @@ export function RemindersUpcomingPanel({ ledgerId }: { ledgerId: string }) {
     const [view, setView] = useState<{ year: number; month: number }>(
         { year: today.year, month: today.month });
     const [active, setActive] = useState<UpcomingOccurrence | null>(null);
+    const queryClient = useQueryClient();
     const [notice, setNotice] = useState<string | null>(null);
     const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
 
@@ -54,6 +55,20 @@ export function RemindersUpcomingPanel({ ledgerId }: { ledgerId: string }) {
     const grid = useMemo(() => monthMatrix(view.year, view.month), [view]);
 
     const openOccurrence = (o: UpcomingOccurrence) => { setNotice(null); setActive(o); };
+
+    // Restoring a suppressed occurrence. Only the slot clicked is restored — skipping
+    // sweeps earlier un-acted occurrences, and un-skip deliberately does not undo that
+    // sweep, so a user clears a cascade one chip at a time and keeps the ones they meant.
+    const unskip = useMutation({
+        mutationFn: (o: UpcomingOccurrence) => unskipReminder(ledgerId, o.reminderId, o.date),
+        onSuccess: async (_r, o) => {
+            setNotice(`Restored the ${o.date} occurrence — it can be posted again.`);
+            // The series cursor may have moved EARLIER, so the whole agenda is stale,
+            // not just this cell.
+            await queryClient.invalidateQueries({ queryKey: ['reminders'] });
+        },
+        onError: () => setNotice('Could not restore that occurrence.'),
+    });
 
     return (
         <div className="space-y-3">
@@ -114,6 +129,8 @@ export function RemindersUpcomingPanel({ ledgerId }: { ledgerId: string }) {
                                                     key={`${o.reminderId}-${o.kind}-${i}`}
                                                     occ={o}
                                                     onOpen={openOccurrence}
+                                                    onUnskip={(x) => unskip.mutate(x)}
+                                                    unskipping={unskip.isPending}
                                                 />
                                             ))}
                                             {hidden > 0 ? (
@@ -157,28 +174,57 @@ export function RemindersUpcomingPanel({ ledgerId }: { ledgerId: string }) {
  * read-only chip — `skipped` rendered struck-through so a catch-up cascade
  * leaves a visible trail rather than a gap.
  */
-function OccurrenceChip({ occ, onOpen }: {
+function OccurrenceChip({ occ, onOpen, onUnskip, unskipping }: {
     occ: UpcomingOccurrence;
     onOpen: (o: UpcomingOccurrence) => void;
+    onUnskip: (o: UpcomingOccurrence) => void;
+    unskipping: boolean;
 }) {
     const label = occ.payee ?? 'Reminder';
     const amount = formatSignedAmount(occ.amount);
-    const title = `${label} · ${amount}`;
 
-    // Read-only chips: posted (scheduled) and skipped.
-    if (occ.kind === 'scheduled' || occ.kind === 'skipped') {
-        const skipped = occ.kind === 'skipped';
+    // Mig 220. An estimated amount is prefixed "≈" and says so in the tooltip, because
+    // the number alone cannot tell a reader it is a guess. Only when an estimate was
+    // actually PRODUCED: a series that asked for one and could not have it is showing its
+    // template figure, which is not an estimate and must not be marked as one.
+    const estimated = occ.estimate?.amount != null;
+    const shownAmount = estimated ? `≈${amount}` : amount;
+    const title = estimated
+        ? `${label} · ${shownAmount} · estimated from the last `
+          + `${occ.estimate!.availableSampleCount} occurrence(s)`
+        : `${label} · ${amount}`;
+
+    // A SKIPPED chip is now actionable: un-skip exists, and three fire errors have
+    // instructed people to use it since before it did. A posted (`scheduled`) chip stays
+    // read-only — undoing that is deleting a real transaction, which belongs in the
+    // register, not behind a calendar chip.
+    if (occ.kind === 'skipped') {
         return (
-            <div
-                title={skipped ? `${title} · skipped` : title}
-                className={`rounded bg-surface-muted px-1 text-[0.625rem] leading-tight ${
-                    skipped ? 'text-text-subtle' : 'text-text-muted'}`}
+            <button
+                type="button"
+                title={`${title} · skipped — restore it`}
+                onClick={() => onUnskip(occ)}
+                disabled={unskipping}
+                className="block w-full rounded bg-surface-muted px-1 text-left text-[0.625rem] leading-tight text-text-subtle hover:bg-surface-muted/60 hover:text-text-muted disabled:opacity-50"
             >
                 <span className="flex items-baseline justify-between gap-1">
-                    <span className={`truncate ${skipped ? 'line-through' : ''}`}>
-                        {skipped ? '⊘' : '✓'} {label}
-                    </span>
-                    <span className="shrink-0 tabular-nums">{amount}</span>
+                    <span className="truncate line-through">⊘ {label}</span>
+                    <span className="shrink-0 tabular-nums">{shownAmount}</span>
+                </span>
+            </button>
+        );
+    }
+
+    // Posted: read-only.
+    if (occ.kind === 'scheduled') {
+        return (
+            <div
+                title={title}
+                className="rounded bg-surface-muted px-1 text-[0.625rem] leading-tight text-text-muted"
+            >
+                <span className="flex items-baseline justify-between gap-1">
+                    <span className="truncate">✓ {label}</span>
+                    <span className="shrink-0 tabular-nums">{shownAmount}</span>
                 </span>
             </div>
         );
@@ -194,7 +240,7 @@ function OccurrenceChip({ occ, onOpen }: {
         >
             <span className="flex items-baseline justify-between gap-1">
                 <span className="truncate">● {label}</span>
-                <span className="shrink-0 tabular-nums">{amount}</span>
+                <span className="shrink-0 tabular-nums">{shownAmount}</span>
             </span>
         </button>
     );

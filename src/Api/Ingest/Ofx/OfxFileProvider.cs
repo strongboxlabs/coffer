@@ -125,6 +125,59 @@ public sealed class OfxFileProvider : IFileProvider
         // pattern). Investment statements live in a sibling type
         // hierarchy (OfxNet.Investments) and need their own
         // iteration via GetInvestmentStatements().
+        // Enumeration is guarded, not just Load, and the reason is that
+        // OfxNet is LAZY: Load returns before most of the file has been
+        // looked at, and the missing-element checks fire here — inside
+        // GetStatements() / GetInvestmentStatements(). A SELLOPT with no
+        // <SECURED>, which is a malformed file and nothing more, used to
+        // escape the Load guard and reach the endpoint as an unhandled
+        // exception: HTTP 500, a trace id, and no way for the user to
+        // learn which row was wrong.
+        //
+        // The filter is deliberately the SAME four types Load catches,
+        // rather than `catch (Exception)`. Widening it would turn a
+        // NullReferenceException in this provider into "your file is
+        // malformed", which is the failure mode of every parser that
+        // decided to be forgiving.
+        //
+        // Per-transaction recovery is NOT available: OfxNet materialises
+        // an entire statement — every transaction in it — inside the
+        // enumerator, so one bad aggregate fails the document. Verified
+        // by probing the enumerator directly; the throw lands before the
+        // first item is ever yielded. Salvaging good rows from a
+        // half-broken file would mean forking the parser.
+        try
+        {
+            EnumerateStatements(doc, transactions, discovered, errors, cancellationToken);
+        }
+        catch (Exception ex) when (ex is OfxException
+                                   || ex is System.Xml.XmlException
+                                   || ex is System.IO.InvalidDataException
+                                   || ex is FormatException)
+        {
+            throw new InvalidOperationException(
+                "Failed to read the uploaded OFX/QFX file. " + ex.Message, ex);
+        }
+
+        return Task.FromResult(new FileResult(
+            Transactions: transactions,
+            DiscoveredAccounts: discovered,
+            Errors: errors));
+    }
+
+    /// <summary>
+    /// Walk every statement in the document. Separated from
+    /// <see cref="ParseAsync"/> so the whole walk sits inside one
+    /// parse guard — see the comment at the call site for why the
+    /// guard cannot be any narrower.
+    /// </summary>
+    private static void EnumerateStatements(
+        OfxDocument doc,
+        List<IngestedTransaction> transactions,
+        List<DiscoveredFileAccount> discovered,
+        List<IngestError> errors,
+        CancellationToken cancellationToken)
+    {
         foreach (var stmt in doc.GetStatements())
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -150,11 +203,6 @@ public sealed class OfxFileProvider : IFileProvider
             ProcessInvestmentStatement(
                 inv, secListIndex, transactions, discovered, errors, cancellationToken);
         }
-
-        return Task.FromResult(new FileResult(
-            Transactions: transactions,
-            DiscoveredAccounts: discovered,
-            Errors: errors));
     }
 
     private static void ProcessBankStatement(
@@ -337,16 +385,18 @@ public sealed class OfxFileProvider : IFileProvider
     /// Skipped (with preview warning):
     /// <list type="bullet">
     ///   <item><c>TRANSFER</c>, <c>JRNLSEC</c>, <c>JRNLFUND</c> — share-only / inter-subaccount moves</item>
-    ///   <item><c>CLOSUREOPT</c> — options (ADR-0027 declined)</item>
+    ///   <item><c>CLOSUREOPT</c> / <c>BUYOPT</c> / <c>SELLOPT</c> — options (ADR-0027 declined)</item>
     ///   <item><c>SPLIT</c> — stock splits route through the security-splits surface, not the txn editor</item>
     /// </list>
-    /// <c>BUYOPT</c> / <c>SELLOPT</c> are the exception ADR-0027's
-    /// "options declined" wording doesn't cover: OfxNet models them as
-    /// <c>OfxBuyInvestment</c> / <c>OfxSellInvestment</c> subclasses,
-    /// so the buy/sell arms below claim them before any options check
-    /// could run, and they import as plain buys/sells. Left as-is —
-    /// no option data has been seen in a real file, and changing it
-    /// is an ADR-0027 amendment, not a mapper tweak.
+    /// <para><c>BUYOPT</c> / <c>SELLOPT</c> need their own classifier arms
+    /// to be skipped at all, because OfxNet models them as
+    /// <c>OfxBuyInvestment</c> / <c>OfxSellInvestment</c> subclasses: a
+    /// C# pattern switch matches the first arm that fits, so the buy and
+    /// sell arms claimed them and every option contract imported as a
+    /// plain share position. Silently — CLOSUREOPT warned, these two did
+    /// not. Skipping them is not the ADR-0027 amendment (that would give
+    /// options a real representation); it is refusing to represent them
+    /// as something they are not.</para>
     /// </remarks>
     private static IngestedTransaction? MapInvestmentTransaction(
         OfxInvestmentTransaction txn,
@@ -455,10 +505,9 @@ public sealed class OfxFileProvider : IFileProvider
     /// <summary>
     /// The OFX wire tag and the human reason this slice skips it, for
     /// each aggregate <see cref="ClassifyInvestmentTransaction"/>
-    /// leaves unclassified. Note that <c>BUYOPT</c> / <c>SELLOPT</c>
-    /// are NOT here: OfxNet models them as
-    /// <c>OfxBuyInvestment</c> / <c>OfxSellInvestment</c> subclasses,
-    /// so the classifier's buy/sell arms already claim them.
+    /// leaves unclassified — <c>BUYOPT</c> / <c>SELLOPT</c> included,
+    /// since the classifier now declines them ahead of its buy/sell
+    /// arms rather than letting subclass matching swallow them.
     /// </summary>
     private static (string Tag, string Reason) UnsupportedKind(
         OfxInvestmentTransaction txn) => txn switch
@@ -476,6 +525,12 @@ public sealed class OfxFileProvider : IFileProvider
             "Cash moves between sub-accounts aren't imported in this slice."),
         OfxOptionClosure => (
             "CLOSUREOPT",
+            "Options are outside the ADR-0027 action catalog."),
+        OfxBuyOption => (
+            "BUYOPT",
+            "Options are outside the ADR-0027 action catalog."),
+        OfxSellOption => (
+            "SELLOPT",
             "Options are outside the ADR-0027 action catalog."),
         OfxSplit => (
             "SPLIT",
@@ -498,6 +553,8 @@ public sealed class OfxFileProvider : IFileProvider
         OfxJournalSecurity jrnl   => jrnl.Security,
         OfxOptionClosure closure  => closure.Security,
         OfxSplit split            => split.Security,
+        OfxBuyOption buy          => buy.Security,
+        OfxSellOption sell        => sell.Security,
         _                         => null,
     };
 
@@ -512,6 +569,8 @@ public sealed class OfxFileProvider : IFileProvider
         OfxTransfer transfer      => transfer.Units,
         OfxJournalSecurity jrnl   => jrnl.Units,
         OfxOptionClosure closure  => closure.Units,
+        OfxBuyOption buy          => buy.Units,
+        OfxSellOption sell        => sell.Units,
         _                         => null,
     };
 
@@ -526,6 +585,22 @@ public sealed class OfxFileProvider : IFileProvider
     {
         return txn switch
         {
+            // BEFORE the buy/sell arms, and that order is the whole fix.
+            // OfxNet models BUYOPT / SELLOPT as OfxBuyInvestment /
+            // OfxSellInvestment subclasses, so the arms below used to claim
+            // them and an options contract entered the ledger as a share
+            // position — feeding FIFO lots, cost basis, holdings quantity,
+            // allocation and returns with equity data that was never real.
+            // Unclassified here means the caller skips the row with the same
+            // preview warning CLOSUREOPT already produced.
+            //
+            // Moving these two below the buy/sell arms does not merely
+            // reintroduce the bug — it fails to COMPILE. A subclass arm
+            // after its base is unreachable (CS8510), and this project
+            // sets TreatWarningsAsErrors. So the ordering is enforced by
+            // the compiler rather than by this comment.
+            OfxBuyOption               => (null,                 null),
+            OfxSellOption              => (null,                 null),
             OfxBuyInvestment buy       => ("buy",                buy.Security),
             OfxSellInvestment sell     => ("sell",               sell.Security),
             OfxReinvest reinvest       => ("dividend_reinvest",  reinvest.Security),

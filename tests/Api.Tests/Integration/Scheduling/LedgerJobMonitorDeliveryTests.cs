@@ -59,7 +59,7 @@ public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
         public string JobType { get; }
 
         public Task<JobRunOutcome> RunAsync(
-            AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken ct)
+            AppDbContext db, Guid ledgerId, Guid configuredByUserId, JobRunClock clock, CancellationToken ct)
             => _throw is not null
                 ? throw new InvalidOperationException(_throw)
                 : Task.FromResult(_outcome);
@@ -75,7 +75,8 @@ public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
         _fixture.NewLedgerKeyService().SealWithMasterKey(Encoding.UTF8.GetBytes(
             JsonSerializer.Serialize(new SubscriberConfig("https://hc.invalid/ping"))));
 
-    private async Task AddLedgerSwitchAsync(Guid ledgerId, string monitor)
+    private async Task AddLedgerSwitchAsync(
+        Guid ledgerId, string monitor, string? minSeverity = null)
     {
         await using var db = _fixture.NewDbContext();
         db.LedgerNotificationSubscribers.Add(new LedgerNotificationSubscriberRow
@@ -83,7 +84,7 @@ public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
             LedgerId = ledgerId,
             SubscriberKey = "healthchecks",
             DisplayName = "switch:" + monitor,
-            MinSeverity = NotificationSeverity.Info,
+            MinSeverity = minSeverity ?? NotificationSeverity.Info,
             Monitors = monitor,
             ConfigCiphertext = SealedConfig(),
         });
@@ -135,6 +136,37 @@ public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
         var e = Assert.Single(delivered);
         Assert.Equal(MonitorSignal.Success, e.Signal);
         Assert.Equal(NotificationMonitors.QuoteRefresh, e.Monitor);
+    }
+
+    [Fact]
+    public async Task A_switch_stored_at_the_warning_default_still_hears_a_successful_run()
+    {
+        // The row shape the UI actually creates, which no ledger-scope test covered: every
+        // other test here seeds MinSeverity = Info, but the settings panel hides the
+        // severity select for a heartbeat provider and posts its default, so REAL switches
+        // are stored at "warning" — all four of them in the deployment that prompted this.
+        //
+        // A successful run publishes at Info, strictly below that floor. Wants() branches
+        // on capability before the floor is consulted and the heartbeat arm never reads
+        // MinSeverity, which is the only reason those switches are green. Apply the floor
+        // to heartbeats and every success ping vanishes; the check then goes red from
+        // inactivity, reporting the JOB as dead when it was the notification layer that
+        // stopped. The deployment-scope twin of this is pinned as "THE D5 BUG" in
+        // NotificationRoutingTests; ledger scope had no equivalent.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await AddLedgerSwitchAsync(
+            ledger.LedgerId, NotificationMonitors.QuoteRefresh, NotificationSeverity.Warning);
+        await SeedDueJobAsync(ledger, NotificationMonitors.QuoteRefresh);
+
+        var delivered = await RunAsync(
+            ledger, new OutcomeHandler(NotificationMonitors.QuoteRefresh, JobRunOutcome.Ok()));
+
+        var e = Assert.Single(delivered);
+        Assert.Equal(MonitorSignal.Success, e.Signal);
+
+        // Pinned explicitly: the event really is below the row's stored floor, so this
+        // test would be vacuous if a success were ever published at warning or above.
+        Assert.Equal(NotificationSeverity.Info, e.Severity);
     }
 
     [Fact]

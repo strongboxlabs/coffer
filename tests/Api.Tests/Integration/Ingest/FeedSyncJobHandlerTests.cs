@@ -130,7 +130,8 @@ public sealed class FeedSyncJobHandlerTests
         // clean run over nothing — which is precisely the bug the first version of these
         // tests found.
         await using var db = fixture.NewServiceDbContext();
-        return await handler.RunAsync(db, ledgerId, userId, default);
+        return await handler.RunAsync(
+            db, ledgerId, userId, new JobRunClock(DateTime.UtcNow, "UTC"), default);
     }
 
     [Fact]

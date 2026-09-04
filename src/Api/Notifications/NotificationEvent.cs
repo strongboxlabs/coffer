@@ -148,6 +148,17 @@ public static class NotificationMonitors
     public const string FeedSync = "feed-sync";
 
     /// <summary>
+    /// The per-ledger reminder auto-post job (<c>scheduled_jobs.job_type</c>, mig 219).
+    /// </summary>
+    /// <remarks>
+    /// The only ledger monitor watching a job that WRITES FINANCIAL TRANSACTIONS, which
+    /// is the whole argument in ADR-0097 for making auto-post a job type rather than a
+    /// tick-riding monitor: a writer that stops silently is worse than one that stops
+    /// loudly, and only a job type has a failure counter, an auto-disable and a switch.
+    /// </remarks>
+    public const string ReminderAutoPost = "reminder-auto-post";
+
+    /// <summary>
     /// The per-ledger projection consistency check.
     /// </summary>
     /// <remarks>
@@ -184,12 +195,16 @@ public static class NotificationMonitors
     /// <para>
     /// Declared as an ordered array rather than derived from <c>JobTypes.All</c>, which
     /// is an unordered <c>HashSet</c> — deriving it would give a nondeterministically
-    /// ordered dropdown and coverage map. A unit test asserts the two stay set-equal, so
-    /// adding a job type without a monitor fails loudly instead of shipping a job nothing
-    /// can watch.
+    /// ordered dropdown and coverage map. <c>MonitorScopeTests</c> pins the invariant the
+    /// paragraph above describes: every job type appears here, and the monitors that are
+    /// NOT jobs are an explicit allow-list. (This sentence used to claim the test asserted
+    /// set EQUALITY, which flatly contradicted the paragraph above it once the consistency
+    /// monitor arrived.) So adding a job type without a monitor fails loudly instead of
+    /// shipping a job nothing can watch.
     /// </para>
     /// </remarks>
-    public static readonly string[] Ledger = [QuoteRefresh, Snapshot, FeedSync, Consistency];
+    public static readonly string[] Ledger =
+        [QuoteRefresh, Snapshot, FeedSync, ReminderAutoPost, Consistency];
 
     /// <summary>
     /// Is <paramref name="monitor"/> a monitor that exists at <paramref name="scope"/>?

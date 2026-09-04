@@ -213,6 +213,16 @@ public sealed class QifFileProvider : IFileProvider
         List<IngestError> errors)
     {
         var rawAction = r.Action ?? string.Empty;
+
+        // Cash moves inside the investment section are the investment
+        // register's BANK rows, not security actions, so they leave here
+        // before classification rather than failing it.
+        // Cash moves inside the investment section are the investment
+        // register's BANK rows, not security actions, so they leave here
+        // before classification rather than failing it.
+        if (MapInvestmentCashTransfer(r, rawAction, context) is { } cashRow)
+            return cashRow;
+
         var action = ClassifyInvestmentAction(rawAction);
         if (action is null)
         {
@@ -255,6 +265,67 @@ public sealed class QifFileProvider : IFileProvider
             UnitPrice: r.Price,
             // QIF `O` is commission; null when absent or zero.
             Fee: r.Commission is > 0m ? r.Commission : null);
+    }
+
+    /// <summary>
+    /// Map an investment-section cash move — <c>XIn</c> / <c>XOut</c> /
+    /// <c>ContribX</c> / <c>WithdrwX</c> — to a bank-shape
+    /// <see cref="IngestedTransaction"/>. Returns null for every other
+    /// action, so the caller carries on to security classification.
+    /// </summary>
+    /// <remarks>
+    /// These rows carry no security and no share count: they are cash
+    /// arriving in or leaving the account. The OFX provider already
+    /// treats its equivalent that way — <c>INVBANKTRAN</c> maps to the
+    /// bank shape with a null action — and this is the same fact in a
+    /// different dialect.
+    ///
+    /// <para>Skipping them was not a small gap. A workplace-plan
+    /// statement is mostly <c>ContribX</c>, so a Fidelity NetBenefits
+    /// QIF imported with its contributions dropped: the cash balance was
+    /// wrong, and the missing rows looked like the user's own oversight
+    /// rather than an importer decision.</para>
+    ///
+    /// <para>QIF <c>L</c> (the transfer counterparty) is deliberately not
+    /// read here, consistent with the rest of this provider — the row
+    /// lands needs_review and the user names the other side in the
+    /// editor. So a cash row usually arrives with no payee, which is
+    /// honest: the file did not say.</para>
+    /// </remarks>
+    private IngestedTransaction? MapInvestmentCashTransfer(
+        QifRecordBuilder r,
+        string rawAction,
+        FileIngestContext context)
+    {
+        // Unlike the security actions, the direction IS knowable from
+        // the action alone, so these do not land on the positive
+        // magnitude the `misc` fallback uses.
+        var sign = rawAction.Trim().ToUpperInvariant() switch
+        {
+            "XIN" or "CONTRIBX"   => 1m,
+            "XOUT" or "WITHDRWX"  => -1m,
+            _                     => 0m,
+        };
+        if (sign == 0m) return null;
+
+        var magnitude = Math.Abs(r.Amount ?? r.AltAmount ?? 0m);
+        var postedAt = DateTime.SpecifyKind(r.Date!.Value, DateTimeKind.Utc);
+
+        // rawAction stays in the key so a cash row cannot collide with a
+        // bank-section row of the same date and amount.
+        var externalId = SynthesizeExternalId(
+            context.AccountId, r.Date.Value, rawAction,
+            null, null, null, magnitude, r.Memo);
+
+        return new IngestedTransaction(
+            ExternalId: externalId,
+            PostedAt: postedAt,
+            TransactedAt: null,
+            Amount: sign * magnitude,
+            Payee: NullIfEmpty(r.Payee),
+            Description: NullIfEmpty(r.Memo),
+            Pending: false,
+            ProviderAccountId: SingleAccountKey);
     }
 
     /// <summary>
@@ -319,10 +390,15 @@ public sealed class QifFileProvider : IFileProvider
     /// <summary>
     /// Why this slice skips a given QIF action. The recognised-but-
     /// declined codes get a specific reason; anything else falls back
-    /// to the catalog line. Codes here are deliberately NOT routed to
-    /// actions — several (<c>RtrnCap</c>, <c>XIn</c> / <c>XOut</c>)
-    /// have ADR-0027 equivalents the OFX provider already maps, and
-    /// closing that gap is a classification change, not message text.
+    /// to the catalog line.
+    ///
+    /// <para><c>RtrnCap</c>, <c>XIn</c> / <c>XOut</c> and
+    /// <c>ContribX</c> / <c>WithdrwX</c> used to be listed here with
+    /// reasons, on the note that closing the gap was a classification
+    /// change rather than message text. It was, and it has been: return
+    /// of capital classifies as a cash distribution like the OFX
+    /// provider's RETOFCAP, and the four cash moves take the bank shape
+    /// before classification runs.</para>
     /// </summary>
     private static string UnsupportedActionReason(string qifAction) =>
         qifAction.ToUpperInvariant() switch
@@ -336,10 +412,6 @@ public sealed class QifFileProvider : IFileProvider
                 "Short sales are outside the ADR-0027 action catalog.",
             "GRANT" or "VEST" or "EXERCISE" or "EXERCISX" or "EXPIRE" =>
                 "Equity-compensation actions are outside the ADR-0027 action catalog.",
-            "XIN" or "XOUT" or "CONTRIBX" or "WITHDRWX" =>
-                "Cash transfers inside an investment section aren't imported in this slice.",
-            "RTRNCAP" or "RTRNCAPX" =>
-                "Return of capital isn't imported in this slice.",
             _ =>
                 "This QIF action is outside the ADR-0027 action catalog.",
         };
@@ -380,6 +452,11 @@ public sealed class QifFileProvider : IFileProvider
             "CGLONGX" or "CGSHORTX" or "CGMIDX" => "divx",
             "INTINC" => "dividend_cash",
             "INTINCX" => "divx",
+            // Return of capital is a cash distribution, which is exactly
+            // how the OFX provider maps its RETOFCAP. The X variant
+            // follows the DIV/DIVX pair already above it.
+            "RTRNCAP" => "dividend_cash",
+            "RTRNCAPX" => "divx",
             "REINVDIV" or "REINVLG" or "REINVSH" or "REINVMD" or "REINVINT"
                 => "dividend_reinvest",
             "MISCINC" or "MISCEXP" or "MISCINCX" or "MISCEXPX" or "MARGINT"

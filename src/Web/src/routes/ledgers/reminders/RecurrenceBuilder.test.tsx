@@ -33,6 +33,10 @@ describe('RecurrenceBuilder', () => {
             startDate: '2026-06-16',
             endDate: null,
             autoCommitDaysBefore: null,
+            // Mig 220: a new reminder uses the amount as entered, not an estimate. The
+            // deep-equal is kept rather than loosened to toMatchObject — it is what makes
+            // adding a field to ScheduleValue a deliberate act rather than a silent one.
+            estimateSampleCount: null,
         });
     });
 
@@ -126,5 +130,77 @@ describe('RecurrenceBuilder', () => {
         renderBuilder();
         // Default is monthly on the 16th, from the start date.
         expect(screen.getByText(/Monthly on the 16th · from 2026-06-16/)).toBeInTheDocument();
+    });
+});
+
+describe('RecurrenceBuilder — estimated amounts (mig 220)', () => {
+    /*
+     * The control is offered only to a series that can actually use it. A split has no
+     * single amount to estimate and a loan payment is computed from its terms, so both
+     * are refused server-side; hiding the control is the courtesy that stops a user
+     * choosing something that would be rejected.
+     */
+    it('offers the estimate option when the series is eligible', () => {
+        render(
+            <RecurrenceBuilder
+                value={defaultSchedule('2026-06-16')}
+                onChange={() => {}}
+                estimateEligible
+            />,
+        );
+        expect(screen.getByRole('radio', { name: /estimate from history/i })).toBeTruthy();
+    });
+
+    it('hides it when the series cannot estimate', () => {
+        render(
+            <RecurrenceBuilder
+                value={defaultSchedule('2026-06-16')}
+                onChange={() => {}}
+                estimateEligible={false}
+            />,
+        );
+        expect(screen.queryByRole('radio', { name: /estimate from history/i })).toBeNull();
+    });
+
+    /*
+     * 3 is the default the maintainer specified: enough to smooth a variable bill, short
+     * enough to follow a real change in it. Asserted because a default that silently
+     * became 1 would turn "average of recent occurrences" into "repeat the last one".
+     */
+    it('defaults the sample size to 3 when estimation is switched on', async () => {
+        const seen: ScheduleValue[] = [];
+        render(
+            <RecurrenceBuilder
+                value={defaultSchedule('2026-06-16')}
+                onChange={(next) => seen.push(next)}
+                estimateEligible
+            />,
+        );
+
+        await userEvent.click(screen.getByRole('radio', { name: /estimate from history/i }));
+
+        expect(seen).toHaveLength(1);
+        expect(seen[0].estimateSampleCount).toBe(3);
+    });
+
+    /*
+     * The server REJECTS out of range rather than clamping, so a value the input allowed
+     * through would come back as a 422 the user cannot act on.
+     */
+    it('clamps the sample size to the supported range', async () => {
+        const seen: ScheduleValue[] = [];
+        render(
+            <RecurrenceBuilder
+                value={{ ...defaultSchedule('2026-06-16'), estimateSampleCount: 3 }}
+                onChange={(next) => seen.push(next)}
+                estimateEligible
+            />,
+        );
+
+        const input = screen.getByLabelText('Occurrences to average');
+        await userEvent.clear(input);
+        await userEvent.type(input, '99');
+
+        expect(seen.at(-1)!.estimateSampleCount).toBeLessThanOrEqual(24);
     });
 });

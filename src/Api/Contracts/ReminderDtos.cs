@@ -24,7 +24,10 @@ public sealed record ReminderSummary(
     int? AutoCommitDaysBefore,
     bool IsActive,
     bool IsLoanReminder,
-    string Origin);
+    string Origin,
+
+    // Mig 220: the series' estimate, so the manage list agrees with the agenda.
+    ReminderEstimate? Estimate = null);
 
 /// <summary>
 /// One entry in the upcoming agenda/calendar (ADR-0047):
@@ -35,6 +38,33 @@ public sealed record ReminderSummary(
 /// not yet acted). v1 is reminder-driven (series occurrences); a general
 /// future-transaction calendar is a later enhancement.
 /// </summary>
+/// <summary>
+/// An estimated amount, present only on a series that opted in (migration 220).
+/// </summary>
+/// <remarks>
+/// <para>
+/// <b><see cref="Amount"/> null means there is no estimate</b> and the surface is showing
+/// the template amount; <see cref="UnavailableReason"/> says why. Non-null means the
+/// surface's own amount field IS this estimate.
+/// </para>
+/// <para>
+/// It travels as its own record rather than by rewriting the amount in place, because
+/// "this number is a guess" is not derivable from the number. Every amount-bearing
+/// reminder contract is a bare decimal with no provenance today, and the loan feature got
+/// away without a marker only because <c>IsLoanReminder</c> flags the entire series.
+/// </para>
+/// <para>
+/// <see cref="AvailableSampleCount"/> is shown to the user, not just used internally: an
+/// average of one occurrence and an average of twelve deserve different confidence, and
+/// the user is the only one who can judge which.
+/// </para>
+/// </remarks>
+public sealed record ReminderEstimate(
+    int RequestedSampleCount,
+    int AvailableSampleCount,
+    decimal? Amount,
+    string? UnavailableReason);
+
 public sealed record UpcomingOccurrence(
     DateOnly Date,
     string Kind,
@@ -50,7 +80,12 @@ public sealed record UpcomingOccurrence(
     // it to tell whether acting on an un-fired slot will catch-up (cascade-skip)
     // earlier occurrences — true when SeriesNextDue < Date — so the form can
     // warn inline (ADR-0047 §9.2). Null for a custom series.
-    DateOnly? SeriesNextDue);
+    DateOnly? SeriesNextDue,
+
+    // The series' estimated amount, when it asked for one (mig 220).
+    // Null on a FIRED occurrence: that carries the real committed figure, and an
+    // estimate of a settled fact is noise.
+    ReminderEstimate? Estimate = null);
 
 /// <summary>
 /// Body for <c>POST /api/ledgers/{ledgerId}/reminders/{id}/fire</c> — the
@@ -135,6 +170,18 @@ public sealed class CreateReminderRequest
     /// must be a bank-shape account in this ledger.</summary>
     public Guid SourceAccountId { get; init; }
     public IReadOnlyList<TransactionPosting> Postings { get; init; } = Array.Empty<TransactionPosting>();
+
+    /// <summary>
+    /// NULL = use the template amount. N (1-24) = the amount is the average of the last
+    /// N committed occurrences of this series (mig 220).
+    /// </summary>
+    /// <remarks>
+    /// Only for a SINGLE-posting, non-loan series. Both exclusions are rejected rather
+    /// than silently ignored: a split has no single amount to estimate, and a loan
+    /// payment is computed from its terms and current balance — real information an
+    /// average would only degrade.
+    /// </remarks>
+    public int? EstimateSampleCount { get; init; }
 }
 
 /// <summary>
@@ -163,6 +210,16 @@ public sealed class EditReminderRequest
     /// this list (the template has no lots/overrides, so a clean rebuild is
     /// correct — no LegId reconcile needed). Null = legs untouched.</summary>
     public PatchReminderPostings? Postings { get; init; }
+
+    /// <summary>Explicit clear for the nullable estimate (mig 220).</summary>
+    /// <remarks>
+    /// Mirrors <see cref="ClearAutoCommit"/> because a null scalar on this PATCH body
+    /// already means "unchanged", so there is no other way to say "stop estimating".
+    /// </remarks>
+    public bool ClearEstimate { get; init; }
+
+    /// <summary>Turn estimating on, or change N. See <see cref="CreateReminderRequest.EstimateSampleCount"/>.</summary>
+    public int? EstimateSampleCount { get; init; }
 }
 
 /// <summary>Replace-all postings sub-shape for <see cref="EditReminderRequest"/>.</summary>
@@ -245,6 +302,18 @@ public sealed record SkipReminderResponse(
     int SkippedEarlierCount = 0, DateOnly? SkippedEarlierFrom = null);
 
 /// <summary>
+/// <c>DELETE /api/ledgers/{ledgerId}/reminders/{reminderId}/skip?occurrenceDate=</c> —
+/// the slot is un-acted again, and the series cursor may have moved EARLIER.
+/// </summary>
+/// <remarks>
+/// No cascade count, unlike <see cref="SkipReminderResponse"/>. Un-skip touches exactly
+/// the one slot asked for: skipping sweeps earlier un-acted occurrences, and undoing that
+/// sweep would mean guessing which of them the user wanted back.
+/// </remarks>
+public sealed record UnskipReminderResponse(
+    DateOnly OccurrenceDate, DateOnly? NextDueDate);
+
+/// <summary>
 /// Per-series detail (<c>GET /api/ledgers/{ledgerId}/reminders/{reminderId}</c>,
 /// also returned by create/edit). Series metadata + <see cref="Kind"/>
 /// ("bank" | "investment", derived from the template's
@@ -271,7 +340,15 @@ public sealed record ReminderDetail(
     // the investment brokerage. The SPA splits the template legs against it
     // (ADR-0049 adjust-at-post). Null on a custom / pre-125 series.
     Guid? SourceAccountId,
-    IReadOnlyList<ReminderLegDto> Legs);
+    IReadOnlyList<ReminderLegDto> Legs,
+
+    // Mig 220. The series' estimate, when it asked for one.
+    //
+    // NOT applied to Legs. The reminder EDITOR prefills from this same leg list and
+    // PATCHes it back, so writing the estimate into the legs would make opening the
+    // editor and saving replace the user's template amount with a computed average —
+    // permanently. The estimate travels beside the legs and each surface chooses.
+    ReminderEstimate? Estimate = null);
 
 /// <summary>One template leg in a <see cref="ReminderDetail"/>. Carries the
 /// bank fields (account, amount, memo) plus the investment metadata

@@ -646,3 +646,70 @@ describe('FeedConnectionsPanel', () => {
         expect(options).not.toContain('Already Bound');
     });
 });
+
+describe('FeedConnectionsPanel — an account the provider has stopped listing', () => {
+    // last_seen_at has been written since the feed work landed and rendered nowhere,
+    // so a bank quietly dropping an account presented as transactions that simply
+    // stopped arriving — the hardest shape to notice in a register that never claimed
+    // to be complete.
+    //
+    // Dates are computed from now(), not hardcoded: a fixture with a literal date
+    // silently changes meaning as it ages past the threshold, which is exactly how the
+    // existing fixtures in this file ended up stale without anyone noticing.
+    const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString();
+
+    function connection() {
+        return [{
+            id: 'c1',
+            ledgerId: LEDGER_ID,
+            provider: 'simplefin',
+            institutionName: 'Test Bank',
+            status: 'active',
+            lastSyncedAt: daysAgo(0),
+            createdAt: daysAgo(90),
+        }] as FeedConnectionSummary[];
+    }
+
+    function account(lastSeenAt: string) {
+        return {
+            simpleFinAccountId: 'sf-1',
+            name: 'Dropped Checking',
+            orgName: 'Test Bank',
+            currency: 'USD',
+            balance: 100,
+            lastSeenAt,
+            boundLedgerAccountId: 'ledger-acct-1',
+            boundLedgerAccountName: 'Test Bank Checking',
+            boundLedgerAccountSyncFrom: null,
+        };
+    }
+
+    it('flags an account the provider has not returned for weeks', async () => {
+        const connections = connection();
+        vi.spyOn(apiModule, 'fetchFeedConnections').mockResolvedValue(connections);
+        vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([]);
+        vi.spyOn(apiModule, 'fetchFeedConnectionAccounts')
+            .mockResolvedValue([account(daysAgo(30))]);
+
+        renderPage({ initialConnections: connections });
+
+        expect(await screen.findByText(/dropped checking/i)).toBeInTheDocument();
+        expect(screen.getByText(/not seen since/i)).toBeInTheDocument();
+    });
+
+    it('says nothing about an account the provider returned today', async () => {
+        // The negative half. Without it the badge could render unconditionally and the
+        // test above would still pass — which is the same shape as a check that cannot
+        // fail.
+        const connections = connection();
+        vi.spyOn(apiModule, 'fetchFeedConnections').mockResolvedValue(connections);
+        vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([]);
+        vi.spyOn(apiModule, 'fetchFeedConnectionAccounts')
+            .mockResolvedValue([account(daysAgo(1))]);
+
+        renderPage({ initialConnections: connections });
+
+        expect(await screen.findByText(/dropped checking/i)).toBeInTheDocument();
+        expect(screen.queryByText(/not seen since/i)).toBeNull();
+    });
+});

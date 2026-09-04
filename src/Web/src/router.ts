@@ -191,9 +191,20 @@ const settingsRoute = createRoute({
     // Active tab is URL state (ADR-0069 nav swap): tabs deep-link + survive
     // refresh, and the Overview's "View activity" link targets the Activity
     // tab. Absent/invalid → General, carried as a clean URL with no ?tab.
-    validateSearch: (search: Record<string, unknown>): { tab?: SettingsTab } => {
+    // `check` is an ARRIVAL instruction, not a view: it asks the General tab to run
+    // the consistency check once on landing, so a notification saying "your
+    // projections drifted" can hand the reader the check and its repair instead of
+    // a panel that shows nothing until they press a button themselves.
+    //
+    // Not a boolean toggle in state, because the check is expensive — it walks every
+    // position — and nothing should run it except an explicit act by the reader. The
+    // param is consumed and stripped on arrival so a refresh does not re-run it.
+    validateSearch: (
+        search: Record<string, unknown>,
+    ): { tab?: SettingsTab; check?: true } => {
         const tab = coerceSettingsTab(search.tab);
-        return tab === 'general' ? {} : { tab };
+        const check = search.check === true || search.check === '1' ? true as const : undefined;
+        return { ...(tab === 'general' ? {} : { tab }), ...(check ? { check } : {}) };
     },
 });
 

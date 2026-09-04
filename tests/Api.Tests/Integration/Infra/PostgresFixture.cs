@@ -186,6 +186,13 @@ public sealed class PostgresFixture : IAsyncLifetime
     /// (creating ledgers for multiple users, seeding transactions
     /// across ledgers, …).
     /// </summary>
+    /// <remarks>
+    /// <b>Not the production shape.</b> This builds bare options — no recompute
+    /// interceptors — and is a raw SEEDING handle for arranging rows directly.
+    /// <see cref="NewServiceFactory"/> is what production uses, and anything
+    /// asserting that a write recomputed its derived state must go through that,
+    /// or it proves nothing.
+    /// </remarks>
     public AppDbContext NewServiceDbContext()
     {
         var options = new DbContextOptionsBuilder<AppDbContext>()
@@ -218,8 +225,27 @@ public sealed class PostgresFixture : IAsyncLifetime
             ConnectionString = AppConnectionString,
             ServiceConnectionString = ServiceConnectionString,
         });
-        return new ServiceDbContextFactory(options);
+        return ServiceFactoryFor(options);
     }
+
+    /// <summary>
+    /// A <see cref="ServiceDbContextFactory"/> wired the way PRODUCTION wires it.
+    /// </summary>
+    /// <remarks>
+    /// One place, so the test shape cannot drift from Program.cs. The three
+    /// recompute interceptors are passed because production passes them: a factory
+    /// built without them hands back a context that saves without recomputing, and
+    /// a test asserting a recomputed balance over that is asserting the bug rather
+    /// than the fix. Interceptors are cheap and stateless — each scans the
+    /// ChangeTracker for its own surface and does nothing when it finds none — so
+    /// callers that never touch legs pay an in-memory loop over their own entries.
+    /// </remarks>
+    public static ServiceDbContextFactory ServiceFactoryFor(IOptions<ApiOptions> options) =>
+        new(options,
+            new LegDerivedRecomputeInterceptor(
+                NullLogger<LegDerivedRecomputeInterceptor>.Instance),
+            new HoldingsRecomputeInterceptor(),
+            new TradePriceFromLegInterceptor());
 
     /// <summary>
     /// Test-side master KEK + LedgerKeyService for repository unit

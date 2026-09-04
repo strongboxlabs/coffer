@@ -81,9 +81,13 @@ public sealed class SchedulerService : BackgroundService
 
         var handlers = scope.ServiceProvider.GetServices<IScheduledJobHandler>()
             .ToDictionary(h => h.JobType, StringComparer.Ordinal);
+        // Resolved once and shared by both loops: the global loop announces a disable
+        // too, and two GetRequiredService calls in one tick would be two instances.
+        var publisher =
+            scope.ServiceProvider.GetRequiredService<Notifications.NotificationPublisher>();
+
         var count = await _runner
-            .RunDueAsync(db, handlers, now, _logger, cancellationToken,
-                scope.ServiceProvider.GetRequiredService<Notifications.NotificationPublisher>())
+            .RunDueAsync(db, handlers, now, _logger, cancellationToken, publisher)
             .ConfigureAwait(false);
 
         // Global (non-ledger) jobs share this one loop — e.g. the whole-DB
@@ -91,7 +95,7 @@ public sealed class SchedulerService : BackgroundService
         var globalHandlers = scope.ServiceProvider.GetServices<IGlobalScheduledJobHandler>()
             .ToDictionary(h => h.JobType, StringComparer.Ordinal);
         count += await _runner
-            .RunDueGlobalAsync(db, globalHandlers, now, _logger, cancellationToken)
+            .RunDueGlobalAsync(db, globalHandlers, now, _logger, cancellationToken, publisher)
             .ConfigureAwait(false);
 
         if (count > 0)

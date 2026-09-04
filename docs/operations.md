@@ -488,7 +488,8 @@ cd ~/coffer && docker compose exec postgres   sh -c 'PGPASSWORD=$(cat /run/secre
 The password is read from the docker secret **inside** the container, so it never
 reaches your shell history. On an install created before the scram hardening above,
 initdb left `trust` on the local socket and a bare `psql -U coffer -d coffer` still
-works — `scripts/harden-pg-hba.sh` is the one-time fix. Use the `coffer` superuser for
+works — `scripts/harden-pg-hba.sh` is the one-time fix, and `install.sh` now runs it
+for you on the upgrade path. Use the `coffer` superuser for
 diagnostics: `coffer_app` is `NOBYPASSRLS`, so outside a request `app.user_id` is
 unset and every scoped table returns **zero rows with no error**.
 
@@ -681,8 +682,10 @@ connections it has no reason to accept:
   deployment ever moved to `network_mode: host` or a bare VM.
 
 **Upgrading an existing install:** `initdb` runs exactly once, so an install
-created before this landed still has `trust` in its `PGDATA` — the compose
-setting does nothing for it. Run the one-time remediation:
+created before this landed still has `trust` in its `PGDATA` — the compose setting
+does nothing for it. **`install.sh` applies the remediation itself** when it sees
+those rules, so an upgraded install is hardened without anyone deciding to. Run it
+directly only if that failed, or on a host that was never installed by the script:
 
 ```bash
 scripts/harden-pg-hba.sh          # or: PG_CONTAINER=… ENV_FILE=… scripts/harden-pg-hba.sh
@@ -745,8 +748,11 @@ docker compose up -d              # recreates with the file-based secrets
 It does not rotate anything — the credentials the database already knows keep
 working, because rotating during a migration would mean two things could fail at
 once with no way to tell which. `scripts/install.sh` does the same automatically
-on its upgrade path. Both leave a `.env.pre-secrets` backup that still contains
-the passwords; delete it once the stack is confirmed healthy.
+on its upgrade path. Both leave a `.env.pre-secrets` backup that still contains the
+passwords — and both remove it on their NEXT run, overwriting it first, once
+`secrets/` holds all three. The one-run delay is deliberate: that copy is the way
+back if the file-based arrangement turns out to be wrong, so it survives exactly
+as long as the migration might still need undoing.
 
 #### Container privileges and connection logging
 

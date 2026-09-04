@@ -25,6 +25,7 @@ const VERSION = {
 const SCHEDULE_OFF: BackupSchedule = {
     enabled: false, hourLocal: 3, minuteLocal: 0, timezone: null,
     lastRunAt: null, nextRunAt: null, passphraseConfigured: false,
+    consecutiveFailures: 0, lastError: null, lastFailureAt: null, disabledReason: null,
 };
 
 function renderSystem(isAdmin: boolean) {

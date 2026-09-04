@@ -57,6 +57,19 @@ public sealed class GlobalSchedulesRepository
             row = new GlobalScheduledJobRow { JobType = jobType };
             db.GlobalScheduledJobs.Add(row);
         }
+        // Same transition-only reset as the per-ledger repository, and the same reason:
+        // a backup job auto-disabled at five strikes came back holding five, so the
+        // operator's re-enable bought a single attempt. This table also carries the
+        // KEK-reconciliation disable, which a re-enable equally clears — an admin who
+        // has set a new passphrase is answering exactly that.
+        if (enabled && !row.Enabled)
+        {
+            row.ConsecutiveFailures = 0;
+            row.LastError = null;
+            row.LastFailureAt = null;
+            row.DisabledReason = null;
+        }
+
         row.Enabled = enabled;
         row.HourLocal = hourLocal;
         row.MinuteLocal = minuteLocal;
@@ -111,8 +124,16 @@ public sealed class GlobalSchedulesRepository
     private static GlobalScheduleState ToState(GlobalScheduledJobRow row) =>
         new(
             new ScheduleDto(
-                row.Enabled, row.HourLocal, row.MinuteLocal,
-                row.Timezone, row.LastRunAt, row.NextRunAt),
+                Enabled: row.Enabled,
+                HourLocal: row.HourLocal,
+                MinuteLocal: row.MinuteLocal,
+                Timezone: row.Timezone,
+                LastRunAt: row.LastRunAt,
+                NextRunAt: row.NextRunAt,
+                ConsecutiveFailures: row.ConsecutiveFailures,
+                LastError: row.LastError,
+                LastFailureAt: row.LastFailureAt,
+                DisabledReason: row.DisabledReason),
             PassphraseConfigured: row.PassphraseCiphertext is { Length: > 0 });
 }
 

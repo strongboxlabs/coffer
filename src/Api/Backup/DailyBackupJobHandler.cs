@@ -66,8 +66,14 @@ public sealed class DailyBackupJobHandler : IGlobalScheduledJobHandler
                 Severity: Coffer.Api.Notifications.NotificationSeverity.Critical,
                 Topic: Coffer.Api.Notifications.NotificationTopics.Backup,
                 EventKey: "backup.failed",
-                Summary: "Scheduled backup FAILED: " + ex.Message,
-                Detail: null,
+                // NOT ex.Message. This summary is delivered to whatever webhook or
+                // Healthchecks URL an operator configured, and a failed pg_dump or a
+                // failed remote push produces an Npgsql or HTTP message naming
+                // internal hostnames, ports, database names and file paths — the
+                // exact payload most worth reading for anyone holding that URL.
+                Summary: "Scheduled backup FAILED: "
+                    + Coffer.Api.Notifications.PublishedFailure.Describe(ex),
+                Detail: Coffer.Api.Notifications.PublishedFailure.DetailFor(ex),
                 Monitor: Coffer.Api.Notifications.NotificationMonitors.Backup,
                 Signal: Coffer.Api.Notifications.MonitorSignal.Failure),
                 cancellationToken).ConfigureAwait(false);

@@ -110,10 +110,11 @@ public static class LedgerNotificationsEndpoints
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        var coverage = await publisher.LedgerMonitorCoverageAsync(ledgerId, cancellationToken)
+        var monitors = await publisher.LedgerMonitorStatusAsync(ledgerId, cancellationToken)
             .ConfigureAwait(false);
 
-        return Results.Ok(new LedgerNotificationSettingsDto(targets, coverage));
+        return Results.Ok(new LedgerNotificationSettingsDto(
+            targets, monitors.Coverage, monitors.WatchingNothing));
     }
 
     private static async Task<IResult> CreateSubscriberAsync(

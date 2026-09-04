@@ -232,6 +232,20 @@ public static class BusinessError
         public const string ReminderStartDateRequired      = "reminder-start-date-required";
         public const string ReminderEndBeforeStart         = "reminder-end-before-start";
         public const string ReminderAutoCommitNegative     = "reminder-auto-commit-negative";
+
+        /// <summary>estimateSampleCount outside 1-24 (mig 220).</summary>
+        public const string ReminderEstimateRangeInvalid    = "reminder-estimate-range-invalid";
+
+        /// <summary>
+        /// An estimate was asked for on a series that cannot have one — a split, or a
+        /// loan reminder.
+        /// </summary>
+        /// <remarks>
+        /// Rejected rather than silently dropped: a user who ticks it and gets no error
+        /// believes the amount is estimated when it never will be, which is the same
+        /// silent-nothing failure auto-post shipped with and had to be fixed for.
+        /// </remarks>
+        public const string ReminderEstimateNotEligible     = "reminder-estimate-not-eligible";
         public const string ReminderPatchEmpty             = "reminder-patch-empty";
         public const string ReminderOccurrenceAlreadyFired = "reminder-occurrence-already-fired";
         public const string ReminderOccurrenceSkipped      = "reminder-occurrence-skipped";

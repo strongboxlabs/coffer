@@ -26,6 +26,13 @@ public static class BackupContracts
     /// <summary>Response for the backup schedule (<c>GET/PUT
     /// /api/admin/backups/schedule</c>): the daily schedule plus whether a
     /// passphrase has been set (the panel disables enabling until it is).</summary>
+    /// <remarks>
+    /// The health fields carry the same caveats as <c>ScheduleDto</c>: LastRunAt means
+    /// attempted rather than succeeded, and LastError can be set on a run that did not
+    /// fail. They are here because the backup schedule is the one an operator is least
+    /// likely to look at until it matters — a deployment whose backups quietly stopped
+    /// is the outage this whole surface exists for.
+    /// </remarks>
     public sealed record BackupScheduleResponse(
         bool Enabled,
         int HourLocal,
@@ -33,7 +40,11 @@ public static class BackupContracts
         string? Timezone,
         DateTime? LastRunAt,
         DateTime? NextRunAt,
-        bool PassphraseConfigured);
+        bool PassphraseConfigured,
+        int ConsecutiveFailures = 0,
+        string? LastError = null,
+        DateTime? LastFailureAt = null,
+        string? DisabledReason = null);
 
     /// <summary>Body for <c>PUT /api/admin/backups/schedule</c>.</summary>
     public sealed record SetBackupScheduleRequest(

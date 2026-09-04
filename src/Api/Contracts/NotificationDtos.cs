@@ -101,6 +101,13 @@ public sealed record SystemEventDto(
 /// watching it. Keyed on the ledger's own jobs rather than on every monitor the build
 /// knows, so a ledger with snapshots switched off is not warned about snapshots.
 /// </param>
+/// <param name="MonitorsWatchingNothing">
+/// Monitors this ledger has a switch bound to whose job is NOT enabled here. A check that
+/// can only ever read "Never", which <see cref="MonitorCoverage"/> structurally cannot
+/// report: it is keyed on the jobs that run, so a switch on a job that does not run
+/// matches nothing and vanishes.
+/// </param>
 public sealed record LedgerNotificationSettingsDto(
     IReadOnlyList<NotificationSubscriberDto> Subscribers,
-    IReadOnlyDictionary<string, bool> MonitorCoverage);
+    IReadOnlyDictionary<string, bool> MonitorCoverage,
+    IReadOnlyList<string> MonitorsWatchingNothing);

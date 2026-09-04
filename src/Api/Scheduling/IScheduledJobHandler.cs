@@ -11,8 +11,59 @@ public static class JobTypes
     /// <summary>Daily pull of every bank feed connection on the ledger (mig 215).</summary>
     public const string FeedSync = "feed-sync";
 
+    /// <summary>
+    /// Post reminder occurrences that are within their series' acdays window (mig 219,
+    /// ADR-0097). The only job type here that WRITES FINANCIAL TRANSACTIONS.
+    /// </summary>
+    public const string ReminderAutoPost = "reminder-auto-post";
+
     public static readonly IReadOnlySet<string> All =
-        new HashSet<string>(StringComparer.Ordinal) { QuoteRefresh, Snapshot, FeedSync };
+        new HashSet<string>(StringComparer.Ordinal)
+        { QuoteRefresh, Snapshot, FeedSync, ReminderAutoPost };
+}
+
+/// <summary>
+/// The instant a scheduled run is happening at, and the timezone its ledger reckons days
+/// in.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <b>Why a handler cannot just read the clock.</b> Reminders are pure
+/// <see cref="DateOnly"/> — an occurrence is due on a DATE — so a handler has to answer
+/// "what is today?". <c>DateOnly.FromDateTime(DateTime.UtcNow)</c> is the wrong answer
+/// for any ledger whose local date differs from UTC's at the moment the job fires, which
+/// for an evening slot in the Americas is every single run.
+/// </para>
+/// <para>
+/// It also makes the handler untestable in the one way that matters. A test cannot place
+/// "today" anywhere, so a due-ness assertion either drifts with the wall clock or is
+/// written against whatever today happens to be — and this repo has already shipped one
+/// vacuous test of exactly that shape (see <c>SchedulesRepositoryDstTests</c>, whose
+/// remarks record the endpoint version passing with the fix deleted).
+/// </para>
+/// <para>
+/// The runner already holds both values — the <c>nowUtc</c> that decided due-ness and the
+/// row's <c>Timezone</c> — so passing them down costs nothing and guarantees the instant a
+/// job fired at and the date it reasons about cannot disagree.
+/// </para>
+/// </remarks>
+public readonly record struct JobRunClock(DateTime NowUtc, string? TimezoneId)
+{
+    /// <summary>
+    /// The local calendar date this run is happening on, in the schedule's timezone.
+    /// </summary>
+    /// <remarks>
+    /// Resolved through <see cref="DailyScheduleTiming"/> so a blank or unknown id falls
+    /// back exactly the way <c>NextRunUtc</c> falls back. One definition of the ledger's
+    /// "today", next to the one definition of its next run.
+    /// </remarks>
+    public DateOnly LocalToday()
+    {
+        var tz = DailyScheduleTiming.Resolve(TimezoneId);
+        var local = TimeZoneInfo.ConvertTimeFromUtc(
+            DateTime.SpecifyKind(NowUtc, DateTimeKind.Utc), tz);
+        return DateOnly.FromDateTime(local);
+    }
 }
 
 /// <summary>What a scheduled run actually achieved.</summary>
@@ -87,5 +138,6 @@ public interface IScheduledJobHandler
     /// hide from the runner.
     /// </returns>
     Task<JobRunOutcome> RunAsync(
-        AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken cancellationToken);
+        AppDbContext db, Guid ledgerId, Guid configuredByUserId, JobRunClock clock,
+        CancellationToken cancellationToken);
 }

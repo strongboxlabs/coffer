@@ -18,4 +18,20 @@ internal sealed class RealizedGainWalkRow
     public decimal Proceeds { get; init; }
     public decimal CostBasisSold { get; init; }
     public decimal RealizedGain { get; init; }
+
+    /// <summary>
+    /// The long-term half of the disposal (mig 169), added to this walk by mig 217.
+    /// </summary>
+    /// <remarks>
+    /// Omitted from the function for eleven migrations, which made the consistency
+    /// check structurally unable to see drift in the columns these mirror — it
+    /// cannot compare what its reference implementation does not return. The
+    /// underlying columns are NOT NULL DEFAULT 0, so the failure mode is a silent
+    /// zero rather than an error.
+    /// </remarks>
+    public decimal ProceedsLt { get; init; }
+
+    public decimal CostBasisSoldLt { get; init; }
+
+    public decimal RealizedGainLt { get; init; }
 }

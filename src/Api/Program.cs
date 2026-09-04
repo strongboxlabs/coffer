@@ -683,6 +683,11 @@ builder.Services.AddScoped<Coffer.Api.Scheduling.IScheduledJobHandler,
 // handler is resolved per tick inside the worker's own scope.
 builder.Services.AddScoped<Coffer.Api.Scheduling.IScheduledJobHandler,
     Coffer.Api.Ingest.FeedSyncJobHandler>();
+// Reminder auto-post (mig 219, ADR-0097). The only per-ledger job that WRITES financial
+// transactions; it builds its own service-role contexts rather than writing on the one
+// the runner hands it (see the handler's remarks for why that is not a style choice).
+builder.Services.AddScoped<Coffer.Api.Scheduling.IScheduledJobHandler,
+    Coffer.Api.Reminders.ReminderAutoPostJobHandler>();
 // Global (non-ledger) job handlers — the same worker scans global_scheduled_jobs
 // (mig 139) and dispatches these (ADR-0060: whole-DB backup).
 builder.Services.AddScoped<Coffer.Api.Scheduling.IGlobalScheduledJobHandler,

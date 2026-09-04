@@ -595,6 +595,174 @@ public sealed class OfxIngestTests
         </OFX>
         """;
 
+    /// <summary>
+    /// An OFX investment statement carrying nothing but an option buy
+    /// and an option sell. OfxNet models BUYOPT / SELLOPT as
+    /// OfxBuyInvestment / OfxSellInvestment subclasses, so before the
+    /// classifier declined them explicitly these imported as a plain
+    /// buy and a plain sell — an options contract entering the ledger
+    /// as a share position, silently, while CLOSUREOPT warned.
+    /// Synthesised — no real account names, FIIDs, or CUSIPs.
+    /// </summary>
+    private const string OfxOptionsStatement = """
+        OFXHEADER:100
+        DATA:OFXSGML
+        VERSION:102
+        SECURITY:NONE
+        ENCODING:USASCII
+        CHARSET:1252
+        COMPRESSION:NONE
+        OLDFILEUID:NONE
+        NEWFILEUID:NONE
+
+        <OFX>
+        <SIGNONMSGSRSV1>
+        <SONRS>
+        <STATUS><CODE>0<SEVERITY>INFO</STATUS>
+        <DTSERVER>20260201120000
+        <LANGUAGE>ENG
+        </SONRS>
+        </SIGNONMSGSRSV1>
+        <INVSTMTMSGSRSV1>
+        <INVSTMTTRNRS>
+        <TRNUID>1
+        <STATUS><CODE>0<SEVERITY>INFO</STATUS>
+        <INVSTMTRS>
+        <DTASOF>20260201120000
+        <CURDEF>USD
+        <INVACCTFROM>
+        <BROKERID>fake.example
+        <ACCTID>FAKE-OPT-1
+        </INVACCTFROM>
+        <INVTRANLIST>
+        <DTSTART>20260101
+        <DTEND>20260131
+        <BUYOPT>
+        <INVBUY>
+        <INVTRAN>
+        <FITID>INV-FITID-BUYOPT-1
+        <DTTRADE>20260112
+        </INVTRAN>
+        <SECID>
+        <UNIQUEID>FAKE0002
+        <UNIQUEIDTYPE>CUSIP
+        </SECID>
+        <UNITS>2
+        <UNITPRICE>3.50
+        <TOTAL>-700.00
+        <SUBACCTSEC>CASH
+        <SUBACCTFUND>CASH
+        </INVBUY>
+        <OPTBUYTYPE>BUYTOOPEN
+        <SHPERCTRCT>100
+        </BUYOPT>
+        <SELLOPT>
+        <INVSELL>
+        <INVTRAN>
+        <FITID>INV-FITID-SELLOPT-1
+        <DTTRADE>20260118
+        </INVTRAN>
+        <SECID>
+        <UNIQUEID>FAKE0002
+        <UNIQUEIDTYPE>CUSIP
+        </SECID>
+        <UNITS>-1
+        <UNITPRICE>2.25
+        <TOTAL>225.00
+        <SUBACCTSEC>CASH
+        <SUBACCTFUND>CASH
+        </INVSELL>
+        <OPTSELLTYPE>SELLTOCLOSE
+        <SHPERCTRCT>100
+        <SECURED>COVERED
+        </SELLOPT>
+        </INVTRANLIST>
+        </INVSTMTRS>
+        </INVSTMTTRNRS>
+        </INVSTMTMSGSRSV1>
+        <SECLISTMSGSRSV1>
+        <SECLIST>
+        <OPTINFO>
+        <SECINFO>
+        <SECID>
+        <UNIQUEID>FAKE0002
+        <UNIQUEIDTYPE>CUSIP
+        </SECID>
+        <SECNAME>Fake Test Option
+        <TICKER>FAKEOPT
+        </SECINFO>
+        <OPTTYPE>CALL
+        <STRIKEPRICE>55.00
+        <DTEXPIRE>20260320
+        <SHPERCTRCT>100
+        </OPTINFO>
+        </SECLIST>
+        </SECLISTMSGSRSV1>
+        </OFX>
+        """;
+
+    [Fact]
+    public async Task Malformed_aggregate_is_rejected_as_bad_input_not_a_500()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        // Derived from the good fixture rather than written out again, so
+        // the two cannot drift into testing different files. SECURED is
+        // required on SELLOPT; without it the file is malformed.
+        var malformed = OfxOptionsStatement.Replace(
+            "<SECURED>COVERED\n", string.Empty, StringComparison.Ordinal);
+        Assert.NotEqual(OfxOptionsStatement, malformed);
+
+        var resp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/preview",
+            FileUpload(malformed));
+
+        // 500 before the enumeration was guarded: OfxNet raises its
+        // missing-element errors lazily, inside GetStatements(), and the
+        // parse guard only covered Load. The user got a trace id and no
+        // way to learn which row was wrong.
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task Option_rows_are_skipped_with_a_warning_not_imported_as_shares()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var resp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/preview",
+            FileUpload(OfxOptionsStatement));
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var preview = await resp.Content.ReadFromJsonAsync<FileIngestPreviewResponse>();
+        Assert.NotNull(preview);
+        var account = Assert.Single(preview!.Accounts);
+
+        // Nothing imports. Before the classifier declined these ahead of
+        // its buy/sell arms the same file produced two transactions, and
+        // the count is the assertion that catches a regression: put the
+        // BUYOPT arm back below OfxBuyInvestment and this reads 2.
+        Assert.Equal(0, account.TransactionCount);
+
+        var warnings = preview.Errors
+            .Where(e => e.Code == "ofx_investment_type_unsupported")
+            .Select(e => e.Message)
+            .ToList();
+        Assert.Equal(2, warnings.Count);
+        Assert.Contains(
+            "OFX BUYOPT row skipped (FAKEOPT, 2 units, 2026-01-12). "
+                + "Options are outside the ADR-0027 action catalog.",
+            warnings);
+        Assert.Contains(
+            "OFX SELLOPT row skipped (FAKEOPT, -1 units, 2026-01-18). "
+                + "Options are outside the ADR-0027 action catalog.",
+            warnings);
+    }
+
     [Fact]
     public async Task Preview_surfaces_investment_block_with_supported_count()
     {

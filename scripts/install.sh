@@ -609,10 +609,30 @@ echo "  Manage:  cd $INSTALL_DIR && $DOCKER compose ps | logs -f api | down | up
 if [ -x "$INSTALL_DIR/scripts/harden-pg-hba.sh" ] \
    && $DOCKER compose exec -T postgres sh -c 'grep -qE "\strust\s*$" /var/lib/postgresql/data/pg_hba.conf' 2>/dev/null; then
     echo ""
-    warn "This database still allows password-less connections from inside its container."
-    warn "  initdb only runs on a fresh data directory, so the hardened default doesn't"
-    warn "  apply to an existing install. One-time fix, no restart, no downtime:"
-    echo "      sudo bash $INSTALL_DIR/scripts/harden-pg-hba.sh"
+    info "This database still allows password-less connections from inside its"
+    info "  container (initdb only runs on a fresh data directory, so the hardened"
+    info "  default never applied to it). Applying the one-time fix now."
+
+    # APPLY it, rather than print it. This was a warning, and a warning is the
+    # wrong instrument: it scrolls past an operator who is mid-upgrade watching
+    # for the URL, and the remediation it names is idempotent, needs no restart,
+    # verifies the roles can still authenticate BEFORE changing anything, and
+    # rolls the file back if they cannot. Something that safe, printed rather
+    # than run, is a standing RLS bypass kept alive by the hope that someone
+    # reads their terminal.
+    #
+    # DOCKER is passed through because this host may need `sudo docker`; the
+    # script honours it and defaults to plain `docker` elsewhere.
+    if DOCKER="$DOCKER" bash "$INSTALL_DIR/scripts/harden-pg-hba.sh"; then
+        info "pg_hba hardened - password-less local connections are no longer accepted."
+    else
+        echo ""
+        warn "Automatic pg_hba hardening did not complete, and this database still"
+        warn "  accepts password-less connections from inside its container. Nothing is"
+        warn "  half-applied: the script restores the original file if the roles cannot"
+        warn "  authenticate afterwards. Run it by hand to see why:"
+        echo "      sudo bash $INSTALL_DIR/scripts/harden-pg-hba.sh"
+    fi
 fi
 
 echo "  Restoring an existing Coffer? Open the URL, choose 'Restore from a backup',"

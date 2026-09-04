@@ -9,6 +9,7 @@ import type { UpcomingOccurrence } from '@/lib/types';
 
 vi.mock('@/lib/api', () => ({
     fetchUpcomingReminders: vi.fn(),
+    unskipReminder: vi.fn(),
     ApiError: class ApiError extends Error {
         status: number; detail: string; code?: string;
         constructor(status: number, detail: string, code?: string) {
@@ -34,6 +35,7 @@ vi.mock('./ReminderOccurrenceModal', () => ({
 }));
 
 const fetchUpcomingReminders = vi.mocked(apiModule.fetchUpcomingReminders);
+const unskipReminder = vi.mocked(apiModule.unskipReminder);
 const LEDGER = 'ledger-1';
 
 const now = new Date();
@@ -98,14 +100,42 @@ describe('RemindersUpcomingPanel', () => {
         expect(screen.queryByRole('button', { name: /Posted Rent/ })).not.toBeInTheDocument();
     });
 
-    it('a skipped occurrence is a read-only struck-through chip — not a button', async () => {
+    /*
+     * This case used to assert the opposite — "a read-only struck-through chip, not a
+     * button" — and it was right when written, because un-skip did not exist. Three fire
+     * paths rejected a suppressed slot with "un-skip it before firing" and there was no
+     * route and no control, so a mis-clicked Skip was permanent and a read-only chip was
+     * the honest rendering of that.
+     *
+     * The route exists now, so the chip is the affordance. The struck-through styling
+     * stays: it is still a suppressed occurrence, not a pending one.
+     */
+    it('a skipped occurrence can be restored from its chip', async () => {
         fetchUpcomingReminders.mockResolvedValue([
             occ({ kind: 'skipped', payee: 'Skipped Rent', amount: -1500 }),
         ]);
+        unskipReminder.mockResolvedValue({ occurrenceDate: TODAY, nextDueDate: TODAY });
         renderPanel();
-        const chip = await screen.findByText(/Skipped Rent/);
-        expect(chip.className).toContain('line-through');
-        expect(screen.queryByRole('button', { name: /Skipped Rent/ })).not.toBeInTheDocument();
+
+        const chip = await screen.findByRole('button', { name: /Skipped Rent/ });
+        expect(chip.textContent).toContain('⊘');
+        expect(chip.querySelector('.line-through')).not.toBeNull();
+
+        await userEvent.click(chip);
+
+        await waitFor(() => expect(unskipReminder).toHaveBeenCalledTimes(1));
+        // The slot, and only the slot, is what gets restored.
+        expect(unskipReminder.mock.calls[0][2]).toBe(TODAY);
+    });
+
+    it('a posted occurrence stays read-only — undoing it is a register action', async () => {
+        fetchUpcomingReminders.mockResolvedValue([
+            occ({ kind: 'scheduled', headerId: 'h9', payee: 'Posted Rent', amount: -1500 }),
+        ]);
+        renderPanel();
+        await screen.findByText(/Posted Rent/);
+        expect(screen.queryByRole('button', { name: /Posted Rent/ })).not.toBeInTheDocument();
+        expect(unskipReminder).not.toHaveBeenCalled();
     });
 
     it('caps chips at 3 and reveals the rest via "+N more"', async () => {

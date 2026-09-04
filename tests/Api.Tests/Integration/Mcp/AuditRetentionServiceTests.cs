@@ -62,7 +62,7 @@ public sealed class AuditRetentionServiceTests
         }
 
         await new AuditRetentionService(
-            new ServiceDbContextFactory(opts), opts,
+            PostgresFixture.ServiceFactoryFor(opts), opts,
             NullLogger<AuditRetentionService>.Instance).PruneAsync(default);
 
         await using var read = _fixture.NewDbContext();
@@ -98,7 +98,7 @@ public sealed class AuditRetentionServiceTests
         }
 
         await new AuditRetentionService(
-            new ServiceDbContextFactory(opts), opts,
+            PostgresFixture.ServiceFactoryFor(opts), opts,
             NullLogger<AuditRetentionService>.Instance).PruneAsync(default);
 
         await using var read = _fixture.NewDbContext();
@@ -131,7 +131,7 @@ public sealed class AuditRetentionServiceTests
         }
 
         await new AuditRetentionService(
-            new ServiceDbContextFactory(opts), opts,
+            PostgresFixture.ServiceFactoryFor(opts), opts,
             NullLogger<AuditRetentionService>.Instance).PruneAsync(default);
 
         await using var read = _fixture.NewDbContext();
@@ -166,7 +166,7 @@ public sealed class AuditRetentionServiceTests
             ServiceConnectionString = _fixture.ServiceConnectionString,
             AuditRetentionDays = 180,
         });
-        var recorder = new McpAuditRecorder(new ServiceDbContextFactory(opts));
+        var recorder = new McpAuditRecorder(PostgresFixture.ServiceFactoryFor(opts));
 
         // Seed one aged row in each log...
         var oldId = await recorder.RecordAttemptAsync(ledger.UserId, "old_tool", arguments: null, traceId: null);
@@ -195,7 +195,7 @@ public sealed class AuditRetentionServiceTests
             await seed.SaveChangesAsync();
         }
 
-        await new AuditRetentionService(new ServiceDbContextFactory(opts), opts,
+        await new AuditRetentionService(PostgresFixture.ServiceFactoryFor(opts), opts,
             NullLogger<AuditRetentionService>.Instance).PruneAsync(default);
 
         await using var db = _fixture.NewDbContext();

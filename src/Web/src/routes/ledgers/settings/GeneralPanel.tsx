@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useNavigate } from '@tanstack/react-router';
+import { useNavigate, useRouterState } from '@tanstack/react-router';
 
 import {
     deleteLedger,
@@ -79,6 +80,34 @@ export function GeneralPanel({ ledgerId }: { ledgerId: string }) {
     const consistencyMutation = useMutation({
         mutationFn: () => checkLedgerConsistency(ledgerId),
     });
+
+    // Arriving from a drift notification runs the check once, so the finding hands
+    // over its own fix instead of leaving the reader on a panel that shows nothing
+    // until they press a button. The scheduled monitor already found the problem;
+    // making them re-discover it by hand is the gap this closes.
+    //
+    // Deliberately NOT a plain mount effect. The check walks every position, so it
+    // runs only when the URL asked for it, and the param is stripped immediately so a
+    // refresh — or a back-navigation an hour later — does not silently re-run it.
+    // Read from the LOCATION, not useSearch({ strict: false }): the typed hook resolves
+    // against the nearest matched route, and hands back a search object without the
+    // param wherever this panel is not itself the route component. The location is the
+    // same in every case, and this panel is rendered inside a tab switch rather than
+    // being routed to directly.
+    const search = useRouterState({ select: (s) => s.location.search }) as {
+        check?: boolean | string;
+    };
+    const requestedCheck = search.check === true || search.check === 'true';
+    const consistencyRunRef = useRef(false);
+    useEffect(() => {
+        if (!requestedCheck || consistencyRunRef.current) return;
+        consistencyRunRef.current = true;
+        consistencyMutation.mutate();
+        void navigate({ to: '.', search: {}, replace: true });
+        // consistencyMutation is a stable mutation object; including it would re-run
+        // this on every render of a pending mutation.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [requestedCheck, navigate]);
 
     // One repair per projection, because every projection the report names has a
     // repair — the UI must never show a problem with no way to fix it. A repair

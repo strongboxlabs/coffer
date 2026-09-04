@@ -736,6 +736,7 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at");
             b.Property(x => x.ConsecutiveFailures).HasColumnName("consecutive_failures");
+            b.Property(x => x.DisabledReason).HasColumnName("disabled_reason");
             b.Property(x => x.LastError).HasColumnName("last_error");
             b.Property(x => x.LastFailureAt).HasColumnName("last_failure_at");
             b.HasOne<LedgerRow>().WithMany().HasForeignKey(x => x.LedgerId)
@@ -764,6 +765,7 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at");
             b.Property(x => x.ConsecutiveFailures).HasColumnName("consecutive_failures");
+            b.Property(x => x.DisabledReason).HasColumnName("disabled_reason");
             b.Property(x => x.LastError).HasColumnName("last_error");
             b.Property(x => x.LastFailureAt).HasColumnName("last_failure_at");
             b.HasOne<UserRow>().WithMany().HasForeignKey(x => x.ConfiguredByUserId)
@@ -1280,6 +1282,7 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.Rrule).HasColumnName("rrule");
             b.Property(x => x.SourcePayload).HasColumnName("source_payload").HasColumnType("jsonb");
             b.Property(x => x.AutoCommitDaysBefore).HasColumnName("auto_commit_days_before");
+            b.Property(x => x.EstimateSampleCount).HasColumnName("estimate_sample_count");
             b.Property(x => x.TemplateHeaderId).HasColumnName("template_header_id");
             b.Property(x => x.SourceAccountId).HasColumnName("source_account_id");
             b.Property(x => x.StartDate).HasColumnName("start_date");
@@ -1657,6 +1660,26 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.AccountId).HasColumnName("account_id");
         });
 
+        // reminder_occurrence_lock (migration 218) result type. The boolean is
+        // meaningless — the call's purpose is the transaction-scoped advisory lock on
+        // one (series, occurrence) slot, which fire and skip both take so they cannot
+        // interleave across two tables.
+        modelBuilder.Entity<ReminderOccurrenceLockRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.Locked).HasColumnName("locked");
+        });
+
+        // reminder_estimate_samples (migration 220): the size and sum of one series'
+        // estimate window. Deliberately not an average — see ReminderEstimateSampleRow.
+        modelBuilder.Entity<ReminderEstimateSampleRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.RecurringTransactionId).HasColumnName("recurring_transaction_id");
+            b.Property(x => x.SampleCount).HasColumnName("sample_count");
+            b.Property(x => x.SampleSum).HasColumnName("sample_sum");
+        });
+
         // recompute_posting_counts_for_header (migration 120) result type.
         // Wrapper over the void fn_recompute_posting_counts_for_header;
         // returns the input header_id so EF has a typed projection. Posting
@@ -1728,6 +1751,11 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.Proceeds).HasColumnName("proceeds");
             b.Property(x => x.CostBasisSold).HasColumnName("cost_basis_sold");
             b.Property(x => x.RealizedGain).HasColumnName("realized_gain");
+            // mig 217 — the long-term half, without which the consistency check
+            // could not see drift in it.
+            b.Property(x => x.ProceedsLt).HasColumnName("proceeds_lt");
+            b.Property(x => x.CostBasisSoldLt).HasColumnName("cost_basis_sold_lt");
+            b.Property(x => x.RealizedGainLt).HasColumnName("realized_gain_lt");
         });
         // Migration 201 — cash balances for many instants in one pass.
         modelBuilder.Entity<AccountBalanceAsOfInstantRow>(b =>
@@ -1792,6 +1820,18 @@ public sealed class AppDbContext : DbContext
         // explicitly.
         const BindingFlags InternalInstance =
             BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(ReminderOccurrenceLock), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(DateOnly) })!)
+            .HasName("reminder_occurrence_lock");
+
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(ReminderEstimateSamples), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(Guid?) })!)
+            .HasName("reminder_estimate_samples");
+
         modelBuilder
             .HasDbFunction(typeof(AppDbContext)
                 .GetMethod(nameof(RegisterEntryKeys), InternalInstance,
@@ -2081,6 +2121,41 @@ public sealed class AppDbContext : DbContext
     internal IQueryable<RecomputeBalancesForAccountRow> RecomputeBalancesForAccount(
         Guid accountId, DateTime fromPostedAt) =>
         FromExpression(() => RecomputeBalancesForAccount(accountId, fromPostedAt));
+
+    /// <summary>
+    /// Maps to <c>reminder_occurrence_lock(p_recurring_transaction_id, p_occurrence_date)</c>
+    /// in migration 218 — a transaction-scoped advisory lock on one occurrence slot.
+    /// </summary>
+    /// <remarks>
+    /// Both the fire and the skip paths take it before their checks. They write to
+    /// DIFFERENT tables — fire inserts a txn_header, skip inserts a
+    /// recurring_occurrence_exception — so no constraint can exclude the pair, and
+    /// interleaved they would leave a slot both fired and skipped. Only a lock the two
+    /// share prevents that.
+    /// <para>
+    /// Must be ENUMERATED to take the lock, and must be enumerated INSIDE the caller's
+    /// transaction: the lock is transaction-scoped, so taking it outside one acquires
+    /// and releases it immediately and protects nothing.
+    /// </para>
+    /// </remarks>
+    internal IQueryable<ReminderOccurrenceLockRow> ReminderOccurrenceLock(
+        Guid recurringTransactionId, DateOnly occurrenceDate) =>
+        FromExpression(() => ReminderOccurrenceLock(recurringTransactionId, occurrenceDate));
+
+    /// <summary>
+    /// Maps to <c>reminder_estimate_samples(p_ledger_id, p_recurring_transaction_id)</c>
+    /// in migration 220 — the last N committed, non-hidden occurrences of each estimating
+    /// series, as a count and a sum.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="recurringTransactionId"/> null scopes to the whole ledger, so the
+    /// agenda (which needs every series at once) and the fire path (which needs one) read
+    /// the SAME implementation. That scoping convention comes from <c>balance_walk</c>,
+    /// and it exists so two callers cannot drift into two definitions of the same figure.
+    /// </remarks>
+    internal IQueryable<ReminderEstimateSampleRow> ReminderEstimateSamples(
+        Guid ledgerId, Guid? recurringTransactionId) =>
+        FromExpression(() => ReminderEstimateSamples(ledgerId, recurringTransactionId));
 
     /// <summary>
     /// Maps to <c>recompute_posting_counts_for_header(p_header_id)</c> in

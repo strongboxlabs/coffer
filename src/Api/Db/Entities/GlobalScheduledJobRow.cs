@@ -30,6 +30,13 @@ internal sealed class GlobalScheduledJobRow
     /// <summary>Consecutive handler failures (mig 194); 0 on success. Drives the
     /// backoff and auto-disable in <c>SchedulerRunner</c>.</summary>
     public int ConsecutiveFailures { get; set; }
+
+    /// <summary>
+    /// Why this job is disabled when a person did not disable it (mig 216); NULL when
+    /// enabled or user-disabled. Values from <c>ScheduleDisableReasons</c>. Current
+    /// state only — cleared on re-enable.
+    /// </summary>
+    public string? DisabledReason { get; set; }
     /// <summary>Truncated message of the newest failure (mig 194) — never a stack
     /// trace or payload; this is surfaced in the SPA.</summary>
     public string? LastError { get; set; }

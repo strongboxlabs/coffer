@@ -222,6 +222,93 @@ public sealed class LedgerNotificationsEndpointTests
     }
 
     [Fact]
+    public async Task A_switch_bound_to_a_job_this_ledger_does_not_run_says_so()
+    {
+        // The exact state a real bank-feed check sat in: a healthchecks URL bound to
+        // feed-sync on a ledger that never enabled feed-sync. It read "Never" for months
+        // and NEITHER half of this response could say why. The job does not run, so
+        // nothing pings it; and MonitorCoverage is keyed on the jobs that DO run, so the
+        // switch matches no key and vanishes from the answer rather than showing up
+        // uncovered. Silence from both directions is what made it invisible.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await ClientAsync(factory, ledger);
+
+        var created = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/notifications/subscribers",
+            new CreateNotificationSubscriberRequest
+            {
+                SubscriberKey = "healthchecks",
+                Url = "https://hc.invalid/bank-feed",
+                MinSeverity = "warning",
+                Monitors = NotificationMonitors.FeedSync,
+            });
+        Assert.Equal(HttpStatusCode.OK, created.StatusCode);
+
+        var before = await client.GetFromJsonAsync<LedgerNotificationSettingsDto>(
+            $"/api/ledgers/{ledger.LedgerId}/notifications");
+
+        Assert.Contains(NotificationMonitors.FeedSync, before!.MonitorsWatchingNothing);
+
+        // Pinned deliberately: this is WHY the new list has to exist. If coverage could
+        // report the case, the list would be redundant.
+        Assert.DoesNotContain(NotificationMonitors.FeedSync, before.MonitorCoverage.Keys);
+
+        await using (var db = _fixture.NewDbContext())
+        {
+            db.ScheduledJobs.Add(new Db.Entities.ScheduledJobRow
+            {
+                LedgerId = ledger.LedgerId,
+                JobType = NotificationMonitors.FeedSync,
+                Enabled = true,
+                HourLocal = 5,
+                MinuteLocal = 0,
+                ConfiguredByUserId = ledger.UserId,
+            });
+            await db.SaveChangesAsync();
+        }
+
+        var after = await client.GetFromJsonAsync<LedgerNotificationSettingsDto>(
+            $"/api/ledgers/{ledger.LedgerId}/notifications");
+
+        // Turning the job on clears the complaint and moves it into coverage as watched.
+        // Both halves are asserted: a version that never cleared the warning would still
+        // pass the first assertion alone.
+        Assert.DoesNotContain(NotificationMonitors.FeedSync, after!.MonitorsWatchingNothing);
+        Assert.True(Assert.Contains(NotificationMonitors.FeedSync, after.MonitorCoverage));
+    }
+
+    [Fact]
+    public async Task The_consistency_switch_is_never_called_idle_because_it_is_not_a_job()
+    {
+        // Consistency is the declared non-job monitor: it runs on every scheduler tick
+        // and cannot be switched off, which is the entire reason it is worth binding.
+        // Testing "is there an enabled scheduled_jobs row" against it would find none and
+        // report the one monitor that ALWAYS runs as watching nothing — a warning telling
+        // its owner to turn on a job that does not exist. That is the cry-wolf failure
+        // this subsystem keeps designing against, so the exclusion is pinned here.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await ClientAsync(factory, ledger);
+
+        var created = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/notifications/subscribers",
+            new CreateNotificationSubscriberRequest
+            {
+                SubscriberKey = "healthchecks",
+                Url = "https://hc.invalid/consistency",
+                MinSeverity = "warning",
+                Monitors = NotificationMonitors.Consistency,
+            });
+        Assert.Equal(HttpStatusCode.OK, created.StatusCode);
+
+        var settings = await client.GetFromJsonAsync<LedgerNotificationSettingsDto>(
+            $"/api/ledgers/{ledger.LedgerId}/notifications");
+
+        Assert.DoesNotContain(NotificationMonitors.Consistency, settings!.MonitorsWatchingNothing);
+    }
+
+    [Fact]
     public async Task Someone_without_a_grant_cannot_read_or_change_another_ledgers_settings()
     {
         var mine = await SyntheticLedger.CreateAsync(_fixture);

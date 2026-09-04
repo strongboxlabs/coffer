@@ -32,7 +32,7 @@ public sealed class SnapshotJobHandler : IScheduledJobHandler
     /// the state a dead-man's switch is supposed to catch and would not have.
     /// </remarks>
     public async Task<JobRunOutcome> RunAsync(
-        AppDbContext db, Guid ledgerId, Guid configuredByUserId, CancellationToken cancellationToken)
+        AppDbContext db, Guid ledgerId, Guid configuredByUserId, JobRunClock clock, CancellationToken cancellationToken)
     {
         var repo = new LedgerSnapshotsRepository(
             db, _loggers.CreateLogger<LedgerSnapshotsRepository>());
