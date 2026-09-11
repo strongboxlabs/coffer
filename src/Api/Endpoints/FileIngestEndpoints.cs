@@ -100,7 +100,13 @@ public static class FileIngestEndpoints
     /// Parse the uploaded file and return its discovered account
     /// blocks. No DB writes.
     /// </summary>
-    private static async Task<IResult> PreviewAsync(
+    /// <param name="csvMapping">
+    /// For <c>csv-generic</c> only: the validated mapping the caller resolved, from a
+    /// saved row or from draft YAML. NULL for every other provider, whose format is
+    /// implicit. Resolved by the CALLER so providers stay pure and a draft can be
+    /// previewed without being saved first.
+    /// </param>
+    internal static async Task<IResult> PreviewAsync(
         Guid ledgerId,
         IFormFile? file,
         ICurrentUserAccessor currentUser,
@@ -108,7 +114,8 @@ public static class FileIngestEndpoints
         IngestOrchestrator orchestrator,
         string providerKey,
         string errorPrefix,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Ingest.Csv.CsvMapping? csvMapping = null)
     {
         var visible = await ledgers.GetVisibleByIdAsync(
             currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
@@ -128,7 +135,8 @@ public static class FileIngestEndpoints
             var context = new FileIngestContext(
                 LedgerId: ledgerId,
                 AccountId: Guid.Empty,
-                TriggeredByUserId: currentUser.UserId);
+                TriggeredByUserId: currentUser.UserId,
+                CsvMapping: csvMapping);
             parsed = await orchestrator.PreviewFileAsync(
                 providerKey, stream, context, cancellationToken)
                 .ConfigureAwait(false);
@@ -156,7 +164,8 @@ public static class FileIngestEndpoints
     /// the SPA's existing summary panel can render it. To import N
     /// accounts from one file, call this endpoint N times.
     /// </summary>
-    private static async Task<IResult> ImportAsync(
+    /// <param name="csvMapping">See <see cref="PreviewAsync"/>.</param>
+    internal static async Task<IResult> ImportAsync(
         Guid ledgerId,
         IFormFile? file,
         Guid accountId,
@@ -167,7 +176,8 @@ public static class FileIngestEndpoints
         IngestOrchestrator orchestrator,
         string providerKey,
         string errorPrefix,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Ingest.Csv.CsvMapping? csvMapping = null)
     {
         var visible = await ledgers.GetVisibleByIdAsync(
             currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
@@ -198,6 +208,7 @@ public static class FileIngestEndpoints
                 LedgerId: ledgerId,
                 AccountId: accountId,
                 TriggeredByUserId: currentUser.UserId,
+                CsvMapping: csvMapping,
                 ProviderAccountId: providerAccountId);
             outcome = await orchestrator.RunFileAsync(
                 providerKey, stream, context, cancellationToken)

@@ -263,6 +263,20 @@ export function BankRegisterPage() {
     );
 
     const queryClient = useQueryClient();
+
+    // Refresh path shared by import and undo — the same one a SimpleFIN sync uses.
+    // Freshly-landed (or freshly-removed) rows need the WINDOWED register to re-fetch,
+    // which only happens on register.refresh(); cache invalidation alone does not do it
+    // (ADR-0079). Shared rather than copied, because a second copy is how one of them
+    // ends up missing a key.
+    function refreshAfterImportChange() {
+        register.refresh();
+        queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+        queryClient.invalidateQueries({
+            queryKey: ['register-index-buckets', ledgerId, accountId],
+        });
+    }
+
     const patchMutation = useMutation({
         mutationFn: (args: { headerId: string; body: PatchTransactionRequest }) =>
             patchTransaction(ledgerId, args.headerId, args.body, accountId),
@@ -771,16 +785,12 @@ export function BankRegisterPage() {
                     accountId={accountId}
                     accountName={account.name}
                     onClose={() => setImportDialogOpen(false)}
-                    onImported={() => {
-                        // Same refresh path as a SimpleFIN sync —
-                        // freshly-landed rows need the windowed
-                        // register to re-fetch.
-                        register.refresh();
-                        queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
-                        queryClient.invalidateQueries({
-                            queryKey: ['register-index-buckets', ledgerId, accountId],
-                        });
-                    }}
+                    onImported={refreshAfterImportChange}
+                    // Undo moves the same rows the import moved, so it needs the same
+                    // refresh. Shared rather than copied: the dialog cannot refresh the
+                    // windowed register itself, and a second copy of this list is how
+                    // one of them ends up missing a key.
+                    onUndone={refreshAfterImportChange}
                 />
             ) : null}
 

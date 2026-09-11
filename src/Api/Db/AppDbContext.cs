@@ -158,6 +158,9 @@ public sealed class AppDbContext : DbContext
     /// <summary>A ledger's own delivery targets, for mode 'own' (mig 208).</summary>
     internal DbSet<LedgerNotificationSubscriberRow> LedgerNotificationSubscribers =>
         Set<LedgerNotificationSubscriberRow>();
+    // ADR-0031 Phase 5 / migration 222: hand-editable descriptions of an institution's
+    // delimited export. The definition is a YAML document, not parsed columns.
+    internal DbSet<FeedCsvMappingRow> FeedCsvMappings => Set<FeedCsvMappingRow>();
     // ADR-0034 / migration 089: per-(header, account) running balance.
     // Read-only from the API perspective; the header-walk trigger family
     // (mig 090) owns the writes.
@@ -907,6 +910,22 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.DetailJson).HasColumnName("detail").HasColumnType("jsonb");
         });
 
+        modelBuilder.Entity<FeedCsvMappingRow>(b =>
+        {
+            b.ToTable("feed_csv_mappings");
+            b.HasKey(x => x.Id);
+            // Every column named explicitly. EF's default would emit "DefinitionYaml",
+            // and a missing HasColumnName has silently broken every write to a table in
+            // this repo before.
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
+            b.Property(x => x.LedgerId).HasColumnName("ledger_id");
+            b.Property(x => x.Name).HasColumnName("name");
+            b.Property(x => x.DefinitionYaml).HasColumnName("definition_yaml");
+            b.Property(x => x.SchemaVersion).HasColumnName("schema_version");
+            b.Property(x => x.CreatedAt).HasColumnName("created_at");
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+        });
+
         modelBuilder.Entity<LedgerNotificationSubscriberRow>(b =>
         {
             b.ToTable("ledger_notification_subscribers");
@@ -1236,6 +1255,7 @@ public sealed class AppDbContext : DbContext
                 .HasColumnType("jsonb");
             // Mig 107: register provenance / merge-winner.
             b.Property(x => x.ProviderKey).HasColumnName("provider_key");
+            b.Property(x => x.LedgerOperationId).HasColumnName("ledger_operation_id");
             b.Property(x => x.IsMergeWinner).HasColumnName("is_merge_winner");
             b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
             // ADR-0034 v2 (migration 095): monotonic insertion-order

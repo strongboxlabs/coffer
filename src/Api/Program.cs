@@ -274,6 +274,7 @@ builder.Services.AddSingleton(sp =>
 });
 builder.Services.AddScoped<Coffer.Api.Backup.BackupManager>();
 // "Never delete" pins (ADR-0062 ④b+c) — excluded from retention.
+builder.Services.AddScoped<Coffer.Api.Db.Repositories.CsvMappingsRepository>();
 builder.Services.AddScoped<Coffer.Api.Db.Repositories.BackupPinsRepository>();
 // Deployment-level admin audit (ADR-0092 D2) — service-role only, append-only.
 builder.Services.AddScoped<Coffer.Api.Db.Repositories.AdminAuditRepository>();
@@ -449,6 +450,10 @@ builder.Services.AddSingleton<Coffer.Api.Ingest.IFileProvider, Coffer.Api.Ingest
 // QIF). Hand-rolled parser, no NuGet dependency. The orchestrator
 // resolves all IFileProvider registrations into a key→provider map.
 builder.Services.AddSingleton<Coffer.Api.Ingest.IFileProvider, Coffer.Api.Ingest.Qif.QifFileProvider>();
+// ADR-0031 Phase 5. One provider for every institution describable by a mapping
+// document; the mapping is resolved per request by CsvIngestEndpoints, so the
+// provider itself stays a pure stream-to-result function like its siblings.
+builder.Services.AddSingleton<Coffer.Api.Ingest.IFileProvider, Coffer.Api.Ingest.Csv.CsvGenericFileProvider>();
 builder.Services.AddScoped<Coffer.Api.Ingest.IngestOrchestrator>();
 
 // Quote-provider family (ADR-0033). Parallel structure to ingest:
@@ -1277,6 +1282,7 @@ app.MapTransactionsEndpoints();
 app.MapBalancesEndpoints();
 app.MapOfxIngestEndpoints();
 app.MapQifIngestEndpoints();
+app.MapCsvIngestEndpoints();
 app.MapImportEndpoints();
 app.MapSnapshotsEndpoints();
 app.MapSchedulesEndpoints();

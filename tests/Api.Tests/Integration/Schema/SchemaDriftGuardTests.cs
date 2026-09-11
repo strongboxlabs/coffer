@@ -65,6 +65,17 @@ public sealed class SchemaDriftGuardTests
         // edge — capturing it would let restoring an old snapshot re-enable a target
         // the user deliberately removed, and re-arm a webhook URL they had revoked.
         "ledger_notification_subscribers",
+        // Import FORMAT descriptions (ADR-0031 Phase 5, mig 222) — the same class as
+        // feed_connections and the line above: configuration, not ledger data, and it
+        // must survive a data rollback. Rolling a ledger back to last month must not
+        // delete a mapping authored last week, and restoring an old snapshot must not
+        // resurrect one that was deliberately deleted.
+        //
+        // The transactions a mapping produced ARE snapshotted — they are ordinary rows
+        // in txn_headers. A format description and the money read through it have
+        // separate lifetimes, which is also why deleting a mapping leaves its imports
+        // alone.
+        "feed_csv_mappings",
     };
 
     private static readonly Regex SafeIdent = new("^[a-z_][a-z0-9_]*$", RegexOptions.Compiled);

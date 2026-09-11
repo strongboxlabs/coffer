@@ -420,6 +420,10 @@ public sealed class IngestOrchestrator
                     // provider_key is the specific provider.
                     Origin = "online_import",
                     ProviderKey = "simplefin",
+                    // Which RUN, not just which provider (mig 221) — so this pull can
+                    // be undone as a set. provider_key alone made a repeated import
+                    // indistinguishable from the first.
+                    LedgerOperationId = run.Id,
                     // SimpleFIN v2 split: cleaned merchant name goes
                     // to Payee, raw bank/broker text goes to Memo.
                     // Fall back to Description for the Payee when the
@@ -802,6 +806,10 @@ public sealed class IngestOrchestrator
                 LedgerId = context.LedgerId,
                 Origin = origin.Origin,
                 ProviderKey = origin.ProviderKey,
+                // Mig 221. Load-bearing for file uploads specifically: they have no
+                // dedup, so re-uploading the same statement inserts a second full set,
+                // and this stamp is the only thing that can tell the two apart.
+                LedgerOperationId = run.Id,
                 Payee = t.Payee ?? t.Description,
                 Memo = t.Payee is not null ? t.Description : null,
                 PostedAt = t.PostedAt,
@@ -942,6 +950,12 @@ public sealed class IngestOrchestrator
             // level), provider_key = qif. The CHECK constraint already
             // admits both values (MD-transited QIF rows carry them).
             ["qif"] = new FileOriginMetadata("file_import", "qif"),
+            // ADR-0031 Phase 5. origin = file_import (icon-level, same as its siblings);
+            // provider_key names the generic reader rather than an institution, because
+            // one mapping document per institution is the whole point — the provider is
+            // shared and the FORMAT is what varies.
+            [Csv.CsvGenericFileProvider.Key] =
+                new FileOriginMetadata("file_import", Csv.CsvGenericFileProvider.Key),
         };
 
     // ----- shared helpers (provider-agnostic write paths) -----

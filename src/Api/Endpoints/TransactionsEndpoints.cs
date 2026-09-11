@@ -1041,8 +1041,13 @@ public static class TransactionsEndpoints
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
 
+        // Named token: BulkDeleteAsync took a hardDeleteSourcedRows flag (the undo-import
+        // path) in the position this used to pass positionally. The bulk-delete endpoint
+        // keeps the DEFAULT — hide a feed-sourced row so a re-sync upserts into it rather
+        // than resurrecting it. Only undo wants the other behaviour.
         var (hardDeleted, softHidden) = await bulk.BulkDeleteAsync(
-            ledgerId, request.Selection, cancellationToken).ConfigureAwait(false);
+            ledgerId, request.Selection, cancellationToken: cancellationToken)
+            .ConfigureAwait(false);
         return Results.Ok(new BulkDeleteResponse(hardDeleted, softHidden));
     }
 

@@ -108,6 +108,28 @@ public sealed class LedgerOperationsRepository
 
     /// <summary>Detail for one run — summary + materialised child rows.
     /// Null when the run doesn't exist / isn't in the ledger / is RLS-hidden.</summary>
+    /// <summary>
+    /// The <c>family</c> of one operation on this ledger, or NULL if there is no such
+    /// operation here.
+    /// </summary>
+    /// <remarks>
+    /// Exists so the undo-import endpoint can tell "no such operation" from "that
+    /// operation is a quote refresh, which created no transactions". Both would
+    /// otherwise return zero rows and read as a successful undo of nothing.
+    /// Deliberately not <see cref="GetDetailAsync"/>: that also loads errors and
+    /// promotions to answer a one-column question.
+    /// </remarks>
+    public async Task<string?> FamilyForAsync(
+        Guid ledgerId,
+        Guid operationId,
+        CancellationToken cancellationToken = default) =>
+        await _db.LedgerOperations
+            .AsNoTracking()
+            .Where(r => r.Id == operationId && r.LedgerId == ledgerId)
+            .Select(r => r.Family)
+            .SingleOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+
     public async Task<SyncRunDetail?> GetDetailAsync(
         Guid ledgerId,
         Guid runId,

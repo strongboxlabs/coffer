@@ -12,6 +12,7 @@ export const SETTINGS_TAB_IDS = [
     'notifications',
     'activity',
     'dashboard',
+    'layouts',
 ] as const;
 
 export type SettingsTab = (typeof SETTINGS_TAB_IDS)[number];
@@ -27,6 +28,9 @@ export const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; label: string }> = 
     { id: 'notifications', label: 'Notifications' },
     { id: 'activity', label: 'Activity' },
     { id: 'dashboard', label: 'Dashboard' },
+    // After Bank feeds conceptually, but last in the strip: it is the
+    // rarest visit of the lot — you come here to prune, not to set up.
+    { id: 'layouts', label: 'Import layouts' },
 ];
 
 /** Coerce an unknown (URL search) value to a valid tab; defaults to General. */

@@ -115,6 +115,8 @@ export type {
     PortfolioSummaryDto,
     PositionDto,
 } from './types/holding';
+export type { UndoImportResult } from './types/imports';
+export type { CsvAmountShapeName, CsvMappingShape, CsvDelimiterName, CsvMapping, CsvMappingProblem, CsvMappingVerdict } from './types/csvMapping';
 export type {
     SelectionStatusFilter,
     SelectionRequest,

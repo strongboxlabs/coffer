@@ -187,6 +187,20 @@ export function InvestmentRegisterPage() {
 
     const queryClient = useQueryClient();
 
+    // Shared by import and undo. The windowed register re-reads on register.refresh(),
+    // not on cache invalidation (ADR-0079); holdings and lots derive from the same
+    // legs, so they move whichever direction the rows went — an undone buy changes
+    // them exactly as much as the buy did.
+    function refreshAfterImportChange() {
+        register.refresh();
+        queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+        queryClient.invalidateQueries({
+            queryKey: ['register-index-buckets', ledgerId, accountId],
+        });
+        queryClient.invalidateQueries({ queryKey: ['holdings', ledgerId, accountId] });
+    }
+
+
     // Status filter (All / Cleared / Uncleared N / Scheduled N) — the
     // same shared tabs the bank register uses (ADR-0030 reuse). Applied
     // client-side over the aggregated (displayed) rows, and fed into
@@ -1022,16 +1036,11 @@ export function InvestmentRegisterPage() {
                     accountId={accountId}
                     accountName={account.name}
                     onClose={() => setImportDialogOpen(false)}
-                    onImported={() => {
-                        register.refresh();
-                        queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
-                        queryClient.invalidateQueries({
-                            queryKey: ['register-index-buckets', ledgerId, accountId],
-                        });
-                        queryClient.invalidateQueries({
-                            queryKey: ['holdings', ledgerId, accountId],
-                        });
-                    }}
+                    onImported={refreshAfterImportChange}
+                    // Undo moves the same rows, so it needs the same refresh —
+                    // including holdings, which an undone buy changes just as much as
+                    // the buy did.
+                    onUndone={refreshAfterImportChange}
                 />
             ) : null}
             {/* Portfolio summary + Activity / Holdings view switch. Always

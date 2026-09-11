@@ -5,6 +5,7 @@ using ModelContextProtocol.Server;
 
 using Coffer.Api.Contracts;
 using Coffer.Api.Db.Repositories;
+using Coffer.Api.Ingest.Csv;
 
 namespace Coffer.Api.Mcp;
 
@@ -45,6 +46,85 @@ public sealed class McpWriteTools
             .Select(m => m.GetCustomAttribute<McpServerToolAttribute>()?.Name)
             .OfType<string>()
             .ToHashSet();
+
+    [McpServerTool(Name = "save_csv_mapping"), Description(
+        "Create or replace a delimited-import mapping document (ADR-0031 Phase 5). " +
+        "Pass mappingId to replace an existing one, omit it to create. " +
+        "NOTHING IS STORED UNLESS THE DOCUMENT VALIDATES — call validate_csv_mapping " +
+        "first and fix everything it reports; this returns the same problems rather than " +
+        "saving a document the importer would then fail on row by row. " +
+        "dryRun=true validates and reports without writing. " +
+        "Names are unique per ledger, case-insensitively. " +
+        "See validate_csv_mapping for the document shape.")]
+    public static async Task<McpWriteResult> SaveCsvMapping(
+        McpWriteGuard guard,
+        CsvMappingsRepository mappings,
+        [Description("Ledger id (GUID) from list_ledgers.")] Guid ledgerId,
+        [Description("What to call it; unique per ledger, e.g. 'Store card statement'.")]
+        string name,
+        [Description("The YAML document.")] string definitionYaml,
+        [Description("Existing mapping id (GUID) to replace. Omit to create a new one.")]
+        Guid? mappingId = null,
+        [Description("Validate and report without writing.")] bool dryRun = false,
+        CancellationToken cancellationToken = default)
+    {
+        guard.EnsureWritable();
+
+        if (string.IsNullOrWhiteSpace(name))
+            return McpWriteResult.Fail(mappingId ?? Guid.Empty, "mapping-name-required");
+
+        // Validated on the dry-run path too, which is the point of offering one: an
+        // assistant composing YAML gets the verdict without leaving a half-built row
+        // behind when it guesses wrong.
+        var candidate = CsvMappingsRepository.Validate(definitionYaml ?? "", out var errors);
+        if (candidate is null)
+        {
+            return McpWriteResult.Fail(mappingId ?? Guid.Empty,
+                "mapping-invalid: " + string.Join("; ",
+                    errors.Select(e => (e.Path.Length > 0 ? e.Path + " — " : "") + e.Message)));
+        }
+        if (dryRun)
+            return new McpWriteResult(mappingId ?? Guid.Empty, true, null, name, null);
+
+        var result = await mappings
+            .SaveAsync(ledgerId, mappingId, name, definitionYaml!, cancellationToken)
+            .ConfigureAwait(false);
+
+        if (result.NameTaken)
+            return McpWriteResult.Fail(mappingId ?? Guid.Empty, "mapping-name-taken");
+        if (result.Saved is null)
+            return McpWriteResult.Fail(mappingId ?? Guid.Empty, "mapping-not-in-ledger");
+
+        return new McpWriteResult(result.Saved.Id, true, null, result.Saved.Name, null);
+    }
+
+    [McpServerTool(Name = "delete_csv_mapping"), Description(
+        "Remove a mapping document. Does NOT touch anything already imported with it: " +
+        "those are ordinary transactions carrying their own import stamp, and undoing " +
+        "an import is what removes those. dryRun=true reports without deleting.")]
+    public static async Task<McpWriteResult> DeleteCsvMapping(
+        McpWriteGuard guard,
+        CsvMappingsRepository mappings,
+        [Description("Ledger id (GUID) from list_ledgers.")] Guid ledgerId,
+        [Description("Mapping id (GUID) from list_csv_mappings.")] Guid mappingId,
+        [Description("Report without deleting.")] bool dryRun = false,
+        CancellationToken cancellationToken = default)
+    {
+        guard.EnsureWritable();
+
+        var existing = await mappings.GetAsync(ledgerId, mappingId, cancellationToken)
+            .ConfigureAwait(false);
+        if (existing is null)
+            return McpWriteResult.Fail(mappingId, "mapping-not-in-ledger");
+        if (dryRun)
+            return new McpWriteResult(mappingId, true, existing.Name, null, null);
+
+        var removed = await mappings.DeleteAsync(ledgerId, mappingId, cancellationToken)
+            .ConfigureAwait(false);
+        return removed
+            ? new McpWriteResult(mappingId, true, existing.Name, null, null)
+            : McpWriteResult.Fail(mappingId, "mapping-not-in-ledger");
+    }
 
     [McpServerTool(Name = "set_account_taxstatus"), Description(
         "Set the tax treatment of ONE account (ADR-0066): taxStatus = taxable / " +

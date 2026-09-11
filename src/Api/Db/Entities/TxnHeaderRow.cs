@@ -132,6 +132,20 @@ internal sealed class TxnHeaderRow
     /// <c>ck_txn_headers_provider_key_iff_not_manual</c> enforces
     /// the bi-implication.</summary>
     public string? ProviderKey { get; set; }
+
+    /// <summary>
+    /// The <c>ledger_operations</c> run (family <c>ingest</c>) whose import created this
+    /// row; NULL for a manual entry, a pre-221 row, or an import whose operation audit
+    /// retention has since pruned (mig 221).
+    /// </summary>
+    /// <remarks>
+    /// Exists so an import can be UNDONE as a set. File imports have no dedup by
+    /// decision — CSV rows carry no issuer id, and any content-derived identity either
+    /// collapses two genuinely identical transactions or duplicates everything when a
+    /// download window shifts. Recording which run wrote a row answers "I uploaded that
+    /// twice" exactly, where guessing could not.
+    /// </remarks>
+    public Guid? LedgerOperationId { get; set; }
     /// <summary>TRUE when at least one other row has
     /// <see cref="IsMergedInto"/> pointing at this row (mig 107).
     /// Maintained atomically with the merge mutation in

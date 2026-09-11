@@ -14,7 +14,7 @@
          the assembly by the StampGitVersion target below and surfaced
          via GET /api/meta/version. We compose InformationalVersion
          ourselves, so suppress the SDK's automatic +<sha> append. -->
-    <Version>0.74.1</Version>
+    <Version>0.78.0</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 
@@ -78,6 +78,15 @@
   </Target>
 
   <ItemGroup>
+    <!-- Reads the hand-editable feed_csv_mappings document (mig 222). MIT, so
+         compatible with this project's AGPL-3.0-only. -->
+    <!-- Delimited-file parsing for the generic CSV provider (ADR-0031 Phase 5).
+         Dual MS-PL OR Apache-2.0; taken under Apache-2.0, which is compatible
+         with this project's AGPL-3.0-only. Not hand-rolled: quoted delimiters,
+         doubled quotes and newlines inside quotes are where a splitter silently
+         shifts an amount into the wrong field. -->
+    <PackageReference Include="CsvHelper" Version="33.1.0" />
+    <PackageReference Include="YamlDotNet" Version="18.1.0" />
     <PackageReference Include="dbup-postgresql" Version="6.1.5" />
     <PackageReference Include="Fido2.AspNet" Version="4.0.1" />
     <PackageReference Include="Google.Apis.Drive.v3" Version="1.75.0.4218" />

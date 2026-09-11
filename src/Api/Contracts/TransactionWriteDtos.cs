@@ -552,3 +552,30 @@ public sealed record MergeCandidatePostingDto(
     string CounterpartyAccountName,
     decimal Amount,
     string? LegMemo);
+
+/// <summary>
+/// Outcome of undoing one import (mig 221).
+/// </summary>
+/// <param name="Found">Transactions still carrying this import's stamp.</param>
+/// <param name="Edited">
+/// How many of them the user has since edited (they have a
+/// <c>txn_header_overrides</c> row). Reported so a confirm dialog can say so; never a
+/// reason to refuse, because whose edits they are is the user's call.
+/// </param>
+/// <param name="Deleted">
+/// Rows removed outright. An undo does NOT hide: a hidden row keeps its
+/// <c>external_id</c>, the import dedup matches on that and never on <c>is_hidden</c>,
+/// so hiding would make the same file un-importable — the re-import would count every
+/// row already-known and insert nothing. The file is the backup for a file import,
+/// which is a better recovery than a row nothing can bring back.
+/// </param>
+/// <param name="TooLarge">
+/// The import exceeds <see cref="SelectionLimits.MaxIds"/> and was NOT touched. A
+/// partial undo would leave a half-removed import that no longer matches its own
+/// operation, so it refuses instead.
+/// </param>
+public sealed record UndoImportResult(
+    int Found,
+    int Edited,
+    int Deleted,
+    bool TooLarge);

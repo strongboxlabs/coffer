@@ -84,9 +84,19 @@ public sealed class McpAuditTests
         // Read tools are out of scope (they live in other classes, not audited).
         Assert.DoesNotContain("list_tags", McpWriteTools.ToolNames);
         Assert.DoesNotContain("list_ledgers", McpWriteTools.ToolNames);
+        // Mapping documents are written through MCP on purpose: composing the YAML from
+        // a few sample lines is the part an assistant is good at. They are writes, so
+        // they are guarded and audited like any other.
+        Assert.Contains("save_csv_mapping", McpWriteTools.ToolNames);
+        Assert.Contains("delete_csv_mapping", McpWriteTools.ToolNames);
+        // ...while the read side of the same feature is NOT here, because it lives in
+        // CsvMappingTools and is neither guarded nor audited.
+        Assert.DoesNotContain("validate_csv_mapping", McpWriteTools.ToolNames);
+        Assert.DoesNotContain("list_csv_mappings", McpWriteTools.ToolNames);
+
         // The full known write surface (the guard-completeness test covers each of these):
         // 13 from ADR-0068/0081 + 7 from Slice D (4 tag lifecycle + 3 manual price)
-        // + 1 split-posting recategorize.
-        Assert.Equal(21, McpWriteTools.ToolNames.Count);
+        // + 1 split-posting recategorize + 2 CSV mapping documents (ADR-0031 Phase 5).
+        Assert.Equal(23, McpWriteTools.ToolNames.Count);
     }
 }

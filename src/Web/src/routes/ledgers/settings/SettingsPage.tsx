@@ -13,6 +13,7 @@ import { MarketDataPanel } from './MarketDataPanel';
 import { DashboardLayoutPanel } from './DashboardLayoutPanel';
 import { ActivityPanel } from './ActivityPanel';
 import { NotificationsPanel } from './NotificationsPanel';
+import { ImportLayoutsPanel } from './ImportLayoutsPanel';
 import { SETTINGS_TABS, coerceSettingsTab, type SettingsTab } from './settingsTabs';
 
 /**
@@ -113,6 +114,7 @@ export function SettingsPage() {
                     ) : null}
                     {tab === 'activity' ? <ActivityPanel ledgerId={ledgerId} /> : null}
                     {tab === 'dashboard' ? <DashboardLayoutPanel ledgerId={ledgerId} /> : null}
+                    {tab === 'layouts' ? <ImportLayoutsPanel ledgerId={ledgerId} /> : null}
                 </div>
             </MainPane>
         </MainArea>

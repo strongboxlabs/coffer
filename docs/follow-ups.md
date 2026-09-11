@@ -385,7 +385,28 @@ ranked ahead of them — not because the CSV slice was reassessed.*
 `GenericCsvProvider` reading a `feed_csv_mappings` config (column map + date
 format + sign convention + header rows), extending the same `IngestOrchestrator`
 as SimpleFIN / OFX / QIF. The column-mapping wizard UI lands here. Resolves the
-CSV slice (file upload, per-institution mappings, hash-based `external_id`).
+CSV slice (file upload, per-institution mappings).
+
+**No dedup, decided 2026-09-04.** The earlier "hash-based `external_id`" plan is
+withdrawn. CSV rows carry no issuer-assigned id, so per-row identity has to be inferred
+from content — and content cannot separate two genuinely identical transactions (same
+date, same amount, same merchant). A content hash silently collapses them and eats a real
+row; folding in the row ordinal silently duplicates the whole file the moment a download
+window shifts. Both fail silently, in a ledger reconciled against real balances, and the
+juice is not worth the squeeze.
+
+What replaces it is UNDO, shipped ahead of the slice: mig 221 stamps
+`txn_headers.ledger_operation_id` with the import that wrote each row, and
+`POST /ledger-operations/{id}/undo-import` hides exactly that set (`?dryRun=true` counts
+first). Exact, no inference, and `bulk-unhide` is its inverse.
+
+Note for whoever builds the provider: "no dedup" does NOT mean leaving `external_id`
+NULL. `ck_txn_headers_external_id_for_non_manual` (mig 109) is
+`external_id IS NOT NULL OR origin = 'manual'`, and an import writes
+`origin = 'file_import'` — so every imported row MUST carry one. Emit a deliberately
+non-matching value (unique per import) rather than omitting it. A useful side effect:
+that keeps imported rows on the soft-hide side of bulk delete, so an undo can never
+destroy one.
 
 #### CSV Phase 6 — per-institution ingest providers (ADR-0031)
 
@@ -845,6 +866,32 @@ posted date when `transactedAt !== postedAt`. The remaining UX loop:
   line 2) takes the spot that on bank shows tax date, so tax date
   on investment rows is currently invisible — needs its own
   treatment.
+
+#### A 422 from an import endpoint loses the problem list it carried
+
+*open. Surfaced 2026-09-10 by an audit of the import flow; the rest of that audit's
+findings are fixed.*
+
+`previewCsv` / `importCsv` refuse an invalid mapping with **422** whose body is the
+endpoint's own `CsvMappingValidationResponse` — the full list of problems, each with a
+key path and a line. That body is not ProblemDetails, so the shared `request` helper
+cannot read it, `ApiError` carries nothing, and `errorMessage` falls back to the status
+text. The user clicks Continue on a broken document and is told **"Unprocessable
+Entity"**, with the answer sitting unread in the response body.
+
+Deliberately not folded into the import-flow fixes: the honest repair is in the shared
+client (teach `request` to surface a typed 422 body, or have these endpoints answer with
+ProblemDetails plus an extension), and that reaches every caller rather than this dialog.
+
+Partly masked today — Check validates against the dedicated endpoint and renders the
+same list properly, and Continue is dead while the document is empty — so the bad path
+needs an invalid-but-non-empty document. It is still the one place in the flow that
+answers a real question with a status code.
+
+Related, from the same audit and also open: the file-read *rejection* path
+([CsvMappingStep.tsx](../src/Web/src/routes/ledgers/register/shell/CsvMappingStep.tsx))
+now reports rather than swallowing, but only the empty-file branch is pinned by a test —
+`File.text()` rejecting is not simulated anywhere.
 
 #### Dark mode
 

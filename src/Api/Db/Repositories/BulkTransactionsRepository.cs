@@ -392,9 +392,136 @@ internal sealed class BulkTransactionsRepository
     /// balance-relevant in mig 103 (hidden rows are excluded from the
     /// balance walk) — same #4 call-site pattern as the hard-delete
     /// branch.</remarks>
+    /// <summary>
+    /// Remove every transaction a given import created — the answer to "I uploaded that
+    /// twice".
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// File imports have no dedup and will not get one. CSV rows carry no issuer id
+    /// (unlike OFX's FITID), so any per-row identity has to be derived from content, and
+    /// content cannot separate two genuinely identical transactions — same date, same
+    /// amount, same merchant. A content hash collapses them and silently eats a real
+    /// row; folding in the row ordinal duplicates the whole file the moment a download
+    /// window shifts. Both failure modes are silent, in a ledger reconciled against real
+    /// balances.
+    /// </para>
+    /// <para>
+    /// So the mistake is not prevented by guessing, it is UNDONE exactly. Mig 221 stamps
+    /// <c>ledger_operation_id</c> on every row an import writes, and this deletes that
+    /// set and nothing else. No inference anywhere.
+    /// </para>
+    /// <para>
+    /// Delegates to <see cref="BulkDeleteAsync"/> rather than issuing its own delete:
+    /// that method already captures (account, effective posted_at) pairs BEFORE the
+    /// cascade fires so the balance recompute anchors correctly, and duplicating a
+    /// money-touching delete to save one call is how the two copies drift.
+    /// </para>
+    /// </remarks>
+    public async Task<UndoImportResult> UndoImportAsync(
+        Guid ledgerId,
+        Guid ledgerOperationId,
+        bool dryRun,
+        CancellationToken cancellationToken = default)
+    {
+        var ids = await _db.TxnHeaders
+            .AsNoTracking()
+            .Where(h => h.LedgerId == ledgerId
+                        && h.LedgerOperationId == ledgerOperationId
+                        && h.IsMergedInto == null)
+            .Select(h => h.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        // How many of them the user has since edited. Reported, never used to refuse:
+        // whose edits they are is their call, but an undo that silently discards work
+        // is the kind of "helpful" delete nobody forgives.
+        var edited = ids.Count == 0
+            ? 0
+            : await _db.TxnHeaderOverrides
+                .AsNoTracking()
+                .Where(o => o.LedgerId == ledgerId && EF.Constant(ids.ToArray()).Contains(o.HeaderId))
+                .Select(o => o.HeaderId)
+                .Distinct()
+                .CountAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+        // A PARTIAL undo is worse than none — it leaves a half-removed import that no
+        // longer matches its own operation and cannot be finished by repeating the call.
+        // Refuse loudly instead. MaxIds is 10_000, far above any real statement.
+        if (ids.Count > SelectionLimits.MaxIds)
+        {
+            return new UndoImportResult(
+                Found: ids.Count, Edited: edited, Deleted: 0, TooLarge: true);
+        }
+
+        if (dryRun || ids.Count == 0)
+        {
+            return new UndoImportResult(
+                Found: ids.Count, Edited: edited, Deleted: 0, TooLarge: false);
+        }
+
+        // AN UNDO REMOVES THE ROWS OUTRIGHT. An earlier version hid them, on the
+        // reasoning that hiding is reversible and deleting is not. That was the wrong
+        // recovery to optimise for.
+        //
+        // The thing a person does after undoing an import is import the file again —
+        // wrong account, wrong file, wrong day. A hidden row keeps its external_id, the
+        // dedup lookup matches on external_id and never on is_hidden, and the soft-hide
+        // path deliberately leaves is_hidden alone so a re-sync cannot undo a manual
+        // hide. So the re-import matched every hidden row, counted it already-known,
+        // inserted nothing, and left the register empty while reporting success. Hiding
+        // did not preserve recoverability; it blocked the only recovery there was.
+        //
+        // For a file import the FILE is the backup, which is a better recovery story
+        // than an invisible row nothing can bring back.
+        var (hard, soft) = await BulkDeleteAsync(
+            ledgerId,
+            new SelectionRequest { Kind = "explicit", HeaderIds = ids },
+            hardDeleteSourcedRows: true,
+            cancellationToken).ConfigureAwait(false);
+
+        // Zero unless a reminder occurrence somehow carried an import's stamp, which an
+        // import cannot produce. Surfaced rather than silently added to the total: a row
+        // that survived as hidden when the caller was told it was deleted is exactly the
+        // discrepancy that would send someone re-importing into a duplicate.
+        if (soft != 0)
+        {
+            throw new InvalidOperationException(
+                "Undo hid " + soft + " row(s) instead of removing them; a re-import "
+                + "would then skip them as already-known. Check what wrote a reminder "
+                + "occurrence under an import's ledger_operation_id.");
+        }
+
+        return new UndoImportResult(
+            Found: ids.Count, Edited: edited, Deleted: hard, TooLarge: false);
+    }
+
+    /// <param name="hardDeleteSourcedRows">
+    /// Remove feed-sourced rows (<c>external_id</c> set) outright instead of hiding
+    /// them. Used ONLY by undo-import, and load-bearing there.
+    /// <para>
+    /// The default is to hide such a row, so a later re-sync upserts into it rather than
+    /// resurrecting something the user deleted. That rule is wrong for an undo, because
+    /// the thing a person does after undoing an import is IMPORT THE FILE AGAIN — and a
+    /// hidden row still matches the dedup lookup (which filters on external_id and never
+    /// on is_hidden), so the re-import counts every row already-known, inserts nothing,
+    /// and leaves the register empty while reporting success. Hiding does not preserve
+    /// recoverability for an import; it blocks the only recovery there is.
+    /// </para>
+    /// <para>
+    /// Reminder occurrences are still never hard-deleted, even here. Their
+    /// (recurring_transaction_id, occurrence_date) stamp IS the slot's idempotency key
+    /// (mig 218), and removing it makes reminder-auto-post re-post the occurrence on the
+    /// next tick — a loop the user cannot escape. An import cannot create one, so the
+    /// carve-out is unreachable from undo; it is kept because "unreachable today" is not
+    /// a reason to arm a footgun.
+    /// </para>
+    /// </param>
     public async Task<(int HardDeleted, int SoftHidden)> BulkDeleteAsync(
         Guid ledgerId,
         SelectionRequest selection,
+        bool hardDeleteSourcedRows = false,
         CancellationToken cancellationToken = default)
     {
         var query = BuildSelectionQuery(ledgerId, selection);
@@ -478,8 +605,10 @@ internal sealed class BulkTransactionsRepository
         // next tick — a loop the user cannot escape. The single-delete path was fixed for
         // this and bulk delete was missed, so selecting auto-posted occurrences in the
         // register and deleting them resurrected every one of them.
+        // The reminder-occurrence carve-out holds in BOTH modes; only the external_id
+        // half relaxes.
         var hardDeleted = await query
-            .Where(h => h.ExternalId == null
+            .Where(h => (hardDeleteSourcedRows || h.ExternalId == null)
                         && (h.RecurringTransactionId == null || h.OccurrenceDate == null
                             || h.IsRecurringTemplate))
             .ExecuteDeleteAsync(cancellationToken)
@@ -489,8 +618,11 @@ internal sealed class BulkTransactionsRepository
         // back into the same row but leaves is_hidden alone.
         // Everything else soft-hides: feed-sourced rows (external_id set) AND reminder
         // occurrences, which keep their stamp so the slot stays consumed.
+        // In hard mode only the reminder occurrences are left to hide — everything else
+        // is already gone, and the ExternalId half of this predicate would match nothing
+        // anyway.
         var softHidden = await query
-            .Where(h => h.ExternalId != null
+            .Where(h => (!hardDeleteSourcedRows && h.ExternalId != null)
                         || (h.RecurringTransactionId != null && h.OccurrenceDate != null
                             && !h.IsRecurringTemplate))
             .ExecuteUpdateAsync(

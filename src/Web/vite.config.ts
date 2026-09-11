@@ -95,7 +95,12 @@ export default defineConfig({
         strictPort: true,
         proxy: {
             '/api': {
-                target: 'http://localhost:5000',
+                // Defaults to a locally-run API. COFFER_DEV_API points it somewhere
+                // else — usually a throwaway container holding a clone of dev, which
+                // is the only way to work against real data without publishing
+                // Postgres to the host. Whatever it points at must carry this origin
+                // in its Fido2 allow-list, or WebAuthn fails at sign-in.
+                target: process.env.COFFER_DEV_API ?? 'http://localhost:5000',
                 changeOrigin: false,
                 // changeOrigin=false keeps the Host header so ASP.NET
                 // Core's cookie auth sees the browser's actual origin —
