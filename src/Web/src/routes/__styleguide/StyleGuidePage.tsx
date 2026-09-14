@@ -27,6 +27,8 @@ const surfaceTokens = [
     { name: '--color-surface-muted', cls: 'bg-surface-muted', text: 'text-text' },
     { name: '--color-surface-sidebar', cls: 'bg-surface-sidebar', text: 'text-text' },
     { name: '--color-surface-hover', cls: 'bg-surface-hover', text: 'text-text' },
+    { name: '--color-surface-header', cls: 'bg-surface-header', text: 'text-text-muted' },
+    { name: '--color-chip-neutral', cls: 'bg-chip-neutral', text: 'text-chip-neutral-text' },
 ];
 
 const borderTokens = [

@@ -1,7 +1,7 @@
 {
   "name": "coffer-web",
   "private": true,
-  "version": "0.78.0",
+  "version": "0.81.0",
   "type": "module",
   "description": "Coffer web UI per ADR-0007. Vite + React + TanStack stack.",
   "scripts": {
@@ -11,7 +11,8 @@
     "typecheck": "tsc -b --noEmit",
     "lint": "eslint .",
     "test": "vitest run --pool=forks",
-    "test:watch": "vitest --pool=forks"
+    "test:watch": "vitest --pool=forks",
+    "themes:gen": "vite-node src/styles/theme-gen/generate.mjs"
   },
   "//deps-rationale": [
     "@simplewebauthn/browser  — well-trodden WebAuthn client (base64url + navigator.credentials wrapper).",
@@ -25,13 +26,13 @@
     "tailwindcss + @tailwindcss/vite — v4, CSS-first config. The @theme block in src/index.css holds the design tokens (ADR-0021)."
   ],
   "dependencies": {
-    "@simplewebauthn/browser": "13.3.0",
+    "@simplewebauthn/browser": "14.0.0",
     "@tanstack/react-query": "5.102.8",
     "@tanstack/react-router": "1.170.32",
     "@tanstack/react-virtual": "3.14.10",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
-    "lucide-react": "1.35.0",
+    "lucide-react": "1.41.0",
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "react-virtuoso": "4.18.12",
@@ -42,21 +43,22 @@
     "@tailwindcss/vite": "4.3.3",
     "@testing-library/jest-dom": "7.0.1",
     "@testing-library/react": "16.3.3",
-    "@testing-library/user-event": "14.6.6",
-    "@types/node": "26.4.0",
+    "@testing-library/user-event": "14.6.7",
+    "@types/node": "26.4.1",
     "@types/react": "18.3.18",
     "@types/react-dom": "18.3.5",
     "@vitejs/plugin-react": "6.1.1",
     "eslint": "10.9.1",
     "eslint-plugin-react-hooks": "7.1.1",
-    "eslint-plugin-react-refresh": "0.5.5",
-    "globals": "17.11.0",
+    "eslint-plugin-react-refresh": "0.5.6",
+    "globals": "17.12.0",
     "jsdom": "30.0.1",
     "tailwindcss": "4.3.3",
     "typescript": "6.0.3",
-    "typescript-eslint": "8.68.0",
+    "typescript-eslint": "8.69.0",
     "vite": "8.2.2",
-    "vitest": "4.1.11"
+    "vite-node": "^6.0.0",
+    "vitest": "5.0.0"
   },
   "engines": {
     "node": ">=22"

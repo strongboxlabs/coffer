@@ -219,6 +219,12 @@ public static class FileIngestEndpoints
             return BusinessError.Problem($"{errorPrefix}_parse_failed", ex.Message);
         }
 
+        // Remember the brokerage so the picker can preselect it next time. After the
+        // import, deliberately: a file that failed to parse says nothing about where the
+        // account is held, and this must never be the reason an import reports failure.
+        await accounts.RememberImportProviderAsync(
+            ledgerId, accountId, providerKey, cancellationToken).ConfigureAwait(false);
+
         return Results.Ok(new FileIngestImportResponse(
             SyncRunId: outcome.SyncRunId,
             AccountsDiscovered: outcome.AccountsDiscovered,

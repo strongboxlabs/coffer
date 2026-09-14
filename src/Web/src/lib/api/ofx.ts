@@ -1,6 +1,7 @@
 // OFX/QFX file-upload endpoints (ADR-0031 Phase 4 slice 3).
 
 import { requestMultipart } from './_request';
+import { buildFormData } from './upload';
 import type {
     OfxImportResponse,
     OfxPreviewResponse,
@@ -15,7 +16,7 @@ export async function previewOfx(
 ): Promise<OfxPreviewResponse> {
     return requestMultipart<OfxPreviewResponse>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/ingest/ofx/preview`,
-        buildFormData({ file }),
+        buildFormData({ file }, 'upload.ofx'),
     );
 }
 
@@ -31,25 +32,6 @@ export async function importOfx(
 ): Promise<OfxImportResponse> {
     return requestMultipart<OfxImportResponse>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/ingest/ofx/import`,
-        buildFormData({ file, accountId, providerAccountId }),
+        buildFormData({ file, accountId, providerAccountId }, 'upload.ofx'),
     );
-}
-
-function buildFormData(fields: {
-    file: Blob;
-    accountId?: string;
-    providerAccountId?: string;
-}): FormData {
-    const form = new FormData();
-    // Filename is required by the API's IFormFile binding even
-    // though the parser doesn't read it; "upload.ofx" keeps the
-    // wire shape generic.
-    form.append('file', fields.file, 'upload.ofx');
-    if (fields.accountId !== undefined) {
-        form.append('accountId', fields.accountId);
-    }
-    if (fields.providerAccountId !== undefined) {
-        form.append('providerAccountId', fields.providerAccountId);
-    }
-    return form;
 }

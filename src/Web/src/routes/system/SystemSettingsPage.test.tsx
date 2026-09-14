@@ -71,6 +71,18 @@ describe('SystemSettingsPage', () => {
         expect(screen.queryByRole('tab', { name: /backups/i })).not.toBeInTheDocument();
     });
 
+    it('gives a non-admin the Appearance tab too', async () => {
+        // Appearance is a personal display preference, not an admin control, so
+        // it joins About in the open set. This is the case the old
+        // `tab !== 'about' && !isAdmin` fallback would have bounced.
+        const user = userEvent.setup();
+        renderSystem(false);
+
+        await user.click(await screen.findByRole('tab', { name: /appearance/i }));
+        expect(await screen.findByRole('radio', { name: /dark high contrast/i }))
+            .toBeInTheDocument();
+    });
+
     it('shows the Backups tab to an admin and opens the panel', async () => {
         vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue([]);
         vi.spyOn(apiModule, 'fetchBackupSchedule').mockResolvedValue(SCHEDULE_OFF);

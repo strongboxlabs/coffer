@@ -97,7 +97,8 @@ public sealed class AccountsRepository
                     && !rv.IsHidden),
                 a.HoldingsAccountId,
                 a.IsTradeCommission,
-                a.InstitutionName))
+                a.InstitutionName,
+                a.ImportProviderKey))
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
@@ -452,6 +453,36 @@ public sealed class AccountsRepository
     /// <para>Pass <c>null</c> to clear the watermark — the next
     /// sync will then ask for the full 90 days.</para>
     /// </summary>
+    /// <summary>
+    /// Remember which file-import provider this account was last imported with (mig 223).
+    /// </summary>
+    /// <remarks>
+    /// <para>A memory written as a side effect of a successful import, not a setting the
+    /// user maintains. Saying "this account is at Fidelity" once, by importing a Fidelity
+    /// file, is the whole interaction; the picker preselects it from then on.</para>
+    ///
+    /// <para>Best-effort by design. It returns nothing and is never awaited for its
+    /// result, because the import has already succeeded by the time this runs and
+    /// failing a completed import over a UI convenience would be the wrong trade.</para>
+    /// </remarks>
+    public async Task RememberImportProviderAsync(
+        Guid ledgerId,
+        Guid accountId,
+        string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(providerKey)) return;
+
+        await _db.Accounts
+            .Where(a => a.Id == accountId
+                        && a.LedgerId == ledgerId
+                        && a.ImportProviderKey != providerKey)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(a => a.ImportProviderKey, providerKey),
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
     public async Task<SetSyncFromDateResult> SetSyncFromDateAsync(
         Guid ledgerId,
         Guid accountId,
@@ -1022,7 +1053,9 @@ public sealed class AccountsRepository
 
         var summary = new AccountSummary(
             accountId, ledgerId, parentId, name, type, categoryKind, currency,
-            request.IsActive, false, null, 0, holdingsSiblingId, false, institution);
+            request.IsActive, false, null, 0, holdingsSiblingId, false, institution,
+            // Never imported from anything yet, by definition.
+            null);
         return new(CreateAccountFailure.None, summary);
     }
 

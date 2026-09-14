@@ -784,6 +784,7 @@ export function BankRegisterPage() {
                     ledgerId={ledgerId}
                     accountId={accountId}
                     accountName={account.name}
+                    accountKind="bank"
                     onClose={() => setImportDialogOpen(false)}
                     onImported={refreshAfterImportChange}
                     // Undo moves the same rows the import moved, so it needs the same

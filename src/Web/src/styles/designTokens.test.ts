@@ -41,20 +41,43 @@ const UTILITIES = [
  * `border-2` are Tailwind built-ins and must not be mistaken for token
  * references, so only names beginning with one of these are checked.
  */
-const FAMILIES = ['state', 'surface', 'accent', 'cat', 'border', 'text', 'on'].join('|');
+const FAMILIES = ['state', 'surface', 'accent', 'cat', 'border', 'text', 'on', 'chip'].join('|');
 
 const REFERENCE = new RegExp(
     `(?:^|[\\s"'\`:])(?:${UTILITIES})-((?:${FAMILIES})(?:-[a-z0-9]+)*)`,
     'g',
 );
 
-function definedTokens(): Set<string> {
-    const css = readFileSync(CSS, 'utf8');
+/**
+ * Read one top-level block's body out of the stylesheet. Blocks here are flat
+ * — declarations and comments, no nesting — so the first line that is a lone
+ * `}` closes them.
+ */
+function blockBody(css: string, opener: string): string {
+    const start = css.indexOf(opener);
+    if (start === -1) return '';
+    const from = start + opener.length;
+    const end = css.indexOf('\n}', from);
+    return end === -1 ? css.slice(from) : css.slice(from, end);
+}
+
+function tokensIn(body: string): Set<string> {
     const names = new Set<string>();
-    for (const m of css.matchAll(/--color-([a-z0-9-]+)\s*:/g)) {
-        names.add(m[1]!);
-    }
+    for (const m of body.matchAll(/--color-([a-z0-9-]+)\s*:/g)) names.add(m[1]!);
     return names;
+}
+
+/**
+ * The tokens the app DEFINES — scoped to the `@theme` block on purpose.
+ *
+ * It used to scan the whole file. That was fine until the theme overrides
+ * landed: a typo inside a `[data-theme]` block (`--color-serface`) would have
+ * been read as a definition, so the override would silently do nothing AND
+ * the typo would start vouching for itself everywhere else. The override
+ * blocks are checked against this set instead, below.
+ */
+function definedTokens(): Set<string> {
+    return tokensIn(blockBody(readFileSync(CSS, 'utf8'), '@theme {'));
 }
 
 function sourceFiles(dir: string): string[] {
@@ -80,22 +103,25 @@ describe('design tokens', () => {
         expect(defined.size).toBeGreaterThan(20);
         expect(defined.has('state-warning')).toBe(true);
 
-        // KNOWN DEBT, frozen deliberately. These predate the guard and each is a
-        // real defect — the class resolves to nothing, so the element renders without
-        // the colour it asked for. They are NOT fixed here because each needs a
-        // visual decision in a file this change does not otherwise touch, and a
-        // wrong guess is a silent appearance change. The list exists to stop NEW
-        // ones, not to bless these.
+        // KNOWN DEBT — empty, and it stays that way.
         //
-        //   text-default      -> almost certainly `text-text` (--color-text)
-        //   on-accent         -> almost certainly `text-text-inverse`
-        //   accent-foreground -> almost certainly `text-text-inverse`
-        //   state-danger-bg   -> almost certainly `state-danger-soft`
+        // All four entries (text-default, on-accent, accent-foreground,
+        // state-danger-bg) were cleared alongside the themes. What had frozen
+        // them was the note that "a wrong guess is a silent appearance change";
+        // the four-theme contrast audit is what unblocked them, because every
+        // substitution could be checked against its real background in each
+        // theme before being made rather than guessed.
         //
-        // Shrink this list; never grow it.
-        const known = new Set([
-            'text-default', 'on-accent', 'accent-foreground', 'state-danger-bg',
-        ]);
+        // on-accent and accent-foreground both resolved to text-text-inverse,
+        // as the old note predicted — but only after that token was made
+        // theme-aware, which is the thing the guess could not have known: a
+        // white label is correct on the light themes' teal-700 and unreadable
+        // (1.78:1) on the dark themes' teal-400.
+        //
+        // Do not add to this set. A name here is a class that paints nothing;
+        // fix the reference instead.
+        const known = new Set<string>();
+        expect([...known]).toEqual([]);
 
         const offenders: string[] = [];
         for (const file of sourceFiles(SRC)) {
@@ -111,6 +137,68 @@ describe('design tokens', () => {
         // Listed rather than counted, because the failure has to name the typo to be
         // actionable — "3 bad tokens" sends the reader hunting.
         expect(offenders).toEqual([]);
+    });
+
+    it('themes override only tokens that exist', () => {
+        // A `[data-theme]` block can only RE-point a token the @theme block
+        // already defines. Misspell one and nothing complains: the custom
+        // property is set, no utility reads it, and that theme quietly keeps the
+        // light value for whatever the typo was meant to change.
+        const css = readFileSync(CSS, 'utf8');
+        const defined = definedTokens();
+        expect(defined.size).toBeGreaterThan(20);
+
+        const selectors = [...css.matchAll(/\[data-theme="([a-z-]+)"\]\s*\{/g)]
+            .map((m) => m[1]!);
+        // Guard the guard: if the blocks move or the selector shape changes,
+        // an empty list would make this pass while checking nothing.
+        expect(selectors).toEqual(['light', 'light-hc', 'dark', 'dark-hc']);
+
+        const offenders: string[] = [];
+        for (const sel of selectors) {
+            const body = blockBody(css, `[data-theme="${sel}"] {`);
+            for (const token of tokensIn(body)) {
+                if (!defined.has(token)) offenders.push(`${sel}: ${token}`);
+            }
+        }
+        expect(offenders).toEqual([]);
+    });
+
+    it('the light block restates every @theme token', () => {
+        // Two things ride on completeness here. First, `data-theme` only
+        // COMPOSES if the light block is whole: a light preview nested inside a
+        // dark page inherits the dark value for anything light omits.
+        //
+        // Second, and the reason this test exists: the light block is the
+        // checklist. A token absent from it is a token no theme was ever asked
+        // about, so its light value leaks into all four. That is how
+        // `surface-sidebar` came within a commit of painting a white rail down
+        // the side of both dark themes — it was never wrong anywhere, just
+        // never considered.
+        const css = readFileSync(CSS, 'utf8');
+        const light = tokensIn(blockBody(css, '[data-theme="light"] {'));
+        const missing = [...definedTokens()].filter((t) => !light.has(t)).sort();
+        expect(missing).toEqual([]);
+    });
+
+    it('the style guide renders every @theme token', () => {
+        // StyleGuidePage says at the top that every token in index.css renders
+        // there, and ADR-0021 D.1 is what makes that page the first place a
+        // token change is verified. Nothing enforced it, and it had already
+        // drifted: surface-header was missing before the themes landed.
+        //
+        // Tokens appear there two ways — as a `--color-x` literal in the label,
+        // or only as the utility class that paints the swatch — so both count.
+        const page = readFileSync(
+            join(SRC, 'routes', '__styleguide', 'StyleGuidePage.tsx'),
+            'utf8',
+        );
+        const shown = new Set<string>();
+        for (const m of page.matchAll(/--color-([a-z0-9-]+)/g)) shown.add(m[1]!);
+        for (const m of page.matchAll(REFERENCE)) shown.add(m[1]!);
+
+        const missing = [...definedTokens()].filter((t) => !shown.has(t)).sort();
+        expect(missing).toEqual([]);
     });
 
     it('would catch a token that does not exist', () => {

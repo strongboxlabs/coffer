@@ -184,6 +184,7 @@ export {
 } from './api/driveSync';
 export { previewOfx, importOfx } from './api/ofx';
 export { previewQif, importQif } from './api/qif';
+export { previewFidelity, importFidelity } from './api/fidelity';
 export {
     fetchSnapshots,
     createSnapshot,

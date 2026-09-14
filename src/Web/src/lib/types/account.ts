@@ -50,6 +50,9 @@ export interface AccountSummary {
      *  (value null on categories / accounts with none recorded);
      *  optional here only so existing test fixtures need not change. */
     institutionName?: string | null;
+    /** The file-import provider this account last imported with (mig 223). Null until
+     *  the first such import; preselects the brokerage picker. */
+    importProviderKey?: string | null;
 }
 
 /** Editable amortization terms (ADR-0050 slice 3), mirror of API
@@ -81,6 +84,9 @@ export interface CreateAccountRequest {
     /** Defaults to USD server-side when omitted. */
     currencyCode?: string | null;
     institutionName?: string | null;
+    /** The file-import provider this account last imported with (mig 223). Null until
+     *  the first such import; preselects the brokerage picker. */
+    importProviderKey?: string | null;
     accountNumber?: string | null;
     routingNumber?: string | null;
     accountUrl?: string | null;

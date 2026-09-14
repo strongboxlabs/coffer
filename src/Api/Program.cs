@@ -454,6 +454,10 @@ builder.Services.AddSingleton<Coffer.Api.Ingest.IFileProvider, Coffer.Api.Ingest
 // document; the mapping is resolved per request by CsvIngestEndpoints, so the
 // provider itself stays a pure stream-to-result function like its siblings.
 builder.Services.AddSingleton<Coffer.Api.Ingest.IFileProvider, Coffer.Api.Ingest.Csv.CsvGenericFileProvider>();
+// ADR-0031 Phase 6. One provider per BROKERAGE, and each is a shim: it converts
+// the institution's CSV to QIF and delegates, so the investment action vocabulary
+// lives once in QifFileProvider rather than once per brokerage.
+builder.Services.AddSingleton<Coffer.Api.Ingest.IFileProvider, Coffer.Api.Ingest.Csv.FidelityActivityFileProvider>();
 builder.Services.AddScoped<Coffer.Api.Ingest.IngestOrchestrator>();
 
 // Quote-provider family (ADR-0033). Parallel structure to ingest:
@@ -1282,6 +1286,7 @@ app.MapTransactionsEndpoints();
 app.MapBalancesEndpoints();
 app.MapOfxIngestEndpoints();
 app.MapQifIngestEndpoints();
+app.MapFidelityIngestEndpoints();
 app.MapCsvIngestEndpoints();
 app.MapImportEndpoints();
 app.MapSnapshotsEndpoints();

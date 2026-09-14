@@ -250,7 +250,7 @@ function renderSplitLegBody(leg: BankRow, ctx: RegisterRowBodyCtx): ReactNode {
                 role="cell"
                 className={
                     'text-right font-mono tabular-nums ' +
-                    (leg.amount < 0 ? 'text-state-danger/70' : 'text-text/70')
+                    (leg.amount < 0 ? 'text-state-danger' : 'text-text')
                 }
             >
                 {formatSignedAmount(leg.amount, currency)}

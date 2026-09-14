@@ -382,8 +382,24 @@ Each slice is an independent PR:
    online_match_fitid)` is captured in `docs/follow-ups.md`.
 5. **Phase 5** — CSV generic provider + `feed_csv_mappings` schema
    + column-mapping wizard UI.
-6. **Phase 6** — per-institution CSV providers as needed (the most
-   irregular formats first if a provider's format proves recalcitrant).
+6. **Phase 6** — per-BROKERAGE CSV providers as needed. Shipped for
+   Fidelity 2026-09-12; see the amendment below, which changes what such
+   a provider is.
 
 Moneydance CLI (D3) reconsidered at the start of phase 4 or later;
 not blocking.
+
+---
+
+## Amendment, 2026-09-12: what a Phase 6 provider is
+
+Phase 6 above says "per-institution CSV providers", which reads as though each one
+parses a file and emits `IngestedTransaction`s the way the Phase 5 generic provider
+does. It does not. A brokerage provider converts its institution's CSV to QIF and
+delegates to `QifFileProvider`, so the investment action vocabulary exists once rather
+than once per brokerage.
+
+That is a decision in its own right, with its own rejected alternatives, and it lives in
+**[ADR-0098 — a brokerage CSV provider is a shim to QIF](0098-brokerage-csv-is-a-shim-to-qif.md)**
+rather than here. Phase 5 and the generic mapping document are unaffected: bank CSV has
+no shared vocabulary to protect and stays exactly as this ADR describes.

@@ -8,7 +8,10 @@ import { cn } from '@/lib/cn';
 // declared as semantic tokens in src/index.css (ADR-0021 Rule 5).
 //
 // Variants:
-//   - default               — neutral slate (e.g. for tags)
+//   - default               — neutral slate (e.g. for tags). Its own token
+//                             pair, NOT surface-hover: on a dark theme that
+//                             token has to lighten to read as hover, which
+//                             would drag the chip off its text (ADR-0021 R4).
 //   - warn                  — amber warning (e.g. "needs category")
 //   - flagged               — pink/rose (e.g. "large", manually flagged)
 //   - groc/din/house/util/sub/tran/sal/xfer/phone/rec — category palette
@@ -18,7 +21,7 @@ const chipVariants = cva(
     {
         variants: {
             variant: {
-                default: 'bg-surface-hover text-text-muted',
+                default: 'bg-chip-neutral text-chip-neutral-text',
                 warn: 'bg-state-warning-soft text-state-warning',
                 flagged: 'bg-cat-rec-soft text-cat-rec-text',
                 groc: 'bg-cat-groc-soft text-cat-groc-text',

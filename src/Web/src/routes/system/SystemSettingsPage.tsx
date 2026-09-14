@@ -6,6 +6,7 @@ import { Breadcrumb } from '@/components/ui/Breadcrumb';
 import { MainArea, MainPane, TopBar } from '@/components/ui/SidebarLayout';
 
 import { AboutPanel } from './AboutPanel';
+import { AppearancePanel } from './AppearancePanel';
 import { BackupsPanel } from './BackupsPanel';
 import { MasterKeyPanel } from './MasterKeyPanel';
 import { McpSettingsPanel } from './McpSettingsPanel';
@@ -16,6 +17,7 @@ import { UsersPanel } from './UsersPanel';
 
 export type SystemTab =
     | 'about'
+    | 'appearance'
     | 'backups'
     | 'encryption'
     | 'mcp'
@@ -28,8 +30,8 @@ export type SystemTab =
  * System section agree with this page on what a valid tab is.
  */
 export function coerceSystemTab(value: unknown): SystemTab {
-    return value === 'backups' || value === 'encryption' || value === 'mcp'
-        || value === 'notifications' || value === 'users'
+    return value === 'appearance' || value === 'backups' || value === 'encryption'
+        || value === 'mcp' || value === 'notifications' || value === 'users'
         ? value
         : 'about';
 }
@@ -42,6 +44,9 @@ export function coerceSystemTab(value: unknown): SystemTab {
  * non-admins and the underlying APIs are RequireAdmin — this page is UX, not
  * the security boundary. Future system tabs slot in here.
  */
+/** Tabs every signed-in user gets, admin or not. */
+const OPEN_TABS: ReadonlySet<SystemTab> = new Set<SystemTab>(['about', 'appearance']);
+
 export function SystemSettingsPage() {
     const userQuery = useQuery({ queryKey: ['me'], queryFn: fetchCurrentUser });
     const isAdmin = userQuery.data?.isAdmin ?? false;
@@ -49,6 +54,8 @@ export function SystemSettingsPage() {
     const tabs: ReadonlyArray<{ id: SystemTab; label: string }> = isAdmin
         ? [
               { id: 'about', label: 'About' },
+              // Appearance sits with About as the two tabs everyone gets.
+              { id: 'appearance', label: 'Appearance' },
               // Encryption before Backups: the master key is what makes a backup's
               // sealed secrets portable, so it's the more fundamental of the two —
               // and its own tab, not a card under Backups (ADR-0092). The key wraps
@@ -63,7 +70,10 @@ export function SystemSettingsPage() {
               { id: 'notifications', label: 'Notifications' },
               { id: 'users', label: 'Users' },
           ]
-        : [{ id: 'about', label: 'About' }];
+        : [
+              { id: 'about', label: 'About' },
+              { id: 'appearance', label: 'Appearance' },
+          ];
 
     // The tab lives in the URL (ADR-0090), so it can be linked, bookmarked and
     // reached with the back button — and so the sidebar's System section can
@@ -77,9 +87,11 @@ export function SystemSettingsPage() {
     const search = useSearch({ strict: false }) as { tab?: string };
     const tab = coerceSystemTab(search.tab);
 
-    // If a non-admin somehow lands on an admin tab, fall back to About. The
+    // If a non-admin somehow lands on an ADMIN tab, fall back to About. The
     // underlying APIs are RequireAdmin; this is UX, not the security boundary.
-    const activeTab: SystemTab = tab !== 'about' && !isAdmin ? 'about' : tab;
+    // Listed as the open set rather than `!== 'about'`, so adding another
+    // everyone-tab does not silently make it admin-only.
+    const activeTab: SystemTab = OPEN_TABS.has(tab) || isAdmin ? tab : 'about';
 
     const setTab = (next: SystemTab) =>
         navigate({
@@ -133,6 +145,7 @@ export function SystemSettingsPage() {
                     </nav>
 
                     {activeTab === 'about' ? <AboutPanel /> : null}
+                    {activeTab === 'appearance' ? <AppearancePanel /> : null}
                     {activeTab === 'backups' && isAdmin ? <BackupsPanel /> : null}
                     {activeTab === 'encryption' && isAdmin ? <MasterKeyPanel /> : null}
                     {activeTab === 'notifications' && isAdmin ? (

@@ -34,7 +34,7 @@ export function RegisterStates({
             <div className="p-6">
                 <div
                     role="alert"
-                    className="rounded border border-state-danger/40 bg-state-danger-bg/40 p-4 text-sm text-state-danger"
+                    className="rounded border border-state-danger/40 bg-state-danger-soft/40 p-4 text-sm text-state-danger"
                 >
                     {registerErrorMessage(initialError)}
                 </div>

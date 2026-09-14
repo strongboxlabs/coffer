@@ -46,6 +46,7 @@ async function atResultStep(result: OfxImportResponse = IMPORTED) {
                 ledgerId="led-1"
                 accountId="acc-1"
                 accountName="Checking"
+                accountKind="bank"
                 onClose={vi.fn()}
                 onImported={vi.fn()}
                 onUndone={onUndone}
@@ -272,6 +273,7 @@ describe('ImportFileDialog, delimited path', () => {
                     ledgerId="led-1"
                     accountId="acc-1"
                     accountName="Checking"
+                    accountKind="bank"
                     onClose={vi.fn()}
                     onImported={vi.fn()}
                     onUndone={vi.fn()}
@@ -346,6 +348,34 @@ describe('ImportFileDialog, delimited path', () => {
         await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
     });
 
+    it("does not show the previous file's import failure over a new file's preview", async () => {
+        // Only the PREVIEW mutation was reset on Back and on picking a file, so a failed
+        // import outlived both. The next file previewed cleanly and rendered the last
+        // file's error underneath it, before Import had been pressed at all — a message
+        // about a file no longer on screen, clearing only on the next attempt.
+        const user = renderDialog();
+        vi.spyOn(apiModule, 'importCsv').mockRejectedValue(new Error('server said no'));
+        await upload(user, FOUR_COLUMN, 'statement-a.csv');
+
+        await screen.findByLabelText(/payee column/i);
+        await user.click(screen.getByRole('button', { name: /continue/i }));
+        await user.click(await screen.findByRole('button', { name: /import/i }));
+        expect((await screen.findByRole('alert')).textContent).toContain('server said no');
+
+        // Back to the mapping, back again to the picker, then a different file entirely.
+        // Both hops matter: the error survived each of them independently.
+        await user.click(screen.getByRole('button', { name: /back/i }));
+        await screen.findByLabelText(/payee column/i);
+        await user.click(screen.getByRole('button', { name: /back/i }));
+        await upload(user, THREE_COLUMN, 'statement-b.csv');
+        await user.click(await screen.findByRole('button', { name: /continue/i }));
+
+        // Anchored on the new preview having actually arrived — without this the
+        // assertion would pass on the frame before anything rendered.
+        await screen.findByRole('button', { name: /import/i });
+        expect(screen.queryByText(/server said no/i)).toBeNull();
+    });
+
     it('moves focus to each new step and names it', async () => {
         // Advancing unmounted the focused button and left activeElement on <body>,
         // which the modal's focus trap does not redirect — so the next Tab walked into
@@ -361,5 +391,197 @@ describe('ImportFileDialog, delimited path', () => {
         // so the transition is announced rather than silent.
         expect(heading.textContent).toMatch(/describe this file/i);
         await waitFor(() => expect(document.activeElement).toBe(heading));
+    });
+});
+
+/**
+ * Investment accounts import a BROKERAGE's own CSV; bank accounts describe a delimited
+ * file with a mapping. The two were one flow, which is how the generic bank mapping came
+ * to be offered on an investment account — where it cannot express shares, price or
+ * action, so it would not fail, it would post a share purchase as a cash withdrawal.
+ */
+describe('ImportFileDialog, split by account kind', () => {
+    const FIDELITY = [
+        '',
+        '',
+        'Run Date,Action,Symbol,Description,Type,Price ($),Quantity,Commission ($),'
+        + 'Fees ($),Accrued Interest ($),Amount ($),Cash Balance ($),Settlement Date',
+        '09/02/2026,YOU BOUGHT SAMPLE FUND (SMPL),SMPL,SAMPLE FUND,Cash,10.00,10,,,,'
+        + '-100.00,900.00,',
+    ].join('\n');
+
+    beforeEach(() => {
+        vi.restoreAllMocks();
+        vi.spyOn(apiModule, 'fetchCsvMappings').mockResolvedValue([]);
+    });
+
+    function renderFor(kind: 'bank' | 'investment', importProviderKey?: string | null) {
+        const queryClient = new QueryClient({
+            defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+        });
+        render(
+            <QueryClientProvider client={queryClient}>
+                <ImportFileDialog
+                    ledgerId="led-1"
+                    accountId="acc-1"
+                    accountName="Brokerage"
+                    accountKind={kind}
+                    importProviderKey={importProviderKey}
+                    onClose={vi.fn()}
+                    onImported={vi.fn()}
+                    onUndone={vi.fn()}
+                />
+            </QueryClientProvider>,
+        );
+        return userEvent.setup();
+    }
+
+    async function upload(user: ReturnType<typeof userEvent.setup>, body: string) {
+        await user.upload(
+            screen.getByLabelText('Statement file'),
+            new File([body], 'statement.csv', { type: 'text/csv' }),
+        );
+        await user.click(screen.getByRole('button', { name: /upload/i }));
+    }
+
+    it('offers the supported brokerages on an investment account, and says where the edge is', () => {
+        // The list is also how someone learns what is supported. Sniffing the file could
+        // never answer that: a Schwab holder would see only "could not read this file".
+        renderFor('investment');
+
+        expect(screen.getByRole('radio', { name: /fidelity/i })).toBeTruthy();
+        expect(screen.getByText(/other brokerages aren.t supported yet/i)).toBeTruthy();
+    });
+
+    it('offers no brokerage list on a bank account', () => {
+        renderFor('bank');
+
+        expect(screen.queryByRole('radio', { name: /fidelity/i })).toBeNull();
+    });
+
+    it('preselects the brokerage this account last imported with', () => {
+        // Saying "this account is at Fidelity" should be a once-only act; the server
+        // remembers it as a side effect of the import that said so.
+        renderFor('investment', 'csv-fidelity');
+
+        expect((screen.getByRole('radio', { name: /fidelity/i }) as HTMLInputElement).checked)
+            .toBe(true);
+    });
+
+    it('ignores a remembered provider it no longer recognises', () => {
+        // The key is written by whichever provider last ran. One later renamed or removed
+        // should leave the picker unselected rather than break the dialog.
+        renderFor('investment', 'csv-some-departed-brokerage');
+
+        expect((screen.getByRole('radio', { name: /fidelity/i }) as HTMLInputElement).checked)
+            .toBe(false);
+    });
+
+    it('sends an investment CSV to the brokerage provider, with no mapping step', () => {
+        // The brokerage's provider already knows the format. Asking the user to describe
+        // a file it can read would be asking a question with a known answer.
+        const preview = vi.spyOn(apiModule, 'previewFidelity').mockResolvedValue({
+            accounts: [{
+                providerAccountId: 'fidelity',
+                accountType: 'investment',
+                currency: null,
+                transactionCount: 1,
+                accountName: null,
+            }],
+            errors: [],
+        } as never);
+
+        return (async () => {
+            const user = renderFor('investment', 'csv-fidelity');
+            await upload(user, FIDELITY);
+
+            await waitFor(() => expect(preview).toHaveBeenCalled());
+            // Straight to the preview: no mapping wizard in between.
+            expect(screen.queryByLabelText(/^layout$/i)).toBeNull();
+            expect(screen.queryByLabelText(/date column/i)).toBeNull();
+        })();
+    });
+
+    it('imports through the chosen brokerage, not just previews through it', () => {
+        // Preview and import are separate calls, and only one of them was covered —
+        // so sending the import down the generic CSV path instead changed nothing any
+        // test could see.
+        vi.spyOn(apiModule, 'previewFidelity').mockResolvedValue({
+            accounts: [{
+                providerAccountId: 'fidelity',
+                accountType: 'investment',
+                currency: null,
+                transactionCount: 1,
+                accountName: null,
+            }],
+            errors: [],
+        } as never);
+        const doImport = vi.spyOn(apiModule, 'importFidelity').mockResolvedValue({
+            syncRunId: '11111111-1111-1111-1111-111111111111',
+            accountsDiscovered: 1,
+            transactionsForReview: 1,
+            alreadyKnown: 0,
+            errors: [],
+        } as never);
+        const generic = vi.spyOn(apiModule, 'importCsv');
+
+        return (async () => {
+            const user = renderFor('investment', 'csv-fidelity');
+            await upload(user, FIDELITY);
+
+            await user.click(await screen.findByRole('button', { name: /^import \d+ txn/i }));
+
+            await waitFor(() => expect(doImport).toHaveBeenCalled());
+            expect(generic).not.toHaveBeenCalled();
+            expect(doImport.mock.calls[0]![3]).toBe('fidelity');
+        })();
+    });
+
+    it('still sends a bank CSV through the mapping wizard', () => {
+        // The bank side is untouched by the split.
+        return (async () => {
+            const user = renderFor('bank');
+            await upload(user, 'a,b\n1,2\n');
+
+            expect(await screen.findByLabelText(/^layout$/i)).toBeTruthy();
+        })();
+    });
+
+    it('will not upload an investment CSV until a brokerage is chosen', () => {
+        // Refused on the pick step, not at preview time: uploading only to be told
+        // "choose the brokerage" is a round trip whose answer was already on screen.
+        return (async () => {
+            const user = renderFor('investment');
+            await user.upload(
+                screen.getByLabelText('Statement file'),
+                new File([FIDELITY], 'statement.csv', { type: 'text/csv' }),
+            );
+
+            const button = screen.getByRole('button', { name: /upload/i }) as HTMLButtonElement;
+            expect(button.disabled).toBe(true);
+            // ...and says why, rather than leaving a dead button unexplained.
+            expect((await screen.findByRole('alert')).textContent)
+                .toMatch(/choose the brokerage/i);
+
+            await user.click(screen.getByRole('radio', { name: /fidelity/i }));
+            expect((screen.getByRole('button', { name: /upload/i }) as HTMLButtonElement).disabled)
+                .toBe(false);
+        })();
+    });
+
+    it('does not demand a brokerage for a self-describing format', () => {
+        // OFX, QFX and QIF say what they are. Requiring a brokerage for them would be
+        // asking a question with no bearing on the answer.
+        return (async () => {
+            const user = renderFor('investment');
+            await user.upload(
+                screen.getByLabelText('Statement file'),
+                new File(['!Type:Invst'], 'export.qif', { type: 'application/octet-stream' }),
+            );
+
+            expect((screen.getByRole('button', { name: /upload/i }) as HTMLButtonElement).disabled)
+                .toBe(false);
+            expect(screen.queryByText(/choose the brokerage/i)).toBeNull();
+        })();
     });
 });

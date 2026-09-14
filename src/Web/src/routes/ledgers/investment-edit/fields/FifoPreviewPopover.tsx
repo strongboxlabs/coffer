@@ -66,7 +66,7 @@ export function FifoPreviewPopover({
             aria-label={isTransfer ? 'In-kind lot transfer preview' : 'FIFO lot consumption preview'}
         >
             <div className="mb-1 flex items-baseline justify-between">
-                <span className="font-semibold text-text-default">
+                <span className="font-semibold text-text">
                     {plan.consumed.length === 0
                         ? 'No open lots'
                         : `Will ${verb} ${plan.consumed.length} lot${plan.consumed.length === 1 ? '' : 's'}`}
@@ -86,7 +86,7 @@ export function FifoPreviewPopover({
                             <span>
                                 {fmt(c.qtyConsumed)}/{fmt(c.qtyAvailable)} sh @ {fmtUsd(c.unitCost)}
                             </span>
-                            <span className="text-text-default">
+                            <span className="text-text">
                                 {fmtUsd(c.basisClosed)}
                             </span>
                         </li>
@@ -94,7 +94,7 @@ export function FifoPreviewPopover({
                 </ul>
             ) : null}
 
-            <div className="mt-1 flex items-baseline justify-between border-t border-border pt-1 text-text-default">
+            <div className="mt-1 flex items-baseline justify-between border-t border-border pt-1 text-text">
                 <span>{isTransfer ? 'Total basis carried' : 'Total basis closed'}</span>
                 <span className="font-mono tabular-nums font-semibold">
                     {fmtUsd(plan.totalBasis)}

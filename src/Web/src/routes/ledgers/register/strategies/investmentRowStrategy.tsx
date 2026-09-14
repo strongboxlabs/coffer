@@ -43,7 +43,7 @@ function renderTxnBody(
     return (
         <>
             {/* Slot 3: date + tax-date subtitle */}
-            <span className="font-mono tabular-nums text-text-default">
+            <span className="font-mono tabular-nums text-text">
                 <span className="block">{dateText}</span>
                 {dateSubLabel ? (
                     <span className="block text-[0.6875rem] text-text-muted">
@@ -94,7 +94,7 @@ function renderTxnBody(
                 <span
                     className={
                         'block ' +
-                        (txn.amount < 0 ? 'text-text-default' : 'text-state-success')
+                        (txn.amount < 0 ? 'text-text' : 'text-state-success')
                     }
                 >
                     {amountText}
@@ -102,7 +102,7 @@ function renderTxnBody(
                 {amountSubtitle}
             </span>
             {/* Slot 9: balance after */}
-            <span className="text-right font-mono tabular-nums text-text-default">
+            <span className="text-right font-mono tabular-nums text-text">
                 {balanceText}
             </span>
         </>
@@ -127,7 +127,7 @@ function renderSplitParentBody(
     return (
         <>
             {/* Slot 3: date + tax-date subtitle */}
-            <span className="font-mono tabular-nums text-text-default">
+            <span className="font-mono tabular-nums text-text">
                 <span className="block">{dateText}</span>
                 {dateSubLabel ? (
                     <span className="block text-[0.6875rem] text-text-muted">
@@ -187,7 +187,7 @@ function renderSplitParentBody(
                 <span
                     className={
                         'block ' +
-                        (aggregate.amount < 0 ? 'text-text-default' : 'text-state-success')
+                        (aggregate.amount < 0 ? 'text-text' : 'text-state-success')
                     }
                 >
                     {amountText}
@@ -195,7 +195,7 @@ function renderSplitParentBody(
             </span>
             {/* Slot 9: REAL post-header balance (not a fabricated
                 per-leg step). */}
-            <span className="text-right font-mono tabular-nums text-text-default">
+            <span className="text-right font-mono tabular-nums text-text">
                 {balanceText}
             </span>
         </>
@@ -237,7 +237,7 @@ function renderSplitLegBody(
                 role="cell"
                 className={
                     'text-right font-mono tabular-nums ' +
-                    (leg.amount < 0 ? 'text-text-default/70' : 'text-state-success/70')
+                    (leg.amount < 0 ? 'text-text' : 'text-state-success')
                 }
             >
                 {formatSignedAmount(leg.amount, currency)}

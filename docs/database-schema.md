@@ -125,6 +125,7 @@ erDiagram
         uuid holdings_account_id FK
         text account_number
         text institution_name
+        text import_provider_key
         timestamptz last_simplefin_sync_at
         bool is_trade_commission
         text tax_status

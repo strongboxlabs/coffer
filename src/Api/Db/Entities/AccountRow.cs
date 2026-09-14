@@ -38,6 +38,17 @@ public sealed class AccountRow
     public string? TaxStatus { get; set; }
     public Guid? FeedConnectionId { get; init; }
     public string? ExternalId { get; init; }
+
+    /// <summary>
+    /// The file-import provider this account was last imported with (mig 223).
+    /// </summary>
+    /// <remarks>
+    /// A memory rather than a setting: the brokerage picker preselects it so saying
+    /// "this account is at Fidelity" is a once-only act. NULL until the first such
+    /// import, and an unrecognised value degrades to an unselected picker rather than
+    /// an error — the set of providers is owned by application code, not the schema.
+    /// </remarks>
+    public string? ImportProviderKey { get; init; }
     public bool IsSystem { get; init; }
     public Guid? HoldingsAccountId { get; init; }
     public string? Notes { get; init; }

@@ -19,6 +19,7 @@ import type {
 import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Modal';
 import { CsvMappingStep, type CsvMappingChoice } from './CsvMappingStep';
+import { BROKERAGES, brokerageFor, type Brokerage } from './brokerages';
 import { EMPTY_CSV_DRAFT, type CsvDraft } from './csvDraft';
 import { errorMessage } from '@/lib/errorMessage';
 
@@ -46,6 +47,8 @@ export function ImportFileDialog({
     onClose,
     onImported,
     onUndone,
+    accountKind,
+    importProviderKey,
 }: {
     ledgerId: string;
     accountId: string;
@@ -64,6 +67,16 @@ export function ImportFileDialog({
      * `['transactions', ledgerId]` is not a key anything registers.
      */
     onUndone: () => void;
+    /**
+     * Which register opened this. Investment accounts import a brokerage's own CSV via
+     * a per-brokerage provider; bank accounts describe a delimited file with a mapping.
+     * Offering both everywhere is what made the generic bank mapping available on an
+     * investment account, where it cannot express shares, price or action — so it would
+     * not fail, it would post a share purchase as a cash withdrawal.
+     */
+    accountKind: 'bank' | 'investment';
+    /** The provider this account last imported with (mig 223), to preselect. */
+    importProviderKey?: string | null;
 }) {
     // A delimited file cannot be previewed until something says how to read it, so it
     // gets a step the other formats skip. OFX and QIF describe themselves.
@@ -88,6 +101,11 @@ export function ImportFileDialog({
     // every answer with it. Back from a bad preview used to land on the file picker
     // with nothing kept, so there was no route back to the mapping that caused it.
     const [csvDraft, setCsvDraft] = useState<CsvDraft>(EMPTY_CSV_DRAFT);
+    // Preselected from what this account last imported with, so saying "this account is
+    // at Fidelity" is a once-only act. A single supported brokerage is still SHOWN
+    // rather than assumed: the list is also how someone learns what is supported.
+    const [brokerage, setBrokerage] = useState<Brokerage | null>(
+        () => brokerageFor(importProviderKey));
     const headingRef = useRef<HTMLHeadingElement | null>(null);
 
     const previewMutation = useMutation({
@@ -97,6 +115,12 @@ export function ImportFileDialog({
         mutationFn: (): Promise<OfxPreviewResponse> => {
             if (file === null) throw new Error('No file selected.');
             if (isDelimited(file)) {
+                // An investment account's delimited file is a brokerage export, read by
+                // that brokerage's provider; there is no mapping to choose.
+                if (accountKind === 'investment') {
+                    if (brokerage === null) throw new Error('Choose the brokerage this file came from.');
+                    return brokerage.preview(ledgerId, file);
+                }
                 if (csvMapping === null) throw new Error('Choose or write a mapping first.');
                 return previewCsv(ledgerId, file, csvMapping);
             }
@@ -119,6 +143,10 @@ export function ImportFileDialog({
                 throw new Error('Pick an account from the file.');
             }
             if (isDelimited(file)) {
+                if (accountKind === 'investment') {
+                    if (brokerage === null) throw new Error('Choose the brokerage this file came from.');
+                    return brokerage.import(ledgerId, file, accountId, selectedProviderId);
+                }
                 if (csvMapping === null) throw new Error('Choose or write a mapping first.');
                 return importCsv(
                     ledgerId, file, accountId, selectedProviderId, csvMapping);
@@ -149,9 +177,22 @@ export function ImportFileDialog({
         setCsvMapping(null);
         setCsvDraft(EMPTY_CSV_DRAFT);
         setStep({ name: 'pick' });
+        clearAttempt();
+        if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+
+    /**
+     * Both failures belong to ONE attempt at ONE file, so they expire together.
+     *
+     * Resetting only the preview left a failed import's error alive across Back and
+     * across picking a different file: the next file previewed fine and rendered the
+     * previous file's failure underneath it, before Import had been pressed at all. It
+     * cleared only on the next mutate(), so the message on screen was about a file the
+     * user could no longer see.
+     */
+    function clearAttempt() {
         previewMutation.reset();
         importMutation.reset();
-        if (fileInputRef.current) fileInputRef.current.value = '';
     }
 
     /**
@@ -223,6 +264,9 @@ export function ImportFileDialog({
 
             {step.name === 'pick' ? (
                 <PickStep
+                    accountKind={accountKind}
+                    brokerage={brokerage}
+                    onPickBrokerage={setBrokerage}
                     file={file}
                     onPickFile={(picked) => {
                         setFile(picked);
@@ -232,7 +276,7 @@ export function ImportFileDialog({
                         // garbage, with nothing on screen naming what produced it.
                         setCsvMapping(null);
                         setCsvDraft(EMPTY_CSV_DRAFT);
-                        previewMutation.reset();
+                        clearAttempt();
                     }}
                     fileInputRef={fileInputRef}
                     previewing={previewMutation.isPending}
@@ -244,8 +288,10 @@ export function ImportFileDialog({
                     onCancel={onClose}
                     onUpload={() => {
                         // A delimited file has nothing to preview until a mapping says
-                        // how to read it; every other format describes itself.
-                        if (file !== null && isDelimited(file)) {
+                        // how to read it; every other format describes itself. A
+                        // brokerage export is the third case: its provider already knows
+                        // the format, so it needs no mapping step at all.
+                        if (file !== null && isDelimited(file) && accountKind === 'bank') {
                             setStep({ name: 'mapping' });
                             return;
                         }
@@ -276,7 +322,7 @@ export function ImportFileDialog({
                         // every route to the picker went through this handler, so
                         // deleting the real rule changed nothing a test could see.
                         setStep({ name: 'pick' });
-                        previewMutation.reset();
+                        clearAttempt();
                     }}
                     onCancel={onClose}
                 />
@@ -299,10 +345,10 @@ export function ImportFileDialog({
                         // MAPPING for a delimited file. It went to the file picker, and
                         // the picker looked untouched — same filename, same size — so
                         // nothing said the wizard's answers had just been thrown away.
-                        setStep(file !== null && isDelimited(file)
+                        setStep(file !== null && isDelimited(file) && accountKind === 'bank'
                             ? { name: 'mapping' }
                             : { name: 'pick' });
-                        previewMutation.reset();
+                        clearAttempt();
                     }}
                     onCancel={onClose}
                     onImport={() => importMutation.mutate()}
@@ -347,8 +393,12 @@ function canImport(account: OfxPreviewAccount): boolean {
 }
 
 function PickStep({
+    accountKind, brokerage, onPickBrokerage,
     file, onPickFile, fileInputRef, previewing, previewError, onCancel, onUpload,
 }: {
+    accountKind: 'bank' | 'investment';
+    brokerage: Brokerage | null;
+    onPickBrokerage: (b: Brokerage | null) => void;
     file: File | null;
     onPickFile: (file: File | null) => void;
     fileInputRef: React.MutableRefObject<HTMLInputElement | null>;
@@ -357,15 +407,60 @@ function PickStep({
     onCancel: () => void;
     onUpload: () => void;
 }) {
+    // A brokerage is needed only for a CSV: OFX, QFX and QIF describe themselves, and
+    // demanding one for them would be asking a question with no bearing on the answer.
+    const needsBrokerage = accountKind === 'investment'
+        && file !== null
+        && isDelimited(file)
+        && brokerage === null;
+
     return (
         <>
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
                 <p className="text-sm text-text-muted">
-                    Choose a statement file exported from your bank,
-                    brokerage, or retirement-plan provider. Supported
-                    formats: OFX, QFX, QIF, and delimited text (CSV/TSV), which
-                    needs a mapping describing its columns.
+                    {accountKind === 'investment'
+                        ? 'Choose a statement file exported from your brokerage or '
+                          + 'retirement-plan provider. Supported formats: OFX, QFX, QIF, '
+                          + 'and CSV from the brokerages listed below.'
+                        : 'Choose a statement file exported from your bank, brokerage, or '
+                          + 'retirement-plan provider. Supported formats: OFX, QFX, QIF, '
+                          + 'and delimited text (CSV/TSV), which needs a mapping '
+                          + 'describing its columns.'}
                 </p>
+
+                {accountKind === 'investment' ? (
+                    <fieldset className="rounded border border-border p-3">
+                        <legend className="px-1 text-xs text-text-muted">
+                            If the file is a CSV, which brokerage is it from?
+                        </legend>
+                        <div className="space-y-2">
+                            {BROKERAGES.map((b) => (
+                                <label key={b.key} className="flex items-start gap-2 text-sm">
+                                    <input
+                                        type="radio"
+                                        className="mt-1"
+                                        name="brokerage"
+                                        checked={brokerage?.key === b.key}
+                                        onChange={() => onPickBrokerage(b)}
+                                    />
+                                    <span>
+                                        {b.label}
+                                        <span className="block text-xs text-text-muted">
+                                            Their “{b.exportName}” export.
+                                        </span>
+                                    </span>
+                                </label>
+                            ))}
+                        </div>
+                        {/* Says where the boundary is. Someone holding an export from
+                            somewhere else otherwise learns only that their file could
+                            not be read, which is indistinguishable from a bug. */}
+                        <p className="mt-2 text-xs text-text-subtle">
+                            Other brokerages aren&rsquo;t supported yet. OFX, QFX and QIF
+                            files work from any provider.
+                        </p>
+                    </fieldset>
+                ) : null}
                 <div>
                     {/* The prose above describes the control but is not tied to it,
                         so this input had no accessible name — nothing to announce
@@ -384,6 +479,11 @@ function PickStep({
                         </p>
                     ) : null}
                 </div>
+                {needsBrokerage ? (
+                    <p role="alert" className="text-xs text-state-warning">
+                        Choose the brokerage this CSV came from before uploading.
+                    </p>
+                ) : null}
                 <p className="text-xs text-text-subtle">Maximum file size: 5 MB.</p>
                 {previewError !== null ? (
                     <p role="alert" className="text-xs text-state-danger">
@@ -400,7 +500,10 @@ function PickStep({
                     variant="primary"
                     size="sm"
                     onClick={onUpload}
-                    disabled={file === null || previewing}
+                    // Refused HERE rather than at preview time. Uploading only to be
+                    // told "choose the brokerage" is a round trip whose answer was
+                    // already on screen.
+                    disabled={file === null || previewing || needsBrokerage}
                 >
                     {previewing ? 'Uploading…' : 'Upload & preview →'}
                 </Button>

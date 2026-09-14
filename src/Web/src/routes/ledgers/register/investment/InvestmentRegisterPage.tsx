@@ -1035,6 +1035,8 @@ export function InvestmentRegisterPage() {
                     ledgerId={ledgerId}
                     accountId={accountId}
                     accountName={account.name}
+                    accountKind="investment"
+                    importProviderKey={account.importProviderKey}
                     onClose={() => setImportDialogOpen(false)}
                     onImported={refreshAfterImportChange}
                     // Undo moves the same rows, so it needs the same refresh —
@@ -1569,7 +1571,7 @@ function RawDataModal({
                         Close
                     </button>
                 </div>
-                <pre className="flex-1 overflow-auto rounded bg-surface-muted p-3 text-[0.6875rem] font-mono leading-tight text-text-default">
+                <pre className="flex-1 overflow-auto rounded bg-surface-muted p-3 text-[0.6875rem] font-mono leading-tight text-text">
                     {json}
                 </pre>
                 <div className="flex justify-end">

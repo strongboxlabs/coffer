@@ -1,8 +1,11 @@
 // QIF file-upload endpoints (ADR-0042). Multipart, mirroring
-// `ofx.ts`. When a third multipart surface lands, the shared
-// upload helper noted in ofx.ts should move to `_request.ts`.
+// `ofx.ts`. The third surface landed (Fidelity, ADR-0031 Phase 6),
+// so the form builder moved to `upload.ts` as this note asked —
+// and the local `uploadMultipart` went with it, having been a
+// reinvention of `_request.ts`'s `requestMultipart` all along.
 
-import { ApiError } from './_request';
+import { requestMultipart } from './_request';
+import { buildFormData } from './upload';
 import type {
     QifImportResponse,
     QifPreviewResponse,
@@ -15,9 +18,9 @@ export async function previewQif(
     ledgerId: string,
     file: Blob,
 ): Promise<QifPreviewResponse> {
-    return uploadMultipart<QifPreviewResponse>(
+    return requestMultipart<QifPreviewResponse>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/ingest/qif/preview`,
-        buildFormData({ file }),
+        buildFormData({ file }, 'upload.qif'),
     );
 }
 
@@ -30,64 +33,8 @@ export async function importQif(
     accountId: string,
     providerAccountId: string,
 ): Promise<QifImportResponse> {
-    return uploadMultipart<QifImportResponse>(
+    return requestMultipart<QifImportResponse>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/ingest/qif/import`,
-        buildFormData({ file, accountId, providerAccountId }),
+        buildFormData({ file, accountId, providerAccountId }, 'upload.qif'),
     );
-}
-
-function buildFormData(fields: {
-    file: Blob;
-    accountId?: string;
-    providerAccountId?: string;
-}): FormData {
-    const form = new FormData();
-    // Filename is required by the API's IFormFile binding even
-    // though the parser doesn't read it.
-    form.append('file', fields.file, 'upload.qif');
-    if (fields.accountId !== undefined) {
-        form.append('accountId', fields.accountId);
-    }
-    if (fields.providerAccountId !== undefined) {
-        form.append('providerAccountId', fields.providerAccountId);
-    }
-    return form;
-}
-
-async function uploadMultipart<T>(path: string, body: FormData): Promise<T> {
-    // Content-Type intentionally unset — the browser adds the
-    // multipart boundary; setting it manually strips the boundary.
-    const response = await fetch(path, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { Accept: 'application/json' },
-        body,
-    });
-    if (!response.ok) {
-        throw await buildApiError(response);
-    }
-    return (await response.json()) as T;
-}
-
-async function buildApiError(response: Response): Promise<ApiError> {
-    let code: string | undefined;
-    let detail = response.statusText || `HTTP ${response.status}`;
-    try {
-        const body = (await response.json()) as {
-            detail?: string;
-            title?: string;
-            code?: string;
-        };
-        if (typeof body.detail === 'string' && body.detail.length > 0) {
-            detail = body.detail;
-        } else if (typeof body.title === 'string' && body.title.length > 0) {
-            detail = body.title;
-        }
-        if (typeof body.code === 'string') {
-            code = body.code;
-        }
-    } catch {
-        // Body wasn't JSON; status-text fallback stays.
-    }
-    return new ApiError(response.status, detail, code);
 }

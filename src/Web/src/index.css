@@ -11,8 +11,14 @@
  *   --color-state-{name}    — semantic data state (success, warning, danger)
  *   --color-cat-{slug}      — category palette (groceries, dining, …)
  *
- * Light theme only per ADR-0021 Rule 4; dark mode is a future ADR + PR
- * that overrides these tokens inside a [data-theme="dark"] block.
+ * This block IS the light theme. The other three live in the [data-theme]
+ * blocks at the foot of this file (ADR-0021 Rule 4, revised).
+ *
+ * A `-soft` fill is a TINT OF ITS OWN SURFACE, not a saturated swatch: same
+ * hue and saturation as the strong colour it carries, lightness solved so its
+ * distance from the surface matches across themes. Taking dark's fills from
+ * Tailwind's 900 swatches instead put the cleared badge 1.61 from its surface
+ * where light sits at 1.10 — passing AA the whole time, and still wrong.
  */
 @theme {
     /* Fonts — Inter for prose + UI, JetBrains Mono for numbers. */
@@ -51,9 +57,13 @@
     --color-text-subtle: #64748b;
     --color-text-inverse: #f8fafc;
 
-    /* Accent — slate teal (teal-600). Single accent per ADR-0021 Rule 4. */
-    --color-accent: #0d9488;
-    --color-accent-hover: #0f766e;
+    /* Accent — slate teal. Single accent per ADR-0021 Rule 4.
+       teal-700, NOT teal-600: #0d9488 is only 3.74:1 as text on the white
+       surface and 3.58:1 under a white button label, and Button is text-sm
+       so there is no large-text allowance. teal-700 clears both (5.47 /
+       5.23) without changing the shape of anything. */
+    --color-accent: #0f766e;
+    --color-accent-hover: #115e59;
     --color-accent-soft: #ccfbf1;
     --color-accent-soft-text: #0f766e;
 
@@ -64,6 +74,14 @@
     --color-state-warning-soft: #fef3c7;
     --color-state-danger: #b91c1c;
     --color-state-danger-soft: #fee2e2;
+
+    /* Neutral chip fill — tags, and any chip with no palette colour.
+       Chip.tsx read bg-surface-hover / text-text-muted directly. That is
+       right on light, but on a dark ground surface-hover has to get LIGHTER
+       to read as hover, which drags the chip away from muted text: one token
+       doing two jobs. Split out so each theme sets the chip independently. */
+    --color-chip-neutral: #e2e8f0;
+    --color-chip-neutral-text: #475569;
 
     /* Category palette — ADR-0021 Rule 5. */
     --color-cat-groc-soft: #fff7ed;
@@ -93,7 +111,8 @@
  *
  *   color-scheme:light tells the browser to use light-mode form
  *   controls + scrollbars (so a user with dark system pref doesn't see
- *   dark scrollbars on our light app). Update when dark mode lands.
+ *   dark scrollbars on our light app). Each [data-theme] block below
+ *   sets its own.
  *
  *   font-feature-settings turns on tabular numerals globally on the
  *   sans font, so KPI values + amount sums line up without forcing
@@ -103,3 +122,278 @@
     color-scheme: light;
     font-feature-settings: "tnum" 1;
 }
+
+/*
+ * Theme overrides — ADR-0021 Rule 4 (revised).
+ *
+ * The @theme block above IS the light theme, but `data-theme="light"` still
+ * restates it in full, so the attribute composes: a preview swatch nested
+ * inside a dark page can carry data-theme="light" and actually look light.
+ * The other blocks redefine only the tokens that move. Tailwind v4
+ * emits `color: var(--color-x)` rather than the literal, so redefining the
+ * custom property on an ancestor re-themes every utility for free.
+ *
+ * Every pair these produce is audited against WCAG AA (4.5:1) — including
+ * the composited row-state fills, where the register does its real work.
+ * Do not hand-edit a value here without re-running that audit.
+ */
+
+/* The default. Restated in full rather than left to the @theme
+   block, so that data-theme composes — see the header note. */
+[data-theme="light"] {
+    color-scheme: light;
+
+    /* Surfaces */
+    --color-surface: #ffffff;
+    --color-surface-muted: #f8fafc;
+    --color-surface-hover: #e2e8f0;
+    --color-surface-header: #f1f5f9;
+    --color-surface-sidebar: #ffffff;
+
+    /* Borders */
+    --color-border: #cbd5e1;
+    --color-border-strong: #94a3b8;
+
+    /* Text */
+    --color-text: #0f172a;
+    --color-text-muted: #475569;
+    --color-text-subtle: #64748b;
+    --color-text-inverse: #f8fafc;
+
+    /* Accent */
+    --color-accent: #0f766e;
+    --color-accent-hover: #115e59;
+    --color-accent-soft: #ccfbf1;
+    --color-accent-soft-text: #0f766e;
+
+    /* Data state */
+    --color-state-success: #15803d;
+    --color-state-success-soft: #dcfce7;
+    --color-state-warning: #92400e;
+    --color-state-warning-soft: #fef3c7;
+    --color-state-danger: #b91c1c;
+    --color-state-danger-soft: #fee2e2;
+
+    /* Category palette */
+    --color-cat-groc-soft: #fff7ed;
+    --color-cat-groc-text: #9a3412;
+    --color-cat-din-soft: #faf5ff;
+    --color-cat-din-text: #6b21a8;
+    --color-cat-house-soft: #eff6ff;
+    --color-cat-house-text: #1d4ed8;
+    --color-cat-util-soft: #fffbeb;
+    --color-cat-util-text: #92400e;
+    --color-cat-sub-soft: #eef2ff;
+    --color-cat-sub-text: #4338ca;
+    --color-cat-tran-soft: #ecfeff;
+    --color-cat-tran-text: #155e75;
+    --color-cat-sal-soft: #ecfdf5;
+    --color-cat-sal-text: #047857;
+    --color-cat-xfer-soft: #f1f5f9;
+    --color-cat-xfer-text: #475569;
+    --color-cat-phone-soft: #f0f9ff;
+    --color-cat-phone-text: #075985;
+    --color-cat-rec-soft: #fdf2f8;
+    --color-cat-rec-text: #9d174d;
+
+    /* Neutral chip — see the @theme note */
+    --color-chip-neutral: #e2e8f0;
+    --color-chip-neutral-text: #475569;
+}
+
+/* Light, high contrast. Separators to slate-400 and ink to
+   slate-950 — on a white ground, punch is the ink and separator
+   ramp, not the accent. State and category fills go up one step
+   so the tinted row states keep pace. */
+[data-theme="light-hc"] {
+    color-scheme: light;
+
+    /* Surfaces */
+    --color-surface: #ffffff;
+    --color-surface-muted: #f8fafc;
+    --color-surface-hover: #cbd5e1;
+    --color-surface-header: #e2e8f0;
+    --color-surface-sidebar: #ffffff;
+
+    /* Borders */
+    --color-border: #94a3b8;
+    --color-border-strong: #64748b;
+
+    /* Text */
+    --color-text: #020617;
+    --color-text-muted: #334155;
+    --color-text-subtle: #475569;
+    --color-text-inverse: #f8fafc;
+
+    /* Accent */
+    --color-accent: #115e59;
+    --color-accent-hover: #134e4a;
+    --color-accent-soft: #99f6e4;
+    --color-accent-soft-text: #115e59;
+
+    /* Data state */
+    --color-state-success: #166534;
+    --color-state-success-soft: #bbf7d0;
+    --color-state-warning: #7c2d12;
+    --color-state-warning-soft: #fde68a;
+    --color-state-danger: #991b1b;
+    --color-state-danger-soft: #fecaca;
+
+    /* Category palette */
+    --color-cat-groc-soft: #fed7aa;
+    --color-cat-groc-text: #7c2d12;
+    --color-cat-din-soft: #e9d5ff;
+    --color-cat-din-text: #581c87;
+    --color-cat-house-soft: #bfdbfe;
+    --color-cat-house-text: #1e40af;
+    --color-cat-util-soft: #fde68a;
+    --color-cat-util-text: #78350f;
+    --color-cat-sub-soft: #c7d2fe;
+    --color-cat-sub-text: #3730a3;
+    --color-cat-tran-soft: #a5f3fc;
+    --color-cat-tran-text: #164e63;
+    --color-cat-sal-soft: #a7f3d0;
+    --color-cat-sal-text: #065f46;
+    --color-cat-xfer-soft: #cbd5e1;
+    --color-cat-xfer-text: #334155;
+    --color-cat-phone-soft: #bae6fd;
+    --color-cat-phone-text: #0c4a6e;
+    --color-cat-rec-soft: #fbcfe8;
+    --color-cat-rec-text: #831843;
+
+    /* Neutral chip — see the @theme note */
+    --color-chip-neutral: #cbd5e1;
+    --color-chip-neutral-text: #334155;
+}
+
+/* Dark. Slate-800 ground. Note the header band and canvas go
+   DARKER than the surface, the reverse of light: on a dark ground a
+   recessed band reads as chrome, and lifting it the way light does
+   leaves muted text at 4.04:1 on it. */
+[data-theme="dark"] {
+    color-scheme: dark;
+
+    /* Surfaces */
+    --color-surface: #1e293b;
+    --color-surface-muted: #0f172a;
+    --color-surface-hover: #334155;
+    --color-surface-header: #0f172a;
+    --color-surface-sidebar: #1e293b;
+
+    /* Borders */
+    --color-border: #475569;
+    --color-border-strong: #64748b;
+
+    /* Text */
+    --color-text: #e2e8f0;
+    --color-text-muted: #94a3b8;
+    --color-text-subtle: #8595a9;
+    --color-text-inverse: #020617;
+
+    /* Accent */
+    --color-accent: #2dd4bf;
+    --color-accent-hover: #5eead4;
+    --color-accent-soft: #103732;
+    --color-accent-soft-text: #5eead4;
+
+    /* Data state */
+    --color-state-success: #4ade80;
+    --color-state-success-soft: #11391f;
+    --color-state-warning: #fbbf24;
+    --color-state-warning-soft: #3d3112;
+    --color-state-danger: #fca5a5;
+    --color-state-danger-soft: #5d1b1b;
+
+    /* Category palette */
+    --color-cat-groc-soft: #3f2912;
+    --color-cat-groc-text: #fdba74;
+    --color-cat-din-soft: #3e1c61;
+    --color-cat-din-text: #d8b4fe;
+    --color-cat-house-soft: #162f4b;
+    --color-cat-house-text: #93c5fd;
+    --color-cat-util-soft: #372e10;
+    --color-cat-util-text: #fcd34d;
+    --color-cat-sub-soft: #1d2963;
+    --color-cat-sub-text: #a5b4fc;
+    --color-cat-tran-soft: #103337;
+    --color-cat-tran-text: #67e8f9;
+    --color-cat-sal-soft: #0f3526;
+    --color-cat-sal-text: #6ee7b7;
+    --color-cat-xfer-soft: #232f3d;
+    --color-cat-xfer-text: #cbd5e1;
+    --color-cat-phone-soft: #12313f;
+    --color-cat-phone-text: #7dd3fc;
+    --color-cat-rec-soft: #511837;
+    --color-cat-rec-text: #f9a8d4;
+
+    /* Neutral chip — see the @theme note */
+    --color-chip-neutral: #0f172a;
+    --color-chip-neutral-text: #cbd5e1;
+}
+
+/* Dark, high contrast. Drops the ground to slate-900 on a
+   slate-950 canvas and lifts the ink ramp a step. slate-500 as
+   text-subtle is only 3.75:1 on slate-900, so the third level
+   moves to slate-400 rather than the ramp losing a step. */
+[data-theme="dark-hc"] {
+    color-scheme: dark;
+
+    /* Surfaces */
+    --color-surface: #0f172a;
+    --color-surface-muted: #020617;
+    --color-surface-hover: #1e293b;
+    --color-surface-header: #1e293b;
+    --color-surface-sidebar: #0f172a;
+
+    /* Borders */
+    --color-border: #475569;
+    --color-border-strong: #94a3b8;
+
+    /* Text */
+    --color-text: #f1f5f9;
+    --color-text-muted: #cbd5e1;
+    --color-text-subtle: #94a3b8;
+    --color-text-inverse: #020617;
+
+    /* Accent */
+    --color-accent: #2dd4bf;
+    --color-accent-hover: #5eead4;
+    --color-accent-soft: #0b2824;
+    --color-accent-soft-text: #5eead4;
+
+    /* Data state */
+    --color-state-success: #4ade80;
+    --color-state-success-soft: #0b2816;
+    --color-state-warning: #fbbf24;
+    --color-state-warning-soft: #2b230d;
+    --color-state-danger: #f87171;
+    --color-state-danger-soft: #431414;
+
+    /* Category palette */
+    --color-cat-groc-soft: #2a1b0c;
+    --color-cat-groc-text: #fdba74;
+    --color-cat-din-soft: #291341;
+    --color-cat-din-text: #d8b4fe;
+    --color-cat-house-soft: #0e1f31;
+    --color-cat-house-text: #93c5fd;
+    --color-cat-util-soft: #241e0a;
+    --color-cat-util-text: #fcd34d;
+    --color-cat-sub-soft: #131b41;
+    --color-cat-sub-text: #a5b4fc;
+    --color-cat-tran-soft: #0a2124;
+    --color-cat-tran-text: #67e8f9;
+    --color-cat-sal-soft: #0a2218;
+    --color-cat-sal-text: #6ee7b7;
+    --color-cat-xfer-soft: #171f28;
+    --color-cat-xfer-text: #cbd5e1;
+    --color-cat-phone-soft: #0c202a;
+    --color-cat-phone-text: #7dd3fc;
+    --color-cat-rec-soft: #371025;
+    --color-cat-rec-text: #f9a8d4;
+
+    /* Neutral chip — see the @theme note */
+    --color-chip-neutral: #020617;
+    --color-chip-neutral-text: #cbd5e1;
+}
+
+@import "./styles/themes.generated.css";

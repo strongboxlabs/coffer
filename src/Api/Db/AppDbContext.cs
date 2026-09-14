@@ -615,6 +615,7 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.TaxStatus).HasColumnName("tax_status");   // ADR-0066 / mig 149
             b.Property(x => x.FeedConnectionId).HasColumnName("feed_connection_id");
             b.Property(x => x.ExternalId).HasColumnName("external_id");
+            b.Property(x => x.ImportProviderKey).HasColumnName("import_provider_key");
             b.Property(x => x.IsSystem).HasColumnName("is_system");
             b.Property(x => x.HoldingsAccountId).HasColumnName("holdings_account_id");
             b.Property(x => x.Notes).HasColumnName("notes");

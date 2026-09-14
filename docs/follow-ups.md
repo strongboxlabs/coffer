@@ -434,10 +434,10 @@ cash distribution like `RETOFCAP`. So the workplace-plan route needs no new prov
 mapping wizard and no schema, and this slice keeps only Macy's and the Fidelity brokerage
 CSV.
 
-**Still owed: confirmation against a real NetBenefits export.** The rows import and the
-signs are pinned by test, but whether a whole plan statement round-trips faithfully — an
-account that reconciles to the plan's own balance — is a different question, and no
-synthetic fixture can answer it.
+**Confirmed against a real NetBenefits export (2026-09-11).** The maintainer reports the
+QIF route works: "NetBenefits provides QIF and works fine". The workplace-plan question
+is closed — no new provider, no mapping wizard, no schema. What remains of this slice is
+the brokerage CSV below.
 
 ### 3 · Splits
 
@@ -866,6 +866,49 @@ posted date when `transactedAt !== postedAt`. The remaining UX loop:
   line 2) takes the spot that on bank shows tax date, so tax date
   on investment rows is currently invisible — needs its own
   treatment.
+
+#### The same transaction arriving from two sources imports twice
+
+*open. Surfaced 2026-09-12 by the first real Fidelity brokerage import, against an
+account whose 401(k) rollover had already been imported from NetBenefits QIF.*
+
+Nine rollover legs and a $51,129.88 core-account purchase imported a second time,
+matching existing rows to the cent. Nothing detected it, nothing warned, and the
+duplicates sit in the register beside the originals.
+
+**This is the "no dedup" decision (2026-09-04) meeting a case it did not consider.**
+That decision is still right for what it examined: CSV rows carry no issuer-assigned
+id, content cannot separate two genuinely identical transactions, and UNDO is an exact
+recovery needing no inference. What it assumed was ONE source per account — where
+re-importing the same file is the only overlap, and undo covers it.
+
+A rollover has two sources by nature. The 401(k) plan describes the money leaving
+(NetBenefits QIF) and the brokerage describes it arriving (Fidelity CSV), and both are
+legitimate imports the user wants. Undo does not help: neither import is the mistake.
+
+**What makes it hard, in the order it bites.**
+
+- *The dates disagreed*, by one day — Fidelity's Run Date is when it processed, the
+  plan's is when it happened. FIXED: the shim now reads the `as of <date>` Fidelity
+  splices into the Action text. That removes a red herring; the rows now land on the
+  same day as their twins, which makes the duplication visible rather than solving it.
+- *The amounts match to the cent, and legitimately so.* Nine rollover legs of
+  $4.40 / $146.57 / $437.45 … are nine separate movements that happen to arrive
+  together. Any content hash collapses genuine repeats.
+- *The two sides are not the same shape.* The plan's side is a withdrawal from a
+  401(k); the brokerage's is cash arriving with no counter-account, because a brokerage
+  file cannot know where the money came from. They are the same EVENT, not the same row.
+
+**Not obviously a dedup problem at all.** The register already shows the right answer
+for the existing rows: they carry a counter-account (`Fidelity Koniag 401(K)`) and read
+as `Xfr`. The imported ones have no counterpart and never will from the file alone. So
+the shape of a fix may be "offer to match an imported row against an existing one and
+merge them into a transfer" rather than "refuse the import" — which is a reconciliation
+surface, not a parser change.
+
+**Not scheduled.** It needs the maintainer's call on which of those it is, and it is not
+worth guessing at: getting it wrong silently either drops real transactions or leaves
+paired ones unpaired, and both are worse than the visible duplicates that exist today.
 
 #### A 422 from an import endpoint loses the problem list it carried
 

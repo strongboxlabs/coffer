@@ -403,7 +403,7 @@ export function AccountCategoryPicker({
                                     className={cn(
                                         'rounded px-2 py-0.5 text-[0.6875rem] font-medium',
                                         domain === d
-                                            ? 'bg-accent text-on-accent'
+                                            ? 'bg-accent text-text-inverse'
                                             : 'text-text-muted hover:bg-surface-hover',
                                     )}
                                 >

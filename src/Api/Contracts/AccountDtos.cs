@@ -45,7 +45,13 @@ public sealed record AccountSummary(
     // ADR-0050: the account's institution label (nullable). Surfaced
     // now that the account editor needs to prefill + edit it; null on
     // categories + accounts with no institution recorded.
-    string? InstitutionName);
+    string? InstitutionName,
+    // Migration 223: the file-import provider this account was last
+    // imported with, so the brokerage picker can preselect it. NULL
+    // until the first such import, and an unrecognised value simply
+    // leaves the picker unselected — the set of providers is owned by
+    // application code, not by the schema.
+    string? ImportProviderKey);
 
 /// <summary>
 /// Body for <c>POST /api/ledgers/{ledgerId}/accounts</c> — create an account

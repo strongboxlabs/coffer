@@ -844,6 +844,14 @@ public sealed class IngestOrchestrator
                 // provider_security_mapping with the same key the
                 // next ingest will look up.
                 IngestSecurityTickerHint = t.SecurityTickerHint,
+                // Parity with the pull path, which has always written this. No FILE
+                // provider populated RawProviderPayload until the brokerage shims
+                // (ADR-0098) — OFX and QIF both pass null — so this line was never
+                // missed, and the trail a shim builds was computed and then dropped on
+                // the floor for every row. It is the whole provenance story for a
+                // converted format: the CSV line a row came from and the QIF record it
+                // became, which is what anyone asking "why is this a buy?" needs.
+                ProviderRawPayload = t.RawProviderPayload,
             });
             _db.TxnLegs.Add(new TxnLegRow
             {
@@ -940,7 +948,24 @@ public sealed class IngestOrchestrator
     /// <param name="ProviderKey">Specific provider tag persisted to
     /// <c>txn_headers.provider_key</c> — e.g. <c>ofx</c>,
     /// <c>csv</c>.</param>
-    private readonly record struct FileOriginMetadata(string Origin, string ProviderKey);
+    /// <summary>
+    /// What a file import writes to <c>txn_headers</c>. Internal rather than private so
+    /// the completeness guard can read it; see <see cref="OriginRegistry"/>.
+    /// </summary>
+    internal readonly record struct FileOriginMetadata(string Origin, string ProviderKey);
+
+    /// <summary>
+    /// Every file provider's origin metadata, exposed so a test can prove the map is
+    /// complete.
+    /// </summary>
+    /// <remarks>
+    /// Registering a provider in DI without adding it here compiles, starts, previews
+    /// and then throws at IMPORT — after the user has chosen a file, an account, and
+    /// pressed the button. That is exactly what happened when the Fidelity provider
+    /// landed, and nothing caught it because nothing could see this map.
+    /// </remarks>
+    internal static IReadOnlyDictionary<string, FileOriginMetadata> OriginRegistry =>
+        ProviderOriginFor;
 
     private static readonly IReadOnlyDictionary<string, FileOriginMetadata> ProviderOriginFor =
         new Dictionary<string, FileOriginMetadata>(StringComparer.Ordinal)
@@ -956,6 +981,12 @@ public sealed class IngestOrchestrator
             // shared and the FORMAT is what varies.
             [Csv.CsvGenericFileProvider.Key] =
                 new FileOriginMetadata("file_import", Csv.CsvGenericFileProvider.Key),
+            // ADR-0031 Phase 6. origin = file_import like its siblings; provider_key
+            // names the BROKERAGE, unlike the generic reader above — provider_security_mappings
+            // is keyed by it, so a symbol learned from a Fidelity file must be remembered
+            // as Fidelity's rather than pooled with every other CSV.
+            [Csv.FidelityActivityFileProvider.Key] =
+                new FileOriginMetadata("file_import", Csv.FidelityActivityFileProvider.Key),
         };
 
     // ----- shared helpers (provider-agnostic write paths) -----

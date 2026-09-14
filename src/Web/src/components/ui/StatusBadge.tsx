@@ -4,8 +4,8 @@ import { cva, type VariantProps } from 'class-variance-authority';
 import { cn } from '@/lib/cn';
 
 // Status badge — small round pill with a single character.
-//   - cleared       ✓ on light green     (matched against a statement)
-//   - reconciling   · on accent-soft     (user is mid-reconciliation; functionally still uncleared but flagged)
+//   - cleared       ✓ on accent-soft     (matched against a statement)
+//   - reconciling   • on accent-soft     (user is mid-reconciliation; functionally still uncleared but flagged)
 //   - pending       P on amber          (SimpleFIN-style pending bank charge)
 //   - scheduled     S on accent-soft    (future-dated, not yet posted)
 //   - uncleared     (hollow ring)        (default; not yet matched)
@@ -26,12 +26,17 @@ const statusBadgeVariants = cva(
     {
         variants: {
             status: {
-                cleared: 'bg-state-success-soft text-state-success',
-                // Reconciling: small accent-coloured dot. Distinct from
-                // both the filled-green cleared and the hollow-ring
-                // uncleared, so the eye can scan a reconciliation
-                // session's "marked but not finished" rows at a glance.
-                reconciling: 'bg-accent-soft text-accent border border-accent',
+                // Cleared and Reconciling share one treatment on purpose: the
+                // glyph is what tells them apart (check vs dot), so the colour
+                // is free to be the app's own tone instead of a second hue.
+                // The check used to be Tailwind green — hue 142, the only thing
+                // in the app at that hue next to an accent at 172 — which is
+                // what made it read as a foreign green.
+                cleared: 'bg-accent-soft text-accent-soft-text',
+                // Reconciling: the accent-toned dot. This is the tone the
+                // rest of the column is tuned AGAINST — the check was the
+                // outlier, not this.
+                reconciling: 'bg-accent-soft text-accent-soft-text border border-accent',
                 pending: 'bg-state-warning-soft text-state-warning',
                 scheduled: 'bg-accent-soft text-accent-soft-text',
                 // Hollow ring — visible but explicitly "not done."
@@ -47,7 +52,7 @@ const statusBadgeVariants = cva(
 
 const LABELS: Record<NonNullable<StatusBadgeProps['status']>, string> = {
     cleared: '✓',
-    reconciling: '·',
+    reconciling: '•',   // bullet, not a middot — a middot is a speck at 10px
     pending: 'P',
     scheduled: 'S',
     uncleared: '', // hollow ring — no glyph

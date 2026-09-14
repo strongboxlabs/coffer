@@ -97,26 +97,122 @@ looking like a tool, not like a marketing site.
 - Base type 12–13px in the register, 14px in dashboard prose, 11px
   for muted labels (uppercase tracking-wide).
 
-### Rule 4 — Accent: slate teal, single accent, light only
+### Rule 4 — Accent: slate teal, single accent, four themes
 
-- Accent: `teal-600` / `#0d9488`. Used for the active nav inset, the
+- Accent: `teal-700` / `#0f766e` on the light themes, `teal-400` /
+  `#2dd4bf` on the dark ones. Used for the active nav inset, the
   primary button fill, accent links, the spending-bar fill, and the
   selected-row indicator.
+  - **Revised from `teal-600` / `#0d9488`.** That value is 3.74:1 as
+    text on the white surface and 3.58:1 under a white button label,
+    and `Button` is `text-sm`, so no large-text allowance applies.
+    Both uses were below AA everywhere they appeared. teal-700 clears
+    them (5.47 and 5.23) and changes the shape of nothing.
+- **`text-inverse` is theme-aware**, and it is the foreground for
+  every solid fill — `bg-accent` and `bg-state-danger` alike. Near-white
+  on the light themes, near-black (`#020617`) on the dark ones: a white
+  label on `teal-400` is 1.78:1. A single value cannot serve both
+  directions, which is what `on-accent` and `accent-foreground` were
+  each reaching for before they were folded into this token.
 - Accent soft: `#ccfbf1` bg / `#0f766e` text — for the "active
   filter" pill and the inbox-link affordance.
 - No second accent. Status colors (rose for outflow / debt, emerald
   for inflow / cleared, amber for pending / warning) are not
   accents — they're semantic and reserved for the data, never for
   chrome.
-- **Light theme only** for now. Dark mode is deferred to a later PR;
-  every token should be palette-aware (CSS variable) so a dark-mode
-  pass is a token swap, not a screen-by-screen rebuild.
+- **Four themes** (revised; this rule previously read "light theme
+  only"). The bet that a dark pass would be "a token swap, not a
+  screen-by-screen rebuild" held: every theme is a block of
+  `--color-*` overrides in `index.css` keyed off `data-theme` on
+  `<html>`, and no component changed to support them.
+  - `light` — the default, unchanged.
+  - `light-hc` — separators to slate-400, ink to slate-950, state
+    and category fills up one step. On a white ground the contrast
+    is carried by the ink and separator ramp, not the accent.
+  - `dark` — slate-800 ground, softer ink, for long sessions.
+  - `dark-hc` — slate-900 ground on a slate-950 canvas, ink ramp
+    lifted a step.
+- **The accent is per theme, but there is still only one of it.** The
+  dark themes use `teal-400` / `#2dd4bf`, because on a dark ground
+  contrast runs the other way. The single-accent rule is unchanged;
+  what varies is the value, not the count.
+- **Two inversions that are not symmetric.** Porting to dark surfaced
+  both, and neither is a token swap:
+  - The header band and canvas go DARKER than the surface on dark and
+    LIGHTER on light. Lifting the band the way light does leaves
+    muted text at 4.04:1 on it.
+  - `surface-hover` cannot double as the neutral chip fill on dark: it
+    has to lighten to read as hover, which drags the chip off its
+    text. The chip now has its own `--color-chip-neutral` pair, which
+    on light is exactly the values `Chip.tsx` used to hardcode.
+- **Every theme is held to WCAG AA (4.5:1)** across the pairs the
+  register actually renders — including the composited row-state
+  fills (selected, needs-review, nested), where the tinted background
+  is what the text sits on. A theme that fails that is not shipped.
+- The choice is per device (localStorage), not per account — see
+  `lib/theme.ts`. `index.html` applies it before first paint; without
+  that, every load flashes light.
+- **A second axis: the colour DIRECTION.** One hue regenerates both
+  halves of the palette — the accent family, and the neutral ramp at
+  hue+74 on slate's own lightness/chroma curve. `teal` (what ships),
+  `indigo`, `rust`. Status colours and the category palette never
+  rotate: those carry meaning, not brand.
+  - The +74° offset is not invented. It is the teal/slate relationship
+    this design already encodes (slate sits 40° off teal in HSL, 74° in
+    OKLCh, at a fraction of its chroma), generalised. It holds well at
+    rust and stretches at indigo; violet was tried and dropped for
+    looking contrived, so treat the rule as having a working range
+    rather than as a law.
+  - **OKLCh, not HSL.** HSL saturation is not perceptually uniform —
+    rotating slate's 0.33 gave a plum ground at indigo and olive at
+    rust. The shipping ramp measures a near-constant C 0.037, tapering
+    to 0 at white, and that taper is what keeps a tinted near-white
+    from going cream.
+  - **Contrast targets are per direction, and the scale-down is
+    dark-only.** Blue carries ~7% of luminance against green's ~72%, so
+    indigo held to teal's 7.86:1 turns pastel on dark. On light the
+    asymmetry runs the other way: scaling down there put indigo at
+    4.01:1 and rust at 4.48:1 on white, both under AA.
+  - **Selectors are compound** (`[data-theme][data-accent]`) and every
+    block restates every token. Both are load-bearing for the previews
+    on the Appearance screen, which nest a palette inside a different
+    one: split the attributes across two elements and nothing matches;
+    emit a partial block and it inherits from whatever it sits in.
+  - Generated by `src/styles/theme-gen/`, committed as
+    `styles/themes.generated.css`, regenerated with `npm run
+    themes:gen`. A test fails if the committed file drifts from the
+    model, and refuses any combination below AA.
 
 ### Rule 5 — Status and category color system
 
 - **Status badges.** Cleared = green pill with ✓ (`#dcfce7` bg /
   `#15803d` text); Pending = amber pill with P (`#fef3c7` bg /
   `#92400e` text). Small fixed circle, 1rem × 1rem.
+- **The badge column: the glyph carries the meaning.** Every state has
+  its own mark — check, dot, `P`, `S`, `!`, empty ring — so nothing is
+  identified by colour alone. That is what lets the column work without
+  colour vision, and it means colour does not have to do a second job.
+  - Cleared and Reconciling share ONE treatment, `accent-soft` with
+    `accent-soft-text`; the check and the dot tell them apart, and
+    Reconciling adds a border.
+  - Pending and Failed keep their status colours — those are warnings,
+    and they should not blend into the app's own tone.
+  - Uncleared stays a hollow ring: nothing asserted yet.
+- **The check was Tailwind green (hue 142) and should not have been.**
+  The accent is at 172 and the neutral ramp at 215 — the whole app
+  lives in the teal/blue half, so a pure green was the only thing at
+  its hue and read as foreign rather than as meaningful. Reported on
+  the dark themes as the check being "a different shade of green" from
+  the sage-toned Reconciling marker. Moving it a few degrees was not
+  enough and neither was desaturating it; the answer was that it did
+  not need its own colour at all.
+  `state-success` still exists and still colours positive amounts in
+  the investment register. It is simply not what paints the badge.
+- **Split-leg amounts carry no opacity.** A leg row is de-emphasised by
+  the nested `surface-muted` plane and the tree glyph, never by dimming
+  its amount. `state-success` at 70% over that plane is 2.88:1 and no
+  opacity value clears AA, so leg amounts render at full token
+  strength in both registers.
 - **Needs-review row treatment** (slice 2c, migration 037). The
   register flags bank-feed rows the user hasn't approved with a
   3px left bar in `state-warning` plus a soft `state-warning-soft`
@@ -182,6 +278,41 @@ visual silhouette is already locked in.
   palette names.
 - Dark mode (future) is a single `[data-theme="dark"]` override that
   remaps every semantic token.
+
+### Rule 9 — Action affordances: one shape for "commit or back out"
+
+Added after an Appearance panel shipped a left-aligned **Apply / Cancel**
+while all 25 other action footers in the app were right-aligned
+**Cancel / Save**. Nothing caught it, because the pattern existed 25
+times and was owned by nobody.
+
+- **Right-aligned, `flex justify-end gap-2`.** The commit action sits
+  furthest right, where the eye and the thumb finish.
+- **Cancel first, then the affirmative.** Reading order is
+  retreat-then-commit; the destructive-by-accident click is the one
+  furthest from where you were reading.
+- **`variant="secondary"` for the retreat, `variant="primary"` for the
+  commit**, both `size="sm"`. A destructive commit takes
+  `variant="danger"` instead of primary — never a second primary.
+- **Vocabulary.** "Save" commits an edit; "Cancel" abandons one. Not
+  "Apply", not "OK", not "Done". A pending commit reads "Saving…" and a
+  pending destructive one "Working…", matching `ConfirmDialog`.
+- **Disabled until there is something to do.** Both buttons are
+  disabled when nothing has changed, so the footer states whether the
+  form is dirty without a separate indicator.
+
+This is a description of what the app already does, not a new
+invention — `ConfirmDialog`, `LayoutNameDialog`, `AccountEditorDialog`
+and the split-posting editor all follow it. The rule exists so the
+26th one does too.
+
+**A rule this mechanical belongs in a primitive, not in prose.** The
+follow-on is an `ActionFooter` in `components/ui/` plus a guard test —
+the same move this repo already made for tokens (a colour class naming
+a token that does not exist is a test failure, not a review catch) and
+for the hand-copied pre-paint script in `index.html`. Until that lands,
+this rule is the spec and review is the enforcement, which is exactly
+the weak arrangement that produced the defect.
 
 ## Design-system PR cluster (follow-on)
 

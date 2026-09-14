@@ -170,7 +170,7 @@ export function RegisterDateJumpPopover({
                         </button>
                         <button
                             type="submit"
-                            className="rounded bg-accent px-2 py-0.5 text-accent-foreground hover:opacity-90"
+                            className="rounded bg-accent px-2 py-0.5 text-text-inverse hover:opacity-90"
                         >
                             Jump
                         </button>
