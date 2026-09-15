@@ -32,7 +32,7 @@ import type { RowStatus } from './registerStatus';
 //     owns the cells AFTER the lead (date ... amount ... balance) for
 //     all three variants via one `renderBody` switch, plus the per-
 //     register grid template + container layout classes that genuinely
-//     differ (bank rows are `min-h-9 items-center`, investment rows are
+//     differ (bank rows are `min-h-control-36px items-center`, investment rows are
 //     `items-start py-1.5`).
 //
 // Rendering is byte-for-byte identical to the six components this
@@ -94,7 +94,7 @@ export interface RegisterRowStrategy<R extends RegisterRowUnion> {
     /** Grid template (BANK_COLS / INVESTMENT_REGISTER_COLS). */
     cols: string;
     /** Container layout classes that differ per register — bank uses
-     *  `min-h-9 items-center`, investment uses `items-start py-1.5`. */
+     *  `min-h-control-36px items-center`, investment uses `items-start py-1.5`. */
     rowClassName: string;
     /** Cursor affordance class for the container — bank rows are
      *  `cursor-pointer`, investment rows are `cursor-default`. */

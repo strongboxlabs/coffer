@@ -86,7 +86,7 @@ export function LandingPage() {
                                 variant="secondary"
                                 onClick={() => navigate({ to: '/imports/moneydance' })}
                             >
-                                <FileUp className="mr-1 h-4 w-4" aria-hidden />
+                                <FileUp className="mr-1 size-icon-md" aria-hidden />
                                 Import from Moneydance
                             </Button>
                             <Button
@@ -94,7 +94,7 @@ export function LandingPage() {
                                 variant="secondary"
                                 onClick={() => setCreating(true)}
                             >
-                                <Plus className="mr-1 h-4 w-4" aria-hidden />
+                                <Plus className="mr-1 size-icon-md" aria-hidden />
                                 New ledger
                             </Button>
                         </div>
@@ -206,7 +206,7 @@ function LedgerList({ ledgers }: { ledgers: readonly LedgerSummary[] }) {
                         >
                             <span className="flex items-center gap-2">
                                 <Building2
-                                    className="h-4 w-4 text-text-muted"
+                                    className="size-icon-md text-text-muted"
                                     aria-hidden
                                 />
                                 <span className="text-sm font-medium text-text">

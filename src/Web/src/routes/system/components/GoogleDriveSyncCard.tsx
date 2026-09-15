@@ -106,21 +106,21 @@ export function GoogleDriveSyncCard() {
                     <>
                         <dl className="space-y-1 text-xs">
                             <div className="flex gap-2">
-                                <dt className="w-20 shrink-0 text-text-subtle">Account</dt>
+                                <dt className="w-fixed-80px shrink-0 text-text-subtle">Account</dt>
                                 <dd className="font-medium">{status.connectedEmail ?? 'Connected'}</dd>
                             </div>
                             <div className="flex gap-2">
-                                <dt className="w-20 shrink-0 text-text-subtle">Folder</dt>
+                                <dt className="w-fixed-80px shrink-0 text-text-subtle">Folder</dt>
                                 <dd className="font-medium">{status.folderName ?? 'Coffer Backups'}</dd>
                             </div>
                             {status.installId ? (
                                 <div className="flex gap-2">
-                                    <dt className="w-20 shrink-0 text-text-subtle">Install ID</dt>
+                                    <dt className="w-fixed-80px shrink-0 text-text-subtle">Install ID</dt>
                                     <dd className="font-mono font-medium">{status.installId}</dd>
                                 </div>
                             ) : null}
                             <div className="flex gap-2">
-                                <dt className="w-20 shrink-0 text-text-subtle">Last sync</dt>
+                                <dt className="w-fixed-80px shrink-0 text-text-subtle">Last sync</dt>
                                 <dd className="font-medium">
                                     {lastSyncText(status)}
                                     {isStale(status) ? (
@@ -139,7 +139,7 @@ export function GoogleDriveSyncCard() {
                                 checked={status.enabled}
                                 disabled={busy}
                                 onChange={(e) => enableMutation.mutate(e.target.checked)}
-                                className="h-4 w-4 rounded border-border text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                                className="size-icon-md rounded border-border text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                             />
                             <span>Keep Google Drive in sync after each new backup</span>
                         </label>

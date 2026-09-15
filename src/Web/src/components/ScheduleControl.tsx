@@ -134,7 +134,7 @@ export function ScheduleControl({
                         checked={schedule?.enabled ?? false}
                         disabled={toggleDisabled}
                         onChange={(e) => setEnabled(e.target.checked)}
-                        className="h-4 w-4 rounded border-border text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                        className="size-icon-md rounded border-border text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                     />
                     <span>{label}</span>
                 </label>

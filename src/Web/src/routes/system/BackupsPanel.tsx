@@ -424,7 +424,7 @@ function RetentionInput({ label, value, onChange, disabled }: {
             <input
                 type="number" min={0} max={3650} value={value} disabled={disabled}
                 onChange={(e) => onChange(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
-                className="w-24 rounded border border-border bg-surface px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
+                className="w-fixed-96px rounded border border-border bg-surface px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
             />
         </label>
     );

@@ -15,7 +15,7 @@ import { Globe, FileText, Pencil, GitMerge } from 'lucide-react';
  *
  * Slot semantics in the register row: leftmost narrow column,
  * uniform width across bank + investment registers so the column
- * line stays vertical. Compact (h-3 w-3 icons) to keep the column
+ * line stays vertical. Compact (size-icon-xs icons) to keep the column
  * sub-text-line in height.
  */
 export interface ProvenanceIconProps {
@@ -35,17 +35,17 @@ export function ProvenanceIcon({
         : label;
     return (
         <span
-            className="relative inline-flex h-3 w-3 items-center justify-center"
+            className="relative inline-flex size-icon-xs items-center justify-center"
             title={fullLabel}
             aria-label={fullLabel}
         >
-            <Icon className={`h-3 w-3 ${hue}`} strokeWidth={2} aria-hidden />
+            <Icon className={`size-icon-xs ${hue}`} strokeWidth={2} aria-hidden />
             {isMergeWinner ? (
                 // Merge-winner overlay: small chevron in the
                 // upper-right, accent palette so it pops against
                 // the muted provenance icon.
                 <GitMerge
-                    className="absolute -right-1 -top-1 h-2 w-2 text-accent"
+                    className="absolute -right-1 -top-1 size-icon-2xs text-accent"
                     strokeWidth={2.5}
                     aria-hidden
                 />

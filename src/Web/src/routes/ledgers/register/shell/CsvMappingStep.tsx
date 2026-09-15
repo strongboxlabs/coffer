@@ -648,7 +648,7 @@ export function CsvMappingStep({
                                 <textarea
                                     aria-label="Mapping YAML"
                                     wrap="off"
-                                    className="h-72 w-full whitespace-pre rounded border border-border bg-surface p-2 font-mono text-xs"
+                                    className="h-fixed-288px w-full whitespace-pre rounded border border-border bg-surface p-2 font-mono text-xs"
                                     value={yaml}
                                     spellCheck={false}
                                     onChange={(e) => {

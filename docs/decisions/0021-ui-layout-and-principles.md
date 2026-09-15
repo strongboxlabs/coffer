@@ -236,9 +236,44 @@ looking like a tool, not like a marketing site.
   - phone — sky (`#f0f9ff` / `#075985`)
   - recreation — pink (`#fdf2f8` / `#9d174d`)
   - **uncategorized** — amber warning (`#fef3c7` / `#92400e`)
-- Categories the user adds get an auto-assigned color (rotating
-  through the palette) with a per-category override on the category-
-  edit form.
+- **Tag chips are the exception, and they are solid.** A tag's colour
+  is USER DATA, not a token — the recolor endpoint validates the
+  `#rrggbb` shape, not palette membership — so it cannot be audited
+  with the token set and cannot rotate with a colour direction. A
+  coloured tag therefore renders as a SOLID fill of its hex with a
+  black or white label, whichever contrasts more.
+  - It was the hex as text over a ~13% tint of the same hex. That is
+    unfixable rather than mistuned: both sides of the pair move
+    together, so the formula has no contrast term. 33 of 40
+    swatch/theme combinations were below AA, and on light ALL TEN
+    failed — amber at 1.94:1.
+  - Solid fill makes contrast depend only on the hex, so it is immune
+    to the theme x direction matrix. Optimal PURE black/white bottoms
+    out at ~4.58:1 at the luminance crossover, so every colour a user
+    can pick clears AA by construction. Near-black/near-white does
+    NOT: the worst case drops to 4.34 and an 11,232-colour sweep puts
+    197 below the line.
+  - It also makes the picker honest. The swatches in the Tags panel
+    were always solid circles of the hex while the chip rendered a
+    tint, so what you picked was never what you got.
+  - The cost is that a coloured tag reads louder than a tinted one.
+    That is the right trade for a label whose whole job is to be
+    picked out at a glance, and colour is opt-in per tag.
+- Categories the user adds get an auto-assigned color: the name is
+  pattern-matched onto a palette variant, and anything unmatched hashes
+  its account id to one, so every transaction in a category lands on
+  the same colour. Category colour is therefore entirely TOKEN-driven —
+  it rotates with the theme and is covered by the token audit, which is
+  exactly why categories did not suffer the tag-chip contrast failure.
+  - **There is no per-category override.** This rule claimed one
+    ("with a per-category override on the category-edit form") for long
+    enough to be quoted back as fact; there is no `color` field on the
+    category type and no endpoint for it. Corrected 2026-09-14.
+  - If one is ever built it takes a user-supplied hex, which puts it in
+    the same class as tags: outside the token system, invisible to the
+    token audit, and reachable by arbitrary `#rrggbb`. Use the tag
+    treatment — solid fill, black-or-white label — not a tint. A tint
+    over the surface is what failed 33 of 40 combinations.
 
 ### Rule 6 — Register is the work surface; treat it as first-class
 
@@ -306,13 +341,225 @@ invention — `ConfirmDialog`, `LayoutNameDialog`, `AccountEditorDialog`
 and the split-posting editor all follow it. The rule exists so the
 26th one does too.
 
-**A rule this mechanical belongs in a primitive, not in prose.** The
-follow-on is an `ActionFooter` in `components/ui/` plus a guard test —
-the same move this repo already made for tokens (a colour class naming
-a token that does not exist is a test failure, not a review catch) and
-for the hand-copied pre-paint script in `index.html`. Until that lands,
-this rule is the spec and review is the enforcement, which is exactly
-the weak arrangement that produced the defect.
+**Use `ActionFooter`.** The rule is mechanical, so it lives in a
+primitive rather than in this paragraph: `components/ui/ActionFooter`
+takes optional `tertiary` / `cancel` / `confirm` slots and renders them
+in that order with the variants and size above, whatever order you pass
+them in.
+
+Slots rather than `onCancel` / `onSave` because the app has four footer
+shapes, and a two-callback API fits one and fights the rest: cancel +
+confirm; cancel + tertiary + confirm (the import wizard's Back);
+tertiary + confirm with no cancel ("Import another" / "Done"); and a
+decision pair ("Deny" / "Allow"). The primitive fixes what should never
+vary — placement, order, variants, size, gap — and leaves the wording,
+which is a product decision.
+
+**A single-slot footer is still a footer.** A lone "Done" or "Close"
+gets the same treatment — `ActionFooter` with only `confirm` filled —
+because cohesion is about the shape of the thing, not the number of
+buttons in it.
+
+`ActionFooter.test.ts` holds the line: a `justify-end` container with a
+Button outside the primitive fails, with the nineteen pre-existing
+sites frozen in a list that may shrink and must not grow.
+
+Know what that guard cannot do. It is a text scan, and it errs both
+ways: it would NOT have caught the defect that prompted this rule
+(`justify-start`), and it DOES flag right-aligned toolbar actions that
+are not footers at all. The threshold is one Button rather than two
+because the two errors cost differently — a false positive is one line
+on the frozen list, a false negative is drift nobody sees. It stops the
+next hand-rolled footer; it does not verify the rule.
+
+### Rule 10 — A visible affordance, with right-click as the accelerator
+
+Added after the Tags and Categories settings panels were found to
+contain ZERO `<Button>` and ZERO `<IconButton>` between them: eight
+actions — rename, recolour, merge, delete, add sub-category, move —
+reachable only by right-clicking a row.
+
+- **Every action needs a path you can see.** Right-click is an
+  accelerator for people who already know, never the only way in.
+- **A `title` tooltip is not an affordance.** "Right-click for actions"
+  does not exist on touch, is not announced as an action, and is
+  invisible until you are already hovering the thing you did not know
+  was interactive. Both panels relied on exactly that.
+- **On a list row, the visible path is `RowActionsButton`** — a kebab
+  that opens the same `ContextMenu`, anchored to the button so keyboard
+  users get a sensible position rather than a pointer coordinate that
+  never existed.
+- **A row with no actions gets a same-size spacer**, so the columns of
+  rows that do have them stay aligned.
+
+**The register is a deliberate partial exception, and it is a gap, not
+a clean bill of health.** Selecting rows reveals a bulk bar covering
+Categorize / Move / Delete, so those have a visible path. Accept,
+Duplicate, Create reminder and Show other side remain right-click-only.
+A control on every row of a grid that dense would cost more than it
+buys, so this is recorded rather than closed. Anyone adding a row
+action there should ask whether it also belongs on the bulk bar.
+
+**Built.** `components/ui/RowActions.test.ts` checks that every surface
+attaching `onContextMenu` also renders a `RowActionsButton`, or is
+listed as an exception WITH A REASON (the register trio, on the terms
+above). It failed on its first run, naming a surface nobody had
+looked at.
+
+**On a dense rail, only the SELECTED row carries the kebab.** Added
+after that first run flagged `AuthedSidebar.tsx`: account tab
+membership was reachable only by right-clicking a nav row, and the
+empty state literally read *"Right-click an account … to add it"* —
+an instruction that cannot be followed on touch at all, which is the
+same defect as the `title` tooltip above and more explicit about it.
+
+A control on every row of a ~23px rail is the cost Rule 10 already
+declines to pay in the register. One on the selected row is not:
+
+- It is **always visible where it is**, so it is discoverable. A
+  hover-revealed control is not an answer — the rule's own objection is
+  to affordances "invisible until you are already hovering the thing
+  you did not know was interactive", and hover-reveal is exactly that.
+- **Every row reserves the slot** from the same pinned token the button
+  uses (`--spacing-control-20px`), so names and review dots stay in one
+  column and stay aligned at all three densities (Rule 11).
+- A **tab strip needs no reserved slot** — it wraps rather than forming
+  columns, so nothing below it shifts.
+- `IconButton` gained a 20px `sm` size for this. It is not a "make a
+  button unobtrusive" knob; 20px is the floor of a comfortable pointer
+  target.
+
+**What the guard cannot check, and what that cost.** It is file-level,
+so it proves a surface has *an* affordance, not that every row type
+does. Note also that "renders any button" would have been worthless
+here: the sidebar carries four IconButtons — System settings, collapse,
+Account security, Sign out — all global chrome, none a row action. The
+check names the mechanism the rule prescribes instead.
+
+**A correction worth keeping.** The first reading of this finding was
+that deactivate had no visible path either. It does: the account editor
+dialog carries an "Active" checkbox. The grep that found
+`setAccountActive` called only from the sidebar missed it because the
+dialog PATCHes `isActive` through a different call. Only tab membership
+was actually stranded — and membership belongs where the tabs are, not
+on the accounts page, which sections by type and never names a tab.
+
+### Rule 11 — Three kinds of length, and rhythm rides a ramp
+
+Written down after a census found the spacing vocabulary was already
+coherent — 1,690 of 1,691 rhythm utilities sat on the ramp below — but
+undefended. Nothing distinguished `py-2.5` (the list-row standard, nine
+call sites) from `py-3.5` (one tile, no reason), because the vocabulary
+grew by copying the neighbouring component rather than by decision.
+
+**Rhythm** — padding, margin, gap, space — uses only:
+
+```
+0  0.5  1  1.5  2  2.5  3  4  5  6  8  10  12
+```
+
+- `0.5 1 1.5 2 3` inside controls; `2.5` is the list-row vertical
+  padding (8px rows are cramped, 12px wastes a settings page);
+  `4 5 6` between blocks, with **`5` the page and dialog padding
+  standard** (25 call sites — every page shell, every dialog);
+  `8 10 12` between sections and for empty-state breathing room.
+- `7`, `9` and `11` are absent from rhythm and stay absent. They exist
+  here only as control heights (`h-7`) and gutter offsets.
+
+**Hairlines** are `px` — one device pixel, on purpose. Dividers
+(`gap-px`), border pull-ups (`-mb-px`), optical nudges (`py-px`).
+Deliberately off the ramp, and deliberately not scaled.
+
+**Pinned lengths** are icon sizes, control heights, layout widths and
+scroll caps. They sit on NAMED tokens — `--spacing-icon-md`,
+`--spacing-control-28px`, `--spacing-fixed-96px` — which Tailwind
+compiles to a bare `var(--spacing-icon-md)` rather than
+`calc(var(--spacing) * N)`. Density therefore cannot reach them by
+construction, not by anyone remembering to keep them out of the way.
+(The register's scroll-gutter offsets are a fourth case: `right-[26px]`
+aligns to a browser-drawn scrollbar and belongs to no design scale at
+all.)
+
+**Arbitrary values are barred from rhythm.** Not for tidiness: Tailwind
+v4 derives every rhythm utility from `--spacing`, so `p-4` is
+`calc(var(--spacing) * 4)`. An arbitrary value does not move when that
+variable does, so it stops matching its neighbours at every density but
+the one it was eyeballed at. The sidebar nav row was pinned at
+`py-[0.3rem]` exactly this way. If a value is genuinely needed it gets
+a token, not a bracket.
+
+Enforced by `src/Web/src/styles/spacingScale.test.ts`, which is a proof
+rather than a proxy — exact utility matches, not a heuristic. It scans
+comments too: the first run flagged a comment describing the sidebar
+padding as `py-[0.3rem]`, a claim about to go stale in the same diff.
+
+### Rule 11a — Density is the third Appearance axis, and it moves space only
+
+The axis this rule existed to unblock. `data-density` on `<html>`
+redefines exactly one token:
+
+| | `--spacing` | page padding | list row | icon-to-label gap |
+|---|---|---|---|---|
+| Compressed | 0.2rem (0.8×) | 16px | 8px | 6.4px |
+| Regular | 0.25rem | 20px | 10px | 8px |
+| Relaxed | 0.3rem (1.2×) | 24px | 12px | 9.6px |
+
+One variable moves ~1,700 utilities. Text, icons, controls and fixed
+widths do not move at any setting.
+
+**Why controls hold still.** Text does not scale here — this is a
+spacing control, not a zoom control — so a box that shrank around it
+would close on its own contents. At 0.8× an `h-7` icon button would be
+22.4px around 13px of text; at 1.2× a primary button would be 48px.
+The same logic bars icons for a different reason: an icon rasterises a
+shape, so 14px at 0.8× is 11.2px carrying a sub-pixel stroke, which
+renders *soft* rather than small. Fractional pixels are fine for
+rhythm (`gap-2` → 6.4px) because layout is subpixel-positioned.
+
+**What holds the line.** `pinnedLengths.test.ts` bans numeric sizers
+outright — `h-4`, `w-24`, `size-4`, `min-h-9` — rather than setting a
+threshold. An earlier draft allowed control-sized squares to scale, and
+that judgement call is precisely what produced a split `h-7
+w-fixed-28px` pair: the height still scaling, the width no longer
+doing so, every icon button visibly non-square at any setting except
+the default, and correct-looking in review. The same file asserts that
+the density blocks declare `--spacing` and nothing else, and that the
+Rule 10 row-action spacer still matches `IconButton`.
+
+### Rule 11b — A preview varies one axis; everything else shows what you have
+
+"Staged" is a claim about what the user SEES, not about where the state
+lives. The Appearance panel satisfied the second and failed the first,
+and it was reported twice as applying on the fly.
+
+Nothing was ever saved on selection — the root attributes were correct
+throughout. What broke the illusion was that every preview followed
+every *draft*: one density click repainted 7 of the 10 cards, and one
+theme click darkened 6 of them. A panel where most of the surface
+changes the instant you click is indistinguishable from one that
+applied your choice.
+
+- **Each card shows its own option against the APPLIED values of the
+  other axes.** A click moves the radio and nothing else.
+- **The cost, accepted deliberately**: stage a theme and a colour
+  together and the colour cards still show the old theme until you
+  save. That is the honest reading — they show what you currently have
+  — and it beats the churn. The helper text says so.
+- **A preview must be a large enough sample to show its own axis.**
+  The density cards were three heights of 16 / 20 / 24px, a 4px spread
+  beside a two-line label, and read as identical — the same *symptom*
+  as the compound-selector bug in Rule 4, from a different cause.
+  Density is cumulative, so the sample has to accumulate: six rows puts
+  the spread at 48 / 60 / 72px.
+
+Guarded in `AppearancePanel.test.tsx` by snapshotting all ten preview
+cards and asserting that a click on any axis changes none of them.
+
+**Per device, like the other two axes.** localStorage, stamped before
+first paint by the inline script in `index.html` — without that the app
+lays out at the default spacing and reflows when React mounts, which is
+a visible jump rather than a flash. `theme.test.ts` guards the
+duplication.
 
 ## Design-system PR cluster (follow-on)
 

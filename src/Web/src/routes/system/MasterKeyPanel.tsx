@@ -284,7 +284,7 @@ export function MasterKeyPanel() {
                                         value={confirmText}
                                         onChange={(e) => setConfirmText(e.target.value)}
                                         placeholder={ROTATE_CONFIRM_PHRASE}
-                                        className="w-40"
+                                        className="w-fixed-160px"
                                     />
                                 </label>
 

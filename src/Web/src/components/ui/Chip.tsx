@@ -17,7 +17,7 @@ import { cn } from '@/lib/cn';
 //   - groc/din/house/util/sub/tran/sal/xfer/phone/rec — category palette
 
 const chipVariants = cva(
-    'inline-flex items-center gap-1 rounded px-1.5 py-[0.0625rem] text-[0.6875rem] font-medium',
+    'inline-flex items-center gap-1 rounded px-1.5 py-px text-[0.6875rem] font-medium',
     {
         variants: {
             variant: {

@@ -422,7 +422,7 @@ function SleeveEditor({
                         <option value="">(any region)</option>
                         {LT_REGIONS.map((c) => <option key={c} value={c}>{c.replace(/_/g, ' ')}</option>)}
                     </select>
-                    <input type="number" min="0" step="0.1" className={sel + ' w-20 text-right'} value={r.weight}
+                    <input type="number" min="0" step="0.1" className={sel + ' w-fixed-80px text-right'} value={r.weight}
                         onChange={(e) => update(i, { weight: Number(e.target.value) })} />
                     <button type="button" className="text-xs text-state-danger" onClick={() => setRows(rows.filter((_, j) => j !== i))}>
                         Remove

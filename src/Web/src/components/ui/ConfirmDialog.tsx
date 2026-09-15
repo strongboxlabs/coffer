@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
-import { Button } from './Button';
+import { ActionFooter } from './ActionFooter';
 import { Modal } from './Modal';
 import { cn } from '@/lib/cn';
 
@@ -162,26 +162,17 @@ export function ConfirmDialog({
                         />
                     </label>
                 ) : null}
-                <div className="flex justify-end gap-2 pt-1">
-                    <Button
-                        type="button"
-                        variant="secondary"
-                        size="sm"
-                        onClick={onCancel}
-                    >
-                        {cancelLabel}
-                    </Button>
-                    <Button
-                        ref={confirmRef}
-                        type="button"
-                        variant={variant === 'danger' ? 'danger' : 'primary'}
-                        size="sm"
-                        onClick={onConfirm}
-                        disabled={affirmDisabled}
-                    >
-                        {isConfirming ? 'Working…' : confirmLabel}
-                    </Button>
-                </div>
+                <ActionFooter
+                    className="pt-1"
+                    confirmRef={confirmRef}
+                    cancel={{ label: cancelLabel, onClick: onCancel }}
+                    confirm={{
+                        label: isConfirming ? 'Working…' : confirmLabel,
+                        onClick: onConfirm,
+                        disabled: affirmDisabled,
+                        variant: variant === 'danger' ? 'danger' : 'primary',
+                    }}
+                />
             </div>
         </Modal>
     );

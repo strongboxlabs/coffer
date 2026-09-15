@@ -212,7 +212,7 @@ export function RegisterScrollTrack({
             onPointerLeave={handlePointerLeave}
             className="
                 absolute top-0 right-0 bottom-0
-                w-12 select-none
+                w-fixed-48px select-none
                 cursor-pointer
             "
             style={{ touchAction: 'none' }}
@@ -223,7 +223,7 @@ export function RegisterScrollTrack({
                 Photos pattern where year markers sit at the
                 far-right against the page edge. */}
             <div
-                className="absolute top-1 bottom-1 right-7 w-0.5 bg-text-muted/70"
+                className="absolute top-1 bottom-1 right-7 w-fixed-2px bg-text-muted/70"
                 aria-hidden
             />
 
@@ -275,8 +275,8 @@ export function RegisterScrollTrack({
                         className={
                             'absolute -translate-y-1/2 ' +
                             (isActive
-                                ? 'right-6 h-0.5 w-3 bg-accent rounded-full'
-                                : 'right-[26px] h-px w-1.5 bg-text-muted/40')
+                                ? 'right-6 h-fixed-2px w-fixed-12px bg-accent rounded-full'
+                                : 'right-[26px] h-px w-fixed-6px bg-text-muted/40')
                         }
                         style={{ top: bucketPixelHeight * (i + 0.5) }}
                     />

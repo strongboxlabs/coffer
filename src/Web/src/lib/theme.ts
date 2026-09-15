@@ -123,3 +123,67 @@ export function setTheme(theme: ThemeId): void {
     }
     applyTheme(theme);
 }
+
+/**
+ * The third axis: DENSITY — ADR-0021 Rule 11.
+ *
+ * Unlike the other two this one changes no colour at all. It overrides a
+ * single token, `--spacing`, which Tailwind v4 multiplies into every padding,
+ * margin, gap and space utility in the app (`p-4` compiles to
+ * `calc(var(--spacing) * 4)`). One variable moves ~1,700 utilities.
+ *
+ * It moves SPACE and nothing else. Icons, dots, swatches, control heights and
+ * fixed widths are all on named `--spacing-*` tokens, which compile to a bare
+ * `var(--spacing-icon-md)` and are therefore immune by construction rather
+ * than by anyone remembering. That separation is the whole reason this axis
+ * can exist: text does not scale here, so a control that shrank around it
+ * would close on its own contents, and an icon that shrank would render soft
+ * rather than small.
+ */
+export const DENSITY_IDS = ['compressed', 'regular', 'relaxed'] as const;
+
+export type DensityId = (typeof DENSITY_IDS)[number];
+
+export const DEFAULT_DENSITY: DensityId = 'regular';
+
+/** Shared with the inline script in index.html, like the other two keys. */
+export const DENSITY_STORAGE_KEY = 'coffer.density';
+
+export const DENSITIES: ReadonlyArray<{ id: DensityId; label: string; hint: string }> = [
+    {
+        id: 'compressed',
+        label: 'Compressed',
+        hint: 'Tighter rows and padding — more of the register on screen.',
+    },
+    { id: 'regular', label: 'Regular', hint: 'The default.' },
+    {
+        id: 'relaxed',
+        label: 'Relaxed',
+        hint: 'Roomier padding and gaps. Controls and text are unchanged.',
+    },
+];
+
+export function coerceDensity(value: unknown): DensityId {
+    return DENSITY_IDS.includes(value as DensityId) ? (value as DensityId) : DEFAULT_DENSITY;
+}
+
+export function readStoredDensity(): DensityId {
+    try {
+        return coerceDensity(localStorage.getItem(DENSITY_STORAGE_KEY));
+    } catch {
+        return DEFAULT_DENSITY;
+    }
+}
+
+export function applyDensity(density: DensityId): void {
+    document.documentElement.setAttribute('data-density', density);
+}
+
+export function setDensity(density: DensityId): void {
+    try {
+        localStorage.setItem(DENSITY_STORAGE_KEY, density);
+    } catch {
+        // Blocked storage — the choice just will not survive a reload.
+    }
+    applyDensity(density);
+}

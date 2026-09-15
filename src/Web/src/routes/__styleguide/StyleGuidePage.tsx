@@ -83,7 +83,7 @@ function Swatch({ name, cls, text }: { name: string; cls: string; text?: string 
     return (
         <div className="flex items-center gap-3">
             <div
-                className={`h-10 w-10 rounded border border-border ${cls}`}
+                className={`size-swatch-lg rounded border border-border ${cls}`}
                 aria-label={name}
             />
             <code className={`font-mono text-xs ${text ?? 'text-text-muted'}`}>{name}</code>
@@ -98,7 +98,7 @@ export function StyleGuidePage() {
                 <SidebarHeader>
                     <span className="text-sm font-bold tracking-tight">Coffer</span>
                 </SidebarHeader>
-                <SidebarPicker swatch={<span className="h-1.5 w-1.5 rounded-sm bg-accent" />}>
+                <SidebarPicker swatch={<span className="size-dot-sm rounded-sm bg-accent" />}>
                     Style guide
                 </SidebarPicker>
                 <SidebarNav>
@@ -151,7 +151,7 @@ export function StyleGuidePage() {
                                 {borderTokens.map((t) => (
                                     <div key={t.name} className="flex items-center gap-3">
                                         <div
-                                            className={`h-10 w-10 rounded border-2 bg-surface ${t.cls}`}
+                                            className={`size-swatch-lg rounded border-2 bg-surface ${t.cls}`}
                                         />
                                         <code className="font-mono text-xs text-text-muted">
                                             {t.name}
@@ -302,7 +302,7 @@ export function StyleGuidePage() {
                                                 2026-05-11
                                             </td>
                                             <td className="px-2 py-1">
-                                                <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-state-success-soft text-[0.625rem] font-bold text-state-success">
+                                                <span className="inline-flex size-icon-md items-center justify-center rounded-full bg-state-success-soft text-[0.625rem] font-bold text-state-success">
                                                     &#10003;
                                                 </span>
                                             </td>

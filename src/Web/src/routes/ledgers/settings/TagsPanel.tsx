@@ -9,6 +9,7 @@ import { Panel, PanelBody, PanelHead } from '@/components/ui/Panel';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
 
+import { RowActionsButton } from '@/components/ui/RowActionsButton';
 import { MergeTagDialog, TagEditDialog } from './TagDialogs';
 
 /**
@@ -100,25 +101,30 @@ export function TagsPanel({ ledgerId }: { ledgerId: string }) {
                                     e.preventDefault();
                                     setMenu({ tag, x: e.clientX, y: e.clientY });
                                 }}
-                                title="Right-click for actions"
-                                className="flex cursor-context-menu items-center justify-between gap-2 py-1.5 pr-1 hover:bg-surface-hover"
+                                className="flex items-center justify-between gap-2 py-1.5 pr-1 hover:bg-surface-hover"
                             >
                                 <span className="flex min-w-0 items-center gap-2">
                                     <span
                                         aria-hidden
                                         className={cn(
-                                            'h-3 w-3 shrink-0 rounded-full border border-border/50',
+                                            'size-dot-lg shrink-0 rounded-full border border-border/50',
                                             tag.color ? '' : 'bg-surface-hover',
                                         )}
                                         style={tag.color ? { backgroundColor: tag.color } : undefined}
                                     />
                                     <span className="truncate text-sm text-text">{tag.name}</span>
                                 </span>
-                                <span
-                                    className="shrink-0 text-[0.6875rem] tabular-nums text-text-subtle"
-                                    title={`${tag.usageCount} transaction${tag.usageCount === 1 ? '' : 's'}`}
-                                >
-                                    {tag.usageCount} txns
+                                <span className="flex shrink-0 items-center gap-1">
+                                    <span
+                                        className="text-[0.6875rem] tabular-nums text-text-subtle"
+                                        title={`${tag.usageCount} transaction${tag.usageCount === 1 ? '' : 's'}`}
+                                    >
+                                        {tag.usageCount} txns
+                                    </span>
+                                    <RowActionsButton
+                                        label={`Actions for ${tag.name}`}
+                                        onOpen={({ x, y }) => setMenu({ tag, x, y })}
+                                    />
                                 </span>
                             </li>
                         ))}

@@ -51,7 +51,7 @@ export function RegisterLeadHeaderCells({
                     checked={allVisibleSelected}
                     onChange={onToggleAll}
                     disabled={disabled}
-                    className="h-3 w-3 accent-accent"
+                    className="size-icon-xs accent-accent"
                 />
             </span>
             <span role="columnheader" aria-label="Status" />
@@ -102,7 +102,7 @@ export function RegisterRowLead({
                         onToggleSelected(e.shiftKey);
                     }}
                     onChange={() => {}}
-                    className="h-3 w-3 accent-accent"
+                    className="size-icon-xs accent-accent"
                 />
             </span>
             <span role="cell">{statusNode}</span>

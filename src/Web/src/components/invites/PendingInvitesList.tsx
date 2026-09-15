@@ -30,7 +30,7 @@ export function PendingInvitesList({
             {invites.map((inv) => (
                 <li key={inv.id} className="flex items-center justify-between gap-4 py-2">
                     <div className="flex min-w-0 items-center gap-2.5 text-sm">
-                        <Link2 className="size-4 shrink-0 text-text-muted" aria-hidden />
+                        <Link2 className="size-icon-md shrink-0 text-text-muted" aria-hidden />
                         <div className="min-w-0">
                             <div className="font-medium">{describeScope(inv, showLedger)}</div>
                             <div className="truncate text-xs text-text-muted">

@@ -68,7 +68,7 @@ export function SecurityField({
                 aria-label="Security"
                 className={cn(error ? 'border-state-danger' : undefined)}
                 // Render the whole catalog; the dropdown's
-                // max-h-64 + overflow-auto provides the visual cap.
+                // max-h-fixed-256px + overflow-auto provides the visual cap.
                 // The generic 8-row default would chop off holdings
                 // beyond row 8 — unacceptable for a picker whose
                 // first tier IS the user's positions.

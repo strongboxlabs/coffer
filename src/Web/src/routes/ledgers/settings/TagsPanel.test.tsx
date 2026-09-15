@@ -10,6 +10,8 @@ import type { TagDto } from '@/lib/types';
 //   * Lists tags with usage counts; empty state.
 //   * "Remove N unused" appears only with orphans and calls cleanup.
 //   * Right-click a row → Delete → confirm → calls deleteTag.
+//   * A VISIBLE per-row actions button opens the same menu — the panel had no
+//     visible controls at all, so every action was right-click-only.
 
 const LEDGER_ID = '00000000-0000-0000-0000-000000000010';
 
@@ -72,6 +74,35 @@ describe('TagsPanel', () => {
 
         await screen.findByText('work');
         expect(screen.queryByRole('button', { name: /Remove .* unused/i })).not.toBeInTheDocument();
+    });
+
+    it('gives every row a visible actions button', async () => {
+        // The defect this guards: the panel rendered zero Buttons and zero
+        // IconButtons, so rename/recolour/merge/delete were reachable only by
+        // right-clicking, advertised by a title tooltip that does not exist on
+        // touch and is not announced as an affordance.
+        renderPanel([
+            { id: 't1', name: 'work', color: '#3b82f6', usageCount: 3 },
+            { id: 't2', name: 'home', color: null, usageCount: 1 },
+        ]);
+        expect(await screen.findByRole('button', { name: 'Actions for work' }))
+            .toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'Actions for home' }))
+            .toBeInTheDocument();
+    });
+
+    it('opens the same menu from the button as from right-click', async () => {
+        renderPanel([{ id: 't1', name: 'work', color: '#3b82f6', usageCount: 3 }]);
+
+        // Anchor: the menu is absent before the click, so the assertion after
+        // it cannot pass on a menu that was always there.
+        expect(screen.queryByText('Rename / recolour…')).not.toBeInTheDocument();
+
+        fireEvent.click(await screen.findByRole('button', { name: 'Actions for work' }));
+
+        expect(await screen.findByText('Rename / recolour…')).toBeInTheDocument();
+        expect(screen.getByText('Merge…')).toBeInTheDocument();
+        expect(screen.getByText('Delete')).toBeInTheDocument();
     });
 
     it('deletes a tag via the row menu + confirm', async () => {

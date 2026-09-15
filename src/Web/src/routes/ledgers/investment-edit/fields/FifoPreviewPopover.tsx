@@ -61,7 +61,7 @@ export function FifoPreviewPopover({
 
     return (
         <div
-            className="mt-1 w-72 rounded border border-border bg-surface p-2 text-[0.6875rem] shadow-sm"
+            className="mt-1 w-fixed-288px rounded border border-border bg-surface p-2 text-[0.6875rem] shadow-sm"
             role="tooltip"
             aria-label={isTransfer ? 'In-kind lot transfer preview' : 'FIFO lot consumption preview'}
         >

@@ -272,7 +272,7 @@ function AccountGroup({
     return (
         <div>
             <div className="flex items-center gap-2 bg-surface-muted/30 px-4 py-1.5 text-[0.6875rem] font-semibold uppercase tracking-wider text-text-muted">
-                <Icon className="h-3.5 w-3.5" aria-hidden />
+                <Icon className="size-icon-sm" aria-hidden />
                 <span>{meta.label}</span>
                 <span className="ml-auto font-mono tabular-nums">
                     {formatCurrency(group.subtotal)}
@@ -393,7 +393,7 @@ function UpcomingWidget({
                             className="flex items-center justify-between gap-3 px-4 py-2 text-sm"
                         >
                             <span className="flex min-w-0 items-baseline gap-2">
-                                <span className="w-12 shrink-0 font-mono text-[0.6875rem] tabular-nums text-text-subtle">
+                                <span className="w-fixed-48px shrink-0 font-mono text-[0.6875rem] tabular-nums text-text-subtle">
                                     {shortDate(r.date)}
                                 </span>
                                 <span className="truncate">{r.payee ?? 'Reminder'}</span>

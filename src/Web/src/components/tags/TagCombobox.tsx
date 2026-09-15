@@ -167,7 +167,7 @@ export function TagCombobox({
                 <ul
                     id={listId}
                     role="listbox"
-                    className="absolute left-0 top-full z-40 mt-1 max-h-56 w-56 max-w-[16rem] overflow-auto rounded border border-border bg-surface py-1 text-xs shadow-lg"
+                    className="absolute left-0 top-full z-40 mt-1 max-h-fixed-224px w-fixed-224px max-w-[16rem] overflow-auto rounded border border-border bg-surface py-1 text-xs shadow-lg"
                 >
                     {options.map((opt, i) => {
                         const isCreate = opt === null;
@@ -195,7 +195,7 @@ export function TagCombobox({
                                             <span
                                                 aria-hidden
                                                 className={cn(
-                                                    'h-2.5 w-2.5 shrink-0 rounded-full border border-border/50',
+                                                    'size-dot-md shrink-0 rounded-full border border-border/50',
                                                     opt.color ? '' : 'bg-surface-hover',
                                                 )}
                                                 style={opt.color ? { backgroundColor: opt.color } : undefined}

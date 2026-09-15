@@ -269,7 +269,7 @@ function KindIcon({ kind }: { kind: 'auto' | 'manual' }) {
     return kind === 'auto' ? (
         <span
             title="Auto-snapshot (weekly)"
-            className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-full bg-surface-muted text-accent/80"
+            className="mt-0.5 inline-flex size-icon-lg items-center justify-center rounded-full bg-surface-muted text-accent/80"
             aria-hidden
         >
             ◷
@@ -277,7 +277,7 @@ function KindIcon({ kind }: { kind: 'auto' | 'manual' }) {
     ) : (
         <span
             title="Manual snapshot"
-            className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-full bg-accent-soft text-accent"
+            className="mt-0.5 inline-flex size-icon-lg items-center justify-center rounded-full bg-accent-soft text-accent"
             aria-hidden
         >
             ✱

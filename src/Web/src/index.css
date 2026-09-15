@@ -104,6 +104,89 @@
     --color-cat-phone-text: #075985;
     --color-cat-rec-soft: #fdf2f8;
     --color-cat-rec-text: #9d174d;
+
+    /*
+     * PINNED LENGTHS — ADR-0021 Rule 11.
+     *
+     * Named rather than numeric, and that is the whole point. Tailwind v4
+     * compiles `size-4` to `calc(var(--spacing) * 4)` but `size-icon-md` to
+     * a bare `var(--spacing-icon-md)`. The density axis moves `--spacing`;
+     * everything below is therefore immune to it by construction, not by
+     * anyone remembering to keep it out of the way.
+     *
+     * What belongs here is anything that sizes a THING rather than the space
+     * around it. Two reasons, and they are different:
+     *
+     *   - Icons, dots and swatches RASTERISE A SHAPE. A 14px lucide glyph at
+     *     0.8x is 11.2px carrying a sub-pixel stroke, which renders soft
+     *     rather than small. That is a rendering defect, not a density
+     *     preference.
+     *   - Fixed widths are sized to FIT TEXT, and text does not scale with
+     *     density (this is a spacing control, not a zoom control). Shrinking
+     *     the box while its contents stay put clips them. The amount column
+     *     in the categories panel is 96px holding a ~75px figure; at 0.8x the
+     *     box loses more than the slack.
+     */
+    --spacing-icon-2xs: 0.5rem; /* 8px — the provenance overlay badge */
+    --spacing-icon-xs: 0.75rem; /* 12px — register-density icons, checkboxes */
+    --spacing-icon-sm: 0.875rem; /* 14px — list-row icons */
+    --spacing-icon-md: 1rem; /* 16px — the default */
+    --spacing-icon-lg: 1.25rem; /* 20px — page headers, empty states */
+
+    /* Status and colour dots. `dot-lg` duplicates `icon-xs`'s value on
+       purpose: a 12px tag swatch and a 12px chevron are the same length and
+       different ideas, and naming them apart is what lets one move later. */
+    --spacing-dot-xs: 0.25rem; /* 4px */
+    --spacing-dot-sm: 0.375rem; /* 6px */
+    --spacing-dot-md: 0.625rem; /* 10px */
+    --spacing-dot-lg: 0.75rem; /* 12px */
+
+    /* Colour swatches in pickers, and the styleguide's theme chips. */
+    --spacing-swatch-sm: 1.5rem; /* 24px */
+    --spacing-swatch-lg: 2.5rem; /* 40px */
+
+    /*
+     * Control heights. Density moves the space AROUND a control, never the
+     * control itself: the text inside does not scale (this is a spacing
+     * control, not a zoom control), so a shrinking box closes on fixed-size
+     * contents. At 0.8x an `h-7` icon button would be 22.4px around 13px
+     * text, and at 1.2x a primary button would be 48px.
+     *
+     * Seven values, which is more than a scale wants, but each is load-bearing
+     * somewhere: 28px is the dense register control, 36/40/44 are Button's
+     * three sizes, 24 and 32 are the sidebar disc and the day-of-week toggle,
+     * and 20px is the compact kebab that fits a ~23px sidebar nav row.
+     */
+    --spacing-control-20px: 1.25rem;
+    --spacing-control-24px: 1.5rem;
+    --spacing-control-28px: 1.75rem;
+    --spacing-control-32px: 2rem;
+    --spacing-control-36px: 2.25rem;
+    --spacing-control-40px: 2.5rem;
+    --spacing-control-44px: 2.75rem;
+
+    /* Fixed boxes — dropdown widths, label columns, scroll caps, progress
+       bars, and the register's scroll gutter. Named by PIXEL rather than by
+       the Tailwind step they replace: `fixed-0_5` would need an underscore in
+       the utility name, and `w-fixed-96px` says what it is without the reader
+       having to multiply anything. */
+    --spacing-fixed-2px: 0.125rem;
+    --spacing-fixed-8px: 0.5rem;
+    --spacing-fixed-6px: 0.375rem;
+    --spacing-fixed-12px: 0.75rem;
+    --spacing-fixed-40px: 2.5rem;
+    --spacing-fixed-48px: 3rem;
+    --spacing-fixed-64px: 4rem;
+    --spacing-fixed-80px: 5rem;
+    --spacing-fixed-96px: 6rem;
+    --spacing-fixed-128px: 8rem;
+    --spacing-fixed-160px: 10rem;
+    --spacing-fixed-176px: 11rem;
+    --spacing-fixed-208px: 13rem;
+    --spacing-fixed-224px: 14rem;
+    --spacing-fixed-256px: 16rem;
+    --spacing-fixed-288px: 18rem;
+    --spacing-fixed-320px: 20rem;
 }
 
 /*
@@ -121,6 +204,40 @@
 :root {
     color-scheme: light;
     font-feature-settings: "tnum" 1;
+}
+
+/*
+ * Density — ADR-0021 Rule 11, the third Appearance axis.
+ *
+ * One token, ~1,700 utilities. Tailwind v4 compiles every padding, margin,
+ * gap and space utility to `calc(var(--spacing) * N)`, so redefining
+ * `--spacing` on `<html>` re-spaces the whole app with no other change.
+ *
+ * It moves SPACE and nothing else. Icons, dots, swatches, control heights and
+ * fixed widths sit on named `--spacing-*` tokens (see the pinned-lengths block
+ * above), which compile to a bare `var(--spacing-icon-md)` and so cannot be
+ * reached from here. That is by construction, not by convention, and
+ * `pinnedLengths.test.ts` is what keeps it that way.
+ *
+ * The factors are 0.8 / 1.0 / 1.2 against the 0.25rem base. Far enough apart
+ * to be worth a setting; near enough that a fixed-size control never ends up
+ * crowded by its own padding. Half-steps land on fractional pixels
+ * (`gap-2` → 6.4px at 0.8x) and that is fine — layout is subpixel-positioned.
+ * It would NOT be fine for an icon, which rasterises a shape; hence the split.
+ *
+ * `regular` is restated rather than left to the default so the attribute
+ * composes, for the same reason `data-theme="light"` is restated below.
+ */
+[data-density="compressed"] {
+    --spacing: 0.2rem;
+}
+
+[data-density="regular"] {
+    --spacing: 0.25rem;
+}
+
+[data-density="relaxed"] {
+    --spacing: 0.3rem;
 }
 
 /*

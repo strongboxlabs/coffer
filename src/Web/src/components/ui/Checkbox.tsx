@@ -3,7 +3,7 @@ import type { InputHTMLAttributes, ReactNode } from 'react';
 import { cn } from '@/lib/cn';
 
 // Checkbox — the standard styled checkbox + label (was a hand-rolled
-// `<input type="checkbox" className="h-4 w-4 …">` in ~13 files, some bare/
+// `<input type="checkbox" className="size-icon-md …">` in ~13 files, some bare/
 // unstyled). One affordance, one look. Pass `label` for the common
 // checkbox-with-text case, or use bare (no label) inline.
 
@@ -18,7 +18,7 @@ export function Checkbox({ label, className, wrapperClassName, ...props }: Check
         <input
             type="checkbox"
             className={cn(
-                'h-4 w-4 rounded border-border text-accent',
+                'size-icon-md rounded border-border text-accent',
                 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent',
                 'disabled:cursor-not-allowed disabled:opacity-50',
                 className,

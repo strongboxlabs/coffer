@@ -83,7 +83,7 @@ export function RegisterFilterControls({
         + (filter.securityId ? 1 : 0);
     const anyPopover = popoverCount > 0;
 
-    const fieldClass = 'h-7 rounded border border-border bg-surface px-2 text-xs';
+    const fieldClass = 'h-control-28px rounded border border-border bg-surface px-2 text-xs';
 
     return (
         <div ref={rootRef} className="flex min-w-0 items-center gap-2">
@@ -94,7 +94,7 @@ export function RegisterFilterControls({
                 placeholder="Search…"
                 aria-label="Search transactions"
                 title="Search payee, memo, check #, category, or tag"
-                className={`${fieldClass} w-56`}
+                className={`${fieldClass} w-fixed-224px`}
             />
             <div className="relative shrink-0">
                 <button
@@ -103,7 +103,7 @@ export function RegisterFilterControls({
                     aria-expanded={open}
                     aria-controls={popId}
                     className={
-                        'inline-flex h-7 items-center gap-1 rounded border px-2 text-xs '
+                        'inline-flex h-control-28px items-center gap-1 rounded border px-2 text-xs '
                         + (anyPopover
                             ? 'border-accent bg-accent-soft text-accent'
                             : 'border-border bg-surface text-text hover:border-accent')
@@ -115,7 +115,7 @@ export function RegisterFilterControls({
                 {open ? (
                     <div
                         id={popId}
-                        className="absolute right-0 z-30 mt-1 w-80 rounded border border-border bg-surface p-3 text-xs shadow-lg"
+                        className="absolute right-0 z-30 mt-1 w-fixed-320px rounded border border-border bg-surface p-3 text-xs shadow-lg"
                     >
                         <div className="flex gap-2">
                             <FilterField label="Date from">

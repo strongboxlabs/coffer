@@ -87,7 +87,7 @@ function VersionRow({ label, value, muted = false }: {
 }) {
     return (
         <div className="flex items-baseline gap-3">
-            <dt className="w-10 shrink-0 font-medium text-text-muted">{label}</dt>
+            <dt className="w-fixed-40px shrink-0 font-medium text-text-muted">{label}</dt>
             <dd className={cn('font-mono text-xs', muted ? 'text-text-subtle' : 'text-text')}>
                 {value}
             </dd>

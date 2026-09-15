@@ -173,7 +173,7 @@ export function RecurrenceBuilder(props: {
                         <input
                             type="number"
                             min={1}
-                            className={cn(inputClass, 'mt-0 w-20')}
+                            className={cn(inputClass, 'mt-0 w-fixed-80px')}
                             value={recurrence.interval}
                             disabled={disabled}
                             aria-label="Interval"
@@ -206,7 +206,7 @@ export function RecurrenceBuilder(props: {
                                     title={d.code}
                                     onClick={() => toggleWeekday(d.code)}
                                     className={cn(
-                                        'h-8 w-8 rounded-full border text-xs font-medium transition-colors',
+                                        'size-control-32px rounded-full border text-xs font-medium transition-colors',
                                         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent',
                                         'disabled:pointer-events-none disabled:opacity-50',
                                         on
@@ -234,7 +234,7 @@ export function RecurrenceBuilder(props: {
                                 type="number"
                                 min={1}
                                 max={31}
-                                className={cn(inputClass, 'mt-1 w-24')}
+                                className={cn(inputClass, 'mt-1 w-fixed-96px')}
                                 value={monthDayIsLast ? '' : monthDayNumber}
                                 disabled={disabled || monthDayIsLast}
                                 aria-label="Day of month"
@@ -314,7 +314,7 @@ export function RecurrenceBuilder(props: {
                     </label>
                     <input
                         type="date"
-                        className={cn(inputClass, 'mt-0 w-44')}
+                        className={cn(inputClass, 'mt-0 w-fixed-176px')}
                         value={value.endDate ?? ''}
                         disabled={disabled}
                         aria-label="End date"
@@ -366,7 +366,7 @@ export function RecurrenceBuilder(props: {
                                        rather than clamping — this column shipped with its
                                        cap, so there are no legacy rows to keep editable. */
                                     max={24}
-                                    className={cn(inputClass, 'mt-0 w-16')}
+                                    className={cn(inputClass, 'mt-0 w-fixed-64px')}
                                     value={value.estimateSampleCount}
                                     disabled={disabled}
                                     aria-label="Occurrences to average"
@@ -438,7 +438,7 @@ export function RecurrenceBuilder(props: {
                                  * long before the money leaves.
                                  */
                                 max={90}
-                                className={cn(inputClass, 'mt-0 w-20')}
+                                className={cn(inputClass, 'mt-0 w-fixed-80px')}
                                 value={value.autoCommitDaysBefore}
                                 disabled={disabled}
                                 aria-label="Days before due"

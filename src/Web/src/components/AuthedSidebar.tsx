@@ -55,6 +55,7 @@ import {
     SidebarSection,
 } from '@/components/ui/SidebarLayout';
 import { IconButton } from '@/components/ui/IconButton';
+import { RowActionsButton } from '@/components/ui/RowActionsButton';
 import {
     ContextMenu,
     type ContextMenuAnchor,
@@ -347,7 +348,7 @@ export function AuthedSidebar() {
                     className="flex items-center gap-1.5 rounded hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                 >
                     <LineChart
-                        className="h-4 w-4 text-accent"
+                        className="size-icon-md text-accent"
                         strokeWidth={2.25}
                         aria-hidden
                     />
@@ -362,7 +363,7 @@ export function AuthedSidebar() {
                     aria-label="System settings"
                     onClick={() => navigate({ to: '/system' })}
                 >
-                    <Cog className="h-3.5 w-3.5" aria-hidden />
+                    <Cog className="size-icon-sm" aria-hidden />
                 </IconButton>
             </SidebarHeader>
 
@@ -395,11 +396,11 @@ export function AuthedSidebar() {
                                 );
                             }}
                         >
-                            <span className="h-1.5 w-1.5 shrink-0 rounded-sm bg-accent" />
+                            <span className="size-dot-sm shrink-0 rounded-sm bg-accent" />
                             <span className="min-w-0 flex-1 truncate text-left">
                                 {ledger?.name ?? 'Ledger'}
                             </span>
-                            <ChevronDown className="h-3.5 w-3.5 shrink-0 text-text-subtle" aria-hidden />
+                            <ChevronDown className="size-icon-sm shrink-0 text-text-subtle" aria-hidden />
                         </button>
                 ) : (
                     /* No ledger at all (a fresh install, before the first one is
@@ -421,11 +422,11 @@ export function AuthedSidebar() {
                             );
                         }}
                     >
-                        <span className="h-1.5 w-1.5 shrink-0 rounded-sm bg-text-subtle/40" />
+                        <span className="size-dot-sm shrink-0 rounded-sm bg-text-subtle/40" />
                         <span className="min-w-0 flex-1 truncate text-left">
                             Manage ledgers
                         </span>
-                        <ChevronDown className="h-3.5 w-3.5 shrink-0 text-text-subtle" aria-hidden />
+                        <ChevronDown className="size-icon-sm shrink-0 text-text-subtle" aria-hidden />
                     </button>
                 )}
                 {ledgerId && hasConnections ? (
@@ -441,7 +442,7 @@ export function AuthedSidebar() {
                     >
                         <RefreshCw
                             className={
-                                'h-3.5 w-3.5 text-text-subtle ' +
+                                'size-icon-sm text-text-subtle ' +
                                 (syncAllMutation.isPending ? 'animate-spin' : '')
                             }
                             aria-hidden
@@ -476,7 +477,7 @@ export function AuthedSidebar() {
                             return (
                                 <SidebarNavLink key={d.label} asChild active={active}>
                                     <Link to={d.to} params={{ ledgerId }}>
-                                        <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                                        <Icon className="size-icon-sm shrink-0" aria-hidden />
                                         <span>{d.label}</span>
                                     </Link>
                                 </SidebarNavLink>
@@ -516,12 +517,12 @@ export function AuthedSidebar() {
                 ) : null}
                 {ledgerId && activeGroup !== null && visibleAccounts.length === 0 ? (
                     <div className="mx-3 mt-2 rounded border border-dashed border-border/60 px-2 py-1.5 text-[0.6875rem] italic leading-snug text-text-subtle">
-                        No accounts in this tab yet. Right-click an account
-                        (switch to <button
+                        No accounts in this tab yet. Switch to <button
                             type="button"
                             className="not-italic font-medium text-accent hover:underline"
                             onClick={() => setActiveGroupId(null)}
-                        >All</button>) to add it.
+                        >All</button>, select an account, and use its actions
+                        menu to add it here.
                     </div>
                 ) : null}
 
@@ -552,12 +553,12 @@ export function AuthedSidebar() {
                         type="checkbox"
                         checked={showInactive}
                         onChange={(e) => setShowInactive(e.target.checked)}
-                        className="h-3 w-3 cursor-pointer"
+                        className="size-icon-xs cursor-pointer"
                     />
                     <span>Show inactive accounts</span>
                 </label>
                 <div className="flex items-center gap-2">
-                    <span className="flex h-6 w-6 items-center justify-center rounded-full bg-accent text-[0.625rem] font-semibold text-text-inverse">
+                    <span className="flex size-control-24px items-center justify-center rounded-full bg-accent text-[0.625rem] font-semibold text-text-inverse">
                         {displayName ? displayName[0]!.toUpperCase() : '·'}
                     </span>
                     <span className="flex-1 truncate text-xs font-medium text-text">
@@ -570,14 +571,14 @@ export function AuthedSidebar() {
                         aria-label="Account security"
                         onClick={() => navigate({ to: '/account/security' })}
                     >
-                        <ShieldCheck className="h-3.5 w-3.5" aria-hidden />
+                        <ShieldCheck className="size-icon-sm" aria-hidden />
                     </IconButton>
                     <IconButton
                         aria-label="Sign out"
                         onClick={() => logoutMutation.mutate()}
                         disabled={logoutMutation.isPending}
                     >
-                        <LogOut className="h-3.5 w-3.5" aria-hidden />
+                        <LogOut className="size-icon-sm" aria-hidden />
                     </IconButton>
                 </div>
             </SidebarFooter>
@@ -715,11 +716,29 @@ function TabStrip({
                         onCommit={(name) => onCommitRename(g.id, name)}
                         onCancel={onCancelRename}
                     />
+                ) : activeGroupId === g.id ? (
+                    // ADR-0021 Rule 10: the selected tab carries a visible way
+                    // into Rename / Delete. A tab strip wraps rather than
+                    // forming columns, so unlike the account rows this needs no
+                    // reserved slot — nothing below it shifts.
+                    <span key={g.id} className="inline-flex items-center gap-0.5">
+                        <Tab
+                            label={g.name}
+                            active
+                            onSelect={() => onSelect(g.id)}
+                            onContextMenu={(anchor) => onContextMenuGroup(g, anchor)}
+                        />
+                        <RowActionsButton
+                            size="sm"
+                            label={`Actions for tab ${g.name}`}
+                            onOpen={(anchor) => onContextMenuGroup(g, anchor)}
+                        />
+                    </span>
                 ) : (
                     <Tab
                         key={g.id}
                         label={g.name}
-                        active={activeGroupId === g.id}
+                        active={false}
                         onSelect={() => onSelect(g.id)}
                         onContextMenu={(anchor) => onContextMenuGroup(g, anchor)}
                     />
@@ -738,9 +757,9 @@ function TabStrip({
                     aria-label="New tab"
                     title="New tab"
                     onClick={onStartCreate}
-                    className="flex h-6 w-6 items-center justify-center rounded text-text-subtle hover:bg-surface-hover hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                    className="flex size-control-24px items-center justify-center rounded text-text-subtle hover:bg-surface-hover hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                 >
-                    <Plus className="h-3.5 w-3.5" aria-hidden />
+                    <Plus className="size-icon-sm" aria-hidden />
                 </button>
             )}
         </div>
@@ -821,7 +840,7 @@ function InlineTabInput({
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={handleKeyDown}
             onBlur={commitOrCancel}
-            className="h-6 w-24 rounded border border-accent bg-surface px-1.5 text-[0.6875rem] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            className="h-control-24px w-fixed-96px rounded border border-accent bg-surface px-1.5 text-[0.6875rem] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
         />
     );
 }
@@ -849,7 +868,7 @@ function AccountGroupRows({
         <>
             <SidebarSection>
                 <span className="flex items-center gap-1.5">
-                    <Icon className="h-3 w-3" aria-hidden />
+                    <Icon className="size-icon-xs" aria-hidden />
                     {group.label}
                 </span>
             </SidebarSection>
@@ -857,12 +876,12 @@ function AccountGroupRows({
                 so the groups read as distinct blocks (ADR-0021). */}
             <div className="mb-1 ml-2 space-y-px border-l border-border pl-1.5">
             {group.accounts.map((account) => (
+                <div key={account.id} className="relative">
                 <SidebarNavLink
-                    key={account.id}
                     asChild
                     active={account.id === activeAccountId}
-                    // Denser account list (overrides the default
-                    // py-[0.3rem]) — the rail-grouped rows read fine
+                    // Denser account list (overrides SidebarNavLink's
+                    // default py-1) — the rail-grouped rows read fine
                     // tighter and fit more accounts per screen.
                     className="py-0.5"
                 >
@@ -879,7 +898,7 @@ function AccountGroupRows({
                         }}
                     >
                         <span
-                            className="h-1 w-1 rounded-full bg-text-subtle"
+                            className="size-dot-xs rounded-full bg-text-subtle"
                             aria-hidden
                         />
                         {/* Inactive accounts (surfaced only when the
@@ -901,18 +920,46 @@ function AccountGroupRows({
                             // the accent palette. Title carries the
                             // count for screen readers + hover.
                             <span
-                                className="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-accent"
+                                className="ml-auto size-dot-sm shrink-0 rounded-full bg-accent"
                                 title={`${account.needsReviewCount} transaction${account.needsReviewCount === 1 ? '' : 's'} to review`}
                                 aria-label={`${account.needsReviewCount} transactions to review`}
                             />
                         ) : null}
+                        {/* Reserved slot for the row-actions kebab. Present on
+                            EVERY row so the names and review dots stay in one
+                            column, and sized from the same pinned token as the
+                            button, so it still lines up at every density. */}
+                        <span aria-hidden className="size-control-20px shrink-0" />
                     </Link>
                 </SidebarNavLink>
+                {/* ADR-0021 Rule 10. Only the SELECTED row carries it: always
+                    visible where it is, so it is discoverable without being
+                    hover-only — the rule rejects affordances you have to
+                    already be hovering to find — and without putting a control
+                    on every row of a dense rail. Right-click still works
+                    everywhere, as the accelerator it was meant to be. */}
+                {account.id === activeAccountId ? (
+                    <RowActionsButton
+                        size="sm"
+                        label={`Actions for ${account.name}`}
+                        onOpen={(anchor) => onContextMenuAccount(account, anchor)}
+                        className="absolute inset-y-0 right-2 my-auto"
+                    />
+                ) : null}
+                </div>
             ))}
             </div>
         </>
     );
 }
+
+
+// --------------------------------------------------------------------
+// Account-type grouping — one section per account type (Banking / Cash /
+// Credit cards / Investments / Assets / Liabilities / Loans), labelled,
+// iconed, and ordered by the shared accountTypes metadata so this list
+// stays in lock-step with the Ledger Hub's account sections.
+// --------------------------------------------------------------------
 
 /** Build the context-menu items for an account row: which user
  *  tabs is it NOT yet in (= "Add to" entries), plus a "Remove from
@@ -968,13 +1015,6 @@ function buildAccountMenuItems(
     }
     return items;
 }
-
-// --------------------------------------------------------------------
-// Account-type grouping — one section per account type (Banking / Cash /
-// Credit cards / Investments / Assets / Liabilities / Loans), labelled,
-// iconed, and ordered by the shared accountTypes metadata so this list
-// stays in lock-step with the Ledger Hub's account sections.
-// --------------------------------------------------------------------
 
 function groupAccounts(accounts: readonly AccountSummary[]): AccountGroup[] {
     const byType = new Map<string, AccountSummary[]>();

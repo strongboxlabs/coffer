@@ -124,7 +124,7 @@ export function ImportLedgerPage() {
                                         disabled={!file || previewMutation.isPending}
                                         onClick={() => file && previewMutation.mutate(file)}
                                     >
-                                        <FileUp className="mr-1 h-4 w-4" aria-hidden />
+                                        <FileUp className="mr-1 size-icon-md" aria-hidden />
                                         {previewMutation.isPending ? 'Analyzing…' : 'Analyze export'}
                                     </Button>
                                 </div>
@@ -187,7 +187,7 @@ export function ImportLedgerPage() {
                                 {job?.state === 'succeeded' ? (
                                     <div className="space-y-4">
                                         <p className="flex items-center gap-2 text-sm font-medium text-state-success">
-                                            <CheckCircle2 className="h-5 w-5" aria-hidden />
+                                            <CheckCircle2 className="size-icon-lg" aria-hidden />
                                             Import complete.
                                         </p>
                                         <div className="flex justify-end">
@@ -208,7 +208,7 @@ export function ImportLedgerPage() {
                                 ) : job?.state === 'failed' ? (
                                     <div className="space-y-4">
                                         <p role="alert" className="flex items-center gap-2 text-sm text-state-danger">
-                                            <AlertTriangle className="h-5 w-5" aria-hidden />
+                                            <AlertTriangle className="size-icon-lg" aria-hidden />
                                             {job.error ?? 'The import failed.'}
                                         </p>
                                         <div className="flex justify-end">
@@ -223,7 +223,7 @@ export function ImportLedgerPage() {
                                             Importing… {job ? `${job.completed} of ${job.total} steps` : 'starting'}
                                             {job?.step ? ` — ${job.step}` : ''}
                                         </p>
-                                        <div className="h-2 w-full overflow-hidden rounded bg-surface-hover">
+                                        <div className="h-fixed-8px w-full overflow-hidden rounded bg-surface-hover">
                                             <div
                                                 className="h-full bg-accent transition-all"
                                                 style={{

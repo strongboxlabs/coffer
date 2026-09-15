@@ -42,7 +42,7 @@ function ColorSwatchPicker({
                     aria-pressed={value === hex}
                     style={{ backgroundColor: hex }}
                     className={cn(
-                        'h-6 w-6 rounded-full border border-black/10',
+                        'size-swatch-sm rounded-full border border-black/10',
                         value === hex
                             ? 'ring-2 ring-accent ring-offset-1 ring-offset-surface'
                             : '',

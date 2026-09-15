@@ -10,8 +10,8 @@ import { REGISTER_STATUS_VIEWS, type StatusFilter } from './registerStatus';
 // not a multi-toggle. Both registers render this via RegisterControlsBar, so
 // the view vocabulary can't drift between bank + investment.
 //
-// Styled to match the register's other compact h-7 controls (the Filter
-// button); the app's h-10 form primitives are deliberately NOT used here — a
+// Styled to match the register's other compact h-control-28px controls (the Filter
+// button); the app's h-control-40px form primitives are deliberately NOT used here — a
 // dense register header uses the tighter register-field scale.
 
 const LABEL_BY_VALUE = new Map(REGISTER_STATUS_VIEWS.map((v) => [v.value, v.label]));
@@ -62,7 +62,7 @@ export function RegisterStatusMenu({ statusFilter, onChange, counts }: RegisterS
                 aria-controls={popId}
                 aria-haspopup="listbox"
                 title="Filter by reconciliation / review status"
-                className="inline-flex h-7 items-center gap-1 rounded border border-border bg-surface px-2 text-xs text-text hover:border-accent"
+                className="inline-flex h-control-28px items-center gap-1 rounded border border-border bg-surface px-2 text-xs text-text hover:border-accent"
             >
                 <span className="text-text-subtle">Show:</span>
                 <span className="font-medium">{activeLabel}</span>
@@ -75,7 +75,7 @@ export function RegisterStatusMenu({ statusFilter, onChange, counts }: RegisterS
                 <ul
                     id={popId}
                     role="listbox"
-                    className="absolute left-0 z-30 mt-1 w-44 rounded border border-border bg-surface py-1 text-xs shadow-lg"
+                    className="absolute left-0 z-30 mt-1 w-fixed-176px rounded border border-border bg-surface py-1 text-xs shadow-lg"
                 >
                     {REGISTER_STATUS_VIEWS.map((v) => (
                         <li

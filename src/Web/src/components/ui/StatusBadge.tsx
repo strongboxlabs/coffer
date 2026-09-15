@@ -22,7 +22,7 @@ import { cn } from '@/lib/cn';
 // of label content. Per ADR-0021 Rule 5.
 
 const statusBadgeVariants = cva(
-    'inline-flex h-4 w-4 items-center justify-center rounded-full text-[0.625rem] font-bold leading-none',
+    'inline-flex size-icon-md items-center justify-center rounded-full text-[0.625rem] font-bold leading-none',
     {
         variants: {
             status: {

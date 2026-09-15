@@ -463,7 +463,7 @@ function SetupForm({ token, onBack }: SetupFormProps) {
                                     onChange={(event) =>
                                         setIncludeDemo(event.target.checked)
                                     }
-                                    className="mt-1 size-4 accent-accent"
+                                    className="mt-1 size-icon-md accent-accent"
                                 />
                                 <span className="flex-1 space-y-1">
                                     <span className="block">

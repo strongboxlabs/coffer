@@ -999,7 +999,7 @@ export function InvestmentRegisterPage() {
                             onClick={() => setImportDialogOpen(true)}
                             className="gap-1.5"
                         >
-                            <Upload className="h-3.5 w-3.5" aria-hidden />
+                            <Upload className="size-icon-sm" aria-hidden />
                             Import
                         </Button>
                         {account?.feedConnectionId !== null
@@ -1018,7 +1018,7 @@ export function InvestmentRegisterPage() {
                             >
                                 <RefreshCw
                                     className={
-                                        'h-3.5 w-3.5 ' +
+                                        'size-icon-sm ' +
                                         (syncAccountMutation.isPending ? 'animate-spin' : '')
                                     }
                                     aria-hidden

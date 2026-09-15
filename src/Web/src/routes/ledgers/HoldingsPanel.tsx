@@ -118,7 +118,7 @@ export function PortfolioBar({
                 >
                     Holdings
                     {positionsCount !== undefined ? ` (${positionsCount})` : ''}
-                    <ChevronRight className="h-3.5 w-3.5" aria-hidden />
+                    <ChevronRight className="size-icon-sm" aria-hidden />
                 </button>
             ) : (
                 <button
@@ -126,7 +126,7 @@ export function PortfolioBar({
                     onClick={() => onViewChange('activity')}
                     className="flex shrink-0 items-center gap-0.5 font-medium text-text-muted transition-colors hover:text-text"
                 >
-                    <ChevronLeft className="h-3.5 w-3.5" aria-hidden />
+                    <ChevronLeft className="size-icon-sm" aria-hidden />
                     Activity
                 </button>
             )}

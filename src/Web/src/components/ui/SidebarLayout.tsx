@@ -56,7 +56,7 @@ export const SidebarLayout = forwardRef<HTMLDivElement, SidebarLayoutProps>(
 export type SidebarProps = HTMLAttributes<HTMLElement>;
 
 /**
- * Fixed-width left rail. 224px (`w-56`) per ADR-0021 Rule 1. The width
+ * Fixed-width left rail. 224px (`w-fixed-224px`) per ADR-0021 Rule 1. The width
  * is settled here so screens don't drift apart. Responsive collapse
  * (icons-only ≤ 1024px, drawer ≤ 768px) lands in PR 5.3.
  */
@@ -68,7 +68,7 @@ export const Sidebar = forwardRef<HTMLElement, SidebarProps>(function Sidebar(
         <aside
             ref={ref}
             className={cn(
-                'flex w-56 flex-col border-r border-border bg-surface-sidebar',
+                'flex w-fixed-224px flex-col border-r border-border bg-surface-sidebar',
                 className,
             )}
             {...props}
@@ -197,7 +197,7 @@ export const SidebarNavLink = forwardRef<HTMLAnchorElement, SidebarNavLinkProps>
         ref,
     ) {
         const composedClassName = cn(
-            'flex items-center gap-2 rounded px-2 py-[0.3rem] text-[0.8125rem] text-text-muted',
+            'flex items-center gap-2 rounded px-2 py-1 text-[0.8125rem] text-text-muted',
             'hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1',
             active &&
                 'bg-surface font-semibold text-text shadow-[inset_2px_0_0_var(--color-accent)]',
@@ -281,7 +281,7 @@ export type TopBarProps = HTMLAttributes<HTMLElement>;
 
 /**
  * Thin top bar — breadcrumb on the left, actions on the right.
- * Fixed 40px height (`h-10`) per ADR-0021 Rule 1.
+ * Fixed 40px height (`h-control-40px`) per ADR-0021 Rule 1.
  */
 export const TopBar = forwardRef<HTMLElement, TopBarProps>(function TopBar(
     { className, ...props },
@@ -291,7 +291,7 @@ export const TopBar = forwardRef<HTMLElement, TopBarProps>(function TopBar(
         <header
             ref={ref}
             className={cn(
-                'flex h-10 items-center justify-between border-b border-border bg-surface px-4 text-xs',
+                'flex h-control-40px items-center justify-between border-b border-border bg-surface px-4 text-xs',
                 className,
             )}
             {...props}

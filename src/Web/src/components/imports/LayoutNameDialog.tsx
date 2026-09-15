@@ -1,6 +1,6 @@
 import { useState } from 'react';
 
-import { Button } from '@/components/ui/Button';
+import { ActionFooter } from '@/components/ui/ActionFooter';
 import { Input } from '@/components/ui/Input';
 import { Modal } from '@/components/ui/Modal';
 
@@ -66,19 +66,14 @@ export function LayoutNameDialog({
                 {error !== null ? (
                     <p role="alert" className="text-xs text-state-danger">{error}</p>
                 ) : null}
-                <div className="flex justify-end gap-2">
-                    <Button type="button" variant="secondary" size="sm" onClick={onClose}>
-                        Cancel
-                    </Button>
-                    <Button
-                        type="submit"
-                        variant="primary"
-                        size="sm"
-                        disabled={trimmed === '' || problem !== null || pending}
-                    >
-                        {pending ? 'Saving…' : submitLabel}
-                    </Button>
-                </div>
+                <ActionFooter
+                    cancel={{ label: 'Cancel', onClick: onClose }}
+                    confirm={{
+                        label: pending ? 'Saving…' : submitLabel,
+                        type: 'submit',
+                        disabled: trimmed === '' || problem !== null || pending,
+                    }}
+                />
             </form>
         </Modal>
     );

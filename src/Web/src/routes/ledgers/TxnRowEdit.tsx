@@ -730,7 +730,7 @@ export function TxnRowEdit({
                             placeholder=""
                             aria-label="Check number"
                             onChange={(e) => setCheckNumber(e.target.value)}
-                            className="h-7 w-full rounded border border-border bg-surface px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                            className="h-control-28px w-full rounded border border-border bg-surface px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                         />
                     </label>
                     <div className="flex min-w-0 flex-col gap-2">
@@ -800,7 +800,7 @@ export function TxnRowEdit({
                                 }}
                                 disabled={isSaving}
                                 placeholder="Optional (Shift+Enter for new line)"
-                                className="min-h-7 max-h-24 w-full resize-none overflow-y-auto rounded border border-border bg-surface px-2 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                                className="min-h-control-28px max-h-fixed-96px w-full resize-none overflow-y-auto rounded border border-border bg-surface px-2 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                             />
                         </label>
                     </div>
@@ -842,7 +842,7 @@ export function TxnRowEdit({
                                 const n = Number(text);
                                 if (!Number.isNaN(n)) patchPosting(onlyPosting.key, { amount: n.toFixed(2) });
                             }}
-                            className="h-7 w-full rounded border border-border bg-surface px-2 text-right font-mono text-xs tabular-nums focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                            className="h-control-28px w-full rounded border border-border bg-surface px-2 text-right font-mono text-xs tabular-nums focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                         />
                     </label>
                     {mode.kind === 'edit' ? (
@@ -956,7 +956,7 @@ export function TxnRowEdit({
                         placeholder=""
                         aria-label="Check number"
                         onChange={(e) => setCheckNumber(e.target.value)}
-                        className="h-7 w-full rounded border border-border bg-surface px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                        className="h-control-28px w-full rounded border border-border bg-surface px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                     />
                 </label>
                 <div className="flex min-w-0 flex-col gap-2">
@@ -997,7 +997,7 @@ export function TxnRowEdit({
                                     ? 'Optional note that applies to the whole split (Shift+Enter for new line)'
                                     : 'Optional (Shift+Enter for new line)'
                             }
-                            className="min-h-7 max-h-24 w-full resize-none overflow-y-auto rounded border border-border bg-surface px-2 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                            className="min-h-control-28px max-h-fixed-96px w-full resize-none overflow-y-auto rounded border border-border bg-surface px-2 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                         />
                     </label>
                 </div>
@@ -1280,7 +1280,7 @@ function PostingRowEditor({
                         e.stopPropagation();
                     }
                 }}
-                className="min-h-7 max-h-24 w-full resize-none overflow-y-auto rounded border border-border bg-surface px-2 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
+                className="min-h-control-28px max-h-fixed-96px w-full resize-none overflow-y-auto rounded border border-border bg-surface px-2 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
             />
             {/* col6 (register's CATEGORY · TAGS) — category
                 typeahead + per-leg tags placeholder, stacked under
@@ -1320,7 +1320,7 @@ function PostingRowEditor({
                     const n = Number(text);
                     if (!Number.isNaN(n)) onChange({ amount: n.toFixed(2) });
                 }}
-                className="h-7 w-full rounded border border-border bg-surface px-2 text-right font-mono text-xs tabular-nums focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                className="h-control-28px w-full rounded border border-border bg-surface px-2 text-right font-mono text-xs tabular-nums focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             />
             {/* col8 (register's BALANCE) — remove button. The
                 register's balance is meaningless mid-edit (the
@@ -1336,7 +1336,7 @@ function PostingRowEditor({
                 }
                 disabled={disabled || !canRemove}
                 onClick={onRemove}
-                className="ml-auto h-7 w-7 rounded text-text-subtle hover:bg-state-danger-soft hover:text-state-danger disabled:cursor-not-allowed disabled:opacity-30"
+                className="ml-auto size-control-28px rounded text-text-subtle hover:bg-state-danger-soft hover:text-state-danger disabled:cursor-not-allowed disabled:opacity-30"
             >
                 −
             </button>
@@ -1408,7 +1408,7 @@ function TagsPlaceholder({
             <div
                 role="presentation"
                 title={hint}
-                className="flex h-7 min-w-0 items-center rounded border border-dashed border-border bg-transparent px-2 text-xs italic text-text-subtle opacity-50"
+                className="flex h-control-28px min-w-0 items-center rounded border border-dashed border-border bg-transparent px-2 text-xs italic text-text-subtle opacity-50"
             >
                 {hint}
             </div>
@@ -1473,7 +1473,7 @@ function TagsInput({
         >
             {label !== undefined ? <span>{label}</span> : null}
             <div
-                className="flex min-h-7 min-w-0 flex-wrap items-center gap-1 rounded border border-border bg-surface px-1 py-0.5 text-xs focus-within:outline-none focus-within:ring-2 focus-within:ring-accent"
+                className="flex min-h-control-28px min-w-0 flex-wrap items-center gap-1 rounded border border-border bg-surface px-1 py-0.5 text-xs focus-within:outline-none focus-within:ring-2 focus-within:ring-accent"
             >
                 {tags.map((tag, i) => (
                     <span

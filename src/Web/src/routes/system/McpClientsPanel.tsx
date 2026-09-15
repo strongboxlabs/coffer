@@ -95,7 +95,7 @@ export function McpClientsPanel() {
                                                 <input
                                                     autoFocus
                                                     aria-label={`Name for ${c.displayName}`}
-                                                    className="w-56 rounded-md border border-border px-2 py-1 text-sm"
+                                                    className="w-fixed-224px rounded-md border border-border px-2 py-1 text-sm"
                                                     value={draft}
                                                     placeholder={c.displayName}
                                                     onChange={(e) => setDraft(e.target.value)}

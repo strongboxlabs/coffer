@@ -18,6 +18,7 @@
       (function () {
         var fallback = 'light';
         var accentFallback = 'teal';
+        var densityFallback = 'regular';
         try {
           var t = localStorage.getItem('coffer.theme');
           var ok = t === 'light' || t === 'light-hc' || t === 'dark' || t === 'dark-hc';
@@ -25,10 +26,14 @@
           var a = localStorage.getItem('coffer.accent');
           var aok = a === 'teal' || a === 'indigo' || a === 'rust';
           document.documentElement.setAttribute('data-accent', aok ? a : accentFallback);
+          var d = localStorage.getItem('coffer.density');
+          var dok = d === 'compressed' || d === 'regular' || d === 'relaxed';
+          document.documentElement.setAttribute('data-density', dok ? d : densityFallback);
         } catch (e) {
           // Blocked storage (private window, embedded webview) throws on read.
           document.documentElement.setAttribute('data-theme', fallback);
           document.documentElement.setAttribute('data-accent', accentFallback);
+          document.documentElement.setAttribute('data-density', densityFallback);
         }
       })();
     </script>

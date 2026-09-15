@@ -387,7 +387,7 @@ export function InvestmentTxnRowEdit({
                         }}
                         disabled={disabled}
                         aria-label="Action"
-                        className="h-7 rounded border border-border bg-surface px-2 text-xs"
+                        className="h-control-28px rounded border border-border bg-surface px-2 text-xs"
                     >
                         <option value="">Pick action…</option>
                         {ACTION_PICKER_ENTRIES.map(({ action: a, label, hint }) => (
@@ -406,7 +406,7 @@ export function InvestmentTxnRowEdit({
                         value={draft.postedAt}
                         onChange={(e) => setPostedAt(e.target.value)}
                         disabled={disabled}
-                        className="h-7 rounded border border-border bg-surface px-2 font-mono text-xs"
+                        className="h-control-28px rounded border border-border bg-surface px-2 font-mono text-xs"
                     />
                 </div>
 
@@ -428,7 +428,7 @@ export function InvestmentTxnRowEdit({
                         disabled={disabled}
                         aria-label="Tax date"
                         title="Leave blank when the tax date is the same as the posted date"
-                        className="h-7 rounded border border-border bg-surface px-2 font-mono text-xs"
+                        className="h-control-28px rounded border border-border bg-surface px-2 font-mono text-xs"
                     />
                 </div>
 
@@ -441,7 +441,7 @@ export function InvestmentTxnRowEdit({
                         onChange={(e) => setCheckNumber(e.target.value)}
                         disabled={disabled}
                         placeholder="(optional)"
-                        className="h-7 w-24 rounded border border-border bg-surface px-2 text-xs"
+                        className="h-control-28px w-fixed-96px rounded border border-border bg-surface px-2 text-xs"
                     />
                 </div>
 
@@ -458,7 +458,7 @@ export function InvestmentTxnRowEdit({
                         onChange={(e) => setPayee(e.target.value)}
                         disabled={disabled}
                         placeholder="(optional)"
-                        className="h-7 w-full rounded border border-border bg-surface px-2 text-xs"
+                        className="h-control-28px w-full rounded border border-border bg-surface px-2 text-xs"
                     />
                 </div>
                 <div className="flex min-w-0 flex-[2] flex-col gap-1 text-xs">
@@ -470,7 +470,7 @@ export function InvestmentTxnRowEdit({
                         onChange={(e) => setMemo(e.target.value)}
                         disabled={disabled}
                         placeholder="(optional)"
-                        className="h-7 w-full rounded border border-border bg-surface px-2 text-xs"
+                        className="h-control-28px w-full rounded border border-border bg-surface px-2 text-xs"
                     />
                 </div>
             </div>

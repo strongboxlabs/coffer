@@ -9,7 +9,7 @@ import {
 } from './registerSort';
 
 // Column-sort selector (mig 166). A compact "Sort: <col> <arrow> ▾" dropdown
-// sitting next to the status "Show ▾" menu, on the same dense h-7 register
+// sitting next to the status "Show ▾" menu, on the same dense h-control-28px register
 // control scale. Picking a column sorts by it in its natural default direction
 // (defaultDirFor); picking the ALREADY-active column flips the direction.
 // Investment-only columns (Security / Shares / Price / Action) appear only on
@@ -62,7 +62,7 @@ export function RegisterSortMenu({ sort, onChange, investment }: RegisterSortMen
                 aria-controls={popId}
                 aria-haspopup="listbox"
                 title="Sort the register by a column"
-                className="inline-flex h-7 items-center gap-1 rounded border border-border bg-surface px-2 text-xs text-text hover:border-accent"
+                className="inline-flex h-control-28px items-center gap-1 rounded border border-border bg-surface px-2 text-xs text-text hover:border-accent"
             >
                 <span className="text-text-subtle">Sort:</span>
                 <span className="font-medium">{sortColumnLabel(sort.column)}</span>
@@ -73,7 +73,7 @@ export function RegisterSortMenu({ sort, onChange, investment }: RegisterSortMen
                 <ul
                     id={popId}
                     role="listbox"
-                    className="absolute left-0 z-30 mt-1 w-40 rounded border border-border bg-surface py-1 text-xs shadow-lg"
+                    className="absolute left-0 z-30 mt-1 w-fixed-160px rounded border border-border bg-surface py-1 text-xs shadow-lg"
                 >
                     {columns.map((c) => (
                         <li key={c.value}>

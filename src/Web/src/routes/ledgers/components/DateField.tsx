@@ -63,7 +63,7 @@ export function DateField({
                         onChange(shiftDateInputValue(value, -1));
                     }
                 }}
-                className="h-7 w-full rounded border border-border bg-surface px-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                className="h-control-28px w-full rounded border border-border bg-surface px-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             />
         </label>
     );

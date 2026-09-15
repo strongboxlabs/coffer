@@ -280,7 +280,7 @@ function bankContainerAttrs(_row: BankRow, ctx: RegisterRowContainerCtx) {
 
 export const bankRowStrategy: RegisterRowStrategy<BankRow> = {
     cols: BANK_COLS,
-    rowClassName: 'min-h-9 items-center',
+    rowClassName: 'min-h-control-36px items-center',
     cursorClassName: 'cursor-pointer',
     containerAttrs: bankContainerAttrs,
     renderBody(row, ctx) {

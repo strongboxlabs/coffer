@@ -113,7 +113,7 @@ export function LedgerHubSection({
                 >
                     <ChevronDown
                         className={cn(
-                            'h-4 w-4 text-text-muted transition-transform',
+                            'size-icon-md text-text-muted transition-transform',
                             expanded ? 'rotate-0' : '-rotate-90',
                         )}
                         aria-hidden

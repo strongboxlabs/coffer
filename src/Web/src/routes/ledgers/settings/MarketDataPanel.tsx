@@ -92,7 +92,7 @@ export function MarketDataPanel({ ledgerId }: { ledgerId: string }) {
                                             checked={enabled.includes(p.key)}
                                             disabled={mutation.isPending}
                                             onChange={(e) => toggle(p.key, e.target.checked)}
-                                            className="h-4 w-4 rounded border-border text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                                            className="size-icon-md rounded border-border text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                                             aria-label={`Enable ${p.displayName}`}
                                         />
                                     </label>

@@ -9,6 +9,7 @@ import type { CategoryNode } from '@/lib/types';
 import { formatCurrency } from '@/lib/money';
 import { errorMessage } from '@/lib/errorMessage';
 import { cn } from '@/lib/cn';
+import { RowActionsButton } from '@/components/ui/RowActionsButton';
 import { Panel, PanelBody, PanelHead } from '@/components/ui/Panel';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
@@ -105,13 +106,11 @@ export function CategoriesPanel({ ledgerId }: { ledgerId: string }) {
             <li
                 key={node.id}
                 style={{ paddingLeft: `${0.5 + depth * 1.25}rem` }}
-                title={actionable ? 'Right-click for actions' : undefined}
                 onContextMenu={actionable
                     ? (e) => { e.preventDefault(); setMenu({ node, x: e.clientX, y: e.clientY }); }
                     : undefined}
                 className={cn(
                     'flex items-center justify-between gap-2 rounded py-1 pr-1.5 hover:bg-surface-hover',
-                    actionable && 'cursor-context-menu',
                 )}
             >
                 <div className="flex min-w-0 items-center gap-2">
@@ -136,9 +135,19 @@ export function CategoriesPanel({ ledgerId }: { ledgerId: string }) {
                     >
                         {node.transactionCount} txns
                     </span>
-                    <span className="w-24 text-right text-sm tabular-nums text-text">
+                    <span className="w-fixed-96px text-right text-sm tabular-nums text-text">
                         {formatCurrency(displayTotal(node.total, node.categoryKind))}
                     </span>
+                    {/* A placeholder keeps the money column aligned on rows
+                        that have no actions (system categories). */}
+                    {actionable ? (
+                        <RowActionsButton
+                            label={`Actions for ${node.name}`}
+                            onOpen={({ x, y }) => setMenu({ node, x, y })}
+                        />
+                    ) : (
+                        <span aria-hidden className="size-control-28px shrink-0" />
+                    )}
                 </div>
             </li>
         );
@@ -280,7 +289,7 @@ function KindSection({
         <section>
             <div className="mb-1 flex items-center justify-between gap-2 border-b border-border pb-1">
                 <h3 className="flex items-center gap-1.5 text-sm font-semibold text-text">
-                    <Icon className={cn('h-4 w-4', iconClass)} aria-hidden />
+                    <Icon className={cn('size-icon-md', iconClass)} aria-hidden />
                     {label}
                     <span className="text-xs font-normal text-text-subtle">({rows.length})</span>
                 </h3>
@@ -296,7 +305,7 @@ function KindSection({
                         onClick={onNew}
                         className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-text-muted hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                     >
-                        <Plus className="h-3.5 w-3.5" aria-hidden />
+                        <Plus className="size-icon-sm" aria-hidden />
                         New {label.toLowerCase()}
                     </button>
                 </div>

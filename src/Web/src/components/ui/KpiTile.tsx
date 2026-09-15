@@ -25,7 +25,7 @@ export const KpiTile = forwardRef<HTMLDivElement, KpiTileProps>(
         return (
             <div
                 ref={ref}
-                className={cn('bg-surface px-4 py-3.5', className)}
+                className={cn('bg-surface px-4 py-3', className)}
                 {...props}
             >
                 <div className="mb-1 text-[0.6875rem] font-medium uppercase tracking-wider text-text-muted">

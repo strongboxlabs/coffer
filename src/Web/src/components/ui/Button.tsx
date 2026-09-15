@@ -33,9 +33,9 @@ const buttonVariants = cva(
                 danger: 'bg-state-danger text-text-inverse hover:bg-state-danger/90',
             },
             size: {
-                md: 'h-10 px-4 py-2',
-                sm: 'h-9 px-3',
-                lg: 'h-11 px-8',
+                md: 'h-control-40px px-4 py-2',
+                sm: 'h-control-36px px-3',
+                lg: 'h-control-44px px-8',
             },
         },
         defaultVariants: {

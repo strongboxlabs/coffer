@@ -85,7 +85,7 @@ export function FeeField({
                     aria-invalid={!!error}
                     aria-describedby={error ? `${amountId}-error` : undefined}
                     className={cn(
-                        'h-7 w-24 rounded border bg-surface px-2 text-right font-mono text-xs tabular-nums',
+                        'h-control-28px w-fixed-96px rounded border bg-surface px-2 text-right font-mono text-xs tabular-nums',
                         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent',
                         error ? 'border-state-danger' : 'border-border',
                     )}

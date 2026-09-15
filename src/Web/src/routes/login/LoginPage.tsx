@@ -79,7 +79,7 @@ export function LoginPage() {
         <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center px-6 py-12">
             <div className="mb-6 flex items-center gap-2">
                 <LineChart
-                    className="h-5 w-5 text-accent"
+                    className="size-icon-lg text-accent"
                     strokeWidth={2.25}
                     aria-hidden
                 />

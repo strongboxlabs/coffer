@@ -619,7 +619,7 @@ function PreviewStep({
                         <p className="font-medium">
                             Preview warnings ({preview.errors.length}):
                         </p>
-                        <ul className="mt-1 max-h-40 list-disc overflow-y-auto pl-4">
+                        <ul className="mt-1 max-h-fixed-160px list-disc overflow-y-auto pl-4">
                             {preview.errors.map((e, i) => (
                                 <li key={i}>
                                     <span className="font-mono">{e.code}</span>: {e.message}
@@ -756,7 +756,7 @@ function ResultStep({
                         <p className="font-medium">
                             Import warnings ({result.errors.length}):
                         </p>
-                        <ul className="mt-1 max-h-40 list-disc overflow-y-auto pl-4">
+                        <ul className="mt-1 max-h-fixed-160px list-disc overflow-y-auto pl-4">
                             {result.errors.map((e, i) => (
                                 <li key={i}>
                                     <span className="font-mono">{e.code}</span>: {e.message}

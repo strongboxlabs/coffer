@@ -415,7 +415,7 @@ export function AccountCategoryPicker({
                     <ul
                         ref={listRef}
                         role="listbox"
-                        className="max-h-64 overflow-y-auto py-1"
+                        className="max-h-fixed-256px overflow-y-auto py-1"
                     >
                         {rows.length === 0 ? (
                             <li className="px-3 py-2 text-text-subtle">No matches</li>

@@ -479,7 +479,7 @@ export function AccountEditorDialog({ ledgerId, account, onClose, onSaved }: Acc
                                         <span>Fixed amount</span>
                                     </label>
                                     {!ltComputed ? (
-                                        <input className={cn(inputClass, 'mt-0 w-32')} inputMode="decimal"
+                                        <input className={cn(inputClass, 'mt-0 w-fixed-128px')} inputMode="decimal"
                                             value={ltFixed} placeholder="0.00"
                                             aria-label="Fixed payment amount"
                                             onChange={(e) => setLtFixed(e.target.value)} />

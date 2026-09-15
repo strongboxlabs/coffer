@@ -90,7 +90,7 @@ export function DashboardLayoutPanel({ ledgerId }: { ledgerId: string }) {
                                             onClick={() => move(i, -1)}
                                             className="text-text-muted hover:text-text disabled:opacity-30"
                                         >
-                                            <ArrowUp className="h-3.5 w-3.5" aria-hidden />
+                                            <ArrowUp className="size-icon-sm" aria-hidden />
                                         </button>
                                         <button
                                             type="button"
@@ -99,7 +99,7 @@ export function DashboardLayoutPanel({ ledgerId }: { ledgerId: string }) {
                                             onClick={() => move(i, 1)}
                                             className="text-text-muted hover:text-text disabled:opacity-30"
                                         >
-                                            <ArrowDown className="h-3.5 w-3.5" aria-hidden />
+                                            <ArrowDown className="size-icon-sm" aria-hidden />
                                         </button>
                                     </span>
                                     <span className="flex-1 text-sm font-medium">{w.label}</span>
@@ -115,7 +115,7 @@ export function DashboardLayoutPanel({ ledgerId }: { ledgerId: string }) {
                                                 checked={w.visible}
                                                 disabled={mutation.isPending}
                                                 onChange={() => toggle(i)}
-                                                className="h-4 w-4 rounded border-border text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                                                className="size-icon-md rounded border-border text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                                                 aria-label={`Show ${w.label}`}
                                             />
                                         </label>

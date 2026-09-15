@@ -155,7 +155,7 @@ export function RecoveryCodes({ codes, onAcknowledge }: RecoveryCodesProps) {
             >
                 <input
                     type="checkbox"
-                    className="mt-1 size-4 rounded border-border accent-accent"
+                    className="mt-1 size-icon-md rounded border-border accent-accent"
                     checked={acknowledged}
                     onChange={(event) => setAcknowledged(event.target.checked)}
                 />

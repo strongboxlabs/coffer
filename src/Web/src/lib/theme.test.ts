@@ -8,12 +8,19 @@ import {
     ACCENT_STORAGE_KEY,
     applyTheme,
     coerceAccent,
+    coerceDensity,
     coerceTheme,
     DEFAULT_ACCENT,
+    DEFAULT_DENSITY,
     DEFAULT_THEME,
+    DENSITIES,
+    DENSITY_IDS,
+    DENSITY_STORAGE_KEY,
     readStoredAccent,
+    readStoredDensity,
     readStoredTheme,
     setAccent,
+    setDensity,
     setTheme,
     THEME_IDS,
     THEME_STORAGE_KEY,
@@ -25,6 +32,8 @@ const INDEX_HTML = join(import.meta.dirname, '..', '..', 'index.html');
 afterEach(() => {
     localStorage.clear();
     document.documentElement.removeAttribute('data-theme');
+    document.documentElement.removeAttribute('data-accent');
+    document.documentElement.removeAttribute('data-density');
     vi.restoreAllMocks();
 });
 
@@ -116,12 +125,28 @@ describe('the pre-paint script in index.html', () => {
         expect(html).toContain(`var accentFallback = '${DEFAULT_ACCENT}'`);
     });
 
-    it('stamps BOTH attributes before paint', () => {
+    it('uses the same density storage key', () => {
+        expect(html).toContain(`'${DENSITY_STORAGE_KEY}'`);
+    });
+
+    it('knows every density the module ships', () => {
+        for (const id of DENSITY_IDS) expect(html).toContain(`'${id}'`);
+    });
+
+    it('falls back to the same density default', () => {
+        expect(html).toContain(`var densityFallback = '${DEFAULT_DENSITY}'`);
+    });
+
+    it('stamps ALL THREE attributes before paint', () => {
         // The stylesheet's pair selectors are compound, so a load that set only
         // data-theme would render the default palette until React mounted —
-        // a flash of the wrong colour, not just the wrong theme.
+        // a flash of the wrong colour, not just the wrong theme. Density is the
+        // same failure in a different currency: without it the app lays out at
+        // the default spacing and then reflows once React mounts, which is a
+        // visible jump rather than a flash.
         expect(html).toContain("setAttribute('data-theme'");
         expect(html).toContain("setAttribute('data-accent'");
+        expect(html).toContain("setAttribute('data-density'");
     });
 
     it('runs before the stylesheet-dependent app script', () => {
@@ -153,6 +178,51 @@ describe('the accent axis', () => {
             throw new DOMException('denied', 'SecurityError');
         });
         expect(readStoredAccent()).toBe(DEFAULT_ACCENT);
+    });
+});
+
+describe('the density axis', () => {
+    it('accepts every shipped level and rejects the rest', () => {
+        for (const id of DENSITY_IDS) expect(coerceDensity(id)).toBe(id);
+        for (const bad of [null, undefined, '', 'compact', 'COMPRESSED', 3, {}]) {
+            expect(coerceDensity(bad)).toBe(DEFAULT_DENSITY);
+        }
+    });
+
+    it('reads, persists and applies independently of theme and accent', () => {
+        setTheme('dark');
+        setAccent('rust');
+        setDensity('compressed');
+        expect(localStorage.getItem(DENSITY_STORAGE_KEY)).toBe('compressed');
+        expect(document.documentElement.getAttribute('data-density')).toBe('compressed');
+        // The other two axes are untouched — three independent choices, not a
+        // combined "appearance" blob.
+        expect(document.documentElement.getAttribute('data-theme')).toBe('dark');
+        expect(document.documentElement.getAttribute('data-accent')).toBe('rust');
+        expect(readStoredDensity()).toBe('compressed');
+    });
+
+    it('still applies when the write is refused', () => {
+        vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+            throw new DOMException('quota', 'QuotaExceededError');
+        });
+        setDensity('relaxed');
+        expect(document.documentElement.getAttribute('data-density')).toBe('relaxed');
+    });
+
+    it('survives storage that throws on read', () => {
+        vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+            throw new DOMException('denied', 'SecurityError');
+        });
+        expect(readStoredDensity()).toBe(DEFAULT_DENSITY);
+    });
+
+    it('lists every id exactly once, in id order, each with a label and hint', () => {
+        expect(DENSITIES.map((d) => d.id)).toEqual([...DENSITY_IDS]);
+        for (const d of DENSITIES) {
+            expect(d.label.length).toBeGreaterThan(0);
+            expect(d.hint.length).toBeGreaterThan(0);
+        }
     });
 });
 

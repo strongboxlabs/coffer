@@ -91,7 +91,7 @@ export function RestoreBackupCard() {
             <PanelBody className="space-y-4">
                 <div className="space-y-1">
                     <h3 className="flex items-center gap-2 text-sm font-semibold text-state-danger">
-                        <AlertTriangle className="h-4 w-4" aria-hidden />
+                        <AlertTriangle className="size-icon-md" aria-hidden />
                         Restore from a backup
                     </h3>
                     <p className="text-xs text-text-muted">

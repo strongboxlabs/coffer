@@ -561,7 +561,7 @@ function ConnectionRow({
                 >
                     <RefreshCw
                         className={
-                            'h-3.5 w-3.5 ' + (isSyncing ? 'animate-spin' : '')
+                            'size-icon-sm ' + (isSyncing ? 'animate-spin' : '')
                         }
                         aria-hidden
                     />
@@ -572,7 +572,7 @@ function ConnectionRow({
                     onClick={onDelete}
                     disabled={isDeleting}
                 >
-                    <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                    <Trash2 className="size-icon-sm" aria-hidden />
                 </IconButton>
             </div>
 
@@ -925,7 +925,7 @@ function ConnectionAccountRow({
                             value={pickerValue}
                             onChange={(e) => setPickerValue(e.target.value)}
                             disabled={inFlight}
-                            className="h-7 rounded border border-border bg-surface px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                            className="h-control-28px rounded border border-border bg-surface px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                         >
                             <option value="">Pick a Coffer account…</option>
                             {options.map((a) => (
@@ -1025,7 +1025,7 @@ function SyncFromEditor({
                     value={draft}
                     max={todayIso}
                     onChange={(e) => setDraft(e.target.value)}
-                    className="h-7 rounded border border-border bg-surface px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                    className="h-control-28px rounded border border-border bg-surface px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                 />
                 <Button type="button" variant="secondary" size="sm" onClick={onClose}>
                     Cancel
@@ -1098,9 +1098,9 @@ function SyncActivityPanel({
                 aria-expanded={expanded}
             >
                 {expanded ? (
-                    <ChevronDown className="h-3 w-3" aria-hidden />
+                    <ChevronDown className="size-icon-xs" aria-hidden />
                 ) : (
-                    <ChevronRight className="h-3 w-3" aria-hidden />
+                    <ChevronRight className="size-icon-xs" aria-hidden />
                 )}
                 Sync activity
             </button>
@@ -1176,9 +1176,9 @@ function SyncRunListItem({
                 </span>
                 {hasDetail ? (
                     expanded ? (
-                        <ChevronDown className="h-3 w-3" aria-hidden />
+                        <ChevronDown className="size-icon-xs" aria-hidden />
                     ) : (
-                        <ChevronRight className="h-3 w-3" aria-hidden />
+                        <ChevronRight className="size-icon-xs" aria-hidden />
                     )
                 ) : null}
             </button>

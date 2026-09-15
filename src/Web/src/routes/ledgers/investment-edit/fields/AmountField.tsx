@@ -49,7 +49,7 @@ export function AmountField({
                     }
                 }}
                 className={cn(
-                    'h-7 w-full rounded border bg-surface px-2 text-right font-mono text-xs tabular-nums',
+                    'h-control-28px w-full rounded border bg-surface px-2 text-right font-mono text-xs tabular-nums',
                     'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent',
                     error ? 'border-state-danger' : 'border-border',
                 )}

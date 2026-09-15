@@ -368,7 +368,7 @@ function TypeaheadInner<T>(
                 onKeyDown={handleKeyDown}
                 onBlur={handleBlur}
                 className={cn(
-                    'flex h-8 w-full rounded border border-border bg-surface px-2 text-sm text-text',
+                    'flex h-control-32px w-full rounded border border-border bg-surface px-2 text-sm text-text',
                     'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-accent',
                     'disabled:cursor-not-allowed disabled:opacity-50',
                 )}
@@ -377,7 +377,7 @@ function TypeaheadInner<T>(
                 <ul
                     id={listboxId}
                     role="listbox"
-                    className="absolute left-0 right-0 z-20 mt-1 max-h-64 overflow-auto rounded border border-border bg-surface shadow-[0_4px_12px_rgba(15,23,42,0.08)]"
+                    className="absolute left-0 right-0 z-20 mt-1 max-h-fixed-256px overflow-auto rounded border border-border bg-surface shadow-[0_4px_12px_rgba(15,23,42,0.08)]"
                 >
                     {filtered.map((item, index) => {
                         const key = getKey(item);
