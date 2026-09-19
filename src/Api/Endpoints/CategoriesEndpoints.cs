@@ -103,6 +103,12 @@ public static class CategoriesEndpoints
             AccountsRepository.ReparentCategoryResult.WouldCycle =>
                 BusinessError.Problem(BusinessError.Codes.CategoryCycle,
                     "That move would make a category its own ancestor."),
+            AccountsRepository.ReparentCategoryResult.BudgetTargetConflict =>
+                BusinessError.Problem(BusinessError.Codes.BudgetTargetAncestorConflict,
+                    "That move would put a budget target underneath another one for the same "
+                    + "month. A target covers everything beneath it, so only one level of a "
+                    + "branch can carry one. Clear whichever target you no longer need, then "
+                    + "move the category."),
             _ => Results.Problem("Unknown reparent-category result.", statusCode: 500),
         };
     }
@@ -111,8 +117,13 @@ public static class CategoriesEndpoints
     /// <c>POST /api/ledgers/{ledgerId}/categories/{categoryId}/merge</c> — merge this
     /// (source) category into <c>targetId</c>: repoint every leg (committed +
     /// reminder templates), reparent the source's children to the target, and
-    /// deactivate the source (reversible). Both must be the same kind. <c>dryRun</c>
-    /// returns the counts that would move without writing.
+    /// deactivate the source (reversible). <c>dryRun</c> returns the counts that
+    /// would move without writing.
+    /// <para>The kinds MAY differ (ADR-0017). A cross-kind merge is now the only
+    /// way to reclassify a category, because the kind of an existing one is
+    /// immutable — flipping it in place would move every posting between the
+    /// spending and income totals silently, where this states the counts,
+    /// deactivates rather than destroys, and can be undone by reactivating.</para>
     /// </summary>
     private static async Task<IResult> MergeAsync(
         Guid ledgerId,
@@ -151,9 +162,13 @@ public static class CategoriesEndpoints
             AccountsRepository.MergeCategoryResult.NotCategory =>
                 BusinessError.Problem(BusinessError.Codes.AccountNotACategory,
                     "Both source and target must be categories."),
+            // Unreachable since ADR-0017 opened cross-kind merges; the arm is kept
+            // so the switch stays exhaustive over the enum, whose member is itself
+            // retained for clients that still branch on it.
             AccountsRepository.MergeCategoryResult.KindMismatch =>
                 BusinessError.Problem(BusinessError.Codes.CategoryKindMismatch,
-                    "Categories can only merge into another of the same kind (income or expense)."),
+                    "Categories of different kinds can no longer be refused here; if you are "
+                    + "seeing this, the server and this message disagree — please report it."),
             AccountsRepository.MergeCategoryResult.SameCategory =>
                 BusinessError.Problem(BusinessError.Codes.CategoryMergeSelf,
                     "A category cannot be merged into itself."),

@@ -43,6 +43,16 @@ export interface RegisterFilterArgs {
     /** Caller's LOCAL calendar date (YYYY-MM-DD) so "scheduled" matches the
      *  user's date, not the server's UTC one. */
     today?: string;
+    /**
+     * Widen a CATEGORY register to its descendants (mig 226).
+     *
+     * A parent category holds no postings of its own — they are all on its
+     * children — so without this its register is empty while every other screen
+     * reports money against it. Meaningless for a real account, which has no
+     * tree, and omitted from the query string when false so ordinary registers
+     * keep their existing URLs and cache keys.
+     */
+    includeSubcategories?: boolean;
 }
 
 /** True when any *user* filter dimension is set. Excludes `status` (owned by
@@ -59,6 +69,14 @@ export function isRegisterFilterActive(f: RegisterFilterArgs): boolean {
         || f.categoryId
         || f.tag
         || f.securityId
+        // `includeSubcategories` is deliberately NOT here. It is a SCOPE —
+        // which register you are looking at — not a filter narrowing it, and
+        // treating it as one put it in the chip row next to "food" and
+        // "Category: Groceries", where removing it reads as clearing a search
+        // rather than leaving the subtree. It has its own persistent toggle in
+        // the controls bar, which shows its state without pretending to be a
+        // filter. The bucket/page query keys hash the whole filter object, so
+        // the rail still re-derives when it changes.
     );
 }
 
@@ -90,6 +108,9 @@ function appendFilterParams(params: URLSearchParams, filter?: RegisterFilterArgs
     if (filter.categoryId) params.set('category_id', filter.categoryId);
     if (filter.status) params.set('status', filter.status);
     if (filter.today) params.set('today', filter.today);
+    // Omitted when false, so an ordinary account register keeps the URL and
+    // cache key it has always had.
+    if (filter.includeSubcategories) params.set('include_subcategories', 'true');
 }
 
 export interface FetchRegisterArgs {

@@ -10,7 +10,8 @@ export type DashboardWidgetKey =
     | 'accounts'
     | 'investments'
     | 'upcoming'
-    | 'activity';
+    | 'activity'
+    | 'spending';
 
 export interface DashboardWidgetMeta {
     key: DashboardWidgetKey;
@@ -26,6 +27,7 @@ export const DASHBOARD_WIDGETS: readonly DashboardWidgetMeta[] = [
     { key: 'investments', label: 'Investments', alwaysVisible: false },
     { key: 'upcoming', label: 'Upcoming', alwaysVisible: false },
     { key: 'activity', label: 'Recent activity', alwaysVisible: false },
+    { key: 'spending', label: 'Spending', alwaysVisible: false },
 ] as const;
 
 export interface ResolvedWidget extends DashboardWidgetMeta {

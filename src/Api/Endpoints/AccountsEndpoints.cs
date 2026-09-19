@@ -491,7 +491,13 @@ public static class AccountsEndpoints
                     "Account name cannot be blank."),
             AccountsRepository.UpdateAccountResult.CategoryKindInvalid =>
                 BusinessError.Problem(BusinessError.Codes.AccountCategoryKindInvalid,
-                    "Category kind must be 'income' or 'expense', and only on categories."),
+                    "Category kind must be 'income', 'expense' or 'adjustment', and only on categories."),
+            AccountsRepository.UpdateAccountResult.CategoryKindImmutable =>
+                BusinessError.Problem(BusinessError.Codes.CategoryKindImmutable,
+                    "A category's kind cannot be changed — it would move every posting in it "
+                    + "between the spending and income totals, for all of its history. Create a "
+                    + "category of the kind you want and merge this one into it instead; the merge "
+                    + "says what moves and can be undone."),
             AccountsRepository.UpdateAccountResult.CurrencyInvalid =>
                 BusinessError.Problem(BusinessError.Codes.AccountCurrencyInvalid,
                     "Currency must be a 3-letter ISO code."),

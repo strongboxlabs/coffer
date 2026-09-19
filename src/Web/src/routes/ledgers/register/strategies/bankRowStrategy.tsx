@@ -85,7 +85,7 @@ function renderTxnBody(txn: BankRow, ctx: RegisterRowBodyCtx): ReactNode {
                 )}
             </span>
             <span role="cell" className="min-w-0 space-y-1">
-                {renderBankSlot6(txn, ctx.accountPaths)}
+                {renderBankSlot6(txn, ctx.accountPaths, ctx.rollupRootId)}
             </span>
             <span
                 role="cell"
@@ -112,15 +112,107 @@ function renderTxnBody(txn: BankRow, ctx: RegisterRowBodyCtx): ReactNode {
     );
 }
 
-function renderSplitParentBody(row: BankRow, ctx: RegisterRowBodyCtx): ReactNode {
+/**
+ * One entry per DISTINCT counterparty across a split group, in first-seen
+ * order, with amounts summed and legs counted.
+ *
+ * Deduplication is not cosmetic. An ADR-0036 target cluster's legs frequently
+ * share ONE counterparty, so a naive per-leg list prints the same category
+ * three times; and a paycheck's Medicare Tax can appear twice (regular plus
+ * surtax), which a reader expects to see added up, not listed twice.
+ *
+ * Amounts come from the LEGS and never from the parent row: a split parent's
+ * `amount` is the group's NET, so pairing it with any one category would
+ * attribute a whole paycheck to it.
+ */
+interface SplitCategoryEntry {
+    id: string | null | undefined;
+    label: string | null | undefined;
+    name: string | null | undefined;
+    type: string | null | undefined;
+    sum: number;
+    legCount: number;
+}
+
+function summarizeSplitCategories(
+    legs: readonly BankRow[],
+    accountPaths?: ReadonlyMap<string, string>,
+): readonly SplitCategoryEntry[] {
+    const byId = new Map<string, SplitCategoryEntry>();
+    for (const leg of legs) {
+        // Key on the id when there is one; fall back to the name so two
+        // uncategorised legs do not merge into one misleading entry.
+        const key = leg.counterpartyAccountId ?? `name:${leg.counterpartyAccountName ?? ''}`;
+        const found = byId.get(key);
+        if (found !== undefined) {
+            found.sum += leg.amount;
+            found.legCount += 1;
+            continue;
+        }
+        byId.set(key, {
+            id: leg.counterpartyAccountId,
+            name: leg.counterpartyAccountName,
+            type: leg.counterpartyAccountType,
+            label: displayAccountPath(
+                accountPaths, leg.counterpartyAccountId, leg.counterpartyAccountName,
+            ),
+            sum: leg.amount,
+            legCount: 1,
+        });
+    }
+    return [...byId.values()];
+}
+
+/**
+ * Which category stands for the whole split in one line.
+ *
+ * The ACTIVE FILTER WINS, because the row is on screen BECAUSE of it: the
+ * server filters at entry level, so filtering by Insurance/Health returns the
+ * paycheck, and the one thing the collapsed row has to answer is "which leg
+ * matched, and for how much".
+ *
+ * Failing that, the largest entry by ABSOLUTE summed amount. On both real
+ * shapes in this repo — a paycheck (gross pay against a dozen deductions) and
+ * a two-way grocery split — one entry carries most of the group, and it is the
+ * one a human would name the transaction after. "Most common category" is a
+ * coin flip on both (a paycheck's deductions are all distinct; a two-way split
+ * ties), and "sign matches the net" discriminates nothing on an all-negative
+ * split.
+ */
+function leadSplitCategory(
+    entries: readonly SplitCategoryEntry[],
+    filterCategoryId?: string | null,
+): { entry: SplitCategoryEntry; matchedFilter: boolean } | null {
+    if (entries.length === 0) return null;
+    if (filterCategoryId != null) {
+        const hit = entries.find((e) => e.id != null && e.id === filterCategoryId);
+        if (hit !== undefined) return { entry: hit, matchedFilter: true };
+    }
+    let best = entries[0]!;
+    for (const e of entries) {
+        // Strictly greater, so a tie keeps the first-seen (leg order) entry.
+        if (Math.abs(e.sum) > Math.abs(best.sum)) best = e;
+    }
+    return { entry: best, matchedFilter: false };
+}
+
+function renderSplitParentBody(row: BankRow, ctx: RegisterRowBodyCtx<BankRow>): ReactNode {
     // The page synthesizes the representative parent row as the canonical
     // leg with the group's amount + balance-after-last-leg, so the cells
     // read off `row` directly (same fields the former SplitParentRowCells
     // computed from canonical / groupAmount / groupBalanceAfter).
-    const { currency, today, expand } = ctx;
+    const { currency, today, expand, accountPaths, legs, filterCategoryId } = ctx;
     const status = resolveRowStatus(row, today);
     const scheduled = status === 'scheduled';
     const taxDateLabel = taxDateSubLabel(row);
+    // The collapsed row used to show NO category anywhere — the expand toggle
+    // occupied the whole cell. That is worst immediately after a category
+    // filter, which matches per LEG on the server and hands back a group whose
+    // row then names neither the matching leg nor its amount.
+    const lead = leadSplitCategory(
+        summarizeSplitCategories(legs ?? [], accountPaths),
+        filterCategoryId,
+    );
     return (
         <>
             <span role="cell" className="font-mono tabular-nums">
@@ -161,20 +253,76 @@ function renderSplitParentBody(row: BankRow, ctx: RegisterRowBodyCtx): ReactNode
                     </span>
                 ) : null}
             </span>
-            {/* Combined category · tags column. For a split parent the
-                category slot shows the "— N splits —" expand affordance;
-                tags belong to the header so they wrap beneath. */}
+            {/* Combined category · tags column. The split parent leads with
+                the category that stands for the group — at the cell's LEFT
+                edge, exactly where a flat row's chip sits, so the column reads
+                straight down rather than alternating between two shapes — and
+                pins the expand toggle to the right. Tags belong to the header
+                so they wrap beneath. */}
             <span role="cell" className="min-w-0 space-y-1">
-                <button
-                    type="button"
-                    aria-expanded={expand?.expanded ?? false}
-                    aria-controls={`split-group-${expand?.groupId ?? ''}`}
-                    onClick={() => expand?.onToggle()}
-                    className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[0.6875rem] font-medium text-text-muted hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
-                >
-                    <span aria-hidden>{expand?.expanded ? '▾' : '▸'}</span>
-                    — {expand?.count ?? 0} splits —
-                </button>
+                <span className="flex min-w-0 items-center gap-1">
+                    {lead !== null ? (
+                        <Chip
+                            variant={categoryChipVariant(
+                                lead.entry.name ?? null, lead.entry.type ?? null, lead.entry.id ?? null,
+                            )}
+                            className="min-w-0 max-w-full truncate"
+                            title={
+                                lead.matchedFilter
+                                    ? `${lead.entry.label} — matches the active category filter`
+                                    : lead.entry.label ?? undefined
+                            }
+                        >
+                            <span className="truncate">{lead.entry.label}</span>
+                        </Chip>
+                    ) : (
+                        <span className="text-text-subtle">—</span>
+                    )}
+                    {/* The matched leg's own summed amount, shown ONLY when the
+                        filter picked this category. Unfiltered it would be
+                        noise — and worse, a second figure on a row whose
+                        Amount column already shows the group's net, inviting
+                        the reader to subtract one from the other. */}
+                    {lead?.matchedFilter === true ? (
+                        <span className="shrink-0 font-mono text-[0.625rem] tabular-nums text-text-muted">
+                            {formatSignedAmount(lead.entry.sum, currency)}
+                        </span>
+                    ) : null}
+                    <button
+                        type="button"
+                        aria-expanded={expand?.expanded ?? false}
+                        onClick={(e) => {
+                            // The row underneath handles click (focus).
+                            e.stopPropagation();
+                            expand?.onToggle();
+                        }}
+                        // BOTH handlers are needed, and that is the whole
+                        // trap. `dblclick` is its own DOM event, not something
+                        // derived from the two clicks, so stopping click
+                        // propagation does nothing for it — an impatient
+                        // double-click on the toggle used to expand the split
+                        // AND drop the editor on top of it.
+                        //
+                        // The investment strategy stops only the click and
+                        // looks fine, but that is luck: its split parents are
+                        // readOnly, so RegisterRow never wires a double-click
+                        // handler for the event to reach.
+                        onDoubleClick={(e) => e.stopPropagation()}
+                        title={
+                            expand?.expanded === true
+                                ? 'Hide this split’s categories'
+                                : 'Show this split’s categories'
+                        }
+                        className="ml-auto inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[0.6875rem] font-medium text-text-muted hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
+                    >
+                        <span aria-hidden>{expand?.expanded ? '▾' : '▸'}</span>
+                        {/* The count stays in the TEXT, not in an aria-label:
+                            an aria-label here would be the button's whole
+                            accessible name and the category chip beside it
+                            would be all a screen reader lost. */}
+                        {expand?.count ?? 0} splits
+                    </button>
+                </span>
                 {row.tags.length > 0 ? (
                     <span className="flex flex-wrap gap-1">
                         {row.tags.map((tag) => (

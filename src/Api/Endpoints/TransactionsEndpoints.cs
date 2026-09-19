@@ -192,6 +192,10 @@ public static class TransactionsEndpoints
         Guid? category_id,
         string? status,
         DateOnly? today,
+        // Mig 226. A parent CATEGORY holds no postings of its own — they are all
+        // on its children — so its register is empty without this. Ignored for
+        // real accounts, which have no tree.
+        bool? include_subcategories,
         // Sort (mig 166). Display-order only; both whitelisted below.
         string? sort,
         string? dir,
@@ -240,7 +244,7 @@ public static class TransactionsEndpoints
         }
 
         var filter = BuildFilter(search, date_from, date_to, amount_min, amount_max,
-            security_id, tag, category_id, status, today);
+            security_id, tag, category_id, status, today, include_subcategories ?? false);
         var sortSpec = string.IsNullOrWhiteSpace(sort)
             ? RegisterSort.Default
             : new RegisterSort(sort, Descending: dir is not "asc");
@@ -277,7 +281,8 @@ public static class TransactionsEndpoints
     private static RegisterFilter BuildFilter(
         string? search, DateOnly? dateFrom, DateOnly? dateTo,
         decimal? amountMin, decimal? amountMax, Guid? securityId,
-        string? tag, Guid? categoryId, string? status, DateOnly? today) =>
+        string? tag, Guid? categoryId, string? status, DateOnly? today,
+        bool includeSubcategories = false) =>
         new(
             Search: string.IsNullOrWhiteSpace(search) ? null : search.Trim(),
             DateFrom: dateFrom,
@@ -288,7 +293,8 @@ public static class TransactionsEndpoints
             Tag: string.IsNullOrWhiteSpace(tag) ? null : tag.Trim(),
             CategoryId: categoryId,
             Status: string.IsNullOrWhiteSpace(status) ? null : status,
-            Today: today);
+            Today: today,
+            IncludeSubcategories: includeSubcategories);
 
     /// <summary>
     /// <c>GET /api/ledgers/{ledgerId}/transactions/index-buckets?account_id=...</c>.
@@ -324,6 +330,10 @@ public static class TransactionsEndpoints
         Guid? category_id,
         string? status,
         DateOnly? today,
+        // Mig 226. A parent CATEGORY holds no postings of its own — they are all
+        // on its children — so its register is empty without this. Ignored for
+        // real accounts, which have no tree.
+        bool? include_subcategories,
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         AccountsRepository accounts,
@@ -353,7 +363,7 @@ public static class TransactionsEndpoints
                 "Account does not belong to this ledger.");
 
         var filter = BuildFilter(search, date_from, date_to, amount_min, amount_max,
-            security_id, tag, category_id, status, today);
+            security_id, tag, category_id, status, today, include_subcategories ?? false);
 
         var buckets = await register.GetIndexBucketsAsync(
             ledgerId, scopedAccountId, hidden ?? false, filter, cancellationToken)
@@ -380,6 +390,9 @@ public static class TransactionsEndpoints
         string? tag,
         Guid? category_id,
         DateOnly? today,
+        // Must match the list's scope or the badges would count a different set
+        // of entries than the rows beneath them.
+        bool? include_subcategories,
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         AccountsRepository accounts,
@@ -405,7 +418,8 @@ public static class TransactionsEndpoints
 
         // status: null — GetStatusCountsAsync buckets across every status itself.
         var filter = BuildFilter(search, date_from, date_to, amount_min, amount_max,
-            security_id, tag, category_id, status: null, today);
+            security_id, tag, category_id, status: null, today,
+            include_subcategories ?? false);
 
         var counts = await register.GetStatusCountsAsync(
             ledgerId, scopedAccountId, filter, cancellationToken)
@@ -701,6 +715,9 @@ public static class TransactionsEndpoints
                 TransactionsRepository.PatchResult.PostingsLegNotInHeader =>
                     BusinessError.Problem(BusinessError.Codes.TransactionPostingLegNotInHeader,
                         "A posting's legId does not match any existing leg on this transaction."),
+                TransactionsRepository.PatchResult.PostingsDuplicateLegId =>
+                    BusinessError.Problem(BusinessError.Codes.TransactionPostingLegIdDuplicated,
+                        "Two postings carry the same legId. Each posting must reference a distinct existing leg, or omit legId to create a new one."),
                 TransactionsRepository.PatchResult.PostingsSourceAccountMismatch =>
                     BusinessError.Problem(BusinessError.Codes.TransactionSourceAccountMismatch,
                         "The supplied sourceAccountId does not match the transaction's source-side legs."),

@@ -148,6 +148,18 @@ export { refreshQuotes } from './api/quote';
 export { fetchLedgerOperations } from './api/ledgerOperation';
 export { fetchLedgerOverview } from './api/overview';
 export {
+    deleteBudgetTarget,
+    fetchBudgetProgress,
+    fetchBudgetTransactions,
+    fillBudgetTargets,
+    setBudgetTarget,
+} from './api/budget';
+export type {
+    BudgetTargetEntry,
+    BudgetTargetEntryResult,
+    FillBudgetTargetsResponse,
+} from './api/budget';
+export {
     fetchQuoteProviders,
     fetchQuotesPrefs,
     saveQuotesPrefs,

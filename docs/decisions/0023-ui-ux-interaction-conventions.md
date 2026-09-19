@@ -57,6 +57,38 @@ per-cell trap where each click commits independently. Single-
 click on a row is reserved for **focus** (see §B.1 below) — a
 distinct state from selection, which is checkbox-gated.
 
+### B.2 — A single-field numeric cell may commit in place (2026-09-18)
+
+§B forbids per-cell commit-on-blur, and ADR-0099 D1 requires exactly that for
+the budget screen's Target cell. One of the two had to move on the record rather
+than be quietly contradicted, and it is this one — narrowly.
+
+**The exception.** A cell may commit in place when the row has EXACTLY ONE
+editable field, the field is a single scalar, and the surface is not a
+transaction register.
+
+**Why it does not reopen what §B closed.** §B's stated objection is the
+"per-cell trap where each click commits independently" — a hazard that needs two
+or more editable cells to exist at all. You escape one, land in another, and a
+half-finished row is committed a piece at a time with no coherent point of
+review. A row with a single editable field has no second cell to escape into:
+the commit boundary and the row boundary are the same thing.
+
+**Why not row-edit mode instead.** That is the faithful reading of §B, and it
+would put a Cancel/Save footer on every row to set one number — on a screen
+whose entire premise (ADR-0099) is that there is nothing to configure and the
+numbers are useful before anyone types one. The ceremony would cost more than
+the protection is worth here.
+
+**What the exception still requires.** Escape abandons the draft — without it
+the only exit from a half-typed number is to blur, which commits it. An empty
+field is a distinct instruction, not a zero. And a cell whose value cannot be
+accepted renders DISABLED with the reason on hover, rather than taking
+keystrokes it will reject.
+
+Registers keep double-click-to-edit unchanged. They are multi-field by nature,
+which is precisely the case §B is about.
+
 ### B.1 — Selection and focus are independent states
 
 Two row states co-exist in the register and never collapse into one:
@@ -134,6 +166,29 @@ input (`<input>` of type text/number/email/etc., `<textarea>`,
 `contenteditable`) — those shortcuts belong to the field, not the
 register.
 
+**Two further bail-outs on Enter** (added 2026-09-16), both of which fixed live
+double-fires rather than hypotheticals:
+
+- **`event.defaultPrevented` is set.** Something nearer the event already
+  claimed this Enter — an open ContextMenu activates its highlighted item with
+  `preventDefault()` and deliberately does not stop propagation, so without the
+  check the same keypress also opened the editor on the row behind the menu.
+- **The focused element is a `BUTTON`.** A register row carries two — the
+  status-cycle control and the split-parent's expand toggle — and Enter is
+  their NATIVE activation key, so one keypress was cycling the status AND
+  opening the editor. `defaultPrevented` cannot catch this: native activation
+  is the event's DEFAULT ACTION and runs after every handler, so nothing has
+  marked the event by the time the row handler sees it.
+
+Checkboxes stay exempt, which is the distinction the original note blurred by
+lumping them together with buttons: a checkbox does nothing useful with Enter,
+so letting the row handler fire is what makes Enter-after-checkbox-click open
+the editor reliably.
+
+Enter on a **split-parent** row opens the multi-leg editor, the keyboard twin
+of the double-click that already worked. It was a no-op until 2026-09-16, with
+a comment saying it stood "until the split-edit slice lands" — which it had.
+
 Implementation note: focus is tracked as `focusedRowId` in the
 register page component, distinct from `selectedIds`. The list
 library (react-virtuoso) is driven via `scrollIntoView({ index })`
@@ -150,9 +205,20 @@ expanded leg.
 
 **Right-click on a register row opens an actions menu** anchored at
 the cursor. The menu is the canonical home for row-scoped operations
-that aren't first-class enough to merit a dedicated toolbar button —
-today: Duplicate, Show other side, Delete. Future actions (split,
-attach receipt, …) land here too.
+that aren't first-class enough to merit a dedicated toolbar button.
+
+The bank register's menu today: **Accept** (needs-review rows), **Edit**,
+**Duplicate**, **Create reminder**, **Show other side**, **Delete** — not all
+of which this ADR previously listed. Future actions (attach receipt, …) land
+here too.
+
+**Edit** was added 2026-09-16 for split parents specifically. Until then a
+split parent had no menu route to its own legs and Enter was a no-op on it, so
+a double-click was the ONLY way in and a keyboard user had no way in at all.
+Its `shortcutHint` reads `Enter`, which is honest now that §B.2's Enter opens
+the editor on a focused split parent; note that hints in this menu are
+decorative — the component renders them and binds nothing, and `⌘D` on
+Duplicate has never been bound anywhere.
 
 Menu items:
 
@@ -311,6 +377,39 @@ split → single is removing all but one.
 informational only — there's no sum-constraint warning (the
 schema's invariant is per-posting, not transaction-wide).
 
+> **Superseded in part — 2026-09-16 (PR #547).** Everything above about
+> per-posting affordances is now wrong, and the ADR-0025 amendment of the same
+> date carries the reasoning. Restated rather than rewritten so the original
+> choices stay legible:
+>
+> * The legs left the register's grid for **their own five columns** —
+>   `# · Category+Tags · Memo · Amount · actions` — which is what dropped a leg
+>   row from ~62px to 30px and made a fixed-height scroll viewport practical.
+>   The "three columns sized to the editor's own breakpoints" is now five.
+> * The **`⋮` drag handle moved from the left edge to the right-hand actions
+>   cell**, and drag is no longer the only way to reorder: Move up / Move down
+>   live in a per-row menu with Alt+↑ / Alt+↓, because there is no drag on
+>   touch and none at all from a keyboard.
+> * **`[−]` remove became "Remove split"** in that same row menu — a 3.5rem
+>   actions cell cannot hold three controls, and the menu is the visible path
+>   Rule 10 of [ADR-0021](0021-ui-layout-and-principles.md) prescribes.
+> * **The ghost row is gone**, and "No '+ Add posting' button" is reversed by
+>   an **Add split** button in the region's sticky footer. This is the reversal
+>   worth understanding, because the ghost-row pattern is otherwise sound: a
+>   ghost is the LAST ELEMENT of the list, so once the list scrolls inside a
+>   fixed-height viewport the only way to add a posting scrolls away with it.
+>   On a 13-leg paycheck you would scroll to the bottom to reach it every time.
+>   The pattern assumes a list that grows the page; it does not survive a
+>   viewport.
+> * The **`Total:` readout moved INTO that sticky footer**, so it stays visible
+>   while the list scrolls. It is still informational, and that part is
+>   load-bearing: [ADR-0025](0025-transaction-as-postings-list.md) rejects any
+>   sum constraint, and two test files now pin the absence.
+>
+> The counterparty control is also no longer a Typeahead — it is
+> `AccountCategoryPicker` ([ADR-0043](0043-account-category-picker.md)), which
+> matters here because the two components make OPPOSITE Esc choices; see §F.
+
 ### D — Keyboard inside edit forms
 
 | Key | Action |
@@ -368,6 +467,22 @@ popover.
 The contract eliminates the React-setState-batching race where a
 parent's commit handler would read a stale value because
 `onChange(newValue)` and `onCommit()` ran in the same callback.
+
+**Two components, two deliberate Esc contracts** (recorded 2026-09-16). The
+contract above is Typeahead's: Esc closes the popover and lets the event
+BUBBLE, so a parent form's cancel runs after — marked by *not* calling
+`preventDefault()`.
+
+`AccountCategoryPicker` ([ADR-0043](0043-account-category-picker.md)) makes the
+opposite choice: it calls `preventDefault()` when Esc closes its own panel. A
+consumer must therefore read `event.defaultPrevented` rather than assume either
+behaviour.
+
+This is not pedantry. The bank transaction editor did not check, so Esc inside
+an open category dropdown closed the panel *and* cancelled the whole edit —
+dismiss a dropdown you opened by mistake, lose thirteen legs of a paycheck
+split, with no undo and no draft. Reading the flag honours what both components
+already signal instead of overriding one of them.
 
 ### G — Disabled-but-visible placeholders
 
@@ -456,6 +571,19 @@ modal is a destructive confirm). Modal content stays focused
 until dismissed — focus trap inside the modal, return focus to
 the trigger on close.
 
+**A scroll dismisses a `position: fixed` menu** (added 2026-09-16). A menu that
+captures its coordinates once, at open, cannot follow the row that spawned it:
+scroll, and it floats over an unrelated row while still offering the original
+row's actions — *Remove split* on the wrong split. Closing is the only honest
+response, because a menu cannot follow an anchor it never measured.
+
+Register the listener **capture-phase on `document`**, not on `window`. Scroll
+events do not bubble, and this app's document never scrolls — the shell is
+`h-dvh overflow-hidden`, so every scrollport that can move a row is an inner
+element (the register's scroll surface, the splits grid's leg viewport, a
+dialog body). A bubble-phase window listener fires for none of them, which
+looks like working code and is not.
+
 ### M — Date input keyboard shortcuts
 
 Every date input in Coffer accepts the following power-user
@@ -492,6 +620,19 @@ Decision data point: 2026-05-12 scan of the user's imported MD
 ledger showed 7% of memos exceed one line of register width and
 the long tail goes to ~400 chars. Memos are a real notes field
 in practice, not a one-line tag.
+
+**One deliberate override — the splits grid's per-leg memo** (2026-09-16). It
+is a `<textarea>` with a FIXED height and no auto-grow: `rows={1}`,
+`h-control-28px`, `resize-none overflow-y-auto`. The leg list scrolls inside a
+fixed-height viewport, and a row that can grow makes the viewport's height
+budget unpredictable — the thing that lets the editor stay one size at any
+split count.
+
+It stays a `<textarea>` rather than becoming an `<input>`, and that part is not
+cosmetic: `<input>` runs the HTML value-sanitisation algorithm, which STRIPS
+newlines. An existing multi-line leg memo rendered in one would be silently
+mangled on first paint and the next save would persist the mangling. Fixed
+height, yes; wrong element, no.
 
 **Keyboard inside a textarea (Slack convention):**
 

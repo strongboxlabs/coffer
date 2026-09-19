@@ -1,7 +1,10 @@
+import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link, useParams } from '@tanstack/react-router';
 
 import {
+    fetchAccounts,
+    fetchBudgetProgress,
     fetchDashboardPrefs,
     fetchLedgerOverview,
     fetchLedgerOperations,
@@ -10,6 +13,8 @@ import {
 } from '@/lib/api';
 import { errorMessage } from '@/lib/errorMessage';
 import { accountTypeMeta } from '@/lib/accountTypes';
+import { buildAccountPathMap } from '@/lib/accountPath';
+import { overspentRows } from './budget/cumulative';
 import { formatCurrency, formatSignedAmount } from '@/lib/money';
 import type {
     LedgerOverview,
@@ -152,6 +157,8 @@ function OverviewBody({
                         isPending={upcomingPending}
                     />
                 );
+            case 'spending':
+                return <SpendingWidget key={key} ledgerId={ledgerId} />;
             case 'activity':
                 return (
                     <RecentActivityWidget
@@ -297,6 +304,113 @@ function AccountGroup({
                 ))}
             </ul>
         </div>
+    );
+}
+
+/**
+ * This month's spend against what is typical — the dashboard's one-glance half
+ * of budgeting.
+ *
+ * It answers "is this month out of the ordinary" and nothing else. No targets,
+ * nothing to set up, and no empty state that demands configuration first: the
+ * numbers exist the moment there is categorised spending, because `typical` is
+ * derived from history rather than declared.
+ *
+ * Fetches its own data rather than riding the overview aggregate, because
+ * `OverviewRepository` is scoped to net worth and excludes categories by
+ * construction — a deliberate scope, not an oversight.
+ */
+function SpendingWidget({ ledgerId }: { ledgerId: string }) {
+    const query = useQuery({
+        queryKey: ['budget-progress', ledgerId, 'current'],
+        queryFn: () => fetchBudgetProgress(ledgerId),
+        staleTime: 60_000,
+    });
+    const data = query.data;
+    const currency = data?.currencyCode ?? 'USD';
+
+    // Full paths, because this is a FLAT list with no tree around it. A real
+    // ledger has two "Food" and two "Loan" under different parents, and two
+    // identical rows carrying different numbers is worse than a longer label.
+    const accountsQuery = useQuery({
+        queryKey: ['accounts', ledgerId],
+        queryFn: () => fetchAccounts(ledgerId),
+        staleTime: 60_000,
+    });
+    const paths = useMemo(
+        () => buildAccountPathMap(accountsQuery.data ?? []),
+        [accountsQuery.data],
+    );
+
+    // Categories running meaningfully hot, worst first. Shared with the budget
+    // screen rather than reimplemented: this had its own copy of the filter and
+    // sort, and had therefore MISSED the roots-only fix — the API rolls up, so a
+    // parent row already contains its children and the list could report
+    // "Taxes" and "Federal Income Tax" as two separate problems. The floor keeps
+    // it quiet too: a category a pound over its average is not news, and a
+    // widget that cries wolf every month stops being read.
+    const hot = overspentRows(data?.rows ?? []).slice(0, 3);
+
+    return (
+        <Panel>
+            <PanelHead className="flex items-center justify-between">
+                <span className="font-medium">Spending</span>
+                <Link
+                    to="/ledgers/$ledgerId/budget"
+                    params={{ ledgerId }}
+                    className="text-xs font-medium text-accent hover:underline"
+                >
+                    See all →
+                </Link>
+            </PanelHead>
+            <PanelBody>
+                {query.isPending ? (
+                    <p className="text-sm text-text-muted">Loading…</p>
+                ) : !data || data.rows.length === 0 ? (
+                    <p className="text-sm text-text-muted">No categorised spending yet.</p>
+                ) : (
+                    <div className="space-y-2">
+                        <div className="flex items-baseline justify-between gap-3">
+                            <div>
+                                <div className="font-mono text-lg font-bold tabular-nums">
+                                    {formatCurrency(data.actualTotal, currency)}
+                                </div>
+                                <div className="text-[0.6875rem] text-text-muted">
+                                    this month
+                                </div>
+                            </div>
+                            <div className="text-right">
+                                <div className="font-mono text-sm tabular-nums text-text-muted">
+                                    {data.typicalTotal === null
+                                        ? '—'
+                                        : formatCurrency(data.typicalTotal, currency)}
+                                </div>
+                                <div className="text-[0.6875rem] text-text-muted">
+                                    usually, over {data.windowMonths} months
+                                </div>
+                            </div>
+                        </div>
+                        {hot.length > 0 ? (
+                            <ul className="space-y-0.5 border-t border-border/40 pt-2">
+                                {hot.map((r) => (
+                                    <li key={r.categoryId} className="flex justify-between gap-2 text-xs">
+                                        <span
+                                            className="truncate text-text-muted"
+                                            title={paths.get(r.categoryId) ?? r.name}
+                                        >
+                                            {paths.get(r.categoryId) ?? r.name}
+                                        </span>
+                                        <span className="shrink-0 font-mono tabular-nums text-state-danger">
+                                            +{formatCurrency(r.actual - (r.typical ?? 0), currency)}
+                                        </span>
+                                    </li>
+                                ))}
+                            </ul>
+                        ) : null}
+                    </div>
+                )}
+            </PanelBody>
+        </Panel>
     );
 }
 

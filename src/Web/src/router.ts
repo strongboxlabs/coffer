@@ -21,6 +21,7 @@ import { RegisterRouter } from '@/routes/ledgers/register/RegisterRouter';
 import { SecuritiesCatalogPage } from '@/routes/ledgers/SecuritiesCatalogPage';
 import { CategoriesPage } from '@/routes/ledgers/CategoriesPage';
 import { TagsPage } from '@/routes/ledgers/TagsPage';
+import { BudgetPage } from './routes/ledgers/BudgetPage';
 import { SecurityDetailPage } from '@/routes/ledgers/SecurityDetailPage';
 import { SettingsPage } from '@/routes/ledgers/settings/SettingsPage';
 import { RemindersPage } from '@/routes/ledgers/reminders/RemindersPage';
@@ -236,6 +237,24 @@ const tagsRoute = createRoute({
     component: TagsPage,
 });
 
+// /ledgers/$ledgerId/budget — spend this month against what is typical per
+// category. A sibling of Categories / Tags rather than a Settings tab: a budget
+// is checked, not configured.
+const budgetRoute = createRoute({
+    getParentRoute: () => authedRoute,
+    path: '/ledgers/$ledgerId/budget',
+    component: BudgetPage,
+    // The month lives in the URL, not in component state. It was state, and
+    // that made the page un-linkable and lost the month on every round trip:
+    // open a category's register, press Back, and you landed on the CURRENT
+    // month having forgotten which one you were reading. Omitted means "this
+    // month", so the bare path keeps working and stays the canonical entry.
+    validateSearch: (search: Record<string, unknown>): { month?: string } =>
+        typeof search.month === 'string' && /^\d{4}-\d{2}$/.test(search.month)
+            ? { month: search.month }
+            : {},
+});
+
 // /ledgers/$ledgerId/securities/$securityId — Securities Detail.
 // Hero + recent transactions + recent prices.
 const securityDetailRoute = createRoute({
@@ -261,8 +280,24 @@ const registerRoute = createRoute({
     // focus. The branched return narrows the inferred type to
     // `{ focus?: string }`, making the param truly optional at the
     // call site.
-    validateSearch: (search: Record<string, unknown>): { focus?: string } =>
-        typeof search.focus === 'string' ? { focus: search.focus } : {},
+    // `subcategories` joins it on the same terms: present only when true, so an
+    // ordinary account register keeps the URL it has always had. It decides
+    // which register you are reading — a category alone, or the category and
+    // its descendants — which is why it belongs in the URL rather than in
+    // component state: the budget links here with it ON (its rows are
+    // rollups), and Back has to bring you back to what you were reading.
+    validateSearch: (
+        search: Record<string, unknown>,
+    ): { focus?: string; subcategories?: true } => ({
+        ...(typeof search.focus === 'string' ? { focus: search.focus } : {}),
+        // Accept the string forms too — a hand-typed or copied URL carries
+        // `subcategories=true`, not a JSON boolean.
+        ...(search.subcategories === true
+            || search.subcategories === 'true'
+            || search.subcategories === '1'
+            ? { subcategories: true as const }
+            : {}),
+    }),
 });
 
 // /system — deployment-wide (non-ledger) settings (ADR-0060): About (everyone)
@@ -340,6 +375,7 @@ const routeTree = rootRoute.addChildren([
         remindersRoute,
         categoriesRoute,
         tagsRoute,
+    budgetRoute,
         registerRoute,
         systemRoute,
         accountSecurityRoute,

@@ -204,6 +204,21 @@ public sealed class SchemaDriftGuardTests
                 ClearedAt = Utc(2026, 1, 3),
                 ClearedByUserId = null,
             });
+            // Seeded DELIBERATELY. This guard compares per-table counts either side
+            // of a restore, so a table with no rows passes at 0 == 0 — meaning the
+            // snapshot-completeness guard would report green on precisely the
+            // omission it exists to catch (captured but never re-inserted). The
+            // sanity list below asserts these rows exist, so the parity means
+            // something.
+            db.BudgetTargets.Add(new BudgetTargetRow
+            {
+                LedgerId = ledger.LedgerId,
+                CategoryId = dining.Id,
+                TargetMonth = new DateOnly(2026, 1, 1),
+                Amount = 250m,
+                CreatedAt = Utc(2026, 1, 1),
+                UpdatedAt = Utc(2026, 1, 1),
+            });
             await db.SaveChangesAsync();
         }
         await ledger.SetHeaderOverrideAsync(bankLegId, memo: "reconciled at bank");
@@ -219,7 +234,8 @@ public sealed class SchemaDriftGuardTests
 
         // Sanity: the spread we seeded really has rows (so parity means something).
         foreach (var t in new[] { "txn_headers", "txn_legs", "txn_leg_recon", "txn_header_overrides",
-                                  "securities", "holdings", "lots", "security_splits", "security_prices" })
+                                  "securities", "holdings", "lots", "security_splits", "security_prices",
+                                  "budget_targets" })
             Assert.True(before[t] > 0, $"expected seeded rows in {t}");
 
         var createResp = await client.PostAsJsonAsync(

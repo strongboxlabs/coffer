@@ -166,7 +166,6 @@ function renderSplitParentBody(
                 <button
                     type="button"
                     aria-expanded={expand?.expanded ?? false}
-                    aria-controls={`split-group-${expand?.groupId ?? ''}`}
                     onClick={(e) => {
                         e.stopPropagation();
                         expand?.onToggle();

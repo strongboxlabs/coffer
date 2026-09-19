@@ -141,6 +141,16 @@ public sealed class TransactionsRepository
         /// <summary>A request item's <c>LegId</c> doesn't match any
         /// existing source-side leg on this header.</summary>
         LegNotInHeader,
+        /// <summary>Two request items carry the SAME <c>LegId</c>.
+        /// Silently destructive before this was checked: both items
+        /// resolve to one tracked row, so the last array position
+        /// wins, the earlier one produces no posting, and the header
+        /// ends up with fewer postings than the request listed plus a
+        /// hole in <c>posting_index</c> — which then trips the
+        /// <c>posting_index &gt; 0</c> split detectors and the
+        /// <c>posting_index = 0</c> canonical-leg lookup. All on an
+        /// HTTP 200.</summary>
+        DuplicateLegId,
     }
 
     /// <summary>
@@ -167,6 +177,11 @@ public sealed class TransactionsRepository
         Ok,
         HeaderNotInLedger,
         PostingsLegNotInHeader,
+        /// <summary>Two items in the postings list carry the same
+        /// <c>legId</c>. Rejected rather than applied: the reshape
+        /// would drop a posting and leave a hole in
+        /// <c>posting_index</c> while returning 200.</summary>
+        PostingsDuplicateLegId,
         PostingsSourceAccountMismatch,
         /// <summary>Slice 2c.6d: <c>mergeFromHeaderId</c> in the
         /// PATCH body doesn't resolve to a valid merge source —
@@ -301,6 +316,19 @@ public sealed class TransactionsRepository
             from l in _db.TxnLegs.AsNoTracking()
             where l.HeaderId == headerId && l.LedgerId == ledgerId
             join a in _db.Accounts.AsNoTracking() on l.AccountId equals a.Id
+            // This ORDER BY is load-bearing, not tidiness. The GroupBy below keys on
+            // PostingIndex and preserves the order its keys first appear in, and
+            // PatchAsync renumbers posting_index from the resulting array position —
+            // so reading unordered silently REWRITES the user's split order as a side
+            // effect of a recategorize. Postgres guarantees no order without it, and
+            // because every UPDATE moves the row to a new heap location a seq scan
+            // tends to return recently-touched legs LAST: the permutation is likely,
+            // not theoretical. Recategorizing one line of a 14-line paycheck split
+            // could reshuffle the other 13.
+            //
+            // The sibling read in RecategorizeAsync needs no such clause: it returns
+            // IsSplit before order can matter, so it only ever sees one posting.
+            orderby l.PostingIndex, l.Id
             select new { l.Id, l.AccountId, l.PostingIndex, l.Amount, l.LegMemo, a.AccountType, a.Name })
             .ToListAsync(cancellationToken).ConfigureAwait(false);
 
@@ -1054,6 +1082,8 @@ public sealed class TransactionsRepository
             {
                 case PostingsReshapeFailure.LegNotInHeader:
                     return PatchResult.PostingsLegNotInHeader;
+                case PostingsReshapeFailure.DuplicateLegId:
+                    return PatchResult.PostingsDuplicateLegId;
                 case PostingsReshapeFailure.SourceAccountMismatch:
                     return PatchResult.PostingsSourceAccountMismatch;
                 case null:
@@ -1400,18 +1430,26 @@ public sealed class TransactionsRepository
                 l.PostingIndex == sl.PostingIndex && l.Id != sl.Id));
         var sourceLegById = sourceLegs.ToDictionary(l => l.Id);
 
+        var seenLegIds = new HashSet<Guid>();
         foreach (var item in items)
         {
-            if (item.LegId.HasValue && !sourceLegById.ContainsKey(item.LegId.Value))
+            if (!item.LegId.HasValue) continue;
+            if (!sourceLegById.ContainsKey(item.LegId.Value))
             {
                 return (PostingsReshapeFailure.LegNotInHeader, null);
             }
+            // Distinctness is checked here rather than left to `keepLegIds` below,
+            // because that is a HashSet and would swallow the duplicate. Two items
+            // sharing a legId both resolve to ONE tracked row in phase 3b: the last
+            // array position wins, the earlier one writes nothing, and the header
+            // silently loses a posting and gains a hole in posting_index — on a 200.
+            if (!seenLegIds.Add(item.LegId.Value))
+            {
+                return (PostingsReshapeFailure.DuplicateLegId, null);
+            }
         }
 
-        var keepLegIds = items
-            .Where(i => i.LegId.HasValue)
-            .Select(i => i.LegId!.Value)
-            .ToHashSet();
+        var keepLegIds = seenLegIds;
 
         return (null, new PostingsReshapePlan(
             headerId, ledgerId, sourceAccountId, items,

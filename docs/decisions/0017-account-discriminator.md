@@ -106,3 +106,64 @@ transactions" rather than stored.
   parent-with-direct-balance shape ("Employer Benefit Spouse" with $0 own
   balance + 3 sub-categories with their own transactions) is meaningful
   data, not folder metadata. Rejected.
+
+## Amendment (2026-09-18, mig 224) — a third kind, and kind is DISCLOSED not ENFORCED
+
+### A third value: `adjustment`
+
+`category_kind` now admits `adjustment` alongside `income` and `expense`. A
+VALUATION ADJUSTMENT — marking a house up, reconciling a retirement balance to a
+new statement figure — moves an asset's value with no money changing hands. It is
+neither income nor expense, and until mig 224 the column could not say so, which
+forced such entries into an expense category where they read as NEGATIVE SPENDING.
+
+The cost of not having it, measured on a real ledger: one +42,000 property markup
+credited to an expense category made a month's total spend compute to -10,929.49
+against a true +31,070.51 — the largest number on the screen, sign inverted. The
+same shape put 14 months into negative spending and two whole calendar years into
+negative income.
+
+Nothing else had to change to make reporting correct, because
+`ReportingRepository.SummarizeAsync` filters by an explicit per-measure allow-list
+(Spending => expense, Income => income, Net => both). A kind in no list falls out
+of all three. That is precisely why a third KIND beat a per-category "exclude from
+reporting" flag, which every call site would have had to respect by hand.
+
+### Kind is DISCLOSED, never ENFORCED
+
+Pickers no longer filter the categories they offer by kind. Any category may be
+chosen anywhere a category is valid; what changes is that the kind is made
+unmissable at the point of selection and of display.
+
+The reasoning, in order of weight:
+
+* **`category_kind` is a REPORTING classification, not a posting constraint.**
+  Double-entry does not care. The investment side is gated by `posting_role`
+  (stamped from the header action), not by kind — `investment_income` filters on
+  `posting_role='income'` — so opening the pickers cannot corrupt investment income
+  or fee netting.
+* **The filters blocked real work.** The investment editor's category field was an
+  income-only allow-list (widened to expense only for `action='misc'`), so an
+  adjustment category could never be selected there at all — meaning one of the two
+  motivating cases for the third kind had no UI path.
+* **They protected almost nothing.** The distortion they nominally guard against —
+  money landing in the wrong measure — arrived overwhelmingly through the IMPORTER,
+  which bypasses every picker. On a real ledger the filters had prevented none of it.
+
+What replaces them is disclosure. `AccountCategoryPicker` already renders a
+per-row `Kind · Parent` qualifier, which survives search because it is per row
+rather than a group header; that gains the third value. Display surfaces outside
+the picker gain a kind glyph.
+
+**Not colour.** ADR-0099 D5 reserves colour for STATE (under the mark / past it)
+and allows the per-category palette only as an identity dot. Chips already use
+per-category colour. Encoding kind in colour would be a third meaning and would
+collapse all three. Not a border either: borders already carry focus and
+validation state and cannot legibly separate three values.
+
+**No warnings on suspect combinations.** The visible kind is the guard. A warning
+on every entry is noise, and there is no evidence it is needed.
+
+Two exclusions are unaffected because they are a different kind of rule:
+`is_system` (plumbing) and `!is_active` (archived) stay filtered out.
+

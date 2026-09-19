@@ -122,3 +122,36 @@ describe('ContextMenu', () => {
         expect(screen.getByTestId('open-state')).toHaveTextContent('closed');
     });
 });
+
+describe('a scroll strands the menu, so a scroll closes it', () => {
+    // The menu is position:fixed at coordinates captured once, at open. It
+    // cannot follow the row that spawned it, so after a scroll it floats over
+    // an UNRELATED row while still offering the original row's actions —
+    // Remove split on the wrong split. Closing is the only honest response.
+    it('closes on a scroll from a nested scrollport', async () => {
+        render(<Harness items={[{ id: 'a', label: 'Alpha', onSelect: vi.fn() }]} />);
+        expect(screen.getByTestId('open-state')).toHaveTextContent('open');
+
+        // Dispatched on an inner element, NOT on window. Scroll events do not
+        // bubble, and in this app the document never scrolls — the shell is
+        // h-dvh overflow-hidden, so every scrollport that can move a row is an
+        // inner element. A bubble-phase window listener would miss all of them,
+        // which is why the component listens capture-phase on document.
+        const inner = screen.getByTestId('outside');
+        inner.dispatchEvent(new Event('scroll', { bubbles: false }));
+
+        expect(await screen.findByTestId('open-state')).toHaveTextContent('closed');
+    });
+
+    it('stops listening once closed', () => {
+        // A listener that outlived the menu would call onClose on every scroll
+        // in the app, forever.
+        const onClose = vi.fn();
+        const { unmount } = render(
+            <ContextMenu anchor={{ x: 10, y: 10 }} items={[]} onClose={onClose} />,
+        );
+        unmount();
+        document.body.dispatchEvent(new Event('scroll', { bubbles: false }));
+        expect(onClose).not.toHaveBeenCalled();
+    });
+});

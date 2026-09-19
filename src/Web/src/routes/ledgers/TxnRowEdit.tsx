@@ -16,25 +16,26 @@ import {
     fetchSimilarPayees,
     fetchTags,
 } from '@/lib/api';
-import { toDateInputValue, todayInputValue } from '@/lib/dates';
 import { DateField } from './components/DateField';
 import { formatCurrency } from '@/lib/money';
 import type {
     AccountSummary,
     CreateTransactionRequest,
     FrequentCounterpartiesResponse,
-    MergeCandidateDto,
     PatchTransactionRequest,
     PayeeSuggestion,
-    SimilarPayeeDto,
-    TagDto,
     TransactionPosting,
 } from '@/lib/types';
 import { Button } from '@/components/ui/Button';
 import { Typeahead } from '@/components/ui/Typeahead';
 import { AccountCategoryPicker } from '@/components/register/AccountCategoryPicker';
-import { TagCombobox } from '@/components/tags/TagCombobox';
 import { pickableCounterparties } from '@/lib/accountPath';
+import { postingIssues, validatePostings } from './bank-edit/validation';
+import { useTxnRowDraft } from './bank-edit/hooks/useTxnRowDraft';
+import { TagsInput } from './bank-edit/fields/TagsInput';
+import { SimilarPayeesPanel } from './bank-edit/fields/SimilarPayeesPanel';
+import { MergeCandidatesPanel } from './bank-edit/fields/MergeCandidatesPanel';
+import { SplitsGrid } from './bank-edit/fields/SplitsGrid';
 
 // Transaction editor (ADR-0025). One component, one state shape,
 // one save handler for every transaction mutation: new single,
@@ -46,18 +47,22 @@ import { pickableCounterparties } from '@/lib/accountPath';
 // length 1; split = length > 1. Switching between them is just
 // adding or removing postings — no special "convert" affordance.
 //
-// Affordances per posting:
-//   - ⋮  drag handle (HTML5 native draggable, no library dep)
+// Affordances per posting. The splits grid owns all of these now —
+// see bank-edit/fields/SplitsGrid.tsx and bank-edit/README.md:
+//   - a visible row number, so a validation message can name one
+//   - category picker (AccountCategoryPicker, ADR-0043) beside a
+//     reserved per-posting tags slot
+//   - leg-memo textarea, fixed height
 //   - amount input
-//   - counterparty Typeahead
-//   - leg-memo input
-//   - [−] remove (disabled when only one posting remains)
+//   - a drag handle, plus a row menu carrying Move up / Move down
+//     (Alt+↑ / Alt+↓) and Remove split
 //
-// Add-posting affordance: a ghost row at the bottom of the list.
-// Focusing any field of the ghost — by click or by Tab off the
-// last real posting's memo — materialises it as a real posting
-// and adds a fresh ghost below. Notion / Airtable / Linear /
-// spreadsheet pattern (ADR-0023 §C extended).
+// Add-posting affordance: an "Add split" button in the legs region's
+// sticky footer. That REPLACED a ghost row at the bottom of the list,
+// and the reversal is deliberate: a ghost is the list's last element,
+// so once the list scrolls inside a fixed-height viewport the only way
+// to add a posting scrolls away with it. ADR-0025's 2026-09-16
+// amendment records it against the original ADR-0023 §C pattern.
 
 /** A single posting to seed a NEW transaction with (Duplicate path).
  *  No `legId` — every duplicated posting is a fresh leg. */
@@ -202,68 +207,6 @@ export function patchErrorMessage(error: unknown): string {
 }
 
 // --------------------------------------------------------------------
-// Posting draft state
-// --------------------------------------------------------------------
-
-interface PostingDraft {
-    /** Stable id within the editor's lifecycle — used as React
-     *  key during reorder. Distinct from `legId`: a freshly added
-     *  posting has `legId === null` but always a `key`. */
-    key: string;
-    /** Existing source-side leg id (PATCH-only; null for newly
-     *  added postings the server will INSERT). */
-    legId: string | null;
-    /** The chosen counterparty account/category id (ADR-0043 —
-     *  id-based via AccountCategoryPicker; null until picked). */
-    counterpartyId: string | null;
-    /** Free-text amount input. Parsed on save. */
-    amount: string;
-    legMemo: string;
-}
-
-let postingKeyCounter = 0;
-function nextKey(): string {
-    postingKeyCounter += 1;
-    return `p_${postingKeyCounter}`;
-}
-
-function seedToDraft(s: PostingSeed): PostingDraft {
-    return {
-        key: nextKey(),
-        legId: s.legId,
-        // Id-based (ADR-0043): the picker resolves the display name
-        // from the full accounts map, so an existing system-account
-        // counterparty (e.g. Uncategorized) still round-trips even
-        // though it isn't offered for a fresh pick.
-        counterpartyId: s.counterpartyAccountId,
-        amount: s.amount.toFixed(2),
-        legMemo: s.legMemo ?? '',
-    };
-}
-
-function emptyDraft(): PostingDraft {
-    return {
-        key: nextKey(),
-        legId: null,
-        counterpartyId: null,
-        amount: '',
-        legMemo: '',
-    };
-}
-
-/** Map one duplicate-prefill posting to a fresh draft (no legId). The
- *  edit path has `seedToDraft`; this is its new-mode twin. */
-function prefillToDraft(p: PostingPrefill): PostingDraft {
-    return {
-        key: nextKey(),
-        legId: null,
-        counterpartyId: p.counterpartyAccountId,
-        amount: p.amount.toFixed(2),
-        legMemo: p.legMemo ?? '',
-    };
-}
-
-// --------------------------------------------------------------------
 // Editor
 // --------------------------------------------------------------------
 
@@ -303,52 +246,28 @@ export function TxnRowEdit({
         adjustMemoHeight(headerMemoRef.current);
     }, []);
 
-    // Header field state.
-    const [payee, setPayee] = useState(
-        mode.kind === 'new' ? (mode.prefill?.payee ?? '') : (mode.payee ?? ''),
-    );
-    const [headerMemo, setHeaderMemo] = useState(
-        mode.kind === 'new' ? (mode.prefill?.memo ?? '') : (mode.memo ?? ''),
-    );
-    const [checkNumber, setCheckNumber] = useState(
-        mode.kind === 'new'
-            ? (mode.prefill?.checkNumber ?? '')
-            : (mode.checkNumber ?? ''),
-    );
-    const [postedAt, setPostedAt] = useState(
-        mode.kind === 'new'
-            ? (mode.postedAt ?? todayInputValue())
-            : toDateInputValue(mode.postedAt),
-    );
-
-    // Empty string means "not set", which the payloads send as null. Deliberately
-    // NOT defaulted to the posted date: writing transactedAt == postedAt on every
-    // transaction would make the column meaningless and would permanently silence
-    // taxDateSubLabel's noise filter, which only renders a second line when the
-    // two dates differ.
-    const [transactedAt, setTransactedAt] = useState(() => {
-        if (mode.kind === 'new' || !mode.transactedAt) return '';
-        const tax = toDateInputValue(mode.transactedAt);
-        // Same noise filter the register's taxDateSubLabel uses: a tax date on the
-        // same calendar day as the posted date carries no information, so show the
-        // field empty rather than echoing the posted date back. The Moneydance
-        // importer sets transacted_at on EVERY row, so without this every imported
-        // transaction would open with a redundant tax date filled in.
-        //
-        // Consequence, accepted: saving such a row untouched normalises the stored
-        // value to null. Nothing is lost — same-day and null render identically and
-        // mean the same thing — and it moves the data toward the cleaner of two
-        // equivalent representations.
-        return tax === toDateInputValue(mode.postedAt) ? '' : tax;
-    });
-
-    // Slice 2c.6b: tag set. In edit mode seeds from the row's
-    // current tags; in new mode starts empty. The save handler
-    // sends `tags: <this list>` so the server's replace-semantics
-    // produces exactly this membership.
-    const [tags, setTags] = useState<readonly string[]>(
-        mode.kind === 'new' ? [] : mode.tags,
-    );
+    // All editable state — the seven header/posting fields, the posting
+    // mutators and the auto-focus marker. Destructured into the same local
+    // names the JSX already used, so moving it out of the shell changed no
+    // call site. See hooks/useTxnRowDraft.ts for the three properties
+    // (once-only seeding, synchronous addPosting, stable mutator identity)
+    // that the consolidation had to preserve.
+    const {
+        draft: { payee, headerMemo, checkNumber, postedAt, transactedAt, tags, postings },
+        setPayee,
+        setHeaderMemo,
+        setCheckNumber,
+        setPostedAt,
+        setTransactedAt,
+        setTags,
+        patchPosting,
+        addPosting,
+        removePosting,
+        reorderPostings,
+        movePosting,
+        focusKey,
+        setFocusKey,
+    } = useTxnRowDraft(mode);
 
     // Slice 2c.6c: similar-payee recall. Static fetch at row-open
     // (per design — no typeahead refetch). The server returns
@@ -395,21 +314,6 @@ export function TxnRowEdit({
     // the apply helper below; clearing the selection via the same
     // helper is responsible for resetting the merge id too.
     const [mergeFromHeaderId, setMergeFromHeaderId] = useState<string | null>(null);
-
-    // Posting drafts. In edit mode start from the seeds; in new
-    // mode start with one empty draft (the user can add more via
-    // the ghost row).
-    const [postings, setPostings] = useState<PostingDraft[]>(() => {
-        if (mode.kind === 'new') {
-            // Duplicate seeds 1..N postings (single row = N=1, split = N);
-            // the form opens with one empty posting when there's no prefill.
-            const seeds = mode.prefill?.postings;
-            return seeds && seeds.length > 0
-                ? seeds.map((p) => prefillToDraft(p))
-                : [emptyDraft()];
-        }
-        return mode.postings.map((s) => seedToDraft(s));
-    });
 
     const sourceAccountId =
         mode.kind === 'new' ? mode.sourceAccountId : mode.sourceAccountId;
@@ -466,49 +370,6 @@ export function TxnRowEdit({
         return n;
     }, [postings]);
 
-    // Key of the most-recently-added posting. PostingRowEditor with
-    // this key auto-focuses its amount input on mount; after the
-    // focus lands we clear the marker so subsequent re-renders
-    // don't steal focus. Drives the "click ghost row → focus
-    // appears on the new row's amount" UX.
-    const [focusKey, setFocusKey] = useState<string | null>(null);
-
-    // Mutators
-    function patchPosting(key: string, fields: Partial<PostingDraft>) {
-        setPostings((prev) =>
-            prev.map((p) => (p.key === key ? { ...p, ...fields } : p)),
-        );
-    }
-
-    function addPosting(prefill?: Partial<PostingDraft>) {
-        const key = nextKey();
-        setPostings((prev) => [
-            ...prev,
-            { ...emptyDraft(), ...prefill, key, legId: null },
-        ]);
-        setFocusKey(key);
-    }
-
-    function removePosting(key: string) {
-        setPostings((prev) =>
-            prev.length === 1 ? prev : prev.filter((p) => p.key !== key),
-        );
-    }
-
-    function reorderPostings(fromKey: string, toKey: string) {
-        if (fromKey === toKey) return;
-        setPostings((prev) => {
-            const fromIdx = prev.findIndex((p) => p.key === fromKey);
-            const toIdx = prev.findIndex((p) => p.key === toKey);
-            if (fromIdx < 0 || toIdx < 0) return prev;
-            const next = [...prev];
-            const [moved] = next.splice(fromIdx, 1);
-            if (moved === undefined) return prev;
-            next.splice(toIdx, 0, moved);
-            return next;
-        });
-    }
-
     // Click-outside cancels the edit (modern web pattern) — unless the host
     // manages its own dismissal (the reminders occurrence dialog, ADR-0049).
     useEffect(() => {
@@ -531,21 +392,11 @@ export function TxnRowEdit({
     // stay $0 in others. The DB places no constraint either; the
     // earlier "must be non-zero" client rule was an overreach that
     // locked users out of merging into any paycheck-style target.
-    const validation = useMemo(() => {
-        const issues: string[] = [];
-        if (postings.length === 0) issues.push('Add at least one posting.');
-        for (let i = 0; i < postings.length; i++) {
-            const p = postings[i]!;
-            const v = Number(p.amount);
-            if (p.amount.trim().length === 0 || Number.isNaN(v)) {
-                issues.push(`Posting ${i + 1}: amount is required.`);
-            }
-            if (p.counterpartyId === null) {
-                issues.push(`Posting ${i + 1}: pick a counterparty.`);
-            }
-        }
-        return issues;
-    }, [postings]);
+    const validation = useMemo(() => validatePostings(postings), [postings]);
+    // The same defects as data, for the splits grid: it marks the offending
+    // ROW and its summary strip links to the offending FIELD, neither of which
+    // a sentence can do. One rule set behind both — see bank-edit/validation.ts.
+    const issues = useMemo(() => postingIssues(postings), [postings]);
     // When folding into a merge candidate, the editor's postings
     // / payee / memo are about to be discarded — they don't need
     // to validate. Save stays enabled purely on the merge stamp.
@@ -660,7 +511,21 @@ export function TxnRowEdit({
     }
 
     function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
-        if (event.key === 'Escape') {
+        // `defaultPrevented` is the whole guard, and it is load-bearing.
+        // Escape inside an OPEN category picker used to cancel the entire
+        // transaction — dismiss a dropdown you opened by mistake, lose
+        // thirteen legs of a paycheck split. AccountCategoryPicker already
+        // calls preventDefault() when it closes its own panel on Escape; this
+        // handler simply never looked, so the event closed the panel and then
+        // kept going.
+        //
+        // Deliberately NOT stopPropagation inside the picker instead. Typeahead
+        // (the payee field) documents the opposite choice at its own keyboard
+        // contract — "close the popover; let the event bubble so the parent
+        // form's cancel handler can fire" — and marks it by NOT calling
+        // preventDefault. Reading the flag honours both components' existing
+        // signalling rather than overriding one of them.
+        if (event.key === 'Escape' && !event.defaultPrevented) {
             event.preventDefault();
             onCancel();
         }
@@ -842,7 +707,19 @@ export function TxnRowEdit({
                                 const n = Number(text);
                                 if (!Number.isNaN(n)) patchPosting(onlyPosting.key, { amount: n.toFixed(2) });
                             }}
-                            className="h-control-28px w-full rounded border border-border bg-surface px-2 text-right font-mono text-xs tabular-nums focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                            className={
+                                'h-control-28px w-full rounded border border-border bg-surface px-2 text-right font-mono text-xs tabular-nums focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent '
+                                // Same bank-register pairing as the split rows
+                                // — a debit is red, a credit is plain. This
+                                // field carried no colour at all, so a single
+                                // transaction changed colour merely by being
+                                // opened for edit.
+                                + (Number(onlyPosting.amount) < 0
+                                    && onlyPosting.amount.trim().length > 0
+                                    && !Number.isNaN(Number(onlyPosting.amount))
+                                    ? 'text-state-danger'
+                                    : 'text-text')
+                            }
                         />
                     </label>
                     {mode.kind === 'edit' ? (
@@ -1041,59 +918,23 @@ export function TxnRowEdit({
                 )}
             </div>
 
-            {/* Leg column-header strip — labels col5 (per-leg
-                Memo, under root's Memo), col6 (per-leg Category +
-                Tags, under root's umbrella Tags), and col7
-                (Amount). Each leg field stacks directly under its
-                root counterpart in the same column. */}
-            <div
-                aria-hidden
-                className="grid gap-2 border-b border-border/30 px-3 py-1 text-[0.625rem] uppercase tracking-wider text-text-muted"
-                style={{ gridTemplateColumns: cols }}
-            >
-                <span /><span /><span /><span />
-                <span>Memo</span>
-                <span>Category · Tags</span>
-                <span className="text-right">Amount</span>
-                <span />
-            </div>
-
-            {/* Leg rows. Drag handle in col1 (status), category +
-                memo + tags stacked in col5, amount in col7, remove
-                button in col8. */}
-            {postings.map((p, idx) => (
-                <PostingRowEditor
-                    key={p.key}
-                    posting={p}
-                    index={idx}
-                    canRemove={postings.length > 1}
-                    accounts={accounts}
-                    isEligibleCounterparty={isEligibleCounterparty}
-                    frequent={frequent}
-                    cols={cols}
-                    disabled={isSaving}
-                    autoFocusAmount={p.key === focusKey}
-                    onAutoFocused={() => setFocusKey(null)}
-                    onChange={(fields) => patchPosting(p.key, fields)}
-                    onRemove={() => removePosting(p.key)}
-                    onReorder={reorderPostings}
-                />
-            ))}
-            {/* Ghost click-target — one click materialises a new
-                posting + auto-focuses its amount input. */}
-            <GhostPostingRow
-                cols={cols}
+            <SplitsGrid
+                postings={postings}
+                issues={issues}
+                accounts={accounts}
+                isEligibleCounterparty={isEligibleCounterparty}
+                frequent={frequent}
+                currency={currency}
+                total={sourceTotal}
                 disabled={isSaving}
-                onMaterialise={() => addPosting()}
+                focusKey={focusKey}
+                onAutoFocused={() => setFocusKey(null)}
+                onPatch={patchPosting}
+                onAdd={() => addPosting()}
+                onRemove={removePosting}
+                onReorder={reorderPostings}
+                onMove={movePosting}
             />
-
-            {/* Validation hint strip — same contract as the single-
-                posting branch. */}
-            {validation.length > 0 ? (
-                <div className="border-t border-state-warning/30 bg-state-warning-soft/30 px-3 py-1.5 text-[0.6875rem] text-state-warning">
-                    {validation.join(' · ')}
-                </div>
-            ) : null}
 
             {/* Bottom action row — optional leading slot left, Cancel + Save right. */}
             <div className="flex items-center justify-between gap-2 border-t border-border/30 px-3 py-2">
@@ -1136,508 +977,6 @@ export function TxnRowEdit({
                 {saveError}
             </p>
         ) : null}
-        </div>
-    );
-}
-
-// --------------------------------------------------------------------
-// PostingRowEditor + GhostPostingRow
-// --------------------------------------------------------------------
-
-interface PostingRowEditorProps {
-    posting: PostingDraft;
-    index: number;
-    canRemove: boolean;
-    /** Full ledger accounts (for the picker's path/display) + the
-     *  eligibility predicate + the source account's frequents —
-     *  ADR-0043, same shared picker as the investment editor. */
-    accounts: readonly AccountSummary[];
-    isEligibleCounterparty: (a: AccountSummary) => boolean;
-    frequent: FrequentCounterpartiesResponse | null;
-    /** Register's 8-column grid template — leg rows ride on the
-     *  same template so col5 (category + memo + tags) and col7
-     *  (amount) align with the register's PAYEE/MEMO and AMOUNT
-     *  columns above. */
-    cols: string;
-    disabled: boolean;
-    /** True for the most-recently-added posting; the amount input
-     *  focuses itself on mount so the user can start typing
-     *  immediately after clicking the ghost row. */
-    autoFocusAmount: boolean;
-    /** Called once after autoFocusAmount-driven focus lands, so
-     *  the parent can clear its focusKey marker. */
-    onAutoFocused: () => void;
-    onChange: (fields: Partial<PostingDraft>) => void;
-    onRemove: () => void;
-    onReorder: (fromKey: string, toKey: string) => void;
-}
-
-function PostingRowEditor({
-    posting,
-    index,
-    canRemove,
-    accounts,
-    isEligibleCounterparty,
-    frequent,
-    cols,
-    disabled,
-    autoFocusAmount,
-    onAutoFocused,
-    onChange,
-    onRemove,
-    onReorder,
-}: PostingRowEditorProps) {
-    const [dragOver, setDragOver] = useState(false);
-    const amountRef = useRef<HTMLInputElement | null>(null);
-    const memoRef = useRef<HTMLTextAreaElement | null>(null);
-    useEffect(() => {
-        if (autoFocusAmount && amountRef.current) {
-            amountRef.current.focus();
-            onAutoFocused();
-        }
-    }, [autoFocusAmount, onAutoFocused]);
-    function adjustMemoHeight(el: HTMLTextAreaElement | null) {
-        if (el === null) return;
-        el.style.height = 'auto';
-        const maxPx = 96;
-        el.style.height = `${Math.min(el.scrollHeight, maxPx)}px`;
-    }
-    useEffect(() => {
-        adjustMemoHeight(memoRef.current);
-    }, [posting.legMemo]);
-    return (
-        <div
-            className={
-                'grid items-start gap-2 border-b border-border/20 px-3 py-1 ' +
-                (dragOver
-                    ? 'bg-accent-soft/30 shadow-[inset_2px_0_0_var(--color-accent)]'
-                    : '')
-            }
-            style={{ gridTemplateColumns: cols }}
-            onDragOver={(e) => {
-                e.preventDefault();
-                setDragOver(true);
-            }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={(e) => {
-                e.preventDefault();
-                setDragOver(false);
-                const fromKey = e.dataTransfer.getData('text/posting-key');
-                if (fromKey.length > 0) onReorder(fromKey, posting.key);
-            }}
-        >
-            {/* col1-3 (status / checkbox / date) — empty on leg
-                rows. */}
-            <span /><span /><span />
-            {/* col4 (register's CHECK# column) — drag handle. Sits
-                immediately to the left of the leg memo so the
-                affordance is right next to the field a user grabs
-                when they want to move the row. */}
-            <span
-                role="button"
-                aria-label={`Reorder posting ${index + 1}`}
-                title="Drag to reorder"
-                draggable={!disabled && canRemove}
-                onDragStart={(e) => {
-                    e.dataTransfer.setData('text/posting-key', posting.key);
-                    e.dataTransfer.effectAllowed = 'move';
-                }}
-                className="cursor-move select-none self-start pt-1 text-center text-text-subtle hover:text-text"
-            >
-                ⋮
-            </span>
-            {/* col5 (register's PAYEE · MEMO) — per-leg memo,
-                stacked directly under the root's Memo input above.
-                Disabled when the transaction has a single posting:
-                the umbrella memo above IS the only memo a
-                single-row txn needs, and a per-leg memo on the
-                only leg would be redundant. Existing leg memo
-                content (e.g. from a previous multi-split that's
-                been collapsed to a single posting) is preserved
-                read-only, not silently dropped. */}
-            <textarea
-                ref={memoRef}
-                rows={1}
-                value={posting.legMemo}
-                disabled={disabled || !canRemove}
-                placeholder={
-                    canRemove
-                        ? 'Posting memo (optional)'
-                        : 'Use the umbrella memo above'
-                }
-                title={
-                    canRemove
-                        ? undefined
-                        : 'Per-leg memo applies to multi-split transactions; for a single posting the umbrella memo above is the canonical memo.'
-                }
-                aria-label={`Posting ${index + 1} memo`}
-                onChange={(e) => {
-                    onChange({ legMemo: e.target.value });
-                    adjustMemoHeight(e.target);
-                }}
-                onKeyDown={(e) => {
-                    if (e.key === 'Enter' && e.shiftKey) {
-                        e.stopPropagation();
-                    }
-                }}
-                className="min-h-control-28px max-h-fixed-96px w-full resize-none overflow-y-auto rounded border border-border bg-surface px-2 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
-            />
-            {/* col6 (register's CATEGORY · TAGS) — category
-                typeahead + per-leg tags placeholder, stacked under
-                the root's Tags umbrella slot above. Reading down
-                the column: "umbrella tags → leg category → leg
-                tags" tracks one categorisation hierarchy. */}
-            <div className="flex min-w-0 flex-col gap-1">
-                <AccountCategoryPicker
-                    accounts={accounts}
-                    isEligible={isEligibleCounterparty}
-                    frequent={frequent}
-                    valueId={posting.counterpartyId}
-                    onChangeId={(id) => onChange({ counterpartyId: id })}
-                    placeholder="Category or account…"
-                    ariaLabel={`Posting ${index + 1} category`}
-                    disabled={disabled}
-                />
-                <TagsPlaceholder
-                    hint="Per-posting tags coming soon"
-                    aria-label={`Posting ${index + 1} tags`}
-                />
-            </div>
-            {/* col7 (register's AMOUNT) — leg amount input. */}
-            <input
-                ref={amountRef}
-                type="number"
-                step="0.01"
-                inputMode="decimal"
-                value={posting.amount}
-                placeholder="0.00"
-                disabled={disabled}
-                aria-label={`Posting ${index + 1} amount`}
-                onChange={(e) => onChange({ amount: e.target.value })}
-                onBlur={(e) => {
-                    const text = e.target.value.trim();
-                    if (text.length === 0) return;
-                    const n = Number(text);
-                    if (!Number.isNaN(n)) onChange({ amount: n.toFixed(2) });
-                }}
-                className="h-control-28px w-full rounded border border-border bg-surface px-2 text-right font-mono text-xs tabular-nums focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-            />
-            {/* col8 (register's BALANCE) — remove button. The
-                register's balance is meaningless mid-edit (the
-                row is being mutated), so the slot hosts the
-                remove affordance. */}
-            <button
-                type="button"
-                aria-label={`Remove posting ${index + 1}`}
-                title={
-                    canRemove
-                        ? 'Remove this posting'
-                        : 'Cannot remove — a transaction needs at least one posting'
-                }
-                disabled={disabled || !canRemove}
-                onClick={onRemove}
-                className="ml-auto size-control-28px rounded text-text-subtle hover:bg-state-danger-soft hover:text-state-danger disabled:cursor-not-allowed disabled:opacity-30"
-            >
-                −
-            </button>
-        </div>
-    );
-}
-
-interface GhostPostingRowProps {
-    cols: string;
-    disabled: boolean;
-    onMaterialise: () => void;
-}
-
-/** Ghost row affordance (ADR-0025): clicking anywhere on this
- *  row materialises a new posting and moves focus to the new
- *  row's amount input (handled by the parent via
- *  `autoFocusAmount` on the freshly-added PostingRowEditor).
- *
- *  Implemented as a single click-target button (not real inputs)
- *  so the materialise fires exactly once per interaction. */
-function GhostPostingRow({
-    cols,
-    disabled,
-    onMaterialise,
-}: GhostPostingRowProps) {
-    return (
-        <button
-            type="button"
-            disabled={disabled}
-            onClick={onMaterialise}
-            aria-label="Add another posting"
-            title="Add another posting"
-            className="grid w-full items-center gap-2 border-b border-dashed border-border/40 bg-transparent px-3 py-1 text-left italic text-text-subtle opacity-60 transition-opacity hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-            style={{ gridTemplateColumns: cols }}
-        >
-            <span /><span /><span />
-            <span aria-hidden className="text-center not-italic">⋮</span>
-            <span aria-hidden className="px-2 text-xs">
-                + Add another posting…
-            </span>
-            <span /><span /><span />
-        </button>
-    );
-}
-
-// --------------------------------------------------------------------
-// TagsPlaceholder
-// --------------------------------------------------------------------
-
-/** Reserved layout slot for tag editing — visual placeholder, not
- *  a real input. Keeps the form layout stable so a future PR
- *  adding tag editing doesn't reshuffle the editor (user: "I DO
- *  NOT WANT TO REDESIGN FORMS IN EVERY PR"). */
-function TagsPlaceholder({
-    label,
-    hint,
-    'aria-label': ariaLabel,
-}: {
-    label?: string;
-    hint: string;
-    'aria-label'?: string;
-}) {
-    return (
-        <label
-            className="flex min-w-0 flex-col gap-1 text-[0.625rem] font-semibold uppercase tracking-wider text-text-muted"
-            aria-label={ariaLabel}
-        >
-            {label !== undefined ? <span>{label}</span> : null}
-            <div
-                role="presentation"
-                title={hint}
-                className="flex h-control-28px min-w-0 items-center rounded border border-dashed border-border bg-transparent px-2 text-xs italic text-text-subtle opacity-50"
-            >
-                {hint}
-            </div>
-        </label>
-    );
-}
-
-// --------------------------------------------------------------------
-// TagsInput (slice 2c.6b; Tags v1 autocomplete)
-// --------------------------------------------------------------------
-// Chip-style header-level tag editor. Applied tags render as inline
-// chips with an × to remove; the trailing field is a shared
-// {@link TagCombobox} that autocompletes against the ledger's tag
-// dictionary (colour swatch + usage) and offers "Create '<new>'" for a
-// fresh name. Tag matching is case-insensitive within the ledger (server
-// enforces) so the SPA dedupes against applied chips with a lower-case
-// key. Constraints mirror the server validation (BusinessError codes
-// `transaction-tag-{empty,too-long}` and `transaction-tags-too-many`):
-// names are trimmed, whitespace-only is rejected, and the field is
-// disabled once the cap is reached.
-
-const TAG_MAX_LENGTH = 64;
-const TAG_MAX_COUNT = 20;
-
-function TagsInput({
-    label,
-    tags,
-    allTags,
-    onChange,
-    disabled,
-    'aria-label': ariaLabel,
-}: {
-    label?: string;
-    /** Tag names currently applied to this transaction. */
-    tags: readonly string[];
-    /** The ledger's tag dictionary — powers the autocomplete. */
-    allTags: readonly TagDto[];
-    onChange: (next: readonly string[]) => void;
-    disabled: boolean;
-    'aria-label'?: string;
-}) {
-    // Add a name chosen from the combobox (an existing tag or a freshly
-    // typed one): dedupe case-insensitively + honour the same length /
-    // count caps the server enforces.
-    const addName = (name: string) => {
-        const trimmed = name.trim();
-        if (trimmed.length === 0 || trimmed.length > TAG_MAX_LENGTH) return;
-        const lower = trimmed.toLowerCase();
-        if (tags.some((t) => t.toLowerCase() === lower)) return;
-        if (tags.length >= TAG_MAX_COUNT) return;
-        onChange([...tags, trimmed]);
-    };
-
-    const removeAt = (index: number) => onChange(tags.filter((_, i) => i !== index));
-
-    const atCap = tags.length >= TAG_MAX_COUNT;
-
-    return (
-        <label
-            className="flex min-w-0 flex-col gap-1 text-[0.625rem] font-semibold uppercase tracking-wider text-text-muted"
-            aria-label={ariaLabel}
-        >
-            {label !== undefined ? <span>{label}</span> : null}
-            <div
-                className="flex min-h-control-28px min-w-0 flex-wrap items-center gap-1 rounded border border-border bg-surface px-1 py-0.5 text-xs focus-within:outline-none focus-within:ring-2 focus-within:ring-accent"
-            >
-                {tags.map((tag, i) => (
-                    <span
-                        key={`${tag.toLowerCase()}_${i}`}
-                        className="inline-flex items-center gap-1 rounded bg-surface-muted px-1.5 py-0.5 text-[0.6875rem] text-text"
-                    >
-                        {tag}
-                        <button
-                            type="button"
-                            onClick={() => removeAt(i)}
-                            disabled={disabled}
-                            aria-label={`Remove tag ${tag}`}
-                            className="text-text-subtle hover:text-state-danger focus-visible:text-state-danger focus-visible:outline-none"
-                        >
-                            ×
-                        </button>
-                    </span>
-                ))}
-                <TagCombobox
-                    tags={allTags}
-                    excludeNames={tags}
-                    onCommit={addName}
-                    onBackspaceEmpty={() => { if (tags.length > 0) onChange(tags.slice(0, -1)); }}
-                    disabled={disabled || atCap}
-                    placeholder={tags.length === 0 ? 'Add tag…' : atCap ? '' : '+ tag'}
-                    aria-label="Add tag"
-                    maxLength={TAG_MAX_LENGTH}
-                    inputClassName="min-w-[3rem] flex-1 border-none bg-transparent px-1 text-xs focus:outline-none disabled:cursor-not-allowed"
-                />
-            </div>
-        </label>
-    );
-}
-
-// --------------------------------------------------------------------
-// SimilarPayeesPanel (slice 2c.6c)
-// --------------------------------------------------------------------
-// Inline chip row beneath the payee input in the single-posting edit
-// template. Static at row-open (per design — no typeahead refetch).
-// Renders nothing when there are no suggestions (server returns []
-// for non-bank-feed rows, missing payees, or no matches). Clicking a
-// chip applies its (payee, counterparty) pair to the form draft —
-// counterparty path resolution goes through the editor's existing
-// accountPaths lookup so the Typeahead's display matches the format
-// the rest of the form expects. The counterparty is a category on an
-// ordinary expense and a real account when the prior rows were
-// settled as transfers; accountPaths covers every account in the
-// ledger, so both render the same way.
-
-function SimilarPayeesPanel({
-    suggestions,
-    accountPaths,
-    disabled,
-    onApply,
-}: {
-    suggestions: readonly SimilarPayeeDto[];
-    accountPaths: Map<string, string>;
-    disabled: boolean;
-    onApply: (suggestion: SimilarPayeeDto) => void;
-}) {
-    if (suggestions.length === 0) return null;
-    return (
-        <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1 pt-0.5 text-[0.625rem]">
-            <span className="text-text-subtle">Similar:</span>
-            {suggestions.map((s) => {
-                const counterpartyLabel =
-                    accountPaths.get(s.counterpartyAccountId) ?? s.counterpartyAccountName;
-                return (
-                    <button
-                        key={`${s.payee}::${s.counterpartyAccountId}`}
-                        type="button"
-                        disabled={disabled}
-                        onClick={() => onApply(s)}
-                        title={`Apply payee "${s.payee}" → "${counterpartyLabel}" (used ${s.useCount}×)`}
-                        className="inline-flex items-baseline gap-1 rounded border border-border bg-surface px-1.5 py-0.5 text-text hover:border-accent hover:bg-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                        <span className="font-medium">{s.payee}</span>
-                        <span className="text-text-subtle">→</span>
-                        <span>{counterpartyLabel}</span>
-                        {s.useCount > 1 ? (
-                            <span className="text-text-subtle">×{s.useCount}</span>
-                        ) : null}
-                    </button>
-                );
-            })}
-        </div>
-    );
-}
-
-// --------------------------------------------------------------------
-// MergeCandidatesPanel (slice 2c.6d)
-// --------------------------------------------------------------------
-// "Possible matches" chip row beneath the payee field. Each chip
-// represents a manual row whose source-account aggregate equals
-// this row's, within ±7 days. Clicking pre-fills the editor with
-// the candidate's payee / memo / tags / postings AND arms
-// `mergeFromHeaderId` for the next save (the saving handler sends
-// it in the PATCH body so the server stamps `is_merged_into` on
-// the manual row in the same transaction).
-//
-// Selection is a toggle: re-clicking the active chip clears the
-// merge arm (keeping the form state) — provides a "cancel merge,
-// keep my edits" path without restoring original state.
-
-function MergeCandidatesPanel({
-    candidates,
-    accountPaths,
-    selectedHeaderId,
-    disabled,
-    onSelect,
-}: {
-    candidates: readonly MergeCandidateDto[];
-    accountPaths: Map<string, string>;
-    selectedHeaderId: string | null;
-    disabled: boolean;
-    onSelect: (candidate: MergeCandidateDto) => void;
-}) {
-    if (candidates.length === 0) return null;
-    return (
-        <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1 pt-0.5 text-[0.625rem]">
-            <span className="text-text-subtle">Merge candidates:</span>
-            {candidates.map((c) => {
-                const isSelected = selectedHeaderId === c.headerId;
-                // postedAt arrives UTC-anchored (server treats it as
-                // a calendar date); slice the date portion directly
-                // — round-tripping through new Date(...).toISOString()
-                // is equivalent but slower.
-                const dateLabel = c.postedAt.slice(0, 10);
-                const summary =
-                    c.postings.length === 1
-                        ? accountPaths.get(c.postings[0]!.counterpartyAccountId)
-                          ?? c.postings[0]!.counterpartyAccountName
-                        : `${c.postings.length} splits`;
-                return (
-                    <button
-                        key={c.headerId}
-                        type="button"
-                        disabled={disabled}
-                        onClick={() => onSelect(c)}
-                        aria-pressed={isSelected}
-                        title={
-                            isSelected
-                                ? 'Click to cancel the merge (form edits stay).'
-                                : `Merge with ${c.payee ?? '(no payee)'} (${dateLabel}). The bank row keeps its identity; the manual row is marked as merged.`
-                        }
-                        className={
-                            'inline-flex items-baseline gap-1 rounded border px-1.5 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50 ' +
-                            (isSelected
-                                ? 'border-accent bg-accent-soft text-accent'
-                                : 'border-border bg-surface text-text hover:border-accent hover:bg-surface-muted')
-                        }
-                    >
-                        <span className="text-text-subtle">{dateLabel}</span>
-                        <span className="font-medium">
-                            {c.payee ?? '(no payee)'}
-                        </span>
-                        <span className="text-text-subtle">→</span>
-                        <span>{summary}</span>
-                        {isSelected ? (
-                            <span className="text-text-subtle" aria-hidden>✓</span>
-                        ) : null}
-                    </button>
-                );
-            })}
         </div>
     );
 }

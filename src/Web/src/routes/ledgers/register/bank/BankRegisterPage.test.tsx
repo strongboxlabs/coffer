@@ -144,8 +144,17 @@ function renderRegister(
         path: '/ledgers/$ledgerId',
         component: () => <main>detail</main>,
     });
+    // A category register's breadcrumb links at the Categories destination;
+    // TanStack throws on a <Link to> with no matching route.
+    const categoriesRoute = createRoute({
+        getParentRoute: () => root,
+        path: '/ledgers/$ledgerId/categories',
+        component: () => <main>categories</main>,
+    });
     const router = createRouter({
-        routeTree: root.addChildren([registerRoute, landingRoute, detailRoute]),
+        routeTree: root.addChildren([
+            registerRoute, landingRoute, detailRoute, categoriesRoute,
+        ]),
         history: createMemoryHistory({
             initialEntries: [initialUrl],
         }),
@@ -635,5 +644,254 @@ it('toggles the Scheduled filter', async () => {
         expect(
             within(breadcrumbs).queryByRole('link', { name: /all ledgers/i }),
         ).not.toBeInTheDocument();
+    });
+
+    // A CATEGORY register is the same component pointed at a different kind of
+    // account, and every difference below was a place it looked like a bank
+    // account and wasn't: it offered a statement import, a New-transaction
+    // button that the editor cannot honour, a breadcrumb that named neither the
+    // tree it lives in nor its parent, and — once widened to the subtree — rows
+    // whose own sub-category appeared nowhere.
+    describe('a category register', () => {
+        const PARENT_ID = '00000000-0000-0000-0000-000000000200';
+        const CHILD_ID = '00000000-0000-0000-0000-000000000201';
+        const SIBLING_ID = '00000000-0000-0000-0000-000000000202';
+
+        const category = (
+            id: string,
+            name: string,
+            parentId: string | null,
+        ): AccountSummary => ({
+            ...TEST_ACCOUNT,
+            id,
+            name,
+            parentId,
+            accountType: 'category',
+            categoryKind: 'expense',
+        });
+        const FOOD = category(PARENT_ID, 'Food', null);
+        const GROCERIES = category(CHILD_ID, 'Groceries', PARENT_ID);
+        const RESTAURANTS = category(SIBLING_ID, 'Restaurants', PARENT_ID);
+        const TREE = [TEST_ACCOUNT, FOOD, GROCERIES, RESTAURANTS];
+
+        function mockTree(entries: RegisterEntry[]) {
+            vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+                entries,
+                cursorForOlder: null,
+                cursorForNewer: null,
+            });
+            vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
+            vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue(TREE);
+        }
+
+        it('walks the category tree in the breadcrumb, not just the ledger', async () => {
+            mockTree([]);
+            renderRegister(`/ledgers/${LEDGER_ID}/accounts/${CHILD_ID}`);
+
+            const breadcrumbs = await screen.findByRole('navigation');
+            await waitFor(() => {
+                expect(
+                    within(breadcrumbs).getByRole('link', { name: 'Food' }),
+                ).toBeInTheDocument();
+            });
+            const links = within(breadcrumbs).getAllByRole('link');
+            expect(links.map((a) => a.getAttribute('href'))).toEqual([
+                `/ledgers/${LEDGER_ID}`,
+                `/ledgers/${LEDGER_ID}/categories`,
+                `/ledgers/${LEDGER_ID}/accounts/${PARENT_ID}`,
+            ]);
+            // The leaf is the current page — named, not linked.
+            expect(
+                within(breadcrumbs).getByText('Groceries'),
+            ).toHaveAttribute('aria-current', 'page');
+        });
+
+        it('offers no New transaction, because a category cannot hold one', async () => {
+            mockTree([entryOf(makeTxn({ id: 'c1', accountId: CHILD_ID }))]);
+            renderRegister(`/ledgers/${LEDGER_ID}/accounts/${CHILD_ID}`);
+
+            await screen.findByRole('checkbox', {
+                name: /select all transactions/i,
+            });
+            expect(
+                screen.queryByRole('button', { name: /new transaction/i }),
+            ).not.toBeInTheDocument();
+        });
+
+        it('tells a parent its money is on its children, and widens on request', async () => {
+            mockTree([]);
+            renderRegister(`/ledgers/${LEDGER_ID}/accounts/${PARENT_ID}`);
+
+            expect(
+                await screen.findByText(/nothing is filed directly under this category/i),
+            ).toBeInTheDocument();
+            // The empty state is the one with an action attached.
+            const widen = screen.getByRole('button', { name: /include sub-categories/i });
+
+            // Re-point the register at the subtree's rows before widening, so
+            // the assertion is about the widened READ, not an empty re-render.
+            vi.mocked(apiModule.fetchRegister).mockResolvedValue({
+                entries: [entryOf(makeTxn({
+                    id: 'g1', accountId: CHILD_ID, payee: 'Market',
+                }))],
+                cursorForOlder: null,
+                cursorForNewer: null,
+            });
+            fireEvent.click(widen);
+
+            // The scope lands on a PERSISTENT toggle, not a chip that vanished
+            // with the button that set it: a register showing several
+            // sub-categories' rows has to say so somewhere that is still there
+            // once it has happened, and offer the way back.
+            await waitFor(() => {
+                expect(
+                    screen.getByRole('checkbox', { name: /include sub-categories/i }),
+                ).toBeChecked();
+            });
+            await waitFor(() => {
+                expect(apiModule.fetchRegister).toHaveBeenCalledWith(
+                    expect.objectContaining({
+                        filter: expect.objectContaining({ includeSubcategories: true }),
+                    }),
+                );
+            });
+
+            // …and the arriving row names the sub-category it is filed under,
+            // by FULL path. The category column holds the OTHER side of the
+            // posting, so without this a widened register is a list of rows
+            // with no way to tell Groceries from Restaurants.
+            expect(await screen.findByText('Market')).toBeInTheDocument();
+            expect(await screen.findByText('Food/Groceries')).toBeInTheDocument();
+        });
+
+        it('arrives from the budget with the subtree already in scope', async () => {
+            // A budget row is a ROLLUP: the figure just read already contains
+            // every descendant. The register it links to must open the same
+            // way, or the number you clicked is not the number you land on.
+            mockTree([entryOf(makeTxn({
+                id: 'g1', accountId: CHILD_ID, payee: 'Market',
+            }))]);
+            renderRegister(
+                `/ledgers/${LEDGER_ID}/accounts/${PARENT_ID}?subcategories=true`,
+            );
+
+            expect(await screen.findByText('Market')).toBeInTheDocument();
+            // On from the first read — not toggled on afterwards.
+            expect(apiModule.fetchRegister).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    filter: expect.objectContaining({ includeSubcategories: true }),
+                }),
+            );
+            expect(
+                screen.getByRole('checkbox', { name: /include sub-categories/i }),
+            ).toBeChecked();
+            // …and the rows say which sub-category they are filed under.
+            expect(screen.getByText('Food/Groceries')).toBeInTheDocument();
+        });
+
+        it('offers the scope toggle on a parent, and not on a leaf', async () => {
+            mockTree([entryOf(makeTxn({ id: 'p1', accountId: CHILD_ID }))]);
+            const parent = renderRegister(
+                `/ledgers/${LEDGER_ID}/accounts/${PARENT_ID}`,
+            );
+            expect(
+                await screen.findByRole('checkbox', { name: /include sub-categories/i }),
+            ).not.toBeChecked();
+            parent.unmount();
+
+            // A leaf has no subtree, so the toggle would be an affordance for
+            // nothing. Anchor on the register having rendered before asserting
+            // the absence, or this passes on the pending frame.
+            mockTree([entryOf(makeTxn({ id: 'c1', accountId: CHILD_ID, payee: 'Market' }))]);
+            renderRegister(`/ledgers/${LEDGER_ID}/accounts/${CHILD_ID}`);
+            expect(await screen.findByText('Market')).toBeInTheDocument();
+            expect(
+                screen.queryByRole('checkbox', { name: /include sub-categories/i }),
+            ).not.toBeInTheDocument();
+        });
+
+        it('closes the keyboard route to the editor, not just the button', async () => {
+            // Hiding the button while leaving `n` bound left the action
+            // reachable by the exact route a regular would use — and the
+            // editor it opens authors against the register's own account,
+            // which here is a category.
+            mockTree([entryOf(makeTxn({ id: 'c1', accountId: CHILD_ID, payee: 'Market' }))]);
+            renderRegister(`/ledgers/${LEDGER_ID}/accounts/${CHILD_ID}`);
+
+            expect(await screen.findByText('Market')).toBeInTheDocument();
+            await userEvent.keyboard('n');
+
+            // The editor announces itself with a Save control; nothing opened.
+            expect(
+                screen.queryByRole('button', { name: /^save$/i }),
+            ).not.toBeInTheDocument();
+        });
+
+        it('drops Duplicate from the row menu — the other door to the editor', async () => {
+            // The builder is unit-tested; this asserts the WIRING, so the
+            // option cannot sit there unpassed while the menu still offers it.
+            mockTree([entryOf(makeTxn({ id: 'c1', accountId: CHILD_ID, payee: 'Market' }))]);
+            renderRegister(`/ledgers/${LEDGER_ID}/accounts/${CHILD_ID}`);
+
+            fireEvent.contextMenu(await screen.findByText('Market'));
+
+            // Anchor on the menu actually being open before asserting absence.
+            expect(await screen.findByRole('menu')).toBeInTheDocument();
+            expect(
+                screen.queryByRole('menuitem', { name: /duplicate/i }),
+            ).not.toBeInTheDocument();
+        });
+
+        it('filters by ACCOUNT, because that is the other side of these rows', async () => {
+            // The filter's `categoryId` has always meant "counterparty account
+            // id". On a money account's register the other side is a category;
+            // on a CATEGORY's register it is a money account. Offering
+            // categories here filtered an axis these rows do not have — the
+            // counterparty column reads "Checking", and nothing in the list
+            // could ever match it.
+            mockTree([entryOf(makeTxn({ id: 'c1', accountId: CHILD_ID }))]);
+            renderRegister(`/ledgers/${LEDGER_ID}/accounts/${CHILD_ID}`);
+
+            await userEvent.click(await screen.findByRole('button', { name: /^filter/i }));
+
+            const picker = await screen.findByRole('combobox', { name: /account/i });
+            expect(picker).toHaveAttribute('placeholder', 'Any account');
+
+            // Eligibility, not just the label: the money account is offered and
+            // the categories are not.
+            await userEvent.type(picker, 'e');
+            const options = await screen.findAllByRole('option');
+            const labels = options.map((o) => o.textContent ?? '');
+            expect(labels.some((t) => t.includes('Checking'))).toBe(true);
+            expect(labels.some((t) => t.includes('Groceries'))).toBe(false);
+        });
+
+        it('still filters by CATEGORY on an ordinary account register', async () => {
+            // The mirror of the case above — the default must not drift.
+            mockTree([entryOf(makeTxn({ id: 'b1' }))]);
+            renderRegister();
+
+            await userEvent.click(await screen.findByRole('button', { name: /^filter/i }));
+
+            const picker = await screen.findByRole('combobox', { name: /category/i });
+            expect(picker).toHaveAttribute('placeholder', 'Any category');
+
+            await userEvent.type(picker, 'o');
+            const labels = (await screen.findAllByRole('option')).map((o) => o.textContent ?? '');
+            expect(labels.some((t) => t.includes('Groceries'))).toBe(true);
+            expect(labels.some((t) => t.includes('Checking'))).toBe(false);
+        });
+
+        it('leaves an unwidened row unlabelled — its category is the breadcrumb', async () => {
+            mockTree([entryOf(makeTxn({
+                id: 'c1', accountId: CHILD_ID, payee: 'Market',
+            }))]);
+            renderRegister(`/ledgers/${LEDGER_ID}/accounts/${CHILD_ID}`);
+
+            // Anchor on the row being present, THEN assert the absence —
+            // a bare queryBy…toBeNull passes on the pending frame.
+            expect(await screen.findByText('Market')).toBeInTheDocument();
+            expect(screen.queryByText('Food/Groceries')).not.toBeInTheDocument();
+        });
     });
 });

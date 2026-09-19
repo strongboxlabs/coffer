@@ -35,6 +35,15 @@ const CURRENCIES: ReadonlyArray<string> = [
 ];
 
 const sectionClass = 'text-[0.625rem] font-semibold uppercase tracking-wider text-text-subtle';
+/** Kind values as they read to a person. Also covers an unrecognised value by
+ *  falling through to the raw string, so a category created by an older or newer
+ *  build never renders a blank field. */
+const CATEGORY_KIND_LABELS: Record<string, string> = {
+    income: 'Income',
+    expense: 'Expense',
+    adjustment: 'Adjustment',
+};
+
 const inputClass =
     'mt-1 w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm text-text ' +
     'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent';
@@ -323,11 +332,35 @@ export function AccountEditorDialog({ ledgerId, account, onClose, onSaved }: Acc
                     {isCategory ? (
                         <div className="block">
                             <FieldLabel htmlFor="acct-kind">Kind</FieldLabel>
-                            <select id="acct-kind" className={inputClass} value={categoryKind ?? 'expense'}
-                                onChange={(e) => setCategoryKind(e.target.value)}>
-                                <option value="expense">Expense</option>
-                                <option value="income">Income</option>
-                            </select>
+                            {isEdit ? (
+                                // READ-ONLY once the category exists (ADR-0017).
+                                // Changing a kind does not edit a label: it moves
+                                // every posting in the category between the spending
+                                // and income totals, for all of its history, with no
+                                // record. The server refuses it. Showing an editable
+                                // control that always fails would be worse than
+                                // showing none — so this matches the Type field above,
+                                // which is immutable for the same reason.
+                                <input
+                                    id="acct-kind"
+                                    className={cn(inputClass, 'cursor-not-allowed text-text-muted')}
+                                    value={CATEGORY_KIND_LABELS[categoryKind ?? ''] ?? categoryKind ?? ''}
+                                    title={"A category's kind can't be changed. Create one of the kind "
+                                        + 'you want and merge this into it.'}
+                                    readOnly disabled
+                                />
+                            ) : (
+                                <select id="acct-kind" className={inputClass} value={categoryKind ?? 'expense'}
+                                    onChange={(e) => setCategoryKind(e.target.value)}>
+                                    <option value="expense">Expense</option>
+                                    <option value="income">Income</option>
+                                    {/* mig 224 / ADR-0017 — neither income nor
+                                        expense: a house marked up, a retirement
+                                        balance reconciled. Falls out of all three
+                                        reporting measures by construction. */}
+                                    <option value="adjustment">Adjustment</option>
+                                </select>
+                            )}
                         </div>
                     ) : (
                         <>

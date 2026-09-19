@@ -1012,13 +1012,39 @@ the two sides of one posting — same value within the header, different
 `account_id`. The pair sums to zero (same-currency invariant). User
 edits to per-leg fields (amount, leg memo) live in `txn_leg_overrides`.
 
+**`posting_index` does double duty, and the second job is easy to
+miss: it is also the split's DISPLAY ORDER.** The bank patch path
+renumbers it 0..N-1 from the position of `postings.items[]` in the
+request, which is what makes the editor's drag-to-reorder persist, and
+every UI read sorts by it (`resolved_transactions` exposes it as
+`leg_index`). The consequence for writers: **any code that rebuilds
+the full `items[]` array from a leg query owns the user's ordering, so
+that query MUST carry `ORDER BY posting_index`.** Postgres guarantees
+no order without one, and because every UPDATE moves the row to a new
+heap location a seq scan tends to return recently-touched legs last —
+so an unordered read permutes a user's split reliably rather than
+rarely. `RecategorizeSplitPostingsAsync` shipped without that clause
+and could reshuffle the other 13 lines of a 14-line paycheck split as
+a side effect of recategorizing one of them.
+
+The other way a writer can corrupt the sequence is **duplicate
+`legId`s in one `items[]` array**. Both items resolve to the same
+tracked row, so the last array position wins, the earlier one writes
+nothing, and the header ends up with fewer postings than the request
+listed plus a hole in `posting_index` — which then trips the
+`posting_index > 0` split detectors and the `posting_index = 0`
+canonical-leg lookup. The patch path now rejects this with
+`transaction-posting-leg-id-duplicated` (422) rather than applying it;
+each item must reference a distinct existing leg, or omit `legId` to
+create a new posting.
+
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
 | `id` | `UUID` | PK | |
 | `header_id` | `UUID` | NOT NULL FK → `txn_headers(id)` ON DELETE CASCADE | |
 | `account_id` | `UUID` | NOT NULL FK → `accounts(id, ledger_id)` ON DELETE RESTRICT | Composite FK includes `ledger_id` (migration 049) so a leg can only reference an account in the same ledger as its `txn_headers` row. |
 | `ledger_id` | `UUID` | NOT NULL FK → `ledgers(id)` ON DELETE RESTRICT | Denormalized from `txn_headers.ledger_id` (migration 049). All three composite FKs (header / account / security-when-set) reference `(parent_id, ledger_id)` so the DB structurally refuses a leg whose parents span different ledgers. |
-| `posting_index` | `INTEGER` | NOT NULL CHECK ≥ 0 | Pairs the two legs of one posting. For an MD txn with N splits, the legs use `posting_index = 0..N-1`. |
+| `posting_index` | `INTEGER` | NOT NULL CHECK ≥ 0 | Pairs the two legs of one posting, **and is the split's display order** — see the note above. For an MD txn with N splits, the legs use `posting_index = 0..N-1`; a patch that drops a middle posting compacts the survivors rather than leaving a hole, which matters because readers treat `posting_index > 0` as "this header is a split" and `posting_index = 0` as the canonical leg. |
 | `leg_memo` | `TEXT` | | Per-split memo (MD's `0.desc`, e.g. "Salary", "Federal Tax"). NULL on single-split events (the view falls back to `txn_headers.memo`). |
 | `amount` | `NUMERIC(19,4)` | NOT NULL, CHECK `amount = round(amount, 2)` | Impact on `account_id`. The two legs of a posting sum to zero. **Money is authoritative at 2 decimals** (ADR-0073, migration 159 `ck_txn_legs_amount_scale_2`): for investment share-trades the request `amount` is the real settled cash and lands here exactly. Sub-cent amounts (historically `price × shares` unrounded) are barred — they had leaked into fractional / "-$0.00" running balances; migration 159 scrubbed 56 such legs. The column keeps scale 4 for headroom; the CHECK pins the money model. |
 | `security_id` | `UUID` | FK → `securities(id, ledger_id)` ON DELETE RESTRICT | Composite FK includes `ledger_id` (migration 049). Set on legs that participate in an investment posting. On the **holdings-side** leg of a buy/sell/divr it carries the position change. NULL on cash-side legs and non-investment legs. |
@@ -1369,6 +1395,163 @@ Amortization parameters for a loan account, **1:1** with `accounts` (one row per
 
 RLS: flattened per-ledger policy `loan_terms_per_user` (same shape as migrations 071/072/075/125). Covered by `fn_ledger_snapshot_payload` / `fn_ledger_snapshot_restore` (added alongside the table in migration 127).
 
+### `budget_targets`
+
+The number a person **typed** for one category in one month (migration 225, [decisions/0099-budget-as-guideposts-and-hand-rolled-charts.md](decisions/0099-budget-as-guideposts-and-hand-rolled-charts.md) D1/D1a). Its counterpart, the derived *normal*, is the mean of the trailing complete months and is stored **nowhere** — it is recomputed on every read, which is what lets the budget screen be useful before anyone has typed anything.
+
+**Presence of the row IS the state** (ADR-0099 D1). There is no per-ledger "budgeting enabled" flag. A category with a row this month is judged against `amount`; one without is judged against its normal. Deleting a row therefore does not clear a budget, it returns that category to its normal.
+
+| Column | Type | Constraints / FK | Notes |
+|---|---|---|---|
+| `id` | `UUID` | PK `pk_budget_targets`, DEFAULT `gen_random_uuid()` | A surrogate key, even though `(ledger_id, category_id, target_month)` is the real identity. **Load-bearing**: migration 197's snapshot chunk pagination probes `pg_attribute` for an attribute named exactly `id` and advances with `(chunk -> -1 ->> 'id')::uuid`. A non-UUID `id` fails on the first chunk; no `id` silently takes the unchunked path with a 500k-row ceiling. |
+| `ledger_id` | `UUID` | NOT NULL FK `fk_budget_targets_ledger` → `ledgers(id)` ON DELETE CASCADE | Phase A anchor (ADR-0020), same role as on `loan_terms`. |
+| `category_id` | `UUID` | NOT NULL; composite FK `fk_budget_targets_category` `(category_id, ledger_id)` → `accounts(id, ledger_id)` ON DELETE CASCADE | Ledger-coherent composite, resolving against `uq_accounts_id_ledger`. CASCADE is **forced**: `fn_ledger_snapshot_clear` deletes every `accounts` row on every restore and `fn_ledger_delete` does the same on every ledger delete, so RESTRICT would break both. |
+| `target_month` | `DATE` | NOT NULL CHECK `ck_budget_targets_month_is_first_of_month` (`= date_trunc('month', …)`) | Always the first of the month. Without the CHECK a mid-month date makes two rows that are one month to a reader and two to the unique index. |
+| `amount` | `NUMERIC(19,2)` | NOT NULL CHECK `ck_budget_targets_amount_non_negative` (`>= 0`) | Zero is meaningful ("I intend to spend nothing here"); negatives are not. Scale is (19,2) because this is typed by a human and never computed — the column is the single rounding point. Round nowhere else (see migration 209). |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+| `updated_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+
+Unique: `uq_budget_targets_category_month (ledger_id, category_id, target_month)`. Index: `ix_budget_targets_ledger_month (ledger_id, target_month)` for the month-at-a-time read.
+
+**Two rules the schema deliberately cannot enforce**, both owned by `BudgetTargetsRepository`:
+
+1. *That `category_id` names a category at all.* Categories are rows in `accounts`, so the composite FK is satisfied by a bank account too. Enforcing it in SQL would need a unique index on `(id, ledger_id, category_kind)` to compose against, and ADR-0032 makes a trigger a last resort.
+2. *That a target and its ancestors are mutually exclusive* (ADR-0099 D1a) — a target may sit on a node or on its descendants, never both, so each subtree has exactly one authoritative mark and the hero's roots-only ceiling needs no special case. This is a **recursive tree predicate**: no CHECK and no unique index can express it. Writes that would violate it are refused with a business error naming the conflicting category.
+
+RLS: role-aware pair `budget_targets_read` (SELECT for any grant) / `budget_targets_write` (ALL, `role IN ('owner','editor')`, repeated in USING and WITH CHECK), per migration 174 / ADR-0083 D2. Covered by `fn_ledger_snapshot_payload` / `_restore` / `_part_names` / `_insert_order` / `_clear` (all five re-declared in migration 225) — a stored target is a decision about the book, the same class as a transaction, so it rolls back with one.
+
+### `feed_csv_mappings`
+
+A reusable, hand-editable description of one institution's delimited export (migration 222, [decisions/0031-ingest-provider-pattern.md](decisions/0031-ingest-provider-pattern.md) Phase 5). `GenericCsvProvider` (provider key `csv-generic`) reads a file according to one of these rows instead of a hand-written parser per institution. The mapping describes a **file shape, not a destination** — two cards from one issuer export identically, so it is bound to the ledger and never to an account; binding it to an account would duplicate the row and let the copies drift. Migration 223's `accounts.import_provider_key` deliberately does not go near this table: that column names a per-brokerage provider implemented in code ([decisions/0098-brokerage-csv-is-a-shim-to-qif.md](decisions/0098-brokerage-csv-is-a-shim-to-qif.md)), which needs no mapping document.
+
+**Why the definition is a document and not typed columns.** This was first written as a dozen typed columns with `CHECK` constraints, and the first real target file argued it down. One department-store export produced six format surprises on its own: TAB-delimited despite a `.csv` extension (zero commas in the whole file), no header row (line 1 is already data), UTF-8 with BOM, a currency symbol inside the amount field, amounts signed from the *issuer's* perspective (a purchase is positive because it increases what you owe), and a fixed-width space-padded description packing merchant, city and state. Every one of those would have been a column — from one file. A schema that needs a migration per institution is the wrong shape for a format nobody controls, and the churn would land on every existing row as a nullable-with-default.
+
+**YAML text, not JSONB.** The point of a hand-editable document is that it survives being hand-edited. Comments, key order and formatting belong to whoever wrote it, and round-tripping through JSONB would silently discard all three — so what is stored is exactly what was written, and a preset for a given bank can be pasted in or shared as-is.
+
+**What the table gives up, and where the real gate is.** Choosing a document surrenders every constraint the column version had: that a signed shape names an amount column, that an index is ≥ 1, that the delimiter is one of a known set. Postgres cannot check any of it here. That work does not disappear — it moves to `CsvMappingValidator`, which is deliberately **stricter** than the CHECKs it replaced: unknown keys are *rejected* (a document parser's default is to ignore what it does not recognise, so a mistyped `ammount_column` would leave the amount unmapped and the import would read a different column as money); the cross-field rules the CHECKs used to hold (shape ↔ which columns) are asserted there instead; and column indexes are 1-based, because a `0` would read the wrong field rather than fail, and in an amount position that means importing a date as money.
+
+| Column | Type | Constraints / FK | Notes |
+|---|---|---|---|
+| `id` | `UUID` | PK `pk_feed_csv_mappings`, DEFAULT `gen_random_uuid()` | |
+| `ledger_id` | `UUID` | NOT NULL FK `fk_feed_csv_mappings_ledger` → `ledgers(id)` ON DELETE CASCADE | Phase A anchor (ADR-0020). The mapping belongs to the book, not to an account or a feed connection. |
+| `name` | `TEXT` | NOT NULL CHECK `ck_feed_csv_mappings_name_present` (`length(btrim(name)) > 0`) | Stays a real column rather than living inside the document: it is what the picker lists and what uniqueness is enforced on, and a value that is both queried and hand-editable inside a blob is a value with two sources of truth. |
+| `definition_yaml` | `TEXT` | NOT NULL CHECK `ck_feed_csv_mappings_yaml_present` (non-blank); CHECK `ck_feed_csv_mappings_yaml_size` (`length <= 65536`) | The YAML source as written, not a normalised re-render. The two CHECKs are the only things the database can honestly assert about a document — that it is not empty and not enormous; everything else is the validator's. The 64 KB cap is a guard, not a policy: this is a format description, and anything approaching it is a paste accident or an attack, better refused at the boundary than parsed. |
+| `schema_version` | `INT` | NOT NULL DEFAULT `1`, CHECK `ck_feed_csv_mappings_schema_version` (`>= 1`) | Which validator understood the document, so a stored mapping can still be read by the validator that accepted it — a mapping written today must not start failing because version 2 added a required key. Bumped only when a change would reject a document that was valid before (`CsvMappingValidator.CurrentVersion`). Written by the save path from the document's own `version:` key, so the column is a queryable projection of the document, never an independent value. |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT `now()` | |
+| `updated_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT `now()` | Maintained by `CsvMappingsRepository` on save, not by a trigger (ADR-0032). |
+
+Unique: `uq_feed_csv_mappings_ledger_name (ledger_id, lower(name))` — the import wizard offers these by name, and two "Store card" rows would make the choice a coin flip. Case-insensitive, because "Store card" and "store card" are the same choice to the person reading the list.
+
+Nothing references this table: no FK points at a mapping, so deleting one leaves the transactions it produced untouched.
+
+RLS: role-aware pair `feed_csv_mappings_read` (SELECT for any grant) / `feed_csv_mappings_write` (ALL, `role IN ('owner','editor')`, repeated in USING and WITH CHECK), per migration 174 / ADR-0083 D2 — declared by migration 222 itself, because a table added after 174 inherits no protection and `ALTER DEFAULT PRIVILEGES` already grants `coffer_app` write, so "no policy" would mean "no refusal". **Not** part of `fn_ledger_snapshot_*` — same class as `feed_connections`: configuration, not ledger data, and it must survive a data rollback. Rolling a ledger back to last month must not delete a mapping authored last week, and restoring an old snapshot must not resurrect one that was deliberately deleted. The transactions a mapping produced *are* captured — as ordinary rows in `txn_headers` / `txn_legs`. A format description and the money read through it have separate lifetimes.
+
+### `ledger_events`
+
+What a ledger has been **told** — one row per notification published about one ledger (migration 208, [decisions/0096-notification-bus-and-two-event-scopes.md](decisions/0096-notification-bus-and-two-event-scopes.md) D1). Migration 207 built the deployment half (`system_events`); 208 built this one because the consistency check produced ledger-scope findings and had nowhere to publish them, and writing them into `system_events` would have broken the scope split the ADR spends its length arguing for. Distinct from `ledger_operations`, which is a **run** log: a drift notice has no start, no end and no provider. ADR-0096 D4 keeps them apart from the other direction too — `ledger_operations` records every four-hourly quote refresh and should keep doing so, but if every activity row became a notification the channel would become noise and stop being read.
+
+ADR-0096 D1 as written proposed *extending* `ledger_operations` for ledger scope; migration 208 took a separate table instead, for the reason above, while keeping the part of D1 that is load-bearing — the two scopes never share a table. The alternative, a nullable `ledger_id` on `system_events`, fails on all four of D1's tests: **authorization** (a ledger event is gated by grant, an RLS question; a system event by admin — one table means one policy answering both, and a NULL scope is exactly where fail-open and fail-closed bugs live), **lifecycle** (these rows die with their ledger, while "the backup failed" outlives every ledger), **snapshot capture** (see the closing line), and **audience** (the ledger's holders vs whoever operates the install).
+
+`event_key` is the column the read side actually reasons with. Keys are `<subject>.<outcome>` — `consistency.drift`, `consistency.ok`, `quote-refresh.failed` — so the events panel derives "is this still true?" by finding the first later `info` event sharing the subject, and reports that instant as the resolution. That needs no `resolved_at` column and no correlation id, and it makes every scheduled-job warning self-resolving for free, because the success signal each job already publishes on its next good run *is* the all-clear. It is derived on read rather than stored deliberately: the log is append-only, and "is this still true" is a fact about the rows *around* a row, not a property of it — writing `resolved_at` back onto a log entry would mean mutating history to answer a question history can already answer.
+
+| Column | Type | Constraints / FK | Notes |
+|---|---|---|---|
+| `id` | `UUID` | PK `pk_ledger_events`, DEFAULT `gen_random_uuid()` | |
+| `ledger_id` | `UUID` | NOT NULL FK `fk_ledger_events_ledger` → `ledgers(id)` ON DELETE CASCADE | Phase A anchor (ADR-0020) and the RLS gate. CASCADE is D1's lifecycle argument in one clause: a notice about a ledger is meaningless once the ledger is gone. Contrast `system_events`, which has no such parent. |
+| `occurred_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | Publish instant. Leading sort of the only non-PK index, and the cutoff column for retention pruning. |
+| `severity` | `TEXT` | NOT NULL CHECK `ck_ledger_events_severity` in (`info`, `warning`, `critical`) | ADR-0096 D3, orthogonal to `topic` on purpose — "backup failed" and "quote provider unreachable" share a severity and want very different handling. `info` does double duty as the all-clear the resolution rule reads. |
+| `topic` | `TEXT` | NOT NULL CHECK `ck_ledger_events_topic` in (`backup`, `snapshot`, `sync`, `quotes`, `consistency`, `scheduler`) | The subsystem the event is about. A new job does not widen this if it fits an existing topic: migration 219's reminder auto-post publishes under `scheduler` and needed no schema change. |
+| `event_key` | `TEXT` | NOT NULL; deliberately no CHECK | `<subject>.<outcome>`. Machine-readable and part of the delivery contract (a heartbeat subscriber keys its monitor on it), not a label. Unconstrained because the key set is a property of the build's publishers, not of the schema — same argument migration 212 makes for `monitors`. Not unique, and repeats are expected: `PublishLedgerThrottledAsync` suppresses a repeat by asking this table whether the same key was published for the same ledger inside a window, which is scoped per ledger so one ledger's standing drift cannot silence another ledger's first report of the same kind. |
+| `summary` | `TEXT` | NOT NULL | One line, for a human reading a list. |
+| `detail` | `JSONB` | NOT NULL DEFAULT `'{}'::jsonb` | Structured extras, kept small — this is not a log. Notably does **not** carry the ledger's name: the publisher adds that to the *delivered* payload only, so a shared webhook can tell ledgers apart, while the stored row keeps the original detail. Repeating the name here would duplicate it into every historical row and freeze a stale copy of a renameable thing in the store. |
+
+Index `ix_ledger_events_ledger_occurred (ledger_id, occurred_at DESC)` — one index serving both reads: the panel's bounded top-N per ledger, and `AuditRetentionService`'s cutoff scan. That service prunes rows older than `Api:EventRetentionDays` (default **365**), a separate and longer knob than `Api:AuditRetentionDays` (180) because the two answer different questions — the audit logs answer "what happened recently", the event log answers "how long has this been going wrong".
+
+RLS: enabled, with a **single read policy** `ledger_events_read` (SELECT for any grant) and **no write policy, on purpose**. `NotificationPublisher` writes through `ServiceDbContextFactory` (BYPASSRLS) and no app-role path writes here at all — the panel only reads. RLS is default-deny for anything without a permissive policy, so a `coffer_app` INSERT/UPDATE/DELETE is refused outright; this matters because migration 017's `ALTER DEFAULT PRIVILEGES` already hands `coffer_app` write *permission* on new tables, so "no write policy" means "no refusal" only if the table forgets to enable RLS. Same treatment migration 174 gave the other service-written logs (`ledger_operations`, `mcp_tool_invocations`). **Not** part of `fn_ledger_snapshot_payload` / `_restore` — this is a record of what was *announced*, not ledger data, and restoring it would resurrect stale notices (a "drift found" that has since been repaired) and erase newer ones. A rollback must not rewrite what you were already told.
+
+### `ledger_notification_subscribers`
+
+A ledger's own notification delivery targets (migration 208, [decisions/0096-notification-bus-and-two-event-scopes.md](decisions/0096-notification-bus-and-two-event-scopes.md) D7/D8). One row per destination — a `webhook` URL, a `healthchecks` dead-man's switch — that `NotificationPublisher` delivers this ledger's `ledger_events` to. The deployment-scope counterpart is `notification_subscribers` (migration 207); the two rows are identical to deliver to, so one loop adapts both rather than existing twice, which is how the two scopes would quietly drift apart.
+
+**Migration 214 retired the `inherit` mode**, and the reason is the sharpest thing in this table's history. Migration 208 gave `ledgers` a `notification_mode` of `inherit` / `own`, defaulting to `inherit`, which routed a ledger's events to *every* deployment target with no ledger filter — so on a shared install one ledger's activity went to whoever watched the deployment's channel, by default. Two scopes that overlap by default are not two scopes. Retiring the mode alone would have muted ledger scope on every existing install, reproducing ADR-0096's founding incident inside the subsystem built to end it, so 214 moves the deployment's **message** targets into each inheriting ledger first, in the same transaction, then drops the column and its CHECK. That move is pure SQL because `config_ciphertext` in both scopes is sealed with the same master KEK by the same primitive, so the bytes are portable verbatim and no key material is needed at migration time. Three things it deliberately did **not** copy: heartbeat targets (one healthchecks URL is one check — N ledgers pinging it means any one ledger's job holds it green and masks every other ledger's dead one), disabled targets (a target an admin switched off must not return as N copies), and ledgers already in `own` (they opted out explicitly).
+
+| Column | Type | Constraints / FK | Notes |
+|---|---|---|---|
+| `id` | `UUID` | PK `pk_ledger_notification_subscribers`, DEFAULT `gen_random_uuid()` | |
+| `ledger_id` | `UUID` | NOT NULL FK `fk_ledger_notification_subscribers_ledger` → `ledgers(id)` ON DELETE CASCADE | Phase A anchor (ADR-0020) and the RLS gate. |
+| `subscriber_key` | `TEXT` | NOT NULL; deliberately no CHECK | Which provider delivers (`healthchecks`, `webhook`). The registered set is build metadata, not schema. The API rejects an unknown key at create; the publisher records a target whose key resolves to no registered provider as a delivery **failure** rather than skipping it, because from the settings page an unroutable target looks exactly like a working one. |
+| `display_name` | `TEXT` | NOT NULL | User label for the settings list. |
+| `is_enabled` | `BOOLEAN` | NOT NULL DEFAULT TRUE | Delivery switch, and the predicate of the partial index below. |
+| `min_severity` | `TEXT` | NOT NULL DEFAULT `'warning'` CHECK `ck_ledger_notification_subscribers_min_severity` in (`info`, `warning`, `critical`) | Floor for a **message** target. A heartbeat target ignores it entirely: its provider can express only "alive" or "down" and has no concept of severity, so routing it by severity is what made an unrelated Critical event mark the backup check failed. |
+| `topics` | `TEXT[]` | NULL | Topic filter for a message target; NULL or empty means every topic. A filter narrows what arrives — it cannot say what a URL *is*, which is the gap `monitors` exists to close. |
+| `monitors` | `TEXT` | NULL (migration 212) | Singular despite the plural name: the **one** monitor a heartbeat URL watches. A binding, not a filter — a heartbeat subscriber receives its own monitor's signals and nothing else, which is what makes "for each known monitor, is anything watching for its absence?" answerable. No CHECK: the valid set lives in the build (`NotificationMonitors`), so a value list here would need amending by migration for every new job and would reject a value an install mid-upgrade considers valid. The API validates against the **ledger** monitor set (`quote-refresh`, `snapshot`, `feed-sync`, `reminder-auto-post`, `consistency`), requires it for a heartbeat provider, and forbids it for a message one — a rule the database cannot express, since capability lives in the provider, not the row. Migration 212 backfilled pre-existing `healthchecks` rows in both scopes to `backup`; `backup` is a *deployment* monitor that no ledger runs, so such a row at ledger scope is a switch that can never fire, and the coverage API reports it in "watching nothing". |
+| `config_ciphertext` | `BYTEA` | NOT NULL | The delivery URL and any provider config as JSON, **sealed under the master KEK** (ADR-0096 D8) — not the ledger's LEK, even though this is a ledger-scoped table, because a webhook URL routinely carries its own token and the deployment scope needs the same primitive. That choice is what let migration 214 move ciphertext between the two tables as raw bytes, and what lets `KekRotationService` re-wrap both scopes in a single pass. Never plaintext at rest. |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+| `updated_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | Moves on **delivery outcome**, not on user edits — the ledger surface is `POST /subscribers` + `DELETE /subscribers/{id}` only, so a target is replaced, never edited. |
+| `last_success_at` | `TIMESTAMPTZ` | NULL | Last successful delivery. |
+| `last_failure_at` | `TIMESTAMPTZ` | NULL | Last failed delivery. |
+| `last_error` | `TEXT` | NULL | Failure detail, truncated to 500 chars by the publisher (no DB length bound); cleared on the next success. |
+| `consecutive_failures` | `INT` | NOT NULL DEFAULT 0 | Current-state health, not a lifetime counter: incremented per failure, reset to 0 on success. Nothing auto-disables on it — it drives what the settings panel shows, and `is_enabled` stays the user's decision. |
+
+Index `ix_ledger_notification_subscribers_ledger (ledger_id) WHERE is_enabled` — a partial index matching the delivery query exactly (`ledger_id = … AND is_enabled`), which is every publish on this path.
+
+There is deliberately **no** unique constraint on `(ledger_id, subscriber_key)`: two `webhook` rows pointing at two destinations is a legitimate setup. Migration 214's backfill therefore enforces its own idempotence with a `NOT EXISTS` on `subscriber_key` rather than leaning on a constraint — and it compares the key rather than the ciphertext because `SealWithMasterKey` draws a fresh nonce per call, so two seals of the same URL differ byte for byte and ciphertext equality can never be tested.
+
+RLS: role-aware pair `ledger_notification_subscribers_read` (SELECT for any grant) / `ledger_notification_subscribers_write` (ALL, `role IN ('owner','editor')`, repeated in USING and WITH CHECK), per migration 174 / ADR-0083 D2 — a viewer can see where their ledger reports, and only an owner or editor can change it. **Not** part of `fn_ledger_snapshot_payload` / `_restore` — delivery configuration, the same class as `feed_connections`: it must survive a data rollback, and there is a security edge besides. Capturing it would let restoring an old snapshot re-enable a target the user deliberately removed and re-arm a webhook URL they had revoked.
+
+### `system_events`
+
+Deployment-scope notification history — the installation's own event log (migration 207, [decisions/0096-notification-bus-and-two-event-scopes.md](decisions/0096-notification-bus-and-two-event-scopes.md) D1). It exists because of two incidents six days apart that were the same defect: snapshots and backups died for ~68 and ~47 hours with nothing said, and a data scrub left projections wrong for months, surfacing only when somebody ran a maintenance action by hand. Neither was a missing *check* — Coffer had no way to tell anyone anything.
+
+**No `ledger_id`, deliberately** (ADR-0096 D1), rather than a nullable scope column on a shared table with `ledger_operations`. Three things differ, not one: *authorization* — a ledger event is gated by grant (an RLS question), a system event by admin, and one policy answering both means a NULL scope, which is where fail-open/fail-closed bugs live; *lifecycle* — a ledger event dies with its ledger, "the backup failed" must outlive it; *snapshot capture* — ADR-0037 captures per-ledger tables, and system history must never ride inside a ledger snapshot. A row here survives deleting every ledger.
+
+**This table is history, not the alarm** (ADR-0096 D5, the decision that inverts the obvious design). A system event about the system being broken cannot be written by the broken system: if Postgres is unreachable or the container is dead, nothing writes here, no subscriber fires, and nothing lights up — which is exactly what the 68-hour outage was. Absence detection therefore lives *outside* the deployment, in a dead-man's-switch monitor pinged on success. The table records what was announced; it cannot notice silence.
+
+| Column | Type | Constraints / FK | Notes |
+|---|---|---|---|
+| `id` | `UUID` | PK `pk_system_events`, DEFAULT `gen_random_uuid()` | |
+| `occurred_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | Newest-first reads dominate (the admin panel, the events API page), hence the two DESC indexes below. Also the retention cutoff column. |
+| `severity` | `TEXT` | NOT NULL, CHECK `ck_system_events_severity` IN (`info`,`warning`,`critical`) | Orthogonal to `topic` (D3), not one collapsed enum: "backup succeeded" and "quotes updated" share a severity and want different routing; "backup failed" and "provider unreachable" likewise. Collapsing them forces every subscriber to re-derive the distinction. Constrained rather than free text so a typo is a write error instead of an event no subscriber ever matches. |
+| `topic` | `TEXT` | NOT NULL, CHECK `ck_system_events_topic` IN (`backup`,`snapshot`,`sync`,`quotes`,`consistency`,`scheduler`) | The routing axis. Adding a topic is a migration — that is the point of the CHECK. |
+| `event_key` | `TEXT` | NOT NULL | Machine-readable discriminator within a topic, e.g. `backup.succeeded`. **Load-bearing for de-duplication**: `NotificationPublisher.PublishThrottledAsync` suppresses a repeat by asking this table whether the same `event_key` appeared inside a window — checked against the row history rather than kept in memory, so a process restart does not re-announce everything. A standing condition re-checked on the scheduler tick would otherwise be announced ~96 times a day, which mutes the channel and is D4's cry-wolf failure arriving through repetition instead of severity. No index of its own; the probe is bounded by the `occurred_at` range and the table holds a few thousand rows a year. |
+| `summary` | `TEXT` | NOT NULL | Human-readable line as delivered. |
+| `detail` | `JSONB` | NOT NULL DEFAULT `'{}'` | Structured payload for the event; JSONB so a new event kind is not a schema change. |
+
+Indexes: `ix_system_events_occurred_at (occurred_at DESC)` for the panel, and `ix_system_events_severity_occurred (severity, occurred_at DESC)` for the badge/alert filter.
+
+Rows are written by `NotificationPublisher` and `SchedulerRunner` on the **BYPASSRLS service role** — a background tick has no request user. `AuditRetentionService` prunes `occurred_at` older than `Api:EventRetentionDays` (default **365**, a separate and longer knob than `AuditRetentionDays`' 180: the audit logs answer "what happened recently", the event log answers "how long has this been going wrong"). Unlike `ledger_events`, this table has no parent to cascade from, so **that prune is the only thing that ever removes a row.**
+
+RLS: **not** the role-aware pair of migration 174 / ADR-0083 D2 — deployment scope has no `ledger_id` and no grant to join, so the predicate is "is this app user an admin". Single read-only policy `system_events_admin_read` (SELECT for `coffer_app`, `USING current_app_user_is_admin()`), added in **migration 213, not 207** — 207 shipped this table with RLS disabled, so `coffer_app` had unrestricted CRUD by way of migration 017's `ALTER DEFAULT PRIVILEGES`. Those table grants are still there; RLS is what refuses the writes, because no policy covers INSERT/UPDATE/DELETE and nothing user-facing has any business amending an audit trail. `current_app_user_is_admin()` is `SECURITY DEFINER` with a pinned `search_path` on purpose: an inline `EXISTS` over `users` would happen to work today (the row it needs is the caller's own) while silently coupling this policy to the shape of `users_self`. **Not** part of `fn_ledger_snapshot_*`, and it could not be — deployment scope puts it outside the ledger-scoped set `SchemaDriftGuardTests` scans at all. The reason is the same one that excludes `ledger_events`: this is a record of what was **announced**, not ledger data, and a rollback must not rewrite what you were already told — resurrecting a "drift found" notice that has since been repaired, and erasing newer ones.
+
+### `notification_subscribers`
+
+Configured delivery targets for deployment-scope events — one row per configured provider (migration 207, [decisions/0096-notification-bus-and-two-event-scopes.md](decisions/0096-notification-bus-and-two-event-scopes.md) D7/D8). Delivery is pluggable on the ADR-0033 provider pattern: an `INotificationSubscriber` declares a `SubscriberKey` and `DisplayName`, the registry is DI, and `NotificationPublisher` routes. Providers divide by **capability** — *heartbeat* (healthchecks.io, Uptime Kuma push) detects absence; *message* (ntfy, Discord, Slack, generic webhook) cannot, because noticing that nothing arrived requires something outside the deployment to be counting.
+
+**The credential lives here, sealed, not in `secrets/`** (D8, which supersedes D5's earlier parenthetical). Docker secrets are for credentials the app needs *before* it can read a database; Postgres passwords qualify, a webhook URL does not — it is a user-configurable integration, added and changed at runtime, and one file per provider neither scales past the first nor survives adding a second without a container restart. So `config_ciphertext` is sealed with the master KEK by `LedgerKeyService`, exactly as Drive sync stores its outbound OAuth blob, and is re-wrapped by a master-KEK rotation (ADR-0092 D4).
+
+| Column | Type | Constraints / FK | Notes |
+|---|---|---|---|
+| `id` | `UUID` | PK `pk_notification_subscribers`, DEFAULT `gen_random_uuid()` | |
+| `subscriber_key` | `TEXT` | NOT NULL | Matches `INotificationSubscriber.SubscriberKey`, e.g. `healthchecks`, `webhook`. Deliberately **not** unique — see `monitors`. |
+| `display_name` | `TEXT` | NOT NULL | Admin's label for the target. |
+| `is_enabled` | `BOOLEAN` | NOT NULL DEFAULT TRUE | |
+| `min_severity` | `TEXT` | NOT NULL DEFAULT `'warning'`, CHECK `ck_notification_subscribers_min_severity` IN (`info`,`warning`,`critical`) | Inclusive floor: `warning` means warning **and** critical. |
+| `topics` | `TEXT[]` | NULL | Topic filter; NULL means every topic. A filter narrows what arrives — it does not say what the URL *is*, which is why `monitors` had to be added separately. |
+| `monitors` | `TEXT` | NULL (migration 212) | For a heartbeat target, the **one** monitor this URL watches, e.g. `backup`; NULL for a message target, which is bound to nothing. A healthchecks.io check is a single ping URL with no concept of severity, so routing any critical event to it turned an unrelated subject into `/fail` — a critical `consistency` event would mark the *backup* check down. Not CHECK-constrained: which monitors exist is a property of the build (`NotificationMonitors`), so a value list would need a migration per new job and would reject a value an install's own code considers valid mid-upgrade. The API validates on write, requiring it for a heartbeat provider and forbidding it for a message one — a rule the database cannot express, since capability lives in the provider, not the row. |
+| `config_ciphertext` | `BYTEA` | NOT NULL | The provider's URL/token **sealed under the master KEK** (D8); a webhook URL with an embedded token is a credential and is never a plain column. NOT NULL but may be **zero-length**: `KekReconciliationService` clears the blob, disables the row and writes an explanatory `last_error` when a restore brings in a target sealed under a different KEK. The length guard is what makes a second reconciliation pass a no-op. |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+| `updated_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | No trigger — the application sets it. |
+| `last_success_at` | `TIMESTAMPTZ` | NULL | Delivery health, surfaced in the admin panel rather than logged. |
+| `last_failure_at` | `TIMESTAMPTZ` | NULL | Also set by KEK reconciliation when a seal cannot be carried over. |
+| `last_error` | `TEXT` | NULL | |
+| `consecutive_failures` | `INT` | NOT NULL DEFAULT 0 | **Why delivery health is schema at all**: a subscriber that silently stops delivering would rebuild, one layer up, the exact silent failure this whole subsystem exists to prevent. |
+
+Partial index `ix_notification_subscribers_enabled (subscriber_key) WHERE is_enabled` for the publisher's fan-out. There is no unique constraint on `subscriber_key`: one healthchecks.io URL is one check, so watching a second job needs a second row.
+
+Migration 214 (*ledgers own their notifications*) retired the per-ledger `inherit` mode and copied this table's **message** targets into every inheriting ledger's `ledger_notification_subscribers`, because `inherit` routed a ledger's events to every deployment target with no ledger filter — two scopes that overlap by default are not two scopes. Heartbeat rows (`monitors IS NOT NULL`) and disabled rows deliberately stayed here: copying one ping URL into N ledgers would let any single ledger's job hold the check green and mask every other ledger's dead one, and a target an admin switched off must not return as N copies. So a heartbeat row here is normally a *deployment* switch watching a deployment job that no ledger runs.
+
+RLS: **not** the role-aware pair of migration 174 / ADR-0083 D2 — no `ledger_id`, no grant to join. A single `FOR ALL` policy `notification_subscribers_admin` for `coffer_app`, gated on the `SECURITY DEFINER` helper `current_app_user_is_admin()` in both `USING` and `WITH CHECK`; `coffer_service` is BYPASSRLS, which is how the publisher and monitors keep working with no user behind them. Added in **migration 213, not 207**: 207 shipped a table of sealed delivery credentials with RLS disabled and migration 017's default grants intact. There was no live escalation — the admin endpoints all carry `RequireAuthorization(AuthPolicies.RequireAdmin)` — but this repo treats RLS as the backstop and the API filter as the primary check precisely because a filter is one forgotten attribute away from absent, which the ledger notification endpoints proved in 0.65.0 by shipping without `RequireLedgerAccess()`. **Not** part of `fn_ledger_snapshot_*`, and outside the ledger-scoped set `SchemaDriftGuardTests` scans. Same reason as `feed_connections` and `ledger_notification_subscribers`: configuration that must survive a data rollback — plus a security edge, since capturing it would let an old snapshot re-enable a target the user deliberately removed and re-arm a webhook URL they had revoked.
+
 ### `user_preferences`
 
 General per-(user, ledger) preference store, one table not a table per feature (migration 134, [decisions/0057-user-preferences-store.md](decisions/0057-user-preferences-store.md)). One row per `(user_id, ledger_id, namespace)`; `value` is a namespace-typed JSON document, so a new preference area is a new `namespace` (+ a typed record in the API), never a schema change. Consumers so far: the `quotes` namespace (`{ "enabledProviders": [...] }`) — the per-ledger opt-in for external market-data providers (Yahoo), which **supersedes** the ADR-0054 `Quotes:Yahoo:Enabled` config gate — and the `dashboard` namespace (`{ "widgets": [{ "key", "visible" }] }`) — the per-ledger Overview layout (order + show/hide), ADR-0056 slice 3.
@@ -1467,6 +1650,41 @@ Per-call audit of MCP **write**-tool invocations (migration 170, ADR-0081 D3; tw
 | `completed_at` | `TIMESTAMPTZ` | NULL; CHECK `(status = 'pending') = (completed_at IS NULL)` | Finalize instant; NULL while pending. |
 | `trace_id` | `TEXT` | NULL | `HttpContext.TraceIdentifier`, correlating the row with the app log line + client response. |
 
+### Tables this document deliberately does not describe
+
+Five tables exist in the schema and have no section here, on purpose:
+
+* `OpenIddictApplications`, `OpenIddictAuthorizations`, `OpenIddictScopes`,
+  `OpenIddictTokens` — created and owned by the OpenIddict library's own
+  migrations, not by `db/migrations/`. Their shape is the library's to change,
+  and documenting a copy here would rot silently on the next package bump. See
+  [decisions/0063-mcp-server-and-reporting.md](decisions/0063-mcp-server.md)
+  for how they are used.
+* `__schema_migrations` — DbUp's own journal of applied scripts. One row per
+  migration file; `LedgerSnapshotsRepository` reads its highest entry to stamp a
+  snapshot's schema version, which is what makes a restore refuse across a
+  migration boundary.
+
+Everything else in `pg_tables` has a section. If you add a table and skip the
+docs, this list is where the next person will look before concluding the
+omission was deliberate.
+
+### `admin_audit_events`
+
+Durable record of deployment-level administrative actions on key material (migration 191, [decisions/0092-kek-lifecycle-in-the-ui.md](decisions/0092-kek-lifecycle-in-the-ui.md) D2). Once the master KEK became viewable and rotatable from the UI, "who saw the key, and when" had to be answerable after the fact — and until 191 the only record was the application log, which rotates away and isn't queryable. Scope is deliberately administrative-and-global rather than "everything": the two existing audit surfaces don't fit and weren't stretched — `ledger_operations` (ADR-0055) is per-ledger and RLS-scoped, `mcp_tool_invocations` (ADR-0081) is the MCP **write** audit. This table is for actions that belong to the *deployment*. The vocabulary lives in `AdminAuditActions`: `master-key.revealed` / `.rotated` / `.adopted` / `.shown-at-setup`, plus `backup-passphrase.revealed` (migration 192). The setup disclosure is its own action rather than folded into `.revealed`, so an auditor can tell the unavoidable bootstrap showing — which happens once per install and has no fresh-assertion gate, the registration ceremony being the proof — from a deliberate later one.
+
+**Append-only, and deliberately not pruned.** `AdminAuditRepository` exposes append + read and nothing else: a row the party it describes could edit wouldn't be worth writing. `AuditRetentionService` trims `ledger_operations` and `mcp_tool_invocations` on `Api:AuditRetentionDays` because those are high-volume operational records; key access is the opposite — a handful of rows per install, ever, whose whole value is that they are old — so the service explicitly skips this table and says so at the call site.
+
+| Column | Type | Constraints / FK | Notes |
+|---|---|---|---|
+| `id` | `UUID` | PK `pk_admin_audit_events`, DEFAULT `gen_random_uuid()` | |
+| `occurred_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | Indexed DESC (`ix_admin_audit_events_occurred_at`) — newest-first, optionally filtered by `action`, is the only query shape this table has. |
+| `action` | `TEXT` | NOT NULL, CHECK `ck_admin_audit_events_action` (`action <> ''`) | Stable event name. The emptiness CHECK is the *only* constraint: the value set is deliberately **not** enumerated in SQL. The WebAuthn flow CHECK had to be widened three times (migrations 140, 176, 190) purely to admit a new string, and an audit log is exactly the kind of table that grows new event types — so the vocabulary lives in the `AdminAuditActions` C# constants instead. This is the repo's position on vocabulary columns; migrations 212, 214 and 216 cite 191 for it. |
+| `actor_user_id` | `UUID` | FK → `users(id)` ON DELETE SET NULL | Who did it. SET NULL, not CASCADE: the event must outlive the account, otherwise removing a user erases the record of what they did. NULL also covers the actor-less case — a `master-key.adopted` row is written during the adoption boot, before anyone is signed in. |
+| `detail` | `TEXT` | NULL | Free-text operator context (e.g. "rotated to v2; 3 ledger key(s)"). A `COMMENT ON COLUMN` carries the rule: **never** key material, passphrases, or ciphertext, because any admin can read it back. |
+
+RLS: **enabled and forced with zero policies** — deny-all for `coffer_app` — alongside `REVOKE ALL FROM coffer_app` / `GRANT ALL TO coffer_service`, the same service-role-only posture as `system_settings` / `global_scheduled_jobs` / `drive_sync`. The empty policy set is the design, not an unfinished migration: admin is a deployment-global capability, so `RequireAdmin` is the boundary and the runtime role has no business reading this at all; with no policy RLS denies by default, which keeps the table closed even if a grant to `coffer_app` were ever restored. `AdminAuditRepositoryTests.The_app_role_cannot_read_the_audit` pins the resulting failure mode as the real behaviour — a hard `42501` permission-denied from the revoked grant, not an RLS-filtered empty set. Not ledger-scoped (there is no `ledger_id`, by design — the events belong to the install, not to a book), so it is outside `fn_ledger_snapshot_payload` / `_restore` entirely; per-ledger snapshots neither capture nor clear it, and a ledger rollback must not be able to rewrite the record of who saw the master key. Its durability comes from the whole-DB backup (ADR-0060).
+
 ### `drive_sync`
 
 Deployment-wide singleton holding the Google Drive backup-destination config (migration 142, ADR-0062). One row, `id = 1` (CHECK pins it). Service-role only with the same RLS-deny-all posture as `global_scheduled_jobs` — there's no ledger to scope it to. The OAuth blob is sealed under the master KEK (never plaintext) and re-wrapped by a master-KEK rotation (System → Encryption, ADR-0092 D4). ④a populates connect/disconnect + sync status; the `enabled` toggle drives auto-push. The Drive folder MIRRORS the local backup set (ADR-0074) — migration 160 dropped the former Drive-side retention columns, since there is no separate Drive retention.
@@ -1522,6 +1740,21 @@ Server-side capped snapshots of the user-curated ledger graph (migration 111, AD
 | `content_size_uncompressed` | `integer` | NOT NULL CHECK (`>= 0`) | Uncompressed byte count for the SPA's "N MB before compression" display without decompressing. |
 
 Indexes: `idx_ledger_snapshots_ledger_created (ledger_id, created_at DESC)`, `idx_ledger_snapshots_ledger_kind_created (ledger_id, kind, created_at)`. No RLS — access is mediated by the repository/service layer. Migration 112 later extended the snapshot scope (recurring transactions + splits).
+
+### `ledger_snapshot_parts`
+
+The v3 snapshot payload, stored in pieces: one row per (snapshot, source table, chunk of rows), added in migration 193 under the same decision as v2, [decisions/0087-snapshot-payload-server-side.md](decisions/0087-snapshot-payload-server-side.md). It has no ADR of its own because the decision did not change — the payload still never enters managed memory — only its shape did, after the shape ADR-0087 shipped was measured. Migration 179 fixed an OOM in the API process and created a smaller one in Postgres: `fn_ledger_snapshot_payload` builds a single `jsonb_build_object` over 21 `jsonb_agg` subqueries, migration 179 assigned that into a plpgsql variable, then rendered the whole document to text purely to count its bytes. On prod (2026-08-13) a 184.2 MB snapshot peaked at 2.49 GB of anonymous backend memory — roughly 14x — and the kernel OOM-killed the backend against the container's 1g limit; the postmaster terminated every other backend and entered crash recovery, the scheduler could not persist `next_run_at` over the killed connection, so a daily job became a 15-minute crash loop that ran ~2 days and took the nightly whole-DB backup down with it.
+
+Capture writes one table's rows here in chunks of 2000 (`fn_snapshot_write_part`) and restore replays them in `seq` order, one chunk in flight (`fn_snapshot_restore_part`), so peak memory is a function of chunk size and row width and stays flat as the ledger grows — the property the single-document form did not have. The chunking key is `ctid`, not the primary key: two in-scope tables have no `id` column (`txn_header_tags`, `user_account_group_members`), so a keyset over `id` is not universal, while `ctid > $x ORDER BY ctid` needs no catalog lookup and gets a TID range scan; tuples cannot move under the capture, which runs in one transaction, and the commands that would rewrite the heap take AccessExclusiveLock. The presence of any row for a snapshot **is** the v3 format gate — v3 leaves `ledger_snapshots.content_json` NULL, and existing v2 snapshots keep restoring through the unchanged v2 branch rather than being rewritten in place. There is no EF entity: the table is written and read only by the migration-193 functions, so it appears nowhere in `AppDbContext`, and the API discriminates formats on `content.Length > 0` (v1 only) without ever projecting a payload.
+
+| Column | Type | Constraints / FK | Notes |
+|---|---|---|---|
+| `snapshot_id` | `uuid` | NOT NULL; PK part 1; FK → `ledger_snapshots(id)` ON DELETE CASCADE | CASCADE is what keeps the 5-per-ledger eviction in `LedgerSnapshotsRepository` a single delete of the metadata row — the parts go with it, and no API code needs to know this table exists. |
+| `part_name` | `text` | NOT NULL; PK part 2 | The source table name, one of `fn_ledger_snapshot_part_names()`. Deliberately unconstrained — no CHECK, no catalog FK — and safe because restore drives from `fn_ledger_snapshot_insert_order()` and *filters* on this value; a stored name is never interpolated as an identifier. |
+| `seq` | `integer` | NOT NULL; PK part 3 | 0-based chunk index within `(snapshot_id, part_name)`. `seq = 0` is written even for an empty table, so the key exists as `'[]'`: migration 188's restore assertion distinguishes an absent key from an empty one, and skipping the write would drop the key for any ledger with an empty in-scope table. |
+| `content` | `jsonb` | NOT NULL | Always a jsonb **array** of that chunk's rows, never an object and never NULL. jsonb rather than text so Postgres TOAST-compresses it on disk — which is what replaced the v1 hand-rolled gzip. Size accounting sums per-chunk `octet_length`, so the figure runs a few bytes per chunk above the v2 number for the same data; it is a display value for the SPA, not a checksum. |
+
+Indexes: the primary key `(snapshot_id, part_name, seq)` is the only one, and it covers both access paths exactly — "any parts for this snapshot?" (the format gate) and "this table's chunks in order" (the restore loop). RLS: **none** — and inherited rather than chosen. `ledger_snapshots` has no policies either, so the parts table follows the table it belongs to rather than introducing a second, subtly different posture for the same data; both hold a full copy of every row of a ledger — the same rows their source tables protect with RLS — gated only by the API's `LedgerAuthorizer`. Adding RLS to both is a behaviour change to an existing table and is tracked as "RLS on the snapshot tables" in [follow-ups.md](follow-ups.md). Grants mirror `ledger_snapshots`: SELECT/INSERT/UPDATE/DELETE to `coffer_app` (capture and restore run request-side, as the caller, not `SECURITY DEFINER`), everything to `coffer_service`. Not captured by `fn_ledger_snapshot_payload` / `_part_names` — it *is* the snapshot storage, and a snapshot cannot contain itself (the reason `SchemaDriftGuardTests` gives for excluding `ledger_snapshots`); it also falls outside that guard entirely, since the guard classifies tables carrying `ledger_id` and this one reaches its ledger transitively through `snapshot_id`.
 
 ### `user_account_groups`
 
@@ -1611,7 +1844,7 @@ fit cleanly in LINQ. Every function is bound to EF via
 method on `AppDbContext` is a translation anchor only — its body is
 never executed.
 
-### `register_entry_keys(p_account_id, p_ledger_id, p_cursor_entry_key, p_cursor_seq, p_direction, p_limit, p_hidden, p_search, p_date_from, p_date_to, p_amount_min, p_amount_max, p_security_id, p_tag, p_category_id, p_status, p_today, p_sort_column, p_sort_dir)`
+### `register_entry_keys(p_account_ids, p_ledger_id, p_cursor_entry_key, p_cursor_seq, p_direction, p_limit, p_hidden, p_search, p_date_from, p_date_to, p_amount_min, p_amount_max, p_security_id, p_tag, p_category_id, p_status, p_today, p_sort_column, p_sort_dir)`
 
 Returns one row per **register entry** in the requested sort order (default
 `(posted_at DESC, seq DESC)`) — ready for keyset pagination over the windowed
@@ -1624,7 +1857,7 @@ RETURN shape is unchanged.
 
 | Parameter | Meaning |
 |---|---|
-| `p_account_id` (UUID, nullable) | Narrow to one account; NULL = all visible accounts in the ledger |
+| `p_account_ids` (UUID[], nullable) | Narrow to these accounts; NULL = all visible accounts in the ledger. Mig 226 widened this from a scalar `p_account_id`: a parent category's postings all sit on its children, so a register that could only name one account could never show a category's own money. One account passes an array of one |
 | `p_ledger_id` (UUID) | Ledger scope (required for the EXISTS-on-accounts guard when account_id is NULL) |
 | `p_cursor_entry_key`, `p_cursor_seq` | Boundary entry's key + seq from the previous page (mig 166: entry-key based, so the cursor is sort-agnostic); NULL on the first page |
 | `p_direction` (TEXT) | `'before'` (further along the display order — scroll down) or `'after'` (earlier — scroll up); ignored when the cursor is NULL. Output is always in display order — `'after'` fetches in reverse under the LIMIT and the outer SELECT flips it back |
@@ -1653,7 +1886,10 @@ History: migration 019 (5-param original) → 029 (created-at tiebreaker) → 03
 (add the `reconciling` status) → 166 (dynamic sort + entry-key cursor) → 167
 (the filter WHERE factored into `register_filtered_entries`; this function now
 `SELECT`s FROM that primitive and adds only the GROUP BY + sort + keyset +
-LIMIT). Bound via `HasDbFunction` / `AppDbContext.RegisterEntryKeys(...)`;
+LIMIT) → 226 (`p_account_id uuid` → `p_account_ids uuid[]`; the predicate went
+from `= $1` to `= ANY($1)` and nothing else moved — both functions DROPped by
+full signature first, because a changed parameter list would otherwise create an
+overload and make every existing call ambiguous rather than fail). Bound via `HasDbFunction` / `AppDbContext.RegisterEntryKeys(...)`;
 cursor codec in `RegisterRepository.EncodeCursor` / `DecodeCursor`. The
 scroll-rail buckets, the per-status dropdown counts, and a filtered select-all
 call the SAME `register_filtered_entries` primitive (ADR-0076), so the page,
@@ -1661,7 +1897,7 @@ the rail, the counts, and select-all can't drift.
 
 End-to-end test: [db/test/verify_register_entry_functions.sql](../db/test/verify_register_entry_functions.sql).
 
-### `register_filtered_entries(p_account_id, p_ledger_id, p_hidden, p_search, p_date_from, p_date_to, p_amount_min, p_amount_max, p_security_id, p_tag, p_category_id, p_status, p_today)`
+### `register_filtered_entries(p_account_ids, p_ledger_id, p_hidden, p_search, p_date_from, p_date_to, p_amount_min, p_amount_max, p_security_id, p_tag, p_category_id, p_status, p_today)`
 
 The **single source of truth** for the register filter (mig 167 / ADR-0076).
 Applies visibility + ledger/account scope + every filter dimension (search /
@@ -1677,7 +1913,8 @@ defined exactly once:
 - `BulkTransactionsRepository` — the filtered select-all intersection.
 
 Filter params match `register_entry_keys` (same meaning; each defaults NULL ⇒
-no-op). `p_hidden` is three-valued: `FALSE`/`TRUE` selects one visibility side;
+no-op), `p_account_ids` included — mig 226 widened both functions together, so
+the four consumers scope identically. `p_hidden` is three-valued: `FALSE`/`TRUE` selects one visibility side;
 **NULL returns both** (used by select-all, whose own query scopes visibility).
 Predicates are per-leg, so a header appears iff any of its legs match. As a
 single-`SELECT` `LANGUAGE sql STABLE` function it **inlines** into its callers

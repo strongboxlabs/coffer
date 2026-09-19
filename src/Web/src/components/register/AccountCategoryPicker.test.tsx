@@ -75,3 +75,87 @@ describe('AccountCategoryPicker (tree-aware)', () => {
         expect(onChangeId).toHaveBeenCalledWith('elec');
     });
 });
+
+describe('fitting a tight container', () => {
+    // The panel is ~286px at full height and position:absolute, so an ancestor
+    // with overflow-y:auto CLIPS it. That coupling is deliberate — the panel
+    // can never be visible while its input is not, which is what stops an
+    // opaque dropdown floating over unrelated chrome after a scroll, still
+    // accepting clicks into a field the user can no longer see. So a container
+    // with limited room makes the panel FIT rather than making it ESCAPE.
+    it('shortens the results list when compact', async () => {
+        const user = userEvent.setup();
+        const { container } = render(
+            <AccountCategoryPicker
+                accounts={CATS}
+                isEligible={isCategory}
+                valueId={null}
+                onChangeId={vi.fn()}
+                ariaLabel="Category"
+                compact
+            />,
+        );
+        await user.click(screen.getByRole('combobox', { name: 'Category' }));
+        const list = container.querySelector('ul');
+        expect(list?.className).toContain('max-h-fixed-160px');
+        expect(list?.className).not.toContain('max-h-fixed-256px');
+    });
+
+    it('keeps the full list height by default', async () => {
+        const user = userEvent.setup();
+        const { container } = render(
+            <AccountCategoryPicker
+                accounts={CATS}
+                isEligible={isCategory}
+                valueId={null}
+                onChangeId={vi.fn()}
+                ariaLabel="Category"
+            />,
+        );
+        await user.click(screen.getByRole('combobox', { name: 'Category' }));
+        expect(container.querySelector('ul')?.className).toContain('max-h-fixed-256px');
+    });
+});
+
+describe('onOpenChange', () => {
+    it('does not fire on mount, only on a real open', async () => {
+        // A container that scrolls itself on every notification would jump on
+        // first render. A picker that has never been opened has not "closed".
+        const onOpenChange = vi.fn();
+        const user = userEvent.setup();
+        render(
+            <AccountCategoryPicker
+                accounts={CATS}
+                isEligible={isCategory}
+                valueId={null}
+                onChangeId={vi.fn()}
+                ariaLabel="Category"
+                onOpenChange={onOpenChange}
+            />,
+        );
+        expect(onOpenChange).not.toHaveBeenCalled();
+
+        await user.click(screen.getByRole('combobox', { name: 'Category' }));
+        expect(onOpenChange).toHaveBeenCalledWith(true);
+    });
+
+    it('reports the close too', async () => {
+        const onOpenChange = vi.fn();
+        const user = userEvent.setup();
+        render(
+            <AccountCategoryPicker
+                accounts={CATS}
+                isEligible={isCategory}
+                valueId={null}
+                onChangeId={vi.fn()}
+                ariaLabel="Category"
+                onOpenChange={onOpenChange}
+            />,
+        );
+        const box = screen.getByRole('combobox', { name: 'Category' });
+        await user.click(box);
+        onOpenChange.mockClear();
+        await user.keyboard('{Escape}');
+        expect(onOpenChange).toHaveBeenCalledWith(false);
+    });
+});

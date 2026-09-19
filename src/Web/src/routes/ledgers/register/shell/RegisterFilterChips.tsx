@@ -1,3 +1,6 @@
+import { useMemo } from 'react';
+
+import { buildAccountPathMap } from '@/lib/accountPath';
 import { isRegisterFilterActive, type RegisterFilterArgs } from '@/lib/api/register';
 import type { AccountSummary, SecuritySummary } from '@/lib/types';
 
@@ -14,8 +17,12 @@ type ChipDim = 'search' | 'dateFrom' | 'amountMin' | 'categoryId' | 'tag' | 'sec
 export interface RegisterFilterChipsProps {
     filter: RegisterFilterArgs;
     onChange: (next: RegisterFilterArgs) => void;
-    /** Categories — resolves the category chip's id → name. */
-    categories: readonly AccountSummary[];
+    /** EVERY account in the ledger — resolves the counterparty chip's id → path.
+     *  Not just the categories: on a CATEGORY register the counterparty is a
+     *  money account, and a list of categories could not name it. */
+    accounts: readonly AccountSummary[];
+    /** What the other side of a posting is here; labels the chip. */
+    counterpartyKind?: 'category' | 'account';
     /** Securities — resolves the security chip's id → ticker/name. */
     securities?: readonly SecuritySummary[];
     /** Total matching entries when a filter is active; null hides the count. */
@@ -25,13 +32,31 @@ export interface RegisterFilterChipsProps {
 export function RegisterFilterChips({
     filter,
     onChange,
-    categories,
+    accounts,
     securities,
     resultCount,
+    counterpartyKind = 'category',
 }: RegisterFilterChipsProps) {
+    // Hooks before the early return — Rules of Hooks.
+    const categoryPaths = useMemo(() => buildAccountPathMap(accounts), [accounts]);
+
     if (!isRegisterFilterActive(filter)) return null;
 
-    const categoryName = (id?: string) => categories.find((c) => c.id === id)?.name ?? id;
+    // FULL PATH, not the leaf. This chip is the only thing on screen telling you
+    // which of two same-named categories the register is filtered to, and a real
+    // ledger has several such pairs — two "Food", two "Loan", two "Automobile"
+    // under different parents.
+    //
+    // The fallback is a placeholder rather than the raw id it used to print: an
+    // inactive or deleted category is absent from `categories`, and a UUID in a
+    // chip is not an answer to "what am I filtered to". The chip is still
+    // removable, which is what the user actually needs from it.
+    const categoryName = (id?: string) => {
+        if (id === undefined) return undefined;
+        return categoryPaths.get(id)
+            ?? accounts.find((c) => c.id === id)?.name
+            ?? `Unknown ${counterpartyKind}`;
+    };
     const securityLabel = (id?: string) => {
         const s = securities?.find((x) => x.id === id);
         return s ? (s.ticker ?? s.name) : id;
@@ -43,7 +68,10 @@ export function RegisterFilterChips({
         chips.push({ dim: 'dateFrom', label: `${filter.dateFrom ?? '…'} – ${filter.dateTo ?? '…'}` });
     if (filter.amountMin !== undefined || filter.amountMax !== undefined)
         chips.push({ dim: 'amountMin', label: `$${filter.amountMin ?? '0'} – $${filter.amountMax ?? '∞'}` });
-    if (filter.categoryId) chips.push({ dim: 'categoryId', label: `Category: ${categoryName(filter.categoryId)}` });
+    if (filter.categoryId) {
+        const what = counterpartyKind === 'account' ? 'Account' : 'Category';
+        chips.push({ dim: 'categoryId', label: `${what}: ${categoryName(filter.categoryId)}` });
+    }
     if (filter.tag) chips.push({ dim: 'tag', label: `Tag: ${filter.tag}` });
     if (filter.securityId) chips.push({ dim: 'securityId', label: `Security: ${securityLabel(filter.securityId)}` });
 
@@ -54,6 +82,9 @@ export function RegisterFilterChips({
     };
     // Clear-all resets every user dimension; status/today are added back by the
     // controller, so an empty object is the correct "no user filter" state.
+    // It leaves the sub-category SCOPE alone — the page only re-reads that key
+    // when it is explicitly present — because "clear the filters" should not
+    // silently change which register you are looking at.
     const clearAll = () => onChange({});
 
     return (

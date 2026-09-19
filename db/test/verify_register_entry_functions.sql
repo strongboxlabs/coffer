@@ -153,12 +153,13 @@ DECLARE
 BEGIN
     SELECT group_id INTO v_expected_group FROM regfn_state;
 
-    -- Mig 166 signature: (account, ledger, cursor_entry_key, cursor_seq,
-    -- direction, limit, …) — the trailing sort/filter params default, so
-    -- 6 positional args exercise the plain register.
+    -- Mig 226 signature: (accountS, ledger, cursor_entry_key, cursor_seq,
+    -- direction, limit, …) — the first argument is a uuid[] since a category
+    -- register scopes to a whole subtree. The trailing sort/filter params
+    -- default, so 6 positional args exercise the plain register.
     SELECT COUNT(*) INTO v_count
     FROM register_entry_keys(
-        'aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa',
+        ARRAY['aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa']::UUID[],
         'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa',
         NULL::UUID, NULL::BIGINT, 'before', 100);
     IF v_count <> 6 THEN
@@ -170,7 +171,7 @@ BEGIN
     -- First entry (DESC by posted_at) is the 2026-05-15 group.
     SELECT entry_key INTO v_top_key
     FROM register_entry_keys(
-        'aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa',
+        ARRAY['aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa']::UUID[],
         'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa',
         NULL::UUID, NULL::BIGINT, 'before', 1);
     IF v_top_key <> v_expected_group THEN
@@ -209,7 +210,7 @@ BEGIN
         FOR r IN
             SELECT posted_at, seq, entry_key
             FROM register_entry_keys(
-                'aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa',
+                ARRAY['aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa']::UUID[],
                 'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa',
                 v_cursor_entry_key, v_cursor_seq, 'before', 2)
         LOOP
@@ -235,7 +236,7 @@ BEGIN
 END $$;
 
 -- ---------------------------------------------------------------------------
--- Test 3: NULL p_account_id (ledger-wide) scopes to the right ledger
+-- Test 3: NULL p_account_ids (ledger-wide) scopes to the right ledger
 -- via the EXISTS-on-accounts predicate. ADR-0036: entry_key
 -- derivation is asymmetric — originating-side rows (account is
 -- touched by every posting of the header) bucket under header_id;
@@ -262,7 +263,7 @@ DECLARE
 BEGIN
     SELECT COUNT(*) INTO v_count
     FROM register_entry_keys(
-        NULL,
+        NULL::UUID[],
         'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa',
         NULL::UUID, NULL::BIGINT, 'before', 100);
     IF v_count <> 9 THEN
@@ -289,7 +290,7 @@ DECLARE
 BEGIN
     SELECT COUNT(DISTINCT header_id) INTO v_all
     FROM register_filtered_entries(
-        'aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa',
+        ARRAY['aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa']::UUID[],
         'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa', FALSE);
     IF v_all <> 6 THEN
         RAISE EXCEPTION
@@ -298,7 +299,7 @@ BEGIN
 
     SELECT COUNT(DISTINCT header_id) INTO v_search
     FROM register_filtered_entries(
-        'aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa',
+        ARRAY['aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa']::UUID[],
         'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa', FALSE, 'split-test');
     IF v_search <> 1 THEN
         RAISE EXCEPTION
@@ -307,11 +308,64 @@ BEGIN
 
     SELECT COUNT(DISTINCT header_id) INTO v_amount
     FROM register_filtered_entries(
-        'aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa',
+        ARRAY['aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa']::UUID[],
         'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa', FALSE, NULL, NULL, NULL, 35);
     IF v_amount <> 3 THEN
         RAISE EXCEPTION
             'register_filtered_entries: amount_min=35 should match 3 headers, got %', v_amount;
+    END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- Test 5 (mig 226): the account scope is a SET. This is the thing the old
+-- scalar parameter could not say, and the reason a parent category's register
+-- was empty — its postings are all on its children, so no single account id
+-- names them.
+--
+-- The WALK from a parent to its descendants is the API's job
+-- (RegisterRepository.ResolveScopeAsync); what the function owes is that a
+-- multi-element array returns the UNION. Federal Tax and State Tax each appear
+-- on exactly one header — the split — and on 1 of its 3 postings, so each is a
+-- target-side entry keyed per leg (ADR-0036): 1 entry alone, 2 together.
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_one INT;
+    v_two INT;
+BEGIN
+    SELECT COUNT(*) INTO v_one
+    FROM register_entry_keys(
+        ARRAY['aaaaaaaa-3333-3333-3333-aaaaaaaaaaaa']::UUID[],
+        'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa',
+        NULL::UUID, NULL::BIGINT, 'before', 100);
+    IF v_one <> 1 THEN
+        RAISE EXCEPTION
+            'register_entry_keys: one category should see 1 entry, got %', v_one;
+    END IF;
+
+    SELECT COUNT(*) INTO v_two
+    FROM register_entry_keys(
+        ARRAY['aaaaaaaa-3333-3333-3333-aaaaaaaaaaaa',
+              'aaaaaaaa-4444-4444-4444-aaaaaaaaaaaa']::UUID[],
+        'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa',
+        NULL::UUID, NULL::BIGINT, 'before', 100);
+    IF v_two <> 2 THEN
+        RAISE EXCEPTION
+            'register_entry_keys: two categories should see 2 entries (the union), got %',
+            v_two;
+    END IF;
+
+    -- …and the shared filter primitive scopes identically, or the page and the
+    -- rail beneath it would disagree about which register they are showing.
+    SELECT COUNT(DISTINCT header_id) INTO v_two
+    FROM register_filtered_entries(
+        ARRAY['aaaaaaaa-3333-3333-3333-aaaaaaaaaaaa',
+              'aaaaaaaa-4444-4444-4444-aaaaaaaaaaaa']::UUID[],
+        'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa', FALSE);
+    IF v_two <> 1 THEN
+        RAISE EXCEPTION
+            'register_filtered_entries: both tax categories sit on ONE header, got %',
+            v_two;
     END IF;
 END $$;
 

@@ -731,4 +731,56 @@ public sealed class BulkTransactionsEndpointsTests
             });
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
     }
+
+    [Fact]
+    public async Task Select_all_on_a_rollup_category_covers_the_subtree_it_displays()
+    {
+        // The fourth consumer of the shared register filter (ADR-0076), and the
+        // only one that ACTS rather than displays. A select-all that ignored the
+        // sub-category scope would show the reader every descendant's rows and
+        // then hand a bulk delete the parent's own postings instead — of which a
+        // rollup parent has NONE. Wrong set, destructive verb, no error.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var bank = await ledger.AddBankAccountAsync("Checking");
+        var taxes = await ledger.AddCategoryAsync("Taxes");
+        var federal = await ledger.AddCategoryAsync("Federal", parentId: taxes.Id);
+        var medicare = await ledger.AddCategoryAsync("Medicare", parentId: federal.Id);
+
+        var when = new DateTime(2026, 4, 3, 0, 30, 0, DateTimeKind.Utc);
+        await ledger.AddTransactionPairAsync(bank.Id, federal.Id, -100m, when, payee: "fed");
+        await ledger.AddTransactionPairAsync(bank.Id, medicare.Id, -20m, when, payee: "medicare");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var url = $"/api/ledgers/{ledger.LedgerId}/transactions/selection-summary";
+        var selectedAt = new DateTime(2026, 12, 31, 0, 0, 0, DateTimeKind.Utc);
+
+        // Narrow: the parent holds nothing of its own.
+        var narrow = await client.PostAsJsonAsync(url, new
+        {
+            kind = "all",
+            accountId = taxes.Id,
+            statusFilter = "all",
+            selectedAt,
+            includeSubcategories = false,
+        });
+        Assert.Equal(HttpStatusCode.OK, narrow.StatusCode);
+        var narrowSummary = await narrow.Content.ReadFromJsonAsync<SelectionSummary>();
+        Assert.Equal(0, narrowSummary!.Count);
+
+        // Widened: the same two entries the register itself shows, grandchild
+        // included — the walk is not one level deep.
+        var wide = await client.PostAsJsonAsync(url, new
+        {
+            kind = "all",
+            accountId = taxes.Id,
+            statusFilter = "all",
+            selectedAt,
+            includeSubcategories = true,
+        });
+        Assert.Equal(HttpStatusCode.OK, wide.StatusCode);
+        var wideSummary = await wide.Content.ReadFromJsonAsync<SelectionSummary>();
+        Assert.Equal(2, wideSummary!.Count);
+    }
 }

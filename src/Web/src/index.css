@@ -187,6 +187,7 @@
     --spacing-fixed-256px: 16rem;
     --spacing-fixed-288px: 18rem;
     --spacing-fixed-320px: 20rem;
+    --spacing-fixed-344px: 21.5rem;
 }
 
 /*
@@ -204,6 +205,35 @@
 :root {
     color-scheme: light;
     font-feature-settings: "tnum" 1;
+}
+
+/*
+ * Money and quantity fields are `type="number"` for the decimal keypad on
+ * touch and for step/validation semantics — but the spin buttons that come
+ * with that are dead weight, and not only visually.
+ *
+ * Chrome lays ::-webkit-inner-spin-button out inside the input's editor even
+ * while it is transparent, so EVERY number input reserves ~13px on its right
+ * edge that its text can never use. On a right-aligned currency field that is
+ * 13px of invisible offset between the figure and the column heading above it,
+ * which is exactly the "looks not quite aligned" the splits grid showed — and
+ * the same offset exists on the single-posting amount field, the investment
+ * editor's quantity and price, and everywhere else the app asks for a number.
+ *
+ * Removing them costs nothing: arrow-key increment is a property of the input
+ * type, not of the buttons, so ↑/↓ still step the value. And nobody adjusts a
+ * paycheck line item by clicking a 13px arrow 47 times.
+ */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+    appearance: none;
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+input[type="number"] {
+    appearance: textfield;
+    -moz-appearance: textfield;
 }
 
 /*

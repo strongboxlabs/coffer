@@ -42,6 +42,12 @@ builder.Configuration.AddEnvironmentVariables(prefix: "COFFER_");
 // a configured-but-unreadable file rather than starting up passwordless.
 var dbPasswordOutcomes = DbPasswordResolver.ApplyTo(builder.Configuration);
 
+// Same layer, same two strings: pin the Postgres session timezone to UTC so
+// EXTRACT(YEAR/MONTH/DAY FROM posted_at) cannot depend on the server's default.
+// Unconditional — the password resolver above returns early when no password
+// file is configured, and this guarantee has to hold either way.
+var dbTimeZoneOutcomes = DbSessionTimeZone.ApplyTo(builder.Configuration);
+
 builder.Services
     .AddOptions<ApiOptions>()
     .Bind(builder.Configuration.GetSection(ApiOptions.SectionName))
@@ -498,6 +504,8 @@ builder.Services.AddScoped<InvitesRepository>();
 builder.Services.AddScoped<AccountsRepository>();
 builder.Services.AddScoped<AccountBalancesRepository>();
 builder.Services.AddScoped<OverviewRepository>();
+builder.Services.AddScoped<BudgetProgressRepository>();
+builder.Services.AddScoped<BudgetTargetsRepository>();
 builder.Services.AddScoped<ReportingRepository>();
 builder.Services.AddScoped<InvestmentReportingRepository>();
 builder.Services.AddScoped<AccountsReportingRepository>();
@@ -824,6 +832,18 @@ foreach (var outcome in dbPasswordOutcomes)
             outcome.Role == "coffer_app"
                 ? DbPasswordResolver.AppPasswordFileKey
                 : DbPasswordResolver.ServicePasswordFileKey);
+}
+
+// -- a deployment that set its OWN session timezone and just had it replaced.
+// Only ever logged when the two disagree: silently discarding a value someone
+// set on purpose is how a deliberate configuration becomes a mystery.
+foreach (var outcome in dbTimeZoneOutcomes.Where(o => o.OverriddenZone is not null))
+{
+    app.Logger.LogWarning(
+        "{Key} asked for the Postgres session timezone {Configured}; it has been overridden to {Pinned}. "
+        + "Reporting groups months and days by extracting date parts from timestamptz values, so the "
+        + "session zone decides which period a transaction falls in, and the app requires the pinned value.",
+        outcome.Key, outcome.OverriddenZone, DbSessionTimeZone.Zone);
 }
 
 // -- a freshly minted key (ADR-0092 D3). Said at Warning, not Information: on a
@@ -1281,6 +1301,7 @@ app.MapFeedConnectionsEndpoints();
 app.MapSyncRunsEndpoints();
 app.MapLedgerOperationsEndpoints();
 app.MapOverviewEndpoints();
+app.MapBudgetEndpoints();
 app.MapPreferencesEndpoints();
 app.MapTransactionsEndpoints();
 app.MapBalancesEndpoints();

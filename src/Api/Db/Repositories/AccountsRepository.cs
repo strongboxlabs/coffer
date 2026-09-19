@@ -687,8 +687,15 @@ public sealed class AccountsRepository
     }
 
     /// <summary>Counts moved by a (non-dry-run) merge, for the API / MCP echo.</summary>
+    /// <param name="BudgetTargetsMoved">Stored targets repointed to the destination
+    /// (ADR-0099). Summed where both sides held one for the same month.</param>
+    /// <param name="BudgetTargetsDropped">Targets on the source's children that had
+    /// to go because the destination already held one for that month — D1a allows a
+    /// target on a node or on its descendants, never both, and reparenting the
+    /// children under the destination is what creates the clash.</param>
     public sealed record MergeCategoryOutcome(
-        MergeCategoryResult Result, int TransactionsMoved, int ChildrenReparented);
+        MergeCategoryResult Result, int TransactionsMoved, int ChildrenReparented,
+        int BudgetTargetsMoved = 0, int BudgetTargetsDropped = 0);
 
     /// <summary>
     /// Merge category <paramref name="sourceId"/> into <paramref name="targetId"/>
@@ -727,8 +734,14 @@ public sealed class AccountsRepository
             return new MergeCategoryOutcome(MergeCategoryResult.NotCategory, 0, 0);
         if (source.IsSystem)
             return new MergeCategoryOutcome(MergeCategoryResult.SourceIsSystem, 0, 0);
-        if (source.CategoryKind != target.CategoryKind)
-            return new MergeCategoryOutcome(MergeCategoryResult.KindMismatch, 0, 0);
+        // Kinds MAY differ, deliberately (ADR-0017). This is now the only way to
+        // reclassify a category, so refusing a cross-kind merge would leave no way
+        // at all — and the alternative it used to push people towards, flipping the
+        // kind in place, is the strictly worse version of the same rewrite: no
+        // counts, no confirmation, no trail. Here the caller is told how many
+        // transactions and children move, and the source is deactivated rather than
+        // destroyed. KindMismatch is retained on the enum so an older client that
+        // still switches on it keeps compiling; nothing returns it.
 
         var txnCount = await _db.TxnLegs
             .Where(l => l.LedgerId == ledgerId && l.AccountId == sourceId)
@@ -759,6 +772,13 @@ public sealed class AccountsRepository
             })
             .ToListAsync(cancellationToken).ConfigureAwait(false);
 
+        // The source's children and everything under them, captured BEFORE the
+        // reparent below rewrites their parentage — afterwards the tree no longer
+        // says which nodes arrived, and these are exactly the ones that can newly
+        // collide with a target on the destination (ADR-0099 D1a).
+        var movedSubtree = await DescendantsOfChildrenAsync(ledgerId, sourceId, cancellationToken)
+            .ConfigureAwait(false);
+
         await using var tx = await _db.Database.BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
 
@@ -773,6 +793,9 @@ public sealed class AccountsRepository
             .Where(a => a.LedgerId == ledgerId && a.ParentId == sourceId)
             .ExecuteUpdateAsync(s => s.SetProperty(a => a.ParentId, (Guid?)targetId), cancellationToken)
             .ConfigureAwait(false);
+
+        var (targetsMoved, targetsDropped) = await MergeBudgetTargetsAsync(
+            ledgerId, sourceId, targetId, movedSubtree, cancellationToken).ConfigureAwait(false);
 
         // Deactivate the now-empty source (reversible; preserves the row).
         await _db.Accounts
@@ -791,7 +814,8 @@ public sealed class AccountsRepository
             moved.Select(m => m.HeaderId), cancellationToken).ConfigureAwait(false);
 
         await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
-        return new MergeCategoryOutcome(MergeCategoryResult.Ok, txnCount, childCount);
+        return new MergeCategoryOutcome(
+            MergeCategoryResult.Ok, txnCount, childCount, targetsMoved, targetsDropped);
     }
 
     /// <summary>Outcome of <see cref="DeleteCategoryAsync"/>.</summary>
@@ -841,9 +865,144 @@ public sealed class AccountsRepository
     }
 
     /// <summary>Outcome of <see cref="ReparentCategoryAsync"/>.</summary>
+    // -----------------------------------------------------------------------
+    // Budget targets under a moving tree (ADR-0099 D1a)
+    // -----------------------------------------------------------------------
+    //
+    // D1a: a target may sit on a node OR on its descendants, never both, so every
+    // subtree has exactly one authoritative mark and the budget hero's roots-only
+    // ceiling needs no special case. SetAsync enforces that on the write path; a
+    // merge and a reparent can each manufacture a violation out of two states that
+    // were individually legal, which is what these cover.
+    //
+    // They resolve it DIFFERENTLY, on purpose. A merge is an explicit instruction
+    // to treat two categories as one, so it repairs and reports. A reparent is a
+    // move, not a combine, and carries no such instruction, so it refuses rather
+    // than silently discarding a number somebody typed.
+
+    /// <summary>Every descendant of this category's CHILDREN, inclusive of those
+    /// children — the subtree a reparent drags along, minus the node itself.
+    /// <see cref="CategoryTree.DescendantsAsync"/> does the walk.</summary>
+    private async Task<HashSet<Guid>> DescendantsOfChildrenAsync(
+        Guid ledgerId, Guid parentId, CancellationToken cancellationToken) =>
+        await CategoryTree
+            .DescendantsAsync(_db, ledgerId, parentId, includeRoot: false, cancellationToken)
+            .ConfigureAwait(false);
+
+    /// <summary>
+    /// Repoint the source's targets onto the destination, then drop any target in
+    /// the arriving subtree that the destination now covers.
+    /// </summary>
+    /// <remarks>
+    /// SUMMED on collision, not "destination wins". The merge repoints every leg
+    /// with NO date predicate, so the destination's ACTUALS for months long past
+    /// grow by the source's spend the instant it commits; leaving the mark
+    /// unchanged would make each of those months read as newly over budget for a
+    /// reason the user never chose. Summing keeps the comparison proportionate.
+    /// It does mutate a number ADR-0099 D2 calls frozen, and that is justified as
+    /// a new explicit instruction to treat the two categories as one, not as
+    /// history drifting on its own.
+    /// </remarks>
+    private async Task<(int Moved, int Dropped)> MergeBudgetTargetsAsync(
+        Guid ledgerId, Guid sourceId, Guid targetId,
+        IReadOnlySet<Guid> arrivingSubtree, CancellationToken cancellationToken)
+    {
+        var sourceTargets = await _db.BudgetTargets
+            .Where(t => t.LedgerId == ledgerId && t.CategoryId == sourceId)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var destTargets = await _db.BudgetTargets
+            .Where(t => t.LedgerId == ledgerId && t.CategoryId == targetId)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+
+        var destByMonth = destTargets.ToDictionary(t => t.TargetMonth);
+        var now = DateTime.UtcNow;
+
+        foreach (var src in sourceTargets)
+        {
+            if (destByMonth.TryGetValue(src.TargetMonth, out var dest))
+            {
+                dest.Amount += src.Amount;
+                dest.UpdatedAt = now;
+                _db.BudgetTargets.Remove(src);
+            }
+            else
+            {
+                src.CategoryId = targetId;
+                src.UpdatedAt = now;
+                destByMonth[src.TargetMonth] = src;
+            }
+        }
+
+        // The destination now speaks for the arriving children, so any target they
+        // hold in a month the destination also covers is a D1a violation the merge
+        // itself created. The ancestor wins, matching the bulk-fill rule; the count
+        // comes back so the caller can say so rather than lose it silently.
+        var dropped = 0;
+        if (arrivingSubtree.Count > 0 && destByMonth.Count > 0)
+        {
+            var months = destByMonth.Keys.ToList();
+            var ids = arrivingSubtree.ToList();
+            var clashes = await _db.BudgetTargets
+                .Where(t => t.LedgerId == ledgerId
+                            && ids.Contains(t.CategoryId)
+                            && months.Contains(t.TargetMonth))
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            _db.BudgetTargets.RemoveRange(clashes);
+            dropped = clashes.Count;
+        }
+
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return (sourceTargets.Count, dropped);
+    }
+
+    /// <summary>
+    /// True when moving this category under a new parent would put a target under
+    /// another for the same month, in either direction.
+    /// </summary>
+    private async Task<bool> ReparentWouldClashAsync(
+        Guid ledgerId, Guid categoryId, Guid newParentId, CancellationToken cancellationToken)
+    {
+        var tree = await _db.Accounts.AsNoTracking()
+            .Where(a => a.LedgerId == ledgerId && a.AccountType == "category")
+            .Select(a => new { a.Id, a.ParentId })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var parentOf = tree.ToDictionary(t => t.Id, t => t.ParentId);
+
+        // The destination chain: the new parent and everything above it.
+        var above = new HashSet<Guid>();
+        Guid? cursor = newParentId;
+        while (cursor is Guid node && above.Count < 64)
+        {
+            if (!above.Add(node)) break;
+            cursor = parentOf.TryGetValue(node, out var p) ? p : null;
+        }
+
+        // The moving tree: the node and everything under it.
+        var below = await DescendantsOfChildrenAsync(ledgerId, categoryId, cancellationToken)
+            .ConfigureAwait(false);
+        below.Add(categoryId);
+
+        var aboveIds = above.ToList();
+        var aboveMonths = await _db.BudgetTargets.AsNoTracking()
+            .Where(t => t.LedgerId == ledgerId && aboveIds.Contains(t.CategoryId))
+            .Select(t => t.TargetMonth)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        if (aboveMonths.Count == 0) return false;
+
+        var belowIds = below.ToList();
+        return await _db.BudgetTargets.AsNoTracking()
+            .AnyAsync(t => t.LedgerId == ledgerId
+                           && belowIds.Contains(t.CategoryId)
+                           && aboveMonths.Contains(t.TargetMonth), cancellationToken)
+            .ConfigureAwait(false);
+    }
+
     public enum ReparentCategoryResult
     {
         Ok, NotInLedger, NotCategory, IsSystem, ParentNotCategory, WouldCycle, SameParent,
+        /// <summary>The move would put a budget target under another for the same
+        /// month, which ADR-0099 D1a forbids.</summary>
+        BudgetTargetConflict,
     }
 
     /// <summary>
@@ -888,6 +1047,13 @@ public sealed class AccountsRepository
                     .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
             }
         }
+
+        // ADR-0099 D1a, checked on the DRY RUN too: a dry run that answered Ok and
+        // then failed for real would be worse than having no dry run at all.
+        if (newParentId is Guid dest
+            && await ReparentWouldClashAsync(ledgerId, categoryId, dest, cancellationToken)
+                .ConfigureAwait(false))
+            return ReparentCategoryResult.BudgetTargetConflict;
 
         if (dryRun) return ReparentCategoryResult.Ok;
 
@@ -939,7 +1105,7 @@ public sealed class AccountsRepository
         if (isCategory)
         {
             categoryKind = request.CategoryKind?.Trim();
-            if (categoryKind is not ("income" or "expense"))
+            if (categoryKind is not ("income" or "expense" or "adjustment"))
                 return new(CreateAccountFailure.CategoryKindInvalid, null);
         }
         else if (!string.IsNullOrWhiteSpace(request.CategoryKind))
@@ -1112,6 +1278,8 @@ public sealed class AccountsRepository
     {
         Ok, NotInLedger, IsSystem, PatchEmpty, NameRequired, CategoryKindInvalid, CurrencyInvalid,
         OpeningBalanceInvalid, LoanTermsInvalid, LoanTermsNotAllowed, TaxStatusInvalid,
+        /// <summary>The request tried to CHANGE the kind of an existing category.</summary>
+        CategoryKindImmutable,
     }
 
     /// <summary>
@@ -1176,7 +1344,25 @@ public sealed class AccountsRepository
         {
             if (cur.AccountType != "category") return UpdateAccountResult.CategoryKindInvalid;
             var k = request.CategoryKind.Trim();
-            if (k is not ("income" or "expense")) return UpdateAccountResult.CategoryKindInvalid;
+            if (k is not ("income" or "expense" or "adjustment"))
+                return UpdateAccountResult.CategoryKindInvalid;
+
+            // A category's kind is IMMUTABLE (ADR-0017). Changing it does not edit a
+            // label: it retroactively moves every posting in that category between
+            // the Spending and Income measures — silently, with no record, and for
+            // history going back as far as the ledger does. Until now this was the
+            // one unguarded path to that, reachable by touching a dropdown, while
+            // the SAFE route (merge into a category of the wanted kind) was the one
+            // the code refused.
+            //
+            // Reclassification now has exactly one mechanism, and it is the one that
+            // already existed: create a category of the wanted kind, merge this one
+            // into it, and the merge states what moves and can be undone by
+            // reactivating the source.
+            //
+            // Equal is not a change. The account editor sends this field on every
+            // save, so refusing a no-op would make a category impossible to rename.
+            if (k != cur.CategoryKind) return UpdateAccountResult.CategoryKindImmutable;
             categoryKind = k;
         }
 

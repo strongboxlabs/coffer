@@ -348,6 +348,20 @@ public sealed class SelectionRequest
     public Guid? SecurityId { get; init; }
     public string? Tag { get; init; }
     public Guid? CategoryId { get; init; }
+
+    /// <summary>
+    /// The register was widened to the category's DESCENDANTS (mig 226), so the
+    /// selection must be too.
+    /// </summary>
+    /// <remarks>
+    /// This is the fourth consumer of the shared register filter (ADR-0076),
+    /// and the one that must not drift: the other three only DISPLAY. A
+    /// select-all that ignored this would show the reader 6,000 rows from a
+    /// category's sub-categories and then hand a bulk delete a different,
+    /// nearly-empty set — the parent's own postings, of which a rollup parent
+    /// has none.
+    /// </remarks>
+    public bool IncludeSubcategories { get; init; }
 }
 
 /// <summary>

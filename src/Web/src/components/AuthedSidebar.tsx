@@ -20,6 +20,7 @@ import {
     Settings,
     ShieldCheck,
     Tag,
+    Target,
     Wallet,
     type LucideIcon,
 } from 'lucide-react';
@@ -459,6 +460,7 @@ export function AuthedSidebar() {
                     <div className="mb-1 space-y-px">
                         {([
                             { to: '/ledgers/$ledgerId', label: 'Overview', icon: LayoutDashboard, suffix: '' },
+                            { to: '/ledgers/$ledgerId/budget', label: 'Budget', icon: Target, suffix: '/budget' },
                             { to: '/ledgers/$ledgerId/accounts', label: 'Accounts', icon: Wallet, suffix: '/accounts', exact: true },
                             { to: '/ledgers/$ledgerId/categories', label: 'Categories', icon: FolderTree, suffix: '/categories' },
                             { to: '/ledgers/$ledgerId/tags', label: 'Tags', icon: Tag, suffix: '/tags' },

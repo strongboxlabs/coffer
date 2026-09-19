@@ -47,6 +47,14 @@ public sealed class AppUserDbConnectionInterceptor : DbConnectionInterceptor
         ConnectionEndEventData eventData,
         CancellationToken cancellationToken = default)
     {
+        // The session timezone is NOT set here. It is pinned declaratively on
+        // the connection string itself (DbSessionTimeZone), which travels in
+        // Npgsql's startup packet and so applies before a connection can run
+        // anything — including on the unauthenticated path below, which still
+        // issues queries. An interceptor SET would have meant raw SQL in
+        // src/Api (banned by ADR-0005) and a second copy to keep in step in the
+        // test fixture's own interceptor.
+
         if (!_currentUser.IsAuthenticated)
         {
             // No user resolved yet → leave app.user_id unset. RLS

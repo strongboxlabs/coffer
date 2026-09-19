@@ -112,11 +112,21 @@ Fee. `SecurityField` keeps its own picker (it's over securities,
 not accounts, and already shows-all + holdings-prioritize +
 create-new).
 
-**Not** adopted yet: the bank register's `TxnRowEdit` counterparty
-picker. It uses a bespoke `counterpartyText` + `resolveCounterpartyId`
-flow with careful system-account round-trip handling; reworking it
-to id-based selection is invasive and deserves its own focused
-change. Tracked in `follow-ups.md`.
+**Adopted everywhere as of 2026-09-15.** The bank register's `TxnRowEdit` was
+the last holdout — it used a bespoke `counterpartyText` +
+`resolveCounterpartyId` flow with careful system-account round-trip handling,
+and neither symbol exists anywhere in `src/` any more. Both the single-posting
+branch and every leg of a split now use this picker, and the system-account
+round-trip it worked around is handled by the picker's own rule: the displayed
+name comes from the FULL accounts map, so a system-account counterparty (the
+bank-feed sync stamps incoming rows with Uncategorized) still round-trips even
+though it is not offered for a fresh pick.
+
+Two props were added for the splits grid (2026-09-16), both additive:
+`invalid` marks the control without the message `error` renders below it —
+which would push a leg row past the grid's fixed height budget — and
+`onOpenChange` lets a short container bring the input to the top of its
+scrollport so the panel has somewhere to open into.
 
 ## Consequences
 

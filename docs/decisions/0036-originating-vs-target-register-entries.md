@@ -23,7 +23,7 @@ account's perspective the same header appears differently:
 The previous register-entry assembly buckets every multi-posting
 header on every account into one entry keyed by `header_id`. That's
 right for originating-side rendering (bank register's
-"— N splits —" split-parent, investment register's collapse-to-one).
+collapsed split-parent, investment register's collapse-to-one).
 It's wrong for target-side accounts:
 
   - A paycheck split lands three transfer legs on a brokerage cash

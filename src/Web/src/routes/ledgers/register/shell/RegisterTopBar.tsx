@@ -12,6 +12,21 @@ interface RegisterTopBarProps {
      *  inactive accounts that aren't in the active-only list. Null → "Account". */
     accountName: string | null;
     /**
+     * Ancestor categories, root-first, EXCLUDING the account itself —
+     * non-null only when this register is a category's.
+     *
+     * A category isn't reached from the accounts list, so "Ledger /
+     * Groceries" leaves out both where it lives and that it's a category
+     * at all. Non-null turns the trail into
+     * `Ledger / Categories / Food / Groceries`: the same parent/child
+     * path notation used everywhere a category is shown outside a tree,
+     * except that here the breadcrumb's own separators do the joining and
+     * every segment is a link to that category's own register.
+     *
+     * Empty array = a root category (the Categories crumb, then the name).
+     */
+    categoryTrail?: ReadonlyArray<{ id: string; name: string }> | null;
+    /**
      * Optional per-page actions rendered to the right of the
      * breadcrumb (e.g. the bank-register Upload + Sync icons).
      * Multiple icons are common — pass them as a fragment; this
@@ -35,6 +50,7 @@ export function RegisterTopBar({
     ledgerId,
     ledger,
     accountName,
+    categoryTrail = null,
     actions,
 }: RegisterTopBarProps) {
     return (
@@ -55,6 +71,37 @@ export function RegisterTopBar({
                             'Ledger'
                         ),
                     },
+                    ...(categoryTrail !== null
+                        ? [
+                            {
+                                label: 'Categories',
+                                node: (
+                                    <Link
+                                        to="/ledgers/$ledgerId/categories"
+                                        params={{ ledgerId }}
+                                        className="hover:text-text"
+                                    >
+                                        Categories
+                                    </Link>
+                                ),
+                            },
+                            ...categoryTrail.map((ancestor) => ({
+                                label: ancestor.name,
+                                node: (
+                                    <Link
+                                        to="/ledgers/$ledgerId/accounts/$accountId"
+                                        params={{
+                                            ledgerId,
+                                            accountId: ancestor.id,
+                                        }}
+                                        className="hover:text-text"
+                                    >
+                                        {ancestor.name}
+                                    </Link>
+                                ),
+                            })),
+                        ]
+                        : []),
                     { label: accountName ?? 'Account' },
                 ]}
             />

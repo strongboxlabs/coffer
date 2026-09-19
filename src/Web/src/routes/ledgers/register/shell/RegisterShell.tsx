@@ -37,6 +37,13 @@ export interface RegisterShellProps {
      *  unmount mid-search (focus + local search text preserved) and neither
      *  register page can reintroduce the "search box blanks on refetch" drift
      *  (a filter change resets the window → initialLoaded flips false). */
+    /** The register belongs to a CATEGORY — no statements, no new-entry button. */
+    isCategory?: boolean;
+    /** …and it has children, so its own postings being empty is expected. */
+    hasSubcategories?: boolean;
+    /** The subtree is already in scope; see RegisterStates. */
+    subtreeIncluded?: boolean;
+    onIncludeSubcategories?: () => void;
     initialLoaded: boolean;
     initialError: unknown;
     isEmpty: boolean;
@@ -55,6 +62,10 @@ export function RegisterShell({
     initialError,
     isEmpty,
     filterActive,
+    isCategory,
+    hasSubcategories,
+    subtreeIncluded,
+    onIncludeSubcategories,
 }: RegisterShellProps) {
     return (
         <section
@@ -91,6 +102,10 @@ export function RegisterShell({
                 initialError={initialError}
                 isEmpty={isEmpty}
                 filterActive={filterActive}
+                isCategory={isCategory}
+                hasSubcategories={hasSubcategories}
+                subtreeIncluded={subtreeIncluded}
+                onIncludeSubcategories={onIncludeSubcategories}
             >
                 {children}
             </RegisterStates>

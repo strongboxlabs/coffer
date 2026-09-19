@@ -414,6 +414,135 @@ public sealed class PatchTransactionTests
     }
 
     [Fact]
+    public async Task Patch_rejects_two_postings_that_carry_the_same_legId()
+    {
+        // Before the guard this returned 200 and silently destroyed a posting:
+        // both items resolve to ONE tracked row, the last array position wins, the
+        // earlier one writes nothing, and the header ends up with fewer postings
+        // than the request listed plus a hole in posting_index — which then trips
+        // the `posting_index > 0` split detectors and the `posting_index = 0`
+        // canonical-leg lookup. Only a malformed client does this, but "malformed
+        // client" is not a reason to lose a user's data quietly.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var groceries = await ledger.AddCategoryAsync("groceries");
+        var toiletries = await ledger.AddCategoryAsync("toiletries");
+        var (originIds, headerId) = await ledger.AddMultiSplitAsync(
+            bank.Id,
+            new[] { (groceries.Id, -4m), (toiletries.Id, -3m) },
+            new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc));
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var response = await client.SendAsync(Patch(ledger.LedgerId, headerId,
+            new PatchTransactionRequest
+            {
+                Postings = new PatchTransactionPostings
+                {
+                    SourceAccountId = bank.Id,
+                    Items = new[]
+                    {
+                        new TransactionPosting
+                        {
+                            LegId = originIds[0],
+                            CounterpartyAccountId = groceries.Id,
+                            Amount = -4m,
+                        },
+                        // Same legId as above.
+                        new TransactionPosting
+                        {
+                            LegId = originIds[0],
+                            CounterpartyAccountId = toiletries.Id,
+                            Amount = -3m,
+                        },
+                    },
+                },
+            }));
+
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
+        var problem = await response.Content.ReadAsStringAsync();
+        Assert.Contains("transaction-posting-leg-id-duplicated", problem);
+
+        // And the transaction is untouched — a rejected reshape must not have
+        // partially applied.
+        await using var db = _fixture.NewDbContext();
+        var legs = await db.TxnLegs.AsNoTracking()
+            .Where(l => l.HeaderId == headerId)
+            .OrderBy(l => l.PostingIndex)
+            .ToListAsync();
+        Assert.Equal(4, legs.Count);
+        Assert.Equal(new[] { 0, 0, 1, 1 }, legs.Select(l => l.PostingIndex).ToArray());
+        Assert.Contains(originIds[1], legs.Select(l => l.Id));
+    }
+
+    [Fact]
+    public async Task Patch_compacts_posting_index_when_a_MIDDLE_posting_is_dropped()
+    {
+        // The existing drop test keeps the FIRST posting, which already sat at
+        // index 0 — so compaction was true by construction and nothing asserted
+        // it. A regression that preserved the survivors' original indexes would
+        // leave a hole at 1, and several readers key off `posting_index > 0`
+        // meaning "split" and `posting_index == 0` meaning "the canonical leg":
+        // a hole makes a split render as a single-row transaction, or the
+        // reverse. This pins the compaction AND the survivors' relative order.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var alpha = await ledger.AddCategoryAsync("alpha");
+        var bravo = await ledger.AddCategoryAsync("bravo");
+        var charlie = await ledger.AddCategoryAsync("charlie");
+        var (originIds, headerId) = await ledger.AddMultiSplitAsync(
+            bank.Id,
+            new[] { (alpha.Id, -4m), (bravo.Id, -3m), (charlie.Id, -2m) },
+            new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc));
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        // Drop the MIDDLE posting (bravo, index 1); keep alpha then charlie.
+        var response = await client.SendAsync(Patch(ledger.LedgerId, headerId,
+            new PatchTransactionRequest
+            {
+                Postings = new PatchTransactionPostings
+                {
+                    SourceAccountId = bank.Id,
+                    Items = new[]
+                    {
+                        new TransactionPosting
+                        {
+                            LegId = originIds[0],
+                            CounterpartyAccountId = alpha.Id,
+                            Amount = -4m,
+                        },
+                        new TransactionPosting
+                        {
+                            LegId = originIds[2],
+                            CounterpartyAccountId = charlie.Id,
+                            Amount = -2m,
+                        },
+                    },
+                },
+            }));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        await using var db = _fixture.NewDbContext();
+        var legs = await db.TxnLegs.AsNoTracking()
+            .Where(l => l.HeaderId == headerId)
+            .OrderBy(l => l.PostingIndex)
+            .ThenBy(l => l.Id)
+            .ToListAsync();
+
+        // Two postings, two legs each, indexes 0 and 1 — no hole where bravo was.
+        Assert.Equal(4, legs.Count);
+        Assert.Equal(new[] { 0, 0, 1, 1 }, legs.Select(l => l.PostingIndex).ToArray());
+        // ...and the survivors kept their relative order rather than being
+        // renumbered arbitrarily.
+        Assert.Equal(0, legs.Single(l => l.Id == originIds[0]).PostingIndex);
+        Assert.Equal(1, legs.Single(l => l.Id == originIds[2]).PostingIndex);
+        Assert.DoesNotContain(originIds[1], legs.Select(l => l.Id));
+    }
+
+    [Fact]
     public async Task Patch_with_postings_drops_existing_leg_overrides()
     {
         var seed = await SeedSingleAsync();

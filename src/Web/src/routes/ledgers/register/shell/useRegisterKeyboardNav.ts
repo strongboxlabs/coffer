@@ -141,10 +141,19 @@ export function useRegisterKeyboardNav<Row>({
             const tag = target?.tagName;
             // Text-like inputs (text/number/date/search/email) and
             // textareas own their own keyboard semantics — never
-            // hijack from them. Checkboxes and buttons don't grab
-            // Enter / N for anything useful, so we let our handler
-            // fire even when they're focused (this is what makes
+            // hijack from them. CHECKBOXES don't grab Enter / N for
+            // anything useful, so we let our handler fire even when
+            // one is focused (this is what makes
             // Enter-after-checkbox-click reliably open edit).
+            //
+            // BUTTONS are a different story, and this comment used to
+            // lump them in with checkboxes. A row carries two of them —
+            // the status-cycle control and the split-parent's expand
+            // toggle — and Enter is their NATIVE activation key, so
+            // letting the row handler fire as well means one keypress
+            // does two things: cycle the status AND open the editor, or
+            // toggle the split AND open the editor. See the Enter
+            // branch below, which now returns early for them.
             const isTextLikeInput =
                 tag === 'INPUT'
                 && (() => {
@@ -166,13 +175,28 @@ export function useRegisterKeyboardNav<Row>({
             } else if (e.key === 'Enter') {
                 if (isTypingTarget) return;
                 if (!enabled) return;
+                // Something nearer the event already claimed this Enter.
+                // An open ContextMenu activates its highlighted item with
+                // preventDefault and deliberately does NOT stop
+                // propagation, so without this the same keypress would
+                // also open the editor on whatever row is focused behind
+                // the menu.
+                if (e.defaultPrevented) return;
+                // A focused BUTTON is about to activate natively — the
+                // status-cycle control, or the split-parent's expand
+                // toggle. Its own action is the one the user asked for.
+                // `defaultPrevented` cannot catch this: native activation
+                // is the event's DEFAULT action and runs after every
+                // handler, so nothing has marked the event yet.
+                if (tag === 'BUTTON') return;
                 const currentId = focusedRowIdRef.current;
                 if (currentId === null) return;
                 // The page decides whether this row is editable and
                 // calls `e.preventDefault()` itself only when it
                 // actually opens edit — preserving the per-page
                 // originals, which left the default intact on
-                // non-editable focused rows (split-parent / target).
+                // non-editable focused rows (split legs, read-only
+                // target clusters).
                 onEnterRow(currentId, e);
             } else if (e.key === 'ArrowDown') {
                 if (isTypingTarget) return;

@@ -67,6 +67,15 @@ export type SelectionRequest =
           securityId?: string;
           tag?: string;
           categoryId?: string;
+          /**
+           * The register is widened to the category's DESCENDANTS (mig 226).
+           *
+           * The ninth dimension, and the one with teeth: the other eight only
+           * change what is LISTED, while dropping this one would hand a bulk
+           * delete a different set from the one on screen — a rollup parent's
+           * own postings, of which it has none.
+           */
+          includeSubcategories?: boolean;
       };
 
 /**

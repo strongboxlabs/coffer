@@ -41,8 +41,13 @@ public static class DbPasswordResolver
     /// <summary>Config key for the <c>coffer_service</c> password file.</summary>
     public const string ServicePasswordFileKey = "Api:ServicePasswordFile";
 
-    private const string AppConnectionKey = "Api:ConnectionString";
-    private const string ServiceConnectionKey = "Api:ServiceConnectionString";
+    /// <summary>Config key for the <c>coffer_app</c> connection string. Public
+    /// so <see cref="DbSessionTimeZone"/> pins the same two strings this
+    /// rewrites, rather than repeating the key names and drifting.</summary>
+    public const string AppConnectionKey = "Api:ConnectionString";
+
+    /// <summary>Config key for the <c>coffer_service</c> connection string.</summary>
+    public const string ServiceConnectionKey = "Api:ServiceConnectionString";
 
     /// <summary>What happened for one role, so startup can log it without
     /// touching the secret itself.</summary>

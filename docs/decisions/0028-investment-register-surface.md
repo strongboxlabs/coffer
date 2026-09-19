@@ -13,7 +13,7 @@ amount · balance). Investment accounts share the same scaffold but
 need a different surface because:
 
   - A single user-visible "event" maps to N postings (Buy+Fee
-    is 2 postings, DivXfr+Fee is 3). The bank's "— N splits —"
+    is 2 postings, DivXfr+Fee is 3). The bank's split-parent
     split-parent affordance is wrong here: the user thinks of a
     Buy as one row, not "buy plus fee, expand to see".
   - The Holdings sibling sub-account (ADR-0019) is structural
@@ -57,7 +57,7 @@ minimums so slot 6 keeps its real estate at narrow widths.
 The SPA's `investmentAggregator` collapses every multi-leg entry
 (`kind: 'group'`) on a brokerage register into a single synthesized
 `kind: 'txn'` row before `buildDisplayRows` runs. The split-parent
-code path (— N splits — / expand children) is never reached on the
+code path (collapsed split parent / expand children) is never reached on the
 brokerage register. Bank/credit/cash/asset/liability keep the
 split-parent affordance unchanged.
 

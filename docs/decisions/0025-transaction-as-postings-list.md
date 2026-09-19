@@ -140,6 +140,62 @@ below. No explicit `[+ Add posting]` button anywhere.
 `[Cancel] [Save]` to commit; save fires PATCH (with the postings
 reconcile) or POST (single shot).
 
+## Amendment, 2026-09-16 — the splits editor gets its own grid
+
+The postings-list MODEL above is unchanged and still exactly right: a
+transaction is a list of postings, N=1 is not a special case, and there is no
+convert-to-split path. What changed is how the list is drawn, and FOUR of the
+per-posting affordances specified above are now wrong. They are restated here
+rather than edited in place, so the reasoning that produced them stays legible.
+
+**The legs left the register's grid.** Leg rows used to ride the register's
+eight-column template so each field sat under its root counterpart. Columns 1-3
+were empty on every leg of every split, which forced the category picker to
+share one track with the per-posting tags slot and made a leg row ~62px tall. At the twenty-five splits this
+editor is meant to handle that is ~1,550px of form: the Save button recedes as
+you work down the split, and the running total scrolls off the top of the
+screen while you type the amounts it sums. The legs now have their own five
+columns — `# · Category+Tags · Memo · Amount · actions` — which fits a leg in
+30px and makes a fixed-height scroll viewport practical. The ROOT row still
+rides the register template, so the transaction's own Date / Payee / Amount stay
+aligned with the register behind it. See
+`src/Web/src/routes/ledgers/bank-edit/README.md` for the full reasoning.
+
+**The ghost row is gone, and with it "No explicit `[+ Add posting]` button
+anywhere."** That sentence above is now reversed, deliberately. The ghost row
+was the last element of the postings list, and once the list scrolls inside a
+fixed-height viewport the affordance for adding a posting scrolls away with it
+— on a 13-leg paycheck you would scroll to the bottom every time you wanted a
+fourteenth. Add now lives in the region's sticky footer, next to the running
+total, reachable at any scroll offset. The ghost-row pattern the original
+decision cites (spreadsheets, Notion, Airtable, Linear) assumes a list that
+grows the page; it does not survive a viewport.
+
+**The `⋮` drag handle is no longer at the left edge.** It sat in column 4, the
+register's CHECK# track, because the legs rode the register template. It now
+sits at the far right of the leg row, in the actions cell beside the defect
+marker and the row menu. It is the only per-posting affordance above that this
+amendment does not otherwise reverse, and therefore the one a reader would most
+reasonably have taken as still current.
+
+**`[−]` remove moved into a per-row menu**, alongside Move up / Move down. The
+actions column is 3.5rem and cannot hold three controls; the menu is also the
+visible path ADR-0021 Rule 10 prescribes, and it is what let reorder stop being
+drag-only.
+
+**Reorder is no longer drag-only.** HTML5 native drag stays — still no library
+— but there is no drag on touch and none at all from a keyboard, so Move up /
+Move down (Alt+↑ / Alt+↓) carry the same operation. The two paths use different
+mutators on purpose: a drop splices the row out and re-inserts it at the target
+index, which reads as "after you" dragging down and "before you" dragging up,
+and is therefore NOT "exactly one slot" in both directions. The keyboard path is
+a swap, which is.
+
+**Still true, and load-bearing:** no balance rule. The running total in the
+footer is informational, zero amounts are legal, and an "unbalanced" split is
+not an invalid one. Two test files pin the absence so a later change cannot
+quietly introduce one.
+
 ## Consequences
 
 **Positive**
@@ -148,10 +204,13 @@ reconcile) or POST (single shot).
   a postings list.
 - No "convert-to-split" code path. No "convert-to-single" code
   path. Both fall out of the same edit operation.
-- The SPA's `TxnRowEdit` is one component, one state shape, one
-  save handler — used by `+ New transaction`, double-click-row
-  edit, and (implicitly) by any future "edit splits"
-  affordance.
+- The SPA's `TxnRowEdit` is one state shape and one save handler —
+  used by `+ New transaction`, double-click-row edit, Enter on a
+  focused row, and the splits editor. *(2026-09-16: no longer one
+  COMPONENT. It is a 983-line shell over `bank-edit/` — the pure
+  tier, the draft hook and six field components. The state shape and
+  the single save handler, which are what this bullet was actually
+  claiming, both survived the decomposition intact.)*
 - Reorder (drag) is structurally trivial: the order of `items[]`
   in the request maps to `posting_index`, no separate "move
   posting" endpoint.

@@ -835,7 +835,6 @@ function renderField(key: FieldKey, p: FieldRenderProps) {
                     <CategoryField
                         accounts={p.accounts}
                         frequent={p.frequent}
-                        action={p.action}
                         valueId={p.draft.categoryAccountId}
                         onChangeId={p.setCategoryAccountId}
                         error={p.errors.category ?? null}

@@ -42,9 +42,15 @@ export function FeeField({
     feeAmount, onChangeFeeAmount, error, disabled, contextualHint,
 }: FeeFieldProps) {
     const amountId = useId();
+    // Kind is DISCLOSED, not filtered (ADR-0017). A fee is normally an expense
+    // category and the picker says so on every row, but what makes this leg a
+    // fee is its posting_role — stamped from the header, netted against return
+    // on the standard net-of-fees basis — not the kind of the category it faces.
+    // Filtering by kind here prevented nothing that matters and blocked
+    // categories a user may legitimately want, including the 'adjustment' kind
+    // added by mig 224.
     const isEligible = useCallback(
-        (a: AccountSummary) =>
-            a.isActive && a.accountType === 'category' && a.categoryKind === 'expense',
+        (a: AccountSummary) => a.isActive && a.accountType === 'category',
         [],
     );
     return (

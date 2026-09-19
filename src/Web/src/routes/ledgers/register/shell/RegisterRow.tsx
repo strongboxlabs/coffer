@@ -51,7 +51,7 @@ export type RegisterRowVariant = 'txn' | 'split-parent' | 'split-leg';
  *  split-parent) the expand control the strategy injects into its own
  *  category / description slot, exactly where each register currently
  *  puts it. */
-export interface RegisterRowBodyCtx {
+export interface RegisterRowBodyCtx<R = unknown> {
     variant: RegisterRowVariant;
     currency: string;
     today: Date;
@@ -65,6 +65,17 @@ export interface RegisterRowBodyCtx {
      *  may be absent while accounts load — strategies fall back to the
      *  leaf name via {@link displayAccountPath}. */
     accountPaths?: ReadonlyMap<string, string>;
+    /**
+     * The CATEGORY this register is a subtree rollup of, or null/absent when
+     * it isn't one.
+     *
+     * Widening a parent category's register to its descendants makes every
+     * row's own account vary, and nothing else on the row says which
+     * descendant it is: the category column holds the OTHER side (the bank
+     * account the money moved against). A row whose account isn't this one
+     * therefore names itself.
+     */
+    rollupRootId?: string | null;
     /** Present only for split-parent rows — the expand affordance the
      *  strategy renders in its category / description slot. */
     expand?: {
@@ -73,6 +84,26 @@ export interface RegisterRowBodyCtx {
         count: number;
         groupId: string;
     };
+    /** Split-parent rows only — every leg of the group, in leg order.
+     *
+     *  `row` on a split parent is a SYNTHESIZED representative carrying the
+     *  group's net amount and final balance, so it cannot answer "which
+     *  categories are in here": pairing `row.amount` with any one category
+     *  would attribute the whole paycheck to it. Per-leg figures come from
+     *  here and nowhere else.
+     *
+     *  Optional, and that is load-bearing — a required member would not
+     *  compile against the investment strategy, which annotates the bare
+     *  type. */
+    legs?: readonly R[];
+    /** The register's active category filter, when one is set.
+     *
+     *  The server filters at ENTRY level, so a category filter matches a
+     *  single LEG of a split and returns the whole group. Without this the
+     *  collapsed row cannot say which leg answered the filter — the
+     *  complaint that put a category summary here in the first place.
+     *  Optional for the same reason as `legs`. */
+    filterCategoryId?: string | null;
 }
 
 /** Context for a strategy's `containerAttrs` — the bits a per-register
@@ -113,7 +144,7 @@ export interface RegisterRowStrategy<R extends RegisterRowUnion> {
     ): { dataAttrs?: Record<string, string | number | boolean | undefined>; className?: string };
     /** Everything AFTER the shared lead: date ... amount ... balance,
      *  for all three variants via one internal switch. */
-    renderBody(row: R, ctx: RegisterRowBodyCtx): ReactNode;
+    renderBody(row: R, ctx: RegisterRowBodyCtx<R>): ReactNode;
 }
 
 interface RegisterRowProps<R extends RegisterRowUnion> {
@@ -187,6 +218,13 @@ interface RegisterRowProps<R extends RegisterRowUnion> {
      *  strategy's `renderBody` via `ctx.accountPaths` so category chips
      *  render their full parent→child chain. */
     accountPaths?: ReadonlyMap<string, string>;
+    /** Split-parent rows only — the group's legs, forwarded as `ctx.legs`.
+     *  See that member for why the `row` prop cannot stand in for them. */
+    legs?: readonly R[];
+    /** The active category filter id, forwarded as `ctx.filterCategoryId`. */
+    filterCategoryId?: string | null;
+    /** The rolled-up category's id, forwarded as `ctx.rollupRootId`. */
+    rollupRootId?: string | null;
 }
 
 /**
@@ -222,6 +260,9 @@ export function RegisterRow<R extends RegisterRowUnion>(
         title,
         expand,
         accountPaths,
+        legs,
+        filterCategoryId,
+        rollupRootId,
     } = props;
 
     const isLeg = variant === 'split-leg';
@@ -293,13 +334,16 @@ export function RegisterRow<R extends RegisterRowUnion>(
         (stateClassName ? stateClassName + ' ' : '') +
         (container.className ? container.className + ' ' : '') + bgClass;
 
-    const ctx: RegisterRowBodyCtx = {
+    const ctx: RegisterRowBodyCtx<R> = {
         variant,
         currency,
         today,
         isTargetSplit: readOnly,
         accountPaths,
         expand,
+        legs,
+        filterCategoryId,
+        rollupRootId,
     };
 
     return (

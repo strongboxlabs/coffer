@@ -14,7 +14,7 @@
          the assembly by the StampGitVersion target below and surfaced
          via GET /api/meta/version. We compose InformationalVersion
          ourselves, so suppress the SDK's automatic +<sha> append. -->
-    <Version>0.85.0</Version>
+    <Version>0.88.0</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 
@@ -57,9 +57,36 @@
       <Output TaskParameter="ExitCode" PropertyName="GitDateExit" />
     </Exec>
     <PropertyGroup>
-      <!-- A skipped Exec leaves its ExitCode empty, so the fallback must test
-           the VALUE rather than the exit code — otherwise a supplied sha would
-           be overwritten by "nogit" because '' != '0'. -->
+      <!-- THREE states, not two, and missing the third shipped a git error
+           message as the version string.
+
+           A skipped Exec (value supplied) leaves ExitCode EMPTY, so the
+           fallback cannot key on the exit code alone — '' != '0' would
+           overwrite a supplied sha with "nogit". That is why these tested the
+           VALUE. But an Exec that RAN AND FAILED leaves the value non-empty:
+           ConsoleToMSBuild captures git's own "fatal: not a git repository"
+           into the property, so the value test sees something and the fallback
+           never fires. The build then stamps
+
+               0.87.0+fatal: not a git repository (or any of the parent
+               directories): .git
+
+           as InformationalVersion, which VersionInfo splits on the first '+'
+           and the About panel renders as the commit — twice, since CommitDate
+           is the same text and its "have we got one" guard passes too.
+
+           This only became reachable when the sdk image started shipping git:
+           before that the Exec failed to START (no value captured, empty,
+           fallback fired), which is why the comment above described a
+           degradation that no longer happened. Local builds hit it because
+           .dockerignore excludes .git, so the build stage is not a repo.
+
+           So: clear the value when the Exec ran and failed, THEN apply the
+           empty-value fallback. A skipped Exec still has an empty ExitCode and
+           is untouched by the first condition, so a supplied value survives. -->
+      <GitCommitCount Condition="'$(GitCountExit)' != '' and '$(GitCountExit)' != '0'"></GitCommitCount>
+      <GitShortSha Condition="'$(GitShaExit)' != '' and '$(GitShaExit)' != '0'"></GitShortSha>
+      <GitCommitDate Condition="'$(GitDateExit)' != '' and '$(GitDateExit)' != '0'"></GitCommitDate>
       <GitCommitCount Condition="'$(GitCommitCount)' == ''">0</GitCommitCount>
       <GitShortSha Condition="'$(GitShortSha)' == ''">nogit</GitShortSha>
       <GitCommitDate Condition="'$(GitCommitDate)' == ''"></GitCommitDate>

@@ -133,6 +133,90 @@ public sealed class AccountsMutationTests
     }
 
     [Fact]
+    public async Task A_categorys_kind_cannot_be_changed_but_an_equal_value_is_a_no_op()
+    {
+        // ADR-0017. Flipping a kind does not edit a label — it retroactively moves
+        // every posting in the category between the spending and income totals, for
+        // as far back as the ledger goes, with no record. Until this rule it was the
+        // one UNGUARDED path to that rewrite, reachable by touching a dropdown,
+        // while the safe route (merge) was the one the code refused.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+        var cat = await ledger.AddCategoryAsync("Groceries", "expense");
+        var url = $"/api/ledgers/{ledger.LedgerId}/accounts/{cat.Id}";
+
+        var flip = await client.PatchAsJsonAsync(url,
+            new UpdateAccountRequest { CategoryKind = "income" });
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, flip.StatusCode);
+        Assert.Equal(BusinessError.Codes.CategoryKindImmutable, await ErrorCodeAsync(flip));
+
+        // ...and the refusal did not take.
+        var after = await client.GetFromJsonAsync<List<AccountSummary>>(
+            $"/api/ledgers/{ledger.LedgerId}/accounts?includeCategories=true");
+        Assert.Equal("expense", after!.Single(a => a.Id == cat.Id).CategoryKind);
+
+        // EQUAL IS NOT A CHANGE. The account editor sends this field on every save,
+        // so refusing a no-op would make a category impossible to rename — which is
+        // the obvious way to get this rule wrong.
+        var rename = await client.PatchAsJsonAsync(url,
+            new UpdateAccountRequest { Name = "Food shopping", CategoryKind = "expense" });
+        Assert.Equal(HttpStatusCode.NoContent, rename.StatusCode);
+    }
+
+    [Fact]
+    public async Task A_category_can_be_created_with_the_adjustment_kind()
+    {
+        // mig 224 widened the CHECK; this is the half that makes it reachable. The
+        // database accepted 'adjustment' before this and the API did not, so the
+        // kind existed and nobody could create one.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var created = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/accounts",
+            new CreateAccountRequest
+            {
+                Name = "Valuation adjustment", AccountType = "category", CategoryKind = "adjustment",
+            });
+
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        Assert.Equal("adjustment",
+            (await created.Content.ReadFromJsonAsync<AccountSummary>())!.CategoryKind);
+    }
+
+    [Fact]
+    public async Task A_merge_may_cross_kinds_because_it_is_the_only_way_to_reclassify()
+    {
+        // The mirror of the rule above. With the flip refused, refusing a cross-kind
+        // merge too would leave NO way to reclassify a category — including the case
+        // the adjustment kind exists for, a valuation entry mis-filed as an expense.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var bank = await ledger.AddBankAccountAsync("Checking");
+        var wrong = await ledger.AddCategoryAsync("Adjustment", "expense");
+        var right = await ledger.AddCategoryAsync("Valuation", "adjustment");
+        await ledger.AddTransactionPairAsync(
+            bank.Id, wrong.Id, -42_000m, new DateTime(2026, 4, 18, 0, 30, 0, DateTimeKind.Utc),
+            payee: "markup");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var merge = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/categories/{wrong.Id}/merge",
+            new MergeCategoryRequest(right.Id));
+
+        Assert.Equal(HttpStatusCode.OK, merge.StatusCode);
+
+        // The posting now belongs to the adjustment-kind category, which is what
+        // "reclassified" means here.
+        await using var db = _fixture.NewDbContext();
+        var moved = await db.TxnLegs.AsNoTracking()
+            .CountAsync(l => l.LedgerId == ledger.LedgerId && l.AccountId == right.Id);
+        Assert.Equal(1, moved);
+    }
+
+    [Fact]
     public async Task Create_rejects_blank_name_unknown_type_and_bad_currency()
     {
         var ledger = await SyntheticLedger.CreateAsync(_fixture);

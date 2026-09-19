@@ -9,6 +9,7 @@ import type { CategoryNode } from '@/lib/types';
 import { formatCurrency } from '@/lib/money';
 import { errorMessage } from '@/lib/errorMessage';
 import { cn } from '@/lib/cn';
+import { buildAccountPathMap } from '@/lib/accountPath';
 import { RowActionsButton } from '@/components/ui/RowActionsButton';
 import { Panel, PanelBody, PanelHead } from '@/components/ui/Panel';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
@@ -55,6 +56,15 @@ export function CategoriesPanel({ ledgerId }: { ledgerId: string }) {
     });
     const categories = useMemo(() => categoriesQuery.data ?? [], [categoriesQuery.data]);
     const accounts = useMemo(() => accountsQuery.data ?? [], [accountsQuery.data]);
+
+    // The TREE below keeps its bare leaf names — indentation is the answer there.
+    // These paths are for everything that leaves the tree: the confirm dialogs,
+    // and the tooltip and screen-reader label on each row. That label matters
+    // more than it looks: this panel is not an ARIA tree (no role="tree", no
+    // aria-level), so the indentation is purely visual and a screen reader gets
+    // no ancestry at all without it.
+    const categoryPaths = useMemo(() => buildAccountPathMap(accounts), [accounts]);
+    const pathOf = (node: CategoryNode) => categoryPaths.get(node.id) ?? node.name;
 
     // A category mutation ripples beyond the tree: names/active state feed
     // the register chips + pickers (accounts) and the register itself
@@ -117,7 +127,7 @@ export function CategoriesPanel({ ledgerId }: { ledgerId: string }) {
                     <Link
                         to="/ledgers/$ledgerId/accounts/$accountId"
                         params={{ ledgerId, accountId: node.id }}
-                        title={`Open the ${node.name} register`}
+                        title={`Open the ${pathOf(node)} register`}
                         className={cn(
                             'truncate text-sm hover:text-accent hover:underline',
                             !node.isActive && 'text-text-subtle line-through',
@@ -142,7 +152,7 @@ export function CategoriesPanel({ ledgerId }: { ledgerId: string }) {
                         that have no actions (system categories). */}
                     {actionable ? (
                         <RowActionsButton
-                            label={`Actions for ${node.name}`}
+                            label={`Actions for ${pathOf(node)}`}
                             onOpen={({ x, y }) => setMenu({ node, x, y })}
                         />
                     ) : (
@@ -246,6 +256,7 @@ export function CategoriesPanel({ ledgerId }: { ledgerId: string }) {
 
             {deleteTarget ? (
                 <DeleteCategoryConfirm
+                    path={pathOf(deleteTarget)}
                     node={deleteTarget}
                     isDeleting={deleteMut.isPending}
                     error={deleteMut.isError
@@ -325,9 +336,13 @@ function KindSection({
  *  empty, or an explain-and-redirect-to-merge when it's still in use
  *  (the server blocks the delete; the UI offers the path forward). */
 function DeleteCategoryConfirm({
-    node, isDeleting, error, onConfirmDelete, onMergeInstead, onCancel,
+    node, path, isDeleting, error, onConfirmDelete, onMergeInstead, onCancel,
 }: {
     node: CategoryNode;
+    /** Full Parent/Child path. A modal has no tree around it, and two
+     *  same-named leaves under different parents are indistinguishable by
+     *  leaf alone — on a DESTRUCTIVE confirm that is the worst place for it. */
+    path: string;
     isDeleting: boolean;
     error: string | null;
     onConfirmDelete: () => void;
@@ -341,7 +356,7 @@ function DeleteCategoryConfirm({
         <ConfirmDialog
             open
             variant={inUse ? 'neutral' : 'danger'}
-            title={inUse ? `Can’t delete “${node.name}”` : `Delete “${node.name}”?`}
+            title={inUse ? `Can’t delete “${path}”` : `Delete “${path}”?`}
             confirmLabel={inUse ? 'Merge instead…' : 'Delete'}
             isConfirming={isDeleting}
             body={

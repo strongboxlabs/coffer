@@ -1080,9 +1080,10 @@ export function InvestmentRegisterPage() {
                         isInvestment={isInvestment}
                         filter={filter}
                         onFilterChange={setFilter}
-                        categories={(accountsQuery.data ?? []).filter(
-                            (a) => a.accountType === 'category',
-                        )}
+                        // An investment account faces categories, like any
+                        // other money account; the picker applies eligibility
+                        // itself, so it wants the whole list.
+                        accounts={accountsQuery.data ?? []}
                         tags={tagsQuery.data ?? []}
                         securities={securitiesQuery.data ?? []}
                         resultCount={filterResultCount}

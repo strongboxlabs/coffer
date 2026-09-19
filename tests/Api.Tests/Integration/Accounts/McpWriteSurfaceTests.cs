@@ -87,7 +87,7 @@ public sealed class McpWriteSurfaceTests
     }
 
     [Fact]
-    public async Task Merge_guards_kind_mismatch_non_category_and_self()
+    public async Task Merge_allows_a_kind_change_but_still_guards_non_category_and_self()
     {
         var ledger = await SyntheticLedger.CreateAsync(_fixture);
         var bank = await ledger.AddBankAccountAsync("checking");
@@ -97,12 +97,21 @@ public sealed class McpWriteSurfaceTests
         await using var db = _fixture.NewDbContext();
         var repo = new AccountsRepository(db, new LegDerivedRecomputeService(db));
 
-        Assert.Equal(AccountsRepository.MergeCategoryResult.KindMismatch,
+        // A DIFFERENT KIND IS NOW ALLOWED (ADR-0017). This arm asserted
+        // KindMismatch, and the rule it pinned had the guards inverted: the
+        // cross-kind merge was refused while flipping a category's kind in place
+        // — the same reclassification, applied silently to the whole history with
+        // no counts and no way back — was unguarded. With the flip now refused,
+        // the merge is the only route and must stay open.
+        Assert.Equal(AccountsRepository.MergeCategoryResult.Ok,
             (await repo.MergeCategoryAsync(ledger.LedgerId, expense.Id, income.Id, false)).Result);
+
+        // The other two guards are untouched and still hold: they are about what
+        // a category IS, not about how it is classified.
         Assert.Equal(AccountsRepository.MergeCategoryResult.NotCategory,
-            (await repo.MergeCategoryAsync(ledger.LedgerId, bank.Id, expense.Id, false)).Result);
+            (await repo.MergeCategoryAsync(ledger.LedgerId, bank.Id, income.Id, false)).Result);
         Assert.Equal(AccountsRepository.MergeCategoryResult.SameCategory,
-            (await repo.MergeCategoryAsync(ledger.LedgerId, expense.Id, expense.Id, false)).Result);
+            (await repo.MergeCategoryAsync(ledger.LedgerId, income.Id, income.Id, false)).Result);
     }
 
     [Fact]
@@ -311,6 +320,76 @@ public sealed class McpWriteSurfaceTests
         Assert.Contains("Dining", catNames);
         Assert.Contains("Target", catNames);
         Assert.DoesNotContain("Groceries", catNames);
+    }
+
+    [Fact]
+    public async Task SetSplitPostingCategory_leaves_the_other_postings_in_their_original_order()
+    {
+        // Recategorizing rebuilds the FULL posting set and hands it to PatchAsync,
+        // which renumbers posting_index from array position. So the order of the
+        // list this repository builds IS the user's split order — and it used to be
+        // built from a leg read with no ORDER BY, which Postgres does not order for
+        // you. Recategorizing one line of a 14-line paycheck split could silently
+        // reshuffle the other 13, in the register and in the editor.
+        //
+        // HONEST LIMIT: whether this test FAILS without the fix depends on the heap
+        // order a seq scan happens to return, so it is a regression guard on the
+        // invariant rather than a proof of the bug. The two sequential calls make a
+        // permutation likelier (each rewrites every leg, moving rows in the heap),
+        // but the assertion is the point: the arrangement the user made survives.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var alpha = await ledger.AddCategoryAsync("Alpha", "expense");
+        var bravo = await ledger.AddCategoryAsync("Bravo", "expense");
+        var charlie = await ledger.AddCategoryAsync("Charlie", "expense");
+        var delta = await ledger.AddCategoryAsync("Delta", "expense");
+        var echo = await ledger.AddCategoryAsync("Echo", "expense");
+        var midway = await ledger.AddCategoryAsync("Midway", "expense");
+        var arrived = await ledger.AddCategoryAsync("Arrived", "expense");
+
+        var (_, headerId) = await ledger.AddMultiSplitAsync(
+            bank.Id,
+            new[] { (alpha.Id, 10m), (bravo.Id, 20m), (charlie.Id, 30m), (delta.Id, 40m), (echo.Id, 50m) },
+            Utc(9));
+
+        // Move the MIDDLE posting twice, so every leg gets rewritten both times.
+        await using (var db = _fixture.NewDbContext())
+        {
+            Assert.Equal(
+                TransactionsRepository.SplitPostingRecategorizeResult.Ok,
+                (await new TransactionsRepository(db).RecategorizeSplitPostingsAsync(
+                    ledger.LedgerId, headerId, charlie.Id, midway.Id, dryRun: false)).Result);
+        }
+        await using (var db = _fixture.NewDbContext())
+        {
+            Assert.Equal(
+                TransactionsRepository.SplitPostingRecategorizeResult.Ok,
+                (await new TransactionsRepository(db).RecategorizeSplitPostingsAsync(
+                    ledger.LedgerId, headerId, midway.Id, arrived.Id, dryRun: false)).Result);
+        }
+
+        await using var read = _fixture.NewDbContext();
+        var ordered = await (
+            from l in read.TxnLegs
+            join a in read.Accounts on l.AccountId equals a.Id
+            where l.HeaderId == headerId && a.AccountType == "category"
+            orderby l.PostingIndex
+            select a.Name).ToListAsync();
+
+        // Only the third posting changed category; positions 1, 2, 4 and 5 are where
+        // the user left them.
+        Assert.Equal(new[] { "Alpha", "Bravo", "Arrived", "Delta", "Echo" }, ordered);
+
+        // And the amounts still line up with their postings — a permutation that
+        // happened to preserve the category sequence would still be caught here.
+        // The category leg carries the negation of the seeded (source-side) amount.
+        var amounts = await (
+            from l in read.TxnLegs
+            join a in read.Accounts on l.AccountId equals a.Id
+            where l.HeaderId == headerId && a.AccountType == "category"
+            orderby l.PostingIndex
+            select l.Amount).ToListAsync();
+        Assert.Equal(new[] { -10m, -20m, -30m, -40m, -50m }, amounts);
     }
 
     [Fact]

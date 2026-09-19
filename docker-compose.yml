@@ -155,6 +155,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # .git is dockerignored, so the build stage is not a repo and cannot
+      # work its own commit out. CI passes these from the tagged commit; for a
+      # local build scripts/dev-up-docker.sh exports them from the host. Unset
+      # is fine and means exactly what it says — the image reports "nogit"
+      # rather than pretending to know.
+      args:
+        SOURCE_COMMIT_SHA: ${SOURCE_COMMIT_SHA:-}
+        SOURCE_COMMIT_COUNT: ${SOURCE_COMMIT_COUNT:-}
+        SOURCE_COMMIT_DATE: ${SOURCE_COMMIT_DATE:-}
     container_name: ${COFFER_CONTAINER_PREFIX:-coffer}-api
     depends_on:
       postgres:

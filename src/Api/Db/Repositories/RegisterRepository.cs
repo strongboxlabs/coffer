@@ -29,7 +29,18 @@ public sealed record RegisterFilter(
     string? Tag = null,
     Guid? CategoryId = null,
     string? Status = null,
-    DateOnly? Today = null)
+    DateOnly? Today = null,
+    /// <summary>
+    /// Include the account's DESCENDANTS as well as the account itself. Only
+    /// meaningful for a category, which is the only account type with a tree.
+    /// </summary>
+    /// <remarks>
+    /// A parent category's own register is empty — every posting sits on its
+    /// children — so without this, opening "Taxes" shows nothing while the rest
+    /// of the app reports five figures against it. Off by default: a plain
+    /// account register must keep planning and paging exactly as it did.
+    /// </remarks>
+    bool IncludeSubcategories = false)
 {
     public static readonly RegisterFilter None = new();
 
@@ -40,14 +51,22 @@ public sealed record RegisterFilter(
         || DateFrom is not null || DateTo is not null
         || AmountMin is not null || AmountMax is not null
         || SecurityId is not null || Tag is not null || CategoryId is not null
-        || !string.IsNullOrWhiteSpace(Status);
+        || !string.IsNullOrWhiteSpace(Status)
+        // Widening to the subtree changes which entries exist, so the scroll
+        // rail's buckets must be rebuilt rather than reused from the narrow
+        // view. That is a CACHE-KEY concern, not a UI one: the web deliberately
+        // leaves this dimension out of its own "is a filter active" test, since
+        // it is a scope (which register you are reading) rather than a filter
+        // narrowing one, and it carries a persistent toggle instead of a chip.
+        || IncludeSubcategories;
 
     /// <summary>Compact, stable key for cache-keying the scroll-track buckets
     /// per filter (the date rail must re-derive when the filter narrows the
     /// set). Excludes Today — status intent already varies the key.</summary>
     public string Fingerprint =>
         IsActive
-            ? string.Join('|', Search, DateFrom, DateTo, AmountMin, AmountMax,
+            ? string.Join('|', IncludeSubcategories ? "sub" : null,
+                Search, DateFrom, DateTo, AmountMin, AmountMax,
                 SecurityId, Tag, CategoryId, Status)
             : string.Empty;
 }
@@ -118,6 +137,35 @@ public sealed class RegisterRepository
 {
     private readonly AppDbContext _db;
 
+    /// <summary>
+    /// The account scope for a register query: the account and — when the
+    /// filter asks — its descendants. Null means "every account in this
+    /// ledger", which is what a ledger-wide read passes.
+    /// </summary>
+    /// <remarks>
+    /// Migration 226 widened the register functions from one account id to a
+    /// SET, so that a rollup CATEGORY can show its descendants' entries: a
+    /// parent category's own register is empty, because all of its money sits
+    /// on its children.
+    /// </remarks>
+    /// <remarks>
+    /// The walk itself is <see cref="CategoryTree.DescendantsAsync"/> — shared
+    /// with the budget's expanded row and the reparent guard, which needed the
+    /// same answer. The round trip happens only when the toggle is on.
+    /// </remarks>
+    private async Task<Guid[]?> ResolveScopeAsync(
+        Guid? accountId, Guid ledgerId, RegisterFilter filter,
+        CancellationToken cancellationToken)
+    {
+        if (accountId is not { } id) return null;
+        if (!filter.IncludeSubcategories) return [id];
+
+        var scope = await CategoryTree
+            .DescendantsAsync(_db, ledgerId, id, includeRoot: true, cancellationToken)
+            .ConfigureAwait(false);
+        return [.. scope];
+    }
+
     public RegisterRepository(AppDbContext db)
     {
         _db = db;
@@ -179,6 +227,12 @@ public sealed class RegisterRepository
         CancellationToken cancellationToken = default)
     {
         var f = filter ?? RegisterFilter.None;
+        // Resolved ONCE, before anything queries, because three separate
+        // places have to agree about which accounts are in view: the cursor
+        // resolution, the entry-key window, and the row fetch. They did not,
+        // and the disagreement was silent — see the row fetch below.
+        var scope = await ResolveScopeAsync(accountId, ledgerId, f, cancellationToken)
+            .ConfigureAwait(false);
         var s = sort ?? RegisterSort.Default;
         // Three branches feed the same Q1+Q2 pipeline below:
         //   * starting_at: resolve the focused header's entry cursor;
@@ -194,7 +248,7 @@ public sealed class RegisterRepository
         if (startingAtHeaderId.HasValue)
         {
             reference = await ResolveCursorForHeaderAsync(
-                ledgerId, accountId, startingAtHeaderId.Value, hidden, cancellationToken)
+                ledgerId, scope, startingAtHeaderId.Value, hidden, cancellationToken)
                 .ConfigureAwait(false);
             // Header gone / hidden / out-of-scope ⇒ empty page (unchanged).
             if (reference is null)
@@ -227,8 +281,10 @@ public sealed class RegisterRepository
         // starting_at path we fetch limit-1 strictly-older entries
         // and synthesize the anchor at index 0 ourselves.
         var q1Limit = includeAnchorEntry ? limit - 1 : limit + 1;
+        // Widened to the category's descendants when the caller asked; the
+        // identity case for every ordinary account register.
         var entryKeys = await _db.RegisterEntryKeys(
-                accountId,
+                scope,
                 ledgerId,
                 reference?.EntryKey,
                 reference?.Seq,
@@ -277,10 +333,15 @@ public sealed class RegisterRepository
             .Where(rt => EF.Constant(keysArray).Contains(rt.HeaderId)
                       || EF.Constant(keysArray).Contains(rt.Id));
 
-        if (accountId.HasValue)
+        // THE SAME SCOPE THE SQL USED. This narrowed to a single account,
+        // which silently undid the subtree: the SQL returned the descendants'
+        // entries and this discarded every row that was not on the parent
+        // itself, so a widened query produced an empty page and the feature
+        // looked inert rather than broken.
+        if (scope is not null)
         {
-            var aid = accountId.Value;
-            query = query.Where(rt => rt.AccountId == aid);
+            var inScope = scope;
+            query = query.Where(rt => EF.Constant(inScope).Contains(rt.AccountId));
         }
         else
         {
@@ -407,7 +468,9 @@ public sealed class RegisterRepository
     /// </summary>
     private async Task<RegisterCursor?> ResolveCursorForHeaderAsync(
         Guid ledgerId,
-        Guid? accountId,
+        // The SCOPE, not one account: "start at this header" has to work when
+        // the header sits on a descendant of the category being viewed.
+        Guid[]? scope,
         Guid headerId,
         bool hidden,
         CancellationToken cancellationToken)
@@ -418,10 +481,15 @@ public sealed class RegisterRepository
                 && rt.IsHidden == hidden
                 && rt.IsMergedInto == null);
 
-        if (accountId.HasValue)
+        // THE SAME SCOPE THE SQL USED. This narrowed to a single account,
+        // which silently undid the subtree: the SQL returned the descendants'
+        // entries and this discarded every row that was not on the parent
+        // itself, so a widened query produced an empty page and the feature
+        // looked inert rather than broken.
+        if (scope is not null)
         {
-            var aid = accountId.Value;
-            query = query.Where(rt => rt.AccountId == aid);
+            var inScope = scope;
+            query = query.Where(rt => EF.Constant(inScope).Contains(rt.AccountId));
         }
         else
         {
@@ -471,8 +539,10 @@ public sealed class RegisterRepository
         CancellationToken cancellationToken)
     {
         if (!filter.IsActive) return true;
+        var scope = await ResolveScopeAsync(accountId, ledgerId, filter, cancellationToken)
+            .ConfigureAwait(false);
         return await _db.RegisterFilteredEntries(
-                accountId, ledgerId, hidden,
+                scope, ledgerId, hidden,
                 filter.Search, filter.DateFrom, filter.DateTo, filter.AmountMin, filter.AmountMax,
                 filter.SecurityId, filter.Tag, filter.CategoryId, filter.Status, filter.Today)
             .AsNoTracking()
@@ -1124,8 +1194,10 @@ public sealed class RegisterRepository
         // One filter definition (mig 167 / ADR-0076): the rail reads the SAME
         // register_filtered_entries primitive the page composes over, so the
         // date buckets reflect exactly the filtered set the register shows.
+        var bucketScope = await ResolveScopeAsync(accountId, ledgerId, f, cancellationToken)
+            .ConfigureAwait(false);
         var headerTuples = await _db.RegisterFilteredEntries(
-                accountId, ledgerId, hidden,
+                bucketScope, ledgerId, hidden,
                 f.Search, f.DateFrom, f.DateTo, f.AmountMin, f.AmountMax,
                 f.SecurityId, f.Tag, f.CategoryId, f.Status, f.Today)
             .AsNoTracking()
@@ -1174,8 +1246,10 @@ public sealed class RegisterRepository
         // needs-review buckets. One row per entry (per header — the projected
         // fields are header-constant, so DISTINCT collapses each header's legs;
         // a header appears iff any of its legs matched the per-leg filter).
+        var countScope = await ResolveScopeAsync(accountId, ledgerId, f, cancellationToken)
+            .ConfigureAwait(false);
         var entries = await _db.RegisterFilteredEntries(
-                accountId, ledgerId, hidden: false,
+                countScope, ledgerId, hidden: false,
                 f.Search, f.DateFrom, f.DateTo, f.AmountMin, f.AmountMax,
                 f.SecurityId, f.Tag, f.CategoryId, f.Status, f.Today)
             .AsNoTracking()
@@ -1192,7 +1266,7 @@ public sealed class RegisterRepository
             .ConfigureAwait(false);
 
         var hiddenCount = await _db.RegisterFilteredEntries(
-                accountId, ledgerId, hidden: true,
+                countScope, ledgerId, hidden: true,
                 f.Search, f.DateFrom, f.DateTo, f.AmountMin, f.AmountMax,
                 f.SecurityId, f.Tag, f.CategoryId, f.Status, f.Today)
             .AsNoTracking()

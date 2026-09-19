@@ -136,6 +136,13 @@ export type {
     PortfolioRollup,
 } from './types/overview';
 export type {
+    BudgetCategoryRow,
+    BudgetDailyCell,
+    BudgetProgress,
+    BudgetTransactionLine,
+    BudgetTransactionPage,
+} from './types/budget';
+export type {
     QuoteProvider,
     QuotesPrefs,
     DashboardPrefs,

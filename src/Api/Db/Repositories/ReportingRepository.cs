@@ -35,12 +35,21 @@ public sealed class ReportingRepository
 
     // Pre-rollup intermediate: one row per (month, group, kind).
     private sealed record Cell(
-        int Year, int Month, Guid? GroupId, string GroupName, Guid? ParentId, string Kind, decimal Sum);
+        int Year, int Month, int Day, Guid? GroupId, string GroupName, Guid? ParentId, string Kind, decimal Sum);
 
     public async Task<ReportResult> SummarizeAsync(
         ReportSpec spec, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(spec);
+
+        // A daily series is category-only by construction — the other two
+        // dimensions never put the day in their SQL key, so honouring the
+        // request would mean silently returning MONTHLY buckets labelled as
+        // days. Failing loudly is the only honest option; the caller is code,
+        // and code can be fixed.
+        if (spec.TimeBucket == ReportTimeBucket.Day && spec.GroupBy != ReportGroupBy.Category)
+            throw new ArgumentException(
+                "A daily time bucket is supported for the Category dimension only.", nameof(spec));
 
         var kinds = spec.Measure switch
         {
@@ -85,7 +94,7 @@ public sealed class ReportingRepository
                     Kind = x.a.CategoryKind!,
                 })
                 .Select(g => new Cell(
-                    g.Key.Year, g.Key.Month, g.Key.GroupId,
+                    g.Key.Year, g.Key.Month, 1, g.Key.GroupId,
                     g.Key.GroupName ?? "(account)", null, g.Key.Kind, g.Sum(x => x.r.Amount)))
                 .ToListAsync(cancellationToken).ConfigureAwait(false),
 
@@ -98,8 +107,28 @@ public sealed class ReportingRepository
                     Kind = x.a.CategoryKind!,
                 })
                 .Select(g => new Cell(
-                    g.Key.Year, g.Key.Month, null,
+                    g.Key.Year, g.Key.Month, 1, null,
                     g.Key.Payee ?? "(no payee)", null, g.Key.Kind, g.Sum(x => x.r.Amount)))
+                .ToListAsync(cancellationToken).ConfigureAwait(false),
+
+            // The day is in the SQL key ONLY for a daily series. Putting it
+            // there unconditionally would multiply every existing caller's row
+            // count by up to 31 — a 13-month trend over 20 categories goes from
+            // ~260 rows to ~8,000 — for data they then collapse away again.
+            _ when spec.TimeBucket == ReportTimeBucket.Day => await q
+                .GroupBy(x => new
+                {
+                    x.r.PostedAt.Year,
+                    x.r.PostedAt.Month,
+                    x.r.PostedAt.Day,
+                    CategoryId = x.a.Id,
+                    x.a.Name,
+                    x.a.ParentId,
+                    Kind = x.a.CategoryKind!,
+                })
+                .Select(g => new Cell(
+                    g.Key.Year, g.Key.Month, g.Key.Day, g.Key.CategoryId,
+                    g.Key.Name, g.Key.ParentId, g.Key.Kind, g.Sum(x => x.r.Amount)))
                 .ToListAsync(cancellationToken).ConfigureAwait(false),
 
             _ => await q
@@ -113,7 +142,7 @@ public sealed class ReportingRepository
                     Kind = x.a.CategoryKind!,
                 })
                 .Select(g => new Cell(
-                    g.Key.Year, g.Key.Month, g.Key.CategoryId,
+                    g.Key.Year, g.Key.Month, 1, g.Key.CategoryId,
                     g.Key.Name, g.Key.ParentId, g.Key.Kind, g.Sum(x => x.r.Amount)))
                 .ToListAsync(cancellationToken).ConfigureAwait(false),
         };
@@ -130,7 +159,7 @@ public sealed class ReportingRepository
         var cells = grouped
             .GroupBy(g => new
             {
-                Period = PeriodLabel(spec.TimeBucket, g.Year, g.Month),
+                Period = PeriodLabel(spec.TimeBucket, g.Year, g.Month, g.Day),
                 g.GroupId,
                 g.GroupName,
                 g.ParentId,
@@ -218,11 +247,12 @@ public sealed class ReportingRepository
             .ToList();
     }
 
-    private static string? PeriodLabel(ReportTimeBucket bucket, int year, int month) => bucket switch
+    private static string? PeriodLabel(ReportTimeBucket bucket, int year, int month, int day) => bucket switch
     {
         ReportTimeBucket.None => null,
         ReportTimeBucket.Year => year.ToString("D4", System.Globalization.CultureInfo.InvariantCulture),
         ReportTimeBucket.Quarter => $"{year:D4}-Q{(month - 1) / 3 + 1}",
+        ReportTimeBucket.Day => $"{year:D4}-{month:D2}-{day:D2}",
         _ => $"{year:D4}-{month:D2}",   // Month
     };
 
@@ -256,6 +286,15 @@ public sealed class ReportingRepository
 
         if (query.CategoryId is { } cat)
             q = q.Where(x => x.r.CounterpartyAccountId == cat);
+
+        if (query.CategoryIds is { Count: > 0 } cats)
+        {
+            // Materialized so EF translates Contains to `= ANY(@ids)` rather
+            // than unrolling one OR per id.
+            var ids = cats.ToList();
+            q = q.Where(x => x.r.CounterpartyAccountId != null
+                             && ids.Contains(x.r.CounterpartyAccountId.Value));
+        }
 
         if (query.TagId is { } tag)
             q = q.Where(x => _db.TxnHeaderTags.Any(t => t.HeaderId == x.r.HeaderId && t.TagId == tag));
@@ -299,6 +338,12 @@ public sealed class ReportingRepository
                 ? q.OrderByDescending(x => x.r.PostedAt).ThenByDescending(x => x.r.HeaderSeq)
                 : q.OrderBy(x => x.r.PostedAt).ThenBy(x => x.r.HeaderSeq),
         };
+        // Within one header, legs read in the order the user arranged them. leg_index
+        // IS posting_index (resolved_transactions aliases it), and every UI read path
+        // already sorts by it — tiebreaking straight to the leg's gen_random_uuid()
+        // primary key made this listing disagree with the register and the editor for
+        // every split, so an agent reading a paycheck split saw its lines shuffled.
+        ordered = desc ? ordered.ThenByDescending(x => x.r.LegIndex) : ordered.ThenBy(x => x.r.LegIndex);
         // Deterministic tiebreak so offset paging is reproducible.
         ordered = desc ? ordered.ThenByDescending(x => x.r.Id) : ordered.ThenBy(x => x.r.Id);
 

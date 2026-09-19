@@ -201,7 +201,10 @@ The header *is* the group. Single-split events and multi-split events
 have one shape; the importer no longer special-cases `groupId =
 emittable.Count > 1 ? Guid.NewGuid() : null`. The resolved view exposes
 `legs_count` derived from the leg cardinality so the UI can still render
-"— N splits —" for the collapsed parent.
+"— N splits —" for the collapsed parent. *(2026-09-16: the label is now a
+category chip — the filter-matched leg, else the largest by summed absolute
+amount — followed by a "▸ N splits" toggle. `legs_count` is what both forms
+count, so the reason this field exists is unchanged.)*
 
 ### Rule 8 — RLS on the header; legs inherit
 

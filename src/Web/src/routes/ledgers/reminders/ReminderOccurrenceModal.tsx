@@ -181,8 +181,23 @@ export function ReminderOccurrenceModal({ ledgerId, occ, onClose, onActed }: {
                     <ul className="divide-y divide-border rounded border border-border text-sm">
                         {(bank.prefill.postings ?? []).map((p, i) => (
                             <li key={i} className="flex items-center justify-between gap-2 px-3 py-1.5">
-                                <span className="min-w-0 truncate text-text">
-                                    {accounts.find((a) => a.id === p.counterpartyAccountId)?.name ?? 'Account'}
+                                {/* accountPaths, not the bare name: the legs of a
+                                    loan payment are the liability account plus the
+                                    interest and escrow CATEGORIES, and a category's
+                                    leaf is ambiguous in a flat list. The map walks
+                                    parentId, so a real account — which has none —
+                                    resolves to its plain name and is unaffected. */}
+                                <span
+                                    className="min-w-0 truncate text-text"
+                                    title={p.counterpartyAccountId !== null && p.counterpartyAccountId !== undefined
+                                        ? accountPaths.get(p.counterpartyAccountId)
+                                        : undefined}
+                                >
+                                    {(p.counterpartyAccountId !== null && p.counterpartyAccountId !== undefined
+                                        ? accountPaths.get(p.counterpartyAccountId)
+                                        : undefined)
+                                        ?? accounts.find((a) => a.id === p.counterpartyAccountId)?.name
+                                        ?? 'Account'}
                                 </span>
                                 <span className="shrink-0 font-mono tabular-nums text-text">
                                     {formatSignedAmount(p.amount)}

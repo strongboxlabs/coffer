@@ -7,6 +7,9 @@ import { isInvestmentOwnedRow } from './columns';
 interface BankRowMenuActions {
     /** Clear the bank-feed `needs_review` flag (approve as-is). */
     onApprove: (headerId: string) => void;
+    /** Open the inline editor on `target`'s header. Same `startEdit` the
+     *  row's double-click and the keyboard's Enter both reach. */
+    onEdit: (target: BankRow) => void;
     /** Open the new-transaction form prefilled from `target`. */
     onDuplicate: (target: BankRow) => void;
     /** Open the reminder editor prefilled from `target` (ADR-0051 slice C). */
@@ -40,11 +43,23 @@ export function buildBankRowMenuItems(
          *  counter-side. Its `txnGroupId` is non-null (every split
          *  header is), so without this flag the counter-side guard
          *  below would misclassify it as read-only. A split has no
-         *  single "other side" and Duplicate would clone just one leg,
-         *  so the parent offers only Accept (if it needs review) +
-         *  Delete (removes the whole header); editing stays double-click,
-         *  same as single rows. */
+         *  single "other side", so the parent offers Edit (opens the
+         *  multi-leg editor), Duplicate (the page passes every leg, so
+         *  it clones the whole split), Create reminder and Delete
+         *  (removes the whole header). */
         originatingSplit?: boolean;
+        /**
+         * This register belongs to a CATEGORY, so nothing here may open the
+         * new-transaction editor.
+         *
+         * Duplicate does exactly that, prefilled — and the editor authors
+         * against the register's own account, which here is a category. A
+         * transaction is created against a money account and categorised,
+         * never authored inside a category, so the form would be unfillable.
+         * The "+ New transaction" button is hidden for the same reason; this
+         * is the other door into the same room.
+         */
+        noAuthoring?: boolean;
     },
 ): ContextMenuItem[] {
     const items: ContextMenuItem[] = [];
@@ -56,9 +71,18 @@ export function buildBankRowMenuItems(
                 onSelect: () => actions.onApprove(target.headerId),
             });
         }
+        // Edit opens the multi-leg editor on the whole split. Until this
+        // item existed, a split parent had NO menu route to its own legs
+        // and Enter was a no-op, so the only way in was a double-click.
+        items.push({
+            id: 'edit',
+            label: 'Edit',
+            onSelect: () => actions.onEdit(target),
+            shortcutHint: 'Enter',
+        });
         // Duplicate clones the WHOLE split (the page passes every leg),
         // so it's offered here just like on a single row.
-        items.push({
+        if (!opts?.noAuthoring) items.push({
             id: 'duplicate',
             label: 'Duplicate',
             onSelect: () => actions.onDuplicate(target),
@@ -96,7 +120,7 @@ export function buildBankRowMenuItems(
             onSelect: () => actions.onApprove(target.headerId),
         });
     }
-    if (!isCrossDomainTarget) {
+    if (!isCrossDomainTarget && !opts?.noAuthoring) {
         items.push({
             id: 'duplicate',
             label: 'Duplicate',

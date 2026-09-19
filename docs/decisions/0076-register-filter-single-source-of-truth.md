@@ -33,7 +33,7 @@ standing drift hazard rather than a live bug.
 
 ### D1 — One filter primitive; every consumer composes over it (mig 167)
 
-`register_filtered_entries(account, ledger, hidden, …filters…) RETURNS SETOF
+`register_filtered_entries(accounts, ledger, hidden, …filters…) RETURNS SETOF
 resolved_transactions` is the **single definition** of the register filter. It
 applies visibility + ledger/account scope + all filter dimensions and returns the
 matching rows (per-leg; an entry appears iff any of its legs match — the
@@ -51,6 +51,35 @@ This collapses the duplication: the filter predicate lives once (SQL); the only
 remaining C# status logic is the counts' *bucketing* (a genuinely different
 operation — it partitions a set, it doesn't filter it), and the date semantics
 are now single-sourced on `posted_at::date`.
+
+#### D1a — The account scope is a SET, not one account (mig 226, amendment)
+
+Both functions took `p_account_id uuid`. A **parent category has no postings of
+its own** — they all sit on its children — so a register that could only name
+one account could never show a category's own money: opening "Taxes" showed an
+empty register while the Categories tree, the sidebar and the budget all
+reported five figures against it. The scope is therefore `p_account_ids uuid[]`,
+and the single-account case passes an array of one.
+
+- The predicate went from `rt.account_id = $1` to `rt.account_id = ANY($1)`.
+  Every other use of the parameter is an `IS NULL` / `IS NOT NULL` test, which
+  reads identically on an array, so `NULL` still means *every visible account in
+  the ledger*.
+- **Not** an added `p_account_ids uuid[] DEFAULT NULL` beside the scalar: two
+  ways to say the same thing invites a silent precedence question, and a changed
+  parameter list under `CREATE OR REPLACE` creates an **overload** — every
+  existing call then becomes ambiguous rather than failing loudly. Both
+  functions are DROPped by full signature and recreated (the pattern mig 171
+  established for this pair).
+- Widening BOTH together is what keeps D1 true: the page, the rail, the counts
+  and select-all scope identically because they share the primitive.
+- `= ANY(array)` on a one-element array plans as an equality, so the register's
+  hottest query is unchanged; a category subtree is tens of rows, not thousands.
+
+Who chooses the set is the API's business, not the function's:
+`RegisterRepository.ResolveScopeAsync` expands a category to its descendants
+only when the caller asks (`include_subcategories`), and hands back a
+one-element array otherwise.
 
 ### D2 — The primitive must inline (verified, not assumed)
 

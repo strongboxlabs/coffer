@@ -1,3 +1,5 @@
+import { Checkbox } from '@/components/ui/Checkbox';
+
 import { RegisterFilterChips } from './RegisterFilterChips';
 import { RegisterFilterControls } from './RegisterFilterControls';
 import { RegisterSortMenu } from './RegisterSortMenu';
@@ -35,8 +37,13 @@ export interface RegisterControlsBarProps {
     filter: RegisterFilterArgs;
     /** Filter change handler. */
     onFilterChange: (next: RegisterFilterArgs) => void;
-    /** Categories for the Category picker. */
-    categories: readonly AccountSummary[];
+    /** EVERY account in the ledger — the counterparty picker and the chips both
+     *  apply their own eligibility and need the rest for path building. */
+    accounts: readonly AccountSummary[];
+    /** What the other side of a posting is on this register; see
+     *  {@link RegisterFilterControls}. A CATEGORY register faces money
+     *  accounts, everything else faces categories. */
+    counterpartyKind?: 'category' | 'account';
     /** Ledger tags for the Tag filter's autocomplete. */
     tags: readonly TagDto[];
     /** Securities for the Security picker — omit on bank registers. */
@@ -47,6 +54,26 @@ export interface RegisterControlsBarProps {
     statusCounts: RegisterStatusCounts | null;
     /** Open the new-transaction editor. */
     onNew: () => void;
+    /**
+     * Hide the New button outright, rather than disabling it.
+     *
+     * A CATEGORY register has one: a transaction is created against a money
+     * account and categorised, never authored "inside" a category, so the
+     * button offers something the editor cannot do. Disabled would imply a
+     * state in which it becomes available; there is none.
+     */
+    hideNew?: boolean;
+    /**
+     * Offer the sub-category scope toggle — a parent CATEGORY register only.
+     *
+     * It is a persistent CHECKBOX rather than a one-shot button, because the
+     * state it carries has to be visible and reversible from anywhere in the
+     * register. The first version was a button in the empty state alone: it
+     * vanished the moment it worked, leaving rows from several sub-categories
+     * and nothing on screen saying why — and no way back except the browser's
+     * Back button.
+     */
+    showSubcategoryScope?: boolean;
     /** Disable the New button (e.g. while an editor is already open). */
     newDisabled: boolean;
     /** Title/tooltip for the New button. Defaults to the bank copy. */
@@ -61,7 +88,8 @@ export function RegisterControlsBar({
     isInvestment,
     filter,
     onFilterChange,
-    categories,
+    accounts,
+    counterpartyKind,
     tags,
     securities,
     resultCount,
@@ -69,6 +97,8 @@ export function RegisterControlsBar({
     onNew,
     newDisabled,
     newButtonTitle,
+    hideNew = false,
+    showSubcategoryScope = false,
 }: RegisterControlsBarProps) {
     return (
         <div className="flex flex-col gap-1.5 border-b border-border bg-surface px-3 py-1.5">
@@ -87,24 +117,45 @@ export function RegisterControlsBar({
                 <RegisterFilterControls
                     filter={filter}
                     onChange={onFilterChange}
-                    categories={categories}
+                    accounts={accounts}
+                    counterpartyKind={counterpartyKind}
                     tags={tags}
                     securities={securities}
                 />
+                {/* Grouped with the other scope controls on the left, not
+                    stranded in the gap the hidden New button leaves on the
+                    right — it answers "which rows", like Show and Filter. */}
+                {showSubcategoryScope ? (
+                    <Checkbox
+                        checked={filter.includeSubcategories === true}
+                        onChange={(e) =>
+                            onFilterChange({
+                                ...filter,
+                                includeSubcategories: e.target.checked,
+                            })}
+                        label="Include sub-categories"
+                        title="Show entries filed under this category's descendants as well as its own"
+                        className="size-icon-xs cursor-pointer"
+                        wrapperClassName="shrink-0 cursor-pointer gap-1.5 text-[0.6875rem] text-text-subtle hover:text-text"
+                    />
+                ) : null}
                 <div className="ml-auto shrink-0">
+                    {hideNew ? null : (
                     <RegisterToolbarContent
                         onNew={onNew}
                         disabled={newDisabled}
                         newButtonTitle={newButtonTitle}
                         showHint={false}
                     />
+                    )}
                 </div>
             </div>
             {/* Row 2: active-filter chips (renders null when nothing is active). */}
             <RegisterFilterChips
                 filter={filter}
                 onChange={onFilterChange}
-                categories={categories}
+                accounts={accounts}
+                counterpartyKind={counterpartyKind}
                 securities={securities}
                 resultCount={resultCount}
             />

@@ -151,8 +151,18 @@ export function BankRegisterPage() {
     // row action navigates here with focus set so the receiving page
     // scrolls + focuses the matching counterparty leg on load. NULL
     // when navigating directly (e.g. from the sidebar).
-    const search = useSearch({ strict: false }) as { focus?: string };
+    const search = useSearch({ strict: false }) as {
+        focus?: string;
+        subcategories?: boolean;
+    };
     const focusFromUrl = search.focus;
+    // `?subcategories` is URL-owned, unlike the rest of the filter. It decides
+    // WHICH REGISTER you are reading — a category alone, or the category and
+    // everything under it — so it has to survive a link, a refresh and the Back
+    // button, exactly like the budget's month. It is also how the budget links
+    // here: its rows are rollups, so the register it opens must be one too, or
+    // the figure you clicked would not be the figure you land on.
+    const subtreeIncluded = search.subcategories === true;
 
     const ledgersQuery = useQuery({
         queryKey: ['ledgers'],
@@ -191,7 +201,15 @@ export function BankRegisterPage() {
     // Structured/search filter (mig 164). useState keeps a stable reference
     // between renders — required, since the controller threads it into the
     // windowed hook's effect deps.
-    const [filter, setFilter] = useState<RegisterFilterArgs>({});
+    const [filterState, setFilterState] = useState<RegisterFilterArgs>({});
+    // One filter object for every consumer, with the URL-owned dimension folded
+    // in — so nothing downstream has to know that this one key lives elsewhere.
+    const filter = useMemo<RegisterFilterArgs>(
+        () => (subtreeIncluded
+            ? { ...filterState, includeSubcategories: true }
+            : filterState),
+        [filterState, subtreeIncluded],
+    );
     // Column sort (mig 166). Threaded to the controller (windowed read only)
     // and the controls bar's Sort ▾ menu. A bank register offers no
     // investment-only columns. A change resets the window (fresh keyset walk).
@@ -216,6 +234,33 @@ export function BankRegisterPage() {
         filter,
         sort,
     });
+
+    // A register for a CATEGORY is a different thing from one for an account:
+    // no statements to import, no transaction to author inside it, and if it
+    // has children then having none of its own is expected rather than a gap.
+    const isCategory = account?.accountType === 'category';
+    const hasSubcategories = isCategory
+        && (accountsQuery.data ?? []).some((a) => a.parentId === accountId);
+    // …and it is reached from the Categories tree rather than the accounts
+    // list, so the breadcrumb walks that tree: Ledger / Categories / Food /
+    // Groceries. Ancestors only — the leaf is `accountName`.
+    const categoryTrail = useMemo(() => {
+        if (!isCategory) return null;
+        const byId = new Map(
+            (accountsQuery.data ?? []).map((a) => [a.id, a] as const),
+        );
+        const trail: { id: string; name: string }[] = [];
+        const seen = new Set<string>([accountId]);
+        let parentId = account?.parentId ?? null;
+        while (parentId !== null && !seen.has(parentId)) {
+            seen.add(parentId);
+            const parent = byId.get(parentId);
+            if (parent === undefined) break;
+            trail.unshift({ id: parent.id, name: parent.name });
+            parentId = parent.parentId;
+        }
+        return trail;
+    }, [isCategory, accountsQuery.data, account?.parentId, accountId]);
 
     // Total matches for the filter chips row — the (filter-aware) scroll-track
     // buckets sum to the full filtered entry count. Shown only when a
@@ -250,16 +295,28 @@ export function BankRegisterPage() {
     // would still match.
     const handleFilterChange = useCallback(
         (next: RegisterFilterArgs) => {
-            setFilter(next);
-            if (focusFromUrl !== undefined) {
+            const { includeSubcategories: wantSubtree, ...rest } = next;
+            setFilterState(rest);
+
+            // Only when the caller MENTIONS the scope. Clear-all sends a bare
+            // `{}`, and clearing the filters must not silently change which
+            // register you are looking at.
+            const scopeTouched = 'includeSubcategories' in next;
+            const nextSubtree = scopeTouched ? wantSubtree === true : subtreeIncluded;
+
+            if (nextSubtree !== subtreeIncluded || focusFromUrl !== undefined) {
                 void navigate({
                     to: '/ledgers/$ledgerId/accounts/$accountId',
                     params: { ledgerId, accountId },
-                    search: {},
+                    // The ?focus= anchor is dropped on any filter change
+                    // (ADR-0076): a pinned row must not survive a fresh filter
+                    // and hijack the top of the list. The scope is carried,
+                    // because it is not a filter.
+                    search: nextSubtree ? { subcategories: true } : {},
                 } as unknown as Parameters<typeof navigate>[0]);
             }
         },
-        [focusFromUrl, navigate, ledgerId, accountId],
+        [focusFromUrl, navigate, ledgerId, accountId, subtreeIncluded],
     );
 
     const queryClient = useQueryClient();
@@ -730,6 +787,7 @@ export function BankRegisterPage() {
                 ledgerId={ledgerId}
                 ledger={ledger ?? null}
                 accountName={account?.name ?? null}
+                categoryTrail={categoryTrail}
                 actions={
                     <>
                         {/* Statement-file import (OFX/QFX — ADR-0031 Phase 4;
@@ -880,6 +938,11 @@ export function BankRegisterPage() {
                         filter={filter}
                         onFilterChange={handleFilterChange}
                         filterResultCount={filterResultCount}
+                        isCategory={isCategory}
+                        rollupRootId={
+                            isCategory && subtreeIncluded ? accountId : null
+                        }
+                        hasSubcategories={hasSubcategories}
                         statusCounts={statusCounts}
                         initialLoaded={register.initialLoaded}
                         initialError={register.initialError}
@@ -933,6 +996,13 @@ interface RegisterTableProps {
     filter: RegisterFilterArgs;
     onFilterChange: (next: RegisterFilterArgs) => void;
     filterResultCount: number | null;
+    /** This register is a CATEGORY: no statements, no new-entry button. */
+    isCategory: boolean;
+    /** This category's id while the subtree widening is on, else null — rows
+     *  from a descendant then name their own sub-category. */
+    rollupRootId: string | null;
+    /** …and it has children, so no postings of its own is expected, not a gap. */
+    hasSubcategories: boolean;
     /** Per-status counts for the Show dropdown's badges (mig 165). */
     statusCounts: RegisterStatusCounts | null;
     /** List-area gating forwarded to RegisterShell so the toolbar (search /
@@ -1073,6 +1143,9 @@ function RegisterTable({
     filter,
     onFilterChange,
     filterResultCount,
+    isCategory,
+    rollupRootId,
+    hasSubcategories,
     statusCounts,
     initialLoaded,
     initialError,
@@ -1180,20 +1253,36 @@ function RegisterTable({
             }),
         enabled: editingHeaderId === null && !isCreatingNew,
         onEnterRow: (currentId, e) => {
-            // Only `txn` rows are editable in slice #1 (single-row
-            // edit). Split rows are focusable but Enter is a no-op
-            // until the split-edit slice lands — so we leave the
-            // default intact (no preventDefault) on those, matching
-            // the pre-extraction behavior.
-            const row = displayRows.find(
-                (r) => r.kind === 'txn' && r.txn.id === currentId,
-            );
-            if (row?.kind === 'txn') {
+            // Enter opens the editor on the focused row — the keyboard twin
+            // of double-click, which both editable shapes already wire to
+            // this same `startEdit`.
+            //
+            // Split parents used to be excluded, with a comment saying the
+            // no-op stood "until the split-edit slice lands". It has landed
+            // (bank-edit/fields/SplitsGrid.tsx), and until now the omission
+            // left a keyboard user with NO route to a split's legs at all:
+            // the split-parent context menu carried no Edit item either.
+            //
+            // A split LEG stays a no-op on purpose. The group owns the edit,
+            // and the editor opened from a leg would be the same editor —
+            // so Enter there would silently act on something other than the
+            // row under the cursor.
+            const row = displayRows.find((r) => displayRowId(r) === currentId);
+            if (row === undefined) return;
+            if (row.kind === 'txn') {
                 e.preventDefault();
                 startEdit(row.txn.headerId);
+            } else if (row.kind === 'split-parent') {
+                e.preventDefault();
+                startEdit(row.legs[0]!.headerId);
             }
         },
-        onCreate: startCreate,
+        // Undefined on a CATEGORY register, which removes the `n` shortcut
+        // outright (the hook only binds the key when a handler exists). Hiding
+        // the button while leaving the hotkey live left the action reachable by
+        // the exact route a regular would take — and the editor it opened
+        // authors against the register's own account, which here is a category.
+        onCreate: isCategory ? undefined : startCreate,
     });
     // Viewport-center `yyyy-MM` for the date-aware scroll-track's
     // "you are here" indicator. Updated by virtuoso's rangeChanged
@@ -1584,6 +1673,15 @@ function RegisterTable({
                     row={parentRow}
                     rowIndex={index}
                     accountPaths={accountPaths}
+                    // `parentRow` is a synthesized representative carrying the
+                    // group's NET amount, so it cannot answer "which
+                    // categories are in here". The legs can.
+                    legs={row.legs}
+                    // The server filters at entry level, so a category filter
+                    // matches one LEG and returns the whole group. Handing the
+                    // filter down is what lets the collapsed row name the leg
+                    // that answered it.
+                    filterCategoryId={filter.categoryId ?? null}
                     currency={currency}
                     today={today}
                     selected={selection.isSelected(
@@ -1717,6 +1815,7 @@ function RegisterTable({
                 row={txn}
                 rowIndex={index}
                 accountPaths={accountPaths}
+                rollupRootId={rollupRootId}
                 currency={currency}
                 today={today}
                 selected={selection.isSelected(txn.headerId, txn.createdAt)}
@@ -1756,11 +1855,18 @@ function RegisterTable({
             initialError={initialError}
             isEmpty={isEmpty}
             filterActive={filterActive}
+            isCategory={isCategory}
+            hasSubcategories={hasSubcategories}
+            subtreeIncluded={filter.includeSubcategories === true}
+            onIncludeSubcategories={() =>
+                onFilterChange({ ...filter, includeSubcategories: true })}
             toolbar={(
                     // Combined controls bar (fold #4): status-filter tabs
                     // (left) + New-transaction button & keyboard hint
                     // (right), one row. Identical to investment.
                     <RegisterControlsBar
+                        hideNew={isCategory}
+                        showSubcategoryScope={isCategory && hasSubcategories}
                         statusFilter={statusFilter}
                         onStatusFilterChange={onStatusFilterChange}
                         sort={sort}
@@ -1768,7 +1874,12 @@ function RegisterTable({
                         isInvestment={isInvestment}
                         filter={filter}
                         onFilterChange={onFilterChange}
-                        categories={accounts.filter((a) => a.accountType === 'category')}
+                        accounts={accounts}
+                        // A CATEGORY's register faces MONEY ACCOUNTS: the
+                        // counterparty column on these rows reads "Checking",
+                        // so a Category picker filtered an axis the rows do
+                        // not have and could never match.
+                        counterpartyKind={isCategory ? 'account' : 'category'}
                         tags={tagsQuery.data ?? []}
                         resultCount={filterResultCount}
                         statusCounts={statusCounts}
@@ -1895,6 +2006,7 @@ function RegisterTable({
                     anchor={contextMenu.anchor}
                     items={buildBankRowMenuItems(contextMenu.target, {
                         onApprove,
+                        onEdit: (target) => startEdit(target.headerId),
                         onDuplicate: (target) => {
                             // Open the new-transaction form prefilled
                             // from the source. One path: a split-parent
@@ -1919,7 +2031,10 @@ function RegisterTable({
                         onShowOtherSide,
                         onRequestDelete: (target) =>
                             setPendingDelete({ kind: 'single', target }),
-                    }, { originatingSplit: contextMenu.originatingSplit })}
+                    }, {
+                        originatingSplit: contextMenu.originatingSplit,
+                        noAuthoring: isCategory,
+                    })}
                     onClose={closeContextMenu}
                 />
             ) : null}

@@ -80,9 +80,10 @@ internal sealed class BulkTransactionsRepository
     /// as the <c>selection-empty</c> 422 rather than firing a noop
     /// UPDATE.
     /// </remarks>
-    private IQueryable<TxnHeaderRow>? BuildSelectionQuery(
+    private async Task<IQueryable<TxnHeaderRow>?> BuildSelectionQueryAsync(
         Guid ledgerId,
-        SelectionRequest selection)
+        SelectionRequest selection,
+        CancellationToken cancellationToken = default)
     {
         // Ledger scope is always enforced — RLS will also block
         // cross-ledger rows, but keying the LINQ predicate on
@@ -121,10 +122,27 @@ internal sealed class BulkTransactionsRepository
         // always scopes those filters to an account; when it isn't set the
         // per-account predicate matches nothing (defensive — no wrong select).
         var scopeAccountId = selection.AccountId;
+        // Every per-account predicate below works over a SET, because a
+        // CATEGORY register can be widened to its descendants (mig 226). One
+        // account is an array of one; no account is empty, which matches
+        // nothing — the same defensive behaviour the scalar had.
+        //
+        // This is resolved BEFORE the origination predicate on purpose. The
+        // register-filter intersection further down is an INTERSECTION: it can
+        // only ever remove headers, so widening it alone left the widened
+        // select-all empty, because the headers of a rollup's children never
+        // entered this query in the first place.
+        var scopeIds = selection.AccountId is { } scopeId
+            ? (selection.IncludeSubcategories
+                ? (await CategoryTree
+                    .DescendantsAsync(_db, ledgerId, scopeId, includeRoot: true,
+                        cancellationToken)
+                    .ConfigureAwait(false)).ToArray()
+                : [scopeId])
+            : Array.Empty<Guid>();
 
         if (selection.AccountId.HasValue)
         {
-            var accountId = selection.AccountId.Value;
             // Restrict to headers the account ORIGINATES (ADR-0036), not
             // merely touches: the header has a leg on `accountId` whose
             // denormalized posting counts (migration 120) show the account
@@ -151,7 +169,7 @@ internal sealed class BulkTransactionsRepository
             // the client for read-only rows before they reach here.)
             q = q.Where(h => _db.TxnLegs.Any(
                 l => l.HeaderId == h.Id
-                    && l.AccountId == accountId
+                    && EF.Constant(scopeIds).Contains(l.AccountId)
                     && l.AccountPostingsOnHeader == l.HeaderTotalPostings));
         }
 
@@ -163,7 +181,7 @@ internal sealed class BulkTransactionsRepository
             case "cleared":
                 // Per-account (ADR-0082): the account's leg is cleared.
                 q = q.Where(h => _db.TxnLegs.Any(l =>
-                    l.HeaderId == h.Id && l.AccountId == scopeAccountId
+                    l.HeaderId == h.Id && EF.Constant(scopeIds).Contains(l.AccountId)
                     && _db.TxnLegRecon.Any(r => r.LegId == l.Id && r.Status == "cleared")));
                 break;
             case "uncleared":
@@ -172,7 +190,7 @@ internal sealed class BulkTransactionsRepository
                 // not future-dated. Reconciling is its own case below (mig 164/165),
                 // so this matches the register's "Uncleared" view exactly.
                 q = q.Where(h =>
-                    _db.TxnLegs.Any(l => l.HeaderId == h.Id && l.AccountId == scopeAccountId
+                    _db.TxnLegs.Any(l => l.HeaderId == h.Id && EF.Constant(scopeIds).Contains(l.AccountId)
                         && !_db.TxnLegRecon.Any(r => r.LegId == l.Id
                             && (r.Status == "cleared" || r.Status == "reconciling")))
                     && (_db.TxnHeaderOverrides
@@ -183,7 +201,7 @@ internal sealed class BulkTransactionsRepository
                 // Per-account (ADR-0082): the account's leg is reconciling (mig 165),
                 // not future-dated. Mirrors the register's Reconciling view.
                 q = q.Where(h =>
-                    _db.TxnLegs.Any(l => l.HeaderId == h.Id && l.AccountId == scopeAccountId
+                    _db.TxnLegs.Any(l => l.HeaderId == h.Id && EF.Constant(scopeIds).Contains(l.AccountId)
                         && _db.TxnLegRecon.Any(r => r.LegId == l.Id && r.Status == "reconciling"))
                     && (_db.TxnHeaderOverrides
                             .Where(o => o.HeaderId == h.Id)
@@ -230,14 +248,18 @@ internal sealed class BulkTransactionsRepository
             AmountMax: selection.AmountMax,
             SecurityId: selection.SecurityId,
             Tag: selection.Tag,
-            CategoryId: selection.CategoryId);
+            CategoryId: selection.CategoryId,
+            // Carried, not dropped: `IsActive` counts it, so a select-all whose
+            // ONLY active dimension is the subtree still takes this branch.
+            IncludeSubcategories: selection.IncludeSubcategories);
         if (selection.AccountId.HasValue && registerFilter.IsActive)
         {
-            var filterAccountId = selection.AccountId.Value;
+            // The SAME scope resolved above — the selected set is defined to be
+            // what the reader is looking at.
             // hidden = null: visibility scope is already applied by `q` above;
             // here we only intersect on the non-status filter dimensions.
             var matchingHeaderIds = _db.RegisterFilteredEntries(
-                    filterAccountId, ledgerId, null,
+                    scopeIds, ledgerId, null,
                     registerFilter.Search, registerFilter.DateFrom, registerFilter.DateTo,
                     registerFilter.AmountMin, registerFilter.AmountMax, registerFilter.SecurityId,
                     registerFilter.Tag, registerFilter.CategoryId, registerFilter.Status, registerFilter.Today)
@@ -273,7 +295,8 @@ internal sealed class BulkTransactionsRepository
         SelectionRequest selection,
         CancellationToken cancellationToken = default)
     {
-        var query = BuildSelectionQuery(ledgerId, selection);
+        var query = await BuildSelectionQueryAsync(ledgerId, selection, cancellationToken)
+            .ConfigureAwait(false);
         if (query is null) return null;
 
         var count = await query
@@ -323,7 +346,8 @@ internal sealed class BulkTransactionsRepository
         Guid currentUserId,
         CancellationToken cancellationToken = default)
     {
-        var query = BuildSelectionQuery(ledgerId, selection);
+        var query = await BuildSelectionQueryAsync(ledgerId, selection, cancellationToken)
+            .ConfigureAwait(false);
         if (query is null) return 0;
 
         // Reconciliation is per-account (ADR-0082): bulk-recon targets the
@@ -524,7 +548,8 @@ internal sealed class BulkTransactionsRepository
         bool hardDeleteSourcedRows = false,
         CancellationToken cancellationToken = default)
     {
-        var query = BuildSelectionQuery(ledgerId, selection);
+        var query = await BuildSelectionQueryAsync(ledgerId, selection, cancellationToken)
+            .ConfigureAwait(false);
         if (query is null) return (0, 0);
 
         await using var transaction = await _db.Database
@@ -664,7 +689,7 @@ internal sealed class BulkTransactionsRepository
     /// <summary>
     /// Bulk un-hide the selection (ADR-0072 D2): flip <c>is_hidden</c> back to
     /// false. The selection is expected to carry <c>StatusFilter = "hidden"</c>
-    /// (the Hidden view), so <see cref="BuildSelectionQuery"/> already scopes to
+    /// (the Hidden view), so <see cref="BuildSelectionQueryAsync"/> already scopes to
     /// hidden rows. Un-hidden rows re-enter the balance + holdings walks, so both
     /// are recomputed explicitly — <c>ExecuteUpdateAsync</c> bypasses the
     /// interceptor, same #4 call-site pattern as bulk-delete's soft-hide branch.
@@ -675,7 +700,8 @@ internal sealed class BulkTransactionsRepository
         SelectionRequest selection,
         CancellationToken cancellationToken = default)
     {
-        var query = BuildSelectionQuery(ledgerId, selection);
+        var query = await BuildSelectionQueryAsync(ledgerId, selection, cancellationToken)
+            .ConfigureAwait(false);
         if (query is null) return 0;
 
         await using var transaction = await _db.Database
@@ -825,7 +851,8 @@ internal sealed class BulkTransactionsRepository
         if (sourceAccountId == targetAccountId)
             return (BulkMoveOutcome.TargetSameAsSource, 0);
 
-        var query = BuildSelectionQuery(ledgerId, selection);
+        var query = await BuildSelectionQueryAsync(ledgerId, selection, cancellationToken)
+            .ConfigureAwait(false);
         if (query is null) return (BulkMoveOutcome.Moved, 0);
 
         // Guard: bank-shape only. An investment-shape header (action != null)

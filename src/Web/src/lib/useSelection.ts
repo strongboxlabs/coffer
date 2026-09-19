@@ -195,6 +195,7 @@ export function useSelection(args: UseSelectionArgs): UseSelectionResult {
             securityId: filter?.securityId,
             tag: filter?.tag,
             categoryId: filter?.categoryId,
+            includeSubcategories: filter?.includeSubcategories,
         };
     }, [state, accountId, statusFilter, filter]);
 

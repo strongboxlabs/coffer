@@ -429,6 +429,25 @@ declines to pay in the register. One on the selected row is not:
   button unobtrusive" knob; 20px is the floor of a comfortable pointer
   target.
 
+**A third answer, for a dense grid inside a form** (added 2026-09-16, the
+splits editor). The leg rows of a split are a 30px grid of up to twenty-five
+rows, each carrying Move up / Move down / Remove. Neither existing answer fits:
+a full-strength kebab on every row is twenty-five competing controls in a
+block the eye is meant to scan down, and there is no "selected row" — every
+row is editable at once.
+
+The treatment is **present on every row and always visible, but quiet at rest
+and emphasised on the row you are working in** — `opacity-50`, going to full on
+`group-hover` and `group-focus-within`. That is NOT the hover-reveal this rule
+rejects, and the distinction is the whole point: the control is visible and
+hit-testable before you go near it, so it is discoverable by sight and reachable
+by Tab. What hover changes is emphasis, not existence. A reader scanning the
+list sees that every leg has actions; a reader working a leg sees that leg's
+actions clearly.
+
+The same row keeps `onContextMenu`, so the guard in `RowActions.test.ts` still
+holds the file to prescribing a visible path.
+
 **What the guard cannot check, and what that cost.** It is file-level,
 so it proves a surface has *an* affordance, not that every row type
 does. Note also that "renders any button" would have been worthless

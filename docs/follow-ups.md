@@ -441,38 +441,45 @@ the brokerage CSV below.
 
 ### 3 · Splits
 
-#### The split edit screen
+#### Slice complete: the split edit screen
 
-*Status: open, and now shaped. Requested 2026-07-11 as "perf + code-structure pass,
-scope TBD"; the 2026-08-28 ranking makes it a product slice rather than a refactor.*
+*closed 2026-09-16 by #547, released in 0.87.0. Per-posting tags below is the only
+open work left in slice 3.*
 
-The entry sat unshaped for seven weeks because it was recorded as a refactor, and a
-refactor with no stated defect has no acceptance criterion. Ranked as a feature, it
-gets one — and the two known concrete problems are the place to start:
+Both halves landed, in the order this entry prescribed: a behaviour-zero decomposition
+whose gate was the existing test file staying green with no assertion edits, then the
+feature. The gate held literally — `TxnRowEdit.test.tsx` has no commits in the arc —
+though it was not sufficient on its own, so the PR added a characterisation suite
+first: every mode the old gate covered has ONE posting, so nothing in the repo asserted
+that a split rendered at all.
 
-- `TxnRowEdit.tsx` is ~1620 lines and is one of the six files listed under **Domain-split
-  the remaining mega-files**. That entry's own rule is to decompose *when next touching
-  the file for a feature*, and this is that moment. Two commits in one PR: a
-  behaviour-zero decomposition whose gate is the existing test file staying green with
-  no assertion edits, then the feature.
-- Per-posting tags land here (below), which is new UI inside the same editor. Doing the
-  decomposition first is what stops that landing in a 1600-line file.
+Text deleted rather than annotated, per the convention above. ADR-0025's 2026-09-16
+amendment and ADR-0023 §C carry the affordances that changed, and
+[bank-edit/README.md](../src/Web/src/routes/ledgers/bank-edit/README.md) carries the
+eight design choices and what is deliberately out of scope. One heading stays so the
+slice does not read as untouched.
 
 #### Per-posting tags
 
 *Status: open, ADR first. **Un-parked 2026-08-28** — the ranking commits to the feature,
 which reverses the standing recommendation to delete the placeholder.*
 
-The editor already renders the promise: `<TagsPlaceholder hint="Per-posting tags coming
-soon" />` beside every posting in
-[TxnRowEdit.tsx:1301](../src/Web/src/routes/ledgers/TxnRowEdit.tsx#L1301). Until this
+The editor still renders the promise, in the splits grid's compact form — a dashed
+`tags` chip beside each leg's category picker, with "Per-posting tags coming soon" as
+its tooltip rather than its visible label
+([TagsPlaceholder.tsx](../src/Web/src/routes/ledgers/bank-edit/fields/TagsPlaceholder.tsx),
+rendered from
+[PostingRowEditor.tsx](../src/Web/src/routes/ledgers/bank-edit/fields/PostingRowEditor.tsx)).
+#547 moved and shrank it deliberately so the slot survives at 30px a row. Until this
 ranking the honest move was to delete that control, because holding it meant shipping a
 permanent "coming soon" against an ADR nobody was scheduled to write. The ranking
 schedules it, so the control stays and the ADR gets written.
 
 **The ADR is not optional and it is not small.** No `txn_leg_tags` table exists; ADR-0009
 put tags at transaction level and stands unamended, and ADR-0025's "Open questions" now
-reads "None", so the deferral has fallen off the ADR trail entirely. The schema shape is
+reads "None", so the deferral is still absent from the ADR trail — the 2026-09-16
+amendment did not restore it either. It is written down in exactly one place:
+`bank-edit/README.md`'s "Out of scope". The schema shape is
 already forced by things that will fail closed:
 
 - the table must carry `ledger_id NOT NULL` — `fn_snapshot_write_part` chunks on a
@@ -503,8 +510,31 @@ not "build a dashboard" — it is that five stacked widgets is a list, not a scr
 Worth settling before building:
 
 - **Which widgets are missing rather than thin.** Budgets-at-a-glance and a cash-flow
-  strip are the obvious candidates, and both are downstream of slices 6 and 7 — so a
-  home screen ranked *above* Reports and Budgets can only build the frame for them now.
+  strip are the obvious candidates. Budgets-at-a-glance really is downstream of slice 7.
+  A spending strip is NOT downstream of anything — see the deferral note below, which
+  re-checking on 2026-09-16 showed has expired.
+
+- **Two of ADR-0056's three deferrals have expired, and nobody went back.** That ADR
+  deferred *"spending-by-category, budgets, net-worth-over-time chart"* for one stated
+  reason — **"no data yet"** ([ADR-0056](decisions/0056-ledger-overview-dashboard.md),
+  the D3 layout note). Two now have data, and neither is reachable from the SPA:
+
+  | Deferral | Computation today | On REST? | In the SPA? |
+  |---|---|---|---|
+  | spending-by-category | `ReportingRepository.SummarizeAsync` | no — MCP only | no |
+  | net-worth-over-time | `AccountsReportingRepository.NetWorthHistoryAsync` | no — MCP only | no |
+  | budgets | absent | — | — |
+
+  So the overview is not excluding categories on principle — `OverviewRepository` is
+  scoped to net worth by design and correctly so, and its own header calls itself
+  "ADR-0056 slice 1". The overview as a SURFACE was always meant to grow these. What
+  blocks both widgets is the same single missing piece: **the reporting analyses have
+  no REST endpoint**, so the SPA cannot reach computation the app already performs.
+  Build that once and both widgets are wiring, not new aggregation.
+
+  A net-worth-over-time chart additionally needs a charting decision: `package.json`
+  carries no chart library and `components/ui/` has no sparkline. That is a dependency
+  choice to make deliberately, not one to smuggle in inside a widget.
 - **Layout, not just order.** Today the preference stores `{ key, visible }` and renders
   a stack. Widths or a grid mean the stored shape changes, which is a preference
   migration, not a CSS change. Decide it once, here.
@@ -845,20 +875,25 @@ any UI is drawn.
 
 #### Tax / transaction date — systemic surface
 
-*Status: partial — `transacted_at` write plumbing + the read-only
-bank `tax {date}` sub-label shipped; remaining: (a) a Tax-date
-field in the editors, (b) Reports tax-year grouping opt-in on
+*Status: partial — `transacted_at` write plumbing, the read-only bank
+`tax {date}` sub-label AND the bank editor's Tax-date field have all
+shipped; remaining: (b) Reports tax-year grouping opt-in on
 `transactedAt`, (c) CSV export of tax date, (d) investment-register
-treatment.*
+treatment. Re-checked 2026-09-16.*
 
 The data column `txn_headers.transacted_at` is populated end-to-end
 and the bank register renders a `tax {date}` sub-label under the
 posted date when `transactedAt !== postedAt`. The remaining UX loop:
 
-- **Editor:** no field in `TxnRowEdit` / `TxnRowCreate` for tax
-  date. A user who needs to backdate a Dec-29-booked-but-Jan-2-
-  posted dividend has no path. One PR adds a "Tax date" field
-  (date-picker, defaulting to posted).
+- ~~**Editor:**~~ **Done.** `TxnRowEdit` renders a `Tax date` field in
+  both branches, hinted "Blank = same as posted", with a noise filter
+  that treats a same-calendar-day tax date as unset. The field carries a
+  documented data-loss history — an edit-mode caller that failed to seed
+  it silently WIPED an existing tax date — which is why
+  `bank-edit/draft.test.ts` pins `seedTransactedAt` against ISO strings
+  that DIFFER, the case the component-level test could not catch.
+  A `TxnRowCreate` component does not exist; creation is the same editor
+  in `kind: 'new'` mode.
 - **Reports:** the Reports module always keys off `postedAt`.
   Add an opt-in to use `transactedAt` for tax-year grouping.
 - **CSV export:** expose the tax date.
@@ -866,6 +901,39 @@ posted date when `transactedAt !== postedAt`. The remaining UX loop:
   line 2) takes the spot that on bank shows tax date, so tax date
   on investment rows is currently invisible — needs its own
   treatment.
+
+#### The investment register's collapsed split rows still say only how many
+
+*open, small. Surfaced 2026-09-16 by #547 giving the bank register a category summary
+and not its sibling.*
+
+A bank split-parent now leads with the category that carries the group — the
+filter-matched leg when a category filter is active, else the largest by summed
+absolute amount — followed by a `▸ N splits` toggle. The investment register's
+split-parent still renders only the count, so a collapsed cluster there says nothing
+about what is in it.
+
+It matters more there than it did on the bank side, because an investment
+split-parent is hardcoded `readOnly` with no editor path at all: expansion is the
+ONLY way to see its legs. The helper is already written and pure
+(`summarizeSplitCategories` / `leadSplitCategory` in `bankRowStrategy.tsx`); the work
+is lifting it somewhere both strategies can import and threading `legs` +
+`filterCategoryId` through `InvestmentRegisterPage`'s `RegisterRow`, which the shell
+already supports as optional props.
+
+#### ArrowRight / ArrowLeft do nothing on a split row
+
+*open, small. Surfaced 2026-09-16 alongside #547's split-parent keyboard work.*
+
+`useRegisterKeyboardNav` binds ArrowUp, ArrowDown, Enter and optionally `N`. Left and
+right are unbound everywhere in the SPA, and they are the conventional treegrid keys
+for expand/collapse. #547 made Enter open the editor on a split parent and left
+expansion reachable from the keyboard only by Tabbing to the toggle — which works, but
+is not what a keyboard user reaches for on a disclosure row.
+
+Bind ArrowRight to expand and ArrowLeft to collapse on a focused split parent. Watch
+the same trap #547 hit: the handler must keep yielding to a focused BUTTON and to
+`event.defaultPrevented`, or the keypress does two things at once.
 
 #### The same transaction arriving from two sources imports twice
 
@@ -1067,7 +1135,11 @@ appends new tabs to the end (max+1). Drag-to-reorder needs:
   the desired id sequence. The bulk path is cleaner for a real
   drag-and-drop (one round trip instead of N).
 - HTML5-drag affordance on the tab strip in `AuthedSidebar.tsx`
-  (same pattern as `TxnRowEdit`'s posting reorder).
+  (same pattern as the splits editor's posting reorder, which now lives in
+  [bank-edit/fields/SplitsGrid.tsx](../src/Web/src/routes/ledgers/bank-edit/fields/SplitsGrid.tsx)).
+  Copy the whole shape, not just the drag: as of #547 that reorder is also
+  reachable from a row menu and Alt+↑ / Alt+↓, because there is no drag on
+  touch and none at all from a keyboard.
 
 Land when the user actually wants to reorder — at 2-4 tabs the
 append-order is usually fine.
@@ -1355,18 +1427,47 @@ decomposing by domain (pattern locked in
 external symbol and keeps the test suite green — when next touching the file for a
 feature, not as a standalone "refactor week".*
 
-Current offenders (line counts 2026-07-24):
+Current offenders (re-measured 2026-09-16):
 
-- `register/bank/BankRegisterPage.tsx` (~1990) — shell + row strategies + mutations + selection.
-- `Db/Repositories/InvestmentTransactionsRepository.cs` (~1810) — partial-class split (`.Create` / `.Patch` / `.Delete` / `.Lots`).
-- `Db/Repositories/TransactionsRepository.cs` (~1790) — partial-class split (`.Headers` / `.Postings` / `.Recon` / `.Merge`).
-- `TxnRowEdit.tsx` (~1620) — mirror the investment-editor structure (per-field components + pure validation module + lifted draft hook).
-- `settings/FeedConnectionsPanel.tsx` (~1200) — split into `ConnectionsList` / `AccountsDirectory` / `SyncRunsPanel` / `MappingWizard`.
-- `SecurityDetailPage.tsx` (~1190) — split panels into siblings; keep dialogs with their owning panel.
+- `register/bank/BankRegisterPage.tsx` (~2030) — shell + row strategies + mutations + selection.
+- `Db/Repositories/TransactionsRepository.cs` (~1880) — partial-class split (`.Headers` / `.Postings` / `.Recon` / `.Merge`).
+- `Db/Repositories/InvestmentTransactionsRepository.cs` (~1870) — partial-class split (`.Create` / `.Patch` / `.Delete` / `.Lots`).
+- `settings/FeedConnectionsPanel.tsx` (~1265) — split into `ConnectionsList` / `AccountsDirectory` / `SyncRunsPanel` / `MappingWizard`.
+- `SecurityDetailPage.tsx` (~1180) — split panels into siblings; keep dialogs with their owning panel. Has drifted back under the threshold; listed for the panel split, not the size.
+
+`TxnRowEdit.tsx` came off this list on 2026-09-16: #547 did exactly what its bullet
+prescribed — per-field components, a pure validation module and a lifted draft hook —
+and the shell is ~980 lines.
+
+**`BankRegisterPage.tsx` is the one now due, and it is due on this entry's own terms.**
+#547 touched it for a feature and it GREW, 2008 → 2030 lines, so the "decompose when
+next touching the file" rule fired and was not honoured. It is also the file whose
+split-row behaviour had no page-level test until that same PR added one.
 
 ---
 
 ### Performance
+
+#### The bank editor's seven per-field seeds want one constructor
+
+*open, small, and deliberately left. Created 2026-09-16 by #547.*
+
+`bank-edit/draft.ts` exports `seedPayee`, `seedMemo`, `seedCheckNumber`, `seedPostedAt`,
+`seedTransactedAt`, `seedTags` and `seedPostings`, called one per `useState` in
+`hooks/useTxnRowDraft.ts`. One constructor returning the whole draft is the right end
+state.
+
+It was split off on purpose rather than overlooked: folding them into one would have
+meant touching every reference to seven state variables in the SAME diff that moved the
+seeding logic — two risks at once, with the gate able to say only that something broke,
+not which. Per-field seeds needed no call-site changes, so the logic became testable
+immediately and the consolidation is a separate step whose only job is moving
+references.
+
+Whatever replaces them must keep the property the tests pin: seeding runs ONCE. Seeds
+mint a fresh React key per posting, so a recomputed initial remounts every leg row and
+destroys focus and in-flight edits — which is why the hook captures initial state with
+`useState` and never `useMemo`.
 
 #### The consistency monitor runs a full check 96 times a day to announce once
 *open. Surfaced 2026-09-01 while explaining the cadence after the 0.71.0 deploy. The

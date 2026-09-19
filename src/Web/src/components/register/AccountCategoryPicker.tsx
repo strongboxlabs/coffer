@@ -52,8 +52,35 @@ export interface AccountCategoryPickerProps {
     label?: string;
     placeholder?: string;
     error?: string | null;
+    /** Mark the control invalid WITHOUT the message `error` renders below it.
+     *  The splits grid needs that: the defect is already reported on the row
+     *  and in the summary strip, and a message under the field would push the
+     *  row taller than the grid's fixed height budget. */
+    invalid?: boolean;
     disabled?: boolean;
     ariaLabel?: string;
+    /** DOM id for the combobox input, so a caller can send focus to it. */
+    id?: string;
+    /**
+     * Shorten the results list so the whole panel fits a tight container.
+     *
+     * The panel is ~286px at full height (a 256px list plus the filter bar),
+     * and it is position:absolute — so an ancestor with `overflow-y: auto`
+     * CLIPS it. That coupling is deliberate and worth keeping: the panel can
+     * never be visible when its own input is not, which is what stops an
+     * opaque dropdown floating over unrelated chrome after a scroll, still
+     * accepting clicks into a field the user can no longer see. The splits
+     * grid's leg viewport is 344px, so a full-height panel does not fit inside
+     * it; the answer is to make the panel fit the container rather than to
+     * make it escape.
+     */
+    compact?: boolean;
+    /**
+     * Fired when the panel opens or closes. Lets a container with limited room
+     * bring the input to the top of its scrollport so the panel has somewhere
+     * to go. Not fired on mount.
+     */
+    onOpenChange?: (open: boolean) => void;
 }
 
 type Domain = 'all' | 'accounts' | 'categories';
@@ -97,6 +124,10 @@ export function AccountCategoryPicker({
     label,
     placeholder = 'Account or category…',
     error,
+    invalid,
+    id,
+    compact,
+    onOpenChange,
     disabled,
     ariaLabel,
 }: AccountCategoryPickerProps) {
@@ -110,11 +141,6 @@ export function AccountCategoryPicker({
     // display matches the register chips (ADR-0069). Categories show their
     // chain; real accounts have no parent, so this is just the name.
     const pathMap = useMemo(() => buildAccountPathMap(accounts), [accounts]);
-
-    // Immediate parent name per account (for the flat-row qualifier /
-    // duplicate-name disambiguation).
-    const parentName = (a: AccountSummary): string | null =>
-        a.parentId !== null ? (byId.get(a.parentId)?.name ?? null) : null;
 
     const eligible = useMemo(
         () => accounts.filter(isEligible),
@@ -146,6 +172,17 @@ export function AccountCategoryPicker({
     const showFilters = hasAccounts && hasCategories;
 
     const [open, setOpen] = useState(false);
+
+    // Notify the container, skipping the mount pass — a picker that has never
+    // been opened has not "closed", and a container that scrolls on every
+    // notification would jump on first render.
+    const notifiedOpen = useRef<boolean | null>(null);
+    useEffect(() => {
+        if (notifiedOpen.current === open) return;
+        const first = notifiedOpen.current === null;
+        notifiedOpen.current = open;
+        if (!first || open) onOpenChange?.(open);
+    }, [open, onOpenChange]);
     const [query, setQuery] = useState('');
     const [domain, setDomain] = useState<Domain>('all');
     const [highlight, setHighlight] = useState(0);
@@ -162,12 +199,22 @@ export function AccountCategoryPicker({
         : '';
     const inputText = open ? query : selectedPath;
 
+    // KIND ONLY for categories. This used to read `Expense · ImmediateParent`,
+    // which was the one-hop half of an answer: it disambiguated two "Food" under
+    // different parents only when the tree was two deep, and said nothing at
+    // three. The full chain now lives in the label (see the row render), so
+    // repeating the parent here would print it twice and spend the width that
+    // the path needs.
+    //
+    // The kind stays, and is the point of the qualifier now: ADR-0017 makes kind
+    // DISCLOSED rather than enforced — pickers no longer filter by it — so it has
+    // to be legible at the moment of choosing.
     const qualifier = (a: AccountSummary): string => {
         if (a.accountType === 'category') {
-            const kind = a.categoryKind === 'income' ? 'Income'
-                : a.categoryKind === 'expense' ? 'Expense' : 'Category';
-            const parent = parentName(a);
-            return parent !== null ? `${kind} · ${parent}` : kind;
+            return a.categoryKind === 'income' ? 'Income'
+                : a.categoryKind === 'expense' ? 'Expense'
+                : a.categoryKind === 'adjustment' ? 'Adjustment'
+                : 'Category';
         }
         return accountTypeLabel(a.accountType);
     };
@@ -363,10 +410,12 @@ export function AccountCategoryPicker({
                 </span>
             ) : null}
             <input
+                id={id}
                 ref={inputRef}
                 type="text"
                 role="combobox"
                 aria-expanded={open}
+                aria-invalid={error != null || invalid === true ? true : undefined}
                 aria-label={ariaLabel ?? label ?? 'Account or category'}
                 value={inputText}
                 placeholder={placeholder}
@@ -376,7 +425,7 @@ export function AccountCategoryPicker({
                 onKeyDown={onKeyDown}
                 className={cn(
                     'w-full rounded border bg-surface px-2 py-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50',
-                    error ? 'border-state-danger' : 'border-border',
+                    error || invalid ? 'border-state-danger' : 'border-border',
                 )}
             />
             {error ? (
@@ -415,7 +464,10 @@ export function AccountCategoryPicker({
                     <ul
                         ref={listRef}
                         role="listbox"
-                        className="max-h-fixed-256px overflow-y-auto py-1"
+                        className={cn(
+                            'overflow-y-auto py-1',
+                            compact ? 'max-h-fixed-160px' : 'max-h-fixed-256px',
+                        )}
                     >
                         {rows.length === 0 ? (
                             <li className="px-3 py-2 text-text-subtle">No matches</li>
@@ -444,7 +496,11 @@ export function AccountCategoryPicker({
                                             itemIndices[highlight] === i ? 'bg-accent-soft/40' : 'hover:bg-surface-hover',
                                         )}
                                     >
-                                        <span className="min-w-0 truncate">{row.account.name}</span>
+                                        <PickerLabel
+                                            account={row.account}
+                                            depth={row.depth}
+                                            path={pathMap.get(row.account.id) ?? row.account.name}
+                                        />
                                         {row.qualifier !== null ? (
                                             <span className="shrink-0 text-[0.625rem] text-text-muted">
                                                 {row.qualifier}
@@ -458,5 +514,55 @@ export function AccountCategoryPicker({
                 </div>
             ) : null}
         </label>
+    );
+}
+
+/**
+ * A picker row's name, showing its ancestry only when the row's own position
+ * does not already convey it.
+ *
+ * WHEN THE PATH APPEARS. Exactly when the rendered depth HIDES the real
+ * ancestry: `depth === 0 && parentId !== null`. That is one condition covering
+ * two separate ways a nested category ends up looking like a root — the pinned
+ * "Frequent" group, which is deliberately flat, and a category whose parent fell
+ * out of the caller's eligible set (an ACTIVE child under an INACTIVE parent;
+ * deactivation does not cascade) and was re-parented to the forest root by
+ * `categoryPickerRows`. Both render two same-named children of different parents
+ * as two identical unindented rows, which is the exact ambiguity the rule exists
+ * to prevent.
+ *
+ * Genuine tree rows keep the bare leaf. Indentation is already the answer there,
+ * and a self-path on every row would be noise.
+ *
+ * WHICH END TRUNCATES. The ancestors, never the leaf. The row is narrow — inside
+ * the splits grid it is one column — and truncating from the right would hide
+ * the very word identifying the category, which is worse than showing no path at
+ * all. Ancestors take the flexible track and clip; the leaf is `shrink-0`.
+ */
+function PickerLabel({
+    account,
+    depth,
+    path,
+}: {
+    account: AccountSummary;
+    depth: number;
+    path: string;
+}) {
+    const ancestryHidden =
+        account.accountType === 'category' && depth === 0 && account.parentId !== null;
+
+    if (!ancestryHidden) {
+        return <span className="min-w-0 truncate" title={path}>{account.name}</span>;
+    }
+
+    const cut = path.lastIndexOf('/');
+    const ancestors = cut >= 0 ? path.slice(0, cut + 1) : '';
+    const leaf = cut >= 0 ? path.slice(cut + 1) : path;
+
+    return (
+        <span className="flex min-w-0 items-baseline" title={path}>
+            <span className="min-w-0 truncate text-text-muted">{ancestors}</span>
+            <span className="shrink-0">{leaf}</span>
+        </span>
     );
 }

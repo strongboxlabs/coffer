@@ -161,6 +161,8 @@ public sealed class AppDbContext : DbContext
     // ADR-0031 Phase 5 / migration 222: hand-editable descriptions of an institution's
     // delimited export. The definition is a YAML document, not parsed columns.
     internal DbSet<FeedCsvMappingRow> FeedCsvMappings => Set<FeedCsvMappingRow>();
+
+    internal DbSet<BudgetTargetRow> BudgetTargets => Set<BudgetTargetRow>();
     // ADR-0034 / migration 089: per-(header, account) running balance.
     // Read-only from the API perspective; the header-walk trigger family
     // (mig 090) owns the writes.
@@ -923,6 +925,23 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.Name).HasColumnName("name");
             b.Property(x => x.DefinitionYaml).HasColumnName("definition_yaml");
             b.Property(x => x.SchemaVersion).HasColumnName("schema_version");
+            b.Property(x => x.CreatedAt).HasColumnName("created_at");
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+        });
+
+        modelBuilder.Entity<BudgetTargetRow>(b =>
+        {
+            b.ToTable("budget_targets");
+            b.HasKey(x => x.Id);
+            // Every column named explicitly, for the reason stated on
+            // FeedCsvMappingRow above: EF's default would emit "TargetMonth", and a
+            // missing HasColumnName has silently broken every write to a table in
+            // this repo before.
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
+            b.Property(x => x.LedgerId).HasColumnName("ledger_id");
+            b.Property(x => x.CategoryId).HasColumnName("category_id");
+            b.Property(x => x.TargetMonth).HasColumnName("target_month");
+            b.Property(x => x.Amount).HasColumnName("amount");
             b.Property(x => x.CreatedAt).HasColumnName("created_at");
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at");
         });
@@ -1856,7 +1875,7 @@ public sealed class AppDbContext : DbContext
         modelBuilder
             .HasDbFunction(typeof(AppDbContext)
                 .GetMethod(nameof(RegisterEntryKeys), InternalInstance,
-                    types: new[] { typeof(Guid?), typeof(Guid),
+                    types: new[] { typeof(Guid[]), typeof(Guid),
                                    typeof(Guid?), typeof(long?),
                                    typeof(string),
                                    typeof(int), typeof(bool),
@@ -1878,7 +1897,7 @@ public sealed class AppDbContext : DbContext
         modelBuilder
             .HasDbFunction(typeof(AppDbContext)
                 .GetMethod(nameof(RegisterFilteredEntries), InternalInstance,
-                    types: new[] { typeof(Guid?), typeof(Guid), typeof(bool?),
+                    types: new[] { typeof(Guid[]), typeof(Guid), typeof(bool?),
                                    typeof(string), typeof(DateOnly?), typeof(DateOnly?),
                                    typeof(decimal?), typeof(decimal?), typeof(Guid?),
                                    typeof(string), typeof(Guid?), typeof(string),
@@ -2026,7 +2045,7 @@ public sealed class AppDbContext : DbContext
     // translator instead.
 
     /// <summary>
-    /// Maps to <c>register_entry_keys(p_account_id, p_ledger_id,
+    /// Maps to <c>register_entry_keys(p_account_ids, p_ledger_id,
     /// p_cursor_entry_key, p_cursor_seq, p_direction, p_limit, …,
     /// p_sort_column, p_sort_dir)</c> (migrations 097 / 164 / 166).
     /// Returns one row per register entry in the requested sort order —
@@ -2042,7 +2061,11 @@ public sealed class AppDbContext : DbContext
     /// <c>"asc"</c> / <c>"desc"</c>.
     /// </summary>
     internal IQueryable<RegisterEntryKeyRow> RegisterEntryKeys(
-        Guid? accountId,
+        // A SET since mig 226. One account passes an array of one; a category
+        // passes itself and its descendants, which is the only way a rollup
+        // parent's register can show anything — its money is all on its
+        // children. Null still means "every account in the ledger".
+        Guid[]? accountIds,
         Guid ledgerId,
         Guid? cursorEntryKey,
         long? cursorSeq,
@@ -2065,12 +2088,12 @@ public sealed class AppDbContext : DbContext
         string sortColumn,
         string sortDir) =>
         FromExpression(() =>
-            RegisterEntryKeys(accountId, ledgerId, cursorEntryKey, cursorSeq, direction, limit, hidden,
+            RegisterEntryKeys(accountIds, ledgerId, cursorEntryKey, cursorSeq, direction, limit, hidden,
                 search, dateFrom, dateTo, amountMin, amountMax, securityId, tag, categoryId, status, today,
                 sortColumn, sortDir));
 
     /// <summary>
-    /// Maps to <c>register_filtered_entries(p_account_id, p_ledger_id,
+    /// Maps to <c>register_filtered_entries(p_account_ids, p_ledger_id,
     /// p_hidden, …filters…)</c> (migration 167 / ADR-0076) — the single
     /// definition of the register filter predicate. Returns the
     /// <c>resolved_transactions</c> rows matching the filter (per-leg; an entry
@@ -2081,7 +2104,8 @@ public sealed class AppDbContext : DbContext
     /// the caller's plan (no barrier).
     /// </summary>
     internal IQueryable<ResolvedTransactionView> RegisterFilteredEntries(
-        Guid? accountId,
+        // A SET since mig 226; see RegisterEntryKeys above.
+        Guid[]? accountIds,
         Guid ledgerId,
         bool? hidden,
         string? search,
@@ -2095,7 +2119,7 @@ public sealed class AppDbContext : DbContext
         string? status,
         DateOnly? today) =>
         FromExpression(() =>
-            RegisterFilteredEntries(accountId, ledgerId, hidden, search, dateFrom, dateTo,
+            RegisterFilteredEntries(accountIds, ledgerId, hidden, search, dateFrom, dateTo,
                 amountMin, amountMax, securityId, tag, categoryId, status, today));
 
     /// <summary>

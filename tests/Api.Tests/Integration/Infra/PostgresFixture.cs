@@ -329,6 +329,14 @@ GRANT USAGE          ON SCHEMA public TO coffer_app;
             // one collection, so a modest ceiling is ample.
             MaxPoolSize = 40,
             ConnectionIdleLifetime = 10,
+
+            // Mirrors production's DbSessionTimeZone, which pins this on the
+            // connection string rather than issuing a SET. It has to be the
+            // same MECHANISM and not merely the same value: a fixture that
+            // reached UTC another way would let a regression in the real pin
+            // pass the whole suite. Testcontainers' postgres image defaults to
+            // UTC, so without this the tests would agree by luck.
+            Timezone = Coffer.Api.Configuration.DbSessionTimeZone.Zone,
         };
         return builder.ConnectionString;
     }

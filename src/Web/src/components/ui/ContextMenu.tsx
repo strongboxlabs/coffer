@@ -130,9 +130,23 @@ export function ContextMenu({ anchor, items, onClose }: ContextMenuProps) {
         // any other handler runs on the click that opens another menu.
         window.addEventListener('pointerdown', handlePointerDown);
         window.addEventListener('blur', handleWindowBlur);
+        // A scroll strands the menu. Its coordinates are captured once, at
+        // open, and it is position:fixed — so it does not move with the row
+        // that spawned it, and after a scroll it floats over an unrelated one,
+        // still offering that row's actions. Closing is the only honest
+        // response: a menu cannot follow an anchor it never measured.
+        //
+        // CAPTURE PHASE, and on document rather than window, because scroll
+        // events do NOT bubble and the document itself never scrolls here —
+        // the app shell is `h-dvh overflow-hidden`, so every scrollport that
+        // can move a row is an inner element (the register's scroll surface,
+        // the splits grid's leg viewport, a dialog body). A bubble-phase
+        // window listener would fire for none of them.
+        document.addEventListener('scroll', onClose, true);
         return () => {
             window.removeEventListener('pointerdown', handlePointerDown);
             window.removeEventListener('blur', handleWindowBlur);
+            document.removeEventListener('scroll', onClose, true);
         };
     }, [onClose]);
 
@@ -235,7 +249,13 @@ function ContextMenuRow({ item, highlighted, onHover, onClick }: ContextMenuRowP
         >
             <span>{item.label}</span>
             {item.shortcutHint ? (
-                <span className="ml-4 text-[0.6875rem] text-text-muted">
+                // aria-hidden: the hint is adjacent text with no separator, so
+                // it concatenates straight onto the label in the accessible
+                // name — a screen reader was announcing "EditEnter",
+                // "Duplicate⌘D" and "DeleteDel". The glyph is decoration for
+                // the eye; the keystroke it names is bound elsewhere or (for
+                // ⌘D) not at all.
+                <span aria-hidden className="ml-4 text-[0.6875rem] text-text-muted">
                     {item.shortcutHint}
                 </span>
             ) : null}

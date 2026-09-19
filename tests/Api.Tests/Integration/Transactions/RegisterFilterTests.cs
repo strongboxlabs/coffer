@@ -1,9 +1,11 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
 
 using Microsoft.AspNetCore.Mvc.Testing;
 
 using Coffer.Api.Contracts;
+using Coffer.Api.Db.Repositories;
 using Coffer.Api.Tests.Integration.Infra;
 
 namespace Coffer.Api.Tests.Integration.Transactions;
@@ -220,5 +222,43 @@ public sealed class RegisterFilterTests
         }
 
         Assert.Equal(matches, seen);
+    }
+
+    [Fact]
+    public async Task A_parent_categorys_register_is_empty_until_subcategories_are_included()
+    {
+        // The defect, and the fix, in one test. A rollup parent holds NO postings
+        // of its own — they are all on its children — so its register showed
+        // nothing while every other screen reported five figures against it. True
+        // from the Categories tree and the sidebar too, not just the budget link.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var bank = await ledger.AddBankAccountAsync("Checking");
+        var taxes = await ledger.AddCategoryAsync("Taxes");
+        var federal = await ledger.AddCategoryAsync("Federal", parentId: taxes.Id);
+        var medicare = await ledger.AddCategoryAsync("Medicare", parentId: federal.Id);
+
+        var when = new DateTime(2026, 4, 3, 0, 30, 0, DateTimeKind.Utc);
+        await ledger.AddTransactionPairAsync(bank.Id, federal.Id, -100m, when, payee: "fed");
+        await ledger.AddTransactionPairAsync(bank.Id, medicare.Id, -20m, when, payee: "medicare");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var url = $"/api/ledgers/{ledger.LedgerId}/transactions?account_id={taxes.Id}";
+
+        var narrow = await client.GetFromJsonAsync<JsonElement>(url);
+        Assert.Empty(narrow.GetProperty("entries").EnumerateArray());
+
+        // ...and with the subtree, the grandchild comes too — the walk is not one
+        // level deep.
+        // Repository first, so a failure here says WHICH layer is wrong.
+        var repo = new RegisterRepository(_fixture.NewDbContext());
+        var direct = await repo.GetPageAsync(
+            ledger.LedgerId, taxes.Id, cursor: null, direction: "older", startingAtHeaderId: null,
+            limit: 50, hidden: false, filter: new RegisterFilter(IncludeSubcategories: true));
+        Assert.Equal(2, direct.Entries.Count);
+
+        var wide = await client.GetFromJsonAsync<JsonElement>(url + "&include_subcategories=true");
+        Assert.Equal(2, wide.GetProperty("entries").EnumerateArray().Count());
     }
 }

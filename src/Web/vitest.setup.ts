@@ -33,6 +33,16 @@ if (typeof globalThis.ResizeObserver === 'undefined') {
     } as unknown as typeof ResizeObserver;
 }
 
+// jsdom implements no scrolling at all, so Element.prototype.scrollIntoView is
+// simply absent and any call to it throws. Every browser has had it for a
+// decade, so the gap is the environment's, not the code's — stubbed here for
+// the same reason as ResizeObserver above, rather than guarded at each call
+// site, which would mean writing `el.scrollIntoView?.()` forever to describe a
+// method that is never actually missing in production.
+if (typeof Element.prototype.scrollIntoView !== 'function') {
+    Element.prototype.scrollIntoView = function scrollIntoView() {};
+}
+
 // react-virtuoso uses layout APIs (scrollHeight / IntersectionObserver
 // / ResizeObserver) that jsdom doesn't implement, so under the
 // default behaviour the `<Virtuoso>` body renders empty — tests that

@@ -26,8 +26,20 @@ import type { AccountSummary, SecuritySummary, TagDto } from '@/lib/types';
 export interface RegisterFilterControlsProps {
     filter: RegisterFilterArgs;
     onChange: (next: RegisterFilterArgs) => void;
-    /** Categories (account_type='category') for the Category picker. */
-    categories: readonly AccountSummary[];
+    /** EVERY account in the ledger. The picker applies its own eligibility and
+     *  needs the rest for parent-path building. */
+    accounts: readonly AccountSummary[];
+    /**
+     * What the OTHER side of a posting is on THIS register.
+     *
+     * The filter's `categoryId` is really "counterparty account id" — it has
+     * always matched on the other leg, whatever type it is. On a money
+     * account's register the other side is a category, so the picker offers
+     * categories. On a CATEGORY's register the other side is a money account,
+     * and offering categories there filtered an axis the rows do not have: the
+     * counterparty column shows "Checking", and nothing in the list matched it.
+     */
+    counterpartyKind?: 'category' | 'account';
     /** Ledger tags for the Tag filter's autocomplete. */
     tags: readonly TagDto[];
     /** Securities for the Security picker — omit to hide it (bank registers). */
@@ -37,10 +49,13 @@ export interface RegisterFilterControlsProps {
 export function RegisterFilterControls({
     filter,
     onChange,
-    categories,
+    accounts,
     tags,
     securities,
+    counterpartyKind = 'category',
 }: RegisterFilterControlsProps) {
+    const facingAccounts = counterpartyKind === 'account';
+    const counterpartyLabel = facingAccounts ? 'Account' : 'Category';
     const popId = useId();
     const [open, setOpen] = useState(false);
     const rootRef = useRef<HTMLDivElement>(null);
@@ -93,7 +108,7 @@ export function RegisterFilterControls({
                 onChange={(e) => setSearchText(e.target.value)}
                 placeholder="Search…"
                 aria-label="Search transactions"
-                title="Search payee, memo, check #, category, or tag"
+                title={`Search payee, memo, check #, ${counterpartyLabel.toLowerCase()}, or tag`}
                 className={`${fieldClass} w-fixed-224px`}
             />
             <div className="relative shrink-0">
@@ -143,12 +158,14 @@ export function RegisterFilterControls({
                         </div>
                         <div className="mb-2">
                             <AccountCategoryPicker
-                                accounts={categories}
-                                isEligible={(a) => a.accountType === 'category'}
+                                accounts={accounts}
+                                isEligible={(a) => (facingAccounts
+                                    ? a.accountType !== 'category'
+                                    : a.accountType === 'category')}
                                 valueId={filter.categoryId ?? null}
                                 onChangeId={(id) => set({ categoryId: id ?? undefined })}
-                                label="Category"
-                                placeholder="Any category"
+                                label={counterpartyLabel}
+                                placeholder={`Any ${counterpartyLabel.toLowerCase()}`}
                             />
                         </div>
                         <FilterField label="Tag">

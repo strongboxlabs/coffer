@@ -101,6 +101,28 @@ else
     echo "[dev-up-docker] WARNING: could not read <Version> from Api.csproj; using COFFER_IMAGE_TAG from .env" >&2
 fi
 
+# Stamp the commit into the image. .git is dockerignored, so the build stage is
+# NOT a repo and cannot work this out for itself — without these, a local build
+# reports "nogit" and the running container cannot answer "what commit is this?",
+# which is the whole point of the /api/meta/version surface (ADR-0044).
+#
+# Guarded: a tarball install is not a git checkout, and that is a legitimate way
+# to run this. Unset simply means the image says "nogit", which is honest.
+if git -C "$repo_root" rev-parse --git-dir >/dev/null 2>&1; then
+    SOURCE_COMMIT_SHA="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || true)"
+    SOURCE_COMMIT_COUNT="$(git -C "$repo_root" rev-list --count HEAD 2>/dev/null || true)"
+    SOURCE_COMMIT_DATE="$(git -C "$repo_root" log -1 --format=%cd --date=short 2>/dev/null || true)"
+    export SOURCE_COMMIT_SHA SOURCE_COMMIT_COUNT SOURCE_COMMIT_DATE
+    echo "[dev-up-docker] stamping commit ${SOURCE_COMMIT_SHA:-<unknown>} into the image"
+    # A dirty tree means the image is NOT that commit. Say so rather than
+    # letting the version string quietly overstate what is running.
+    if [ -n "$(git -C "$repo_root" status --porcelain 2>/dev/null)" ]; then
+        echo "[dev-up-docker] NOTE: working tree is dirty — the image is ${SOURCE_COMMIT_SHA:-?} PLUS uncommitted changes."
+    fi
+else
+    echo "[dev-up-docker] not a git checkout — the image will report its commit as 'nogit'"
+fi
+
 # Build + (re)start the stack. --build picks up code changes since last run;
 # --pull refreshes the base images (the floating dotnet 10.0 tags) so a rebuild
 # gets the latest patched runtime instead of a stale cached layer — cheap when

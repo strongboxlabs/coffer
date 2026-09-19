@@ -13,8 +13,23 @@ import { FieldLabel } from '@/components/ui/FieldLabel';
 import { Modal } from '@/components/ui/Modal';
 import { AccountCategoryPicker } from '@/components/register/AccountCategoryPicker';
 import { errorMessage } from '@/lib/errorMessage';
+import { buildAccountPathMap } from '@/lib/accountPath';
 
 import { collectDescendantIds } from './categoryTree';
+
+/**
+ * Full `Parent/Child` path for a category, for use in flat prose.
+ *
+ * A modal has no tree around it. The user may have opened this from a row deep
+ * in the hierarchy, and a real ledger has several same-named leaves under
+ * different parents — so a bare name in a confirmation sentence can name the
+ * wrong category convincingly. The manage-categories TREE behind the dialog is
+ * the exception and keeps its leaf names: indentation answers it there.
+ */
+function useCategoryPath(accounts: readonly AccountSummary[]) {
+    const paths = useMemo(() => buildAccountPathMap(accounts), [accounts]);
+    return (id: string, fallback: string) => paths.get(id) ?? fallback;
+}
 
 // Manage-categories action dialogs (Slice A). Categories ARE accounts,
 // so create/rename go through the accounts endpoints (createAccount /
@@ -26,6 +41,14 @@ import { collectDescendantIds } from './categoryTree';
 // success; the host panel owns cache invalidation. Form idiom mirrors
 // AccountEditorDialog (ADR-0023): labels above inputs, inline error,
 // [Cancel] [confirm] footer.
+
+/** Kind values as a person reads them. Falls through to the raw string so a
+ *  value from an older or newer build never renders blank. */
+const KIND_LABEL: Record<string, string> = {
+    income: 'Income',
+    expense: 'Expense',
+    adjustment: 'Adjustment',
+};
 
 const inputClass =
     'mt-1 w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm text-text ' +
@@ -43,6 +66,27 @@ function eligibleCategory(
     return (a) =>
         a.accountType === 'category'
         && a.categoryKind === kind
+        && a.isActive
+        && !excludeIds.has(a.id);
+}
+
+/**
+ * Merge targets, which — unlike parent targets — are NOT narrowed by kind.
+ *
+ * A merge across kinds is now the ONLY way to reclassify a category (ADR-0017:
+ * the kind of an existing category is immutable, because flipping it silently
+ * moves every posting in it between the spending and income totals for all of
+ * its history). Filtering the target list by kind would leave no route at all.
+ *
+ * The merge is the better mechanism for exactly the reasons the flip is not: it
+ * states how many transactions and children move, it deactivates the source
+ * rather than destroying it, and reactivating undoes it.
+ */
+function eligibleMergeTarget(
+    excludeIds: ReadonlySet<string>,
+): (a: AccountSummary) => boolean {
+    return (a) =>
+        a.accountType === 'category'
         && a.isActive
         && !excludeIds.has(a.id);
 }
@@ -66,6 +110,7 @@ export interface CategoryCreateDialogProps {
 export function CategoryCreateDialog({
     ledgerId, accounts, presetKind, presetParentId, onClose, onSaved,
 }: CategoryCreateDialogProps) {
+    const categoryPath = useCategoryPath(accounts);
     const parentLocked = presetParentId != null && presetParentId !== '';
     const lockedParent = parentLocked
         ? accounts.find((a) => a.id === presetParentId) ?? null
@@ -123,6 +168,12 @@ export function CategoryCreateDialog({
                         onChange={(e) => { setKind(e.target.value); setParentId(null); }}>
                         <option value="expense">Expense</option>
                         <option value="income">Income</option>
+                        {/* mig 224 / ADR-0017. A valuation adjustment — marking a
+                            house up, reconciling a retirement balance — is neither
+                            income nor expense, and booking it as an expense made it
+                            read as NEGATIVE SPENDING. It falls out of all three
+                            reporting measures by construction. */}
+                        <option value="adjustment">Adjustment</option>
                     </select>
                 </div>
 
@@ -130,7 +181,9 @@ export function CategoryCreateDialog({
                     <FieldLabel>Parent</FieldLabel>
                     {parentLocked ? (
                         <p className="mt-1 rounded-md border border-border bg-surface-muted/40 px-2 py-1.5 text-sm text-text-muted">
-                            {lockedParent?.name ?? 'Selected category'}
+                            {lockedParent !== null
+                                ? categoryPath(lockedParent.id, lockedParent.name)
+                                : 'Selected category'}
                         </p>
                     ) : (
                         <>
@@ -244,6 +297,7 @@ export interface CategoryMoveDialogProps {
 }
 
 export function CategoryMoveDialog({ ledgerId, node, accounts, onClose, onSaved }: CategoryMoveDialogProps) {
+    const categoryPath = useCategoryPath(accounts);
     // Default to picking a parent (picker active) — the dialog's whole job is
     // to choose a destination, so the target picker is always visible; "Top
     // level" is the explicit opt-out.
@@ -282,7 +336,7 @@ export function CategoryMoveDialog({ ledgerId, node, accounts, onClose, onSaved 
         <Modal open onClose={onClose} titleId="cat-move-title" className="max-w-sm">
             <div className="flex flex-col gap-3 p-5">
                 <h2 id="cat-move-title" className="text-base font-semibold text-text">
-                    Move “{node.name}”
+                    Move “{categoryPath(node.id, node.name)}”
                 </h2>
                 <p className="text-xs text-text-muted">
                     Choose a new parent, or move it to the top level.
@@ -336,6 +390,7 @@ export interface CategoryMergeDialogProps {
 }
 
 export function CategoryMergeDialog({ ledgerId, node, accounts, onClose, onSaved }: CategoryMergeDialogProps) {
+    const categoryPath = useCategoryPath(accounts);
     const [targetId, setTargetId] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
 
@@ -344,11 +399,10 @@ export function CategoryMergeDialog({ ledgerId, node, accounts, onClose, onSaved
         set.add(node.id);
         return set;
     }, [node.id, accounts]);
-    const isEligible = useMemo(
-        () => eligibleCategory(node.categoryKind, excluded),
-        [node.categoryKind, excluded],
-    );
+    const isEligible = useMemo(() => eligibleMergeTarget(excluded), [excluded]);
     const hasTarget = useMemo(() => accounts.some(isEligible), [accounts, isEligible]);
+    const target = targetId !== null ? accounts.find((a) => a.id === targetId) ?? null : null;
+    const kindChanges = target !== null && target.categoryKind !== node.categoryKind;
 
     const mergeMut = useMutation({
         mutationFn: () => mergeCategory(ledgerId, node.id, { targetId: targetId ?? '' }),
@@ -357,7 +411,10 @@ export function CategoryMergeDialog({ ledgerId, node, accounts, onClose, onSaved
     });
 
     const targetName = targetId !== null
-        ? accounts.find((a) => a.id === targetId)?.name ?? null
+        ? (() => {
+            const a = accounts.find((x) => x.id === targetId);
+            return a !== undefined ? categoryPath(a.id, a.name) : null;
+        })()
         : null;
     const txns = node.transactionCount;
     const kids = node.childCount;
@@ -366,13 +423,13 @@ export function CategoryMergeDialog({ ledgerId, node, accounts, onClose, onSaved
         <Modal open onClose={onClose} titleId="cat-merge-title" className="max-w-sm">
             <div className="flex flex-col gap-3 p-5">
                 <h2 id="cat-merge-title" className="text-base font-semibold text-text">
-                    Merge “{node.name}”
+                    Merge “{categoryPath(node.id, node.name)}”
                 </h2>
 
                 {!hasTarget ? (
                     <p className="text-sm text-text-muted">
-                        There’s no other {node.categoryKind} category to merge into. Create one
-                        first, or move this category instead.
+                        There’s no other category to merge into. Create one first, or
+                        move this category instead.
                     </p>
                 ) : (
                     <>
@@ -396,7 +453,21 @@ export function CategoryMergeDialog({ ledgerId, node, accounts, onClose, onSaved
                                     <> and <span className="font-medium text-text">{kids} sub-categor{kids === 1 ? 'y' : 'ies'}</span></>
                                 ) : null}{' '}
                                 into <span className="font-medium text-text">{targetName}</span>, then
-                                deactivates “{node.name}”. This can be undone by reactivating it.
+                                deactivates “{categoryPath(node.id, node.name)}”. This can be undone
+                                by reactivating it.
+                            </p>
+                        ) : null}
+                        {kindChanges && target !== null ? (
+                            <p className="rounded border border-state-warning/40 bg-state-warning-soft p-2 text-xs leading-relaxed text-text">
+                                These are different kinds. Those{' '}
+                                <span className="font-medium">{txns} transaction{txns === 1 ? '' : 's'}</span>{' '}
+                                move from{' '}
+                                <span className="font-medium">{KIND_LABEL[node.categoryKind] ?? node.categoryKind}</span>{' '}
+                                to{' '}
+                                <span className="font-medium">{KIND_LABEL[target.categoryKind ?? ''] ?? target.categoryKind}</span>,
+                                which changes the totals they count towards — for their whole history,
+                                not just this month. This is the intended way to reclassify a category;
+                                it is only worth being sure it is what you meant.
                             </p>
                         ) : null}
                     </>

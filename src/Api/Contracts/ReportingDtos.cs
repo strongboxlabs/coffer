@@ -18,8 +18,19 @@ public enum ReportMeasure
 }
 
 /// <summary>Time granularity for the series. <see cref="None"/> = a single total
-/// per group (no time axis).</summary>
-public enum ReportTimeBucket { None, Month, Quarter, Year }
+/// per group (no time axis).
+/// <para><see cref="Day"/> is supported for the CATEGORY dimension only — it is
+/// there to feed a daily spending chart, and adding the day to the SQL grouping
+/// key multiplies the row count by up to 31 for every caller that does not want
+/// it. Asking for a daily series by account or payee throws rather than
+/// silently returning monthly buckets.</para>
+/// <para>Day buckets are only trustworthy because the session timezone is
+/// pinned to UTC (see AppUserDbConnectionInterceptor): Postgres extracts date
+/// parts from a timestamptz in the session zone, so an unpinned session would
+/// put a late-evening transaction on the wrong DAY for anyone west of UTC —
+/// visible every day, unlike the month-boundary version of the same bug.</para>
+/// </summary>
+public enum ReportTimeBucket { None, Month, Quarter, Year, Day }
 
 /// <summary>
 /// The dimension a transaction summary groups by. The measure (spending/income/

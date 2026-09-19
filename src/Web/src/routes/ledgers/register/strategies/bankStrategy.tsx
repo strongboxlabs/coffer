@@ -67,7 +67,15 @@ export function renderBankSlot5(txn: BankRow): ReactNode {
 export function renderBankSlot6(
     txn: BankRow,
     accountPaths?: ReadonlyMap<string, string>,
+    rollupRootId?: string | null,
 ): ReactNode {
+    // Subtree rollup only: the row's OWN category, when it isn't the one in
+    // the breadcrumb. Full parent/child path, like every other category shown
+    // outside a tree. Leads the cell because it answers "what is this row"
+    // before the counterparty answers "against what".
+    const ownPath = rollupRootId != null && txn.accountId !== rollupRootId
+        ? displayAccountPath(accountPaths, txn.accountId, null)
+        : null;
     const chipVariant = categoryChipVariant(
         txn.counterpartyAccountName,
         txn.counterpartyAccountType,
@@ -78,6 +86,15 @@ export function renderBankSlot6(
     );
     return (
         <>
+            {ownPath ? (
+                <Chip
+                    variant={categoryChipVariant(ownPath, 'category', txn.accountId)}
+                    className="max-w-full truncate"
+                    title={`Filed under ${ownPath}`}
+                >
+                    <span className="truncate">{ownPath}</span>
+                </Chip>
+            ) : null}
             {txn.counterpartyAccountName ? (
                 <Chip
                     variant={chipVariant}

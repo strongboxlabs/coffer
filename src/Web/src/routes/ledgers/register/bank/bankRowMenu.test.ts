@@ -51,13 +51,14 @@ function makeRow(overrides: Partial<BankRow> & { id: string }): BankRow {
 
 const noopActions = {
     onApprove: () => {},
+    onEdit: () => {},
     onDuplicate: () => {},
     onCreateReminder: () => {},
     onShowOtherSide: () => {},
     onRequestDelete: () => {},
 };
 
-const ids = (row: BankRow, opts?: { originatingSplit?: boolean }) =>
+const ids = (row: BankRow, opts?: { originatingSplit?: boolean; noAuthoring?: boolean }) =>
     buildBankRowMenuItems(row, noopActions, opts).map((i) => i.id);
 
 describe('buildBankRowMenuItems — originating split-parent', () => {
@@ -72,7 +73,7 @@ describe('buildBankRowMenuItems — originating split-parent', () => {
             accountPostingsOnHeader: 9,
             headerTotalPostings: 9,
         });
-        expect(ids(row, { originatingSplit: true })).toEqual(['duplicate', 'create-reminder', 'delete']);
+        expect(ids(row, { originatingSplit: true })).toEqual(['edit', 'duplicate', 'create-reminder', 'delete']);
     });
 
     it('offers Accept + Duplicate + Delete when the originating split needs review', () => {
@@ -83,6 +84,11 @@ describe('buildBankRowMenuItems — originating split-parent', () => {
         });
         expect(ids(row, { originatingSplit: true })).toEqual([
             'accept',
+            // Edit sits after Accept and before Duplicate: Accept is the
+            // one-click resolution a flagged row is asking for, so it stays
+            // first. Until Edit existed a split parent had no menu route to
+            // its own legs at all.
+            'edit',
             'duplicate',
             'create-reminder',
             'delete',
@@ -129,5 +135,29 @@ describe('buildBankRowMenuItems — single editable row', () => {
             'show-other-side',
             'delete',
         ]);
+    });
+});
+
+describe('a category register offers no authoring', () => {
+    // Duplicate opens the NEW-transaction editor, prefilled. That editor
+    // authors against the register's own account, which on a category
+    // register is a category — a transaction is created against a money
+    // account and categorised, never authored inside one. The "+ New
+    // transaction" button is hidden for the same reason; this is the other
+    // door into the same room.
+    it('drops Duplicate on a single row', () => {
+        const row = makeRow({ id: 'r1' });
+        expect(ids(row)).toContain('duplicate');
+        expect(ids(row, { noAuthoring: true })).not.toContain('duplicate');
+    });
+
+    it('drops Duplicate on an originating split parent too', () => {
+        const row = makeRow({ id: 'r2', txnGroupId: 'g1' });
+        expect(ids(row, { originatingSplit: true })).toContain('duplicate');
+        const without = ids(row, { originatingSplit: true, noAuthoring: true });
+        expect(without).not.toContain('duplicate');
+        // …and it removes ONLY that: Edit and Delete still have to work.
+        expect(without).toContain('edit');
+        expect(without).toContain('delete');
     });
 });

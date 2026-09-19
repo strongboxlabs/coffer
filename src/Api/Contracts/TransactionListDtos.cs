@@ -35,6 +35,18 @@ public sealed class TransactionQuery
     public required Guid LedgerId { get; init; }
     public Guid? AccountId { get; init; }
     public Guid? CategoryId { get; init; }
+    /// <summary>
+    /// Restrict to lines facing ANY of these categories. Null or empty = no
+    /// restriction; combined with <see cref="CategoryId"/> both must hold.
+    /// </summary>
+    /// <remarks>
+    /// Exists for the budget screen, where expanding a row shows the whole
+    /// SUBTREE's transactions so the list adds up to the row's number — the row
+    /// is a rollup, so direct postings alone would not. The caller passes one
+    /// category and the server expands it; the alternative was one request per
+    /// descendant, which for a deep branch is a request storm for a click.
+    /// </remarks>
+    public IReadOnlyCollection<Guid>? CategoryIds { get; init; }
     /// <summary>Restrict to transactions carrying this tag (ADR-0077). Null = any.</summary>
     public Guid? TagId { get; init; }
     public string? Payee { get; init; }

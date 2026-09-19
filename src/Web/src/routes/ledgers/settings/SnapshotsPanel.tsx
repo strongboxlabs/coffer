@@ -63,8 +63,22 @@ export function SnapshotsPanel({ ledgerId }: { ledgerId: string }) {
                 <h2 className="text-base font-semibold">Snapshots</h2>
                 <p className="text-sm text-text-muted">
                     Server-side checkpoints of this ledger's data. Create one
-                    manually before a risky change, or schedule a daily
-                    auto-snapshot below. Up to 5 per ledger.
+                    before a bulk edit or an import you might want to undo, or
+                    schedule a daily auto-snapshot below. Up to 5 per ledger.
+                </p>
+                {/* Said plainly, because the honest version of this limit is
+                    unguessable and the old copy pointed straight at it: it read
+                    "create one before a risky change", while a restore refuses
+                    outright when the snapshot's schema version differs from live
+                    (ADR-0037 Phase 1). Upgrading the app is the riskiest change
+                    there is, and it is precisely the one a snapshot cannot carry
+                    you back through. A backup can. */}
+                <p className="text-sm text-text-muted">
+                    A snapshot can only be restored on the same app version that
+                    made it — upgrading the app retires the snapshots taken
+                    before it. To protect against an upgrade, take a{' '}
+                    <strong className="font-medium text-text">backup</strong>{' '}
+                    instead.
                 </p>
             </header>
 

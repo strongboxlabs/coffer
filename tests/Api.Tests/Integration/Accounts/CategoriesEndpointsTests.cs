@@ -269,8 +269,16 @@ public sealed class CategoriesEndpointsTests
     }
 
     [Fact]
-    public async Task Merge_rejects_kind_mismatch()
+    public async Task Merge_may_cross_kinds()
     {
+        // REVERSED deliberately (ADR-0017). This used to assert a 422, and the
+        // rule it pinned had the guards backwards: a cross-kind merge was refused
+        // while flipping a category's kind in place — the same reclassification,
+        // done silently to the category's entire history with no counts and no way
+        // back — was completely unguarded.
+        //
+        // The flip is now refused and the merge is the one sanctioned way to
+        // reclassify, so refusing this too would leave no route at all.
         var ledger = await SyntheticLedger.CreateAsync(_fixture);
         var expense = await ledger.AddCategoryAsync("Exp", "expense");
         var income = await ledger.AddCategoryAsync("Inc", "income");
@@ -281,8 +289,13 @@ public sealed class CategoriesEndpointsTests
         var resp = await client.PostAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/categories/{expense.Id}/merge",
             new MergeCategoryRequest(income.Id));
-        Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
-        Assert.Equal(BusinessError.Codes.CategoryKindMismatch, await ErrorCodeAsync(resp));
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        // And the source is deactivated rather than destroyed — which is what
+        // makes the reclassification reversible, and the flip's key advantage
+        // over it imaginary.
+        await using var read = _fixture.NewDbContext();
+        Assert.False((await read.Accounts.AsNoTracking().FirstAsync(a => a.Id == expense.Id)).IsActive);
     }
 
     [Fact]

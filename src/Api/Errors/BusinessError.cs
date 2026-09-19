@@ -99,6 +99,18 @@ public static class BusinessError
         // Preferences (ADR-0057)
         public const string QuoteProviderUnknown = "quote-provider-unknown";
 
+        /// <summary>A budget-progress request named a month or window the
+        /// endpoint cannot honour (unparseable month, window outside 1..24).</summary>
+        public const string BudgetRangeInvalid = "budget-range-invalid";
+
+        /// <summary>A target was refused because an ANCESTOR of that category already
+        /// holds one for the month (ADR-0099 D1a). The detail names the ancestor.</summary>
+        public const string BudgetTargetAncestorConflict = "budget-target-ancestor-conflict";
+
+        /// <summary>The mirror: a DESCENDANT already holds a target for the month.
+        /// The detail names the descendant.</summary>
+        public const string BudgetTargetDescendantConflict = "budget-target-descendant-conflict";
+
         // Schedules (mig 136 — quote-refresh / snapshot)
         public const string ScheduleInvalid = "schedule-invalid";
         public const string ScheduleJobTypeUnknown = "schedule-job-type-unknown";
@@ -141,6 +153,13 @@ public static class BusinessError
         public const string PaymentReminderSourceInvalid  = "payment-reminder-source-invalid";
         // Categories management (Slice A) — REST over the ADR-0068 repo methods.
         public const string AccountNotACategory         = "account-not-a-category";
+
+        /// <summary>A request tried to CHANGE an existing category's kind. Refused
+        /// outright (ADR-0017): the flip would retroactively move every posting in
+        /// that category between the Spending and Income measures, silently and with
+        /// no record. Reclassify by merging into a category of the wanted kind
+        /// instead, which states what moves and can be undone.</summary>
+        public const string CategoryKindImmutable      = "category-kind-immutable";
         public const string CategoryKindMismatch        = "category-kind-mismatch";
         public const string CategoryCycle               = "category-cycle";
         public const string CategoryInUse               = "category-in-use";
@@ -182,6 +201,7 @@ public static class BusinessError
         public const string TransactionPostingSelf               = "transaction-posting-self";
         public const string TransactionPostingCounterpartyRequired = "transaction-posting-counterparty-required";
         public const string TransactionPostingLegNotInHeader     = "transaction-posting-leg-not-in-header";
+        public const string TransactionPostingLegIdDuplicated    = "transaction-posting-leg-id-duplicated";
         public const string TransactionSourceAccountMismatch     = "transaction-source-account-mismatch";
 
         // Move to account (ADR-0072 D3)
