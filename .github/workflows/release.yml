@@ -30,13 +30,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          # Full history: the identity step below counts commits, and a shallow
-          # clone would report 1 for every release.
+          # Full history so `rev-list --count` below is a real number. On this
+          # repo that count is "how many releases have been published", since a
+          # snapshot is one orphan commit per release — coherent as a build
+          # number, and the shallow default would make it the constant 1.
           fetch-depth: 0
 
-      # Stamped into the assembly because .git is dockerignored — without these the
-      # image cannot identify its own commit, and the csproj's git fallback bakes
-      # "fatal: not a git repository" into the version string instead.
+      # WHY THIS EXISTS AT ALL. .git is dockerignored, so the build stage is not
+      # a repo and cannot work its own commit out. Without these three passed in,
+      # Api.csproj consults a .git that is not there — and until the fix in
+      # 0.88.0 it captured git's own "fatal: not a git repository" as the value,
+      # so every public image ever built carried that error text as its version
+      # and rendered it in its own About panel. Post-0.88.0 it degrades honestly
+      # to "X.Y.Z+nogit" instead, which is better but still cannot name a commit.
+      #
+      # THE SHA IS THIS REPO'S, deliberately, not the private one it was
+      # snapshotted from. A public image should name a commit a consumer can
+      # actually check out; the private sha names nothing they can reach, and
+      # the two repos share no history by construction.
+      #
+      # The private release.yml has had this since 43031e3a. That it took until
+      # 0.88.0 to reach here is the drift the publish script warns about: these
+      # two workflows cannot drift in CONTENT, because nothing is copied between
+      # them — they drift in CAPABILITY, silently, and nothing watches.
       - name: Resolve build identity
         id: ident
         run: |
@@ -98,6 +114,8 @@ jobs:
           # natively, and PGDG publishes postgresql-client-16 for arm64 on noble (the
           # aspnet:10.0 base), which the runtime stage needs.
           platforms: linux/amd64,linux/arm64
+          # Stamped into the assembly; see "Resolve build identity" above for why
+          # the build cannot derive these itself.
           build-args: |
             SOURCE_COMMIT_SHA=${{ steps.ident.outputs.sha }}
             SOURCE_COMMIT_COUNT=${{ steps.ident.outputs.count }}
