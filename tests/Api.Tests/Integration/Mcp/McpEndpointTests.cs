@@ -107,4 +107,49 @@ public sealed class McpEndpointTests
                 + "Program.cs; the SDK's default is true and must be overridden.");
         Assert.False(string.IsNullOrWhiteSpace(ids!.FirstOrDefault()));
     }
+
+    /// <summary>
+    /// The budget tool is REGISTERED, proven over the wire rather than by calling
+    /// the static method.
+    /// </summary>
+    /// <remarks>
+    /// Read tools register by assembly scan for <c>[McpServerToolType]</c>. That is
+    /// convenient and silent: a class that loses the attribute, or a tool whose
+    /// signature the SDK declines to bind, disappears from the surface while every
+    /// direct-call unit test stays green — the feature is inert and nothing says so.
+    /// So this asks the SERVER what it exposes.
+    /// </remarks>
+    [Fact]
+    public async Task Budget_progress_is_actually_exposed_as_a_tool()
+    {
+        await using var factory = new ApiFactory(_fixture).WithMcpEnabled();
+        using var client = factory.CreateClient();
+
+        // Stateful transport: tools/list has to carry the session initialize hands back.
+        var init = await client.SendAsync(NewInitialize());
+        Assert.True(init.Headers.TryGetValues("Mcp-Session-Id", out var ids));
+        var sessionId = ids!.First();
+
+        var request = new HttpRequestMessage(HttpMethod.Post, "/mcp")
+        {
+            Content = JsonContent.Create(new
+            {
+                jsonrpc = "2.0",
+                id = 2,
+                method = "tools/list",
+            }),
+        };
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+        request.Headers.Add("Mcp-Session-Id", sessionId);
+
+        var response = await client.SendAsync(request);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        // Anchor on a tool that has always been there, so a body that failed to
+        // parse or came back empty cannot read as "budget_progress is missing".
+        Assert.Contains("transaction_summary", body, StringComparison.Ordinal);
+        Assert.Contains("budget_progress", body, StringComparison.Ordinal);
+    }
 }

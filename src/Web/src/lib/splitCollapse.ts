@@ -37,6 +37,24 @@ export type DisplayRow<R extends RegisterRow = RegisterRow> =
     | { kind: 'split-leg'; leg: R };
 
 /**
+ * Does this rendered row carry the given header?
+ *
+ * Shared because focus is resolved by header ID rather than by index: the
+ * windowed-register hook counts ENTRIES while a register renders ROWS (after
+ * regrouping target splits, filtering by status and expanding groups), and the
+ * two counts are not equal on either register. Resolving by id removes the
+ * chance of comparing one space against the other.
+ */
+export function rowHasHeader<R extends RegisterRow>(
+    row: DisplayRow<R>,
+    headerId: string,
+): boolean {
+    if (row.kind === 'txn') return row.txn.headerId === headerId;
+    if (row.kind === 'split-leg') return row.leg.headerId === headerId;
+    return row.legs.some((l) => l.headerId === headerId);
+}
+
+/**
  * A register entry narrowed to a domain row shape `R` — the shared input to
  * {@link regroupTargetSplits} and {@link buildDisplayRows}. Mirrors the API
  * `RegisterEntryDto` union; a domain-scoped caller narrows its window to `R`

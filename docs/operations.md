@@ -649,8 +649,8 @@ are browser-driven and usually pass.
   are generated per install on first start and are gitignored. A container install keeps
   them on its own volume; the image ships no `/app/data`, so it always mints its own. A
   NATIVE run writes them into `src/Api/data/` — its content root — which is why that
-  path is ignored and why `scripts/maintainer/check-no-key-material.sh` fails preflight
-  if anything under it becomes tracked.
+  path is ignored and why the key-material check fails preflight if anything under
+  it becomes tracked.
 
   These two files were tracked and published in earlier snapshots, so **treat that key
   pair as public**. Container installs were never affected (own volume, own keys). A

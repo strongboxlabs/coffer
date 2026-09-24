@@ -14,7 +14,7 @@ import {
 import { errorMessage } from '@/lib/errorMessage';
 import { accountTypeMeta } from '@/lib/accountTypes';
 import { buildAccountPathMap } from '@/lib/accountPath';
-import { overspentRows } from './budget/cumulative';
+import { ceilingFromRows, overspentRows } from './budget/cumulative';
 import { formatCurrency, formatSignedAmount } from '@/lib/money';
 import type {
     LedgerOverview,
@@ -308,13 +308,23 @@ function AccountGroup({
 }
 
 /**
- * This month's spend against what is typical — the dashboard's one-glance half
- * of budgeting.
+ * This month's spend against the budget — the dashboard's one-glance half of
+ * budgeting.
  *
- * It answers "is this month out of the ordinary" and nothing else. No targets,
- * nothing to set up, and no empty state that demands configuration first: the
- * numbers exist the moment there is categorised spending, because `typical` is
- * derived from history rather than declared.
+ * Still no empty state that demands configuration first: with no targets set
+ * it judges against what is TYPICAL, which exists the moment there is
+ * categorised spending because it is derived from history rather than
+ * declared. Set a target and the same widget judges against that instead,
+ * because `mark` is already whichever of the two applies (ADR-0099 D1).
+ *
+ * It used to say "no targets, nothing to set up" and mean it — the comparison
+ * was hard-wired to `typical`. That outlived the targets shipping in 0.88.0,
+ * and left the widget SELECTING rows one way and DISPLAYING them another:
+ * `overspentRows` has always ranked by mark, so a category with typical 500,
+ * target 200 and actual 300 was picked as over — then had its overage printed
+ * against typical, rendering "+-$200.00". Both halves judge by mark now, and
+ * the totals use the same `ceilingFromRows` the budget screen's hero draws, so
+ * the widget and the screen behind "See all" cannot disagree.
  *
  * Fetches its own data rather than riding the overview aggregate, because
  * `OverviewRepository` is scoped to net worth and excludes categories by
@@ -351,6 +361,16 @@ function SpendingWidget({ ledgerId }: { ledgerId: string }) {
     // widget that cries wolf every month stops being read.
     const hot = overspentRows(data?.rows ?? []).slice(0, 3);
 
+    // The SAME ceiling the budget screen's hero draws — sum of the marks over
+    // root rows — rather than `typicalTotal`, which ignores every target that
+    // has been set. Two surfaces showing one month must not disagree about
+    // what the month is measured against.
+    const ceiling = ceilingFromRows(data?.rows ?? []);
+    const anyTarget = (data?.rows ?? []).some((r) => r.target !== null);
+    const barMax = Math.max(data?.actualTotal ?? 0, ceiling ?? 0) * 1.05 || 1;
+    const barPct = (v: number) =>
+        `${Math.max(0, Math.min(100, (v / barMax) * 100))}%`;
+
     return (
         <Panel>
             <PanelHead className="flex items-center justify-between">
@@ -381,15 +401,40 @@ function SpendingWidget({ ledgerId }: { ledgerId: string }) {
                             </div>
                             <div className="text-right">
                                 <div className="font-mono text-sm tabular-nums text-text-muted">
-                                    {data.typicalTotal === null
+                                    {ceiling === null
                                         ? '—'
-                                        : formatCurrency(data.typicalTotal, currency)}
+                                        : formatCurrency(ceiling, currency)}
                                 </div>
                                 <div className="text-[0.6875rem] text-text-muted">
-                                    usually, over {data.windowMonths} months
+                                    {anyTarget
+                                        ? 'budgeted'
+                                        : `usually, over ${data.windowMonths} months`}
                                 </div>
                             </div>
                         </div>
+                        {/* Same construction as the budget screen's bars: the
+                            run to the mark in accent, the excess beyond it in
+                            danger, the mark itself a tick. Drawn only when
+                            there IS a ceiling — a bar against nothing would
+                            imply a limit the ledger has not got. */}
+                        {ceiling !== null ? (
+                            <span aria-hidden className="relative block h-control-20px">
+                                <span
+                                    className="absolute top-1.5 h-fixed-8px rounded-l-full bg-accent"
+                                    style={{ left: 0, width: barPct(Math.min(data.actualTotal, ceiling)) }}
+                                />
+                                {data.actualTotal > ceiling ? (
+                                    <span
+                                        className="absolute top-1.5 h-fixed-8px rounded-r-full bg-state-danger"
+                                        style={{ left: barPct(ceiling), width: barPct(data.actualTotal - ceiling) }}
+                                    />
+                                ) : null}
+                                <span
+                                    className="absolute top-0 h-full w-fixed-2px bg-border-strong"
+                                    style={{ left: barPct(ceiling) }}
+                                />
+                            </span>
+                        ) : null}
                         {hot.length > 0 ? (
                             <ul className="space-y-0.5 border-t border-border/40 pt-2">
                                 {hot.map((r) => (
@@ -400,8 +445,10 @@ function SpendingWidget({ ledgerId }: { ledgerId: string }) {
                                         >
                                             {paths.get(r.categoryId) ?? r.name}
                                         </span>
+                                        {/* Against the MARK, matching how
+                                            overspentRows picked this row. */}
                                         <span className="shrink-0 font-mono tabular-nums text-state-danger">
-                                            +{formatCurrency(r.actual - (r.typical ?? 0), currency)}
+                                            +{formatCurrency(r.actual - (r.mark ?? 0), currency)}
                                         </span>
                                     </li>
                                 ))}

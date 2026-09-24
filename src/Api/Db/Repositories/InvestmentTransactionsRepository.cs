@@ -430,14 +430,19 @@ public sealed class InvestmentTransactionsRepository
     /// field matrix is re-validated against the resulting
     /// (post-patch) shape.</para>
     ///
-    /// <para>Balances, holdings/lots, and posting counts all recompute
-    /// automatically via <see cref="LegDerivedRecomputeInterceptor"/> +
-    /// <see cref="HoldingsRecomputeInterceptor"/>. The leg-drop +
-    /// header-update flush captures the OLD (account, security) +
-    /// (account, posted_at) pairs from the tracked deletes, and the
-    /// subsequent EF-tracked leg insert captures the NEW pairs — both
-    /// reconcile on their respective <c>SaveChangesAsync</c> boundaries.
-    /// No explicit recompute call here.</para>
+    /// <para>Legs KEEP their ids across an edit wherever the new shape still
+    /// has a leg with the same (account, posting_role, security) — see the
+    /// block that does the matching. Only what the new shape has no room for
+    /// is deleted. This exists because anything keyed on leg_id used to die
+    /// with the row, <c>txn_leg_recon</c> most damagingly.</para>
+    ///
+    /// <para>Balances and posting counts recompute via
+    /// <see cref="LegDerivedRecomputeInterceptor"/>, whose Modified branch
+    /// supplies both the OLD and the NEW pair from OriginalValues — so the
+    /// two-flush split that used to carry that is no longer what makes it
+    /// correct. Holdings and lots are reconciled EXPLICITLY at the end:
+    /// <see cref="HoldingsRecomputeInterceptor"/> watches legs only, so a
+    /// shape-identical edit produces nothing for it to see.</para>
     /// </remarks>
     public async Task<PatchResult> PatchAsync(
         Guid ledgerId,
@@ -464,33 +469,24 @@ public sealed class InvestmentTransactionsRepository
         // bank: the URL headerId is the LOSER, MergeFromHeaderId the WINNER.
         if (request.MergeFromHeaderId is { } mergeWinnerId)
         {
-            // Editor row must still be a fresh, undecided, effectively-visible
-            // row (override-aware hidden) — merging an accepted/merged/hidden
-            // row would mutate a tombstone.
-            var editorHidden = await _db.TxnHeaderOverrides
-                .Where(o => o.HeaderId == headerId)
-                .Select(o => (bool?)o.IsHidden).FirstOrDefaultAsync(cancellationToken)
-                .ConfigureAwait(false) ?? existing.IsHidden;
+            // Editor row must still be a fresh, undecided, visible row —
+            // merging an accepted/merged/hidden row would mutate a tombstone.
+            // is_hidden is canonical since mig 230.
             if (!existing.NeedsReview
                 || existing.IsMergedInto is not null
-                || editorHidden
+                || existing.IsHidden
                 || mergeWinnerId == headerId)
                 return PatchResult.Fail(PatchFailure.MergeSourceInvalid);
 
             var winner = await _db.TxnHeaders
                 .FirstOrDefaultAsync(h => h.Id == mergeWinnerId && h.LedgerId == ledgerId,
                     cancellationToken).ConfigureAwait(false);
-            var winnerHidden = winner is not null
-                && (await _db.TxnHeaderOverrides
-                        .Where(o => o.HeaderId == mergeWinnerId)
-                        .Select(o => (bool?)o.IsHidden).FirstOrDefaultAsync(cancellationToken)
-                        .ConfigureAwait(false) ?? winner.IsHidden);
             // Candidate must be settled + visible + not itself a loser.
             // Winners ARE allowed (multi-source collapse keeps a one-hop graph).
             if (winner is null
                 || winner.NeedsReview
                 || winner.IsMergedInto is not null
-                || winnerHidden)
+                || winner.IsHidden)
                 return PatchResult.Fail(PatchFailure.MergeSourceInvalid);
 
             // The loser's holdings-side (account, security) pairs — its shares
@@ -507,23 +503,105 @@ public sealed class InvestmentTransactionsRepository
                 .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             existing.IsMergedInto = winner.Id;   // editor row → loser
             winner.IsMergeWinner = true;          // candidate → winner (idempotent)
+            // ...and the loser is no longer awaiting review. The bank editor has
+            // always sent `approve: true` alongside its merge stamp — "to keep
+            // state coherent if the row is ever surfaced again" — and the
+            // investment branch, which takes a merge-ONLY patch and returns before
+            // any approve handling, never did. So investment losers alone stayed
+            // flagged, and the sidebar's review dot stayed lit on an account whose
+            // register had nothing left to review.
+            //
+            // Done HERE rather than by teaching the SPA to send the flag: the
+            // server owns the end state, and a merge-only PATCH should not depend
+            // on a caller remembering to pair it with an approve.
+            existing.NeedsReview = false;
             // Winner adopts the imported (loser) row's date — the fresh feed
-            // row's date is authoritative for the merged event. Override layer
-            // (ADR-0003); balance-relevant, so the balance recompute interceptor
-            // rewalks the winner's account on save.
+            // row's date is authoritative for the merged event. Written onto the
+            // winner's canonical row since mig 230, with its feed date captured
+            // to txn_header_originals first. Balance-relevant, so the balance
+            // recompute interceptor rewalks the winner's account on save.
             var importedPostedAt = request.PostedAt ?? existing.PostedAt;
-            await SetPostedAtOverrideAsync(ledgerId, winner.Id, importedPostedAt, cancellationToken)
+            await SetPostedAtAsync(winner, importedPostedAt, cancellationToken)
                 .ConfigureAwait(false);
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
             // Stamping is_merged_into on the header doesn't mutate txn_legs, so
             // the HoldingsRecomputeInterceptor never fires — trigger the holdings
-            // recompute explicitly for the loser's (account, security). Mig 163
-            // makes the recompute exclude merged legs, so the loser's shares drop
-            // out. Same transaction, so it's atomic with the stamp.
+            // recompute explicitly. Mig 163 makes the recompute exclude merged
+            // legs, so the loser's shares drop out. Same transaction, so it's
+            // atomic with the stamp.
+            //
+            // The WINNER's pairs go in too, and that became load-bearing with mig
+            // 229. The walk orders by the date the line above just moved — so the
+            // winner's lots, basis and realized gains can re-sort against
+            // everything else in that holding, and recomputing only the loser
+            // would leave the winner's figures derived from its pre-merge
+            // position. (229 moved the walk onto the effective date; 230 made
+            // that the only date there is.)
+            var winnerPairs = await _db.TxnLegs.AsNoTracking()
+                .Where(l => l.HeaderId == winner.Id
+                    && l.SecurityId != null
+                    && l.Quantity != null)
+                .Select(l => new { l.AccountId, SecurityId = l.SecurityId!.Value })
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+
             await new HoldingsRecomputeService(_db)
                 .RecomputeAsync(
-                    loserPairs.Select(p => (p.AccountId, p.SecurityId)), cancellationToken)
+                    loserPairs.Select(p => (p.AccountId, p.SecurityId))
+                        .Concat(winnerPairs.Select(p => (p.AccountId, p.SecurityId)))
+                        .Distinct(),
+                    cancellationToken)
                 .ConfigureAwait(false);
+
+            // ADR-0082 merge → reconciling, as the bank branch has always done.
+            // A feed match is the INSTITUTION acknowledging the transaction, and
+            // nothing in that reasoning depends on the institution being a bank:
+            // a brokerage confirming a trade is the same evidence in the same
+            // shape. The survivor's leg becomes 'reconciling' unless it is
+            // already 'cleared' — the stronger, user-affirmed state wins.
+            //
+            // THE BROKERAGE, not "the first non-category account" the bank picks.
+            // An investment header also carries legs on the HOLDINGS sibling,
+            // which is an account of type 'investment' and would satisfy that
+            // heuristic; the recon status belongs on the cash sleeve the register
+            // actually shows. A brokerage is the account that POINTS AT a
+            // holdings account, which is how the rest of this file identifies
+            // one.
+            var brokerageAccountId = await _db.TxnLegs
+                .Where(l => l.HeaderId == headerId)
+                .Join(_db.Accounts, l => l.AccountId, a => a.Id, (l, a) => a)
+                .Where(a => a.HoldingsAccountId != null)
+                .Select(a => (Guid?)a.Id)
+                .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            if (brokerageAccountId is { } brokerageId)
+            {
+                var winnerLegId = await _db.TxnLegs
+                    .Where(l => l.HeaderId == winner.Id && l.AccountId == brokerageId)
+                    .Select(l => (Guid?)l.Id)
+                    .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+                if (winnerLegId is { } legId)
+                {
+                    var current = await _db.TxnLegRecon
+                        .FirstOrDefaultAsync(r => r.LegId == legId, cancellationToken)
+                        .ConfigureAwait(false);
+                    if (current is null)
+                    {
+                        // 'reconciling' never carries clearedAt/clearedBy — those
+                        // belong to 'cleared', which only a person sets.
+                        _db.TxnLegRecon.Add(new TxnLegReconRow
+                        {
+                            LegId = legId,
+                            LedgerId = ledgerId,
+                            Status = "reconciling",
+                        });
+                    }
+                    else if (current.Status != "cleared")
+                    {
+                        current.Status = "reconciling";
+                    }
+                    await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                }
+            }
+
             await mergeTx.CommitAsync(cancellationToken).ConfigureAwait(false);
             return PatchResult.Ok();
         }
@@ -609,9 +687,16 @@ public sealed class InvestmentTransactionsRepository
         var oldLegs = await _db.TxnLegs
             .Where(l => l.HeaderId == headerId)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
-        _db.TxnLegs.RemoveRange(oldLegs);
+        // NOT removed yet — which legs survive is decided below, once the new
+        // specs exist to match against.
 
-        // Update header in place.
+        // Update header in place. The feed's values are captured to
+        // txn_header_originals first (mig 230) — this path has always written
+        // canonical and, until 230, captured nothing at all, so an investment
+        // edit destroyed the imported values outright. Rows edited before 230
+        // are past recovering; from here on both paths keep the original.
+        await HeaderOriginals.CaptureAsync(_db, existing, cancellationToken)
+            .ConfigureAwait(false);
         existing.Payee        = asCreate.Payee;
         existing.Memo         = asCreate.Memo;
         existing.CheckNumber  = asCreate.CheckNumber;
@@ -654,6 +739,130 @@ public sealed class InvestmentTransactionsRepository
                 && firstHoldingsLegId == Guid.Empty)
             {
                 firstHoldingsLegId = otherId;
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Keep leg IDENTITY across the edit.
+        //
+        // This used to delete every leg and rebuild with fresh ids. Anything
+        // keyed on leg_id therefore died with the row — and txn_leg_recon.leg_id
+        // cascades on delete (mig 171), so editing a CLEARED brokerage row, even
+        // just its memo, silently reverted it to uncleared and destroyed
+        // cleared_at / cleared_by_user_id. A reconciled brokerage account drifted
+        // with nothing on screen to say why. The bank path never had this: it
+        // keeps the legs a request names by legId and mutates them in place.
+        //
+        // The investment editor cannot name legs — they are DERIVED from the
+        // action x field matrix, so the client never sees them — so identity is
+        // re-established here instead, by matching old to new on
+        // (account_id, posting_role, security_id).
+        //
+        // That key is load-bearing, not incidental: it is what makes a reused id
+        // unable to migrate between (account, security) pairs. realized_gains
+        // carries UNIQUE (sell_leg_id) (mig 148) and the recompute deletes and
+        // re-inserts per pair, so an id that moved across pairs could race the two
+        // per-pair recomputes and collide. Narrowing this key would open that.
+        // ----------------------------------------------------------------
+        var reusedLegIds = new List<Guid>();
+        List<LegInsertSpec> legsToInsert;
+        if (asCreate.Action == LedgerActions.TransferShares)
+        {
+            // transfer_shares is EXCLUDED from reuse. Its FIFO plan is computed
+            // from committed lots after the drop flush precisely so it cannot see
+            // this transfer's own effect (see below), which means its legs must
+            // genuinely be gone by then. Its postings are also per-moved-lot, so
+            // there is no stable (account, role, security) identity to match on —
+            // every lot's leg looks alike under that key.
+            _db.TxnLegs.RemoveRange(oldLegs);
+            legsToInsert = legs;
+        }
+        else
+        {
+            var pool = new List<TxnLegRow>(oldLegs);
+            legsToInsert = new List<LegInsertSpec>(legs.Count);
+            for (var i = 0; i < legs.Count; i++)
+            {
+                var spec = legs[i];
+                // Null-safe on security_id: cash-side legs carry NULL, and in SQL
+                // semantics NULL never equals NULL — matching those by == would
+                // silently rebuild every cash leg.
+                var match = pool.FirstOrDefault(l =>
+                    l.AccountId == spec.Leg.AccountId
+                    && l.PostingRole == spec.Leg.PostingRole
+                    && Nullable.Equals(l.SecurityId, spec.Leg.SecurityId));
+                if (match is null)
+                {
+                    legsToInsert.Add(spec);
+                    continue;
+                }
+
+                pool.Remove(match);
+                // Mutate in place. PostingIndex is deliberately NOT set here — the
+                // renumber happens after a shift flush below, so a kept leg cannot
+                // collide with a doomed one on uq_txn_legs_posting.
+                match.Amount      = spec.Leg.Amount;
+                match.LegMemo     = spec.Leg.LegMemo;
+                match.Quantity    = spec.Leg.Quantity;
+                match.UnitPrice   = spec.Leg.UnitPrice;
+                reusedLegIds.Add(match.Id);
+                // The lot binds to the holdings leg by id, so the spec has to
+                // carry the id that actually survived.
+                legs[i] = spec with { Id = match.Id };
+            }
+
+            // Whatever the new shape had no room for.
+            _db.TxnLegs.RemoveRange(pool);
+        }
+
+        // The holdings leg may now be a REUSED id rather than the freshly
+        // generated one, and the acquisition lot binds to it. Recomputed here
+        // rather than in the build loop, which ran before matching.
+        if (asCreate.Action != LedgerActions.TransferShares)
+        {
+            firstHoldingsLegId = Guid.Empty;
+            foreach (var spec in legs)
+            {
+                if (spec.Leg.AccountId == holdingsAccountId
+                    && spec.Leg.PostingRole == PostingRoles.Security)
+                {
+                    firstHoldingsLegId = spec.Id;
+                    break;
+                }
+            }
+        }
+
+        // A surviving leg keeps its txn_leg_recon row, and that is the POINT of
+        // reusing the identity — the reconciled state is what an edit used to
+        // destroy. It is deliberately not dropped here; nor does the bank path
+        // drop it.
+        //
+        // This block also used to delete the leg's txn_leg_overrides row, on the
+        // reasoning that a stale override would mask the amount just saved. That
+        // table went away in migration 230 (zero rows in every database, never
+        // written by the API), so only the index dance is left.
+        if (reusedLegIds.Count > 0)
+        {
+            // Park kept legs at indices nothing else can claim, and flush, so the
+            // final renumber below cannot transiently collide with a leg being
+            // deleted in the same save. The bank calls the equivalent step
+            // mandatory; EF gives no ordering guarantee between the delete and the
+            // update that wants the vacated index.
+            //
+            // Only when something actually MOVES. Shifting unconditionally would
+            // also make every reused leg Modified on every edit, which would mask
+            // the holdings-recompute gap below behind an accident: the interceptor
+            // watches legs, so it would fire for the wrong reason and stop firing
+            // the day someone tightened this.
+            var finalIndexById = legs.ToDictionary(x => x.Id, x => x.PostingIndex);
+            var anyIndexMoves = oldLegs.Any(l =>
+                finalIndexById.TryGetValue(l.Id, out var target) && target != l.PostingIndex);
+            if (anyIndexMoves)
+            {
+                foreach (var leg in oldLegs)
+                {
+                    if (reusedLegIds.Contains(leg.Id)) leg.PostingIndex += PostingIndexShift;
+                }
             }
         }
 
@@ -706,9 +915,22 @@ public sealed class InvestmentTransactionsRepository
         // both interceptors from the ChangeTracker: HoldingsRecompute
         // (auto-creates the NEW (brokerage, security) holding row, so
         // GetHoldingIdAsync below finds it) and LegDerivedRecompute
-        // (balances + posting counts). The prior leg-drop flush already
-        // reconciled the OLD pairs. No explicit recompute call needed.
-        _db.TxnLegs.AddRange(legs.Select(ToTxnLegRow));
+        // (balances + posting counts). Legs KEPT from the old shape are
+        // Modified rather than Added, and that branch reports both their old
+        // and new pair, so the OLD side is covered without the delete.
+        //
+        // Now that the doomed legs are gone, the kept ones can take their final
+        // indices without contending for one.
+        if (reusedLegIds.Count > 0)
+        {
+            var specById = legs.ToDictionary(x => x.Id, x => x.PostingIndex);
+            foreach (var leg in oldLegs)
+            {
+                if (specById.TryGetValue(leg.Id, out var finalIndex))
+                    leg.PostingIndex = finalIndex;
+            }
+        }
+        _db.TxnLegs.AddRange(legsToInsert.Select(ToTxnLegRow));
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 
         if (asCreate.Action == LedgerActions.TransferShares)
@@ -770,10 +992,39 @@ public sealed class InvestmentTransactionsRepository
             }
         }
 
+        // HoldingsRecomputeInterceptor watches txn_legs and nothing else, so it
+        // used to fire on every PATCH only because every PATCH deleted every leg.
+        // Now a shape-identical edit — a memo fix, or a DATE change, which reorders
+        // the FIFO walk — can produce no leg diff at all and recompute nothing,
+        // leaving lots, realized_gains and cost basis derived from the old order.
+        // So the pairs this header touches, before and after, are reconciled
+        // explicitly. Recompute is a full re-derivation, so doing it when the
+        // interceptor already did is a no-op, not a double-count.
+        var touchedPairs = oldLegs
+            .Where(l => l.SecurityId is not null && l.Quantity is not null)
+            .Select(l => (l.AccountId, SecurityId: l.SecurityId!.Value))
+            .Concat(legs
+                .Where(x => x.Leg.SecurityId is not null && x.Leg.Quantity is not null)
+                .Select(x => (x.Leg.AccountId, SecurityId: x.Leg.SecurityId!.Value)))
+            .Distinct()
+            .ToList();
+        if (touchedPairs.Count > 0)
+        {
+            await new HoldingsRecomputeService(_db)
+                .RecomputeAsync(touchedPairs, cancellationToken).ConfigureAwait(false);
+        }
+
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
         return PatchResult.Ok();
     }
+
+    /// <summary>
+    /// Offset kept legs are parked at while their doomed siblings are deleted.
+    /// Larger than any plausible posting count, so a parked index can never be
+    /// one a final renumber wants.
+    /// </summary>
+    private const int PostingIndexShift = 10_000;
 
     // ----------------------------------------------------------------
     // DELETE — hard-delete manual / soft-hide imported
@@ -822,8 +1073,20 @@ public sealed class InvestmentTransactionsRepository
         if (header is null) return DeleteOutcome.HeaderNotFound;
         if (header.Action is null) return DeleteOutcome.HeaderNotInvestment;
 
+        // A fired reminder occurrence is NOT hard-deleted, exactly as on the bank
+        // side. GetUpcomingAsync decides "already fired" from the (series, slot)
+        // stamp on a live committed header, so removing the row returns the slot to
+        // the agenda as un-acted and re-fireable — while the identical delete of a
+        // BANK occurrence leaves it consumed. Soft-hiding keeps the stamp, takes the
+        // row out of the register the same way a deleted feed row goes, and
+        // UnhideAsync is already the undo.
+        var isReminderOccurrence =
+            header.RecurringTransactionId is not null
+            && header.OccurrenceDate is not null
+            && !header.IsRecurringTemplate;
+
         DeleteOutcome outcome;
-        if (header.ExternalId is null)
+        if (header.ExternalId is null && !isReminderOccurrence)
         {
             // Hard delete cascades through txn_legs. Both interceptors
             // (mig 102 balance + mig 104 holdings) read the doomed
@@ -856,126 +1119,188 @@ public sealed class InvestmentTransactionsRepository
     /// <summary>
     /// Investment merge candidates for the editor's "possible matches" panel
     /// (mirrors <see cref="TransactionsRepository.GetMergeCandidatesAsync"/> for
-    /// the bank shape). The anchor is the edited row's holdings-side security
-    /// leg — the header must be a fresh, undecided, effectively-visible
-    /// investment row (needs_review). Candidates are SETTLED investment rows on
-    /// the SAME holdings-sibling account (→ same brokerage + ledger) and
-    /// security, within ±7 effective days, matching the anchor's signed
-    /// holdings-leg amount — the trade principal, which is stable across the
-    /// share-count rounding that differs between feeds, so a $1,293.13 buy
-    /// matches its twin even when the share counts differ slightly. For a
-    /// zero-amount basis-only move the amount is uninformative, so it falls back
-    /// to exact signed quantity. All reads go through
-    /// <c>resolved_transactions</c> (override-aware date + hidden), so matching
-    /// agrees with what the register shows. Merge winners ARE eligible (folding
-    /// into a prior winner keeps the merge graph one-hop).
+    /// the bank shape): settled investment rows the edited, still-unreviewed row
+    /// could fold into.
     /// </summary>
+    /// <remarks>
+    /// <para><b>The anchor reads the ingest HINTS, not a security leg.</b> It used
+    /// to require the edited row to carry <c>posting_role='security'</c> with a
+    /// security_id, a quantity, and a non-null <c>action</c> — while also requiring
+    /// <c>needs_review</c>. Those two demands are mutually exclusive in this
+    /// product, so the panel could never return a single row: ingest writes a
+    /// BANK-shaped two-leg posting (account + Uncategorized) and carries the
+    /// investment detail in the <c>ingest_*</c> columns, and the investment shape
+    /// only appears at Accept, which clears <c>needs_review</c> in the same
+    /// transaction. The original predicate came from ADR-0031's sync-time write
+    /// path, which specified action-bearing needs_review rows; migration 076
+    /// records that the shipped Phase 3c deliberately did NOT do that, because
+    /// <c>trg_validate_posting_role</c> (migration 057) makes posting_role and
+    /// header.action inseparable and the invariant could not be relaxed for
+    /// unreviewed rows. The anchor was written against the superseded design and
+    /// was never reachable — the only writer of that state is a raw UPDATE in the
+    /// old test fixtures, which is exactly why the gate stayed green.</para>
+    ///
+    /// <para>So the anchor is now defined over what an unreviewed row ACTUALLY
+    /// has, the way the bank anchor always has been: its source leg (the
+    /// non-category one) for the account and the effective date, and the
+    /// <c>ingest_*</c> carriers for the money, the share count and the security.
+    /// Reshaping ingest to suit the old predicate is not an option and never
+    /// was — the trigger forbids it.</para>
+    ///
+    /// <para><b>Matching.</b> Candidates are settled, un-merged, effectively
+    /// visible investment rows whose holdings leg sits on the source account's
+    /// Holdings sibling (so: same brokerage, same ledger), within ±7 effective
+    /// days, matched on MAGNITUDE:</para>
+    /// <list type="number">
+    ///   <item><description><c>ingest_amount</c> — the wire's own cash total. The
+    ///   only usable number for a reinvest, whose net on the account is 0.00 by
+    ///   construction (mig 228; before that column existed there was nothing to
+    ///   match a reinvest on at all).</description></item>
+    ///   <item><description>else the summed source-account amount — a plain buy or
+    ///   sell moves real cash, so its own leg carries the principal.</description></item>
+    ///   <item><description>else <c>ingest_shares</c> against the candidate's
+    ///   quantity, for a basis-only move where no amount is informative.</description></item>
+    /// </list>
+    /// <para>Magnitude, not signed value: <c>ingest_amount</c> is stored as the
+    /// wire's absolute total while a holdings leg is signed by direction, so a
+    /// signed comparison would miss every match.</para>
+    ///
+    /// <para><b>Security.</b> Required only when OFX actually resolved it.
+    /// <c>ingest_security_id</c> is set when the ticker hint matched an existing
+    /// <c>provider_security_mappings</c> row and NULL when it did not (a security
+    /// seen for the first time). Demanding a match in the NULL case would
+    /// guarantee zero candidates for exactly the rows a person is most likely to
+    /// be reviewing, so there the amount, account and date window carry the
+    /// match on their own.</para>
+    ///
+    /// <para>All date/visibility reads resolve the override layer so matching
+    /// agrees with what the register shows. Merge winners ARE eligible (folding
+    /// into a prior winner keeps the merge graph one-hop).</para>
+    /// </remarks>
     public async Task<IReadOnlyList<InvestmentMergeCandidateDto>> GetMergeCandidatesAsync(
         Guid ledgerId,
         Guid headerId,
         int limit,
         CancellationToken cancellationToken = default)
     {
-        // Anchor on the RAW holdings-side security leg — NOT resolved_transactions.
-        // A security posting has two legs both tagged posting_role='security'
-        // (ADR-0019); the view projects security_id onto BOTH, so filtering the
-        // view on (role=security, security_id != null) is ambiguous (cash −P and
-        // holdings +P both match). The raw cash leg carries security_id = NULL, so
-        // (security_id != null AND quantity != null) selects exactly the holdings
-        // leg. posted_at / is_hidden are still resolved override-aware via
-        // subqueries so matching agrees with the register.
+        // The edited row must be fresh, undecided and effectively visible. Anchored
+        // through resolved_transactions for the override-aware date + hidden, and on
+        // the NON-CATEGORY leg — the same negative test the bank anchor uses, which
+        // is what makes it hold for the plain two-leg shape ingest writes.
         var anchor = await (
-            from l in _db.TxnLegs.AsNoTracking()
-            join h in _db.TxnHeaders.AsNoTracking() on l.HeaderId equals h.Id
-            where l.HeaderId == headerId
-                && l.LedgerId == ledgerId
-                && l.PostingRole == PostingRoles.Security
-                && l.SecurityId != null
-                && l.Quantity != null
-                && h.Action != null
-                && h.NeedsReview
-                && h.IsMergedInto == null
+            from rv in _db.ResolvedTransactions.AsNoTracking()
+            where rv.HeaderId == headerId
+                && rv.NeedsReview
+                && rv.IsMergedInto == null
+                && !rv.IsHidden
+                && rv.AccountType != "category"
+            join account in _db.Accounts.AsNoTracking() on rv.AccountId equals account.Id
+            // The BROKERAGE leg specifically, identified as the account that owns a
+            // Holdings sibling. "Not a category" alone is enough on the bank side,
+            // where exactly one such leg exists; here it is not. An investment-shaped
+            // row has a cash leg on the brokerage AND holdings legs on the sibling,
+            // both non-category and both at posting_index 0, so the tie-break would
+            // pick either one at the database's discretion — and picking the holdings
+            // leg yields no sibling of its own and silently returns no candidates.
+            where account.LedgerId == ledgerId && account.HoldingsAccountId != null
+            orderby rv.LegIndex
             select new
             {
-                SiblingAccountId = l.AccountId,
-                SecurityId = l.SecurityId!.Value,
-                l.Amount,
-                l.Quantity,
-                EffectiveHidden = _db.TxnHeaderOverrides
-                    .Where(o => o.HeaderId == h.Id)
-                    .Select(o => o.IsHidden).FirstOrDefault() ?? h.IsHidden,
-                EffectivePostedAt = _db.TxnHeaderOverrides
-                    .Where(o => o.HeaderId == h.Id)
-                    .Select(o => (DateTime?)o.PostedAt).FirstOrDefault() ?? h.PostedAt,
+                SourceAccountId = rv.AccountId,
+                rv.PostedAt,
+                // The Holdings sibling hosts every candidate's security leg
+                // (ADR-0019). NULL on a non-brokerage account, which then matches
+                // nothing — correct, as there are no investment rows to fold into.
+                account.HoldingsAccountId,
+                rv.IngestAmount,
+                rv.IngestShares,
+                rv.IngestSecurityId,
             })
             .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
-        if (anchor is null || anchor.EffectiveHidden)
+        if (anchor is null || anchor.HoldingsAccountId is not { } holdingsAccountId)
             return Array.Empty<InvestmentMergeCandidateDto>();
 
-        // Candidate holdings legs: same sibling account + security, settled +
-        // un-merged header, magnitude match. Amount/quantity are leg-level (not
-        // overridable) so those filter server-side; the effective posted_at +
-        // hidden are resolved per row and the ±7d window is applied in memory
-        // (the amount/security filter already narrows to a tiny set).
-        var q =
-            from l in _db.TxnLegs.AsNoTracking()
-            join h in _db.TxnHeaders.AsNoTracking() on l.HeaderId equals h.Id
-            join s in _db.Securities.AsNoTracking() on l.SecurityId equals s.Id
-            where l.HeaderId != headerId
-                && l.AccountId == anchor.SiblingAccountId
-                && l.SecurityId == anchor.SecurityId
-                && l.PostingRole == PostingRoles.Security
-                && l.Quantity != null
-                && h.Action != null
-                && !h.NeedsReview
-                && h.IsMergedInto == null
-            select new { l, h, s };
+        // The effective sum on the source account: this row's own cash movement.
+        // Zero for a reinvest, which is why ingest_amount is preferred over it.
+        var sourceAmount = await _db.ResolvedTransactions.AsNoTracking()
+            .Where(rv => rv.HeaderId == headerId && rv.AccountId == anchor.SourceAccountId)
+            .SumAsync(rv => rv.Amount, cancellationToken)
+            .ConfigureAwait(false);
 
-        // Match magnitude by signed principal amount; fall back to signed
-        // quantity only for a zero-amount (basis-only) move.
-        q = anchor.Amount != 0m
-            ? q.Where(x => x.l.Amount == anchor.Amount)
-            : q.Where(x => x.l.Quantity == anchor.Quantity);
+        var principal = Math.Abs(anchor.IngestAmount ?? 0m);
+        if (principal == 0m) principal = Math.Abs(sourceAmount);
+        var shares = Math.Abs(anchor.IngestShares ?? 0m);
+        // Nothing to match on: no cash figure and no share count. Offering every
+        // row in the window would be worse than offering none.
+        if (principal == 0m && shares == 0m)
+            return Array.Empty<InvestmentMergeCandidateDto>();
+
+        // Candidates read through resolved_transactions, like the bank side, so a
+        // curated amount/date/payee/visibility is what gets matched — the raw-leg
+        // read this replaces honoured overrides for the window but not for the
+        // amount, so an edited figure matched on its pre-edit value.
+        //
+        // The view COALESCEs security_id and quantity across a posting's sibling
+        // legs, so those two cannot tell a security posting's cash leg from its
+        // holdings leg. Pinning account_id to the Holdings sibling can, and that
+        // filter is needed anyway.
+        var windowStart = anchor.PostedAt.AddDays(-7);
+        var windowEnd = anchor.PostedAt.AddDays(7);
+
+        var q =
+            from rv in _db.ResolvedTransactions.AsNoTracking()
+            where rv.HeaderId != headerId
+                && rv.AccountId == holdingsAccountId
+                && rv.PostingRole == PostingRoles.Security
+                && rv.SecurityId != null
+                && rv.Quantity != null
+                && rv.InvestmentAction != null
+                && !rv.NeedsReview
+                && rv.IsMergedInto == null
+                && !rv.IsHidden
+                && rv.PostedAt >= windowStart
+                && rv.PostedAt <= windowEnd
+            select rv;
+
+        // Only when OFX resolved the ticker to a security already mapped.
+        if (anchor.IngestSecurityId is { } knownSecurityId)
+            q = q.Where(rv => rv.SecurityId == knownSecurityId);
+
+        q = principal != 0m
+            ? q.Where(rv => (rv.Amount < 0 ? -rv.Amount : rv.Amount) == principal)
+            : q.Where(rv => (rv.Quantity < 0 ? -rv.Quantity : rv.Quantity) == shares);
 
         var rows = await q
-            .Select(x => new
+            .Select(rv => new
             {
-                x.h.Id,
-                x.h.Action,
-                x.s.Ticker,
-                x.l.Quantity,
-                x.l.UnitPrice,
-                x.l.Amount,
-                EffectiveHidden = _db.TxnHeaderOverrides
-                    .Where(o => o.HeaderId == x.h.Id)
-                    .Select(o => o.IsHidden).FirstOrDefault() ?? x.h.IsHidden,
-                EffectivePostedAt = _db.TxnHeaderOverrides
-                    .Where(o => o.HeaderId == x.h.Id)
-                    .Select(o => (DateTime?)o.PostedAt).FirstOrDefault() ?? x.h.PostedAt,
-                Payee = _db.TxnHeaderOverrides
-                    .Where(o => o.HeaderId == x.h.Id)
-                    .Select(o => o.Payee).FirstOrDefault() ?? x.h.Payee,
+                rv.HeaderId,
+                rv.InvestmentAction,
+                rv.SecurityTicker,
+                rv.Quantity,
+                rv.UnitPrice,
+                rv.Amount,
+                rv.PostedAt,
+                rv.Payee,
             })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        var windowStart = anchor.EffectivePostedAt.AddDays(-7);
-        var windowEnd = anchor.EffectivePostedAt.AddDays(7);
-
         return rows
-            .Where(r => !r.EffectiveHidden
-                && r.EffectivePostedAt >= windowStart
-                && r.EffectivePostedAt <= windowEnd)
-            .OrderBy(r => Math.Abs((r.EffectivePostedAt - anchor.EffectivePostedAt).TotalDays))
-            .ThenByDescending(r => r.EffectivePostedAt)
+            // One row per HEADER. The view is per-leg, so a header carrying more
+            // than one matching holdings leg would otherwise be offered twice and
+            // spend two of the caller's limit slots on one candidate.
+            .GroupBy(r => r.HeaderId)
+            .Select(g => g.First())
+            .OrderBy(r => Math.Abs((r.PostedAt - anchor.PostedAt).TotalDays))
+            .ThenByDescending(r => r.PostedAt)
             .Take(limit)
             .Select(r => new InvestmentMergeCandidateDto(
-                r.Id,
-                r.EffectivePostedAt,
-                (int)Math.Round((r.EffectivePostedAt - anchor.EffectivePostedAt).TotalDays),
-                r.Action,
-                r.Ticker,
+                r.HeaderId,
+                r.PostedAt,
+                (int)Math.Round((r.PostedAt - anchor.PostedAt).TotalDays),
+                r.InvestmentAction,
+                r.SecurityTicker,
                 r.Quantity,
                 r.UnitPrice,
                 r.Amount,
@@ -984,44 +1309,23 @@ public sealed class InvestmentTransactionsRepository
     }
 
     /// <summary>
-    /// Upsert a posted_at override on <paramref name="headerId"/> (ADR-0003
-    /// override layer), preserving any other override fields. Used by the merge
-    /// branch of <see cref="PatchAsync"/> so the surviving winner adopts the
-    /// imported loser's date. Mirrors the bank repository's private helper.
+    /// Set ONLY <c>posted_at</c> on a header, capturing its original first
+    /// (migration 230). Used by the merge branch of <see cref="PatchAsync"/> so
+    /// the surviving winner adopts the imported loser's date.
     /// </summary>
-    private async Task SetPostedAtOverrideAsync(
-        Guid ledgerId,
-        Guid headerId,
+    /// <remarks>
+    /// Identical to the bank repository's helper of the same name, and both
+    /// delegate the capture to <see cref="HeaderOriginals"/> — the two paths
+    /// share one rule rather than two that happen to agree.
+    /// </remarks>
+    private async Task SetPostedAtAsync(
+        TxnHeaderRow header,
         DateTime postedAt,
         CancellationToken cancellationToken)
     {
-        var existing = await _db.TxnHeaderOverrides
-            .FirstOrDefaultAsync(o => o.HeaderId == headerId, cancellationToken)
+        await HeaderOriginals.CaptureAsync(_db, header, cancellationToken)
             .ConfigureAwait(false);
-
-        if (existing is null)
-        {
-            _db.TxnHeaderOverrides.Add(new TxnHeaderOverrideRow
-            {
-                HeaderId = headerId,
-                LedgerId = ledgerId,
-                PostedAt = postedAt,
-            });
-        }
-        else
-        {
-            _db.Entry(existing).CurrentValues.SetValues(new TxnHeaderOverrideRow
-            {
-                HeaderId = headerId,
-                LedgerId = ledgerId,
-                Payee = existing.Payee,
-                Memo = existing.Memo,
-                CheckNumber = existing.CheckNumber,
-                PostedAt = postedAt,
-                TransactedAt = existing.TransactedAt,
-                IsHidden = existing.IsHidden,
-            });
-        }
+        header.PostedAt = postedAt;
     }
 
     // ----------------------------------------------------------------
@@ -1136,6 +1440,20 @@ public sealed class InvestmentTransactionsRepository
             ? new[] { LedgerActions.Sell, LedgerActions.SellXfr }
             : new[] { LedgerActions.Buy, LedgerActions.BuyXfr };
 
+        // Date and visibility come from the OVERRIDE LAYER, not the raw header.
+        // This read decides whether a pair is convertible, and the caller compares
+        // the two sides' dates — but the detector that OFFERS the pair
+        // (FindInKindCandidates) reads resolved_transactions. This side used to
+        // read the raw posted_at while that view resolved the override, so the two
+        // disagreed about the same pair in both directions: a pair whose displayed
+        // dates matched was offered and then rejected as NotAValidPair, and a pair
+        // a user had deliberately dated apart could still convert. Since mig 230
+        // there is one date and they cannot drift again.
+        //
+        // The leg columns come off txn_legs on purpose: resolved_transactions
+        // COALESCEs security_id and quantity across a posting's sibling legs, so
+        // reading them from the view would make the cash leg indistinguishable
+        // from the holdings leg this must find.
         var row = await (
             from l in _db.TxnLegs.AsNoTracking()
             join h in _db.TxnHeaders.AsNoTracking() on l.HeaderId equals h.Id
@@ -1145,14 +1463,22 @@ public sealed class InvestmentTransactionsRepository
                   && l.SecurityId != null
                   && l.Quantity != null
                   && h.Action != null && actions.Contains(h.Action)
-                  && !h.IsHidden && h.IsMergedInto == null
-            select new HoldingsLeg(l.SecurityId!.Value, l.Quantity!.Value, l.AccountId, h.PostedAt))
+                  && h.IsMergedInto == null
+            select new
+            {
+                SecurityId = l.SecurityId!.Value,
+                Quantity = l.Quantity!.Value,
+                l.AccountId,
+                h.IsHidden,
+                h.PostedAt,
+            })
             .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
 
-        if (row is null) return null;
+        if (row is null || row.IsHidden) return null;
         if (disposal && row.Quantity >= 0m) return null;
         if (!disposal && row.Quantity <= 0m) return null;
-        return row;
+        return new HoldingsLeg(
+            row.SecurityId, row.Quantity, row.AccountId, row.PostedAt);
     }
 
     private Task<Guid?> BrokerageForSiblingAsync(

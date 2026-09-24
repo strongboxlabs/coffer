@@ -83,7 +83,7 @@ public sealed class PayeesEndpointsTests
             bank.Id, groceries.Id, -10m, postedAt, payee: "AMZ MKT *RP4...");
 
         // Overwrite the imported payee with the user's cleaned-up name.
-        await ledger.SetHeaderOverrideAsync(legId, payee: "Amazon");
+        await ledger.EditHeaderAsync(legId, payee: "Amazon");
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);

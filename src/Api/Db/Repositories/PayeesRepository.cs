@@ -11,16 +11,14 @@ namespace Coffer.Api.Db.Repositories;
 /// recency, with hidden + merged-away headers filtered out.
 /// </summary>
 /// <remarks>
-/// The query LEFT JOINs <c>txn_headers</c> against
-/// <c>txn_header_overrides</c> and projects
-/// <c>COALESCE(override.payee, header.payee)</c> as the resolved value
-/// — same precedence the <c>resolved_transactions</c> view uses, kept
-/// in C# here because aggregating over a per-leg view would
-/// double-count splits. RLS on <c>txn_headers</c> + the override table
-/// scopes the read to ledgers the caller already has a grant on; the
-/// endpoint still proves visibility via <see cref="LedgersRepository"/>
-/// before delegating here so the 422 surfaces before the work
-/// happens.
+/// The aggregation reads <c>txn_headers.payee</c>, which since migration 230
+/// IS the curated value — the COALESCE through the old override layer went
+/// away with the table. It aggregates over headers rather than over
+/// <c>resolved_transactions</c> because that view is per-leg and would
+/// double-count splits. RLS on <c>txn_headers</c> scopes the read to ledgers
+/// the caller already has a grant on; the endpoint still proves visibility via
+/// <see cref="LedgersRepository"/> before delegating here so the 422 surfaces
+/// before the work happens.
 /// </remarks>
 public sealed class PayeesRepository
 {

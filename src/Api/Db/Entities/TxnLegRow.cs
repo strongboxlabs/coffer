@@ -16,18 +16,27 @@ internal sealed class TxnLegRow
     // header's ledger, so the API just copies it from the header at
     // write time and lets the DB police coherence.
     public Guid LedgerId { get; init; }
-    // AccountId / PostingIndex / Amount / LegMemo are mutable (get;
-    // set;) because the postings-reshape flow (ADR-0025) edits them
-    // in place — same pattern as TxnHeaderRow.Status. Other fields
-    // (id, header, investment metadata) stay init-only since they
-    // don't change after row creation.
+    // Everything a reshape can edit is mutable (get; set;). The bank's
+    // postings-reshape flow (ADR-0025) needs AccountId / PostingIndex /
+    // Amount / LegMemo; the investment PATCH additionally rewrites the
+    // investment metadata in place, so that is mutable too.
+    //
+    // The investment metadata was init-only on the reasoning that it never
+    // changes after row creation. That was true only because the investment
+    // PATCH deleted every leg and rebuilt it — which is precisely the
+    // behaviour that silently destroyed a row's reconciliation overlay, since
+    // txn_leg_recon.leg_id cascades on delete. Keeping leg identity across an
+    // edit means shares and price now change in place, so they must be
+    // settable. Id / HeaderId / LedgerId stay init-only: those really are
+    // fixed for the life of the row, and the interceptors rely on HeaderId in
+    // particular being immutable.
     public Guid AccountId { get; set; }
     public int PostingIndex { get; set; }
     public string? LegMemo { get; set; }
     public decimal Amount { get; set; }
-    public Guid? SecurityId { get; init; }
-    public decimal? Quantity { get; init; }
-    public decimal? UnitPrice { get; init; }
+    public Guid? SecurityId { get; set; }
+    public decimal? Quantity { get; set; }
+    public decimal? UnitPrice { get; set; }
     /// <summary>
     /// Investment posting role marker (migration 056): one of
     /// <c>'security'</c>, <c>'income'</c>, <c>'transfer'</c>, <c>'fee'</c>;
@@ -35,7 +44,7 @@ internal sealed class TxnLegRow
     /// MD's <c>invest.splittype</c> and by the editor when adding
     /// postings. Both legs of a posting share the same role.
     /// </summary>
-    public string? PostingRole { get; init; }
+    public string? PostingRole { get; set; }
     /// <summary>
     /// Denormalized posting-count pair (migration 120, ADR-0036).
     /// <see cref="AccountPostingsOnHeader"/> is the number of postings of

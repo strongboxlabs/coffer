@@ -78,15 +78,21 @@ export interface PatchTransactionPostings {
  * postings list."
  */
 export interface PatchTransactionRequest {
+    /* Header fields: PRESENCE decides, not nullness (migration 230).
+     * OMIT a key to leave that column alone; send it as `null` to CLEAR
+     * the column. They used to mean "null = leave alone", which made a
+     * cleared payee, memo or check number impossible to express — the
+     * server read the null as "no change" and handed the old text back. */
     payee?: string | null;
     memo?: string | null;
-    /** Check-number override — goes through `txn_header_overrides`
-     *  per ADR-0003 (same layer as Payee / Memo). */
     checkNumber?: string | null;
-    /** ISO-8601 UTC timestamp string — the bank-side posted date. */
-    postedAt?: string | null;
-    /** ISO-8601 UTC timestamp string — the tax/transaction date. */
-    transactedAt?: string | null;
+    /** ISO-8601 UTC timestamp string — the bank-side posted date. The
+     *  column is NOT NULL, so an explicit `null` is a 422, not a clear. */
+    postedAt?: string;
+    /** ISO-8601 UTC timestamp string — the tax/transaction date. NOT NULL
+     *  since mig 189 ("no distinct tax date" is the posted date), so an
+     *  explicit `null` is a 422, not a clear. */
+    transactedAt?: string;
     /** When supplied, replaces the postings list. */
     postings?: PatchTransactionPostings;
     /** Slice 2c.6a: when `true`, clears `needs_review` on this row

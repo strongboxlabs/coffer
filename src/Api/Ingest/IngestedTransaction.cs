@@ -121,4 +121,22 @@ public sealed record IngestedTransaction(
     /// transaction's subtype. Persisted to
     /// <c>txn_headers.ingest_fee</c>. NULL when the wire carried
     /// no fee-shaped fields OR they summed to zero.</summary>
-    decimal? Fee = null);
+    decimal? Fee = null,
+    /// <summary>
+    /// The AUTHORITATIVE total the source stated for this row, when it states
+    /// one the row's own amount does not already carry.
+    /// </summary>
+    /// <remarks>
+    /// Exists for the cash-neutral case. An OFX REINVEST states its reinvested
+    /// dollar value in TOTAL, and the provider reports the cash-leg amount as
+    /// ZERO on purpose — a reinvestment moves no cash, and reporting the total
+    /// as a movement walks the balance down on every one. That left the figure
+    /// with nowhere to live, so the editor rebuilt it as shares x unit_price,
+    /// which is a DIFFERENT number: ADR-0073 D1 is explicit that "price x
+    /// shares need NOT equal the amount". A file stating 6.584 units at 48.05
+    /// totalling 316.37 rebuilt as 316.36, and Accept persisted that.
+    ///
+    /// Null for buy/sell, whose cash leg already carries the real total, and
+    /// for providers that state none.
+    /// </remarks>
+    decimal? IngestAmount = null);

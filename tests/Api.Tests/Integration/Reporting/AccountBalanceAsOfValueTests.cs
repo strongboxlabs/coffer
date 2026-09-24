@@ -101,7 +101,7 @@ public sealed class AccountBalanceAsOfValueTests
         await ledger.AddTransactionPairAsync(bank.Id, other.Id, 100m, Utc(2024, 1, 10));
         var (moved, _) = await ledger.AddTransactionPairAsync(
             bank.Id, other.Id, 900m, Utc(2024, 9, 1));
-        await ledger.SetHeaderOverrideAsync(moved, postedAt: Utc(2024, 2, 1));
+        await ledger.EditHeaderAsync(moved, postedAt: Utc(2024, 2, 1));
         await ledger.RecomputeBalancesAsync(new[] { bank.Id, other.Id });
 
         // At 2024-03-01 the moved header's EFFECTIVE date (Feb 1) has passed, so its

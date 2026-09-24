@@ -102,7 +102,21 @@ export type InvestmentTxnRowEditMode =
            *  in place (preserves scroll position + chronological
            *  order). Null when the server omitted the resolve
            *  (rare; falls back to the parent's refresh path). */
-          onSaved: (entry: RegisterEntry | null) => void;
+          /**
+           * @param entry the server's freshly-resolved entry, or null when the
+           *   row no longer belongs in this register.
+           * @param mergedIntoHeaderId set ONLY on a merge: the SURVIVOR's
+           *   header id, where `entry` is the survivor's entry and the row
+           *   being edited has just become the loser. The page needs both —
+           *   the loser to remove and the survivor to place — and the entry
+           *   alone cannot say which row to drop. Without this the page
+           *   swapped the survivor's data onto the loser's row and left two
+           *   entries sharing one header id.
+           */
+          onSaved: (
+              entry: RegisterEntry | null,
+              mergedIntoHeaderId?: string | null,
+          ) => void;
       }
     | {
           // Adjust-at-post (ADR-0049): reuse this editor to commit an EDITED
@@ -143,6 +157,16 @@ export interface InvestmentTxnRowEditProps {
      *  takes precedence in edit mode). */
     submitLabel?: string;
     submittingLabel?: string;
+    /**
+     * Host-owned in-flight flag, for `mode.kind === 'fire'`.
+     *
+     * In that mode the HOST owns the request — the editor's own mutations never
+     * run — so `mutation.isPending` is permanently false and every control stayed
+     * live for the whole POST. `submittingLabel` was being passed and could never
+     * appear, Cancel stayed clickable, and a second click on Post issued a second
+     * POST: a duplicate transaction. The bank editor has always taken this prop.
+     */
+    isSaving?: boolean;
     onCancel: () => void;
     mode: InvestmentTxnRowEditMode;
 }
@@ -164,6 +188,7 @@ export function InvestmentTxnRowEdit({
     footerLeading,
     submitLabel,
     submittingLabel,
+    isSaving,
     onCancel,
     mode,
 }: InvestmentTxnRowEditProps) {
@@ -223,7 +248,7 @@ export function InvestmentTxnRowEdit({
         staleTime: 60_000,
     });
 
-    // Merge "possible matches": settled rows the edited (fresh,
+    // Merge candidates: settled rows the edited (fresh,
     // needs_review) row could fold into. Edit-mode only; an empty result
     // hides the panel (the matching predicate decides). Mirrors the bank
     // editor's merge-candidates query.
@@ -259,6 +284,13 @@ export function InvestmentTxnRowEdit({
         // any cached open-lots queries so the next editor open
         // re-fetches.
         queryClient.invalidateQueries({ queryKey: ['open-lots', ledgerId] });
+        // Merge candidates are cached with staleTime: Infinity, so nothing ever
+        // refetched them. A candidate that has since been merged or accepted
+        // stayed on offer until a reload — the bank register has invalidated
+        // this on every save since it shipped, and the investment side never
+        // learned it. One line here rather than two, because both mutations
+        // funnel through this hook.
+        queryClient.invalidateQueries({ queryKey: ['investment-merge-candidates', ledgerId] });
         // This editor SEEDS its draft from the ['header-legs', headerId]
         // cache (fetchHeaderLegs — the full cross-account leg set that
         // legsToDraft needs but the windowed register row doesn't carry),
@@ -296,15 +328,32 @@ export function InvestmentTxnRowEdit({
                 ? patchInvestmentTransaction(
                       ledgerId, mode.headerId, body, brokerageAccountId)
                 : Promise.reject(new Error('patchMutation in non-edit mode')),
-        onSuccess: (entry) => {
+        onSuccess: (entry, body) => {
             setSaveError(null);
             invalidateAfterSave();
-            if (mode.kind === 'edit') mode.onSaved(entry);
+            // The merge target rides along: on a merge the edited row is the
+            // LOSER and `entry` is the survivor, which the page cannot work out
+            // from the entry by itself.
+            if (mode.kind === 'edit') {
+                mode.onSaved(entry, body.mergeFromHeaderId ?? null);
+            }
         },
         onError: (err) => {
             setSaveError(err instanceof ApiError ? err.detail : 'Save failed.');
         },
     });
+
+    /// Escape cancels, as it does on a bank row.
+    function handleKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+        // `defaultPrevented` is the guard, copied deliberately from the bank
+        // editor: a picker that closed its own panel on Escape marks the event,
+        // and without the check the same keystroke would close the panel and then
+        // throw away the whole transaction behind it.
+        if (event.key === 'Escape' && !event.defaultPrevented) {
+            event.preventDefault();
+            onCancel();
+        }
+    }
 
     function handleSave() {
         // Merge fold (mirrors bank): when a candidate is armed the editor's
@@ -347,12 +396,15 @@ export function InvestmentTxnRowEdit({
 
     const action = draft.action;
     const layout = action ? ACTION_LAYOUTS[action] : [];
-    const disabled = mutation.isPending;
+    // The host's flag counts too — in 'fire' mode it is the only one that can
+    // ever be true.
+    const disabled = mutation.isPending || isSaving === true;
 
     return (
         <div
             role="row"
             aria-label="New investment transaction"
+            onKeyDown={handleKeyDown}
             data-editing="true"
             data-creating={mode.kind === 'new' || undefined}
             style={{ gridTemplateColumns: cols }}
@@ -405,6 +457,11 @@ export function InvestmentTxnRowEdit({
                         type="date"
                         value={draft.postedAt}
                         onChange={(e) => setPostedAt(e.target.value)}
+                        // Opening the editor puts the caret here, as the bank
+                        // editor does in both its layouts. Without it focus stayed
+                        // on the register grid behind, so the first keystroke after
+                        // opening a row went nowhere.
+                        autoFocus
                         disabled={disabled}
                         className="h-control-28px rounded border border-border bg-surface px-2 font-mono text-xs"
                     />
@@ -468,6 +525,17 @@ export function InvestmentTxnRowEdit({
                         type="text"
                         value={draft.memo}
                         onChange={(e) => setMemo(e.target.value)}
+                        // Enter commits, as it does from the bank editor's memo.
+                        // There is no <form> here and no submit button, so without
+                        // this the only way to save was to reach for the mouse.
+                        // Guarded on validity for the same reason the button is
+                        // disabled — Enter must not do what the button refuses.
+                        onKeyDown={(e) => {
+                            if (e.key !== 'Enter' || e.shiftKey) return;
+                            e.preventDefault();
+                            if (disabled || (mergeFromHeaderId === null && !isValid)) return;
+                            handleSave();
+                        }}
                         disabled={disabled}
                         placeholder="(optional)"
                         className="h-control-28px w-full rounded border border-border bg-surface px-2 text-xs"
@@ -475,7 +543,7 @@ export function InvestmentTxnRowEdit({
                 </div>
             </div>
 
-            {/* "Possible matches" — settled rows this fresh row could fold
+            {/* Merge candidates — settled rows this fresh row could fold
                 into (self-hides when there are none). Directly under Payee/
                 Memo, mirroring the bank editor's placement. */}
             <InvestmentMergeCandidatesPanel
@@ -595,7 +663,13 @@ export function InvestmentTxnRowEdit({
                 <div className="col-span-full flex items-baseline gap-3 px-1 py-2 text-xs">
                     <span className="text-text-subtle uppercase tracking-wide">Amount</span>
                     <span className={`font-mono tabular-nums ${
-                        (draft.amount ?? 0) < 0 ? 'text-danger' : ''
+                        // text-state-danger, not text-danger: index.css is Tailwind
+                        // v4 CSS-first, so only declared --color-* names become
+                        // utilities and --color-danger is not one. The class was
+                        // inert, which left a negative amount in ordinary body text
+                        // at exactly the moment its sign is what tells the user
+                        // which action to pick.
+                        (draft.amount ?? 0) < 0 ? 'text-state-danger' : ''
                     }`}>
                         {draft.amount === null
                             ? '—'
@@ -678,7 +752,7 @@ export function InvestmentTxnRowEdit({
 }
 
 /**
- * "Possible matches" panel for the investment editor (mirrors the bank
+ * Merge-candidates panel for the investment editor (mirrors the bank
  * MergeCandidatesPanel). Each chip is a one-line summary — date · action ·
  * ticker · shares · amount — and toggling one arms/clears the merge. Picking
  * a chip folds the edited (fresh, needs-review) row into that candidate: the
@@ -699,7 +773,11 @@ function InvestmentMergeCandidatesPanel({
     if (candidates.length === 0) return null;
     return (
         <div className="col-span-full flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1 pb-2 text-[0.625rem]">
-            <span className="text-text-subtle">Possible matches:</span>
+            {/* "Merge candidates", matching the bank editor. It read
+                "Possible matches" here, so the word "merge" appeared nowhere on
+                the investment side at all — which is most of why merge was
+                believed to be a bank-only feature. */}
+            <span className="text-text-subtle">Merge candidates:</span>
             {candidates.map((c) => {
                 const isSelected = selectedHeaderId === c.headerId;
                 // postedAt is UTC-anchored (server treats it as a calendar

@@ -42,6 +42,9 @@ export function hintToDraft(
     ingestShares: number | null = null,
     ingestUnitPrice: number | null = null,
     ingestFee: number | null = null,
+    /** Mig 228: the file's AUTHORITATIVE total, for rows whose cash leg is
+     *  deliberately zero. See its use below. */
+    ingestAmount: number | null = null,
 ): InvestmentTxnDraft {
     // Bank-shape sync rows have two legs at posting_index 0:
     // brokerage cash (signed = -spend / +receive) and an Uncategorized
@@ -79,15 +82,33 @@ export function hintToDraft(
             : action === 'sell' || action === 'sellx'
                 ? Math.abs(cashAmount) + feeAbs
                 : null; // reinvest is cash-neutral — no meaningful cash total
+    // The file's own total, where it stated one (mig 228). This is the answer
+    // for a cash-neutral row: a REINVEST's cash leg is zero BY DESIGN — the
+    // dividend funds the purchase — so `cashBasedAmount` is null and the code
+    // below used to fall through to shares × price. That is precisely the
+    // recomputation this function's own comment warns about: it "would silently
+    // change the amount just by opening the row, and Accept would persist the
+    // wrong value". It did. A file stating 6.584 units at 48.05 totalling
+    // 316.37 opened as 316.36, one cent adrift of the settled row beside it.
+    //
+    // A fee, if any, is excluded the same way a buy's is: the Amount field is
+    // the principal, and the fee rides in its own field.
+    const ingestBasedAmount =
+        ingestAmount != null && Math.abs(ingestAmount) > 0.005
+            ? Number.parseFloat((Math.abs(ingestAmount) - feeAbs).toFixed(2))
+            : null;
+
     const amount =
         action !== null && isLinkedAction(action)
-            // Prefer the real settled amount when the cash leg carries one; fall
-            // back to shares × price only when it's ~0 (cash-neutral reinvest, or
-            // a buyx/sellx funded by a transfer) — where seeding from cash would
-            // leave Amount at 0 and block Accept.
+            // Prefer the real settled amount when the cash leg carries one, then
+            // the file's stated total, and only then shares × price — the last
+            // is a RECONSTRUCTION and is kept purely so a row with neither still
+            // opens with something rather than 0 (which would block Accept).
             ? (cashBasedAmount != null && cashBasedAmount > 0.005
                 ? Number.parseFloat(cashBasedAmount.toFixed(2))
-                : sharesPrice ?? amountForAction(cashAmount, action))
+                : ingestBasedAmount
+                    ?? sharesPrice
+                    ?? amountForAction(cashAmount, action))
             : amountForAction(cashAmount, action);
 
     // Price is DERIVED metadata = amount ÷ |shares| (ADR-0073), at the

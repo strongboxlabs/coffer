@@ -430,6 +430,34 @@ export function TxnRowEdit({
         | { kind: 'patch'; body: PatchTransactionRequest }
         | null
     {
+        // Inverted-merge direction: when a candidate is selected, the editor
+        // row is about to become a loser — its content is moot. Send a minimal
+        // PATCH that just stamps the merge (+ implicit approve to keep state
+        // coherent if the row is ever surfaced again). The candidate stays
+        // untouched, so there's nothing to apply to the editor row's payee /
+        // memo / postings / tags.
+        //
+        // FIRST, before the postings are read at all. This sat AFTER the
+        // validation loop below, which returns null on a posting with no
+        // counterparty — so folding a row that had none silently did nothing:
+        // `saveDisabled` deliberately skips validation while merging, so the
+        // button said "Fold into selected →" and was enabled, and the click
+        // reached a builder that bailed before it ever saw the merge stamp.
+        // An uncategorised imported row is exactly that shape, and
+        // uncategorised imported rows are most of what needs review.
+        // `mode.kind === 'edit'` is the type narrowing the create early-return
+        // used to provide when this block sat further down; merging is an
+        // edit-only action anyway (the candidates query is gated on an edit
+        // header), so it costs nothing to state it.
+        if (mergeFromHeaderId !== null && mode.kind === 'edit') {
+            // Merge stamp ONLY — no `approve`. Clearing needs_review on the loser
+            // is the server's job now (TransactionsRepository's merge branch), so
+            // sending the flag would be a second mechanism for one invariant and
+            // would imply a caller that omits it gets a different outcome. It does
+            // not. Identical to the body the investment editor sends.
+            return { kind: 'patch', body: { mergeFromHeaderId } };
+        }
+
         const items: TransactionPosting[] = [];
         for (const p of postings) {
             const amount = Number(p.amount);
@@ -446,10 +474,10 @@ export function TxnRowEdit({
             const body: CreateTransactionRequest = {
                 postedAt: `${postedAt}T00:00:00.000Z`,
                 // Blank means "no distinct tax date", which mig 189 stores as the
-                // posted date — NOT null. On the patch path null means "leave this
-                // column alone" (override layer, ADR-0003), so sending null to
-                // clear a tax date would silently do nothing. Same value on both
-                // paths so create and patch cannot drift.
+                // posted date — NOT null. Both date columns are NOT NULL, and
+                // since mig 230 the server rejects an explicit null on either
+                // rather than ignoring it. Same value on both paths so create and
+                // patch cannot drift.
                 transactedAt: `${transactedAt.length === 0 ? postedAt : transactedAt}T00:00:00.000Z`,
                 payee: payee.trim().length === 0 ? null : payee.trim(),
                 memo: headerMemo.trim().length === 0 ? null : headerMemo.trim(),
@@ -462,24 +490,11 @@ export function TxnRowEdit({
             return { kind: 'create', body };
         }
 
-        // Inverted-merge direction: when a candidate is selected,
-        // the editor row is about to become a loser — its content
-        // is moot. Send a minimal PATCH that just stamps the merge
-        // (+ implicit approve to keep state coherent if the row is
-        // ever surfaced again). The candidate stays untouched, so
-        // there's nothing to apply to the editor row's payee /
-        // memo / postings / tags.
-        if (mergeFromHeaderId !== null) {
-            return {
-                kind: 'patch',
-                body: {
-                    mergeFromHeaderId,
-                    approve: mode.needsReview ? true : undefined,
-                },
-            };
-        }
-
         const body: PatchTransactionRequest = {
+            // Every header field, every save. Since mig 230 an explicit null
+            // CLEARS the column, so an emptied payee / memo / check box now
+            // actually empties it — under the old override layer the server read
+            // the null as "leave alone" and handed the old text back.
             payee: payee.trim().length === 0 ? null : payee.trim(),
             memo: headerMemo.trim().length === 0 ? null : headerMemo.trim(),
             checkNumber:
@@ -540,6 +555,32 @@ export function TxnRowEdit({
     // wrapper handles Escape / click-outside cancel + the
     // save-error footer.
     const onlyPosting = postings[0]!;
+
+    // Declared once and rendered in BOTH layouts. It used to live only inside the
+    // single-posting arm, so on a split row the candidates query fired, the server
+    // answered, the data landed in cache — and nothing rendered it. Merge was
+    // unreachable from any split bank row, which is exactly where an imported
+    // duplicate of a paycheck would need folding in. The investment editor mounts
+    // its panel once for the same reason: it has only one layout to fall out of.
+    const mergePanel = (
+        <MergeCandidatesPanel
+            candidates={mergeCandidates.data ?? []}
+            accountPaths={accountPaths}
+            selectedHeaderId={mergeFromHeaderId}
+            disabled={isSaving}
+            onSelect={(c) => {
+                // Inverted-merge direction: picking a candidate means "fold this
+                // editor row INTO the candidate." The candidate is the surviving
+                // canonical row — its data is preserved as-is. The editor's form
+                // fields are moot once a candidate is selected (the row vanishes
+                // on save). No pre-fill — that would silently overwrite the
+                // candidate's content with a confused copy. Toggle behaviour
+                // mirrors the old direction.
+                setMergeFromHeaderId(
+                    mergeFromHeaderId === c.headerId ? null : c.headerId);
+            }}
+        />
+    );
 
     return (
         <div
@@ -621,30 +662,7 @@ export function TxnRowEdit({
                                     });
                                 }}
                             />
-                            <MergeCandidatesPanel
-                                candidates={mergeCandidates.data ?? []}
-                                accountPaths={accountPaths}
-                                selectedHeaderId={mergeFromHeaderId}
-                                disabled={isSaving}
-                                onSelect={(c) => {
-                                    // Inverted-merge direction:
-                                    // picking a candidate means "fold
-                                    // this editor row INTO the
-                                    // candidate." The candidate is
-                                    // the surviving canonical row —
-                                    // its data is preserved as-is.
-                                    // The editor's form fields are
-                                    // moot once a candidate is
-                                    // selected (the row vanishes on
-                                    // save). No pre-fill — that
-                                    // would silently overwrite the
-                                    // candidate's content with a
-                                    // confused copy. Toggle behavior
-                                    // mirrors the old direction.
-                                    setMergeFromHeaderId(
-                                        mergeFromHeaderId === c.headerId ? null : c.headerId);
-                                }}
-                            />
+                            {mergePanel}
                         </label>
                         <label className="flex min-w-0 flex-col gap-1">
                             <span className="text-[0.625rem] font-semibold uppercase tracking-wider text-text-muted">Memo</span>
@@ -849,6 +867,7 @@ export function TxnRowEdit({
                             aria-label="Payee"
                         />
                     </label>
+                    {mergePanel}
                     <label className="flex min-w-0 flex-col gap-1">
                         <span className="text-[0.625rem] font-semibold uppercase tracking-wider text-text-muted">
                             {postings.length > 1 ? 'Memo (umbrella)' : 'Memo'}

@@ -194,6 +194,13 @@ public sealed class TransactionsRepository
         /// The bank endpoint surfaces this as
         /// <c>transaction-header-is-investment</c>.</summary>
         HeaderNotBankShape,
+        /// <summary>Migration 230: the request carried <c>postedAt</c> or
+        /// <c>transactedAt</c> explicitly set to null. Both columns are NOT
+        /// NULL, so there is no cleared state to move to. Rejected rather than
+        /// ignored — silently doing nothing with a field the caller named is
+        /// the exact failure the presence-based header fields exist to
+        /// remove.</summary>
+        HeaderDateNull,
     }
 
     /// <summary>Outcome of <see cref="RecategorizeAsync"/> (ADR-0068).</summary>
@@ -683,9 +690,16 @@ public sealed class TransactionsRepository
         //    (the recall axis), and its resolved (payee, counterparty)
         //    so we can dedupe suggestions that already match the saved
         //    state on THIS row (no point suggesting what's already
-        //    there). Anchored on the canonical payee, not the
-        //    override: the override is what we're trying to RECALL,
-        //    not the key we search by. Manual rows (null provider_key)
+        //    there).
+        //
+        //    ANCHORED ON THE FEED'S PAYEE, which since mig 230 lives in
+        //    txn_header_originals — the header itself now holds the curated
+        //    name, and that is what we are trying to RECALL, not the key we
+        //    search by. A header with no original has never been edited, so its
+        //    own payee IS the feed's: `original ?? h.Payee` reads correctly
+        //    either way. Getting this backwards would key recall on the curated
+        //    name and match only rows nobody renamed — the panel would go
+        //    quietly empty. Manual rows (null provider_key)
         //    are excluded — recall is a feed-row concern, and the
         //    candidate scope below would have nothing to match against
         //    anyway.
@@ -693,16 +707,14 @@ public sealed class TransactionsRepository
             from h in _db.TxnHeaders.AsNoTracking()
             where h.Id == headerId && h.LedgerId == ledgerId
                 && h.ProviderKey != null
-                && h.Payee != null && h.Payee != ""
                 // Accept-flow gates — match merge-candidates'
                 // target-side validation. Server enforces these
                 // independent of the SPA's UI filtering per the
                 // server-side-concurrency principle.
                 && h.NeedsReview
-                // Effective visibility (override-aware), not raw is_hidden.
-                && (_db.TxnHeaderOverrides
-                        .Where(o => o.HeaderId == h.Id)
-                        .Select(o => (bool?)o.IsHidden).FirstOrDefault() ?? h.IsHidden) == false
+                // is_hidden is canonical since mig 230 — no override layer left
+                // to resolve through.
+                && !h.IsHidden
                 && h.IsMergedInto == null
             // The money side — the leg that isn't a category. The
             // NeedsReview gate above guarantees an un-accepted feed
@@ -712,15 +724,26 @@ public sealed class TransactionsRepository
             where moneyLeg.HeaderId == h.Id
             join moneyAccount in _db.Accounts on moneyLeg.AccountId equals moneyAccount.Id
             where moneyAccount.AccountType != "category"
-            let overridePayee = _db.TxnHeaderOverrides
+            let feedPayee = _db.TxnHeaderOriginals
                 .Where(o => o.HeaderId == h.Id)
                 .Select(o => o.Payee)
                 .FirstOrDefault()
+            // "The anchor has a bank payee to search by" — asked of the FEED's
+            // payee, not the header's. This gate used to read h.Payee, which was
+            // the same thing before mig 230 and is not now: on a needs_review row
+            // someone edited without approving (MCP, or a direct PATCH — the SPA
+            // always pairs a save with approve), h.Payee is the curated name, and
+            // a CLEARED one would fail the gate while the bank's payee sat in the
+            // sidecar with recall still perfectly possible.
+            where (feedPayee ?? h.Payee) != null && (feedPayee ?? h.Payee) != ""
             select new
             {
-                BankPayee = h.Payee!,
+                // The FEED's payee — the original where one was captured, else
+                // the header's own (never edited, so it is still the feed's).
+                BankPayee = (feedPayee ?? h.Payee)!,
                 ProviderKey = h.ProviderKey!,
-                ResolvedPayee = overridePayee ?? h.Payee!,
+                // What this row reads as now: simply the canonical value.
+                ResolvedPayee = h.Payee!,
                 SourceAccountId = moneyAccount.Id,
                 // Whatever the other leg currently points at —
                 // Uncategorized on a freshly ingested row.
@@ -749,12 +772,14 @@ public sealed class TransactionsRepository
                 // can refer to the same merchant but rarely
                 // string-match).
                 && h.ProviderKey == anchor.ProviderKey
-                && h.Payee == anchor.BankPayee
-                && !h.NeedsReview
-                // Effective visibility (override-aware), not raw is_hidden.
-                && (_db.TxnHeaderOverrides
+                // Match on the candidate's FEED payee too, for the same reason
+                // the anchor uses it: two rows are "the same payee" when the
+                // BANK called them the same thing.
+                && (_db.TxnHeaderOriginals
                         .Where(o => o.HeaderId == h.Id)
-                        .Select(o => (bool?)o.IsHidden).FirstOrDefault() ?? h.IsHidden) == false
+                        .Select(o => o.Payee).FirstOrDefault() ?? h.Payee) == anchor.BankPayee
+                && !h.NeedsReview
+                && !h.IsHidden
                 && h.IsMergedInto == null
             // Single-posting prior rows only (exactly 2 legs).
             where _db.TxnLegs.Count(l => l.HeaderId == h.Id) == 2
@@ -768,21 +793,15 @@ public sealed class TransactionsRepository
             from leg in _db.TxnLegs
             where leg.HeaderId == h.Id && leg.AccountId != anchor.SourceAccountId
             join account in _db.Accounts on leg.AccountId equals account.Id
-            // Override.payee falls back to the raw bank payee.
-            let overridePayee = _db.TxnHeaderOverrides
-                .Where(o => o.HeaderId == h.Id)
-                .Select(o => o.Payee)
-                .FirstOrDefault()
             select new
             {
-                ResolvedPayee = overridePayee ?? h.Payee!,
+                // The suggestion IS the curated name, which is the canonical
+                // value now.
+                ResolvedPayee = h.Payee!,
                 CounterpartyAccountId = account.Id,
                 CounterpartyAccountName = account.Name,
-                // Effective posted_at so the "last used" recency reflects
-                // the curated date, not the raw feed date.
-                PostedAt = _db.TxnHeaderOverrides
-                    .Where(o => o.HeaderId == h.Id)
-                    .Select(o => (DateTime?)o.PostedAt).FirstOrDefault() ?? h.PostedAt,
+                // The curated date, which is the canonical one now.
+                PostedAt = h.PostedAt,
             })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -1017,9 +1036,11 @@ public sealed class TransactionsRepository
     /// three independent concerns the body can carry runs inside
     /// one outer Postgres transaction:
     /// <list type="bullet">
-    ///   <item><b>Header-override edits</b> (payee, memo, posted_at,
-    ///   transacted_at, check_number) → upserted into
-    ///   <c>txn_header_overrides</c> per ADR-0003.</item>
+    ///   <item><b>Header edits</b> (payee, memo, posted_at,
+    ///   transacted_at, check_number) → written to <c>txn_headers</c>,
+    ///   with the feed's values captured to <c>txn_header_originals</c>
+    ///   on the first edit (migration 230). A field the body CARRIED is
+    ///   assigned, null included; a field it omitted is left alone.</item>
     ///   <item><b>Postings reshape</b> (<c>request.Postings</c>) →
     ///   reconciled against <c>txn_legs</c> per ADR-0025.</item>
     ///   <item><b>Approve</b> (slice 2c.6a) → clears
@@ -1072,6 +1093,17 @@ public sealed class TransactionsRepository
         // caller can route the user there.
         if (header.Action is not null) return PatchResult.HeaderNotBankShape;
 
+        // Migration 230 — the header fields now clear on an explicit null, but
+        // both date columns are NOT NULL (transacted_at since mig 189, whose
+        // "no distinct tax date" is the posted date, not a null). Naming one
+        // and setting it null is therefore a request the schema cannot honour;
+        // say so instead of ignoring the field.
+        if ((request.HasPostedAt && request.PostedAt is null)
+            || (request.HasTransactedAt && request.TransactedAt is null))
+        {
+            return PatchResult.HeaderDateNull;
+        }
+
         PostingsReshapePlan? postingsPlan = null;
         if (request.Postings is { } postings)
         {
@@ -1118,12 +1150,9 @@ public sealed class TransactionsRepository
             // Editor gate: must still be a fresh needs_review row.
             // Re-folding an already-accepted row is out of scope
             // here; merging into an already-merged or effectively-
-            // hidden row would mutate a tombstone. Visibility is the
-            // override-aware effective value, matching the read side.
-            var editorHidden = await _db.TxnHeaderOverrides
-                .Where(o => o.HeaderId == headerId)
-                .Select(o => (bool?)o.IsHidden).FirstOrDefaultAsync(cancellationToken)
-                .ConfigureAwait(false) ?? header.IsHidden;
+            // hidden row would mutate a tombstone. is_hidden is canonical
+            // since mig 230 — there is no override layer left to resolve.
+            var editorHidden = header.IsHidden;
             if (!header.NeedsReview
                 || header.IsMergedInto is not null
                 || editorHidden)
@@ -1145,15 +1174,11 @@ public sealed class TransactionsRepository
             // lets multi-source rows (MD+ ← SimpleFIN ← OFX ← …)
             // collapse into one canonical winner without losing the
             // earlier merge work.
-            var mergeSourceHidden = mergeSource is not null
-                && (await _db.TxnHeaderOverrides
-                        .Where(o => o.HeaderId == sourceId)
-                        .Select(o => (bool?)o.IsHidden).FirstOrDefaultAsync(cancellationToken)
-                        .ConfigureAwait(false) ?? mergeSource.IsHidden);
             if (mergeSource is null
                 || mergeSource.NeedsReview
                 || mergeSource.IsMergedInto is not null
-                || mergeSourceHidden)
+                // is_hidden is canonical since mig 230.
+                || mergeSource.IsHidden)
             {
                 return PatchResult.MergeSourceInvalid;
             }
@@ -1167,7 +1192,7 @@ public sealed class TransactionsRepository
         // bottom is the single visible commit boundary.
         if (HasAnyHeaderField(request))
         {
-            await UpsertHeaderOverrideAsync(ledgerId, headerId, request, cancellationToken)
+            await ApplyHeaderFieldsAsync(header, request, cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -1198,21 +1223,32 @@ public sealed class TransactionsRepository
             // already-TRUE winner is a no-op for the change tracker.
             header.IsMergedInto = mergeSource.Id;
             mergeSource.IsMergeWinner = true;
+            // A merged loser is never awaiting review. This used to depend on the
+            // SPA pairing the merge with `approve: true`, which it does — but that
+            // left the invariant in the caller, so any other client (MCP, a direct
+            // PATCH) merged a row and left it flagged, which keeps the sidebar's
+            // review dot lit on an account whose register has nothing to review.
+            // Enforced here, where the state lives, so it holds for every caller.
+            // The investment branch does the same; the two paths were reconciled
+            // on this deliberately rather than left to diverge.
+            header.NeedsReview = false;
 
             // The survivor adopts the IMPORTED (loser) row's posted date:
             // the editor row is always a fresh feed/import row (gated on
             // needs_review above), and its bank date is authoritative for
-            // the merged transaction. Stamped as a posted_at override on
-            // the winner (ADR-0003 — a curated change lives in the
-            // override layer, leaving the winner's raw feed value intact).
+            // the merged transaction. Written straight onto the winner since
+            // migration 230, with its feed date captured to
+            // txn_header_originals first — so the winner's raw value is still
+            // recoverable, which is what the override layer was providing.
             // `request.PostedAt` covers an in-editor date edit made on the
-            // same PATCH; otherwise it's the import row's raw posted_at.
-            // A posted_at override change is balance-relevant, so the
-            // recompute interceptor rewalks the winner's account on save —
-            // same path as a normal date edit.
+            // same PATCH; otherwise it's the import row's raw posted_at. Note
+            // `header.PostedAt` is read AFTER ApplyHeaderFieldsAsync above, so
+            // the `??` arm and the explicit arm now agree by construction.
+            // A posted_at change is balance-relevant, so the recompute
+            // interceptor rewalks the winner's account on save — same path as
+            // a normal date edit.
             var importedPostedAt = request.PostedAt ?? header.PostedAt;
-            await SetPostedAtOverrideAsync(
-                ledgerId, mergeSource.Id, importedPostedAt, cancellationToken)
+            await SetPostedAtAsync(mergeSource, importedPostedAt, cancellationToken)
                 .ConfigureAwait(false);
 
             // ADR-0082 merge → reconciling: the feed match is the bank
@@ -1461,17 +1497,14 @@ public sealed class TransactionsRepository
     /// (ADR-0025). Three phases:
     /// <list type="number">
     ///   <item>Delete the source-side leg + paired counterparty for
-    ///   every posting the user dropped. Cascades to
-    ///   <c>txn_leg_overrides</c> via FK ON DELETE CASCADE.</item>
+    ///   every posting the user dropped.</item>
     ///   <item>Shift kept legs' <c>posting_index</c> by a large
     ///   offset and flush so the final re-number in phase 3 can't
     ///   trip the UNIQUE(<c>header_id, posting_index, account_id</c>)
     ///   constraint during intermediate UPDATEs (swap-two-postings
     ///   would otherwise clash on the first UPDATE).</item>
-    ///   <item>Drop overrides on kept legs (canonical re-save
-    ///   supersedes the override layer per ADR-0003), then apply
-    ///   the final ordering + amount / counterparty edits and
-    ///   insert any fresh legs.</item>
+    ///   <item>Apply the final ordering + amount / counterparty
+    ///   edits and insert any fresh legs.</item>
     /// </list>
     /// </summary>
     private async Task ApplyPostingsReshapeAsync(
@@ -1499,20 +1532,13 @@ public sealed class TransactionsRepository
         }
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 
-        // Phase 3a — drop overrides on kept legs.
-        if (plan.KeepLegIds.Count > 0)
-        {
-            var keepCounterLegIds = plan.KeepLegIds
-                .Select(id => plan.CounterpartyBySourceLegId[id].Id)
-                .ToArray();
-            var allKeptLegIds = plan.KeepLegIds.Concat(keepCounterLegIds).ToArray();
-            await _db.TxnLegOverrides
-                .Where(o => allKeptLegIds.Contains(o.LegId))
-                .ExecuteDeleteAsync(cancellationToken)
-                .ConfigureAwait(false);
-        }
-
-        // Phase 3b — final ordering + insert new postings.
+        // Phase 3 — final ordering + insert new postings.
+        //
+        // This used to be preceded by a "drop overrides on kept legs" step, on
+        // the reasoning that a canonical re-save supersedes the override layer.
+        // txn_leg_overrides went away in migration 230: it held zero rows in
+        // every database and nothing in the API ever wrote one, so it was a
+        // join on the hottest view and on the balance walk for no rows at all.
         // posting_index = position in items[].
         for (var i = 0; i < plan.Items.Count; i++)
         {
@@ -1535,99 +1561,68 @@ public sealed class TransactionsRepository
         }
     }
 
+    /// <summary>
+    /// Did the request CARRY any header field? Presence, not nullness
+    /// (migration 230) — a body sending <c>"payee": null</c> to clear the payee
+    /// is a header edit, and reading it as "no header fields" would drop it on
+    /// the floor, which is the bug this replaced.
+    /// </summary>
     private static bool HasAnyHeaderField(PatchTransactionRequest r) =>
-        r.Payee is not null
-        || r.Memo is not null
-        || r.CheckNumber is not null
-        || r.PostedAt is not null
-        || r.TransactedAt is not null;
+        r.HasPayee
+        || r.HasMemo
+        || r.HasCheckNumber
+        || r.HasPostedAt
+        || r.HasTransactedAt;
 
     /// <summary>
-    /// Upsert the header-override row with the supplied non-null
-    /// fields (ADR-0003). Null on a request field means "leave that
-    /// column alone."
+    /// Apply the header fields the request CARRIED to the canonical row,
+    /// capturing the feed's values to <c>txn_header_originals</c> first
+    /// (migration 230).
     /// </summary>
-    private async Task UpsertHeaderOverrideAsync(
-        Guid ledgerId,
-        Guid headerId,
+    /// <remarks>
+    /// <para>A field the body omitted is left alone; a field it carried is
+    /// assigned, <c>null</c> included — that is how a payee, memo or check
+    /// number gets CLEARED, which the override layer could not express.</para>
+    ///
+    /// <para>The capture runs even when the assignment turns out to be a no-op
+    /// (saving a row without changing anything). Making it conditional on an
+    /// actual value change would mean an originals row exists only when some
+    /// field currently differs, and "has been edited" would flicker off the
+    /// moment the user typed a value back to what the feed said. Existence, not
+    /// difference, is the signal.</para>
+    ///
+    /// <para>This is the same helper the investment path calls, which is the
+    /// point: one capture rule, not two that agree today.</para>
+    /// </remarks>
+    private async Task ApplyHeaderFieldsAsync(
+        TxnHeaderRow header,
         PatchTransactionRequest r,
         CancellationToken cancellationToken)
     {
-        var existing = await _db.TxnHeaderOverrides
-            .FirstOrDefaultAsync(o => o.HeaderId == headerId, cancellationToken)
+        await HeaderOriginals.CaptureAsync(_db, header, cancellationToken)
             .ConfigureAwait(false);
 
-        if (existing is null)
-        {
-            _db.TxnHeaderOverrides.Add(new TxnHeaderOverrideRow
-            {
-                HeaderId = headerId,
-                LedgerId = ledgerId,
-                Payee = r.Payee,
-                Memo = r.Memo,
-                CheckNumber = r.CheckNumber,
-                PostedAt = r.PostedAt,
-                TransactedAt = r.TransactedAt,
-            });
-        }
-        else
-        {
-            var rowUpdate = new TxnHeaderOverrideRow
-            {
-                HeaderId = headerId,
-                LedgerId = ledgerId,
-                Payee = r.Payee ?? existing.Payee,
-                Memo = r.Memo ?? existing.Memo,
-                CheckNumber = r.CheckNumber ?? existing.CheckNumber,
-                PostedAt = r.PostedAt ?? existing.PostedAt,
-                TransactedAt = r.TransactedAt ?? existing.TransactedAt,
-                IsHidden = existing.IsHidden,
-            };
-            _db.Entry(existing).CurrentValues.SetValues(rowUpdate);
-        }
+        if (r.HasPayee) header.Payee = r.Payee;
+        if (r.HasMemo) header.Memo = r.Memo;
+        if (r.HasCheckNumber) header.CheckNumber = r.CheckNumber;
+        // Non-null guaranteed by the HeaderDateNull gate in the validate phase.
+        if (r.HasPostedAt) header.PostedAt = r.PostedAt!.Value;
+        if (r.HasTransactedAt) header.TransactedAt = r.TransactedAt!.Value;
     }
 
     /// <summary>
-    /// Set ONLY the <c>posted_at</c> override on a header, preserving any
-    /// other override fields (payee / memo / check# / transacted_at /
-    /// is_hidden). Used by the merge path so the surviving row adopts the
-    /// imported row's date (ADR-0072 follow-up) without disturbing the
-    /// winner's other curated fields.
+    /// Set ONLY <c>posted_at</c> on a header, capturing its original first.
+    /// Used by the merge path so the surviving row adopts the imported row's
+    /// date (ADR-0072 follow-up) without disturbing its other curated fields.
     /// </summary>
-    private async Task SetPostedAtOverrideAsync(
-        Guid ledgerId,
-        Guid headerId,
+    private async Task SetPostedAtAsync(
+        TxnHeaderRow header,
         DateTime postedAt,
         CancellationToken cancellationToken)
     {
-        var existing = await _db.TxnHeaderOverrides
-            .FirstOrDefaultAsync(o => o.HeaderId == headerId, cancellationToken)
+        await HeaderOriginals.CaptureAsync(_db, header, cancellationToken)
             .ConfigureAwait(false);
-
-        if (existing is null)
-        {
-            _db.TxnHeaderOverrides.Add(new TxnHeaderOverrideRow
-            {
-                HeaderId = headerId,
-                LedgerId = ledgerId,
-                PostedAt = postedAt,
-            });
-        }
-        else
-        {
-            var rowUpdate = new TxnHeaderOverrideRow
-            {
-                HeaderId = headerId,
-                LedgerId = ledgerId,
-                Payee = existing.Payee,
-                Memo = existing.Memo,
-                CheckNumber = existing.CheckNumber,
-                PostedAt = postedAt,
-                TransactedAt = existing.TransactedAt,
-                IsHidden = existing.IsHidden,
-            };
-            _db.Entry(existing).CurrentValues.SetValues(rowUpdate);
-        }
+        header.PostedAt = postedAt;
     }
 
     /// <summary>

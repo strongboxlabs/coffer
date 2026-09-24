@@ -274,6 +274,7 @@ export function ReminderOccurrenceModal({ ledgerId, occ, onClose, onActed }: {
                     submitLabel="Post"
                     submittingLabel="Posting…"
                     onCancel={onClose}
+                    isSaving={fireInvestment.isPending}
                     mode={{
                         kind: 'fire',
                         initialDraft: investment.draft,

@@ -109,13 +109,11 @@ internal sealed class BulkTransactionsRepository
 
         // "all" mode — predicate over the current view filter, including the
         // visibility scope (ADR-0072 D1): the "hidden" filter selects the hidden
-        // recovery view; every other filter selects visible rows. Effective
-        // visibility (override-aware), not raw is_hidden — the selection set
-        // must match what the register shows.
+        // recovery view; every other filter selects visible rows. is_hidden is
+        // canonical since mig 230, so this matches what the register shows by
+        // reading the same column the register reads.
         var hiddenScope = string.Equals(selection.StatusFilter, "hidden", StringComparison.Ordinal);
-        q = q.Where(h => (_db.TxnHeaderOverrides
-                .Where(o => o.HeaderId == h.Id)
-                .Select(o => (bool?)o.IsHidden).FirstOrDefault() ?? h.IsHidden) == hiddenScope);
+        q = q.Where(h => h.IsHidden == hiddenScope);
 
         // Reconciliation status is per-account (ADR-0082): the cleared /
         // uncleared cases below evaluate the account's own leg. The register
@@ -193,9 +191,7 @@ internal sealed class BulkTransactionsRepository
                     _db.TxnLegs.Any(l => l.HeaderId == h.Id && EF.Constant(scopeIds).Contains(l.AccountId)
                         && !_db.TxnLegRecon.Any(r => r.LegId == l.Id
                             && (r.Status == "cleared" || r.Status == "reconciling")))
-                    && (_db.TxnHeaderOverrides
-                            .Where(o => o.HeaderId == h.Id)
-                            .Select(o => (DateTime?)o.PostedAt).FirstOrDefault() ?? h.PostedAt) <= DateTime.UtcNow);
+                    && h.PostedAt <= DateTime.UtcNow);
                 break;
             case "reconciling":
                 // Per-account (ADR-0082): the account's leg is reconciling (mig 165),
@@ -203,14 +199,10 @@ internal sealed class BulkTransactionsRepository
                 q = q.Where(h =>
                     _db.TxnLegs.Any(l => l.HeaderId == h.Id && EF.Constant(scopeIds).Contains(l.AccountId)
                         && _db.TxnLegRecon.Any(r => r.LegId == l.Id && r.Status == "reconciling"))
-                    && (_db.TxnHeaderOverrides
-                            .Where(o => o.HeaderId == h.Id)
-                            .Select(o => (DateTime?)o.PostedAt).FirstOrDefault() ?? h.PostedAt) <= DateTime.UtcNow);
+                    && h.PostedAt <= DateTime.UtcNow);
                 break;
             case "scheduled":
-                q = q.Where(h => (_db.TxnHeaderOverrides
-                        .Where(o => o.HeaderId == h.Id)
-                        .Select(o => (DateTime?)o.PostedAt).FirstOrDefault() ?? h.PostedAt) > DateTime.UtcNow);
+                q = q.Where(h => h.PostedAt > DateTime.UtcNow);
                 break;
             case "needs_review":
                 // The bank-feed review FLAG (migration 037, ADR-0031
@@ -460,9 +452,17 @@ internal sealed class BulkTransactionsRepository
         // How many of them the user has since edited. Reported, never used to refuse:
         // whose edits they are is their call, but an undo that silently discards work
         // is the kind of "helpful" delete nobody forgives.
+        //
+        // "Edited" is "has an original on file" (mig 230): every edit on BOTH
+        // write paths captures one. It used to be "has an override row", which
+        // counted bank edits only — an investment edit wrote the canonical row
+        // and created nothing, so this under-reported exactly the work an undo
+        // destroys. A merge still counts as an edit, because it stamps the
+        // winner's date and so captures an original; for a warning dialog,
+        // erring toward telling you is the right direction.
         var edited = ids.Count == 0
             ? 0
-            : await _db.TxnHeaderOverrides
+            : await _db.TxnHeaderOriginals
                 .AsNoTracking()
                 .Where(o => o.LedgerId == ledgerId && EF.Constant(ids.ToArray()).Contains(o.HeaderId))
                 .Select(o => o.HeaderId)
@@ -567,7 +567,7 @@ internal sealed class BulkTransactionsRepository
         // The anchor MUST be the EFFECTIVE date —
         // COALESCE(override.posted_at, header.posted_at) — because
         // fn_recompute_balances_for_account walks by the effective date
-        // (mig 103), and bank date edits live in txn_header_overrides
+        // (mig 103), and bank date edits land on txn_headers.posted_at
         // (ADR-0003). Anchoring on the raw header date would leave the
         // [effective, raw) range unrecomputed when an override moved the
         // header earlier than its raw date. The single-row interceptor
@@ -579,10 +579,7 @@ internal sealed class BulkTransactionsRepository
                 (h, l) => new
                 {
                     l.AccountId,
-                    PostedAt = _db.TxnHeaderOverrides
-                        .Where(o => o.HeaderId == h.Id)
-                        .Select(o => (DateTime?)o.PostedAt)
-                        .FirstOrDefault() ?? h.PostedAt,
+                    PostedAt = h.PostedAt,
                 })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -593,10 +590,7 @@ internal sealed class BulkTransactionsRepository
                 (h, l) => new
                 {
                     l.AccountId,
-                    PostedAt = _db.TxnHeaderOverrides
-                        .Where(o => o.HeaderId == h.Id)
-                        .Select(o => (DateTime?)o.PostedAt)
-                        .FirstOrDefault() ?? h.PostedAt,
+                    PostedAt = h.PostedAt,
                 })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -619,7 +613,7 @@ internal sealed class BulkTransactionsRepository
             .ConfigureAwait(false);
 
         // Hard-delete manual rows (external_id IS NULL). CASCADE on
-        // txn_legs / txn_header_overrides / txn_leg_overrides /
+        // txn_legs / txn_header_originals /
         // txn_header_tags handles the cleanup.
         // A REMINDER OCCURRENCE IS NEVER HARD-DELETED, here as on the single-delete
         // path (TransactionsRepository.DeleteAsync).
@@ -718,10 +712,7 @@ internal sealed class BulkTransactionsRepository
                 (h, l) => new
                 {
                     l.AccountId,
-                    PostedAt = _db.TxnHeaderOverrides
-                        .Where(o => o.HeaderId == h.Id)
-                        .Select(o => (DateTime?)o.PostedAt)
-                        .FirstOrDefault() ?? h.PostedAt,
+                    PostedAt = h.PostedAt,
                 })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -790,9 +781,7 @@ internal sealed class BulkTransactionsRepository
             .Select(h => new
             {
                 h.Action,
-                EffectivePostedAt = _db.TxnHeaderOverrides
-                    .Where(o => o.HeaderId == h.Id)
-                    .Select(o => (DateTime?)o.PostedAt).FirstOrDefault() ?? h.PostedAt,
+                EffectivePostedAt = h.PostedAt,
             })
             .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
         if (header is null) return MoveAccountOutcome.HeaderNotFound;
@@ -884,8 +873,7 @@ internal sealed class BulkTransactionsRepository
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
         var affectedDates = await query
-            .Select(h => _db.TxnHeaderOverrides.Where(o => o.HeaderId == h.Id)
-                .Select(o => (DateTime?)o.PostedAt).FirstOrDefault() ?? h.PostedAt)
+            .Select(h => h.PostedAt)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
 
         var moved = await _db.TxnLegs

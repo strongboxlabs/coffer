@@ -26,20 +26,20 @@ import type { RegisterEntry } from '@/lib/types';
 //     boundary cursor becomes the new outer cursor — no need to
 //     synthesize cursors client-side.
 //
-//   * `firstItemIndex` is the LOGICAL index of `entries[0]` — i.e.
-//     the index the rest of the world (virtuoso, the consumer's
-//     focus state) should use. When we evict N entries from the
-//     front, `firstItemIndex` rises by N and virtuoso preserves
-//     scroll position relative to the still-present items. The
-//     consumer wires this to virtuoso's `firstItemIndex` prop and
-//     converts its own focus/select state to logical indices when
-//     it asks virtuoso to scroll.
+//   * There is deliberately NO `firstItemIndex` here. This hook
+//     used to track the logical index of `entries[0]` and hand it
+//     to virtuoso's prop of the same name. That was wrong: this
+//     counts ENTRIES, while virtuoso's is a property of the
+//     RENDERED array — and every register renders rows only after
+//     regrouping target splits, filtering by status and expanding
+//     groups, so the two counts differ. `RegisterVirtualList`
+//     derives its own from the rows it is handed, the only place
+//     that can see them.
 //
-//   * State is held as one combined `WindowState` rather than five
-//     separate `useState` slots. Eviction needs `entries`, `pages`,
-//     and `firstItemIndex` to update atomically (counts must stay
-//     consistent with cursor metadata, and the index shift must
-//     match the entries slice). Separate `useState` updaters defer
+//   * State is held as one combined `WindowState` rather than
+//     separate `useState` slots. Eviction needs `entries` and
+//     `pages` to update atomically (counts must stay consistent
+//     with cursor metadata). Separate `useState` updaters defer
 //     their work until React's batched flush; trying to coordinate
 //     them via a shared `let` in the calling scope is fragile and
 //     was the root cause of the visible "count drops to 930" jolt
@@ -93,13 +93,18 @@ interface PageMeta {
 interface WindowState {
     entries: RegisterEntry[];
     pages: PageMeta[];
-    firstItemIndex: number;
+}
+
+/** Does this entry carry the given header? Covers both entry shapes. */
+function entryHasHeader(entry: RegisterEntry, headerId: string): boolean {
+    return entry.kind === 'txn'
+        ? entry.txn.headerId === headerId
+        : entry.legs.some((l) => l.headerId === headerId);
 }
 
 const EMPTY_STATE: WindowState = {
     entries: [],
     pages: [],
-    firstItemIndex: 0,
 };
 
 export interface UseWindowedRegisterArgs {
@@ -133,10 +138,6 @@ export interface UseWindowedRegisterResult {
     /** Window of entries, time-DESC. `entries[0]` is the newest
      *  currently loaded. */
     entries: RegisterEntry[];
-    /** Logical index of `entries[0]`. Bumps up on eviction from
-     *  the front; bumps down on prepend. Pass to virtuoso's
-     *  `firstItemIndex` so scroll position survives evictions. */
-    firstItemIndex: number;
     /** True once the first fetch (initial / focus seed) returned;
      *  consumers gate the empty-state UI on this. */
     initialLoaded: boolean;
@@ -166,8 +167,10 @@ export interface UseWindowedRegisterResult {
      *
      *  <para>Optional <c>anchorHeaderId</c> overrides the URL's
      *  <c>focusHeaderId</c> for this one fetch: the server
-     *  centres the new window on that row (start-at semantics),
-     *  guaranteeing it lands at <c>focusIndex = 0</c>. Used by
+     *  centres the new window on that row (start-at semantics) WHEN the row
+     *  matches the active filter, and silently returns the ordinary page when
+     *  it does not — so check <c>focusAnchorHeaderId</c> rather than assuming.
+     *  Used by
      *  the post-PATCH path so the just-saved row is visible +
      *  focusable even when the user is editing a row deep in
      *  history. Without an anchor, refresh re-fetches the
@@ -181,12 +184,25 @@ export interface UseWindowedRegisterResult {
     /** Trigger a load at the newer edge. No-op at the timeline
      *  head or when a newer load is already in flight. */
     loadNewer: () => void;
-    /** LOGICAL index of the focused row in the timeline, when the
-     *  hook was seeded with `focusHeaderId` and the focused entry
-     *  is still in the window. -1 otherwise. Consumers pass this
-     *  to virtuoso's `initialTopMostItemIndex` to land on the
-     *  row. */
-    focusIndex: number;
+    /**
+     * The anchor header the server ACTUALLY placed in the window, or null.
+     *
+     * This used to be a logical index, fixed at 0 whenever an anchor was
+     * requested — a guarantee the server does not make. `RegisterRepository`
+     * pins an anchor only if it matches the active filter and otherwise
+     * silently returns the ordinary most-recent page, and `RegisterPage`
+     * carries no field saying which happened. So "anchor requested" was being
+     * read as "anchor is at position 0", and with a status tab active, saving a
+     * row OUT of that tab focused and scrolled to whatever sat at index 0
+     * instead.
+     *
+     * An id rather than an index also ends a second confusion. Indices here
+     * come in two spaces — entry-space (what this hook counts) and row-space
+     * (what a page renders after regrouping, filtering and expanding) — and
+     * they are not equal on either register. A consumer resolves this id
+     * against its own rendered rows, so the question cannot be got wrong.
+     */
+    focusAnchorHeaderId: string | null;
     /** In-place mutation hook for optimistic updates. The mapper
      *  runs once per entry; return the same entry to leave it
      *  alone, return a patched copy to apply changes. */
@@ -205,7 +221,7 @@ export function useWindowedRegister(
     const { ledgerId, accountId, focusHeaderId, pageSize = 100, hidden = false, filter, sort } = args;
 
     const [windowState, setWindowState] = useState<WindowState>(EMPTY_STATE);
-    const { entries, pages, firstItemIndex } = windowState;
+    const { entries, pages } = windowState;
     const [initialLoaded, setInitialLoaded] = useState(false);
     const [initialError, setInitialError] = useState<unknown>(null);
     const [loadingOlder, setLoadingOlder] = useState(false);
@@ -213,7 +229,7 @@ export function useWindowedRegister(
 
     // Latched on first load. LOGICAL index — comparable with
     // virtuoso's `initialTopMostItemIndex` even after eviction.
-    const [focusIndex, setFocusIndex] = useState(-1);
+    const [focusAnchorHeaderId, setFocusAnchorHeaderId] = useState<string | null>(null);
 
     // Refresh nonce — bumping it triggers the initial-load
     // useEffect via dep change, even when the identity args
@@ -244,12 +260,12 @@ export function useWindowedRegister(
         setWindowState(EMPTY_STATE);
         setInitialLoaded(false);
         setInitialError(null);
-        setFocusIndex(-1);
+        setFocusAnchorHeaderId(null);
         let cancelled = false;
         // Anchor priority: the one-shot override (set by
         // `refresh(anchorHeaderId)`) wins; otherwise fall back to
-        // the URL-driven `focusHeaderId`. Either way, when an
-        // anchor is in play we land focusIndex on the row.
+        // the URL-driven `focusHeaderId`. Requesting one is not the same as
+        // getting one — see `focusAnchorHeaderId`.
         const anchor = anchorOverride ?? focusHeaderId;
         (async () => {
             try {
@@ -272,13 +288,15 @@ export function useWindowedRegister(
                             bottom: page.cursorForOlder,
                         },
                     ],
-                    firstItemIndex: 0,
                 });
-                if (anchor !== undefined && page.entries.length > 0) {
-                    // Server places the anchored entry at index 0
-                    // (logical index 0 too, since firstItemIndex
-                    // starts at 0).
-                    setFocusIndex(0);
+                // Report the anchor only when the server actually honoured it.
+                // It declines whenever the row does not match the active filter
+                // (RegisterRepository.GetPageAsync) and says so only by
+                // returning an ordinary page, so the one reliable test is
+                // whether the row is in what came back.
+                if (anchor !== undefined
+                    && page.entries.some((e) => entryHasHeader(e, anchor))) {
+                    setFocusAnchorHeaderId(anchor);
                 }
                 setInitialLoaded(true);
             } catch (err) {
@@ -447,7 +465,6 @@ export function useWindowedRegister(
 
     return {
         entries,
-        firstItemIndex,
         initialLoaded,
         initialError,
         loadingOlder,
@@ -457,7 +474,7 @@ export function useWindowedRegister(
         loadNewer,
         atTimelineHead,
         atTimelineTail,
-        focusIndex,
+        focusAnchorHeaderId,
         mutateEntries,
         removeEntries,
     };
@@ -498,7 +515,6 @@ function applyOlderLoad(
         pages: keepFromPage > 0
             ? appendedPages.slice(keepFromPage)
             : appendedPages,
-        firstItemIndex: prev.firstItemIndex + evictedFromFront,
     };
 }
 
@@ -526,9 +542,6 @@ function applyNewerLoad(
         total -= drop.length;
         keepUpToPage--;
     }
-    // Prepending N entries drops `firstItemIndex` by N (data[0] is
-    // now N items earlier in logical-index space). Evicting from
-    // the back doesn't affect firstItemIndex.
     return {
         entries: evictedFromBack > 0
             ? prependedEntries.slice(
@@ -537,6 +550,5 @@ function applyNewerLoad(
               )
             : prependedEntries,
         pages: prependedPages.slice(0, keepUpToPage),
-        firstItemIndex: prev.firstItemIndex - newEntries.length,
     };
 }

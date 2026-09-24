@@ -359,9 +359,16 @@ public sealed class IngestOrchestrator
                     // looks pre-split (memo empty + payee equals the
                     // raw description); user-edited rows carry a
                     // distinct payee that we don't want to clobber.
-                    // User overrides live in txn_header_overrides; the
-                    // base row is the bank's view, which is what we
-                    // refresh here.
+                    // The heuristic is the whole guard, and since migration
+                    // 230 it is the ONLY guard: this row IS the user's copy now,
+                    // so a rewrite here would overwrite an edit rather than
+                    // sitting harmlessly underneath one. It only fires when the
+                    // row still looks exactly as the pre-split importer left it
+                    // (memo empty AND payee byte-equal to the raw description),
+                    // which no edited row can satisfy — an edit that produced
+                    // that shape reproduced the feed's own values, so writing
+                    // the split is what the user would get anyway. The feed's
+                    // original is in txn_header_originals either way.
                     if (t.Payee is not null
                         && string.IsNullOrEmpty(existing.Memo)
                         && string.Equals(existing.Payee, t.Description, StringComparison.Ordinal))
@@ -777,8 +784,9 @@ public sealed class IngestOrchestrator
         foreach (var t in filtered)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (existingByExternalId.ContainsKey(t.ExternalId))
+            if (existingByExternalId.TryGetValue(t.ExternalId, out var knownById))
             {
+                BackfillIngestCarriers(knownById, t);
                 alreadyKnown++;
                 continue;
             }
@@ -787,8 +795,10 @@ public sealed class IngestOrchestrator
             if (isOfx
                 && t.OnlineMatchFiId is not null
                 && t.OnlineMatchFitid is not null
-                && existingByOnlineMatch.ContainsKey((t.OnlineMatchFiId, t.OnlineMatchFitid)))
+                && existingByOnlineMatch.TryGetValue(
+                    (t.OnlineMatchFiId, t.OnlineMatchFitid), out var knownByMatch))
             {
+                BackfillIngestCarriers(knownByMatch, t);
                 alreadyKnown++;
                 continue;
             }
@@ -839,6 +849,11 @@ public sealed class IngestOrchestrator
                 IngestShares = t.Shares,
                 IngestUnitPrice = t.UnitPrice,
                 IngestFee = t.Fee,
+                // Mig 228: the file's authoritative total, for rows whose own
+                // amount is deliberately zero (a reinvest moves no cash).
+                // Without it the editor rebuilds the figure from shares x price
+                // and lands a cent out.
+                IngestAmount = t.IngestAmount,
                 // Mig 114: persist the provider's ticker hint
                 // string so the SPA's Accept flow can record a
                 // provider_security_mapping with the same key the
@@ -1051,6 +1066,50 @@ public sealed class IngestOrchestrator
                 });
             }
         }
+    }
+
+    /// <summary>
+    /// Fill in per-row ingest carriers a re-import can supply and the stored
+    /// row is missing. Only ever writes over NULL.
+    /// </summary>
+    /// <remarks>
+    /// <para>Re-importing the same file used to be a pure no-op: the file path
+    /// counted the row as already known and <c>continue</c>d. That made every
+    /// carrier added after a row was first imported permanently unavailable for
+    /// it — there was no way to repair a row short of deleting it. The pull
+    /// path already backfilled <c>provider_raw_payload</c> on exactly this
+    /// reasoning; the file path never learned it.</para>
+    ///
+    /// <para>What prompted this: <c>ingest_amount</c> (mig 228) carries the
+    /// total an OFX REINVEST states, because the editor was otherwise rebuilding
+    /// it from shares x price and landing a cent out. Rows imported before that
+    /// column existed had no way to acquire it, so re-importing the file — the
+    /// obvious repair — reported a dedup and changed nothing.</para>
+    ///
+    /// <para>NULL-ONLY, and metadata only. It never overwrites a value already
+    /// stored (once captured, a payload is an archive), and it touches no
+    /// amount, payee, memo or any field a person may have edited — the money
+    /// lives on txn_legs and is not in scope here. So it is safe on an accepted
+    /// row, where it simply improves what a later reader can recover, and it is
+    /// the actual repair on a still-unreviewed one, where the editor reads
+    /// these carriers when the row is opened.</para>
+    /// </remarks>
+    private static void BackfillIngestCarriers(TxnHeaderRow existing, IngestedTransaction t)
+    {
+        if (existing.ProviderRawPayload is null && t.RawProviderPayload is not null)
+            existing.ProviderRawPayload = t.RawProviderPayload;
+        if (existing.IngestAmount is null && t.IngestAmount is not null)
+            existing.IngestAmount = t.IngestAmount;
+        if (existing.IngestShares is null && t.Shares is not null)
+            existing.IngestShares = t.Shares;
+        if (existing.IngestUnitPrice is null && t.UnitPrice is not null)
+            existing.IngestUnitPrice = t.UnitPrice;
+        if (existing.IngestFee is null && t.Fee is not null)
+            existing.IngestFee = t.Fee;
+        if (existing.IngestActionHint is null && t.Action is not null)
+            existing.IngestActionHint = t.Action;
+        if (existing.IngestSecurityTickerHint is null && t.SecurityTickerHint is not null)
+            existing.IngestSecurityTickerHint = t.SecurityTickerHint;
     }
 
     /// <summary>

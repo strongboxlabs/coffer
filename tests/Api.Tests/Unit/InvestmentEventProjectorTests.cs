@@ -207,7 +207,12 @@ public sealed class InvestmentEventProjectorTests
 
         var e = InvestmentEventProjector.ProjectEvent(new[] { divLeg, buyLeg }, HoldingsSibling);
 
+        // Still zero — the net of this account's legs, per ADR-0028. That is
+        // the contract, not a defect, and it does not change.
         Assert.Equal(0m, e.Amount);
+        // …and the settled money the event actually moved, per ADR-0073 D1,
+        // which the register had no way to show. |security leg| = the buy.
+        Assert.Equal(50m, e.SettledAmount);
         Assert.Null(e.FeeAmount);
         Assert.Null(e.FeeCategoryName);
         Assert.Equal("Dividend Income", e.CounterpartyAccountName);
@@ -234,6 +239,11 @@ public sealed class InvestmentEventProjectorTests
         var e = InvestmentEventProjector.ProjectEvent(new[] { incLeg, xferLeg, feeLeg }, HoldingsSibling);
 
         Assert.Equal(0m, e.Amount);               // 200 - 195 - 5
+        // No security-role leg exists on an in-kind dividend — the security is
+        // pinned to the income leg — so the settled amount comes from the
+        // TRANSFER leg. Keying this on the security role alone would have left
+        // every divx null.
+        Assert.Equal(195m, e.SettledAmount);
         Assert.Equal(5m, e.FeeAmount);
         Assert.Equal(29795m, e.BalanceAfter);
         Assert.Equal("Dividend Income", e.CategoryAccountName);
@@ -340,5 +350,56 @@ public sealed class InvestmentEventProjectorTests
     {
         Assert.Throws<ArgumentException>(() =>
             InvestmentEventProjector.ProjectEvent(Array.Empty<InvestmentEventLeg>(), HoldingsSibling));
+    }
+
+    /// <summary>
+    /// A sale whose proceeds a fee exactly consumes: net zero, and the settled
+    /// amount EQUALS the fee by construction.
+    /// </summary>
+    /// <remarks>
+    /// 478 dev entries are this shape, across sell, sellx AND buy. The
+    /// projector still reports both numbers — suppressing here would hide a
+    /// true value from every other consumer, including MCP — and it is the
+    /// register's subtitle that declines to print the same figure twice. The
+    /// assertion below is what makes that relationship explicit, so a later
+    /// change to either side has to confront it.
+    /// </remarks>
+    [Fact]
+    public void Projects_settled_equal_to_fee_when_a_fee_consumes_the_proceeds()
+    {
+        var sellLeg = Leg(
+            legIndex: 0, amount: 25, postingRole: PostingRoles.Security,
+            securityId: Guid.NewGuid(), securityTicker: "AAA", securityName: "Fund A",
+            quantity: -5, unitPrice: 5,
+            counterpartyAccountId: HoldingsSibling, counterpartyAccountName: "Brokerage Holdings",
+            counterpartyAccountType: "investment");
+        var feeLeg = Leg(
+            legIndex: 1, amount: -25, balanceAfter: 1000, postingRole: PostingRoles.Fee,
+            counterpartyAccountId: InvestmentFees, counterpartyAccountName: "Investment Fees",
+            counterpartyAccountType: "category");
+
+        var e = InvestmentEventProjector.ProjectEvent(new[] { sellLeg, feeLeg }, HoldingsSibling);
+
+        Assert.Equal(0m, e.Amount);
+        Assert.Equal(25m, e.SettledAmount);
+        Assert.Equal(25m, e.FeeAmount);
+        // The equality is the trap: a surface that renders both prints 25 twice
+        // under a zero.
+        Assert.Equal(e.FeeAmount, e.SettledAmount);
+    }
+
+    /// <summary>An event with neither a security nor a transfer leg has no
+    /// settled amount — null, not zero. "Unknown" is not "nothing".</summary>
+    [Fact]
+    public void Projects_null_settled_when_no_leg_carries_one()
+    {
+        var incLeg = Leg(
+            legIndex: 0, amount: 10, postingRole: PostingRoles.Income,
+            counterpartyAccountId: DividendIncome, counterpartyAccountName: "Dividend Income",
+            counterpartyAccountType: "category");
+
+        var e = InvestmentEventProjector.ProjectEvent(new[] { incLeg }, HoldingsSibling);
+
+        Assert.Null(e.SettledAmount);
     }
 }

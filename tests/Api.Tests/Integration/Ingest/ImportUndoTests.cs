@@ -314,20 +314,18 @@ public sealed class ImportUndoTests
 
         var import = await ImportAsync(client, ledger.LedgerId, brokerage.Id);
 
+        Guid editedId;
         await using (var seed = _fixture.NewDbContext())
         {
-            var one = await seed.TxnHeaders
+            editedId = (await seed.TxnHeaders
                 .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif")
                 .OrderBy(h => h.PostedAt)
-                .FirstAsync();
-            seed.TxnHeaderOverrides.Add(new TxnHeaderOverrideRow
-            {
-                HeaderId = one.Id,
-                LedgerId = ledger.LedgerId,
-                Payee = "renamed by hand",
-            });
-            await seed.SaveChangesAsync();
+                .FirstAsync()).Id;
         }
+        // Through the fixture helper, which produces the same state a real edit
+        // does (mig 230: the header takes the new value, its feed values are
+        // captured to txn_header_originals) — the count keys on that capture.
+        await ledger.EditHeaderAsync(editedId, payee: "renamed by hand");
 
         var resp = await client.PostAsync(
             UndoUrl(ledger.LedgerId, import.SyncRunId, dryRun: true), null);

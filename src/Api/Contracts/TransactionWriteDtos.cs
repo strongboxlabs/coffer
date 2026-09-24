@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace Coffer.Api.Contracts;
 
 /// <summary>
@@ -37,12 +39,11 @@ public sealed record DeleteTransactionResponse(string Kind);
 
 /// <summary>
 /// One row of <c>GET /api/ledgers/{ledgerId}/payees</c>. Built by
-/// aggregating <c>txn_headers</c> (with <c>txn_header_overrides</c>
-/// COALESCE applied) so the suggestion list reflects what the user
-/// last typed, not whatever the importer originally wrote.
+/// aggregating <c>txn_headers.payee</c>, which since migration 230 IS what
+/// the user last typed — the feed's original moved to
+/// <c>txn_header_originals</c> and the COALESCE went away with it.
 /// </summary>
-/// <param name="Name">Resolved payee text — the override value when
-/// present, the header value otherwise.</param>
+/// <param name="Name">The header's payee text.</param>
 /// <param name="Count">Number of headers in this ledger that resolve
 /// to this payee. Drives the primary sort.</param>
 /// <param name="LastUsedAt">Most recent <c>posted_at</c> among the
@@ -174,20 +175,96 @@ public sealed class PatchTransactionPostings
 /// </summary>
 public sealed class PatchTransactionRequest
 {
-    public string? Payee { get; init; }
-    public string? Memo { get; init; }
+    // ------------------------------------------------------------------
+    // Header fields: PRESENCE decides, not nullness (migration 230).
+    //
+    // These used to mean "null = leave this column alone", which made a
+    // CLEARED field unreachable: the editor sends null for an emptied payee
+    // and the server read it as "no change", so the old text came straight
+    // back. You could not clear a payee, memo or check number on a bank row.
+    //
+    // System.Text.Json calls a property's setter only when the JSON carries
+    // the key, so the setter itself is the presence signal — an omitted key
+    // leaves the flag false, an explicit `"payee": null` sets it true with a
+    // null value and CLEARS the column. That distinction is the whole point;
+    // a plain nullable property cannot express it.
+    //
+    // This is also why the flags are set rather than derived: every existing
+    // caller that names one field keeps working unchanged, and no caller has
+    // to send a whole header block to edit one column.
+    // ------------------------------------------------------------------
+    // WhenWritingNull on each of the five: the server only ever DESERIALIZES
+    // this type, but tests and any .NET client serialize it, and
+    // System.Text.Json writes nulls by default — so `new
+    // PatchTransactionRequest { Payee = "x" }` would go over the wire with four
+    // explicit nulls and clear the other fields. The condition affects writing
+    // only, so it cannot weaken the presence detection on the read side. The
+    // cost is that a serialized DTO can no longer SAY "clear this"; a caller
+    // that means it writes the JSON (see the tests' PatchJson helper).
+    private readonly string? _payee;
+    private readonly string? _memo;
+    private readonly string? _checkNumber;
+    private readonly DateTime? _postedAt;
+    private readonly DateTime? _transactedAt;
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Payee
+    {
+        get => _payee;
+        init { _payee = value; HasPayee = true; }
+    }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Memo
+    {
+        get => _memo;
+        init { _memo = value; HasMemo = true; }
+    }
     /// <summary>
-    /// Optional check number override. Goes through the same
-    /// <c>txn_header_overrides</c> layer as Payee / Memo per ADR-
-    /// 0003: feed-imported transactions keep their canonical
-    /// <c>check_number</c> on <c>txn_headers</c>, the user's
-    /// edited value lands on the override row.
+    /// Check number. Since migration 230 this lands on
+    /// <c>txn_headers.check_number</c> like every other header edit, with the
+    /// feed's value captured to <c>txn_header_originals</c> on the first edit.
     /// </summary>
-    public string? CheckNumber { get; init; }
-    /// <summary>Bank-side posted date (the register's primary date column).</summary>
-    public DateTime? PostedAt { get; init; }
-    /// <summary>Tax / transaction date — distinct from posted_at.</summary>
-    public DateTime? TransactedAt { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? CheckNumber
+    {
+        get => _checkNumber;
+        init { _checkNumber = value; HasCheckNumber = true; }
+    }
+    /// <summary>
+    /// Bank-side posted date (the register's primary date column). The column
+    /// is NOT NULL, so unlike the text fields an explicit null here is
+    /// rejected (<c>header-date-null</c>, 422) rather than silently ignored —
+    /// a no-op is the failure mode this whole change exists to remove.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DateTime? PostedAt
+    {
+        get => _postedAt;
+        init { _postedAt = value; HasPostedAt = true; }
+    }
+    /// <summary>
+    /// Tax / transaction date — distinct from posted_at, and NOT NULL since
+    /// migration 189: "no distinct tax date" is stored as the posted date, so
+    /// there is no null state to clear to and an explicit null is rejected the
+    /// same way <see cref="PostedAt"/>'s is.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DateTime? TransactedAt
+    {
+        get => _transactedAt;
+        init { _transactedAt = value; HasTransactedAt = true; }
+    }
+
+    /// <summary>True when the request CARRIED <c>payee</c>, whatever its value.</summary>
+    [JsonIgnore] public bool HasPayee { get; private init; }
+    /// <inheritdoc cref="HasPayee"/>
+    [JsonIgnore] public bool HasMemo { get; private init; }
+    /// <inheritdoc cref="HasPayee"/>
+    [JsonIgnore] public bool HasCheckNumber { get; private init; }
+    /// <inheritdoc cref="HasPayee"/>
+    [JsonIgnore] public bool HasPostedAt { get; private init; }
+    /// <inheritdoc cref="HasPayee"/>
+    [JsonIgnore] public bool HasTransactedAt { get; private init; }
     /// <summary>
     /// When supplied, replaces the postings list wholesale per the
     /// reconcile rules in <see cref="PatchTransactionPostings"/>.
@@ -573,8 +650,18 @@ public sealed record MergeCandidatePostingDto(
 /// <param name="Found">Transactions still carrying this import's stamp.</param>
 /// <param name="Edited">
 /// How many of them the user has since edited (they have a
-/// <c>txn_header_overrides</c> row). Reported so a confirm dialog can say so; never a
-/// reason to refuse, because whose edits they are is the user's call.
+/// <c>txn_header_originals</c> row — migration 230). Reported so a confirm dialog
+/// can say so; never a reason to refuse, because whose edits they are is the
+/// user's call.
+///
+/// <para>The signal got STRICTLY better at 230 without changing its intent. It
+/// used to be "has an override row", which missed every investment edit (that
+/// path wrote the canonical row and created no override) — under-reporting
+/// exactly the work an undo would destroy. Both paths now capture an original,
+/// so both count. The one false positive survives: a merge stamps the winner's
+/// date, which captures an original, so a merged-into row reads as edited even
+/// if no field was typed. That errs toward warning, which is the right
+/// direction for a confirm dialog.</para>
 /// </param>
 /// <param name="Deleted">
 /// Rows removed outright. An undo does NOT hide: a hidden row keeps its

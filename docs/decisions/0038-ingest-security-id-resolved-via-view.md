@@ -35,7 +35,7 @@ that surfaced during the OFX investment-prefill slice
 
 2. **A backfill side-effect inside the repo.**
    `ProviderSecurityMappingsRepository.UpsertAsync` was extended
-   (PR #166 follow-up) to run an `ExecuteUpdateAsync` over
+   (PR \#166 follow-up) to run an `ExecuteUpdateAsync` over
    `txn_headers` after every mapping insert, rewriting
    `ingest_security_id` on every header with a matching ticker hint.
    This is action-at-a-distance — one upsert mutates N unrelated

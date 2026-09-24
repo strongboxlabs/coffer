@@ -549,13 +549,9 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 11, 12, 0, 0, DateTimeKind.Utc),
             payee: "Curated Payee");
         var manualId = await ledger.ResolveHeaderIdAsync(manualLegId);
-        // …but its effective posted_at was curated to 03-20 (same day).
-        await using (var db = _fixture.NewDbContext())
-        {
-            await db.Database.ExecuteSqlInterpolatedAsync($@"
-                INSERT INTO txn_header_overrides (header_id, ledger_id, posted_at)
-                VALUES ({manualId}, {ledger.LedgerId}, {new DateTime(2026, 3, 20, 12, 0, 0, DateTimeKind.Utc)});");
-        }
+        // …but the user re-dated it to 03-20 (same day).
+        await ledger.EditHeaderAsync(
+            manualId, postedAt: new DateTime(2026, 3, 20, 12, 0, 0, DateTimeKind.Utc));
 
         var targetId = await SeedBankFeedTargetAsync(
             ledger, bank.Id, uncategorized.Id, -9m,
@@ -589,12 +585,8 @@ public sealed class MergeCandidatesTests
             bank.Id, dining.Id, -9m,
             new DateTime(2026, 3, 20, 12, 0, 0, DateTimeKind.Utc));  // raw in-window
         var manualId = await ledger.ResolveHeaderIdAsync(manualLegId);
-        await using (var db = _fixture.NewDbContext())
-        {
-            await db.Database.ExecuteSqlInterpolatedAsync($@"
-                INSERT INTO txn_header_overrides (header_id, ledger_id, posted_at)
-                VALUES ({manualId}, {ledger.LedgerId}, {new DateTime(2026, 3, 1, 12, 0, 0, DateTimeKind.Utc)});");
-        }
+        await ledger.EditHeaderAsync(
+            manualId, postedAt: new DateTime(2026, 3, 1, 12, 0, 0, DateTimeKind.Utc));
 
         var targetId = await SeedBankFeedTargetAsync(
             ledger, bank.Id, uncategorized.Id, -9m,
@@ -609,10 +601,9 @@ public sealed class MergeCandidatesTests
     }
 
     [Fact]
-    public async Task Excludes_a_candidate_hidden_via_override()
+    public async Task Excludes_a_hidden_candidate()
     {
-        // Candidate is visible on the base row but hidden by override —
-        // effective visibility must exclude it.
+        // A hidden row is not on screen, so it is not offerable.
         var ledger = await SyntheticLedger.CreateAsync(_fixture);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
@@ -622,12 +613,7 @@ public sealed class MergeCandidatesTests
             bank.Id, dining.Id, -9m,
             new DateTime(2026, 3, 19, 12, 0, 0, DateTimeKind.Utc));
         var manualId = await ledger.ResolveHeaderIdAsync(manualLegId);
-        await using (var db = _fixture.NewDbContext())
-        {
-            await db.Database.ExecuteSqlInterpolatedAsync($@"
-                INSERT INTO txn_header_overrides (header_id, ledger_id, is_hidden)
-                VALUES ({manualId}, {ledger.LedgerId}, true);");
-        }
+        await ledger.HideTransactionAsync(manualId);
 
         var targetId = await SeedBankFeedTargetAsync(
             ledger, bank.Id, uncategorized.Id, -9m,
@@ -685,14 +671,62 @@ public sealed class MergeCandidatesTests
         var manual = await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == manualId);
         // Editor (target) is now the loser of the candidate.
         Assert.Equal(manualId, target.IsMergedInto);
-        // Approve=true still flips needs_review on the (now-hidden)
-        // loser; harmless but keeps state coherent.
+        // needs_review is cleared on the loser. Approve=true is passed here,
+        // but it is no longer what does it — see the no-approve test below.
         Assert.False(target.NeedsReview);
         // Candidate (manual) is the surviving winner — its identity,
         // postings, and payee remain untouched. (Its posted_at DOES move
         // to the import's date — asserted in the next test.)
         Assert.Null(manual.IsMergedInto);
         Assert.True(manual.IsMergeWinner);
+    }
+
+    /// <summary>
+    /// A merge with NO approve flag still clears needs_review on the loser.
+    /// </summary>
+    /// <remarks>
+    /// "A merged loser is not awaiting review" is an invariant of the data, so it
+    /// is enforced in the repository rather than left to each caller. It used to
+    /// depend on the SPA pairing the merge with approve: true — which it did, so
+    /// the product looked correct — but any other client (MCP, a direct PATCH)
+    /// merged a row and left it flagged, which keeps the sidebar review dot lit on
+    /// an account whose register has nothing left to review.
+    ///
+    /// The investment branch hit exactly that, because its merge PATCH is
+    /// merge-only and never carried the flag. Rather than teach it to send one,
+    /// both paths were reconciled on the server owning the end state.
+    /// </remarks>
+    [Fact]
+    public async Task Patch_mergeFromHeaderId_clears_needs_review_without_an_approve_flag()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var dining = await ledger.AddCategoryAsync("Dining");
+        var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
+
+        var (manualLegId, _) = await ledger.AddTransactionPairAsync(
+            bank.Id, dining.Id, -9m,
+            new DateTime(2026, 3, 5, 12, 0, 0, DateTimeKind.Utc),
+            payee: "Downtown Parking");
+        var manualId = await ledger.ResolveHeaderIdAsync(manualLegId);
+        var targetId = await SeedBankFeedTargetAsync(
+            ledger, bank.Id, uncategorized.Id, -9m,
+            new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
+            bankPayee: "DOWNTOWN PARKING #4250");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        // Merge stamp ONLY — the body the SPA now sends, and the one an API
+        // client would write by hand.
+        var response = await client.SendAsync(Patch(ledger.LedgerId, targetId,
+            new PatchTransactionRequest { MergeFromHeaderId = manualId }));
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        await using var db = _fixture.NewDbContext();
+        var target = await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == targetId);
+        Assert.Equal(manualId, target.IsMergedInto);
+        Assert.False(target.NeedsReview);
     }
 
     [Fact]

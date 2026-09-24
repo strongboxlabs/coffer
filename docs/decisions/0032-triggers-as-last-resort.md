@@ -1,7 +1,7 @@
 # 0032 — Triggers as a last resort; validation invariants live in API code
 
 * Status: Accepted (principle locked; per-trigger removal slices tracked
-  in [follow-ups.md](../follow-ups.md))
+  in the open-work backlog)
 * Date: 2026-05-29
 * Related: ADR-0019 (symmetric postings), ADR-0022 (txn_headers and legs),
   ADR-0029 (investment transaction editor)
@@ -205,7 +205,7 @@ Removal happens **one trigger per slice**, each with:
 4. **Commit message documents the API surface that now owns the
    invariant.**
 
-Removal order (tracked in [follow-ups.md → Trigger reduction](../follow-ups.md)):
+Removal order (tracked in the open-work backlog):
 
 1. ~~`trg_validate_posting_role`~~ — done in migration 084.
 2. ~~`trg_validate_posting_cardinality_insert` / `_update`~~ — done in migration 085.

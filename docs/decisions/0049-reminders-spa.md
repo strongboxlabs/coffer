@@ -5,11 +5,11 @@
 * Related: ADR-0047 (reminders backend + mutation API), ADR-0048 (live/template
   view layer), ADR-0023 (modern-web UX conventions), ADR-0043 (account/category
   picker), ADR-0037 (snapshots SPA panel — the structural precedent), ADR-0021
-  (design tokens/primitives). Backend: PRs #199–#202.
+  (design tokens/primitives). Backend: PRs \#199–#202.
 
 ## Context
 
-The reminders backend is complete (#202): list / upcoming / detail / create /
+The reminders backend is complete (\#202): list / upcoming / detail / create /
 edit / disable / skip / fire, for bank and investment shapes, with each series'
 signed **amount** on the read surface (`ReminderSummary.Amount`,
 `UpcomingOccurrence.Amount` — the net on `recurring_transactions.source_account_id`,
@@ -57,7 +57,7 @@ detail→legs) and carries none of the editor-extraction / RRULE-builder risk.
 
 The agenda, calendar day-popover, and detail show each occurrence's **signed,
 colour-coded amount** (`formatSignedAmount`; outflow `state-danger`, inflow
-`state-success`). The backend already supplies it (#202); no per-row detail
+`state-success`). The backend already supplies it (\#202); no per-row detail
 fetch. This was the key gap vs MD and is the most prominent datum in its view.
 
 ### D4 — Zero new dependencies (hand-roll, per the pinned-deps posture)

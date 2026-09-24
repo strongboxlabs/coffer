@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 using OfxNet;
 using OfxNet.Investments;
@@ -46,7 +48,7 @@ namespace Coffer.Api.Ingest.Ofx;
 /// <c>online_match_fi_id</c>. Together this lets future MD-imported
 /// rows that preserved an OFX FITID dedup against incoming
 /// QFX/OFX rows for the same bank — the cross-source case captured
-/// in <c>docs/follow-ups.md</c>.</para>
+/// in <c>docs/maintainer/follow-ups.md</c>.</para>
 /// </remarks>
 public sealed class OfxFileProvider : IFileProvider
 {
@@ -457,7 +459,7 @@ public sealed class OfxFileProvider : IFileProvider
             Pending: false,
             Action: action,
             SecurityTickerHint: ticker,
-            RawProviderPayload: null,
+            RawProviderPayload: SerializeParsed(txn),
             ProviderAccountId: providerAccountId,
             OnlineMatchFiId: fiId,
             // OFX FITID lands on the OFX-protocol online_match_fitid
@@ -466,7 +468,8 @@ public sealed class OfxFileProvider : IFileProvider
             OnlineMatchFitid: txn.InstitutionId,
             Shares: ExtractShares(txn),
             UnitPrice: ExtractUnitPrice(txn),
-            Fee: ExtractFee(txn));
+            Fee: ExtractFee(txn),
+            IngestAmount: ExtractIngestAmount(txn));
     }
 
     /// <summary>
@@ -673,6 +676,90 @@ public sealed class OfxFileProvider : IFileProvider
         _                              => 0m,
     };
 
+    private static readonly JsonSerializerOptions RawPayloadOptions = new()
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        // A Security reference can point back at the statement's security list.
+        ReferenceHandler = ReferenceHandler.IgnoreCycles,
+        WriteIndented = false,
+    };
+
+    /// <summary>
+    /// The PARSED transaction, as JSON, kept on the row for later recovery.
+    /// </summary>
+    /// <remarks>
+    /// <para>NOT the original SGML. OfxNet exposes typed properties and keeps
+    /// no raw node or source text, so byte-exact preservation would mean
+    /// capturing element boundaries ourselves while reading the file. What is
+    /// stored instead is everything the parser understood — strictly more than
+    /// this provider consumes — which is what a later backfill would need.
+    /// Callers must not treat it as the file's own bytes.</para>
+    ///
+    /// <para>WHY AT ALL: a REINVEST's TOTAL had nowhere to live, so the editor
+    /// rebuilt the amount from shares x price and landed a cent out. Mig 228
+    /// gives that one field a column — but the reason the damage could not be
+    /// repaired retroactively is that this payload was NULL, so the original
+    /// figure was simply gone. Keeping it means the next field we discover we
+    /// needed is recoverable instead.</para>
+    ///
+    /// <para>RUNTIME TYPE, and the parameter is <c>object</c> for that reason.
+    /// System.Text.Json serializes the DECLARED type, which for a value typed
+    /// as its abstract OFX base would emit the base properties and silently
+    /// drop Total / Units / UnitPrice — exactly the fields this exists to keep.
+    /// A declared type of <c>object</c> makes STJ use the runtime type, so the
+    /// hazard is already closed; passing <c>GetType()</c> as well is belt and
+    /// braces, and keeps this correct if the parameter is ever narrowed to the
+    /// OFX base type by someone tidying the signature.</para>
+    ///
+    /// <para>Never throws: a payload that cannot be serialized is not worth
+    /// failing an import over, so it degrades to null.</para>
+    /// </remarks>
+    private static string? SerializeParsed(object? txn)
+    {
+        if (txn is null) return null;
+        try
+        {
+            return JsonSerializer.Serialize(txn, txn.GetType(), RawPayloadOptions);
+        }
+        catch (NotSupportedException)
+        {
+            return null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The authoritative total for rows whose reported cash amount is
+    /// deliberately ZERO — today, REINVEST.
+    /// </summary>
+    /// <remarks>
+    /// <para><see cref="ExtractAmount"/> maps REINVEST to 0 on purpose: the
+    /// dividend funds the purchase, no cash moves, and reporting the total as a
+    /// cash leg walks the account's balance down on every reinvest. Correct —
+    /// but it was the only copy of the number, so the editor rebuilt the amount
+    /// as <c>shares × unit_price</c> on open.</para>
+    ///
+    /// <para>Those differ. ADR-0073 D1 is explicit that "price × shares need
+    /// NOT equal the amount — a rounded price against an exact total is normal
+    /// and faithful to the feed". A REINVEST stating 6.584 units at 48.05 with
+    /// a TOTAL of 316.37 rebuilt as 316.36, and Accept persisted the rebuilt
+    /// figure.</para>
+    ///
+    /// <para>Magnitude, not OFX's signed convention: the editor's Amount field
+    /// is a positive principal and the action carries direction. Only REINVEST
+    /// is carried — every other type already reports its real total as the cash
+    /// amount, and duplicating it here would give the prefill two sources for
+    /// one number.</para>
+    /// </remarks>
+    private static decimal? ExtractIngestAmount(OfxInvestmentTransaction txn) => txn switch
+    {
+        OfxReinvest reinvest => Math.Abs(reinvest.Total),
+        _                    => null,
+    };
+
     /// <summary>
     /// Extract the share count from an OFX investment transaction.
     /// Returns null for types with no shares (Income / CapitalReturn /
@@ -767,7 +854,7 @@ public sealed class OfxFileProvider : IFileProvider
             Pending: false,                            // OFX has no per-row pending flag (statements are post-clear)
             Action: null,                              // bank shape; investment-action lands in slice 2
             SecurityTickerHint: null,
-            RawProviderPayload: null,                  // OFX parse path doesn't preserve raw element text (yet)
+            RawProviderPayload: SerializeParsed(txn),
             ProviderAccountId: providerAccountId,
             OnlineMatchFiId: fiId,
             // OFX FITID == ExternalId == online_match_fitid (OFX-protocol

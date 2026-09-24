@@ -221,7 +221,7 @@ public sealed class SchemaDriftGuardTests
             });
             await db.SaveChangesAsync();
         }
-        await ledger.SetHeaderOverrideAsync(bankLegId, memo: "reconciled at bank");
+        await ledger.EditHeaderAsync(bankLegId, memo: "reconciled at bank");
 
         // Snapshot the seeded state; capture per-table counts.
         await using var db2 = _fixture.NewDbContext();
@@ -233,7 +233,7 @@ public sealed class SchemaDriftGuardTests
         foreach (var t in captured) before[t] = await CountAsync(conn, t, ledger.LedgerId);
 
         // Sanity: the spread we seeded really has rows (so parity means something).
-        foreach (var t in new[] { "txn_headers", "txn_legs", "txn_leg_recon", "txn_header_overrides",
+        foreach (var t in new[] { "txn_headers", "txn_legs", "txn_leg_recon", "txn_header_originals",
                                   "securities", "holdings", "lots", "security_splits", "security_prices",
                                   "budget_targets" })
             Assert.True(before[t] > 0, $"expected seeded rows in {t}");

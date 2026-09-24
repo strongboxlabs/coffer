@@ -27,7 +27,6 @@ as part of every change ([engineering-standards.md](engineering-standards.md)).
 
 | Doc | Purpose |
 |---|---|
-| [follow-ups.md](follow-ups.md) | Open-work backlog — the ordered *Next* slices + the unordered long-tail behind them. |
 
 ## How these docs interact with the code
 

@@ -652,12 +652,15 @@ public static class TransactionsEndpoints
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        // Presence, not nullness (migration 230): `{"payee": null}` is a
+        // request to CLEAR the payee, which is a header edit and must not read
+        // as an empty body.
         var hasHeaderField =
-            request.Payee is not null
-            || request.Memo is not null
-            || request.CheckNumber is not null
-            || request.PostedAt is not null
-            || request.TransactedAt is not null;
+            request.HasPayee
+            || request.HasMemo
+            || request.HasCheckNumber
+            || request.HasPostedAt
+            || request.HasTransactedAt;
         var hasPostings = request.Postings is not null;
         // Slice 2c.6a: `approve: true` alone is a valid PATCH — it
         // clears needs_review without other edits (the user accepted
@@ -727,6 +730,9 @@ public static class TransactionsEndpoints
                 TransactionsRepository.PatchResult.HeaderNotBankShape =>
                     BusinessError.Problem(BusinessError.Codes.TransactionHeaderIsInvestment,
                         "Header is an investment transaction; use /api/ledgers/{ledgerId}/investment-transactions/{headerId}."),
+                TransactionsRepository.PatchResult.HeaderDateNull =>
+                    BusinessError.Problem(BusinessError.Codes.TransactionDateNull,
+                        "postedAt and transactedAt cannot be null. Omit the field to leave the date unchanged."),
                 _ => Results.Problem("Unknown patch result.", statusCode: 500),
             };
         }

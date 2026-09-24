@@ -262,8 +262,7 @@ The full ERD lives in [database-schema.md](database-schema.md) alongside the col
 | `feed_connections` | Bank feed credentials/state (SimpleFIN, Plaid, manual) |
 | `txn_headers` | Event envelope: one row per Moneydance txn (or user-entered txn, or SimpleFIN feed event). Carries payee, memo, posted-at, check-number, online-match-status. Reconciliation status moved to the per-leg `txn_leg_recon` overlay (migration 171, ADR-0082) — per-account, so a transfer can be cleared in one account and uncleared in the other. See [decisions/0022-txn-headers-and-legs.md](decisions/0022-txn-headers-and-legs.md). |
 | `txn_legs` | Per-account postings: two legs per posting (one on each account), N postings per multi-split header. `posting_index` pairs the two sides of one posting (shared within the header, different `account_id`). Investment-side metadata (`security_id`, `quantity`, `unit_price`, `commission`) lives on the holdings-side leg of each pair. |
-| `txn_header_overrides` | User edits to header fields (payee, memo, posted-at, check-number, is_hidden). One row per overridden header. |
-| `txn_leg_overrides` | User edits to per-leg fields (leg-memo, amount). One row per overridden leg. |
+| `txn_header_originals` | The FEED's header values (payee, memo, posted-at, transacted-at, check-number), captured once by the first edit that overwrote them. One row per EDITED header; its existence is the "modified" signal. Migration 230, ADR-0100. |
 | `txn_leg_recon` | Per-leg reconciliation status overlay (`uncleared`/`reconciling`/`cleared` + cleared-audit pair). One row per reconciled real-account leg; absent ⇒ uncleared. Per-account (migration 171, ADR-0082). |
 | `txn_header_tags` | Many-to-many join: headers ↔ tags. Tags describe the event, not individual legs. |
 | `securities` | Investment instruments (ticker, CUSIP, name) |
@@ -280,41 +279,76 @@ The detailed column-level schema is in [database-schema.md](database-schema.md).
 
 ---
 
-## 4. Transaction Override Layer
+## 4. Current Values and Captured Originals
 
 ### 4.1 Design principle
 
-Feed data is immutable once written. The `txn_headers` and `txn_legs` tables store raw feed values (payee, memo, amount, posted-at, etc.) and are never modified by user actions. User edits live in two parallel override tables: `txn_header_overrides` for event-level fields (payee, memo, status, …) and `txn_leg_overrides` for per-leg fields (leg-memo, amount). Application code always reads from the `resolved_transactions` view, which coalesces user values over feed values for each layer. See [decisions/0003-immutable-feed-and-overrides.md](decisions/0003-immutable-feed-and-overrides.md) for the override pattern and [decisions/0022-txn-headers-and-legs.md](decisions/0022-txn-headers-and-legs.md) for the header/leg split.
+`txn_headers` and `txn_legs` always hold the CURRENT values — what the register
+shows and what every report computes from. The feed's values for a header are
+captured once, by the first edit that would overwrite them, into
+`txn_header_originals`. A row exists there only for an edited header, so its
+existence IS the "this has been modified" signal. See
+[decisions/0100-canonical-holds-current-sidecar-holds-original.md](decisions/0100-canonical-holds-current-sidecar-holds-original.md)
+and [decisions/0022-txn-headers-and-legs.md](decisions/0022-txn-headers-and-legs.md)
+for the header/leg split.
 
-This approach means:
+This replaced the inverse arrangement (ADR-0003): the canonical row held the
+feed's values and `txn_header_overrides` / `txn_leg_overrides` held the user's,
+resolved as `COALESCE(override, canonical)`. It could not express a CLEARED
+field — a nullable override column has no companion "is overridden" marker, so
+NULL meant both "not overridden" and "overridden to empty", and the COALESCE
+always chose the first. Emptying a payee box saved successfully and handed the
+old text back.
 
-- Feed values are always recoverable — "reset to original" is a single `DELETE` on the overrides row
-- The resolved view logic is defined once (in SQL) rather than replicated across every query
-- A `has_overrides` flag makes it trivial to show a visual indicator on edited transactions
+What the flip keeps:
 
-### 4.2 Override resolution
+- Feed values stay recoverable — one row lookup by primary key, not a
+  reconstruction; "reset to original" is a copy-back.
+- Re-sync can still tell a bank-side change from a user edit, by comparing the
+  incoming value against the ORIGINAL rather than against current.
+- `resolved_transactions.has_overrides` keeps its name and answers the same
+  question from the other side: the row has an original on file.
+
+What it adds:
+
+- Clearing a field works by construction. NULL means NULL.
+- Reads lose a join and five COALESCEs on the hottest view in the app, and the
+  same on the balance walk, `account_current_balances`, the payee-suggestion
+  function and three holdings functions.
+- Bank and investment writes are one shape with one capture rule, rather than
+  two paths that wrote different layers and could land underneath each other.
+
+`txn_leg_overrides` was dropped rather than flipped: zero rows in every
+database and no writer anywhere in the repository.
+
+### 4.2 Where each value lives
 
 ```mermaid
 flowchart LR
-    HDR["txn_headers\npayee · memo · posted_at · status\ncheck_number · is_pending · ..."]
-    LEG["txn_legs\namount · leg_memo · balance_after\nsecurity_id · quantity · ..."]
-    HOV["txn_header_overrides\npayee · memo · status\nposted_at · check_number · is_hidden"]
-    LOV["txn_leg_overrides\nleg_memo · amount"]
-    VIEW["resolved_transactions VIEW\nCOALESCE per layer\nhas_overrides flag"]
+    HDR["txn_headers (CURRENT)\npayee · memo · posted_at\ntransacted_at · check_number\nis_pending · is_hidden · ..."]
+    LEG["txn_legs (CURRENT)\namount · leg_memo\nsecurity_id · quantity · ..."]
+    ORG["txn_header_originals (the FEED's)\npayee · memo · posted_at\ntransacted_at · check_number\ncaptured on FIRST edit"]
+    RCN["txn_leg_recon\nstatus · cleared_at · cleared_by"]
+    VIEW["resolved_transactions VIEW\nno COALESCE for header fields\nhas_overrides = EXISTS(original)"]
     API[.NET API]
     RPT[Reports]
 
     HDR -->|JOIN| VIEW
     LEG -->|JOIN| VIEW
-    HOV -->|LEFT JOIN| VIEW
-    LOV -->|LEFT JOIN| VIEW
+    ORG -.->|EXISTS| VIEW
+    RCN -->|LEFT JOIN| VIEW
+    HDR -->|first edit captures| ORG
     VIEW --> API
     VIEW --> RPT
 ```
 
+`txn_leg_recon` is still a genuine OVERLAY and stays one: clearing is a state
+the leg has no column for, not an edited copy of a column that already exists.
+That distinction is why the flip left it alone.
+
 ### 4.3 Transaction rules
 
-*Planned, not yet implemented.* The original Phase 0 plan reserved a `transaction_rules` table for payee-substring → category auto-categorization on sync (e.g. `feed_payee CONTAINS "WHOLEFDS" → payee="Whole Foods", account=Groceries`). The table was dropped in migration 044 because (a) zero rows had been written in a year of operation and (b) the schema will be re-designed against the current sync pipeline when the feature is actually built. Tracked as "Rule-based auto-categorization on sync" in [follow-ups.md](follow-ups.md).
+*Planned, not yet implemented.* The original Phase 0 plan reserved a `transaction_rules` table for payee-substring → category auto-categorization on sync (e.g. `feed_payee CONTAINS "WHOLEFDS" → payee="Whole Foods", account=Groceries`). The table was dropped in migration 044 because (a) zero rows had been written in a year of operation and (b) the schema will be re-designed against the current sync pipeline when the feature is actually built. Tracked as "Rule-based auto-categorization on sync" in the open-work backlog.
 
 ---
 
@@ -540,7 +574,7 @@ flowchart LR
 | Service / class | Responsibility |
 |---|---|
 | `SimpleFinSyncService` | Server-side orchestrator for the Sync-now flow (Phase 5 slice 2b+). Walks the SimpleFIN connection, FITID-dedups against existing `txn_headers`, inserts unmatched rows directly with `needs_review=true`. Hand-driven merge (slice 2c.6) replaces the original auto-merge plan; no `MergeEvaluator` component exists. |
-| `TransactionRuleEngine` | *Not built.* Original plan was a transaction-rules engine running rule rows over each sync; the rules table was dropped in migration 044 and the feature is parked as "Rule-based auto-categorization on sync" in [follow-ups.md](follow-ups.md). |
+| `TransactionRuleEngine` | *Not built.* Original plan was a transaction-rules engine running rule rows over each sync; the rules table was dropped in migration 044 and the feature is parked as "Rule-based auto-categorization on sync" in the open-work backlog. |
 | `RegisterRepository` (EF Core) | Cursor-paginated register queries against `resolved_transactions`; uses `HasDbFunction` to bind the `register_entry_keys` Postgres function for keyset pagination. |
 | `TransactionsRepository` + `TransactionOverridesRepository` | Manual-transaction create, recon-status / delete mutations, override-layer PATCH path. EF Core; no raw SQL. |
 | `ReportService` | Aggregation queries for spending trends, net worth, cashflow. (Phase 8; the MCP reporting layer per ADR-0063 is the first slice.) |
@@ -609,7 +643,7 @@ Phases are sequenced 1 → 10 (see the gantt below). Shipped detail
 lives in the ADRs and git history; the [README](../README.md)
 carries only a short status paragraph. Open work — the ordered
 **Next** slices + the backlog — lives in
-[follow-ups.md](follow-ups.md).
+the open-work backlog.
 
 ```mermaid
 gantt

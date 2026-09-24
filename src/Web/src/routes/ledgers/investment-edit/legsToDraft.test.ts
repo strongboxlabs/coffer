@@ -65,6 +65,7 @@ function mkLeg(
         ingestShares: null,
         ingestUnitPrice: null,
         ingestFee: null,
+        ingestAmount: null,
         ingestSecurityTickerHint: null,
         categoryAccountId: null,
         categoryAccountName: null,

@@ -82,7 +82,7 @@ public sealed class LedgerBalanceRecomputeEquivalenceTests
         // instead of the override, this is the row that would diverge.
         var (movedLeg, _) = await ledger.AddTransactionPairAsync(
             checking.Id, groceries.Id, -99.99m, new DateTime(2024, 3, 5, 0, 0, 0, DateTimeKind.Utc));
-        await ledger.SetHeaderOverrideAsync(
+        await ledger.EditHeaderAsync(
             movedLeg, postedAt: new DateTime(2024, 1, 5, 0, 0, 0, DateTimeKind.Utc));
 
         // Excluded rows: hidden, and merged away into the first payment.

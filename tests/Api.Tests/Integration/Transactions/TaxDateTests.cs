@@ -12,16 +12,16 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 
 /// <summary>
 /// End-to-end behaviour of the tax / transaction date (`transacted_at`), read
-/// through <c>resolved_transactions</c> — the override-aware view the register and
-/// reports actually read.
+/// through <c>resolved_transactions</c> — the view the register and reports
+/// actually read.
 /// </summary>
 /// <remarks>
 /// <para>This surface had NO server-side test coverage at all before migration 189,
-/// which is how a real defect stayed invisible: the bank PATCH writes the
-/// <c>txn_header_overrides</c> layer, where a null field means "leave this column
-/// alone" (ADR-0003). A client sending null to CLEAR a tax date therefore cleared
-/// nothing. A payload-level assertion cannot see that — only reading back through
-/// the view can.</para>
+/// which is how a real defect stayed invisible: on the bank PATCH an ABSENT field
+/// means "leave this column alone", and before migration 230 a NULL one meant the
+/// same, so a client sending null to CLEAR a tax date cleared nothing. A
+/// payload-level assertion cannot see that — only reading back through the view
+/// can.</para>
 /// <para>Migration 189 makes the base column NOT NULL and stores "no distinct tax
 /// date" as the posted date, so clearing is expressed by sending the posted date
 /// rather than a null. These tests pin that.</para>
@@ -150,7 +150,7 @@ public sealed class TaxDateTests
     }
 
     [Fact]
-    public async Task Patching_a_null_tax_date_leaves_the_existing_one_alone()
+    public async Task Patching_without_a_tax_date_leaves_the_existing_one_alone()
     {
         var ledger = await SyntheticLedger.CreateAsync(_fixture);
         var bank = await ledger.AddBankAccountAsync("checking");
@@ -172,9 +172,13 @@ public sealed class TaxDateTests
             });
         var headerId = (await create.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("headerId").GetGuid();
 
-        // Null on a PATCH field means "leave this column alone" (ADR-0003). This is
-        // the exact behaviour that made a null-to-clear client silently no-op, so
-        // it is pinned deliberately rather than left as folklore.
+        // OMITTING a field means "leave this column alone" — the bank PATCH is
+        // not wholesale, so an edit to the payee must not disturb the tax date.
+        // This used to be expressed as "null means leave alone", which is what
+        // made a null-to-clear client silently no-op; since migration 230 the
+        // request decides on PRESENCE, so the no-op case is the omitted one and
+        // an explicit null is a 422 on this column (it is NOT NULL). Pinned
+        // deliberately rather than left as folklore.
         var patch = await client.PatchAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/transactions/{headerId}",
             new PatchTransactionRequest { Payee = "Renamed" });
@@ -186,7 +190,8 @@ public sealed class TaxDateTests
     /// <summary>
     /// The investment PATCH is wholesale-replace (ADR-0025): the body IS the new
     /// state of the world, so OMITTING a field clears it — the opposite of the
-    /// bank PATCH's override-layer "leave it alone".
+    /// bank PATCH, where an omitted field is left alone and only an explicitly
+    /// sent one is applied.
     /// </summary>
     /// <remarks>
     /// Pinned because the difference is invisible at the call site and cost a real

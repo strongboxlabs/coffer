@@ -41,6 +41,8 @@ import type {
 
 const LEDGER_ID = '00000000-0000-0000-0000-000000000010';
 const ACCOUNT_ID = '00000000-0000-0000-0000-000000000100';
+const LOSER_HEADER = '00000000-0000-0000-0000-0000000010c3';
+const WINNER_HEADER = '00000000-0000-0000-0000-000000001117';
 const FOCUS_ID = '00000000-0000-0000-0000-0000000000f0';
 
 const TEST_LEDGER: LedgerSummary = {
@@ -894,4 +896,174 @@ it('toggles the Scheduled filter', async () => {
             expect(screen.queryByText('Food/Groceries')).not.toBeInTheDocument();
         });
     });
+
+    // The bank's merge SAVE path, which had never been tested. It has shipped
+    // since #341 and works; the gap is why the INVESTMENT register could be
+    // missing the same branch entirely and nobody noticed for as long.
+    //
+    // Direction is inverted: the edited row becomes the LOSER and the chosen
+    // candidate survives, so the server returns the SURVIVOR's entry. Patching
+    // that onto the edited header — the ordinary save path — would paint the
+    // survivor's data onto the loser's row and leave two entries under one
+    // header id.
+    it('removes the loser and keeps the survivor once, on a merge save', async () => {
+        const loser = makeTxn({
+            id: 'l1', headerId: LOSER_HEADER, payee: 'imported dupe',
+            // NO counterparty — an uncategorised imported row, which is what
+            // most needs-review rows look like. Folding one used to be a
+            // silent no-op: buildSaveBody validated the postings before it
+            // reached the merge stamp.
+            needsReview: true,
+        });
+        const winner = makeTxn({
+            id: 'w1', headerId: WINNER_HEADER, payee: 'the keeper',
+        });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(loser), entryOf(winner)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+        vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
+        vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([TEST_ACCOUNT]);
+        vi.spyOn(apiModule, 'fetchMergeCandidates').mockResolvedValue([
+            {
+                headerId: WINNER_HEADER,
+                payee: 'the keeper',
+                memo: null,
+                postedAt: '2026-05-01T12:00:00Z',
+                daysDelta: 0,
+                tags: [],
+                postings: [
+                    {
+                        counterpartyAccountId: '00000000-0000-0000-0000-0000000000c1',
+                        counterpartyAccountName: 'Groceries',
+                        amount: 4.5,
+                        legMemo: null,
+                    },
+                ],
+            },
+        ]);
+        // The server folds the loser away and returns the SURVIVOR's entry.
+        const patchSpy = vi
+            .spyOn(apiModule, 'patchTransaction')
+            .mockResolvedValue(entryOf(winner));
+        // Saving kicks off the in-place balance refresh. Unstubbed it reaches the
+        // real fetch with a relative URL, which the test environment cannot parse
+        // — today an ignored rejection, and a hard "unhandled error" failure on a
+        // newer jsdom, which is how the dependency bump surfaced it.
+        vi.spyOn(apiModule, 'fetchBalancesForHeaders').mockResolvedValue([]);
+
+        renderRegister();
+
+        const loserCell = await screen.findByText('imported dupe');
+        fireEvent.dblClick(loserCell.closest('[role="row"]')!);
+
+        // The chip is labelled by its summary — date · payee · counterparty.
+        fireEvent.click(await screen.findByRole('button', { name: /the keeper.*Groceries/i }));
+        fireEvent.click(
+            await screen.findByRole('button', { name: /fold into selected/i }),
+        );
+
+        await waitFor(() => expect(patchSpy).toHaveBeenCalled());
+        // EXACT, not objectContaining: the body carries the merge stamp and
+        // nothing else. It used to pair an `approve: true`, which put the
+        // "a merged loser is not awaiting review" invariant in the caller —
+        // so clients that did not send it left the row flagged. The server
+        // owns it now, and this pins the body against the flag creeping back.
+        expect(patchSpy.mock.calls[0]![2]).toEqual({
+            mergeFromHeaderId: WINNER_HEADER,
+        });
+
+        await waitFor(() => {
+            expect(screen.queryByText('imported dupe')).not.toBeInTheDocument();
+        });
+        expect(screen.getAllByText('the keeper')).toHaveLength(1);
+    });
 });
+
+describe('BankRegisterPage — focus anchoring', () => {
+    beforeEach(() => {
+        vi.restoreAllMocks();
+        vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
+        vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([TEST_ACCOUNT]);
+        vi.spyOn(apiModule, 'fetchBalancesForHeaders').mockResolvedValue([]);
+    });
+
+    const ANCHOR = '00000000-0000-0000-0000-0000000000aa';
+
+    it('asks the server to anchor on the ?focus= row', async () => {
+        const wanted = makeTxn({ id: 'a1', headerId: ANCHOR, payee: 'Anchored' });
+        const fetchSpy = vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(wanted)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+
+        renderRegister(
+            `/ledgers/${LEDGER_ID}/accounts/${ACCOUNT_ID}?focus=${ANCHOR}`,
+        );
+
+        await screen.findByText('Anchored');
+        expect(fetchSpy.mock.calls[0]![0]).toEqual(
+            expect.objectContaining({ startingAtHeaderId: ANCHOR }),
+        );
+    });
+
+    it('focuses the anchored row when the server returns it', async () => {
+        const wanted = makeTxn({ id: 'a1', headerId: ANCHOR, payee: 'Anchored' });
+        const other = makeTxn({ id: 'b1', headerId: 'other-header', payee: 'Bystander' });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(other), entryOf(wanted)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+
+        renderRegister(
+            `/ledgers/${LEDGER_ID}/accounts/${ACCOUNT_ID}?focus=${ANCHOR}`,
+        );
+
+        await screen.findByText('Anchored');
+        await waitFor(() => {
+            expect(
+                document.querySelector(`[data-headerid="${ANCHOR}"]`)
+                    ?.getAttribute('data-focused'),
+            ).toBe('true');
+        });
+        // ...and NOT the row that merely happens to sit first.
+        expect(
+            document.querySelector('[data-headerid="other-header"]')
+                ?.getAttribute('data-focused'),
+        ).toBe('false');
+    });
+
+    /**
+     * The regression that motivated the whole change.
+     */
+    it('focuses nothing when the server declines to anchor', async () => {
+        // The server pins an anchor only when the row matches the active filter
+        // and otherwise returns the ordinary most-recent page — saying nothing
+        // about which it did. The hook used to read "anchor requested" as
+        // "anchor is at index 0" and focus whatever sat there. With a status tab
+        // active, saving a row out of that tab therefore focused and scrolled to
+        // an unrelated row.
+        const unrelated = makeTxn({ id: 'z1', headerId: 'not-the-anchor', payee: 'Unrelated' });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(unrelated)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+
+        renderRegister(
+            `/ledgers/${LEDGER_ID}/accounts/${ACCOUNT_ID}?focus=${ANCHOR}`,
+        );
+
+        // Settled anchor: the page has rendered the row the server DID return,
+        // so an absence of focus below is a real absence.
+        await screen.findByText('Unrelated');
+        expect(
+            document.querySelector('[data-headerid="not-the-anchor"]')
+                ?.getAttribute('data-focused'),
+        ).toBe('false');
+    });
+});
+

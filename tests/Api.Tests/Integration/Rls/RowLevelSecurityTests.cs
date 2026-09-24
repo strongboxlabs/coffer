@@ -109,6 +109,45 @@ public sealed class RowLevelSecurityTests
     }
 
     [Fact]
+    public async Task Header_originals_are_scoped_to_the_callers_ledgers()
+    {
+        // txn_header_originals holds the FEED's payees and memos for every
+        // edited row — the same class of data as txn_headers, and a table added
+        // after migration 017, so it inherits no policy and migration 017's
+        // ALTER DEFAULT PRIVILEGES already grants coffer_app write. "No policy"
+        // would therefore mean "no refusal", which is why the table declares its
+        // own pair in migration 230 and why this asserts them directly rather
+        // than trusting the endpoint gate.
+        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var aliceBank = await alice.AddBankAccountAsync("alice-bank");
+        var aliceCategory = await alice.AddCategoryAsync("alice-groceries");
+        var bobBank = await bob.AddBankAccountAsync("bob-bank");
+        var bobCategory = await bob.AddCategoryAsync("bob-groceries");
+
+        var (aliceLeg, _) = await alice.AddTransactionPairAsync(
+            aliceBank.Id, aliceCategory.Id, amount: -10m,
+            postedAt: new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
+            payee: "ALICE FEED PAYEE");
+        var (bobLeg, _) = await bob.AddTransactionPairAsync(
+            bobBank.Id, bobCategory.Id, amount: -20m,
+            postedAt: new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
+            payee: "BOB FEED PAYEE");
+
+        // Both edited, so both have an original on file.
+        await alice.EditHeaderAsync(aliceLeg, payee: "Alice's curated name");
+        await bob.EditHeaderAsync(bobLeg, payee: "Bob's curated name");
+
+        await using var aliceDb = _fixture.NewAppDbContextAsUser(alice.UserId);
+        var visible = await aliceDb.TxnHeaderOriginals.AsNoTracking()
+            .Select(o => o.Payee)
+            .ToListAsync();
+
+        Assert.Contains("ALICE FEED PAYEE", visible);
+        Assert.DoesNotContain("BOB FEED PAYEE", visible);
+    }
+
+    [Fact]
     public async Task Users_table_returns_only_callers_own_row()
     {
         var alice = await SyntheticLedger.CreateAsync(_fixture);

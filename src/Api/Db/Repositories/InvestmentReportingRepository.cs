@@ -460,6 +460,7 @@ public sealed class InvestmentReportingRepository
                     p.Quantity,
                     p.UnitPrice,
                     p.Amount,
+                    p.SettledAmount,
                     p.FeeAmount,
                     p.CategoryAccountName,
                     p.TransferAccountName);

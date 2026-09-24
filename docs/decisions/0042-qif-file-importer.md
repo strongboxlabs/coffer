@@ -5,7 +5,7 @@
 * Related: ADR-0031 (ingest-provider pattern; file providers are
   Phase 4–6), ADR-0027 (investment action catalog), ADR-0038
   (provider_security_mappings ticker rail), the OFX REINVEST $0
-  cash contract (PR #166)
+  cash contract (PR \#166)
 
 ## Context
 

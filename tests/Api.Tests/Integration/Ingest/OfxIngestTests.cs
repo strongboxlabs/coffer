@@ -10,6 +10,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Coffer.Api.Contracts;
 using Coffer.Api.Db.Entities;
 using Coffer.Api.Tests.Integration.Infra;
+using System.Text.Json;
 
 namespace Coffer.Api.Tests.Integration.Ingest;
 
@@ -596,6 +597,92 @@ public sealed class OfxIngestTests
         """;
 
     /// <summary>
+    /// A REINVEST whose stated TOTAL does NOT equal units x unit price.
+    /// </summary>
+    /// <remarks>
+    /// 6.584 units at a printed 48.05 multiply to 316.36, while the statement
+    /// settles 316.37. That is not a broken file — ADR-0073 D1 says the printed
+    /// per-share price is rounded and "price x shares need NOT equal the
+    /// amount". The shape matters because a REINVEST's cash leg is reported as
+    /// ZERO by design (no cash moves), so before mig 228 nothing carried the
+    /// total and the editor rebuilt it from the two rounded numbers — landing a
+    /// cent out, and persisting that on Accept.
+    ///
+    /// The existing investment fixture cannot catch this: its reinvest is 0.2
+    /// at 60.00 totalling 12.00, where the product and the total agree, so an
+    /// assertion there passes whether the value was carried or recomputed.
+    /// Synthesised — no real account names, FIIDs, or CUSIPs.
+    /// </remarks>
+    private const string OfxReinvestRoundingStatement = """
+        OFXHEADER:100
+        DATA:OFXSGML
+        VERSION:102
+        SECURITY:NONE
+        ENCODING:USASCII
+        CHARSET:1252
+        COMPRESSION:NONE
+        OLDFILEUID:NONE
+        NEWFILEUID:NONE
+
+        <OFX>
+        <SIGNONMSGSRSV1>
+        <SONRS>
+        <STATUS><CODE>0<SEVERITY>INFO</STATUS>
+        <DTSERVER>20260201120000
+        <LANGUAGE>ENG
+        </SONRS>
+        </SIGNONMSGSRSV1>
+        <INVSTMTMSGSRSV1>
+        <INVSTMTTRNRS>
+        <TRNUID>0
+        <STATUS><CODE>0<SEVERITY>INFO</STATUS>
+        <INVSTMTRS>
+        <DTASOF>20260131120000
+        <CURDEF>USD
+        <INVACCTFROM>
+        <BROKERID>brokerX
+        <ACCTID>INV-0001
+        </INVACCTFROM>
+        <INVTRANLIST>
+        <DTSTART>20260101
+        <DTEND>20260131
+        <REINVEST>
+        <INVTRAN>
+        <FITID>INV-FITID-REINV-ROUND
+        <DTTRADE>20260120
+        </INVTRAN>
+        <SECID>
+        <UNIQUEID>FAKE0001
+        <UNIQUEIDTYPE>CUSIP
+        </SECID>
+        <INCOMETYPE>DIV
+        <TOTAL>-316.37
+        <SUBACCTSEC>CASH
+        <UNITS>6.584
+        <UNITPRICE>48.05
+        </REINVEST>
+        </INVTRANLIST>
+        </INVSTMTRS>
+        </INVSTMTTRNRS>
+        </INVSTMTMSGSRSV1>
+        <SECLISTMSGSRSV1>
+        <SECLIST>
+        <STOCKINFO>
+        <SECINFO>
+        <SECID>
+        <UNIQUEID>FAKE0001
+        <UNIQUEIDTYPE>CUSIP
+        </SECID>
+        <SECNAME>Fake Test Stock
+        <TICKER>FAKE
+        </SECINFO>
+        </STOCKINFO>
+        </SECLIST>
+        </SECLISTMSGSRSV1>
+        </OFX>
+        """;
+
+    /// <summary>
     /// An OFX investment statement carrying nothing but an option buy
     /// and an option sell. OfxNet models BUYOPT / SELLOPT as
     /// OfxBuyInvestment / OfxSellInvestment subclasses, so before the
@@ -811,6 +898,170 @@ public sealed class OfxIngestTests
         Assert.DoesNotContain(warnings, m => m.Contains("INV-FITID-XFR", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// The reinvest's stated TOTAL is carried, not recomputed from the two
+    /// rounded numbers beside it.
+    /// </summary>
+    /// <remarks>
+    /// This is the assertion the older reinvest coverage could not make. There
+    /// the file's 0.2 units at 60.00 total exactly 12.00, so a recomputed value
+    /// and a carried one are indistinguishable. Here 6.584 at a printed 48.05
+    /// multiplies to 316.36 while the statement settles 316.37 — so 316.37 can
+    /// ONLY have come from TOTAL.
+    ///
+    /// A REINVEST's cash leg stays 0: no cash moves, and reporting the total as
+    /// a movement walks the balance down on every reinvest. That is exactly why
+    /// the figure needs its own carrier.
+    /// </remarks>
+    [Fact]
+    public async Task Import_carries_the_reinvest_total_when_it_differs_from_shares_times_price()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var resp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/import",
+            FileUpload(OfxReinvestRoundingStatement, accountId: brokerage.Id,
+                providerAccountId: "inv:brokerX:INV-0001"));
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        await using var db = _fixture.NewDbContext();
+        var header = await db.TxnHeaders.AsNoTracking()
+            .SingleAsync(h => h.LedgerId == ledger.LedgerId
+                && h.ExternalId == "INV-FITID-REINV-ROUND");
+
+        Assert.Equal(6.584m, header.IngestShares);
+        Assert.Equal(48.05m, header.IngestUnitPrice);
+        // 6.584 * 48.05 = 316.3612 -> 316.36. The statement says 316.37.
+        Assert.Equal(316.37m, header.IngestAmount);
+        Assert.NotEqual(
+            decimal.Round(6.584m * 48.05m, 2),
+            header.IngestAmount);
+
+        // The parsed record is kept so the NEXT field we discover we needed is
+        // recoverable — the reason this cent could not be repaired retroactively
+        // is that the payload was null and the original TOTAL was simply gone.
+        //
+        // Asserting on Total and Units specifically: a payload that merely
+        // EXISTS proves nothing, because the way this degrades is by losing
+        // fields rather than by failing. System.Text.Json serializes the
+        // declared type, so a value handed over as its abstract OFX base would
+        // serialize to the base properties alone — dropping exactly these.
+        // (The helper's parameter is `object`, which makes STJ use the runtime
+        // type, so that particular route is closed; this asserts the OUTCOME,
+        // which holds however the serialization is later rewired.)
+        Assert.NotNull(header.ProviderRawPayload);
+        using var parsed = JsonDocument.Parse(header.ProviderRawPayload!);
+        Assert.Equal(
+            -316.37m,
+            parsed.RootElement.GetProperty("Total").GetDecimal());
+        Assert.Equal(6.584m, parsed.RootElement.GetProperty("Units").GetDecimal());
+    }
+
+    /// <summary>
+    /// Re-importing the same file REPAIRS a row that predates a carrier.
+    /// </summary>
+    /// <remarks>
+    /// The file path counted a known FITID and <c>continue</c>d without writing
+    /// anything, so a carrier added after a row was first imported could never
+    /// reach it. That is not academic: mig 228 added <c>ingest_amount</c>
+    /// because the editor was rebuilding a REINVEST's total from shares x price
+    /// and landing a cent out — and the obvious repair, re-importing the file,
+    /// reported a dedup and changed nothing.
+    ///
+    /// The NULL here simulates exactly that row: imported before the column
+    /// existed, so the migration left it empty with nothing to backfill from.
+    /// </remarks>
+    [Fact]
+    public async Task Reimport_backfills_carriers_the_stored_row_is_missing()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        async Task<FileIngestImportResponse> ImportAsync()
+        {
+            var r = await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/import",
+                FileUpload(OfxReinvestRoundingStatement, accountId: brokerage.Id,
+                    providerAccountId: "inv:brokerX:INV-0001"));
+            Assert.Equal(HttpStatusCode.OK, r.StatusCode);
+            return (await r.Content.ReadFromJsonAsync<FileIngestImportResponse>())!;
+        }
+
+        var first = await ImportAsync();
+        Assert.Equal(1, first.TransactionsForReview);
+
+        // Age the row back to how a pre-228 import left it.
+        await using (var db = _fixture.NewDbContext())
+        {
+            // LEDGER-SCOPED. The suite shares one database and sibling tests
+            // import this same FITID into their own ledgers; an unscoped UPDATE
+            // reaches across all of them and corrupts whatever runs next.
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $"UPDATE txn_headers SET ingest_amount = NULL, provider_raw_payload = NULL WHERE external_id = 'INV-FITID-REINV-ROUND' AND ledger_id = {ledger.LedgerId}");
+        }
+
+        var second = await ImportAsync();
+        // Still deduped — this does not create a second row.
+        Assert.Equal(0, second.TransactionsForReview);
+        Assert.Equal(1, second.AlreadyKnown);
+
+        await using (var db = _fixture.NewDbContext())
+        {
+            var rows = await db.TxnHeaders.AsNoTracking()
+                .Where(h => h.LedgerId == ledger.LedgerId
+                    && h.ExternalId == "INV-FITID-REINV-ROUND")
+                .ToListAsync();
+            var header = Assert.Single(rows);
+            // …and the carriers it was missing are now filled from the file.
+            Assert.Equal(316.37m, header.IngestAmount);
+            Assert.NotNull(header.ProviderRawPayload);
+        }
+    }
+
+    /// <summary>A re-import never overwrites a carrier that already holds a
+    /// value — once captured it is an archive, and a person may have a reason
+    /// for what is stored.</summary>
+    [Fact]
+    public async Task Reimport_does_not_overwrite_a_carrier_that_is_already_set()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var content = FileUpload(OfxReinvestRoundingStatement, accountId: brokerage.Id,
+            providerAccountId: "inv:brokerX:INV-0001");
+        Assert.Equal(HttpStatusCode.OK,
+            (await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/import", content)).StatusCode);
+
+        await using (var db = _fixture.NewDbContext())
+        {
+            // Ledger-scoped, as above.
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $"UPDATE txn_headers SET ingest_amount = 999.99 WHERE external_id = 'INV-FITID-REINV-ROUND' AND ledger_id = {ledger.LedgerId}");
+        }
+
+        Assert.Equal(HttpStatusCode.OK,
+            (await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/import",
+                FileUpload(OfxReinvestRoundingStatement, accountId: brokerage.Id,
+                    providerAccountId: "inv:brokerX:INV-0001"))).StatusCode);
+
+        await using (var db = _fixture.NewDbContext())
+        {
+            var header = await db.TxnHeaders.AsNoTracking()
+                .SingleAsync(h => h.LedgerId == ledger.LedgerId
+                    && h.ExternalId == "INV-FITID-REINV-ROUND");
+            Assert.Equal(999.99m, header.IngestAmount);
+        }
+    }
+
     [Fact]
     public async Task Import_persists_investment_actions_with_ticker_hints()
     {
@@ -886,6 +1137,13 @@ public sealed class OfxIngestTests
         Assert.Equal(0.2m, reinvest.IngestShares);
         Assert.Equal(60m,  reinvest.IngestUnitPrice);
         Assert.Null(reinvest.IngestFee);
+        // Mig 228: the file's TOTAL, carried as a magnitude. Here it happens to
+        // equal units x price, so this alone cannot prove it was CARRIED rather
+        // than recomputed — Import_carries_the_reinvest_total_when_it_differs
+        // below is the assertion that can.
+        Assert.Equal(12m, reinvest.IngestAmount);
+        // A cash dividend's own amount already is its total; nothing to carry.
+        Assert.Null(dividend.IngestAmount);
 
         // OFX REINVEST is a net-zero cash event on the brokerage:
         // the dividend income IS the buy funding; no cash actually
@@ -894,8 +1152,11 @@ public sealed class OfxIngestTests
         // dividend's dollar value with a misleading negative sign).
         // Otherwise the user's running cash balance walks down by
         // the dividend on every reinvest, which is wrong. The
-        // editor recovers the buy's magnitude from `IngestShares *
-        // IngestUnitPrice` when upgrading to the investment shape;
+        // editor takes the buy's magnitude from `IngestAmount` — the
+        // total the file stated (mig 228) — falling back to
+        // `IngestShares * IngestUnitPrice` only for rows that carry
+        // none, since those two rounded numbers need not multiply to
+        // the settled total (ADR-0073 D1);
         // income + buy legs net to zero on the brokerage cash side
         // per ADR-0028 — matching this bank-shape contract.
         var reinvestLegs = await db.TxnLegs.AsNoTracking()
@@ -1050,5 +1311,99 @@ public sealed class OfxIngestTests
             FileUpload(Ofx1BankSingleAccount, accountId: bobAccount.Id, providerAccountId: "021000021:1234567890"));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
     }
+    /// <summary>
+    /// An unreviewed row split across several categories counts ONCE toward the
+    /// account's review count.
+    /// </summary>
+    /// <remarks>
+    /// The count reads <c>resolved_transactions</c>, which is per-LEG, while its
+    /// documented contract is per-<c>txn_headers</c> row. Splitting a row before
+    /// approving it puts several legs on the same account, so one transaction
+    /// reported itself as three — visible in the dot's tooltip and aria-label,
+    /// which say "N transactions to review".
+    ///
+    /// Reached the way a person reaches it: import, then split without
+    /// approving. A PATCH that carries postings but no Approve leaves
+    /// needs_review standing.
+    /// </remarks>
+    [Fact]
+    public async Task An_unreviewed_row_split_across_categories_counts_once()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var checking = await ledger.AddBankAccountAsync("Checking");
+        var groceries = await ledger.AddCategoryAsync("Groceries");
+        var household = await ledger.AddCategoryAsync("Household");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var resp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/import",
+            FileUpload(Ofx1BankSingleAccount, accountId: checking.Id,
+                providerAccountId: "021000021:1234567890"));
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        Guid headerId;
+        await using (var db = _fixture.NewDbContext())
+        {
+            headerId = (await db.TxnHeaders.AsNoTracking()
+                .SingleAsync(h => h.LedgerId == ledger.LedgerId
+                    && h.ExternalId == "FITID-COFFEE-1")).Id;
+        }
+
+        var before = await ReviewCountAsync(client, ledger, checking.Id);
+
+        // Split the -12.34 in two, WITHOUT approving: two legs on Checking.
+        var patch = await client.PatchAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/transactions/{headerId}",
+            new PatchTransactionRequest
+            {
+                Postings = new PatchTransactionPostings
+                {
+                    SourceAccountId = checking.Id,
+                    Items = new[]
+                    {
+                        new TransactionPosting
+                        {
+                            CounterpartyAccountId = groceries.Id, Amount = -10.00m,
+                        },
+                        new TransactionPosting
+                        {
+                            CounterpartyAccountId = household.Id, Amount = -2.34m,
+                        },
+                    },
+                },
+            });
+        Assert.True(patch.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
+            $"expected 2xx, got {(int)patch.StatusCode}: "
+            + await patch.Content.ReadAsStringAsync());
+
+        await using (var db = _fixture.NewDbContext())
+        {
+            // The premise: the split really did land two legs on this account,
+            // and the row really is still awaiting review.
+            var legs = await db.TxnLegs.AsNoTracking()
+                .CountAsync(l => l.HeaderId == headerId && l.AccountId == checking.Id);
+            Assert.Equal(2, legs);
+            var header = await db.TxnHeaders.AsNoTracking()
+                .SingleAsync(h => h.Id == headerId);
+            Assert.True(header.NeedsReview);
+        }
+
+        // Still one transaction to review, not two.
+        Assert.Equal(before, await ReviewCountAsync(client, ledger, checking.Id));
+    }
+
+    /// <summary>The review count the sidebar dot reads, for one account.</summary>
+    private static async Task<int> ReviewCountAsync(
+        HttpClient client, SyntheticLedger ledger, Guid accountId)
+    {
+        var accounts = await client.GetFromJsonAsync<List<JsonElement>>(
+            $"/api/ledgers/{ledger.LedgerId}/accounts");
+        return accounts!
+            .Single(a => a.GetProperty("id").GetGuid() == accountId)
+            .GetProperty("needsReviewCount").GetInt32();
+    }
+
 }
 

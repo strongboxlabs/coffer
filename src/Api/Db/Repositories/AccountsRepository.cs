@@ -92,9 +92,29 @@ public sealed class AccountsRepository
                 a.FeedConnectionId,
                 // Needs-review count via resolved_transactions so the
                 // visibility gate is the override-aware effective value.
-                _db.ResolvedTransactions.Count(rv => rv.AccountId == a.Id
-                    && rv.NeedsReview
-                    && !rv.IsHidden),
+                //
+                // MERGED ROWS DO NOT COUNT. A merge stamps is_merged_into and
+                // leaves needs_review alone — deliberately, since the flag records
+                // how the row arrived — so a folded-away duplicate stayed in this
+                // count forever and the sidebar dot never cleared, even though the
+                // register no longer shows the row anywhere. Every other reader of
+                // the flag already excludes merged rows (see
+                // BulkTransactionsRepository's base predicate); this one was the
+                // outlier. Filtering here rather than clearing the flag on merge
+                // also repairs rows already merged, with no backfill.
+                //
+                // DISTINCT BY HEADER, because the view is per-LEG and the contract
+                // is per-transaction: a split with several postings on this account
+                // counted once per posting, so one transaction could read as
+                // "3 transactions to review" in the dot's tooltip.
+                _db.ResolvedTransactions
+                    .Where(rv => rv.AccountId == a.Id
+                        && rv.NeedsReview
+                        && !rv.IsHidden
+                        && rv.IsMergedInto == null)
+                    .Select(rv => rv.HeaderId)
+                    .Distinct()
+                    .Count(),
                 a.HoldingsAccountId,
                 a.IsTradeCommission,
                 a.InstitutionName,
@@ -176,10 +196,9 @@ public sealed class AccountsRepository
                                           && s.AccountId == accountId
                                           && s.PostingIndex == leg.PostingIndex)
             join h in _db.TxnHeaders.AsNoTracking() on leg.HeaderId equals h.Id
-            // Effective visibility (override-aware), not raw is_hidden.
-            where (_db.TxnHeaderOverrides
-                       .Where(o => o.HeaderId == h.Id)
-                       .Select(o => (bool?)o.IsHidden).FirstOrDefault() ?? h.IsHidden) == false
+            // is_hidden is canonical since mig 230 — the override layer that
+            // used to sit over it is gone.
+            where h.IsHidden == false
                   && h.IsMergedInto == null
             join a in _db.Accounts.AsNoTracking() on leg.AccountId equals a.Id
             where a.IsActive && !a.IsSystem
@@ -190,10 +209,7 @@ public sealed class AccountsRepository
                 a.AccountType,
                 a.CategoryKind,
                 HeaderId = h.Id,
-                // Effective posted_at so recency weighting matches the register.
-                PostedAt = _db.TxnHeaderOverrides
-                    .Where(o => o.HeaderId == h.Id)
-                    .Select(o => (DateTime?)o.PostedAt).FirstOrDefault() ?? h.PostedAt,
+                PostedAt = h.PostedAt,
             })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -765,10 +781,7 @@ public sealed class AccountsRepository
             select new
             {
                 l.HeaderId,
-                PostedAt = _db.TxnHeaderOverrides
-                    .Where(o => o.HeaderId == h.Id)
-                    .Select(o => (DateTime?)o.PostedAt)
-                    .FirstOrDefault() ?? h.PostedAt,
+                PostedAt = h.PostedAt,
             })
             .ToListAsync(cancellationToken).ConfigureAwait(false);
 

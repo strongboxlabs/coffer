@@ -62,4 +62,24 @@ public sealed record InvestmentEventProjection(
     string? TransferAccountType,
     decimal? FeeAmount,
     Guid? FeeCategoryId,
-    string? FeeCategoryName);
+    string? FeeCategoryName,
+    /// <summary>
+    /// The event's SETTLED money — ADR-0073 D1's "Amount", which is the trade
+    /// value the caller sent and the legs store directly. Null when the event
+    /// has no leg that carries one.
+    /// </summary>
+    /// <remarks>
+    /// Distinct from <see cref="Amount"/>, and the distinction is the point.
+    /// <see cref="Amount"/> is ADR-0028's register figure: the SUM of this
+    /// account's legs, i.e. the net cash the event moved in or out of the
+    /// sleeve. For a cash-neutral event — a reinvestment, an in-kind transfer,
+    /// a sale whose proceeds a fee consumes — that sum is structurally ZERO,
+    /// and a column of zeroes is a true answer to a question nobody asked.
+    /// 38.8% of this repo's dev brokerage entries are in that class.
+    ///
+    /// Both numbers are real and neither replaces the other, so both are
+    /// projected and the surface decides. Named "settled" rather than "gross"
+    /// because ADR-0073 already calls it that; a third word for one number is
+    /// how the two ADRs came to disagree in the first place.
+    /// </remarks>
+    decimal? SettledAmount);

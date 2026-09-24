@@ -21,7 +21,7 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 ///
 /// <para>Important code-path note: the bank PATCH endpoint routes EVERY
 /// header-field edit — posted_at included — through
-/// <c>txn_header_overrides</c> (ADR-0003); it never writes
+/// <c>txn_headers.posted_at</c> (migration 230); it never writes
 /// <c>txn_headers.posted_at</c> directly. So a date edit via HTTP
 /// exercises the interceptor's <c>CaptureHeaderOverrideEntry</c> anchor:
 /// the FIRST date edit ADDs an override row (no prior override → old

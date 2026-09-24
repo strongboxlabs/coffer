@@ -13,8 +13,7 @@ namespace Coffer.Api.Db;
 /// <summary>
 /// EF Core <c>SaveChangesInterceptor</c> that re-derives the two
 /// leg-derived denormalizations automatically after every API write
-/// that touches <c>txn_legs</c>, <c>txn_headers</c>,
-/// <c>txn_header_overrides</c>, or <c>txn_leg_overrides</c>: the running
+/// that touches <c>txn_legs</c> or <c>txn_headers</c>: the running
 /// balance on <c>txn_header_account_balances</c> (mig 102, ADR-0034) and
 /// the posting counts
 /// (<c>account_postings_on_header</c> / <c>header_total_postings</c>) on
@@ -146,10 +145,9 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
             return;
         }
         _logger.LogDebug(
-            "LegDerivedRecomputeInterceptor: snapshot captured leg_pairs={LegPairs} touched_headers={Headers} touched_leg_overrides={LegOverrides}",
+            "LegDerivedRecomputeInterceptor: snapshot captured leg_pairs={LegPairs} touched_headers={Headers}",
             snap.TouchedLegPairs.Count,
-            snap.TouchedHeaders.Count,
-            snap.TouchedLegOverrides.Count);
+            snap.TouchedHeaders.Count);
     }
 
     // SaveChangesFailedAsync clears the snapshot so the next save on
@@ -193,12 +191,6 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
                 case TxnHeaderRow:
                     CaptureHeaderEntry(entry, snap);
                     break;
-                case TxnHeaderOverrideRow:
-                    CaptureHeaderOverrideEntry(entry, snap);
-                    break;
-                case TxnLegOverrideRow:
-                    CaptureLegOverrideEntry(entry, snap);
-                    break;
             }
         }
 
@@ -218,25 +210,17 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
 
             // The deleted headers vanish from the DB (FK cascade) before
             // RecomputeAsync runs, so their posted_at can't be looked up
-            // there. Capture each one's EFFECTIVE posted_at NOW (still
-            // live at this point) as an anchor so the recompute re-walks
-            // the account from where the deleted row sat — otherwise a
-            // hard delete leaves every row after it carrying the
-            // now-removed contribution.
+            // there. Capture it NOW (still live at this point) as an anchor so
+            // the recompute re-walks the account from where the deleted row
+            // sat — otherwise a hard delete leaves every row after it carrying
+            // the now-removed contribution.
             var deletedAnchors = await db.TxnHeaders.AsNoTracking()
                 .Where(h => headersBeingDeleted.Contains(h.Id))
-                .Select(h => new
-                {
-                    h.Id,
-                    Effective = db.TxnHeaderOverrides
-                        .Where(o => o.HeaderId == h.Id)
-                        .Select(o => (DateTime?)o.PostedAt)
-                        .FirstOrDefault() ?? h.PostedAt,
-                })
+                .Select(h => new { h.Id, h.PostedAt })
                 .ToListAsync(cancellationToken)
                 .ConfigureAwait(false);
             foreach (var d in deletedAnchors)
-                snap.AddOldDateAnchor(d.Id, d.Effective);
+                snap.AddOldDateAnchor(d.Id, d.PostedAt);
         }
 
         return snap;
@@ -296,74 +280,6 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
         // lookup in CaptureSnapshotAsync.
     }
 
-    private static void CaptureHeaderOverrideEntry(EntityEntry entry, Snapshot snap)
-    {
-        // posted_at + is_hidden overrides shift balance walk; the
-        // recompute filters on the COALESCE chain for both. Other
-        // override columns (payee/memo/check_number/etc.) don't.
-        bool postedAtMatters = entry.State switch
-        {
-            EntityState.Added => ((TxnHeaderOverrideRow)entry.Entity).PostedAt is not null,
-            EntityState.Deleted => entry.OriginalValues[nameof(TxnHeaderOverrideRow.PostedAt)] is not null,
-            EntityState.Modified => entry.Property(nameof(TxnHeaderOverrideRow.PostedAt)).IsModified,
-            _ => false,
-        };
-        bool isHiddenMatters = entry.State switch
-        {
-            EntityState.Added => ((TxnHeaderOverrideRow)entry.Entity).IsHidden is not null,
-            EntityState.Deleted => entry.OriginalValues[nameof(TxnHeaderOverrideRow.IsHidden)] is not null,
-            EntityState.Modified => entry.Property(nameof(TxnHeaderOverrideRow.IsHidden)).IsModified,
-            _ => false,
-        };
-        if (postedAtMatters || isHiddenMatters)
-        {
-            var headerId = entry.State == EntityState.Deleted
-                ? (Guid)entry.OriginalValues[nameof(TxnHeaderOverrideRow.HeaderId)]!
-                : ((TxnHeaderOverrideRow)entry.Entity).HeaderId;
-            snap.AddTouchedHeader(headerId);
-            // A date MOVE via the override layer: capture the OLD
-            // effective date so the recompute re-walks the vacated range.
-            if (postedAtMatters)
-            {
-                switch (entry.State)
-                {
-                    case EntityState.Modified:
-                    case EntityState.Deleted:
-                        var oldOverride = entry.OriginalValues
-                            .GetValue<DateTime?>(nameof(TxnHeaderOverrideRow.PostedAt));
-                        if (oldOverride is not null)
-                            snap.AddOldDateAnchor(headerId, oldOverride.Value);
-                        break;
-                    case EntityState.Added:
-                        // No prior override row: the OLD effective date was
-                        // the raw header posted_at (resolved in RecomputeAsync).
-                        snap.OverrideDateAdded.Add(headerId);
-                        break;
-                }
-            }
-        }
-    }
-
-    private static void CaptureLegOverrideEntry(EntityEntry entry, Snapshot snap)
-    {
-        // Amount override shifts the leg's contribution to balance. Other
-        // override columns (leg_memo) don't affect balance.
-        bool amountMatters = entry.State switch
-        {
-            EntityState.Added => ((TxnLegOverrideRow)entry.Entity).Amount is not null,
-            EntityState.Deleted => entry.OriginalValues[nameof(TxnLegOverrideRow.Amount)] is not null,
-            EntityState.Modified => entry.Property(nameof(TxnLegOverrideRow.Amount)).IsModified,
-            _ => false,
-        };
-        if (amountMatters)
-        {
-            var legId = entry.State == EntityState.Deleted
-                ? (Guid)entry.OriginalValues[nameof(TxnLegOverrideRow.LegId)]!
-                : ((TxnLegOverrideRow)entry.Entity).LegId;
-            snap.AddTouchedLegOverride(legId);
-        }
-    }
-
     // ----- recompute -----
 
     private static async Task RecomputeAsync(
@@ -375,9 +291,8 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
 
         // Expand TouchedHeaders into (account, header) pairs by reading
         // current legs from the DB. Headers in this set are ones whose
-        // posted_at or is_merged_into changed (header-row update) or
-        // whose override posted_at moved — both need every account on
-        // the header to be recomputed.
+        // posted_at, is_merged_into or is_hidden changed — every account on
+        // the header needs recomputing.
         if (snap.TouchedHeaders.Count > 0)
         {
             var headerLegs = await db.TxnLegs.AsNoTracking()
@@ -389,36 +304,14 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
                 snap.AddTouchedLegPair(leg.AccountId, leg.HeaderId);
         }
 
-        // Expand TouchedLegOverrides into (account, header) by reading
-        // the leg's header_id and account_id from the DB.
-        if (snap.TouchedLegOverrides.Count > 0)
-        {
-            var legs = await db.TxnLegs.AsNoTracking()
-                .Where(l => snap.TouchedLegOverrides.Contains(l.Id))
-                .Select(l => new { l.HeaderId, l.AccountId })
-                .ToListAsync(cancellationToken)
-                .ConfigureAwait(false);
-            foreach (var leg in legs)
-                snap.AddTouchedLegPair(leg.AccountId, leg.HeaderId);
-        }
-
         if (snap.TouchedLegPairs.Count == 0) return;
 
-        // Resolve effective posted_at for each touched header. Use
-        // COALESCE(override.posted_at, header.posted_at) so override
-        // moves are honoured.
+        // posted_at for each touched header. Canonical since mig 230 — the
+        // override layer this used to COALESCE through is gone.
         var headerIds = snap.TouchedLegPairs.Select(p => p.HeaderId).Distinct().ToList();
         var headerInfo = await db.TxnHeaders.AsNoTracking()
             .Where(h => headerIds.Contains(h.Id))
-            .Select(h => new
-            {
-                h.Id,
-                h.PostedAt,
-                OverridePostedAt = db.TxnHeaderOverrides
-                    .Where(o => o.HeaderId == h.Id)
-                    .Select(o => (DateTime?)o.PostedAt)
-                    .FirstOrDefault(),
-            })
+            .Select(h => new { h.Id, h.PostedAt })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
@@ -426,8 +319,7 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
             h => h.Id,
             h =>
             {
-                // New effective posted_at (override wins).
-                var anchor = h.OverridePostedAt ?? h.PostedAt;
+                var anchor = h.PostedAt;
                 // If the date MOVED this save, anchor at the EARLIER of
                 // old/new so the recompute (mig 102 — wipe + re-walk from
                 // the anchor forward) covers the vacated [old, new) range.
@@ -437,10 +329,6 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
                 if (snap.OldDateAnchors.TryGetValue(h.Id, out var oldAnchor)
                     && oldAnchor < anchor)
                     anchor = oldAnchor;
-                // Override posted_at ADDED this save → old effective was
-                // the raw header posted_at.
-                if (snap.OverrideDateAdded.Contains(h.Id) && h.PostedAt < anchor)
-                    anchor = h.PostedAt;
                 return anchor;
             });
 
@@ -492,31 +380,22 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
     {
         public HashSet<(Guid AccountId, Guid HeaderId)> TouchedLegPairs { get; } = new();
         public HashSet<Guid> TouchedHeaders { get; } = new();
-        public HashSet<Guid> TouchedLegOverrides { get; } = new();
 
-        // Headers whose effective posted_at MOVED this save. The balance
+        // Headers whose posted_at MOVED this save. The balance
         // recompute must anchor at MIN(old, new) effective date so the
         // rows in the vacated [old, new) range get re-walked — otherwise
         // moving a txn LATER leaves the skipped-over rows drifted by the
-        // txn's amount. headerId -> earliest OLD effective posted_at.
+        // txn's amount. headerId -> earliest OLD posted_at.
         public Dictionary<Guid, DateTime> OldDateAnchors { get; } = new();
-
-        // Headers where an override posted_at was ADDED this save (no
-        // prior override row): the OLD effective date was the raw header
-        // posted_at, resolved against the live header in RecomputeAsync.
-        public HashSet<Guid> OverrideDateAdded { get; } = new();
 
         public bool IsEmpty =>
             TouchedLegPairs.Count == 0
-            && TouchedHeaders.Count == 0
-            && TouchedLegOverrides.Count == 0;
+            && TouchedHeaders.Count == 0;
 
         public void AddTouchedLegPair(Guid accountId, Guid headerId) =>
             TouchedLegPairs.Add((accountId, headerId));
 
         public void AddTouchedHeader(Guid headerId) => TouchedHeaders.Add(headerId);
-
-        public void AddTouchedLegOverride(Guid legId) => TouchedLegOverrides.Add(legId);
 
         public void AddOldDateAnchor(Guid headerId, DateTime candidate)
         {

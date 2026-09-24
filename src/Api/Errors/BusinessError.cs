@@ -171,6 +171,14 @@ public static class BusinessError
         public const string TransactionAccountRequired  = "transaction-account-required";
         public const string TransactionPairSelf         = "transaction-pair-self";
         public const string TransactionPostedAtRequired = "transaction-posted-at-required";
+        /// <summary>A PATCH named <c>postedAt</c> or <c>transactedAt</c> and set
+        /// it to null. Since migration 230 a header field the body carries is
+        /// ASSIGNED, null included — which is how payee / memo / check number
+        /// get cleared — but both date columns are NOT NULL, so there is no
+        /// cleared state to move to. Rejected rather than ignored: silently
+        /// dropping a field the caller named is the failure that change
+        /// removed.</summary>
+        public const string TransactionDateNull         = "transaction-date-null";
         public const string TransactionReconStatusInvalid = "transaction-recon-status-invalid";
         public const string RegisterDirectionInvalid       = "register-direction-invalid";
         public const string RegisterStatusFilterInvalid    = "register-status-filter-invalid";

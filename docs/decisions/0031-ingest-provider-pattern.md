@@ -290,6 +290,44 @@ For each ingested row with `Action != null`:
 For each ingested row with `Action == null`: bank-shape cash-flow
 row (unchanged from Phase 2).
 
+> **Superseded (2026-09-22). Step 2 never shipped, and nothing may be
+> written against it.** Ingest writes the BANK shape for every row,
+> mapped ticker or not, and carries the investment detail in the
+> `ingest_*` header columns instead (migration 076 records the
+> decision; migrations 113/114/228 are the columns). The reason is an
+> invariant, not a preference: `trg_validate_posting_role`
+> (migration 057) makes `txn_legs.posting_role` and
+> `txn_headers.action` inseparable, so an "investment-shape row with
+> `needs_review=true`" cannot be written without also committing to an
+> action the wire does not reliably carry. The investment shape
+> therefore appears only at Accept, which clears `needs_review` in the
+> same transaction.
+>
+> **Consequence, and the bug it caused.** `action IS NOT NULL` and
+> `needs_review = true` are mutually exclusive on any real row. The
+> investment merge-candidates query was written against step 2 and
+> demanded both, plus a holdings security leg — so it returned an empty
+> list for every row a person could actually be reviewing, which is the
+> only state it is ever invoked in. It shipped that way and stayed
+> green, because the only writer of the state it required is a raw
+> `UPDATE txn_headers SET needs_review = TRUE` in its own test fixture.
+> It now anchors on what an unreviewed row has: the non-category leg
+> for the account and date, and `ingest_amount` / `ingest_shares` /
+> `ingest_security_id` for the money, the share count and the security
+> — the same negative leg test the bank anchor has always used.
+>
+> `ingest_security_id` is required of a candidate only when it is
+> non-NULL, i.e. when the ticker hint resolved through
+> `provider_security_mappings`. For a security seen for the first time
+> it is NULL, and requiring a match there would return nothing for
+> exactly the rows most likely to be under review, so the security is
+> disregarded and the amount, account and ±7-day window carry the
+> match.
+>
+> **Anything reading an unreviewed row reads the `ingest_*` columns.**
+> A predicate over `action` or a security leg is, by construction, a
+> predicate that no unreviewed row can satisfy.
+
 ### Editor-time mapping record
 
 The `/investment-transactions` create + PATCH endpoints accept an
@@ -329,7 +367,7 @@ pass) without churning the contract decided here.
 - New DB migration: add `feed_connections.provider_key` (NOT NULL,
   default `'simplefin'` for existing rows) + new `feed_csv_mappings`
   table (columns TBD with the CSV slice).
-- `SimpleFinSyncService` is deleted (PR #123); the logic splits
+- `SimpleFinSyncService` is deleted (PR \#123); the logic splits
   across `SimpleFinPullProvider` and `IngestOrchestrator`. The
   retrofit is a behavior-zero refactor — the existing sync
   endpoint still produces the same DB state from the same

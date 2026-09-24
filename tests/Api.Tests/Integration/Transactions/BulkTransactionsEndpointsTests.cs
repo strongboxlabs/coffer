@@ -106,18 +106,12 @@ public sealed class BulkTransactionsEndpointsTests
     }
 
     [Fact]
-    public async Task Summary_all_excludes_a_row_hidden_via_override()
+    public async Task Summary_all_excludes_a_hidden_row()
     {
-        // Bulk selection must act on what the user SEES: a row hidden by
-        // override is excluded from the count + account sum even though
-        // its base row is visible. (ADR-0003 — effective visibility.)
+        // Bulk selection must act on what the user SEES: a hidden row is
+        // excluded from the count + account sum (ADR-0072 D1).
         var seed = await SeedAsync(2);
-        await using (var db = _fixture.NewDbContext())
-        {
-            await db.Database.ExecuteSqlInterpolatedAsync($@"
-                INSERT INTO txn_header_overrides (header_id, ledger_id, is_hidden)
-                VALUES ({seed.HeaderIds[1]}, {seed.Ledger.LedgerId}, true);");
-        }
+        await seed.Ledger.HideTransactionAsync(seed.HeaderIds[1]);
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);

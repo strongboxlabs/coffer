@@ -184,11 +184,10 @@ public sealed class SecuritiesRepository
     ///
     /// <para>Cursor encodes <c>posted_at | account_id | leg_id</c> — the
     /// canonical leg's own keys — so &gt;page-size rows on the same date
-    /// don't truncate. Header <c>posted_at</c>/<c>payee</c> use the
-    /// override-aware EFFECTIVE value (correlated subquery on
-    /// <c>txn_header_overrides</c>, not the per-leg view — see above), so
-    /// the drill-in orders and labels the same way the register does: a
-    /// curated date reorders the list here too.</para>
+    /// don't truncate. Header <c>posted_at</c>/<c>payee</c> come off
+    /// <c>txn_headers</c> directly (not the per-leg view — see above), which
+    /// since migration 230 IS the curated value, so the drill-in orders and
+    /// labels the same way the register does.</para>
     /// </summary>
     public async Task<SecurityTransactionsPage> ListTransactionsAsync(
         Guid ledgerId,
@@ -219,26 +218,17 @@ public sealed class SecuritiesRepository
                 .First());
 
         // Join the header for posted_at/action/payee — fields the leg
-        // doesn't carry directly. posted_at + payee are the override-aware
-        // effective values so this list orders and labels the same way the
-        // register does (a curated date reorders here too).
+        // doesn't carry directly. Since migration 230 these ARE the curated
+        // values, so this list orders and labels the same way the register does.
         //
         // Apply the SAME visibility predicate the register + holdings use.
-        // Effective is_hidden is override-aware, matching the resolved view's
-        // COALESCE(o.is_hidden, h.is_hidden, FALSE) (migration 028) — a user
-        // can hide a row via txn_header_overrides, not just the raw column.
-        // is_merged_into is header-only (not overridable). Without this predicate
-        // the per-security list leaked hidden/merged legs — e.g. an import-overlap
-        // duplicate the user hid still showed here as a phantom second buy and
-        // inflated the total count — while the register and the holdings total
-        // correctly excluded it (layer inconsistency).
+        // Without it the per-security list leaked hidden/merged legs — e.g. an
+        // import-overlap duplicate the user hid still showed here as a phantom
+        // second buy and inflated the total count — while the register and the
+        // holdings total correctly excluded it.
         var withHeader = from l in q
                          join h in _db.TxnHeaders.AsNoTracking() on l.HeaderId equals h.Id
-                         let effectiveHidden = _db.TxnHeaderOverrides
-                             .Where(o => o.HeaderId == h.Id)
-                             .Select(o => o.IsHidden)
-                             .FirstOrDefault() ?? h.IsHidden
-                         where !effectiveHidden && h.IsMergedInto == null
+                         where !h.IsHidden && h.IsMergedInto == null
                          select new
                          {
                              LegId = l.Id,
@@ -247,13 +237,9 @@ public sealed class SecuritiesRepository
                              l.Amount,
                              l.Quantity,
                              l.UnitPrice,
-                             PostedAt = _db.TxnHeaderOverrides
-                                 .Where(o => o.HeaderId == h.Id)
-                                 .Select(o => (DateTime?)o.PostedAt).FirstOrDefault() ?? h.PostedAt,
+                             PostedAt = h.PostedAt,
                              h.Action,
-                             Payee = _db.TxnHeaderOverrides
-                                 .Where(o => o.HeaderId == h.Id)
-                                 .Select(o => o.Payee).FirstOrDefault() ?? h.Payee,
+                             Payee = h.Payee,
                          };
 
         if (olderThan is { } cursor)
@@ -329,11 +315,7 @@ public sealed class SecuritiesRepository
                 from l in _db.TxnLegs.AsNoTracking()
                 where l.SecurityId == securityId
                 join h in _db.TxnHeaders.AsNoTracking() on l.HeaderId equals h.Id
-                let effectiveHidden = _db.TxnHeaderOverrides
-                    .Where(o => o.HeaderId == h.Id)
-                    .Select(o => o.IsHidden)
-                    .FirstOrDefault() ?? h.IsHidden
-                where !effectiveHidden && h.IsMergedInto == null
+                where !h.IsHidden && h.IsMergedInto == null
                 select l.HeaderId)
             .Distinct()
             .CountAsync(cancellationToken)

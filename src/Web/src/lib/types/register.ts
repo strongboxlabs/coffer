@@ -53,6 +53,10 @@ export interface RegisterRowBase {
     /** Normalized 3-state reconciliation vocabulary (migration 030). */
     status: ReconStatus;
     isHidden: boolean;
+    /** The row has been edited since it arrived: it has a
+     *  `txn_header_originals` row (migration 230). Name kept from when the
+     *  signal was "has a `txn_header_overrides` row" — same question, answered
+     *  from the other side, and now true for investment edits too. */
     hasOverrides: boolean;
     balanceAfter: number | null;
     origin: string;
@@ -211,6 +215,15 @@ export interface InvestmentRow extends RegisterRowBase {
     ingestUnitPrice: number | null;
     ingestFee: number | null;
     /**
+     * The authoritative total the source file stated (mig 228).
+     *
+     * Carried so the editor never rebuilds a cash-neutral row's amount from
+     * shares × price — ADR-0073 D1 is explicit that the two need not agree, and
+     * rebuilding silently changed the figure just by opening the row. Null when
+     * the provider stated none, and on everything imported before mig 228.
+     */
+    ingestAmount: number | null;
+    /**
      * Mig 114: persisted provider ticker hint, used by the Accept flow
      * to record a provider_security_mapping with the same identifier
      * the next ingest will look up.
@@ -233,6 +246,16 @@ export interface InvestmentRow extends RegisterRowBase {
     transferAccountName: string | null;
     transferAccountType: string | null;
     feeAmount: number | null;
+    /**
+     * The event's SETTLED money (ADR-0073 D1) — the trade value — where
+     * `amount` is ADR-0028's net of this account's legs.
+     *
+     * They differ exactly when the event is cash-neutral, and that is 38.8% of
+     * this repo's dev brokerage entries: a reinvestment is income +X and
+     * security −X on one sleeve, so its net is structurally zero however large
+     * the dividend was. Null when no leg carries one.
+     */
+    settledAmount?: number | null;
     feeCategoryId: string | null;
     feeCategoryName: string | null;
 }

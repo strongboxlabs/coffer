@@ -13,11 +13,14 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// <summary>
 /// End-to-end checks for
 /// <c>PATCH /api/ledgers/{ledgerId}/transactions/{headerId}</c>
-/// under ADR-0025. The endpoint applies header overrides AND
+/// under ADR-0025. The endpoint applies header-field edits AND
 /// reshapes the postings list in one atomic transaction. Tests
 /// pin the postings reshape semantics (reconcile-by-legId,
-/// single↔split conversion, reorder, override-wipe-on-reshape)
-/// plus the validation surface and cross-ledger guards.
+/// single↔split conversion, reorder) plus the header-field
+/// semantics migration 230 introduced (presence, not nullness:
+/// an omitted field is left alone, a null one is CLEARED, and the
+/// feed's values are captured to txn_header_originals on the first
+/// edit), the validation surface and cross-ledger guards.
 /// </summary>
 [Collection(ApiCollection.Name)]
 public sealed class PatchTransactionTests
@@ -46,6 +49,21 @@ public sealed class PatchTransactionTests
             $"/api/ledgers/{ledgerId}/transactions/{headerId}")
         { Content = JsonContent.Create(body) };
 
+    /// <summary>
+    /// PATCH with a hand-written body. The typed DTO cannot express the
+    /// distinction migration 230 turns on — a serialized
+    /// <c>PatchTransactionRequest</c> omits its null properties, so "clear the
+    /// payee" and "don't touch the payee" go over the wire identically. Tests
+    /// for that distinction have to state the JSON.
+    /// </summary>
+    private static HttpRequestMessage PatchJson(
+        Guid ledgerId, Guid headerId, string json) =>
+        new(HttpMethod.Patch,
+            $"/api/ledgers/{ledgerId}/transactions/{headerId}")
+        {
+            Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json"),
+        };
+
     private async Task<Seed> SeedSingleAsync()
     {
         var ledger = await SyntheticLedger.CreateAsync(_fixture);
@@ -71,11 +89,21 @@ public sealed class PatchTransactionTests
     // -- Header-only path (unchanged from pre-ADR-0025) ----------------
 
     [Fact]
-    public async Task Patch_header_fields_only_writes_the_override_row()
+    public async Task Patch_header_fields_write_the_canonical_row()
     {
         var seed = await SeedSingleAsync();
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
+
+        DateTime feedPostedAt;
+        string? feedPayee;
+        await using (var before = _fixture.NewDbContext())
+        {
+            var h = await before.TxnHeaders.AsNoTracking()
+                .SingleAsync(x => x.Id == seed.HeaderId);
+            feedPostedAt = h.PostedAt;
+            feedPayee = h.Payee;
+        }
 
         var newDate = new DateTime(2026, 2, 14, 0, 0, 0, DateTimeKind.Utc);
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
@@ -88,18 +116,27 @@ public sealed class PatchTransactionTests
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
         await using var db = _fixture.NewDbContext();
-        var row = await db.TxnHeaderOverrides.AsNoTracking()
+        var header = await db.TxnHeaders.AsNoTracking()
+            .SingleAsync(h => h.Id == seed.HeaderId);
+        Assert.Equal("Cleaned-up Payee", header.Payee);
+        Assert.Equal("lunch with a friend", header.Memo);
+        Assert.Equal(newDate, header.PostedAt);
+
+        // ...and the feed's values are still recoverable. This is the half of
+        // migration 230 that is easy to drop: mutating the canonical row is the
+        // obvious part, capturing what it used to say is the part that keeps
+        // payee recall and "reset to original" possible.
+        var original = await db.TxnHeaderOriginals.AsNoTracking()
             .SingleAsync(o => o.HeaderId == seed.HeaderId);
-        Assert.Equal("Cleaned-up Payee", row.Payee);
-        Assert.Equal("lunch with a friend", row.Memo);
-        Assert.Equal(newDate, row.PostedAt);
+        Assert.Equal(feedPayee, original.Payee);
+        Assert.Equal(feedPostedAt, original.PostedAt);
     }
 
     [Fact]
-    public async Task Patch_merges_into_existing_overrides_preserving_unset_fields()
+    public async Task Patch_leaves_omitted_header_fields_alone()
     {
         var seed = await SeedSingleAsync();
-        await seed.Ledger.SetHeaderOverrideAsync(seed.BankLegId, memo: "first memo");
+        await seed.Ledger.EditHeaderAsync(seed.BankLegId, memo: "first memo");
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
@@ -109,10 +146,85 @@ public sealed class PatchTransactionTests
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
         await using var db = _fixture.NewDbContext();
-        var row = await db.TxnHeaderOverrides.AsNoTracking()
+        var header = await db.TxnHeaders.AsNoTracking()
+            .SingleAsync(h => h.Id == seed.HeaderId);
+        Assert.Equal("second payee", header.Payee);
+        Assert.Equal("first memo", header.Memo);
+    }
+
+    [Fact]
+    public async Task Patch_clears_a_header_field_sent_as_null()
+    {
+        // The reason migration 230 exists. The old override layer stored user
+        // edits in nullable columns with no companion "is overridden" marker, so
+        // NULL had to mean both "not overridden" and "overridden to empty" and
+        // the COALESCE always chose the former: emptying the payee box saved
+        // successfully and handed the old text straight back.
+        var seed = await SeedSingleAsync();
+        await seed.Ledger.EditHeaderAsync(
+            seed.BankLegId, payee: "Typo Payeee", memo: "wrong memo");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, seed.Ledger);
+
+        // Sent as raw JSON: the point is the wire shape. An explicit null is a
+        // request to clear; a key the body omits (check_number here) is not.
+        var response = await client.SendAsync(PatchJson(seed.Ledger.LedgerId, seed.HeaderId,
+            "{\"payee\": null, \"memo\": null}"));
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        await using var db = _fixture.NewDbContext();
+        var header = await db.TxnHeaders.AsNoTracking()
+            .SingleAsync(h => h.Id == seed.HeaderId);
+        Assert.Null(header.Payee);
+        Assert.Null(header.Memo);
+    }
+
+    [Fact]
+    public async Task Patch_with_an_explicit_null_date_is_rejected()
+    {
+        // posted_at and transacted_at are NOT NULL, so there is no cleared state
+        // to move to. Saying so beats ignoring the field: a PATCH that reports
+        // success and changes nothing is the failure 230 set out to remove, and
+        // silently honouring four fields out of five would reinstate it.
+        var seed = await SeedSingleAsync();
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, seed.Ledger);
+
+        var response = await client.SendAsync(PatchJson(seed.Ledger.LedgerId, seed.HeaderId,
+            "{\"postedAt\": null}"));
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
+        var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("transaction-date-null", problem.GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task Patch_captures_the_original_once_not_on_every_edit()
+    {
+        // "Original" means what the FEED said, not what the row said before the
+        // most recent edit. Re-capturing would quietly redefine it and make a
+        // reset restore the second-to-last value.
+        var seed = await SeedSingleAsync();
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, seed.Ledger);
+
+        string? feedPayee;
+        await using (var before = _fixture.NewDbContext())
+            feedPayee = (await before.TxnHeaders.AsNoTracking()
+                .SingleAsync(x => x.Id == seed.HeaderId)).Payee;
+
+        foreach (var name in new[] { "first edit", "second edit" })
+        {
+            var r = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
+                new PatchTransactionRequest { Payee = name }));
+            Assert.Equal(HttpStatusCode.NoContent, r.StatusCode);
+        }
+
+        await using var db = _fixture.NewDbContext();
+        var original = await db.TxnHeaderOriginals.AsNoTracking()
             .SingleAsync(o => o.HeaderId == seed.HeaderId);
-        Assert.Equal("second payee", row.Payee);
-        Assert.Equal("first memo", row.Memo);
+        Assert.Equal(feedPayee, original.Payee);
+        Assert.NotEqual("first edit", original.Payee);
     }
 
     [Fact]
@@ -201,7 +313,7 @@ public sealed class PatchTransactionTests
     }
 
     [Fact]
-    public async Task Patch_persists_check_number_to_override_row()
+    public async Task Patch_persists_check_number_to_the_header()
     {
         var seed = await SeedSingleAsync();
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
@@ -212,9 +324,9 @@ public sealed class PatchTransactionTests
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
         await using var db = _fixture.NewDbContext();
-        var row = await db.TxnHeaderOverrides.AsNoTracking()
-            .SingleAsync(o => o.HeaderId == seed.HeaderId);
-        Assert.Equal("9981", row.CheckNumber);
+        var header = await db.TxnHeaders.AsNoTracking()
+            .SingleAsync(h => h.Id == seed.HeaderId);
+        Assert.Equal("9981", header.CheckNumber);
     }
 
     // -- Postings reshape: edit-in-place ------------------------------
@@ -542,54 +654,12 @@ public sealed class PatchTransactionTests
         Assert.DoesNotContain(originIds[1], legs.Select(l => l.Id));
     }
 
-    [Fact]
-    public async Task Patch_with_postings_drops_existing_leg_overrides()
-    {
-        var seed = await SeedSingleAsync();
-        // Pre-seed an existing override on the leg.
-        await using (var seedDb = _fixture.NewDbContext())
-        {
-            // -99 (no `m` suffix) — the `m` is a C# decimal-literal
-            // suffix and not valid in SQL. The interpolation
-            // parameterises {seed.BankLegId}; the numeric literal
-            // is plain SQL.
-            var ledgerId = seed.Ledger.LedgerId;
-            await seedDb.Database.ExecuteSqlInterpolatedAsync($@"
-                INSERT INTO txn_leg_overrides (leg_id, ledger_id, amount, leg_memo)
-                VALUES ({seed.BankLegId}, {ledgerId}, -99, 'old override');");
-        }
-
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
-        using var client = await AuthedClientAsync(factory, seed.Ledger);
-
-        var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
-            new PatchTransactionRequest
-            {
-                Postings = new PatchTransactionPostings
-                {
-                    SourceAccountId = seed.BankId,
-                    Items = new[]
-                    {
-                        new TransactionPosting
-                        {
-                            LegId = seed.BankLegId,
-                            CounterpartyAccountId = seed.GroceriesId,
-                            Amount = -7m,
-                        },
-                    },
-                },
-            }));
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-
-        await using var db = _fixture.NewDbContext();
-        // The stale override is gone — canonical value supersedes.
-        Assert.False(await db.TxnLegOverrides
-            .AnyAsync(o => o.LegId == seed.BankLegId));
-        // Canonical leg now carries the new amount.
-        var canonical = await db.TxnLegs.AsNoTracking()
-            .SingleAsync(l => l.Id == seed.BankLegId);
-        Assert.Equal(-7m, canonical.Amount);
-    }
+    // `Patch_with_postings_drops_existing_leg_overrides` lived here. It seeded a
+    // txn_leg_overrides row and asserted the reshape deleted it. Migration 230
+    // dropped that table — zero rows in every database, never written by the
+    // API — so the test's premise, and its raw-SQL fixture, went with it. The
+    // reshape's real contract (the kept leg carries the new amount) is covered
+    // by Patch_with_postings_updates_amounts_canonically_on_txn_legs above.
 
     // -- Validation surface ------------------------------------------
 
@@ -823,10 +893,8 @@ public sealed class PatchTransactionTests
         await using var db = _fixture.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == seed.HeaderId);
-        var ovr = await db.TxnHeaderOverrides.AsNoTracking()
-            .SingleAsync(o => o.HeaderId == seed.HeaderId);
         Assert.False(header.NeedsReview);
-        Assert.Equal("Whole Foods", ovr.Payee);
+        Assert.Equal("Whole Foods", header.Payee);
     }
 
     [Fact]
@@ -1083,10 +1151,8 @@ public sealed class PatchTransactionTests
         await using var db = _fixture.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == seed.HeaderId);
-        var ovr = await db.TxnHeaderOverrides.AsNoTracking()
-            .SingleAsync(o => o.HeaderId == seed.HeaderId);
-        Assert.Equal("Whole Foods", ovr.Payee);
-        Assert.Equal("weekend grocery run", ovr.Memo);
+        Assert.Equal("Whole Foods", header.Payee);
+        Assert.Equal("weekend grocery run", header.Memo);
         Assert.False(header.NeedsReview);
         Assert.Equal(new[] { "food", "weekly" }, await CurrentTagsForHeaderAsync(seed.HeaderId));
     }

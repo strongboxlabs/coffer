@@ -733,8 +733,14 @@ builder.Services.AddSingleton<Coffer.Api.Provisioning.ProvisioningService>();
 builder.Services.AddFido2(fido2Options =>
 {
     var fido2 = apiOptions.Fido2;
-    fido2Options.ServerDomain = fido2.RpId;
-    fido2Options.ServerName = fido2.RpName;
+    // RPID / RPName, not ServerDomain / ServerName — Fido2.AspNet 4.1.0
+    // obsoleted the older pair in favour of the spec's own vocabulary, and this
+    // repo compiles warnings as errors, so the bump does not build without the
+    // rename. Same values, same meaning: the relying-party id is the registrable
+    // domain an assertion is scoped to, and getting it wrong invalidates every
+    // existing passkey rather than failing loudly.
+    fido2Options.RPID = fido2.RpId;
+    fido2Options.RPName = fido2.RpName;
     fido2Options.Origins = new HashSet<string>(fido2.Origins);
     fido2Options.TimestampDriftTolerance = fido2.TimeoutSeconds * 1000;
 });

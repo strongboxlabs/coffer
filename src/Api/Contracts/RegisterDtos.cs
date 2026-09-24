@@ -202,6 +202,10 @@ public sealed record InvestmentRowDto : RegisterRowDto
     public decimal? IngestUnitPrice { get; init; }
     public decimal? IngestFee { get; init; }
 
+    /// <summary>The source file's authoritative total (mig 228) — the editor
+    /// prefills from this rather than rebuilding shares x price.</summary>
+    public decimal? IngestAmount { get; init; }
+
     // Mig 114: persisted OFX ticker hint, so the SPA's Accept flow can
     // record a provider_security_mapping with the SAME identifier the
     // next ingest will look up.
@@ -225,6 +229,19 @@ public sealed record InvestmentRowDto : RegisterRowDto
     public decimal? FeeAmount { get; init; }
     public Guid? FeeCategoryId { get; init; }
     public string? FeeCategoryName { get; init; }
+
+    /// <summary>
+    /// The event's settled money (ADR-0073 D1) — the trade value — as opposed
+    /// to <c>Amount</c>, which is ADR-0028's net of this account's legs.
+    /// </summary>
+    /// <remarks>
+    /// The two disagree precisely when the event is cash-neutral, which is not
+    /// an edge: a reinvestment, an in-kind transfer and a fee-consumed sale all
+    /// net to zero by construction, and the register showed each of them as
+    /// $0.00 while the editor behind the same row showed the trade value.
+    /// Null when no leg carries a settled amount.
+    /// </remarks>
+    public decimal? SettledAmount { get; init; }
 }
 
 /// <summary>

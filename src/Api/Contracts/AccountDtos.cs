@@ -10,11 +10,18 @@ namespace Coffer.Api.Contracts;
 /// SimpleFIN connection (slice 2c.2). The feed-mapping wizard filters
 /// these out so the user can't double-map a Coffer account to two
 /// SimpleFIN accounts.</param>
-/// <param name="NeedsReviewCount">Aggregated count of
-/// <c>txn_headers</c> rows touching this account where
-/// <c>needs_review = true</c> (slice 2c.2). Drives the sidebar
-/// review-dot per ADR-0021: present-vs-absent signal, not a
-/// number on the UI. Always 0 for categories + system rows.</param>
+/// <param name="NeedsReviewCount">Count of DISTINCT <c>txn_headers</c>
+/// rows touching this account where <c>needs_review = true</c>
+/// (slice 2c.2), excluding effectively-hidden and MERGED rows.
+/// Drives the sidebar review-dot per ADR-0021: present-vs-absent
+/// signal, not a number on the UI — though the dot's tooltip and
+/// aria-label do read the number, which is why it counts headers and
+/// not the per-leg view rows underneath (a split row counted once per
+/// posting). Merged rows are excluded because a merge stamps
+/// <c>is_merged_into</c> and deliberately leaves <c>needs_review</c>
+/// standing, so a folded-away duplicate otherwise kept the dot lit
+/// with nothing left in the register to review. Always 0 for
+/// categories + system rows.</param>
 /// <param name="HoldingsAccountId">For brokerage (investment) accounts:
 /// the id of the system-managed Holdings sibling sub-account that
 /// carries security positions per ADR-0019. Surfaced so the SPA can

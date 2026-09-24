@@ -330,6 +330,7 @@ export function ReminderEditorDialog({
                                             isTradeCommission={sourceAccount?.isTradeCommission ?? false}
                                             cols={INVESTMENT_FORM_COLS}
                                             onCancel={onClose}
+                                            isSaving={saveInvestment.isPending}
                                             mode={{
                                                 kind: 'fire',
                                                 initialDraft: investmentDraft?.draft,

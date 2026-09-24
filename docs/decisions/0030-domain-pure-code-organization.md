@@ -217,21 +217,21 @@ These need their own design work before the implementation slice:
 
 ## Consequences
 
-* The current PR (#117) lands §1 (file organization) with zero
+* The current PR (\#117) lands §1 (file organization) with zero
   behavior change. Barrels preserve every existing import path.
 * `lib/types/investment.ts` + `lib/api/investment.ts` are empty
   stubs created by the A4.c.3 follow-up PR, not this PR — avoids
   rebase conflict with the in-flight investment editor branch.
-* §1 shipped with PR #117 (file organization).
+* §1 shipped with PR \#117 (file organization).
 * §3 shipped in two phases:
-  - A4.d Phase 1 (PR #119) — `RegisterRouter` dispatcher,
+  - A4.d Phase 1 (PR \#119) — `RegisterRouter` dispatcher,
     `register/shell/RegisterTopBar`, full
     `register/investment/InvestmentRegisterPage` surface.
-  - A4.d Phase 2 (PR #119) — `RegisterPage` relocated to
+  - A4.d Phase 2 (PR \#119) — `RegisterPage` relocated to
     `register/bank/BankRegisterPage` and renamed.
   - `BankRegisterPage` decomposition shipped: shared shell hooks
-    (`useRegisterController` / `useRegisterKeyboardNav`, PR #182)
-    and row/columns/bulk-bar/menu modules (PR #183).
+    (`useRegisterController` / `useRegisterKeyboardNav`, PR \#182)
+    and row/columns/bulk-bar/menu modules (PR \#183).
 * §2 (discriminated-union `RegisterRow`) **shipped via migration 119**
   — `account_type` on `resolved_transactions` drives a
   `BankRow | InvestmentRow` polymorphic contract (System.Text.Json

@@ -444,37 +444,112 @@ describe('ImportFileDialog, split by account kind', () => {
         await user.click(screen.getByRole('button', { name: /upload/i }));
     }
 
-    it('offers the supported brokerages on an investment account, and says where the edge is', () => {
+    /**
+     * Pick a file WITHOUT uploading. The brokerage question is asked after the file,
+     * so most of these tests need the file on screen before there is anything to
+     * assert about brokerages at all.
+     */
+    async function pick(
+        user: ReturnType<typeof userEvent.setup>, name: string, body = FIDELITY,
+    ) {
+        await user.upload(
+            screen.getByLabelText('Statement file'),
+            new File([body], name, { type: 'text/csv' }),
+        );
+        // A settled anchor: the picked file is echoed under the input, so waiting on
+        // it means a later queryByRole(...)  -> null is judging the rendered frame
+        // rather than passing on the one before React processed the pick.
+        await screen.findByText(name, { exact: false });
+    }
+
+    it('offers the supported brokerages once a CSV is picked, and says where the edge is', () => {
         // The list is also how someone learns what is supported. Sniffing the file could
         // never answer that: a Schwab holder would see only "could not read this file".
-        renderFor('investment');
+        return (async () => {
+            const user = renderFor('investment');
+            await pick(user, 'statement.csv');
 
-        expect(screen.getByRole('radio', { name: /fidelity/i })).toBeTruthy();
-        expect(screen.getByText(/other brokerages aren.t supported yet/i)).toBeTruthy();
+            expect(screen.getByRole('radio', { name: /fidelity/i })).toBeTruthy();
+            expect(screen.getByText(/other brokerages aren.t supported yet/i)).toBeTruthy();
+        })();
     });
 
-    it('offers no brokerage list on a bank account', () => {
-        renderFor('bank');
+    it('puts the brokerage question after the file, not before it', () => {
+        // The ordering IS the requirement, not a side effect of the conditional: the
+        // question only makes sense once the file it is about has been chosen. Asserting
+        // document position because both elements being present says nothing about
+        // which one the user meets first.
+        return (async () => {
+            const user = renderFor('investment');
+            await pick(user, 'statement.csv');
 
+            const input = screen.getByLabelText('Statement file');
+            const radio = screen.getByRole('radio', { name: /fidelity/i });
+            // DOCUMENT_POSITION_FOLLOWING = 4: the radio comes after the input.
+            expect(input.compareDocumentPosition(radio)
+                & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+        })();
+    });
+
+    it('asks nothing about brokerages before a file is picked', () => {
+        // The question is CSV-only, so asking it above the control that decides whether
+        // it applies put it to everyone — including someone about to pick a QFX.
+        renderFor('investment');
+
+        // Settled anchor: the picker is mounted and idle, so the absence below is a
+        // real absence and not a frame that has yet to render.
+        expect(screen.getByLabelText('Statement file')).toBeTruthy();
         expect(screen.queryByRole('radio', { name: /fidelity/i })).toBeNull();
+    });
+
+    it('asks nothing about brokerages for a self-describing file', () => {
+        // OFX, QFX and QIF name their own format. The list would be a question with no
+        // bearing on the answer.
+        return (async () => {
+            const user = renderFor('investment');
+            await pick(user, 'export.qif', '!Type:Invst');
+
+            expect(screen.queryByRole('radio', { name: /fidelity/i })).toBeNull();
+        })();
+    });
+
+    it('offers no brokerage list on a bank account, even for a CSV', () => {
+        // A bank CSV goes to the generic mapping step instead; the brokerage providers
+        // are investment-only (they are the half of the split that can express shares).
+        return (async () => {
+            const user = renderFor('bank');
+            await pick(user, 'statement.csv');
+
+            expect(screen.queryByRole('radio', { name: /fidelity/i })).toBeNull();
+        })();
     });
 
     it('preselects the brokerage this account last imported with', () => {
         // Saying "this account is at Fidelity" should be a once-only act; the server
         // remembers it as a side effect of the import that said so.
-        renderFor('investment', 'csv-fidelity');
+        return (async () => {
+            const user = renderFor('investment', 'csv-fidelity');
+            await pick(user, 'statement.csv');
 
-        expect((screen.getByRole('radio', { name: /fidelity/i }) as HTMLInputElement).checked)
-            .toBe(true);
+            expect((screen.getByRole('radio', { name: /fidelity/i }) as HTMLInputElement).checked)
+                .toBe(true);
+            // ...and the preselection is a real answer, not just a checked dot: Upload
+            // is live without touching the radio.
+            expect((screen.getByRole('button', { name: /upload/i }) as HTMLButtonElement).disabled)
+                .toBe(false);
+        })();
     });
 
     it('ignores a remembered provider it no longer recognises', () => {
         // The key is written by whichever provider last ran. One later renamed or removed
         // should leave the picker unselected rather than break the dialog.
-        renderFor('investment', 'csv-some-departed-brokerage');
+        return (async () => {
+            const user = renderFor('investment', 'csv-some-departed-brokerage');
+            await pick(user, 'statement.csv');
 
-        expect((screen.getByRole('radio', { name: /fidelity/i }) as HTMLInputElement).checked)
-            .toBe(false);
+            expect((screen.getByRole('radio', { name: /fidelity/i }) as HTMLInputElement).checked)
+                .toBe(false);
+        })();
     });
 
     it('sends an investment CSV to the brokerage provider, with no mapping step', () => {
@@ -582,6 +657,8 @@ describe('ImportFileDialog, split by account kind', () => {
             expect((screen.getByRole('button', { name: /upload/i }) as HTMLButtonElement).disabled)
                 .toBe(false);
             expect(screen.queryByText(/choose the brokerage/i)).toBeNull();
+            // Not merely unnagged — unasked. The fieldset itself must not be there.
+            expect(screen.queryByRole('radio', { name: /fidelity/i })).toBeNull();
         })();
     });
 });

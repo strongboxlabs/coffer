@@ -85,6 +85,39 @@ surface the split. Chosen over a per-lot `realized_gain_lots` detail table: the
 breakdown on the existing row answers the ask without the extra schema, and the
 FIFO engine stays the single source. The one-shot recompute backfills all history.
 
+### D6 — The walk orders by the EFFECTIVE date (mig 229)
+
+Every holdings function read the raw `txn_headers.posted_at`, while the register
+renders `COALESCE(o.posted_at, h.posted_at)` — the user's curated date. So a row
+could sit in one place on screen and in another in the walk that decides which
+lots a sale consumes, which basis it books and which period the gain lands in.
+
+Already live rather than hypothetical: an investment merge stamps a `posted_at`
+override on the SURVIVOR (it adopts the folded row's date), so every merge winner
+had a displayed date its cost basis did not know about.
+
+`holdings_fifo_walk`, `holdings_cost_basis_as_of` and
+`holdings_market_value_as_of_set` all moved together. Moving only the walk would
+have made the as-of feeders disagree with it — a position inside the cutoff for
+cost basis and outside it for market value at the same instant. Date semantics
+have to be uniform across them or the reports contradict each other.
+
+NOT `resolved_transactions`: its `amount` is `COALESCE(lo.amount, l.amount)`,
+which would fold LEG overrides into cost basis, and it COALESCEs `security_id`
+and `quantity` across a posting's sibling legs, which would double-count every
+holdings leg against its cash twin. The walk joins `txn_header_overrides`
+directly instead.
+
+`is_hidden` stays raw in these functions, deliberately:
+`txn_header_overrides.is_hidden` is only ever carried forward by the override
+upsert, never set — hiding writes `txn_headers.is_hidden`. If that changes, these
+predicates need the same treatment.
+
+Verified by equivalence rather than by fixture: the migration was applied to a
+clone of the real dev database and `holdings`, `lots` and `realized_gains`
+checksummed identical before and after, which is what "no row without an
+overridden date moves" means in practice.
+
 ## Consequences
 
 - Every holding with a partial-sale history gets a (correct, FIFO) basis that

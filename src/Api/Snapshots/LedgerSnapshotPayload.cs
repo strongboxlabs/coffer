@@ -95,9 +95,8 @@ public sealed class LedgerSnapshotPayload
         "txn_legs",
         // Lots reference legs.
         "lots",
-        // Overrides depend on headers / legs.
-        "txn_header_overrides",
-        "txn_leg_overrides",
+        // The feed's pre-edit values; depends on headers (mig 230).
+        "txn_header_originals",
         // Tags + joins (tags before joins).
         "tags",
         "txn_header_tags",

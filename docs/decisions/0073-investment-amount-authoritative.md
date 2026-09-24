@@ -42,6 +42,12 @@ register's max display precision via `formatPrice`), so what is stored equals wh
 is shown — never more digits in the DB than on screen. The wire's originally
 reported price is preserved separately in `ingest_unit_price`.
 
+> **Note (added later).** The word "Amount" is also used by
+> [ADR-0028](0028-investment-register-surface.md) for a DIFFERENT number — the
+> register's per-account leg sum, i.e. the net cash through the sleeve. The two
+> coincide on a plain Buy and diverge on every cash-neutral event. ADR-0028 now
+> carries the reconciliation and the read surface calls this one `SettledAmount`.
+
 `price × shares` need **not** equal the amount — a rounded price against an exact
 total is normal and faithful to the feed (see
 [[feedback_importers_report_feed_not_cash_model]]). Lot cost basis uses the same

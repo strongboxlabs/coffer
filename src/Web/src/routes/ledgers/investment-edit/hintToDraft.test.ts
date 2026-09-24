@@ -63,6 +63,7 @@ function mkLeg(
         ingestShares: null,
         ingestUnitPrice: null,
         ingestFee: null,
+        ingestAmount: null,
         ingestSecurityTickerHint: null,
         categoryAccountId: null,
         categoryAccountName: null,
@@ -86,6 +87,45 @@ function mkLeg(
 }
 
 describe('hintToDraft', () => {
+    it('prefers the stated total from the file over shares × price', () => {
+        // The real shape, from an OFX reinvest: the file states a TOTAL of
+        // 316.37 while 6.584 units at the rounded 48.05 multiply out to 316.36.
+        // ADR-0073 D1 says those need not agree — the total is authoritative —
+        // and before mig 228 nothing carried it, so opening the row rebuilt the
+        // amount one cent adrift and Accept persisted that. A cent is enough to
+        // make the row stop matching its own duplicate: merge candidates are
+        // found by exact principal.
+        const legs = [mkLeg({ accountId: BROKERAGE, amount: 0 })];
+        const draft = hintToDraft(
+            'dividend_reinvest', BROKERAGE, header, legs,
+            /* ingestSecurityId */ null,
+            /* ingestShares */ 6.584,
+            /* ingestUnitPrice */ 48.05,
+            /* ingestFee */ null,
+            /* ingestAmount */ 316.37,
+        );
+        expect(draft.amount).toBe(316.37);
+        // …and the derived price follows the authoritative amount, not the
+        // rounded one the file happened to print.
+        expect(draft.shares).toBe(6.584);
+    });
+
+    it('still falls back to shares × price when the file stated no total', () => {
+        // Every row imported before mig 228, and every provider that states
+        // none. The reconstruction is a last resort, not the norm — but it must
+        // still open with something rather than 0, which would block Accept.
+        const legs = [mkLeg({ accountId: BROKERAGE, amount: 0 })];
+        const draft = hintToDraft(
+            'dividend_reinvest', BROKERAGE, header, legs,
+            /* ingestSecurityId */ null,
+            /* ingestShares */ 6.584,
+            /* ingestUnitPrice */ 48.05,
+            /* ingestFee */ null,
+            /* ingestAmount */ null,
+        );
+        expect(draft.amount).toBe(316.36);
+    });
+
     it('seeds DivReinvest Amount from shares × price (cash leg nets to ~0)', () => {
         // A reinvestment is cash-neutral on the brokerage leg.
         const legs = [mkLeg({ accountId: BROKERAGE, amount: 0 })];

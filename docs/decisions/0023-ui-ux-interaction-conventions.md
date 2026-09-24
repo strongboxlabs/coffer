@@ -377,7 +377,7 @@ split → single is removing all but one.
 informational only — there's no sum-constraint warning (the
 schema's invariant is per-posting, not transaction-wide).
 
-> **Superseded in part — 2026-09-16 (PR #547).** Everything above about
+> **Superseded in part — 2026-09-16 (PR \#547).** Everything above about
 > per-posting affordances is now wrong, and the ADR-0025 amendment of the same
 > date carries the reasoning. Restated rather than rewritten so the original
 > choices stay legible:

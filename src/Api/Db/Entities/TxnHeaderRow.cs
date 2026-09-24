@@ -7,7 +7,9 @@ namespace Coffer.Api.Db.Entities;
 /// <remarks>
 /// <para>API mutations against header rows go through the
 /// <c>RegisterRepository</c>'s LINQ surface. Tags attach via
-/// <c>txn_header_tags</c>; overrides via <c>txn_header_overrides</c>.</para>
+/// <c>txn_header_tags</c>. Since migration 230 this row always holds the
+/// CURRENT values; the feed's are captured once, on the first edit, to
+/// <c>txn_header_originals</c> (<see cref="TxnHeaderOriginalRow"/>).</para>
 ///
 /// <para>Reconciliation status moved OFF the header to the per-leg overlay
 /// <c>txn_leg_recon</c> (<see cref="TxnLegReconRow"/>; ADR-0082, migration
@@ -20,15 +22,14 @@ internal sealed class TxnHeaderRow
     public Guid LedgerId { get; init; }
     public string Origin { get; init; } = string.Empty;
     public string? ExternalId { get; init; }
-    // Payee / Memo / CheckNumber / PostedAt / TransactedAt are
-    // mutable (get; set;) on manual investment txns: ADR-0029's
-    // PATCH endpoint reshapes the whole posting structure +
-    // updates these header fields in place. Bank-shape PATCH
-    // still goes through `txn_header_overrides` per ADR-0003 —
-    // the override layer is the right pattern for FEED-IMPORTED
-    // rows where the raw feed values must stay immutable. These
-    // properties being `set` doesn't break that contract; it
-    // just enables direct mutation on the manual path.
+    // Payee / Memo / CheckNumber / PostedAt / TransactedAt are mutable
+    // (get; set;) and BOTH write paths now assign them directly. The bank path
+    // used to write txn_header_overrides instead, on the ADR-0003 reasoning
+    // that a feed-imported row's raw values must stay immutable. Migration 230
+    // keeps that guarantee and moves it: HeaderOriginals.CaptureAsync
+    // snapshots the feed's values to txn_header_originals before the first
+    // edit overwrites them, so they are still recoverable — while reads stop
+    // paying for a COALESCE and a cleared field becomes expressible.
     public string? Payee { get; set; }
     public string? Memo { get; set; }
     public DateTime PostedAt { get; set; }
@@ -106,6 +107,11 @@ internal sealed class TxnHeaderRow
     /// aggregated value matches ADR-0029's editor model (no per-kind
     /// breakdown).</summary>
     public decimal? IngestFee { get; set; }
+
+    /// <summary>The authoritative total the source file stated (mig 228), so
+    /// the editor never rebuilds it from shares x price. Null when the provider
+    /// stated none, or for rows imported before that migration.</summary>
+    public decimal? IngestAmount { get; set; }
     /// <summary>Migration 114: provider-extracted security identifier
     /// string (OFX: SECLIST-resolved ticker or raw CUSIP fallback).
     /// Persisted at ingest time so the editor's Accept flow can

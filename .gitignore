@@ -117,6 +117,6 @@ temp/
 # OpenIddict token signing/encryption keys. The API writes these into its own
 # content root on first local run (OpenIddictKeyMaterial.LoadOrCreate), and they
 # were committed and published before this line existed — see
-# scripts/maintainer/check-no-key-material.sh, which now fails preflight if they
+# the key-material check, which now fails preflight if they
 # come back. Every install generates its own; nothing here should be shared.
 src/Api/data/openiddict/

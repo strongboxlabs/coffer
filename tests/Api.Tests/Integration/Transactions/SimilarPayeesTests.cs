@@ -62,7 +62,7 @@ public sealed class SimilarPayeesTests
         DateTime postedAt,
         string bankPayee,
         bool needsReview,
-        string? overridePayee = null,
+        string? curatedPayee = null,
         string providerKey = "simplefin",
         string origin = "online_import")
     {
@@ -78,17 +78,24 @@ public sealed class SimilarPayeesTests
             INSERT INTO txn_headers
                 (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, created_at, needs_review)
             VALUES
-                ({headerId}, {ledger.LedgerId}, {origin}, {providerKey}, {headerId.ToString()}, {bankPayee},
+                ({headerId}, {ledger.LedgerId}, {origin}, {providerKey}, {headerId.ToString()}, {curatedPayee ?? bankPayee},
                  {postedAt},{postedAt}, {postedAt}, {needsReview});
             INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount)
             VALUES
                 ({bankLegId},          {headerId}, {ledger.LedgerId}, {bankAccountId},          0, {amount}),
                 ({counterpartyLegId},  {headerId}, {ledger.LedgerId}, {counterpartyAccountId},  0, {-amount});");
-        if (overridePayee is not null)
+        if (curatedPayee is not null)
         {
+            // An EDITED row, in the shape migration 230 produces: the header
+            // carries what the user typed and the sidecar carries what the bank
+            // sent. Recall is the one feature that needs both to exist at once —
+            // it anchors on the bank's text and suggests the user's — so this
+            // fixture is where the flip is easiest to get backwards. Seeding the
+            // curated name into BOTH would make every assertion here pass while
+            // the endpoint matched on the wrong column.
             await db.Database.ExecuteSqlInterpolatedAsync($@"
-                INSERT INTO txn_header_overrides (header_id, ledger_id, payee)
-                VALUES ({headerId}, {ledger.LedgerId}, {overridePayee});");
+                INSERT INTO txn_header_originals (header_id, ledger_id, payee, posted_at, transacted_at)
+                VALUES ({headerId}, {ledger.LedgerId}, {bankPayee}, {postedAt}, {postedAt});");
         }
         return headerId;
     }
@@ -104,12 +111,12 @@ public sealed class SimilarPayeesTests
         var coffee = await ledger.AddCategoryAsync("Coffee");
 
         // Prior approved row: bank payee "STARBUCKS", user
-        // overrode to "Starbucks Coffee" and picked Coffee category.
+        // renamed to "Starbucks Coffee" and picked Coffee category.
         await SeedBankFeedAsync(
             ledger, bank.Id, coffee.Id, -4.50m,
             new DateTime(2026, 4, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "STARBUCKS", needsReview: false,
-            overridePayee: "Starbucks Coffee");
+            curatedPayee: "Starbucks Coffee");
 
         // Current row: same bank payee, awaiting review.
         var currentId = await SeedBankFeedAsync(
@@ -149,7 +156,7 @@ public sealed class SimilarPayeesTests
             ledger, checking.Id, fsa.Id, 242.85m,
             new DateTime(2026, 4, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "INSPIRA-AMERICAN", needsReview: false,
-            overridePayee: "Inspira American");
+            curatedPayee: "Inspira American");
 
         // Fresh feed row on the same account, still parked on
         // Uncategorized the way ingest leaves it.
@@ -189,13 +196,13 @@ public sealed class SimilarPayeesTests
                 ledger, checking.Id, fsa.Id, 100m,
                 new DateTime(2026, 3, i + 1, 12, 0, 0, DateTimeKind.Utc),
                 bankPayee: "INSPIRA-AMERICAN", needsReview: false,
-                overridePayee: "Inspira American");
+                curatedPayee: "Inspira American");
         }
         await SeedBankFeedAsync(
             ledger, checking.Id, medical.Id, 50m,
             new DateTime(2026, 4, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "INSPIRA-AMERICAN", needsReview: false,
-            overridePayee: "Inspira Medical");
+            curatedPayee: "Inspira Medical");
 
         var currentId = await SeedBankFeedAsync(
             ledger, checking.Id, uncategorized.Id, 75m,
@@ -232,7 +239,7 @@ public sealed class SimilarPayeesTests
             ledger, otherCard.Id, coffee.Id, -4m,
             new DateTime(2026, 4, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "STARBUCKS", needsReview: false,
-            overridePayee: "Starbucks Coffee");
+            curatedPayee: "Starbucks Coffee");
 
         var currentId = await SeedBankFeedAsync(
             ledger, checking.Id, uncategorized.Id, -4m,
@@ -260,7 +267,7 @@ public sealed class SimilarPayeesTests
                 ledger, bank.Id, coffee.Id, -4m,
                 new DateTime(2026, 3, i + 1, 12, 0, 0, DateTimeKind.Utc),
                 bankPayee: "STARBUCKS", needsReview: false,
-                overridePayee: "Starbucks Coffee");
+                curatedPayee: "Starbucks Coffee");
         }
         var currentId = await SeedBankFeedAsync(
             ledger, bank.Id, coffee.Id, -4m,
@@ -290,13 +297,13 @@ public sealed class SimilarPayeesTests
                 ledger, bank.Id, coffee.Id, -4m,
                 new DateTime(2026, 3, i + 1, 12, 0, 0, DateTimeKind.Utc),
                 bankPayee: "STARBUCKS", needsReview: false,
-                overridePayee: "Starbucks Coffee");
+                curatedPayee: "Starbucks Coffee");
         }
         await SeedBankFeedAsync(
             ledger, bank.Id, bills.Id, -10m,
             new DateTime(2026, 4, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "STARBUCKS", needsReview: false,
-            overridePayee: "Starbucks Subscription");
+            curatedPayee: "Starbucks Subscription");
 
         var currentId = await SeedBankFeedAsync(
             ledger, bank.Id, coffee.Id, -4m,
@@ -389,14 +396,14 @@ public sealed class SimilarPayeesTests
             ledger, bank.Id, coffee.Id, -4m,
             new DateTime(2026, 3, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "STARBUCKS", needsReview: false,
-            overridePayee: "Starbucks SimpleFIN");
+            curatedPayee: "Starbucks SimpleFIN");
 
         // OFX prior accept on the same raw payee.
         await SeedBankFeedAsync(
             ledger, bank.Id, coffee.Id, -4m,
             new DateTime(2026, 3, 2, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "STARBUCKS", needsReview: false,
-            overridePayee: "Starbucks OFX",
+            curatedPayee: "Starbucks OFX",
             providerKey: "ofx", origin: "file_import");
 
         // OFX needs-review anchor.
@@ -469,7 +476,7 @@ public sealed class SimilarPayeesTests
             alice, aliceBank.Id, aliceCoffee.Id, -4m,
             new DateTime(2026, 4, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "STARBUCKS", needsReview: false,
-            overridePayee: "Alice Starbucks");
+            curatedPayee: "Alice Starbucks");
 
         var bob = await SyntheticLedger.CreateAsync(_fixture);
         var bobBank = await bob.AddBankAccountAsync("checking");
@@ -499,17 +506,17 @@ public sealed class SimilarPayeesTests
             ledger, bank.Id, coffee.Id, -4m,
             new DateTime(2026, 3, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "STARBUCKS", needsReview: false,
-            overridePayee: "Starbucks Coffee");
+            curatedPayee: "Starbucks Coffee");
         var mergedId = await SeedBankFeedAsync(
             ledger, bank.Id, coffee.Id, -4m,
             new DateTime(2026, 3, 2, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "STARBUCKS", needsReview: false,
-            overridePayee: "Starbucks Coffee");
+            curatedPayee: "Starbucks Coffee");
         var winnerId = await SeedBankFeedAsync(
             ledger, bank.Id, coffee.Id, -4m,
             new DateTime(2026, 3, 3, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "STARBUCKS", needsReview: false,
-            overridePayee: "Starbucks Coffee");
+            curatedPayee: "Starbucks Coffee");
 
         // Hide one prior row + merge another into the winner. Only
         // the unhidden, unmerged prior should count toward use_count.
@@ -561,7 +568,7 @@ public sealed class SimilarPayeesTests
             ledger, bank.Id, coffee.Id, -4m,
             new DateTime(2026, 3, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "STARBUCKS", needsReview: false,
-            overridePayee: "Starbucks Coffee");
+            curatedPayee: "Starbucks Coffee");
 
         var currentId = await SeedBankFeedAsync(
             ledger, bank.Id, coffee.Id, -4m,
@@ -586,7 +593,7 @@ public sealed class SimilarPayeesTests
             ledger, bank.Id, coffee.Id, -4m,
             new DateTime(2026, 3, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "STARBUCKS", needsReview: false,
-            overridePayee: "Starbucks");
+            curatedPayee: "Starbucks");
 
         var hiddenId = await SeedBankFeedAsync(
             ledger, bank.Id, coffee.Id, -4m,
@@ -637,7 +644,7 @@ public sealed class SimilarPayeesTests
                 ledger, bank.Id, coffee.Id, -4m,
                 new DateTime(2026, 3, i + 1, 12, 0, 0, DateTimeKind.Utc),
                 bankPayee: "STARBUCKS", needsReview: false,
-                overridePayee: "Starbucks Coffee");
+                curatedPayee: "Starbucks Coffee");
         }
 
         // The "current" row has the SAME (resolved-payee, category)
@@ -647,12 +654,97 @@ public sealed class SimilarPayeesTests
             ledger, bank.Id, coffee.Id, -4m,
             new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "STARBUCKS", needsReview: true,
-            overridePayee: "Starbucks Coffee");
+            curatedPayee: "Starbucks Coffee");
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
             Url(ledger.LedgerId, currentId)))!;
         Assert.Empty(suggestions);
+    }
+
+    /// <summary>
+    /// Recall anchors on the BANK's payee even when the anchor row has itself
+    /// been renamed — including renamed to nothing.
+    /// </summary>
+    /// <remarks>
+    /// <para>Migration 230 put the curated name on <c>txn_headers.payee</c> and
+    /// moved the feed's to <c>txn_header_originals</c>. Recall is the one feature
+    /// that reads both, in opposite directions: the bank's text is the KEY it
+    /// searches by, the user's is the ANSWER it suggests. Keying on the curated
+    /// name instead would match only rows nobody renamed, and the panel would go
+    /// quietly empty rather than fail.</para>
+    ///
+    /// <para>The cleared case is the sharper one, and it is new: the gate that
+    /// asks "does this row have a payee to search by" used to read the header's
+    /// column, which before 230 was always the bank's. Now a cleared payee makes
+    /// that column NULL while the bank's text sits in the sidecar with recall
+    /// perfectly possible. Reachable through MCP or a direct PATCH — the SPA
+    /// always pairs a save with approve, which takes the row out of scope.</para>
+    /// </remarks>
+    [Fact]
+    public async Task Anchors_on_the_bank_payee_when_the_anchor_row_was_itself_renamed()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var coffee = await ledger.AddCategoryAsync("Coffee");
+
+        await SeedBankFeedAsync(
+            ledger, bank.Id, coffee.Id, -4.50m,
+            new DateTime(2026, 4, 1, 12, 0, 0, DateTimeKind.Utc),
+            bankPayee: "STARBUCKS", needsReview: false,
+            curatedPayee: "Starbucks Coffee");
+
+        // The anchor: same bank payee, still awaiting review, but already renamed
+        // to something that matches NO prior row.
+        var renamed = await SeedBankFeedAsync(
+            ledger, bank.Id, coffee.Id, -4.75m,
+            new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
+            bankPayee: "STARBUCKS", needsReview: true,
+            curatedPayee: "a name nothing else uses");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
+            Url(ledger.LedgerId, renamed)))!;
+        var single = Assert.Single(suggestions);
+        Assert.Equal("Starbucks Coffee", single.Payee);
+        Assert.Equal(coffee.Id, single.CounterpartyAccountId);
+    }
+
+    [Fact]
+    public async Task Anchors_on_the_bank_payee_when_the_anchor_rows_payee_was_cleared()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var coffee = await ledger.AddCategoryAsync("Coffee");
+
+        await SeedBankFeedAsync(
+            ledger, bank.Id, coffee.Id, -4.50m,
+            new DateTime(2026, 4, 1, 12, 0, 0, DateTimeKind.Utc),
+            bankPayee: "STARBUCKS", needsReview: false,
+            curatedPayee: "Starbucks Coffee");
+
+        var cleared = await SeedBankFeedAsync(
+            ledger, bank.Id, coffee.Id, -4.75m,
+            new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
+            bankPayee: "STARBUCKS", needsReview: true);
+        // Clear it through the endpoint, which is the behaviour migration 230
+        // made possible in the first place — presence, not nullness.
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+        var clear = await client.SendAsync(new HttpRequestMessage(
+            HttpMethod.Patch, $"/api/ledgers/{ledger.LedgerId}/transactions/{cleared}")
+        {
+            Content = new StringContent(
+                "{\"payee\": null}", System.Text.Encoding.UTF8, "application/json"),
+        });
+        Assert.Equal(HttpStatusCode.NoContent, clear.StatusCode);
+
+        var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
+            Url(ledger.LedgerId, cleared)))!;
+        var single = Assert.Single(suggestions);
+        Assert.Equal("Starbucks Coffee", single.Payee);
     }
 }

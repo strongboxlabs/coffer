@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useNavigate, useParams } from '@tanstack/react-router';
+import { useNavigate, useParams, useSearch } from '@tanstack/react-router';
 import { type VirtuosoHandle } from 'react-virtuoso';
 
 import { Upload, RefreshCw } from 'lucide-react';
@@ -30,6 +30,7 @@ import {
     groupAmount,
     groupBalanceAfter,
     regroupTargetSplits,
+    rowHasHeader,
     type DisplayRow,
     type RegisterEntryOf,
 } from '@/lib/splitCollapse';
@@ -137,6 +138,14 @@ export function InvestmentRegisterPage() {
         accountId: string;
     };
     const navigate = useNavigate();
+    // `?focus=<headerId>` — an arrival anchor. Set by "Show other side" from a
+    // bank row, by this register's own "Show other side" (a transfer_shares
+    // counterparty is always another brokerage), and by every row of the
+    // Security Detail transactions table, whose rows are security-bearing legs
+    // and so always land on a brokerage account. The register seeds the window
+    // on that row and focuses it; NULL when navigating in normally.
+    const search = useSearch({ strict: false }) as { focus?: string };
+    const focusFromUrl = search.focus;
 
     const ledgersQuery = useQuery({
         queryKey: ['ledgers'],
@@ -272,6 +281,7 @@ export function InvestmentRegisterPage() {
         statusFilter,
         filter,
         sort,
+        focusHeaderId: focusFromUrl,
     });
 
     // When any user filter is active the index buckets already reflect the
@@ -434,6 +444,49 @@ export function InvestmentRegisterPage() {
             startEdit(row.txn.headerId);
         },
     });
+
+    // Seed focus from the resolved arrival anchor, once per arrival, and scroll
+    // it into view.
+    //
+    // Resolved by HEADER ID against displayRows — never by index. The hook
+    // counts ENTRIES while this list renders ROWS (after regrouping target
+    // splits, filtering by status and expanding groups), and the two are not
+    // equal. The hook reports an anchor only when the server actually placed it
+    // in the window, so there is no case where this focuses a row nobody asked
+    // for: an anchor the server declined is simply never reported, and one it
+    // honoured but the status filter then hid is not found here.
+    //
+    // The gate holds the anchor id, so an anchored refresh onto the SAME row
+    // (post-create, the other caller) still re-seeds. It resets on a view
+    // change because the Holdings toggle unmounts the list entirely — without
+    // that, returning to Activity would find the gate already satisfied and
+    // never restore focus.
+    const seededFocusForRef = useRef<string | null>(null);
+    useEffect(() => {
+        if (view === 'holdings') {
+            seededFocusForRef.current = null;
+            return;
+        }
+        const anchorId = register.focusAnchorHeaderId;
+        if (anchorId === null) {
+            seededFocusForRef.current = null;
+            return;
+        }
+        if (seededFocusForRef.current === anchorId) return;
+
+        const localIndex = displayRows.findIndex((r) => rowHasHeader(r, anchorId));
+        if (localIndex < 0) return;
+
+        setFocusedRowId(displayRowId(displayRows[localIndex]!));
+        seededFocusForRef.current = anchorId;
+        const handle = window.setTimeout(() => {
+            // Local index: this register feeds virtuoso plain local indices, and
+            // scrollIntoView takes one. No `align` → virtuoso's "smart" mode,
+            // which is a no-op when the row is already fully visible.
+            virtuosoRef.current?.scrollIntoView({ index: localIndex });
+        }, 100);
+        return () => window.clearTimeout(handle);
+    }, [register.focusAnchorHeaderId, displayRows, setFocusedRowId, view]);
     const [contextMenu, setContextMenu] = useState<{
         anchor: { x: number; y: number };
         target: InvestmentRowType;
@@ -919,6 +972,10 @@ export function InvestmentRegisterPage() {
                 canonical.ingestShares,
                 canonical.ingestUnitPrice,
                 canonical.ingestFee,
+                // Mig 228: the file's authoritative total. Without it a
+                // cash-neutral row (a reinvest) has its amount rebuilt from
+                // shares × price and opens a cent adrift.
+                canonical.ingestAmount,
             );
             // Common rail (mig 114): every provider persists its
             // ticker hint at ingest time on
@@ -1297,8 +1354,83 @@ export function InvestmentRegisterPage() {
                                                 initialDraft: editingContext.initialDraft,
                                                 providerSecurityHint: editingContext.providerSecurityHint,
                                                 needsReview: editingContext.needsReview,
-                                                onSaved: (entry) => {
+                                                onSaved: (entry, mergedIntoHeaderId) => {
                                                     setEditingHeaderId(null);
+                                                    // MERGE. The edited row is
+                                                    // the loser and `entry` is
+                                                    // the survivor, so the
+                                                    // ordinary path below —
+                                                    // which patches the saved
+                                                    // entry onto the EDITED
+                                                    // header — would paint the
+                                                    // survivor's data onto the
+                                                    // loser's row and leave two
+                                                    // entries under one header
+                                                    // id (a duplicate virtuoso
+                                                    // key). The server hides
+                                                    // the loser, so a refresh
+                                                    // healed it and nothing
+                                                    // caught it. Mirrors the
+                                                    // bank register.
+                                                    if (mergedIntoHeaderId) {
+                                                        const loserId =
+                                                            editingContext.headerId;
+                                                        register.removeEntries((e) =>
+                                                            (e.kind === 'txn'
+                                                                ? e.txn.headerId
+                                                                : e.legs[0]!.headerId)
+                                                                === loserId);
+                                                        if (entry !== null) {
+                                                            // The survivor adopts the
+                                                            // loser's date, so its sort
+                                                            // slot can move.
+                                                            const at = entry.kind === 'txn'
+                                                                ? entry.txn.postedAt
+                                                                : entry.legs[0]!.postedAt;
+                                                            if (repositionIfDateChanged(
+                                                                mergedIntoHeaderId, at,
+                                                            )) {
+                                                                queryClient.invalidateQueries({
+                                                                    queryKey: [
+                                                                        'register-index-buckets',
+                                                                        ledgerId,
+                                                                        accountId,
+                                                                    ],
+                                                                });
+                                                                return;
+                                                            }
+                                                            register.mutateEntries((e) => {
+                                                                const id = e.kind === 'txn'
+                                                                    ? e.txn.headerId
+                                                                    : e.legs[0]!.headerId;
+                                                                return id === mergedIntoHeaderId
+                                                                    ? entry
+                                                                    : e;
+                                                            });
+                                                        }
+                                                        // A merge REMOVES a row, so every
+                                                        // running balance below it moves —
+                                                        // the same reason the ordinary save
+                                                        // path refreshes. This branch used
+                                                        // to return straight out and skip
+                                                        // it, so a same-day merge left the
+                                                        // balance column stale until a
+                                                        // reload. (The date-moved case
+                                                        // above re-seeds the window, which
+                                                        // brings fresh balances with it,
+                                                        // and returns before reaching here.)
+                                                        // The bank register has always
+                                                        // fallen through to this.
+                                                        void refreshLoadedBalances();
+                                                        queryClient.invalidateQueries({
+                                                            queryKey: [
+                                                                'register-index-buckets',
+                                                                ledgerId,
+                                                                accountId,
+                                                            ],
+                                                        });
+                                                        return;
+                                                    }
                                                     // Investment PATCH is a full reshape
                                                     // per ADR-0025 — leg amounts can shift,
                                                     // every downstream balance updates.

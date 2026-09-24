@@ -35,6 +35,8 @@ import type {
 // wiring.
 
 const LEDGER_ID = '00000000-0000-0000-0000-000000000010';
+const LOSER_HEADER = '00000000-0000-0000-0000-00000000105e';
+const SURVIVOR_HEADER = '00000000-0000-0000-0000-0000000005ff';
 const ACCOUNT_ID = '00000000-0000-0000-0000-000000000200';
 const HOLDINGS_SIBLING_ID = '00000000-0000-0000-0000-000000000201';
 
@@ -108,6 +110,7 @@ function makeTxn(
         ingestShares: null,
         ingestUnitPrice: null,
         ingestFee: null,
+        ingestAmount: null,
         ingestSecurityTickerHint: null,
         categoryAccountId: null,
         categoryAccountName: null,
@@ -134,7 +137,9 @@ function entryOf(t: InvestmentRow): RegisterEntry {
     return { kind: 'txn', txn: t, groupId: null, legs: null };
 }
 
-function renderPage() {
+function renderPage(
+    initialUrl = `/ledgers/${LEDGER_ID}/accounts/${ACCOUNT_ID}`,
+) {
     const queryClient = new QueryClient({
         defaultOptions: { queries: { retry: false } },
     });
@@ -160,17 +165,29 @@ function renderPage() {
     const router = createRouter({
         routeTree: root.addChildren([registerRoute, landingRoute, detailRoute]),
         history: createMemoryHistory({
-            initialEntries: [`/ledgers/${LEDGER_ID}/accounts/${ACCOUNT_ID}`],
+            initialEntries: [initialUrl],
         }),
         context: { queryClient },
     });
 
-    return render(
+    // The router is returned so a test can drive a CLIENT-SIDE navigation —
+    // the path where an arrival anchor shows up after mount rather than in the
+    // first render.
+    return renderWithRouter(router, queryClient);
+}
+
+function renderWithRouter(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    router: any,
+    queryClient: QueryClient,
+) {
+    const result = render(
         <QueryClientProvider client={queryClient}>
             {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
             <RouterProvider router={router as any} />
         </QueryClientProvider>,
     );
+    return { ...result, router };
 }
 
 describe('InvestmentRegisterPage', () => {
@@ -183,6 +200,13 @@ describe('InvestmentRegisterPage', () => {
         window.scrollTo = vi.fn();
         vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
         vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([TEST_ACCOUNT]);
+        // Any save or merge kicks off the in-place balance refresh. Unstubbed it
+        // reaches the real fetch with a relative URL, which this environment
+        // cannot parse — an ignored rejection on today's jsdom and a hard
+        // "unhandled error" run failure on a newer one, which is how the last
+        // one of these surfaced: as a red dependency-bump PR rather than as a
+        // red test.
+        vi.spyOn(apiModule, 'fetchBalancesForHeaders').mockResolvedValue([]);
         // useSelection fires a debounced selection-summary query the
         // moment a row is checked. Stub it so the count/Σ readout is
         // deterministic and no network call escapes the test.
@@ -1085,4 +1109,268 @@ describe('InvestmentRegisterPage', () => {
         expect(screen.queryByText(/edit selected/i)).not.toBeInTheDocument();
     });
 
+    // A cash-neutral event nets to ZERO on the brokerage sleeve by
+    // construction — a reinvestment is income +X and security −X — so ADR-0028's
+    // Amount is a true and useless $0.00. 38.8% of dev's brokerage entries are
+    // in that class, and none of them had any test at all: this file had no
+    // DivReinvest fixture, so nothing pinned what a reader actually sees.
+    describe('cash-neutral events show the settled amount', () => {
+        it('shows what a reinvestment settled for, beneath its $0.00 net', async () => {
+            const txn = makeTxn({
+                id: 'divr1',
+                investmentAction: 'dividend_reinvest',
+                amount: 0,
+                settledAmount: 316.29,
+                feeAmount: null,
+            });
+            vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+                entries: [entryOf(txn)],
+                cursorForOlder: null,
+                cursorForNewer: null,
+            });
+
+            renderPage();
+
+            expect(await screen.findByText(/settled \$316\.29/)).toBeInTheDocument();
+        });
+
+        it('does NOT print the fee twice when a fee consumed the proceeds', async () => {
+            // The trap: on these the settled amount EQUALS the fee, so a naive
+            // "put settled on the subtitle line" renders $25.00 twice under a
+            // zero. 478 dev entries across sell, sellx and buy.
+            const txn = makeTxn({
+                id: 'sell1',
+                investmentAction: 'sell',
+                amount: 0,
+                settledAmount: 25,
+                feeAmount: 25,
+            });
+            vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+                entries: [entryOf(txn)],
+                cursorForOlder: null,
+                cursorForNewer: null,
+            });
+
+            renderPage();
+
+            // Anchor on the fee actually rendering before asserting the absence.
+            expect(await screen.findByText(/fee \$25\.00/)).toBeInTheDocument();
+            expect(screen.queryByText(/settled/)).not.toBeInTheDocument();
+        });
+
+        it('leaves a row with a real net alone', async () => {
+            // When the Amount cell already answers the question, a second
+            // figure beneath it is noise.
+            const txn = makeTxn({
+                id: 'buy1',
+                investmentAction: 'buy',
+                amount: -1000,
+                settledAmount: 1000,
+                feeAmount: null,
+            });
+            vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+                entries: [entryOf(txn)],
+                cursorForOlder: null,
+                cursorForNewer: null,
+            });
+
+            renderPage();
+
+            expect(await screen.findByText(/^ETFA · Index ETF A$/)).toBeInTheDocument();
+            expect(screen.queryByText(/settled/)).not.toBeInTheDocument();
+        });
+    });
+
+    // The merge SAVE path, which neither register had a test for — the bank's
+    // equivalent has shipped untested since #341, which is exactly how the
+    // investment side could be missing the branch entirely and go unnoticed.
+    //
+    // On a merge the edited row becomes the LOSER and the server returns the
+    // SURVIVOR's entry, so the ordinary save path (patch the saved entry onto
+    // the edited header) painted the survivor's data onto the loser's row and
+    // left two entries under one header id — a duplicate virtuoso key.
+    //
+    // Note the fetchHeaderLegs mock. editingContext bails on an EMPTY leg set,
+    // so the shared stub's `[]` means the editor can never mount — which is why
+    // nothing in this file had ever driven it.
+    it('removes the loser and places the survivor when a merge is saved', async () => {
+        const loser = makeTxn({
+            id: 'loser', headerId: LOSER_HEADER, payee: 'imported dupe',
+            needsReview: true,
+        });
+        const survivorRow = makeTxn({
+            id: 'survivor', headerId: SURVIVOR_HEADER, payee: 'the keeper',
+        });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(loser), entryOf(survivorRow)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+        vi.spyOn(apiModule, 'fetchHeaderLegs').mockResolvedValue([loser]);
+        vi.spyOn(apiModule, 'fetchInvestmentMergeCandidates').mockResolvedValue([
+            {
+                headerId: SURVIVOR_HEADER,
+                postedAt: '2026-05-01T12:00:00Z',
+                dayDelta: 0,
+                action: 'buy',
+                securityTicker: 'ETFA',
+                shares: 10,
+                unitPrice: 100,
+                amount: 1000,
+                payee: 'the keeper',
+            },
+        ]);
+        const patchSpy = vi
+            .spyOn(apiModule, 'patchInvestmentTransaction')
+            .mockResolvedValue(entryOf(survivorRow));
+
+        renderPage();
+
+        const loserCell = await screen.findByText('imported dupe');
+        fireEvent.dblClick(loserCell.closest('[role="row"]')!);
+
+        // Arm the merge by picking the candidate chip, then fold.
+        // The chip is labelled by its SUMMARY — date · action · ticker · shares
+        // · amount — not by the payee.
+        fireEvent.click(await screen.findByRole('button', { name: /ETFA.*10 sh/i }));
+        fireEvent.click(
+            await screen.findByRole('button', { name: /fold into selected/i }),
+        );
+
+        await waitFor(() => expect(patchSpy).toHaveBeenCalled());
+        // The PATCH carried the survivor as the merge target.
+        expect(patchSpy.mock.calls[0]![2]).toEqual(
+            expect.objectContaining({ mergeFromHeaderId: SURVIVOR_HEADER }),
+        );
+
+        // The loser is gone from the window…
+        await waitFor(() => {
+            expect(screen.queryByText('imported dupe')).not.toBeInTheDocument();
+        });
+        // …and the survivor appears exactly once, not duplicated onto the
+        // loser's row.
+        expect(screen.getAllByText('the keeper')).toHaveLength(1);
+    });
 });
+
+describe('InvestmentRegisterPage — focus anchoring', () => {
+    const ANCHOR = '00000000-0000-0000-0000-0000000000aa';
+
+    beforeEach(() => {
+        vi.restoreAllMocks();
+        window.scrollTo = vi.fn();
+        vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
+        vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([TEST_ACCOUNT]);
+        vi.spyOn(apiModule, 'fetchBalancesForHeaders').mockResolvedValue([]);
+        vi.spyOn(apiModule, 'fetchSelectionSummary').mockResolvedValue({
+            count: 1,
+            sumOnAccount: -1000,
+        });
+        vi.spyOn(apiModule, 'fetchIndexBuckets').mockResolvedValue([]);
+    });
+
+    it('asks the server to anchor on the ?focus= row', async () => {
+        const wanted = makeTxn({ id: 'a1', headerId: ANCHOR, payee: 'Anchored' });
+        const fetchSpy = vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(wanted)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+
+        renderPage(`/ledgers/${LEDGER_ID}/accounts/${ACCOUNT_ID}?focus=${ANCHOR}`);
+
+        await waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+        expect(fetchSpy.mock.calls[0]![0]).toEqual(
+            expect.objectContaining({ startingAtHeaderId: ANCHOR }),
+        );
+    });
+
+    it('focuses the anchored row, not whatever came first', async () => {
+        // "Show other side" onto a brokerage — from a bank row, from this
+        // register (a transfer_shares counterparty is always another brokerage),
+        // or from any Security Detail row — used to land at the newest rows with
+        // nothing highlighted, because this page never read ?focus= at all.
+        const bystander = makeTxn({ id: 'b1', headerId: 'other-header', payee: 'Bystander' });
+        const wanted = makeTxn({ id: 'a1', headerId: ANCHOR, payee: 'Anchored' });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(bystander), entryOf(wanted)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+
+        renderPage(`/ledgers/${LEDGER_ID}/accounts/${ACCOUNT_ID}?focus=${ANCHOR}`);
+
+        await waitFor(() => {
+            expect(
+                document.querySelector(`[data-headerid="${ANCHOR}"]`)
+                    ?.getAttribute('data-focused'),
+            ).toBe('true');
+        });
+        expect(
+            document.querySelector('[data-headerid="other-header"]')
+                ?.getAttribute('data-focused'),
+        ).toBe('false');
+    });
+
+    it('focuses when the anchor ARRIVES BY NAVIGATION, not just on load', async () => {
+        // The reported symptom: "Show other side" onto a brokerage lands at the
+        // top, and only a browser refresh focuses the row. A refresh has the
+        // anchor in the first render; a client-side navigation delivers it
+        // afterwards.
+        const bystander = makeTxn({ id: 'b1', headerId: 'other-header', payee: 'Bystander' });
+        const wanted = makeTxn({ id: 'a1', headerId: ANCHOR, payee: 'Anchored' });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(bystander), entryOf(wanted)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+
+        // Arrive WITHOUT an anchor, as if from the sidebar...
+        const { router } = renderPage();
+        await screen.findByText('Anchored');
+        expect(
+            document.querySelector(`[data-headerid="${ANCHOR}"]`)
+                ?.getAttribute('data-focused'),
+        ).toBe('false');
+
+        // ...then navigate to the same register WITH one.
+        await router.navigate({
+            to: '/ledgers/$ledgerId/accounts/$accountId',
+            params: { ledgerId: LEDGER_ID, accountId: ACCOUNT_ID },
+            search: { focus: ANCHOR },
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any);
+
+        await waitFor(() => {
+            expect(
+                document.querySelector(`[data-headerid="${ANCHOR}"]`)
+                    ?.getAttribute('data-focused'),
+            ).toBe('true');
+        });
+    });
+
+    it('focuses nothing when the server declines to anchor', async () => {
+        // The server pins an anchor only when the row matches the active filter,
+        // and otherwise returns the ordinary page without saying so. Focusing
+        // "whatever is at index 0" is the bug this guards.
+        const unrelated = makeTxn({ id: 'z1', headerId: 'not-the-anchor', payee: 'Unrelated' });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(unrelated)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+
+        renderPage(`/ledgers/${LEDGER_ID}/accounts/${ACCOUNT_ID}?focus=${ANCHOR}`);
+
+        // Settled anchor: the row the server DID return is on screen, so the
+        // absence below is real rather than a frame that has not rendered.
+        await waitFor(() => {
+            expect(document.querySelector('[data-headerid="not-the-anchor"]')).not.toBeNull();
+        });
+        expect(
+            document.querySelector('[data-headerid="not-the-anchor"]')
+                ?.getAttribute('data-focused'),
+        ).toBe('false');
+    });
+});
+

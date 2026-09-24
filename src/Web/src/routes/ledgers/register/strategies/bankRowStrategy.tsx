@@ -417,11 +417,19 @@ function renderSplitLegBody(leg: BankRow, ctx: RegisterRowBodyCtx): ReactNode {
 // Bank-specific container attribute: `aria-rowindex` on every variant. The
 // row-STATE styling (scheduled / needs-review / hidden + leg muting) now lives
 // in the shared RegisterRow so bank + investment render it identically.
-function bankContainerAttrs(_row: BankRow, ctx: RegisterRowContainerCtx) {
+function bankContainerAttrs(row: BankRow, ctx: RegisterRowContainerCtx) {
     return {
         dataAttrs: {
             'aria-rowindex':
                 ctx.rowIndex !== undefined ? ctx.rowIndex + 1 : undefined,
+            // Mirrors the investment strategy. Focus was previously visible on a
+            // bank row only as styling, so "which row has the keyboard cursor"
+            // could not be asserted — which is why the anchor bug below it went
+            // unnoticed: nothing could see that focus had landed on the wrong
+            // row. `data-headerid` is omitted on legs, as investment omits it,
+            // because a leg is not the header's row.
+            'data-headerid': ctx.variant === 'split-leg' ? undefined : row.headerId,
+            'data-focused': ctx.focused ? 'true' : 'false',
         },
     };
 }

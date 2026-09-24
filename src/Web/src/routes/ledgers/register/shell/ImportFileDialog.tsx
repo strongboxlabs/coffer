@@ -409,10 +409,18 @@ function PickStep({
 }) {
     // A brokerage is needed only for a CSV: OFX, QFX and QIF describe themselves, and
     // demanding one for them would be asking a question with no bearing on the answer.
-    const needsBrokerage = accountKind === 'investment'
+    //
+    // So the question is asked AFTER the file, not before it. Asking first put a
+    // CSV-only question above the control that decides whether it applies — the
+    // brokerage list was the first thing on screen even for someone about to pick a
+    // QFX, who then had to work out that it did not concern them. Picking the file
+    // first means the list appears only once it is the actual next thing to answer,
+    // and "other brokerages aren't supported yet" lands when it is actionable rather
+    // than as a caveat about a file that has not been chosen.
+    const showBrokeragePicker = accountKind === 'investment'
         && file !== null
-        && isDelimited(file)
-        && brokerage === null;
+        && isDelimited(file);
+    const needsBrokerage = showBrokeragePicker && brokerage === null;
 
     return (
         <>
@@ -421,17 +429,35 @@ function PickStep({
                     {accountKind === 'investment'
                         ? 'Choose a statement file exported from your brokerage or '
                           + 'retirement-plan provider. Supported formats: OFX, QFX, QIF, '
-                          + 'and CSV from the brokerages listed below.'
+                          + 'and CSV from supported brokerages.'
                         : 'Choose a statement file exported from your bank, brokerage, or '
                           + 'retirement-plan provider. Supported formats: OFX, QFX, QIF, '
                           + 'and delimited text (CSV/TSV), which needs a mapping '
                           + 'describing its columns.'}
                 </p>
 
-                {accountKind === 'investment' ? (
+                <div>
+                    {/* The prose above describes the control but is not tied to it,
+                        so this input had no accessible name — nothing to announce
+                        beyond "file upload button". */}
+                    <input
+                        ref={fileInputRef}
+                        type="file"
+                        aria-label="Statement file"
+                        accept=".ofx,.qfx,.qif,.csv,.tsv,.txt"
+                        onChange={(e) => onPickFile(e.target.files?.[0] ?? null)}
+                        className="block w-full text-sm file:mr-3 file:rounded file:border-0 file:bg-accent file:px-3 file:py-1.5 file:text-text-inverse hover:file:cursor-pointer hover:file:opacity-90"
+                    />
+                    {file !== null ? (
+                        <p className="mt-2 text-xs text-text-subtle">
+                            {file.name} — {formatBytes(file.size)}
+                        </p>
+                    ) : null}
+                </div>
+                {showBrokeragePicker ? (
                     <fieldset className="rounded border border-border p-3">
                         <legend className="px-1 text-xs text-text-muted">
-                            If the file is a CSV, which brokerage is it from?
+                            Which brokerage is this CSV from?
                         </legend>
                         <div className="space-y-2">
                             {BROKERAGES.map((b) => (
@@ -454,35 +480,24 @@ function PickStep({
                         </div>
                         {/* Says where the boundary is. Someone holding an export from
                             somewhere else otherwise learns only that their file could
-                            not be read, which is indistinguishable from a bug. */}
+                            not be read, which is indistinguishable from a bug — and now
+                            that it shows only once a CSV is in hand, the second sentence
+                            is a route they can actually take. */}
                         <p className="mt-2 text-xs text-text-subtle">
-                            Other brokerages aren&rsquo;t supported yet. OFX, QFX and QIF
-                            files work from any provider.
+                            Other brokerages aren&rsquo;t supported yet — but OFX, QFX and
+                            QIF files work from any provider.
                         </p>
+                        {/* role="alert" earns its keep here: the whole fieldset appears
+                            only on picking a CSV, so a screen-reader user gets no other
+                            signal that a new question just became the reason Upload is
+                            dead. It sits INSIDE the fieldset because it is about this
+                            question, not about the dialog. */}
+                        {needsBrokerage ? (
+                            <p role="alert" className="mt-2 text-xs text-state-warning">
+                                Choose the brokerage this CSV came from before uploading.
+                            </p>
+                        ) : null}
                     </fieldset>
-                ) : null}
-                <div>
-                    {/* The prose above describes the control but is not tied to it,
-                        so this input had no accessible name — nothing to announce
-                        beyond "file upload button". */}
-                    <input
-                        ref={fileInputRef}
-                        type="file"
-                        aria-label="Statement file"
-                        accept=".ofx,.qfx,.qif,.csv,.tsv,.txt"
-                        onChange={(e) => onPickFile(e.target.files?.[0] ?? null)}
-                        className="block w-full text-sm file:mr-3 file:rounded file:border-0 file:bg-accent file:px-3 file:py-1.5 file:text-text-inverse hover:file:cursor-pointer hover:file:opacity-90"
-                    />
-                    {file !== null ? (
-                        <p className="mt-2 text-xs text-text-subtle">
-                            {file.name} — {formatBytes(file.size)}
-                        </p>
-                    ) : null}
-                </div>
-                {needsBrokerage ? (
-                    <p role="alert" className="text-xs text-state-warning">
-                        Choose the brokerage this CSV came from before uploading.
-                    </p>
                 ) : null}
                 <p className="text-xs text-text-subtle">Maximum file size: 5 MB.</p>
                 {previewError !== null ? (

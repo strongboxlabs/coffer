@@ -50,7 +50,7 @@ public sealed class CurrentBalanceEffectiveOrderTests
         // Now move the JANUARY transaction to March by override, so effective order
         // becomes Feb (-10) then Mar (-100): 990, then 890. The final balance is the
         // same 890 — the point is WHICH ROW the view calls latest.
-        await ledger.SetHeaderOverrideAsync(
+        await ledger.EditHeaderAsync(
             jan.FromTxnId, postedAt: new DateTime(2026, 3, 10, 12, 0, 0, DateTimeKind.Utc));
 
         // The override changes the effective ORDER, so the balances must be rebuilt

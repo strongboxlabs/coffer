@@ -246,7 +246,7 @@ erDiagram
         numeric net_amount
     }
 
-    txn_header_overrides {
+    txn_header_originals {
         uuid header_id PK,FK
         uuid ledger_id FK
         text payee
@@ -254,16 +254,7 @@ erDiagram
         timestamptz posted_at
         timestamptz transacted_at
         text check_number
-        bool is_hidden
-        timestamptz updated_at
-    }
-
-    txn_leg_overrides {
-        uuid leg_id PK,FK
-        uuid ledger_id FK
-        text leg_memo
-        numeric amount
-        timestamptz updated_at
+        timestamptz captured_at
     }
 
     txn_leg_recon {
@@ -620,8 +611,7 @@ erDiagram
     txn_headers ||--o{ txn_header_account_balances : "balance per account"
     accounts ||--o{ txn_header_account_balances : "running balance on"
     ledgers ||--o{ txn_header_account_balances : "scopes"
-    txn_headers ||--o| txn_header_overrides : "header-level edits"
-    txn_legs ||--o| txn_leg_overrides : "leg-level edits"
+    txn_headers ||--o| txn_header_originals : "pre-edit feed values"
     txn_legs ||--o| txn_leg_recon : "per-account recon status"
     users ||--o{ txn_leg_recon : "cleared by"
     txn_headers ||--o{ txn_header_tags : "tagged with"
@@ -953,7 +943,9 @@ Event envelope under the ADR-0022 normalised schema. One row per
 Moneydance txn (or user-entered event, or SimpleFIN feed event).
 Carries the umbrella metadata that's shared across all postings of
 the event: payee, memo, posted-at, check number, plus the online-match
-state. User edits to header fields live in `txn_header_overrides`.
+state. These columns hold the CURRENT values — what the register shows.
+The feed's are captured once, by the first edit that overwrites them,
+into `txn_header_originals` (migration 230, ADR-0100).
 Reconciliation status is **not** here — it moved to the per-leg
 `txn_leg_recon` overlay (migration 171, ADR-0082), because a transfer
 can be cleared in one account while still uncleared in the other.
@@ -964,19 +956,20 @@ can be cleared in one account while still uncleared in the other.
 | `ledger_id` | `UUID` | NOT NULL FK → `ledgers(id)` ON DELETE RESTRICT | Phase A anchor — RLS short-circuits at this column for one-hop visibility checks. |
 | `origin` | `TEXT` | NOT NULL CHECK in (`manual`, `online_import`, `file_import`) | Icon-level source mechanism (mig 107, ADR-0035). `online_import` covers any live feed (SimpleFIN, MD+ Direct Connect, OFX online); `file_import` covers any file upload (OFX/QFX, CSV, QIF); `manual` is user-typed. Per-provider audit detail lives in `provider_key`. The dedup query in `IngestOrchestrator` scopes by `(ledger_id, provider_key, external_id)` rather than `(ledger_id, origin, external_id)` since `origin` is no longer per-provider. |
 | `external_id` | `TEXT` | CHECK `ck_txn_headers_external_id_for_non_manual` (`external_id IS NOT NULL OR origin = 'manual'`) | Universal per-provider stable identifier. Set by every ingest path: Moneydance import → MD txnid; SimpleFIN sync → SimpleFIN transaction id (mig 105); future OFX/QFX/CSV → provider-specific stable id. NULL only on manual rows (`origin='manual'`). ADR-0022 keys at the *event* level. Partial unique index `(ledger_id, external_id) WHERE external_id IS NOT NULL`. Mig 105 added the original CHECK; mig 109 rewrote it as `ck_txn_headers_external_id_for_non_manual` in the post-mig-107 vocabulary (the old `is_user_defined` predicate was retired with that column) so any ingest writer that forgets to populate the column trips at INSERT time. |
-| `payee` | `TEXT` | | Raw — never modified after insert. |
+| `payee` | `TEXT` | | The current value. Mutable: both PATCH paths assign it, and the feed's is captured to `txn_header_originals` on the first edit (mig 230). Before that migration this column was raw-and-immutable and the edit lived in `txn_header_overrides`; the flip exists because a nullable override column could not express a CLEARED payee. |
 | `memo` | `TEXT` | | Raw event memo (Moneydance's `txn.memo`, e.g. "Electronic/ACH Credit"). Per-split memos live on `txn_legs.leg_memo`. |
-| `posted_at` | `TIMESTAMPTZ` | NOT NULL | Raw — never modified after insert. |
-| `transacted_at` | `TIMESTAMPTZ` | | Raw. |
+| `posted_at` | `TIMESTAMPTZ` | NOT NULL | The current value (mig 230 — see `payee`). NOT NULL, so a PATCH naming it with an explicit null is rejected (`transaction-date-null`) rather than ignored. |
+| `transacted_at` | `TIMESTAMPTZ` | | The current value (mig 230 — see `payee`). NOT NULL since mig 189: "no distinct tax date" is stored as the posted date, so there is no null state and an explicit null is rejected the same way. |
 | `check_number` | `TEXT` | | Paper-check number (Moneydance's `chk` field). |
 | `is_pending` | `BOOLEAN` | NOT NULL DEFAULT FALSE | Bank-side state — TRUE while the bank itself has not cleared the transaction. Mutable: the sync service flips T→F in place on a future sync that returns the same FITID with `pending: false` (slice 2c promote-on-clear). Orthogonal to `needs_review`. |
-| `is_hidden` | `BOOLEAN` | NOT NULL DEFAULT FALSE | Soft-delete at the header level. The DELETE endpoint flips this to TRUE for any feed-sourced row (i.e. `external_id IS NOT NULL`, which after mig 105 covers SimpleFIN syncs alongside every other ingest path); manual rows (`origin='manual'`, no `external_id`) get hard-deleted instead. Override via `txn_header_overrides.is_hidden`. |
-| `is_merged_into` | `UUID` | composite FK `(is_merged_into, ledger_id)` → `txn_headers(id, ledger_id)` ON DELETE SET NULL (is_merged_into) | Set when this event lost a merge; NULL = active. Self-referential composite FK `txn_headers_is_merged_into_ledger_fkey` (migration 121). |
+| `is_hidden` | `BOOLEAN` | NOT NULL DEFAULT FALSE | Soft-delete at the header level. The DELETE endpoint flips this to TRUE for any feed-sourced row (i.e. `external_id IS NOT NULL`, which after mig 105 covers SimpleFIN syncs alongside every other ingest path); manual rows (`origin='manual'`, no `external_id`) get hard-deleted instead. Canonical since mig 230: `txn_header_overrides.is_hidden` was dropped with its table, having had exactly one writer in the repository — a test fixture. |
+| `is_merged_into` | `UUID` | composite FK `(is_merged_into, ledger_id)` → `txn_headers(id, ledger_id)` ON DELETE SET NULL (is_merged_into) | Set when this event lost a merge; NULL = active. Self-referential composite FK `txn_headers_is_merged_into_ledger_fkey` (migration 121). **A merge also clears `needs_review` on the loser** — a folded-away row is not awaiting review, and the sidebar's review dot counts unreviewed rows. Both the bank and investment merge branches enforce this in the repository rather than trusting a caller to pair the merge with an approve; before that the bank relied on the SPA sending `approve: true`, so an MCP or direct-API merge left the dot lit. |
 | `seq` | `BIGINT` | NOT NULL UNIQUE DEFAULT `nextval('txn_headers_seq')` | Strictly-monotonic insertion-order key (migration 095, ADR-0034 v2). The canonical ordering is `(posted_at, seq)`; within a batch INSERT each row gets a distinct value, eliminating the UUID-tiebreaker ambiguity of the prior `(created_at, id)` design. Immutable (column-level BEFORE-UPDATE trigger). Consumed by the running-balance recompute, `resolved_transactions`, `register_entry_keys`, and the register cursor codec. |
 | `online_match_fitid` | `TEXT` | | OFX `<FITID>` — the bank's per-transaction id, unique only within one FI (migration 034). Part of the OFX dedup key `(ledger_id, online_match_fi_id, online_match_fitid)`. OFX-only (mig 105): the MD importer preserves MD's recorded OFX match state; SimpleFIN never touches it (SimpleFIN ids live on `external_id`). |
 | `online_match_fi_id` | `TEXT` | | OFX FI id — identifies which institution issued the transaction (migration 034). Composite with `online_match_fitid`. |
 | `ingest_action_hint` | `TEXT` | CHECK `ck_txn_headers_ingest_action_hint` (NULL or one of `buy`, `buyx`, `sell`, `sellx`, `dividend_cash`, `dividend_reinvest`, `divx`, `transfer`, `misc`) | Provider-classifier output (ADR-0031 Phase 3c, migration 076). Set by the orchestrator's brokerage branch when sync detects an investment-shape transaction; the editor pre-fills the action picker from it on review. NULL otherwise. |
 | `provider_raw_payload` | `JSONB` | | Original provider JSON for this transaction, verbatim from the wire (migration 078, ADR-0031). Diagnostic / classifier-iteration use only. NULL on manual + MD-imported rows and on feed rows synced before the column existed (re-sync backfills). |
+| `ingest_amount` | `NUMERIC(19,4)` | | Provider-stated **cash total** for the row, verbatim from the wire (OFX investment `TOTAL`), migration 228. Exists because a REINVEST's total is NOT recoverable from shares x price: the wire rounds `UNITS * UNITPRICE` to the cent it actually moved, so rebuilding it lands up to a cent out (ADR-0073 D1 — the amount is the money, `unit_price` is derived). Populated only where the wire states a total the derived figure would contradict; the editor prefers it over `ingest_shares * ingest_unit_price` when pre-filling. NULL elsewhere. |
 | `ingest_shares` | `NUMERIC(28,8)` | | Provider-extracted share count from a file-import wire (OFX investment `UNITS`), migration 113. Populated only on investment rows where the provider carries the data; read by the editor's bank→investment upgrade. NULL for bank/credit and SimpleFIN brokerage rows. |
 | `ingest_unit_price` | `NUMERIC(19,6)` | | Provider-extracted per-share price (OFX `UNITPRICE`), migration 113. Also preserves the wire's originally-reported trade price (see `txn_legs.unit_price`, which is derived). Same population rules as `ingest_shares`. |
 | `ingest_fee` | `NUMERIC(19,4)` | | Provider-extracted aggregated fee — sum of Commission + Fees + Load + Markup + Markdown (migration 113). NULL when the wire had no fee-shaped fields. Pre-fills the editor's single Fee field (ADR-0029). |
@@ -984,12 +977,14 @@ can be cleared in one account while still uncleared in the other.
 | `provider_key` | `TEXT` | CHECK (`(origin='manual') = (provider_key IS NULL)`) | Mig 107, ADR-0035. Per-provider audit detail: `simplefin`, `mdplus`, `ofx`, `qif`, `csv`. NULL when `origin='manual'`. Drives the per-provider hover label on the register provenance icon AND is the per-provider dedup scope (mig 105's `external_id` is universal, `provider_key` qualifies it). |
 | `is_merge_winner` | `BOOLEAN` | NOT NULL DEFAULT FALSE | Mig 107, ADR-0035. TRUE when at least one other row has `is_merged_into` pointing at this row. Maintained atomically with `is_merged_into` in `TransactionsRepository.PatchAsync`. Drives the merge-winner overlay icon in the register. Monotonic — no unmerge surface today, so once TRUE, stays TRUE. |
 | `import_source` | `TEXT` | | Bootstrap-import marker. `'moneydance-import:<file>'` on rows from the MD JSON bootstrap (mig 107 backfilled the bootstrapped rows); NULL on rows born in Coffer + live SimpleFIN sync + future OFX/CSV uploads. Audit / debug only — not surfaced in the register UI. Independent of `origin` (which describes the transaction's source mechanism) and `provider_key` (which identifies the specific provider); mig 109 §2.5. |
-| `needs_review` | `BOOLEAN` | NOT NULL DEFAULT FALSE | Bank-feed workflow flag (migration 037 / slice 2c). TRUE on rows the SimpleFIN sync just inserted; the register renders these with a distinct visual treatment (left bar in state-warning palette) until the Approve endpoint clears the bit. Orthogonal to `is_pending` — a row can be `(is_pending=T, needs_review=T)` (bank-pending AND new to user) or `(is_pending=F, needs_review=T)` (cleared, awaiting approval). Manual entries + MD-imported rows write FALSE on insert. Partial index `(ledger_id) WHERE needs_review` backs the future "review-only" register filter + the inbox count badge. |
+| `needs_review` | `BOOLEAN` | NOT NULL DEFAULT FALSE | Bank-feed workflow flag (migration 037 / slice 2c). TRUE on rows the SimpleFIN sync just inserted; the register renders these with a distinct visual treatment (left bar in state-warning palette) until the Approve endpoint clears the bit — or until the row is merged away, which clears it too (see `is_merged_into`). Orthogonal to `is_pending` — a row can be `(is_pending=T, needs_review=T)` (bank-pending AND new to user) or `(is_pending=F, needs_review=T)` (cleared, awaiting approval). Manual entries + MD-imported rows write FALSE on insert. Partial index `(ledger_id) WHERE needs_review` backs the future "review-only" register filter + the inbox count badge. |
 | `action` | `TEXT` | CHECK in (NULL, `buy`, `buyx`, `sell`, `sellx`, `dividend_cash`, `dividend_reinvest`, `divx`, `transfer`, `misc`, `transfer_shares`) | Investment-event action. Lifted from `txn_legs.investment_action` in migration 047; catalog locked to the 9-action set in migration 062 per ADR-0027 (`buyx`/`sellx`/`divx` first-class; `interest`/`misc_income`/`misc_expense` coalesced into `misc`; `split` moved to `security_splits` by migration 060). Migration 151 (ADR-0065) added the Ledger-native `transfer_shares` (in-kind share move; no MD txntype). One action per event, shared across all postings. NULL on non-investment events. |
 | `is_recurring_template` | `BOOLEAN` | NOT NULL DEFAULT FALSE | Migration 124 (ADR-0048): TRUE marks this header as a recurring-series **template**, not a live event. The `live_txn_headers` / `template_txn_headers` views partition on this flag so the register only ever sees live rows; templates fire occurrences via `recurring_transactions.template_header_id`. |
 | `recurring_transaction_id` | `UUID` | FK → `recurring_transactions(id)` | Migration 124: on a **fired** occurrence, back-reference to the series that produced it. NULL on ordinary rows and on templates. |
 | `occurrence_date` | `DATE` | | Migration 124: the series occurrence date a fired row materializes (paired with `recurring_transaction_id`). |
 | `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+
+> **Re-importing a file backfills these carriers.** A row imported before a carrier column existed has no way to acquire it otherwise, so the file-import dedup path fills `provider_raw_payload` and every `ingest_*` column above **over NULL only** when it re-sees a row it already knows (by `external_id`, or by `(fi_id, fitid)` for OFX). It never overwrites a stored value and never touches money, payee or memo — so it is safe on an accepted row and is the repair path for an unreviewed one. Before this, re-import reported a dedup and changed nothing.
 
 **Idempotent partial unique index** `uq_txn_headers_ledger_external_id`:
 `(ledger_id, external_id) WHERE external_id IS NOT NULL` — re-import
@@ -1009,8 +1004,48 @@ live on `external_id` (origin-scoped dedup in `IngestOrchestrator`).
 Per-account postings. Two legs per posting (one on each account), N
 postings per multi-split header. `posting_index` structurally pairs
 the two sides of one posting — same value within the header, different
-`account_id`. The pair sums to zero (same-currency invariant). User
-edits to per-leg fields (amount, leg memo) live in `txn_leg_overrides`.
+`account_id`. The pair sums to zero (same-currency invariant). These
+columns are canonical — there is no per-leg override layer
+(`txn_leg_overrides` was dropped in migration 230: zero rows in every
+database, no writer anywhere).
+
+**Leg IDENTITY survives an edit, on BOTH write paths.** A leg id is not
+a detail of one save — `txn_leg_recon` (ADR-0082), `lots` and
+`realized_gains` all key on it, and the first cascades on delete. The
+bank patch path keeps the legs a request names by
+`legId` and mutates them in place. The investment patch path cannot be told
+which legs to keep — investment legs are DERIVED from the action × field
+matrix, so the client never sees them — so it re-establishes identity by
+matching the rebuilt legs against the existing ones on
+`(account_id, posting_role, security_id)` and reusing the id where they
+agree. Only legs the new shape has no room for are deleted.
+
+That match key is load-bearing. It is what prevents a reused id from
+migrating between `(account, security)` pairs, which `realized_gains`
+`UNIQUE (sell_leg_id)` (migration 148) would otherwise let collide, since
+the recompute deletes and re-inserts per pair with no ordering guarantee
+between the two.
+
+Two consequences a writer must not "tidy":
+
+- **Reconciliation is preserved on a kept leg.** Keeping a cleared row
+  cleared across an edit is the reason leg identity is kept at all; do not
+  "tidy" `txn_leg_recon` away with a reshape. Both paths used to delete a
+  `txn_leg_overrides` row on a kept leg alongside it — that table is gone
+  as of migration 230, so only the preservation rule remains.
+- **Holdings no longer recompute for free.** `HoldingsRecomputeInterceptor`
+  watches `txn_legs` only; it used to fire on every investment PATCH purely
+  because every PATCH deleted every leg. With legs surviving, a
+  shape-identical edit — notably a DATE change, which is what the FIFO walk
+  orders by — produces no leg diff at all, so the investment patch path
+  calls the recompute explicitly for every `(account, security)` pair the
+  header touches before and after.
+
+`transfer_shares` is excluded from leg reuse and still destroys and
+rebuilds: its FIFO plan is computed from committed lots *after* the leg
+drop, precisely so the plan cannot see the transfer's own effect, and its
+per-moved-lot postings have no distinguishing identity under the match key
+anyway.
 
 **`posting_index` does double duty, and the second job is easy to
 miss: it is also the split's DISPLAY ORDER.** The bank patch path
@@ -1063,49 +1098,47 @@ create a new posting.
 **Unique index** `uq_txn_legs_posting`: `(header_id, posting_index, account_id)`
 — enforces the two-legs-per-posting invariant and drives re-import upsert idempotency.
 
-### `txn_header_overrides`
+### `txn_header_originals`
 
-One row per overridden header. NULL columns mean "use feed value". See [decisions/0003-immutable-feed-and-overrides.md](decisions/0003-immutable-feed-and-overrides.md) for the override pattern and [decisions/0022-txn-headers-and-legs.md](decisions/0022-txn-headers-and-legs.md) for the header/leg split.
+The FEED's header values, captured once by the first edit that overwrote them (migration 230, [ADR-0100](decisions/0100-canonical-holds-current-sidecar-holds-original.md)). One row per **edited** header, so the row's existence is the "has been modified" signal `resolved_transactions.has_overrides` reports.
+
+Every column but the key is nullable, because the feed itself may not have supplied one — a manual row edited later captures nulls, and that is the correct original.
 
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
 | `header_id` | `UUID` | PK FK → `txn_headers(id)` ON DELETE CASCADE | |
-| `ledger_id` | `UUID` | NOT NULL; composite FK `(header_id, ledger_id)` → `txn_headers(id, ledger_id)` ON DELETE CASCADE | Denormalized from the parent header (migration 072) so RLS gates on `ledger_id` directly. Composite FK `txn_header_overrides_header_ledger_fkey`. |
-| `payee` | `TEXT` | | NULL = use feed |
-| `memo` | `TEXT` | | NULL = use feed |
+| `ledger_id` | `UUID` | NOT NULL; composite FK `(header_id, ledger_id)` → `txn_headers(id, ledger_id)` ON DELETE CASCADE | Denormalized from the parent header so RLS gates on `ledger_id` directly, exactly as the table it replaced did. Composite FK `txn_header_originals_header_ledger_fkey`. |
+| `payee` | `TEXT` | | What the feed said |
+| `memo` | `TEXT` | | What the feed said |
 | `posted_at` | `TIMESTAMPTZ` | | |
 | `transacted_at` | `TIMESTAMPTZ` | | |
 | `check_number` | `TEXT` | | |
-| `is_hidden` | `BOOLEAN` | | NULL = use header's value |
-| `updated_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+| `captured_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | When the first edit captured this. Diagnostic only. |
 
-Note: `status` was on this table prior to migration 030 but was dropped — reconciliation status is user-action data (the user clicks the badge to cycle), not an override of an imported value. Since migration 171 (ADR-0082) it lives in the per-leg `txn_leg_recon` overlay — reconciliation is per-account (a transfer can be cleared in one account and uncleared in the other), so it can't be a single header value.
+**RLS**: read `FOR SELECT TO coffer_app` scoped to the user's `user_ledger_grants`; write `FOR ALL` scoped to grants with role `owner`/`editor`. Same shape as the table it replaced.
 
-### `txn_leg_overrides`
+**Write rule.** `HeaderOriginals.CaptureAsync` is the single writer, called by both the bank and the investment PATCH before either touches a header column. Capture is **unconditional on the field** (every column is snapshotted, not just the ones this edit changes — a per-field capture would need a per-field "was this captured" marker, the exact ambiguity the flip removes) and **once per header** (a row already on file was written by an earlier edit and already holds the feed's values; overwriting it would redefine "original" as "whatever it was before the most recent edit").
 
-One row per overridden leg. NULL columns mean "use feed value".
+**Predecessors.** This replaced `txn_header_overrides` and `txn_leg_overrides`, both dropped by migration 230.
 
-| Column | Type | Constraints | Notes |
-|---|---|---|---|
-| `leg_id` | `UUID` | PK FK → `txn_legs(id)` ON DELETE CASCADE | |
-| `ledger_id` | `UUID` | NOT NULL; composite FK `(leg_id, ledger_id)` → `txn_legs(id, ledger_id)` ON DELETE CASCADE | Denormalized from the parent leg (migration 072) so RLS gates on `ledger_id` directly. Composite FK `txn_leg_overrides_leg_ledger_fkey`. |
-| `leg_memo` | `TEXT` | | NULL = use feed |
-| `amount` | `NUMERIC(19,4)` | | NULL = use feed |
-| `updated_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+- `txn_header_overrides` held the user's edits over an immutable feed row. Its columns were plain nullable ones with no "is overridden" marker, so NULL meant both *not overridden* and *overridden to empty* and the read-side COALESCE always chose the first — a payee, memo or check number could not be cleared. It also could not see a canonical write, so an investment edit of a row carrying an override landed underneath it, invisibly. Its `is_hidden` column had exactly one writer in the whole repository: a test fixture. Migration 230 folded it with `COALESCE`, never assignment — most rows carried only some fields, so an assignment would have blanked the date on every one that had none.
+- `txn_leg_overrides` (`leg_memo`, `amount`) held zero rows in every database and was never written by the API. It cost a join on `resolved_transactions` and on the balance walk for no rows at all, so it was dropped rather than flipped.
+
+Also of historical note: `status` was on the header override table prior to migration 030 and was dropped — reconciliation status is user-action data (the user clicks the badge to cycle), not an edited copy of an imported value. Since migration 171 (ADR-0082) it lives in the per-leg `txn_leg_recon` overlay (which survives an edit on both write paths — see **Leg IDENTITY** under `txn_legs`; it cascades on leg delete, so before leg identity was preserved an investment edit silently un-reconciled the row) — reconciliation is per-account, so it can't be a single header value.
 
 ### `txn_leg_recon`
 
-Per-**leg** reconciliation overlay (migration 171, ADR-0082). Reconciliation is a per-account activity — a transfer from Checking to Savings can be cleared in Checking while still uncleared in Savings — so status can't be a single header value. It moved off `txn_headers` to here, keyed by `leg_id`. Only real-account legs are ever reconciled; category legs never get a row and resolve to `uncleared`. Follows the ADR-0003 immutable-feed pattern (like `txn_leg_overrides`): the raw `txn_legs` row stays untouched; the user's clearing action lives in the overlay. A leg with no row reads as `uncleared` — `resolved_transactions` COALESCEs it.
+Per-**leg** reconciliation overlay (migration 171, ADR-0082). Reconciliation is a per-account activity — a transfer from Checking to Savings can be cleared in Checking while still uncleared in Savings — so status can't be a single header value. It moved off `txn_headers` to here, keyed by `leg_id`. Only real-account legs are ever reconciled; category legs never get a row and resolve to `uncleared`. This is a genuine OVERLAY and stays one — clearing is a state the leg has no column for, not an edited copy of a column that already exists — which is why migration 230's flip left it alone while retiring the two override tables. A leg with no row reads as `uncleared` — `resolved_transactions` COALESCEs it.
 
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
 | `leg_id` | `UUID` | PK FK → `txn_legs(id)` ON DELETE CASCADE | One row per reconciled leg. |
-| `ledger_id` | `UUID` | NOT NULL; composite FK `(leg_id, ledger_id)` → `txn_legs(id, ledger_id)` ON DELETE CASCADE | Denormalized for RLS + the composite FK (same shape as `txn_leg_overrides`, mig 072). |
+| `ledger_id` | `UUID` | NOT NULL; composite FK `(leg_id, ledger_id)` → `txn_legs(id, ledger_id)` ON DELETE CASCADE | Denormalized for RLS + the composite FK (mig 072). |
 | `status` | `TEXT` | NOT NULL DEFAULT `'uncleared'` CHECK in (`uncleared`, `reconciling`, `cleared`) | The 3-state recon vocabulary (formerly `txn_headers.status`, mig 030). `reconciling` is a workflow / visual aid (MD parity); functionally uncleared for reporting. |
 | `cleared_at` | `TIMESTAMPTZ` | | Audit timestamp for the `status='cleared'` transition. DB CHECK `(status='cleared') ⇔ (cleared_at IS NOT NULL)` keeps the pair consistent. |
 | `cleared_by_user_id` | `UUID` | FK → `users(id)` ON DELETE SET NULL | User who marked the leg cleared. NULL when uncleared / reconciling or when the user row was removed. |
 
-**Index** `idx_txn_leg_recon_ledger`: `(ledger_id)`. **RLS**: `FOR ALL TO coffer_app` scoped to the user's `user_ledger_grants` (same policy shape as `txn_leg_overrides`). Writes upsert the register account's leg(s) via `SetReconStatusAsync` / `BulkSetReconStatusAsync`; reads flow through `resolved_transactions` (`COALESCE(lr.status, 'uncleared')`).
+**Index** `idx_txn_leg_recon_ledger`: `(ledger_id)`. **RLS**: `FOR ALL TO coffer_app` scoped to the user's `user_ledger_grants`. Writes upsert the register account's leg(s) via `SetReconStatusAsync` / `BulkSetReconStatusAsync`; reads flow through `resolved_transactions` (`COALESCE(lr.status, 'uncleared')`).
 
 ### `txn_header_account_balances`
 
@@ -1754,7 +1787,7 @@ Capture writes one table's rows here in chunks of 2000 (`fn_snapshot_write_part`
 | `seq` | `integer` | NOT NULL; PK part 3 | 0-based chunk index within `(snapshot_id, part_name)`. `seq = 0` is written even for an empty table, so the key exists as `'[]'`: migration 188's restore assertion distinguishes an absent key from an empty one, and skipping the write would drop the key for any ledger with an empty in-scope table. |
 | `content` | `jsonb` | NOT NULL | Always a jsonb **array** of that chunk's rows, never an object and never NULL. jsonb rather than text so Postgres TOAST-compresses it on disk — which is what replaced the v1 hand-rolled gzip. Size accounting sums per-chunk `octet_length`, so the figure runs a few bytes per chunk above the v2 number for the same data; it is a display value for the SPA, not a checksum. |
 
-Indexes: the primary key `(snapshot_id, part_name, seq)` is the only one, and it covers both access paths exactly — "any parts for this snapshot?" (the format gate) and "this table's chunks in order" (the restore loop). RLS: **none** — and inherited rather than chosen. `ledger_snapshots` has no policies either, so the parts table follows the table it belongs to rather than introducing a second, subtly different posture for the same data; both hold a full copy of every row of a ledger — the same rows their source tables protect with RLS — gated only by the API's `LedgerAuthorizer`. Adding RLS to both is a behaviour change to an existing table and is tracked as "RLS on the snapshot tables" in [follow-ups.md](follow-ups.md). Grants mirror `ledger_snapshots`: SELECT/INSERT/UPDATE/DELETE to `coffer_app` (capture and restore run request-side, as the caller, not `SECURITY DEFINER`), everything to `coffer_service`. Not captured by `fn_ledger_snapshot_payload` / `_part_names` — it *is* the snapshot storage, and a snapshot cannot contain itself (the reason `SchemaDriftGuardTests` gives for excluding `ledger_snapshots`); it also falls outside that guard entirely, since the guard classifies tables carrying `ledger_id` and this one reaches its ledger transitively through `snapshot_id`.
+Indexes: the primary key `(snapshot_id, part_name, seq)` is the only one, and it covers both access paths exactly — "any parts for this snapshot?" (the format gate) and "this table's chunks in order" (the restore loop). RLS: **none** — and inherited rather than chosen. `ledger_snapshots` has no policies either, so the parts table follows the table it belongs to rather than introducing a second, subtly different posture for the same data; both hold a full copy of every row of a ledger — the same rows their source tables protect with RLS — gated only by the API's `LedgerAuthorizer`. Adding RLS to both is a behaviour change to an existing table and is tracked as "RLS on the snapshot tables" in the open-work backlog. Grants mirror `ledger_snapshots`: SELECT/INSERT/UPDATE/DELETE to `coffer_app` (capture and restore run request-side, as the caller, not `SECURITY DEFINER`), everything to `coffer_service`. Not captured by `fn_ledger_snapshot_payload` / `_part_names` — it *is* the snapshot storage, and a snapshot cannot contain itself (the reason `SchemaDriftGuardTests` gives for excluding `ledger_snapshots`); it also falls outside that guard entirely, since the guard classifies tables carrying `ledger_id` and this one reaches its ledger transitively through `snapshot_id`.
 
 ### `user_account_groups`
 
@@ -1806,8 +1839,9 @@ ADR-0022 tables.
 
 Application code reads from this view exclusively. Projects from
 `txn_headers` + `txn_legs` (ADR-0022; rewritten by migration 023)
-with header-level + leg-level overrides coalesced in. The column shape
-matches the pre-ADR-0022 view byte-for-byte so the EF `ResolvedTransactionView`
+directly — the header/leg override layer it used to COALESCE through was
+retired by migration 230 (ADR-0100). The column shape matches the
+pre-ADR-0022 view byte-for-byte so the EF `ResolvedTransactionView`
 entity + every repository / DTO consumer continues to work.
 
 Key column derivations:
@@ -1816,13 +1850,13 @@ Key column derivations:
 |---|---|
 | `id`, `account_id`, `investment_action` | `txn_legs` (one row per leg) |
 | `balance_after` | `txn_header_account_balances` joined on `(header_id, account_id)` (ADR-0034 / mig 091). Same value for every leg of `(account, header)`. |
-| `payee`, `memo`, `posted_at`, `transacted_at`, `check_number`, `external_id` | `txn_headers` (with `txn_header_overrides` COALESCE'd in) |
+| `payee`, `memo`, `posted_at`, `transacted_at`, `check_number`, `external_id` | `txn_headers`, directly — these columns ARE the current values since mig 230 |
 | `status` | `COALESCE(txn_leg_recon.status, 'uncleared')` — the per-leg recon overlay (migration 171, ADR-0082). Per-account: each leg reconciles independently, so a transfer can be cleared on one side and uncleared on the other. A leg with no overlay row reads `uncleared`. |
 | `cleared_at`, `cleared_by_user_id` | `txn_leg_recon` (the leg's overlay row) — paired with `status` via the DB CHECK `(status='cleared') ⇔ (cleared_at IS NOT NULL)` |
-| `memo` precedence | `COALESCE(leg_override.leg_memo, leg.leg_memo, header_override.memo, header.memo)` — leg memo wins on multi-split events; single-leg events leave `leg.leg_memo` NULL and the chain falls back to header memo |
-| `amount` | `COALESCE(leg_override.amount, leg.amount)` |
-| `is_hidden` | `COALESCE(header_override.is_hidden, header.is_hidden, FALSE)` |
-| `has_overrides` | `(header_override.header_id IS NOT NULL OR leg_override.leg_id IS NOT NULL)` |
+| `memo` precedence | `COALESCE(leg.leg_memo, header.memo)` — leg memo wins on multi-split events; single-leg events leave `leg.leg_memo` NULL and the chain falls back to header memo |
+| `amount` | `txn_legs.amount` |
+| `is_hidden` | `COALESCE(header.is_hidden, FALSE)` |
+| `has_overrides` | `txn_header_originals.header_id IS NOT NULL` — the row has been EDITED (it has a captured original). Name kept across migration 230 so the view's column shape did not move; the question is the same one, answered from the other side, and it now catches investment edits, which the old override-row test missed entirely. |
 | `counterparty_id`, `counterparty_account_id`, `counterparty_account_name`, `counterparty_account_type` | Structural via `LEFT JOIN txn_legs other ON other.header_id = leg.header_id AND other.posting_index = leg.posting_index AND other.id != leg.id` — finds the other side of the posting. `counterparty_account_name` uses the recursive `account_path()` function for the full root-to-leaf category path. |
 | `txn_group_id` | `CASE WHEN EXISTS (SELECT 1 FROM txn_legs WHERE header_id = h.id AND posting_index > 0) THEN h.id ELSE NULL END` — emits `header.id` only when the header has multiple postings (preserves the pre-ADR-0022 grouping semantics expected by the API's AssembleEntries). |
 | `leg_index` | `txn_legs.posting_index` |
@@ -1991,7 +2025,7 @@ ADR-0034 (mig 089–097). One row per `(header, account)` carries the running ba
 
 The recompute aggregates leg amounts per header (the **header-walk**), then running-SUMs in the canonical **`(posted_at, seq)`** order. `txn_headers.seq` is a strictly-monotonic `BIGINT` populated by the `txn_headers_seq` SEQUENCE; within a batch INSERT each row receives a distinct value, eliminating the UUID-tiebreaker ambiguity that plagued the initial `(created_at, id)` design. Multi-leg same-account headers (e.g. BuyXfr fan-out) collapse to a single step in the running total. Both `txn_headers.seq` (mig 095) and `txn_headers.created_at` (mig 093) are locked immutable by column-level BEFORE-UPDATE triggers.
 
-Invariant: for any **visible** header (`is_merged_into IS NULL` AND `COALESCE(o.is_hidden, h.is_hidden, FALSE) = FALSE`) and any account it touches, `balance_after` equals `opening_balance` + the sum of net-per-header amounts for that account, summed across every earlier visible header in canonical `(posted_at, seq)` order. Hidden headers (`is_hidden=TRUE` on the raw row or via `txn_header_overrides.is_hidden`) are excluded — the recompute predicate matches the resolved view's effective-hidden expression so the rows you can't see don't count against the rows you can. Override amounts (`txn_leg_overrides.amount`) and override posted_at (`txn_header_overrides.posted_at`) are honoured via `COALESCE` in the recompute (mig 099 / 101 / 103).
+Invariant: for any **visible** header (`is_merged_into IS NULL` AND `COALESCE(h.is_hidden, FALSE) = FALSE`) and any account it touches, `balance_after` equals `opening_balance` + the sum of net-per-header amounts for that account, summed across every earlier visible header in canonical `(posted_at, seq)` order. Hidden headers are excluded — the recompute predicate matches the resolved view's so the rows you can't see don't count against the rows you can. Amounts and dates come off `txn_legs` / `txn_headers` directly: migrations 099 / 101 / 103 taught the recompute to COALESCE through the override layer, and migration 230 removed the layer, so the COALESCE went with it.
 
 **Mig 102** dropped the entire balance-trigger family. The recompute function stays as the algorithm but is invoked from API call sites instead: the `BalanceRecomputeInterceptor` (`SaveChangesInterceptor`) scans `ChangeTracker` and fires the recompute automatically for every API write; bulk paths that bypass the ChangeTracker (`ExecuteUpdateAsync` / `ExecuteDeleteAsync` / Dapper) invoke `BalanceRecomputeService` explicitly. **Mig 103** added `is_hidden` to the canonical recompute predicate set, so soft-delete (the bank + investment + bulk DELETE soft-hide branches) removes the row from the balance walk in the same SaveChanges that hides it from the register. See [decisions/0034-header-walk-running-balance.md](decisions/0034-header-walk-running-balance.md) for the rationale and [decisions/0032-triggers-as-last-resort.md](decisions/0032-triggers-as-last-resort.md) for the broader posture.
 

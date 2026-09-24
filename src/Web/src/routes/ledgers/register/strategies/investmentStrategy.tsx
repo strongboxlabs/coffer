@@ -247,18 +247,51 @@ export const investmentStrategy = {
     },
 
     renderAmountSubtitle(txn: InvestmentRow) {
-        // Fee amount subtitle. The investmentAggregator (slice A1.d)
-        // sums the fee-leg amounts across all postings under one
-        // header and stamps the positive total onto the synthesized
-        // row's `feeAmount`. Render `fee $X.XX` beneath the Amount
-        // when set; skip the subtitle (null) on rows with no fee
-        // leg (single-posting Buy/Sell, Div, etc.) so the column
-        // scans cleanly.
-        if (txn.feeAmount === null || txn.feeAmount === undefined) return null;
-        return (
-            <span className="block text-right text-[0.6875rem] text-text-muted">
-                fee {formatCurrency(txn.feeAmount, 'USD')}
-            </span>
-        );
+        // Two possible subtitles share this one line, and only one can win.
+        //
+        // FEE. The investmentAggregator (slice A1.d) sums the fee-leg amounts
+        // across all postings under one header and stamps the positive total
+        // onto the synthesized row's `feeAmount`.
+        //
+        // SETTLED. `amount` is ADR-0028's net of this account's legs, which is
+        // structurally ZERO for a cash-neutral event — a reinvestment, an
+        // in-kind transfer, a sale a fee consumes. 38.8% of dev's brokerage
+        // entries are in that class, and every one of them rendered $0.00 with
+        // nothing to say how big the event was, while the editor behind the
+        // same row showed the trade value (ADR-0073 D1 calls that the Amount;
+        // ADR-0028 calls the net the Amount — the two ADRs disagree, and this
+        // line is where a reader met the consequence).
+        //
+        // Shown only when the Amount cell is uninformative, i.e. exactly zero.
+        // On a row whose net is real, the net IS the answer and a second
+        // figure beneath it is noise.
+        const fee = txn.feeAmount ?? null;
+        const settled = txn.settledAmount ?? null;
+
+        // The fee wins the line when both exist, because it is the one the
+        // Amount does not already imply — and on a fee-consumed sale the two
+        // are the SAME NUMBER by construction (proceeds exactly cancelled by
+        // the fee), so showing both would print it twice under a zero. That is
+        // 478 dev entries across sell, sellx AND buy; keying the suppression on
+        // the VALUES rather than on the action is what catches all three,
+        // instead of the sells someone happened to notice.
+        const settledDuplicatesFee =
+            fee !== null && settled !== null && Math.abs(settled - fee) < 0.005;
+
+        if (fee !== null) {
+            return (
+                <span className="block text-right text-[0.6875rem] text-text-muted">
+                    fee {formatCurrency(fee, 'USD')}
+                </span>
+            );
+        }
+        if (txn.amount === 0 && settled !== null && settled !== 0 && !settledDuplicatesFee) {
+            return (
+                <span className="block text-right text-[0.6875rem] text-text-muted">
+                    settled {formatCurrency(settled, 'USD')}
+                </span>
+            );
+        }
+        return null;
     },
 };

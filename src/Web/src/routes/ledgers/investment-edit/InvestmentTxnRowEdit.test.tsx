@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { createEvent, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
@@ -154,3 +154,128 @@ describe('InvestmentTxnRowEdit — post-save seed cache', () => {
         ).toBeUndefined();
     });
 });
+
+describe('InvestmentTxnRowEdit — parity with the bank editor', () => {
+    beforeEach(() => {
+        vi.restoreAllMocks();
+        vi.spyOn(apiModule, 'fetchSecurities').mockResolvedValue([]);
+        vi.spyOn(apiModule, 'fetchFrequentCounterparties').mockResolvedValue({
+            accounts: [],
+            categories: [],
+        });
+        vi.spyOn(apiModule, 'fetchInvestmentMergeCandidates').mockResolvedValue([]);
+    });
+
+    function renderEditor(extra: Record<string, unknown> = {}) {
+        const onCancel = vi.fn();
+        const queryClient = new QueryClient({
+            defaultOptions: { queries: { retry: false } },
+        });
+        render(
+            <QueryClientProvider client={queryClient}>
+                <InvestmentTxnRowEdit
+                    ledgerId={LEDGER_ID}
+                    brokerageAccountId={ACCOUNT_ID}
+                    accounts={[BROKERAGE, CATEGORY]}
+                    isTradeCommission={false}
+                    cols="1fr"
+                    onCancel={onCancel}
+                    mode={{
+                        kind: 'edit',
+                        headerId: HEADER_ID,
+                        initialDraft: miscDraft(-75),
+                        onSaved: vi.fn(),
+                    }}
+                    {...extra}
+                />
+            </QueryClientProvider>,
+        );
+        return { onCancel };
+    }
+
+    it('cancels on Escape, as a bank row does', () => {
+        const { onCancel } = renderEditor();
+
+        fireEvent.keyDown(screen.getByLabelText('Date'), { key: 'Escape' });
+
+        expect(onCancel).toHaveBeenCalledTimes(1);
+    });
+
+    it('leaves the transaction alone when a child already handled Escape', () => {
+        // The guard the bank editor documents: a picker that closed its own panel
+        // marks the event, and without the check the same keystroke would close
+        // the panel and then discard everything behind it.
+        const { onCancel } = renderEditor();
+
+        // defaultPrevented is derived from a real preventDefault() call, not
+        // settable through the event init — so build the event and mark it the
+        // way a child picker would.
+        const date = screen.getByLabelText('Date');
+        const escaped = createEvent.keyDown(date, { key: 'Escape' });
+        escaped.preventDefault();
+        fireEvent(date, escaped);
+
+        expect(onCancel).not.toHaveBeenCalled();
+    });
+
+    it('focuses the date field on open', () => {
+        renderEditor();
+
+        expect(document.activeElement).toBe(screen.getByLabelText('Date'));
+    });
+
+    it('saves on Enter from the memo field', async () => {
+        const patchSpy = vi
+            .spyOn(apiModule, 'patchInvestmentTransaction')
+            .mockResolvedValue(null);
+        renderEditor();
+
+        fireEvent.keyDown(screen.getByLabelText('Memo'), { key: 'Enter' });
+
+        await waitFor(() => expect(patchSpy).toHaveBeenCalledTimes(1));
+    });
+
+    it('does not save on Shift+Enter', () => {
+        const patchSpy = vi
+            .spyOn(apiModule, 'patchInvestmentTransaction')
+            .mockResolvedValue(null);
+        renderEditor();
+
+        fireEvent.keyDown(screen.getByLabelText('Memo'), { key: 'Enter', shiftKey: true });
+
+        expect(patchSpy).not.toHaveBeenCalled();
+    });
+
+    it('disables its controls while the HOST is saving', async () => {
+        // mode 'fire': the host owns the request, so the editor's own mutation
+        // never runs and `mutation.isPending` is permanently false. Without the
+        // isSaving prop every control stayed live through the POST and a second
+        // click issued a second one.
+        const onSubmit = vi.fn();
+        const queryClient = new QueryClient({
+            defaultOptions: { queries: { retry: false } },
+        });
+        render(
+            <QueryClientProvider client={queryClient}>
+                <InvestmentTxnRowEdit
+                    ledgerId={LEDGER_ID}
+                    brokerageAccountId={ACCOUNT_ID}
+                    accounts={[BROKERAGE, CATEGORY]}
+                    isTradeCommission={false}
+                    cols="1fr"
+                    submitLabel="Post"
+                    submittingLabel="Posting…"
+                    isSaving
+                    onCancel={vi.fn()}
+                    mode={{ kind: 'fire', initialDraft: miscDraft(-75), onSubmit }}
+                />
+            </QueryClientProvider>,
+        );
+
+        const post = await screen.findByRole('button', { name: /posting/i });
+        expect((post as HTMLButtonElement).disabled).toBe(true);
+        fireEvent.click(post);
+        expect(onSubmit).not.toHaveBeenCalled();
+    });
+});
+

@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode, type Ref } from 'react';
+import { useMemo, useState, type ReactNode, type Ref } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 
 import { buildTimelineSentinels } from './registerSentinels';
@@ -19,11 +19,55 @@ import { buildTimelineSentinels } from './registerSentinels';
  *
  * The pages supply ONLY what genuinely differs: the row collection, how to
  * render a row, how to read a row's posted date (the row types differ), and
- * whether logical-index threading is in play. `firstItemIndex` is optional:
- * bank threads it (eviction-stable logical indices); investment aggregates
- * multi-posting rows BEFORE the list and feeds plain local indices, so it omits
- * the prop. That is the one genuine mechanical difference the audit found.
+ * and how to read a row's posted date (the row types differ). Scroll-position
+ * compensation is NOT among them: this component derives its own
+ * `firstItemIndex` from `rows`, so neither page can get the index space wrong.
  */
+/**
+ * Seed for the front-shift offset.
+ *
+ * virtuoso requires a POSITIVE `firstItemIndex` and logs an error below zero,
+ * so the baseline has to leave room for rows to be prepended. A window holds at
+ * most ~1100 entries and prepends a page at a time, so a million is headroom
+ * nothing will spend.
+ */
+const OFFSET_BASE = 1_000_000;
+
+/**
+ * The next offset, given the previous rows and the new ones.
+ *
+ * Front-anchored: find the row that USED to be first inside the new array. If
+ * it moved down by k, k rows were prepended and the offset decreases by k. If
+ * it is gone, find the new first row in the OLD array; if it sat at j, j rows
+ * were dropped from the front and the offset increases by j. If neither is
+ * found the list was replaced wholesale (a refresh or a re-seed), and the
+ * baseline resets — there is no continuity to preserve.
+ */
+function nextShift<Row>(
+    prev: { rows: readonly Row[]; ids: string[]; offset: number },
+    rows: readonly Row[],
+    getRowId: (row: Row) => string,
+): { rows: readonly Row[]; ids: string[]; offset: number } {
+    const ids = rows.map(getRowId);
+    const base = { rows, ids };
+
+    if (prev.ids.length === 0 || ids.length === 0) {
+        return { ...base, offset: OFFSET_BASE };
+    }
+
+    const prepended = ids.indexOf(prev.ids[0]!);
+    if (prepended >= 0) {
+        return { ...base, offset: Math.max(0, prev.offset - prepended) };
+    }
+
+    const removed = prev.ids.indexOf(ids[0]!);
+    if (removed > 0) {
+        return { ...base, offset: prev.offset + removed };
+    }
+
+    return { ...base, offset: OFFSET_BASE };
+}
+
 export interface RegisterVirtualListProps<Row> {
     virtuosoRef: Ref<VirtuosoHandle>;
     /** customScrollParent from the enclosing RegisterScrollSurface. */
@@ -38,10 +82,6 @@ export interface RegisterVirtualListProps<Row> {
     onViewportMonthChange: (yearMonth: string) => void;
     onLoadNewer: () => void;
     onLoadOlder: () => void;
-    /** Logical index of `rows[0]` (eviction-stable). Provide it for logical-
-     *  index threading (bank); OMIT to feed virtuoso plain local indices
-     *  (investment, which aggregates before the list). */
-    firstItemIndex?: number;
     initialTopMostItemIndex?: number;
     /** Timeline edge flags from useRegisterController → sentinels. */
     atTimelineHead: boolean;
@@ -59,7 +99,6 @@ export function RegisterVirtualList<Row>({
     onViewportMonthChange,
     onLoadNewer,
     onLoadOlder,
-    firstItemIndex,
     initialTopMostItemIndex,
     atTimelineHead,
     atTimelineTail,
@@ -70,8 +109,37 @@ export function RegisterVirtualList<Row>({
         [atTimelineHead, atTimelineTail, oldestLabel],
     );
 
-    // Logical index of rows[0]; 0 when the page feeds local indices.
-    const offset = firstItemIndex ?? 0;
+    // ----------------------------------------------------------------
+    // Front-shift offset, owned HERE rather than taken from a page.
+    //
+    // virtuoso reads the DELTA of `firstItemIndex` as "this many rows entered
+    // or left the FRONT", and compensates scrollTop so the viewport does not
+    // jump. It is a property of the RENDERED array.
+    //
+    // It used to be a prop. Bank passed `register.firstItemIndex`, which the
+    // windowing hook computes in ENTRY space — but every page renders ROWS,
+    // after regrouping target splits, filtering by status and expanding groups,
+    // so the two counts differ. Bank therefore fed a delta that was wrong
+    // whenever any of those changed the count, and negative on the first
+    // prepend, which virtuoso rejects. Investment omitted the prop and got no
+    // compensation at all, so its viewport jumped on both edges. One problem,
+    // two wrong answers. Deriving it from `rows` makes the entry-vs-row mistake
+    // unconstructible instead of documented.
+    //
+    // Derived from the previous props during render, holding the previous value
+    // in STATE — React's documented pattern for this. A ref written during
+    // render would double-apply the delta under StrictMode's double-invoke, and
+    // an effect would land the compensation a commit late, which is precisely
+    // the frame that jumps.
+    const [shift, setShift] = useState(() => ({
+        rows: rows as readonly Row[],
+        ids: rows.map(getRowId),
+        offset: OFFSET_BASE,
+    }));
+    if (shift.rows !== rows) {
+        setShift(nextShift(shift, rows, getRowId));
+    }
+    const offset = shift.offset;
 
     return (
         <Virtuoso
@@ -80,9 +148,7 @@ export function RegisterVirtualList<Row>({
             data={rows as Row[]}
             computeItemKey={(_, row) => getRowId(row)}
             initialTopMostItemIndex={initialTopMostItemIndex ?? 0}
-            // Only thread firstItemIndex when the page uses logical indices;
-            // undefined keeps virtuoso on plain local indices (investment).
-            firstItemIndex={firstItemIndex}
+            firstItemIndex={offset}
             startReached={onLoadNewer}
             endReached={onLoadOlder}
             // Pre-fetch margin so the loading state doesn't pop in at the edge.

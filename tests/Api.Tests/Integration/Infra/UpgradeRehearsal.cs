@@ -33,7 +33,8 @@ namespace Coffer.Api.Tests.Integration.Infra;
 /// <para>
 /// <b>What it does NOT do.</b> It rehearses SQL against data, not a deployment.
 /// The container image, the compose topology and the credential plumbing are the
-/// other half of an upgrade and belong to <c>scripts/maintainer/upgrade-drill.sh</c>;
+/// other half of an upgrade and belong to the deployment drill in the
+/// maintainer tooling;
 /// this class would happily pass while the image fails to start. Neither half is
 /// sufficient alone, which is worth remembering before either is cited as proof
 /// that a release upgrades cleanly.

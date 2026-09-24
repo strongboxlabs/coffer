@@ -45,6 +45,7 @@ import { buildAccountPathMap } from '@/lib/accountPath';
 import { RefreshCw, Upload } from 'lucide-react';
 
 import { ImportFileDialog } from '../shell/ImportFileDialog';
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { MoveToAccountDialog } from '../shell/MoveToAccountDialog';
 
 import { Button } from '@/components/ui/Button';
@@ -71,6 +72,7 @@ import {
     groupAmount,
     groupBalanceAfter,
     regroupTargetSplits,
+    rowHasHeader,
     type DisplayRow,
 } from '@/lib/splitCollapse';
 
@@ -596,6 +598,14 @@ export function BankRegisterPage() {
     // values — same bug class as patch-without-refresh.
     // Also invalidate the holdings + accounts queries since deletes
     // can shift cost-basis + review-dot counts.
+    // A refused delete used to vanish. Neither delete mutation defined onError,
+    // and the single path is invoked as `void onDelete(target)` — so a 422 or a
+    // dropped connection became an unhandled rejection, the confirm dialog closed,
+    // and the row stayed on screen. It reads as a click that did not register, so
+    // the user clicks again. The investment register has surfaced this since it
+    // shipped; this is that behaviour, not a new one.
+    const [deleteError, setDeleteError] = useState<string | null>(null);
+
     const deleteMutation = useMutation<
         DeleteTransactionResponse,
         ApiError,
@@ -618,6 +628,9 @@ export function BankRegisterPage() {
             queryClient.invalidateQueries({
                 queryKey: ['register-index-buckets', ledgerId, accountId],
             });
+        },
+        onError: (err) => {
+            setDeleteError(err.detail || err.message || 'Delete failed.');
         },
     });
 
@@ -682,6 +695,9 @@ export function BankRegisterPage() {
             queryClient.invalidateQueries({
                 queryKey: ['register-index-buckets', ledgerId, accountId],
             });
+        },
+        onError: (err) => {
+            setDeleteError(err.detail || err.message || 'Delete failed.');
         },
     });
 
@@ -886,8 +902,7 @@ export function BankRegisterPage() {
                         onLoadNewer={register.loadNewer}
                         loadingOlder={register.loadingOlder}
                         loadingNewer={register.loadingNewer}
-                        focusIndex={register.focusIndex}
-                        firstItemIndex={register.firstItemIndex}
+                        focusAnchorHeaderId={register.focusAnchorHeaderId}
                         atTimelineHead={register.atTimelineHead}
                         atTimelineTail={register.atTimelineTail}
                         oldestEntry={register.entries.at(-1) ?? null}
@@ -960,6 +975,17 @@ export function BankRegisterPage() {
                 onConfirm={recovery.onMoveConfirm}
                 onCancel={recovery.closeMoveDialog}
             />
+            {deleteError !== null ? (
+                <ConfirmDialog
+                    open
+                    title="Couldn't delete this row"
+                    body={deleteError}
+                    confirmLabel="OK"
+                    variant="neutral"
+                    onConfirm={() => setDeleteError(null)}
+                    onCancel={() => setDeleteError(null)}
+                />
+            ) : null}
         </MainArea>
     );
 }
@@ -1024,17 +1050,9 @@ interface RegisterTableProps {
     loadingOlder: boolean;
     /** True while a load-newer fetch is in flight. */
     loadingNewer: boolean;
-    /** LOGICAL index of the focused row (from `?focus` URL param).
-     *  -1 when no focus. Logical = stable across hook evictions:
-     *  consumers add `firstItemIndex` to data-array indices and
-     *  subtract it before reading from data. Passed to virtuoso's
-     *  `initialTopMostItemIndex` to land on the row on mount. */
-    focusIndex: number;
-    /** Logical index of `displayRows[0]`. Bumps up on hook eviction
-     *  from the newer edge; bumps down on prepend. Wired to
-     *  virtuoso's `firstItemIndex` so scroll position survives
-     *  array mutations. */
-    firstItemIndex: number;
+    /** The anchor the server actually placed in the window, or null. Resolved
+     *  against `displayRows` here — see the seed effect. */
+    focusAnchorHeaderId: string | null;
     /** True when the window covers the absolute timeline head —
      *  drives the "Newest transaction" sentinel above the first
      *  row. Honest cue that no more rows exist past the top. */
@@ -1156,8 +1174,7 @@ function RegisterTable({
     onLoadNewer,
     loadingOlder,
     loadingNewer,
-    focusIndex,
-    firstItemIndex,
+    focusAnchorHeaderId,
     atTimelineHead,
     atTimelineTail,
     oldestEntry,
@@ -1245,12 +1262,19 @@ function RegisterTable({
         // Filtering is now server-side (mig 164) — the payload IS the filtered
         // set, so edge-load always paginates through matches (never suppressed).
         suppressEdgeLoad: false,
-        // Index must be LOGICAL — virtuoso adds its own firstItemIndex
-        // offset internally, so we feed it firstItemIndex + localIndex.
+        // LOCAL index. The comment here used to claim virtuoso adds its own
+        // firstItemIndex offset internally — it does not. The scroll-to-index
+        // system takes only { gap, listRefresh, sizes, totalCount }; it never
+        // receives firstItemIndex, so it cannot subtract one, and the index it
+        // wants is in the same space as `sizes` — the rendered data array.
+        // Adding the offset overshot after a front eviction (firstItemIndex
+        // climbs) and clamped to the top after a prepend (it goes negative),
+        // so keyboard navigation scrolled to the wrong row once the window had
+        // moved. Harmless until then, because the offset is 0 on a fresh window
+        // — which is why it survived. The investment register always passed the
+        // local index and was right.
         scrollRowIntoView: (localIndex) =>
-            virtuosoRef.current?.scrollIntoView({
-                index: firstItemIndex + localIndex,
-            }),
+            virtuosoRef.current?.scrollIntoView({ index: localIndex }),
         enabled: editingHeaderId === null && !isCreatingNew,
         onEnterRow: (currentId, e) => {
             // Enter opens the editor on the focused row — the keyboard twin
@@ -1466,61 +1490,50 @@ function RegisterTable({
         }
     }
 
-    // Seed focus from `focusIndex` exactly once per refresh
-    // "season" AND scroll the focused row into view.
-    // `initialTopMostItemIndex` on virtuoso is read once at mount
-    // — before the hook's fetch has resolved focusIndex from -1
-    // to its real value — so we can't rely on it for the
-    // Show-Other-Side arrival. Instead, after the fetch lands
-    // (focusIndex flips from -1 to a real index), we mirror the
-    // row into focus state and call `scrollIntoView` explicitly.
-    // virtuoso no-ops the scroll when the row is already in the
-    // viewport.
+    // Seed focus from the resolved anchor, once per arrival, and scroll it into
+    // view. The hook reports an anchor only when the server actually placed it
+    // in the window, so there is no longer a case where this focuses a row the
+    // user never asked for.
     //
-    // Gate: a ref holds the last focusIndex we seeded; we skip
-    // if it matches the current focusIndex so steady-state
-    // displayRows changes (group expand / window slide) don't
-    // re-seed. But we RESET the ref to -1 whenever focusIndex
-    // goes negative — the hook flips focusIndex to -1 on every
-    // refresh before re-fetching, so the next positive value
-    // counts as a fresh seed even when it happens to equal the
-    // prior one. That's what lets post-PATCH (anchored refresh)
-    // re-seed focus on the same row the user just saved.
-    const seededFocusForIndexRef = useRef<number>(-1);
+    // Resolved by HEADER ID against displayRows, not by index. Two index spaces
+    // exist here — the hook counts ENTRIES, this list renders ROWS after
+    // regrouping target splits, applying the status filter and expanding groups
+    // — and they are not equal. The previous form read
+    // `displayRows[focusIndex - firstItemIndex]`, mixing both, and then passed
+    // that logical index to `scrollIntoView`, which takes a LOCAL one. An id
+    // cannot be in the wrong space.
+    //
+    // The gate is the anchor id plus a nonce, so an anchored refresh onto the
+    // SAME row (post-save, the common case) re-seeds rather than being skipped
+    // as steady state.
+    const seededFocusForRef = useRef<string | null>(null);
     useEffect(() => {
-        if (focusIndex < 0) {
-            seededFocusForIndexRef.current = -1;
+        if (focusAnchorHeaderId === null) {
+            seededFocusForRef.current = null;
             return;
         }
-        if (seededFocusForIndexRef.current === focusIndex) return;
-        // focusIndex is LOGICAL (post-eviction-stable); subtract
-        // firstItemIndex to get the position inside the current
-        // displayRows window.
-        const targetRow = displayRows[focusIndex - firstItemIndex];
-        if (targetRow === undefined) return;
-        const rowId = displayRowId(targetRow);
-        setFocusedRowId(rowId);
-        // Focus seed sets the keyboard cursor + scrolls into view,
-        // but does NOT pre-check the row. Focus and selection are
-        // distinct (ADR-0023 §B); auto-checking the focused row on
-        // Show-Other-Side / post-create surprised the user — they
-        // expect the checkbox to reflect ONLY their explicit clicks.
-        seededFocusForIndexRef.current = focusIndex;
+        if (seededFocusForRef.current === focusAnchorHeaderId) return;
+
+        const localIndex = displayRows.findIndex((row) => rowHasHeader(row, focusAnchorHeaderId));
+        if (localIndex < 0) return;
+
+        const targetRow = displayRows[localIndex]!;
+        setFocusedRowId(displayRowId(targetRow));
+        // Focus seed sets the keyboard cursor + scrolls into view, but does NOT
+        // pre-check the row. Focus and selection are distinct (ADR-0023 §B);
+        // auto-checking the focused row on Show-Other-Side / post-create
+        // surprised the user — they expect the checkbox to reflect ONLY their
+        // explicit clicks.
+        seededFocusForRef.current = focusAnchorHeaderId;
         const handle = window.setTimeout(() => {
-            // No `align` → virtuoso uses its default "smart" mode:
-            // no-op when the row is fully visible, otherwise the
-            // minimum scroll to bring it into view. The previous
-            // `align: 'start'` yanked the saved row to the top of
-            // the viewport after every save-refresh — disruptive
-            // when the user was looking at the row mid-list. Smart
-            // default keeps the row where it is when already
-            // visible (the common case after save).
-            virtuosoRef.current?.scrollIntoView({
-                index: focusIndex,
-            });
+            // No `align` → virtuoso's default "smart" mode: no-op when the row
+            // is fully visible, otherwise the minimum scroll to bring it in.
+            // `align: 'start'` used to yank the saved row to the top after every
+            // save-refresh, which is disruptive mid-list.
+            virtuosoRef.current?.scrollIntoView({ index: localIndex });
         }, 100);
         return () => window.clearTimeout(handle);
-    }, [focusIndex, firstItemIndex, displayRows, setFocusedRowId]);
+    }, [focusAnchorHeaderId, displayRows, setFocusedRowId]);
 
     // Column template: select / status / date+taxdate / check# /
     // payee+memo / category+tags / amount / balance. Category and
@@ -1967,8 +1980,13 @@ function RegisterTable({
                     onViewportMonthChange={setViewportYearMonth}
                     onLoadNewer={onLoadNewer}
                     onLoadOlder={onLoadOlder}
-                    firstItemIndex={firstItemIndex}
-                    initialTopMostItemIndex={focusIndex >= 0 ? focusIndex : 0}
+                    // Always 0. Virtuoso reads this ONCE at mount, before the
+                    // hook's fetch has resolved an anchor, so it could never
+                    // carry a focus arrival — the seed effect above does that,
+                    // for exactly this reason. It previously read an entry-space
+                    // index into a prop that takes a local one, which was
+                    // harmless only because the value was still -1 at mount.
+                    initialTopMostItemIndex={0}
                     atTimelineHead={atTimelineHead}
                     atTimelineTail={atTimelineTail}
                     oldestLabel={oldestPostedAtLabel}

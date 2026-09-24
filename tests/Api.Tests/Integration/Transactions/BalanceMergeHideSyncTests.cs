@@ -641,7 +641,7 @@ public sealed class BalanceMergeHideSyncTests
     // Scenario 12 — REAL user sequence: merge PATCH at t0 (winner +
     // mergeFromHeaderId), then a SECOND PATCH at t1 on a DOWNSTREAM
     // row that just adds a payee/memo/postedAt override (no merge,
-    // no postings reshape). A representative `txn_header_overrides`
+    // no postings reshape). A representative header-field
     // table showed two override rows updated 39 seconds apart — this
     // is exactly that pattern.
     //

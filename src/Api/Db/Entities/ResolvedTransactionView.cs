@@ -192,6 +192,10 @@ internal sealed class ResolvedTransactionView
     /// </summary>
     public decimal? IngestFee { get; init; }
 
+    /// <summary>The source file's authoritative total (mig 228). See
+    /// <see cref="TxnHeaderRow.IngestAmount"/>.</summary>
+    public decimal? IngestAmount { get; init; }
+
     /// <summary>
     /// Migration 114: provider-extracted security identifier string
     /// (OFX SECLIST-resolved ticker or raw CUSIP fallback). The SPA

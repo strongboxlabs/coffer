@@ -5,9 +5,11 @@ namespace Coffer.Api.Db.Entities;
 /// reconciliation overlay. One row per reconciled real-account leg; an absent
 /// row resolves to <c>'uncleared'</c>. Reconciliation is a per-account activity
 /// (a transfer can be cleared in one account and uncleared in the other), so
-/// status lives here — per leg — rather than on the header. ADR-0003: the raw
-/// feed (<c>txn_legs</c>) stays immutable; the user's clearing action is overlay
-/// state, mirroring <see cref="TxnLegOverrideRow"/>.
+/// status lives here — per leg — rather than on the header. It is a genuine
+/// OVERLAY and stays one: clearing is a state the leg does not have a column
+/// for, not an edited value. That is why migration 230's flip left it alone
+/// while retiring the header/leg override tables, which were holding edited
+/// copies of columns that already existed.
 /// </summary>
 internal sealed class TxnLegReconRow
 {
@@ -15,8 +17,7 @@ internal sealed class TxnLegReconRow
     /// <summary>
     /// Denormalized from <c>txn_legs.ledger_id</c>; composite FK
     /// <c>(leg_id, ledger_id) → txn_legs(id, ledger_id)</c> enforces coherence
-    /// and RLS gates on this column directly (same shape as the overrides
-    /// overlay).
+    /// and RLS gates on this column directly.
     /// </summary>
     public Guid LedgerId { get; init; }
     // Mutable: the recon upsert flips status + the cleared audit pair in

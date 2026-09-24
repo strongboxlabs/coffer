@@ -52,7 +52,7 @@ the same kind of structural discriminator.
 
 The discriminator alone is not enough — **every** reader of "live"
 transactions must exclude templates, and that is the balance/holdings
-surface just hardened (#196–#198). Rather than scatter
+surface just hardened (\#196–#198). Rather than scatter
 `AND NOT is_recurring_template` across N readers, the exclusion lives in
 the **view layer**:
 
@@ -69,7 +69,7 @@ the **view layer**:
   mechanism as the mig-103 `is_hidden` exclusion), so templates are
   invisible to balances/holdings structurally, not by caller discipline.
 
-Reader inventory to update (known from the #196–#198 work): the view, the
+Reader inventory to update (known from the \#196–#198 work): the view, the
 two recompute functions, the posting-count denorm, the `scheduled`
 predicate, reports.
 
@@ -249,7 +249,7 @@ Examples below use generic placeholders (no plan-identifying data).
 - Balance/holdings: a template header + legs must produce **no**
   `txn_header_account_balances` / `holdings` rows; firing an occurrence
   produces exactly the live rows a hand-entered transaction would
-  (extends the #196–#198 invariant suite).
+  (extends the \#196–#198 invariant suite).
 - RRULE expansion: unit tests over the MD pattern set (daily/weekly/
   monthly-by-day/monthly-last/yearly + interval) and boundary cases
   (start/end clipping, DST-free UTC dates).

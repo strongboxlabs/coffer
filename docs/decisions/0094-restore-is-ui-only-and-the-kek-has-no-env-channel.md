@@ -102,7 +102,7 @@ both remedies. Neither loses ledger data or passkeys, which do not depend on the
    feed tokens, the stored backup passphrase, the Drive connection), all
    re-establishable in the UI. Per D5 it exits, so the flag must then be removed.
 
-All four states above are pinned by `scripts/maintainer/kek-boot-drill.sh`, which runs
+All four states above are pinned by a boot drill in the maintainer tooling, which runs
 the real boot path against a real Postgres: virgin mint, the refusal (including that it
 writes no key while refusing and names both remedies), recovery via the key file, and
 adopt-mint-exit. Upgrade behaviour is not covered by the test suite — every test starts

@@ -547,16 +547,15 @@ public sealed class SecuritiesEndpointsTests
         }
 
         var visible = await BuyAsync(1, 10m);
-        var overrideHidden = await BuyAsync(2, 20m);
-        var rawHidden = await BuyAsync(3, 30m);
-        var merged = await BuyAsync(4, 40m);
+        var hidden = await BuyAsync(2, 20m);
+        var merged = await BuyAsync(3, 30m);
 
-        // Three ways a leg leaves the register's visibility — all must be
-        // excluded here too.
-        await ledger.HideTransactionAsync(overrideHidden);          // txn_header_overrides.is_hidden
-        await using (var db = _fixture.NewDbContext())
-            await db.Database.ExecuteSqlInterpolatedAsync(
-                $"UPDATE txn_headers SET is_hidden = TRUE WHERE id = {rawHidden}");
+        // Both ways a leg leaves the register's visibility — each must be
+        // excluded here too. There used to be a third case here, "hidden via
+        // txn_header_overrides.is_hidden", which migration 230 retired: nothing
+        // ever wrote that column but a test fixture, so the case it covered was
+        // unreachable.
+        await ledger.HideTransactionAsync(hidden);                  // txn_headers.is_hidden
         await ledger.MarkTransactionMergedAsync(merged, visible);   // txn_headers.is_merged_into
 
         var page = await client.GetFromJsonAsync<SecurityTransactionsPage>(

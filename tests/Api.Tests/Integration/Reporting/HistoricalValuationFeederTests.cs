@@ -111,7 +111,7 @@ public sealed class HistoricalValuationFeederTests
         // Edit the Feb transaction's date FORWARD to 2024-12-31 via a posted_at
         // override — the same column the balance recompute honors
         // (COALESCE(o.posted_at, h.posted_at)). Its effective date is now December.
-        await ledger.SetHeaderOverrideAsync(feb, postedAt: Utc(2024, 12, 31));
+        await ledger.EditHeaderAsync(feb, postedAt: Utc(2024, 12, 31));
 
         await using var db = _fixture.NewDbContext();
         async Task<decimal> BalanceAt(DateTime asOf) =>

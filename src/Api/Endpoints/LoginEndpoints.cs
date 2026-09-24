@@ -157,11 +157,26 @@ public static class LoginEndpoints
                 statusCode: StatusCodes.Status401Unauthorized);
         }
 
-        // Replay-attack guard: the WebAuthn spec requires the new counter
-        // to be strictly greater than the stored one (unless the
-        // authenticator returns 0, which means it doesn't track a
-        // counter). Fido2NetLib already validates this; we trust it and
-        // persist the new value.
+        // Replay-attack guard: the WebAuthn spec requires the new counter to be
+        // strictly greater than the stored one. Fido2NetLib validates it; we
+        // trust that and persist the new value.
+        //
+        // The parenthetical that used to sit here — "unless the authenticator
+        // returns 0, which means it doesn't track a counter" — described 4.0.1
+        // and stopped being true at 4.1.0. A zero is now only tolerated when the
+        // STORED counter is also zero; a credential that has been counting and
+        // then reports 0 is rejected as a suspected clone.
+        //
+        // That is the STRICTEST option the spec permits, not the one it
+        // requires. WebAuthn L3 §7.2 step 22 calls the condition "a signal, but
+        // not proof, that the authenticator may be cloned" and then says
+        // outright that whether the RP "fails the authentication ceremony or
+        // not, is Relying Party-specific". The library chooses to fail; we
+        // inherit that choice rather than having made it.
+        //
+        // It is the one case where this upgrade refuses an assertion its
+        // predecessor allowed, so the distinction is worth keeping written down
+        // rather than rediscovered from a user who cannot sign in.
         await credentials.UpdateAfterAssertionAsync(
             credential.Id, outcome.NewSignatureCounter, cancellationToken).ConfigureAwait(false);
 

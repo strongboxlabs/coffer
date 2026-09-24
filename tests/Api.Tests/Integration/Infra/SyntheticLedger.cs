@@ -813,37 +813,36 @@ public sealed class SyntheticLedger
     }
 
     /// <summary>
-    /// Hide an entire event by inserting a
-    /// <c>txn_header_overrides</c> row with <c>is_hidden=TRUE</c>.
+    /// Hide an entire event: <c>txn_headers.is_hidden = TRUE</c>.
     /// <paramref name="legOrHeaderId"/> accepts either a leg id (from
     /// <see cref="AddTransactionPairAsync"/>) or a header id (from
-    /// <see cref="AddMultiSplitAsync"/>); the helper resolves to the
-    /// header before writing the override.
+    /// <see cref="AddMultiSplitAsync"/>); the helper resolves to the header.
     /// </summary>
+    /// <remarks>
+    /// This used to insert a <c>txn_header_overrides</c> row with
+    /// <c>is_hidden = TRUE</c>, which no production code path has ever written —
+    /// hiding has always set the canonical column, and this fixture was the only
+    /// writer of the override one in the entire repository. Tests built on it
+    /// were asserting against a state the app could not produce. Migration 230
+    /// removed the column along with its table.
+    /// </remarks>
     public async Task HideTransactionAsync(
         Guid legOrHeaderId, CancellationToken cancellationToken = default)
     {
         await using var db = NewDbContext();
-        var ledgerId = LedgerId;
         await db.Database.ExecuteSqlInterpolatedAsync($@"
-            INSERT INTO txn_header_overrides (header_id, ledger_id, is_hidden)
-            VALUES (
-                COALESCE(
-                    (SELECT header_id FROM txn_legs WHERE id = {legOrHeaderId}),
-                    {legOrHeaderId}
-                ),
-                {ledgerId},
-                TRUE
-            )
-            ON CONFLICT (header_id) DO UPDATE SET is_hidden = TRUE;",
+            UPDATE txn_headers SET is_hidden = TRUE
+             WHERE id = COALESCE(
+                       (SELECT header_id FROM txn_legs WHERE id = {legOrHeaderId}),
+                       {legOrHeaderId});",
             cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Re-run <c>fn_recompute_balances_for_account</c> over the given accounts from
     /// the beginning of time. The seed helpers recompute at insert, but the
-    /// override helpers (<see cref="HideTransactionAsync"/>,
-    /// <see cref="SetHeaderOverrideAsync"/>, <see cref="MarkTransactionMergedAsync"/>)
+    /// mutation helpers (<see cref="HideTransactionAsync"/>,
+    /// <see cref="EditHeaderAsync"/>, <see cref="MarkTransactionMergedAsync"/>)
     /// write raw SQL that the BalanceRecomputeInterceptor never sees — so a test
     /// that hides or re-dates an event and then asserts on a BALANCE (rather than
     /// on the register) must call this in between. Migration 103 gave the recompute
@@ -892,13 +891,27 @@ public sealed class SyntheticLedger
     }
 
     /// <summary>
-    /// Seed an arbitrary <c>txn_header_overrides</c> row for tests that
-    /// need to assert the override layer in isolation (without going
-    /// through the override-write endpoint). Mirrors the upsert
-    /// semantics the API uses: missing args leave existing columns
-    /// alone; <paramref name="legOrHeaderId"/> resolves to the header.
+    /// Put a header into the EDITED state without going through the PATCH
+    /// endpoint: capture its current values to <c>txn_header_originals</c>, then
+    /// overwrite the named columns on <c>txn_headers</c>. Missing args leave
+    /// their column alone; <paramref name="legOrHeaderId"/> resolves to the
+    /// header.
     /// </summary>
-    public async Task SetHeaderOverrideAsync(
+    /// <remarks>
+    /// <para>This replaced <c>EditHeaderAsync</c>, which wrote a
+    /// <c>txn_header_overrides</c> row. Migration 230 flipped the layer — the
+    /// canonical row holds the current values and the sidecar holds the feed's —
+    /// so the state a test wants ("the user edited this row") is now shaped this
+    /// way, and a fixture that wrote the other shape would be manufacturing a
+    /// state production can no longer reach.</para>
+    ///
+    /// <para>Capture-then-overwrite, in that order and with
+    /// <c>ON CONFLICT DO NOTHING</c>, mirrors
+    /// <c>HeaderOriginals.CaptureAsync</c> exactly: the original is whatever the
+    /// FIRST edit found, so calling this twice leaves the first capture
+    /// standing.</para>
+    /// </remarks>
+    public async Task EditHeaderAsync(
         Guid legOrHeaderId,
         string? payee = null,
         string? memo = null,
@@ -907,22 +920,26 @@ public sealed class SyntheticLedger
         CancellationToken cancellationToken = default)
     {
         await using var db = NewDbContext();
-        var ledgerId = LedgerId;
         await db.Database.ExecuteSqlInterpolatedAsync($@"
-            INSERT INTO txn_header_overrides (header_id, ledger_id, payee, memo, transacted_at, posted_at)
-            VALUES (
-                COALESCE(
-                    (SELECT header_id FROM txn_legs WHERE id = {legOrHeaderId}),
-                    {legOrHeaderId}),
-                {ledgerId},
-                {payee}, {memo}, {transactedAt}, {postedAt}
-            )
-            ON CONFLICT (header_id) DO UPDATE SET
-                payee         = COALESCE(EXCLUDED.payee,         txn_header_overrides.payee),
-                memo          = COALESCE(EXCLUDED.memo,          txn_header_overrides.memo),
-                transacted_at = COALESCE(EXCLUDED.transacted_at, txn_header_overrides.transacted_at),
-                posted_at     = COALESCE(EXCLUDED.posted_at,     txn_header_overrides.posted_at),
-                updated_at    = now();",
+            INSERT INTO txn_header_originals
+                (header_id, ledger_id, payee, memo, posted_at, transacted_at, check_number)
+            SELECT h.id, h.ledger_id, h.payee, h.memo, h.posted_at, h.transacted_at, h.check_number
+              FROM txn_headers h
+             WHERE h.id = COALESCE(
+                       (SELECT header_id FROM txn_legs WHERE id = {legOrHeaderId}),
+                       {legOrHeaderId})
+            ON CONFLICT (header_id) DO NOTHING;",
+            cancellationToken).ConfigureAwait(false);
+
+        await db.Database.ExecuteSqlInterpolatedAsync($@"
+            UPDATE txn_headers SET
+                payee         = COALESCE({payee}::text,        payee),
+                memo          = COALESCE({memo}::text,         memo),
+                transacted_at = COALESCE({transactedAt}::timestamptz, transacted_at),
+                posted_at     = COALESCE({postedAt}::timestamptz,     posted_at)
+             WHERE id = COALESCE(
+                       (SELECT header_id FROM txn_legs WHERE id = {legOrHeaderId}),
+                       {legOrHeaderId});",
             cancellationToken).ConfigureAwait(false);
     }
 

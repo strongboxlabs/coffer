@@ -26,7 +26,7 @@ namespace Coffer.Api.Tests.Integration.Infra;
 /// object survives the upgrade with the right shape and can be applied twice. It does not
 /// prove the walk's arithmetic — the two consistency tests added alongside 217 do that, on
 /// seeded disposals at head — and it does not prove the container upgrades, which is
-/// <c>scripts/maintainer/upgrade-drill.sh</c>. Three different properties, three different
+/// the deployment drill in the maintainer tooling. Three different properties, three
 /// checks; none of them is evidence for the other two.
 /// </para>
 /// </remarks>

@@ -186,6 +186,15 @@ No donut at all: once a chart needs a legend, the legend is doing the work.
 - The aggregation is reused, not duplicated —
   [ADR-0063](0063-mcp-server.md)'s engine already computed spend by category
   and was reachable only from the MCP tools. This is its first REST caller.
+- The budget reads back OUT over MCP as `budget_progress`, so the traffic runs
+  both ways: ADR-0063's engine feeds the screen, and the screen's subject is
+  visible to an agent. The tool returns the rows and totals but not the per-day
+  series the chart needs, and `mark` is returned rather than left to be derived
+  — under D1a a parent's mark already accounts for targets set on its
+  descendants, so a caller reconstructing it from `target` and `typical` would
+  be wrong on exactly the rows a target was set on. Read-only on purpose: a
+  target is a person's decision, and there is no reading of "the agent set my
+  budget" that is better than the person typing it.
 - One visual language covers budget, the dashboard tile and a future reports
   surface, because the primitives are components rather than a library's idea of
   a chart.

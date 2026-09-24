@@ -697,6 +697,7 @@ public sealed class RegisterRepository
             TransferAccountName = projection.TransferAccountName,
             TransferAccountType = projection.TransferAccountType,
             FeeAmount = projection.FeeAmount,
+            SettledAmount = projection.SettledAmount,
             FeeCategoryId = projection.FeeCategoryId,
             FeeCategoryName = projection.FeeCategoryName,
         };
@@ -851,6 +852,7 @@ public sealed class RegisterRepository
         IngestShares = r.IngestShares,
         IngestUnitPrice = r.IngestUnitPrice,
         IngestFee = r.IngestFee,
+        IngestAmount = r.IngestAmount,
         IngestSecurityTickerHint = r.IngestSecurityTickerHint,
     };
 

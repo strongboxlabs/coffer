@@ -1,7 +1,21 @@
 # 0003 — Immutable feed values + separate `transaction_overrides` layer
 
-* Status: Accepted
+* Status: **Superseded by [ADR-0100](0100-canonical-holds-current-sidecar-holds-original.md)** (2026-09-23)
 * Date: 2026-05-08
+
+> The two-table split described here survives; the two tables swapped
+> contents. Holding the feed's values on the canonical row and the
+> user's in a nullable override column made a CLEARED field
+> unrepresentable — NULL had to mean both "not overridden" and
+> "overridden to empty", and the `COALESCE` always chose the first, so
+> a payee, memo or check number could never be emptied. ADR-0100 flips
+> it: the canonical row holds the current values and
+> `txn_header_originals` holds the feed's, captured once on first edit.
+> Recoverability, re-sync disambiguation and the modified indicator all
+> survive the flip; the reads lose a join.
+>
+> The leg-level half (`txn_leg_overrides`) was dropped rather than
+> flipped — zero rows in every database, no writer anywhere.
 
 ## Context
 

@@ -144,7 +144,11 @@ public sealed record AllocationResult(
 /// <summary>One aggregated investment event for the activity feed (ADR-0080): a
 /// header collapsed via <c>InvestmentEventProjector</c> into a single row — the same
 /// aggregation the register renders. <see cref="Amount"/> is the net cash impact on
-/// the brokerage; <see cref="Fee"/> is the fee leg's magnitude;
+/// the brokerage — which is structurally ZERO for a cash-neutral event (a
+/// reinvestment, an in-kind transfer, a sale a fee consumes), so
+/// <see cref="Settled"/> carries the trade value those events actually moved
+/// (ADR-0073 D1). Read <see cref="Settled"/> when <see cref="Amount"/> is zero;
+/// null means no leg carried one. <see cref="Fee"/> is the fee leg's magnitude;
 /// <see cref="Category"/> / <see cref="TransferAccount"/> are the projected slots
 /// (null when that role leg is absent).</summary>
 public sealed record InvestmentActivityRow(
@@ -159,6 +163,7 @@ public sealed record InvestmentActivityRow(
     decimal? Quantity,
     decimal? UnitPrice,
     decimal Amount,
+    decimal? Settled,
     decimal? Fee,
     string? Category,
     string? TransferAccount);

@@ -222,7 +222,7 @@ public sealed class MoneydanceImportService : IMoneydanceImportService
         // inside a transaction sees this transaction's own uncommitted rows, which
         // is exactly what makes it usable here (VACUUM would not be).
         await connection.ExecuteAsync(new CommandDefinition(
-            "ANALYZE txn_headers, txn_legs, txn_header_overrides, txn_leg_overrides, accounts;",
+            "ANALYZE txn_headers, txn_legs, txn_header_originals, accounts;",
             cancellationToken: cancellationToken)).ConfigureAwait(false);
 
         // The importer uses Dapper / raw SQL, so the API's recompute interceptors

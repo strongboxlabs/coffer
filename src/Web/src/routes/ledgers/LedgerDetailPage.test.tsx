@@ -12,7 +12,9 @@ import {
 import { LedgerDetailPage } from './LedgerDetailPage';
 import { ApiError } from '@/lib/api';
 import * as apiModule from '@/lib/api';
-import type { LedgerOverview, LedgerSummary } from '@/lib/types';
+import type {
+    BudgetCategoryRow, BudgetProgress, LedgerOverview, LedgerSummary,
+} from '@/lib/types';
 
 // Smoke tests for the per-ledger Overview (ADR-0056 slice 1).
 //
@@ -55,11 +57,47 @@ function overview(partial: Partial<LedgerOverview> = {}): LedgerOverview {
     };
 }
 
+const CAT_ID = '00000000-0000-0000-0000-000000000200';
+
+function budgetRow(p: Partial<BudgetCategoryRow> = {}): BudgetCategoryRow {
+    return {
+        categoryId: CAT_ID,
+        name: 'Food',
+        parentId: null,
+        actual: 0,
+        typical: null,
+        target: null,
+        mark: null,
+        ...p,
+    };
+}
+
+function budget(rows: BudgetCategoryRow[], p: Partial<BudgetProgress> = {}): BudgetProgress {
+    const actualTotal = rows.reduce((t, r) => t + r.actual, 0);
+    return {
+        month: '2026-05',
+        windowMonths: 3,
+        rows,
+        actualTotal,
+        typicalTotal: rows.reduce((t, r) => t + (r.typical ?? 0), 0),
+        currencyCode: 'USD',
+        mixedCurrency: false,
+        daysInMonth: 31,
+        elapsedDays: 15,
+        dailyActual: [],
+        dailyNormal: [],
+        latestMonthWithSpending: null,
+        ...p,
+    };
+}
+
 function stubQueries() {
     vi.spyOn(apiModule, 'fetchUpcomingReminders').mockResolvedValue([]);
     vi.spyOn(apiModule, 'fetchLedgerOperations').mockResolvedValue([]);
     // Unconfigured layout → canonical default (all widgets visible).
     vi.spyOn(apiModule, 'fetchDashboardPrefs').mockResolvedValue({ widgets: [] });
+    vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([]);
+    vi.spyOn(apiModule, 'fetchBudgetProgress').mockResolvedValue(budget([]));
 }
 
 function renderDetail(opts: { cachedLedgers?: LedgerSummary[] } = {}) {
@@ -167,5 +205,55 @@ describe('LedgerDetailPage (Overview)', () => {
 
         const alert = await screen.findByRole('alert');
         expect(alert).toHaveTextContent(/ledger not found or not visible/i);
+    });
+
+    // The Spending widget is the budget's one-glance half. It had been SELECTING
+    // hot rows by mark while DISPLAYING their overage against typical, which on a
+    // category budgeted BELOW its history printed a negative overage as "+-$…".
+    describe('the Spending widget judges by mark', () => {
+        it('reports a row over its TARGET by the amount over that target', async () => {
+            vi.spyOn(apiModule, 'fetchLedgerOverview').mockResolvedValue(overview());
+            vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([]);
+            // Budgeted well BELOW what history says — the case that broke.
+            vi.spyOn(apiModule, 'fetchBudgetProgress').mockResolvedValue(
+                budget([budgetRow({ actual: 300, typical: 500, target: 200, mark: 200 })]),
+            );
+
+            renderDetail();
+
+            // Over its target by 100 — not "-200" against its typical.
+            expect(await screen.findByText('+$100.00')).toBeInTheDocument();
+            expect(screen.queryByText(/\+-/)).not.toBeInTheDocument();
+        });
+
+        it('compares the month against the budgeted ceiling, not the typical total', async () => {
+            vi.spyOn(apiModule, 'fetchLedgerOverview').mockResolvedValue(overview());
+            vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([]);
+            vi.spyOn(apiModule, 'fetchBudgetProgress').mockResolvedValue(
+                budget([budgetRow({ actual: 300, typical: 500, target: 200, mark: 200 })]),
+            );
+
+            renderDetail();
+
+            // The ceiling the budget screen's hero draws (sum of root marks),
+            // labelled as a decision rather than as history.
+            expect(await screen.findByText('$200.00')).toBeInTheDocument();
+            expect(screen.getByText('budgeted')).toBeInTheDocument();
+            expect(screen.queryByText(/usually, over/)).not.toBeInTheDocument();
+        });
+
+        it('falls back to typical, and says so, when nothing is targeted', async () => {
+            vi.spyOn(apiModule, 'fetchLedgerOverview').mockResolvedValue(overview());
+            vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([]);
+            vi.spyOn(apiModule, 'fetchBudgetProgress').mockResolvedValue(
+                budget([budgetRow({ actual: 120, typical: 100, target: null, mark: 100 })]),
+            );
+
+            renderDetail();
+
+            // No configuration demanded: the widget still works with no targets.
+            expect(await screen.findByText(/usually, over 3 months/)).toBeInTheDocument();
+            expect(screen.queryByText('budgeted')).not.toBeInTheDocument();
+        });
     });
 });

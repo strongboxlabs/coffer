@@ -37,9 +37,12 @@ export interface UseRegisterKeyboardNavArgs<Row> {
      *  edge-load suppression; both read the single `isClientFiltered` rule so
      *  the policy can't drift between mouse and keyboard, or between pages. */
     suppressEdgeLoad?: boolean;
-    /** Scroll a freshly-focused row into view. `localIndex` is the
-     *  row's position inside `rows`; callers that track a logical
-     *  (eviction-stable) index add their `firstItemIndex` offset. */
+    /** Scroll a freshly-focused row into view. `localIndex` is the row's
+     *  position inside `rows`, and that is what virtuoso's `scrollIntoView` /
+     *  `scrollToIndex` want — they are never given `firstItemIndex` and so
+     *  cannot compensate for one. This used to tell callers to ADD their
+     *  `firstItemIndex` offset, which made bank scroll to the wrong row
+     *  whenever the window had shifted. Pass the local index unmodified. */
     scrollRowIntoView: (localIndex: number) => void;
     /** False while an edit row / new-row form is open — suppresses
      *  the document handler so the editor owns the keyboard. */

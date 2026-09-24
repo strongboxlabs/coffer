@@ -100,8 +100,7 @@ public sealed class AppDbContext : DbContext
     // onto these tables).
     internal DbSet<TxnHeaderRow> TxnHeaders => Set<TxnHeaderRow>();
     internal DbSet<TxnLegRow> TxnLegs => Set<TxnLegRow>();
-    internal DbSet<TxnHeaderOverrideRow> TxnHeaderOverrides => Set<TxnHeaderOverrideRow>();
-    internal DbSet<TxnLegOverrideRow> TxnLegOverrides => Set<TxnLegOverrideRow>();
+    internal DbSet<TxnHeaderOriginalRow> TxnHeaderOriginals => Set<TxnHeaderOriginalRow>();
     internal DbSet<TxnLegReconRow> TxnLegRecon => Set<TxnLegReconRow>();
     internal DbSet<TxnHeaderTagRow> TxnHeaderTags => Set<TxnHeaderTagRow>();
     internal DbSet<TagRow> Tags => Set<TagRow>();
@@ -1260,6 +1259,7 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.IngestShares).HasColumnName("ingest_shares");
             b.Property(x => x.IngestUnitPrice).HasColumnName("ingest_unit_price");
             b.Property(x => x.IngestFee).HasColumnName("ingest_fee");
+            b.Property(x => x.IngestAmount).HasColumnName("ingest_amount");
             // Migration 114 — OFX security ticker hint (provider_id
             // string used to record the provider_security_mapping
             // on Accept, so future ingests auto-resolve).
@@ -1460,9 +1460,12 @@ public sealed class AppDbContext : DbContext
                 .OnDelete(DeleteBehavior.Restrict);
         });
 
-        modelBuilder.Entity<TxnHeaderOverrideRow>(b =>
+        // Migration 230: the flipped form of the old txn_header_overrides.
+        // txn_headers holds the CURRENT values; this holds the feed's, captured
+        // by the first edit that changed them. See TxnHeaderOriginalRow.
+        modelBuilder.Entity<TxnHeaderOriginalRow>(b =>
         {
-            b.ToTable("txn_header_overrides");
+            b.ToTable("txn_header_originals");
             b.HasKey(x => x.HeaderId);
             b.Property(x => x.HeaderId).HasColumnName("header_id");
             b.Property(x => x.LedgerId).HasColumnName("ledger_id");
@@ -1471,24 +1474,9 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.PostedAt).HasColumnName("posted_at");
             b.Property(x => x.TransactedAt).HasColumnName("transacted_at");
             b.Property(x => x.CheckNumber).HasColumnName("check_number");
-            b.Property(x => x.IsHidden).HasColumnName("is_hidden");
-            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").ValueGeneratedOnAdd();
+            b.Property(x => x.CapturedAt).HasColumnName("captured_at").ValueGeneratedOnAdd();
             b.HasOne<TxnHeaderRow>().WithMany()
                 .HasForeignKey(x => x.HeaderId)
-                .OnDelete(DeleteBehavior.Cascade);
-        });
-
-        modelBuilder.Entity<TxnLegOverrideRow>(b =>
-        {
-            b.ToTable("txn_leg_overrides");
-            b.HasKey(x => x.LegId);
-            b.Property(x => x.LegId).HasColumnName("leg_id");
-            b.Property(x => x.LedgerId).HasColumnName("ledger_id");
-            b.Property(x => x.LegMemo).HasColumnName("leg_memo");
-            b.Property(x => x.Amount).HasColumnName("amount");
-            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").ValueGeneratedOnAdd();
-            b.HasOne<TxnLegRow>().WithMany()
-                .HasForeignKey(x => x.LegId)
                 .OnDelete(DeleteBehavior.Cascade);
         });
 
@@ -1614,6 +1602,7 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.IngestShares).HasColumnName("ingest_shares");
             b.Property(x => x.IngestUnitPrice).HasColumnName("ingest_unit_price");
             b.Property(x => x.IngestFee).HasColumnName("ingest_fee");
+            b.Property(x => x.IngestAmount).HasColumnName("ingest_amount");
             // Migration 114: persisted OFX ticker hint.
             b.Property(x => x.IngestSecurityTickerHint).HasColumnName("ingest_security_ticker_hint");
             // Migration 079 (ADR-0031 follow-up): raw provider JSON.

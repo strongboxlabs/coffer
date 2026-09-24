@@ -11,7 +11,7 @@ category / status — was written **twice**:
 
 - **SQL**, in `register_entry_keys` (mig 164, extended by 166), for the windowed
   keyset page. This one is non-negotiable: the page is a sliding window over a
-  cursor, so the client can't filter what it hasn't loaded (that was bug #322);
+  cursor, so the client can't filter what it hasn't loaded (that was bug \#322);
   the filter must run server-side inside the cursor walk.
 - **LINQ**, in `RegisterRepository.ApplyRegisterFilterPredicates`, for the two
   full-set aggregates that don't paginate — the date-rail buckets

@@ -66,6 +66,16 @@ public static class InvestmentEventProjector
         InvestmentEventLeg? categoryLeg = null;
         InvestmentEventLeg? transferLeg = null;
         InvestmentEventLeg? feeLeg = null;
+        // Settled money (ADR-0073 D1), accumulated by ROLE and deliberately
+        // outside the classification below: a security leg that is also the
+        // holdings sibling is skipped there as structural noise, but its amount
+        // is exactly the trade value we want. On a reinvestment the brokerage
+        // side carries the amount with no quantity at all, so keying on
+        // qtyPriceLeg would miss every one of them.
+        decimal securitySum = 0;
+        bool anySecurity = false;
+        decimal transferSum = 0;
+        bool anyTransfer = false;
 
         foreach (var leg in legs)
         {
@@ -86,6 +96,8 @@ public static class InvestmentEventProjector
             // drives the ticker/qty display.
             if (qtyPriceLeg is null && leg.PostingRole == PostingRoles.Security && leg.Quantity is not null)
                 qtyPriceLeg = leg;
+            if (leg.PostingRole == PostingRoles.Security) { securitySum += leg.Amount; anySecurity = true; }
+            else if (leg.PostingRole == PostingRoles.Transfer) { transferSum += leg.Amount; anyTransfer = true; }
             if (securityIdFallback is null && leg.SecurityId is not null)
             {
                 securityIdFallback = leg.SecurityId;
@@ -156,6 +168,16 @@ public static class InvestmentEventProjector
             // (the sign is implied by "fee").
             FeeAmount: feeLeg is null ? null : Math.Abs(feeLeg.Amount),
             FeeCategoryId: feeLeg?.CounterpartyAccountId,
-            FeeCategoryName: feeLeg?.CounterpartyAccountName);
+            FeeCategoryName: feeLeg?.CounterpartyAccountName,
+            // Security first, because on an event that has both (a funded
+            // purchase) the security leg is the trade and the transfer leg is
+            // merely where the money came from. Transfer covers the actions
+            // with no security leg at all — an in-kind dividend pins its
+            // security on the income leg, so there is no security-role leg to
+            // find. Neither present (a bare misc) yields null rather than 0:
+            // "no settled amount" is not "settled nothing".
+            SettledAmount: anySecurity ? Math.Abs(securitySum)
+                : anyTransfer ? Math.Abs(transferSum)
+                : null);
     }
 }

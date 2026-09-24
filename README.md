@@ -65,7 +65,7 @@ Full index — and how the docs stay in sync with the code — is in
 **[docs/README.md](docs/README.md)**. Start with
 [architecture.md](docs/architecture.md) for the design,
 [operations.md](docs/operations.md) to run it, and
-[follow-ups.md](docs/follow-ups.md) for open work.
+the open-work backlog.
 
 ## Status
 
@@ -77,7 +77,7 @@ member + admin management, and invite links (ADR-0083).
 
 The phase sequence is in [docs/architecture.md](docs/architecture.md) §8; open work
 (the ordered *Next* slices + the backlog) is in
-[docs/follow-ups.md](docs/follow-ups.md). Larger items still open: **budgets and
+the open-work backlog. Larger items still open: **budgets and
 budget-vs-actual** (the biggest unbuilt feature), the generic **CSV ingest
 provider**, and broader **in-app reports** — today's reporting strength is via MCP
 rather than the UI.

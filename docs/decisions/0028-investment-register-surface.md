@@ -144,7 +144,7 @@ line 2 when `transactedAt !== postedAt` (the only register where
 tax-date is currently visible at all). A systemic
 tax-date redesign (editor field, reports grouping, exports,
 register UX) is captured in
-[follow-ups.md → Tax / transaction date](../follow-ups.md).
+the open-work backlog.
 
 ### Strategy-pattern surface
 
@@ -189,8 +189,47 @@ in the register has a single, documented source.
 | **Action** (slot 4) | `header.action` ↦ `ACTION_LABEL[]` |
 | **Payee** (line 1 of slot 5) | `header.payee` |
 | **Memo** (line 2 of slot 5) | `header.memo` — shown when non-null |
-| **Amount** (line 1 of slot 8) | `SUM(leg.amount)` across this account's legs of the header — order-independent |
+| **Amount** (line 1 of slot 8) | `SUM(leg.amount)` across this account's legs of the header — order-independent. This is the NET cash the event moved through the sleeve, **not** the trade value; see "Two numbers are both called Amount" below |
+| **Settled** (line 2 of slot 8, conditional) | `\|SUM(security-role legs)\|`, else `\|SUM(transfer-role legs)\|`, else null — ADR-0073 D1's authoritative money. Rendered only when **Amount is exactly 0** and the value does not merely restate the fee |
 | **Balance** (slot 9) | brokerage cash balance **after the whole transaction** completes. Impl: `txn_header_account_balances.balance_after` keyed by `(header_id, brokerage_account_id)`, surfaced through `resolved_transactions.balance_after`. Per ADR-0034 there is one value per `(header, account)`, no posting-leg picker. |
+
+#### Two numbers are both called Amount
+
+This ADR and [ADR-0073](0073-investment-amount-authoritative.md) each define
+"Amount", and they define it as different numbers. Both were right in their own
+scope and nobody reconciled them, so the register shipped a column that
+contradicted the editor behind it.
+
+* **ADR-0073 D1 (write path)** — for `buy` / `sell` / `buyx` / `sellx` /
+  `dividend_reinvest`, the request's `Amount` **is the money**: the settled
+  cash, 2dp, stored directly on the cash + holdings legs.
+* **ADR-0028 (this ADR, read path)** — the register's Amount is the SUM of this
+  account's legs: the net the event moved through the brokerage sleeve.
+
+They agree on a plain Buy, where one leg carries the money. They disagree
+whenever an event is **cash-neutral** — income +X against security −X on one
+sleeve — and that is not an edge case: 6,201 of 15,981 dev brokerage entries
+(**38.8%**) net to zero. Every one rendered `$0.00` while the editor, reading
+the same header, showed the trade value.
+
+The resolution is that BOTH numbers are real and neither replaces the other.
+The register keeps its net as Amount — it is the figure the Balance column
+accumulates, and breaking that correspondence would be worse than the problem —
+and the settled value appears beneath it, but only when the net is zero and
+therefore says nothing. The projected field is called `SettledAmount` because
+ADR-0073 already calls it settled; inventing a third word for one number is how
+this drift started.
+
+One trap worth stating, because it is invisible until it renders: on a sale
+whose proceeds a fee exactly consumes, the settled amount EQUALS the fee, and
+both want the same subtitle line. 478 dev entries are that shape, across
+`sell`, `sellx` **and** `buy`. The fee wins the line, and the suppression is
+keyed on the values being equal rather than on the action — an action list
+would have covered the sells somebody noticed and silently missed the other 10.
+
+`divx` has no security-role leg at all (the security is pinned to the income
+leg), which is why the derivation falls through to the transfer role rather
+than keying on `security` alone.
 
 #### Action-varying fields (slot 6 + slot 7 + Amount subtitle)
 

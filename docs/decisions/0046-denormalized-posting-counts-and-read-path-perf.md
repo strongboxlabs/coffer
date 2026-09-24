@@ -25,8 +25,8 @@ whole account, or several accounts in a group, scans every row and pays
 it in full. The subqueries also inflate the view's planner cost, which
 is part of what trips Postgres JIT compilation on this view (the
 `resolved_transactions` join graph already compiles ~250 functions/query
-— the reason PR #45 shipped the `ALTER ROLE coffer_app SET jit = off`
-stopgap, see [follow-ups](../follow-ups.md) and
+— the reason PR \#45 shipped the `ALTER ROLE coffer_app SET jit = off`
+stopgap, see the open-work backlog and
 `db/init/00-init-roles.sh`).
 
 **Principle (the deciding one): optimize each layer independently.** The

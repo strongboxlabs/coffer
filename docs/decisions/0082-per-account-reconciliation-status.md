@@ -127,6 +127,26 @@ been bank-confirmed, so its status is untouched. Implemented in the merge block
 of `PatchAsync` (alongside the existing import-date adoption + merge stamping) by
 upserting the winner leg's `txn_leg_recon` row.
 
+### It applies to INVESTMENT merges too (amendment)
+
+This section was written in bank vocabulary and the investment merge branch was
+built without it, so for a while a brokerage merge stamped the loser, adopted
+the date and recomputed holdings — and left the survivor `uncleared`.
+
+That was an oversight, not a decision. The rule's reasoning is that a feed match
+is the **institution acknowledging the transaction**, and nothing in it depends
+on the institution being a bank: a brokerage confirming a trade is the same
+evidence in the same shape, arriving through the same import path. Read
+"bank-feed row" and "bank acknowledging" above as *institution*.
+
+One implementation difference is load-bearing. The bank finds the merge account
+as the header's first **non-category** account, which is sound there. An
+investment header also carries legs on the **holdings sibling**, an account of
+type `investment`, so that heuristic can land on the wrong leg. The brokerage is
+identified instead as the account that POINTS AT a holdings account
+(`accounts.holdings_account_id IS NOT NULL`) — the cash sleeve the register
+shows, which is where a recon status means anything.
+
 ## Decisions (resolved)
 
 1. **Single-toggle endpoint shape:** `accountId` in the **body**, not the path —

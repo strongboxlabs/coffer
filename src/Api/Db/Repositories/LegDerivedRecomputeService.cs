@@ -4,9 +4,8 @@ namespace Coffer.Api.Db.Repositories;
 
 /// <summary>
 /// Single entry point for re-deriving the two leg-derived
-/// denormalizations after any write that affects <c>txn_legs</c>,
-/// <c>txn_headers</c>, <c>txn_header_overrides</c>, or
-/// <c>txn_leg_overrides</c>:
+/// denormalizations after any write that affects <c>txn_legs</c> or
+/// <c>txn_headers</c>:
 /// <list type="number">
 ///   <item><description>the running balance on
 ///   <c>txn_header_account_balances</c> (mig 102, ADR-0034) via

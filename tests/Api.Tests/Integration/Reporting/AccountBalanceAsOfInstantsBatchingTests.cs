@@ -106,7 +106,7 @@ public sealed class AccountBalanceAsOfInstantsBatchingTests
 
         // Move the FIRST header far later — after the second — without touching the
         // second. Its seq still sorts before, its effective date now sorts after.
-        await ledger.SetHeaderOverrideAsync(firstLeg, postedAt: Utc(2024, 9, 1));
+        await ledger.EditHeaderAsync(firstLeg, postedAt: Utc(2024, 9, 1));
         await ledger.RecomputeBalancesAsync([bank.Id, other.Id]);
 
         await AssertAgreeAtAllAsync(

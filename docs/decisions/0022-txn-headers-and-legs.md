@@ -13,7 +13,7 @@
 > `transaction_tags` tables plus the ADR-0019 symmetric-pair trigger.
 > Investment lots write through `BulkReplaceLotsAsync` (thousands of lots
 > populated on a large real-world ledger). JIT-off on `coffer_app` stays
-> (PR #45) — the new view's join count keeps the plan above
+> (PR \#45) — the new view's join count keeps the plan above
 > `jit_above_cost`, so the role-level override is the right call for
 > now; see the perf follow-up below for paths to retire it.
 
@@ -49,7 +49,7 @@ Each future group-level field would have needed its own column on
 the main one. The denormalized shape was a 250-line patch with a long
 trail; the right answer is to model the envelope where it belongs.
 
-A spot-check after PR #41's perf work confirmed a secondary benefit:
+A spot-check after PR \#41's perf work confirmed a secondary benefit:
 the RLS chain `transactions → accounts → user_ledger_grants` produced a
 plan with 134 inlined functions that triggered ~500ms of JIT compilation
 per query. Hoisting `ledger_id` directly onto the header collapses that
@@ -227,7 +227,7 @@ CREATE POLICY leg_via_header ON txn_legs
 `txn_legs` reads need two (`header_id → txn_headers.ledger_id →
 user_ledger_grants`). Both are shorter than the
 `transactions → accounts → user_ledger_grants` chain in ADR-0020 Phase D,
-which is what triggered the JIT regression patched in PR #41.
+which is what triggered the JIT regression patched in PR \#41.
 
 **Phase 2 update (2026-05-12):** Measured after the cut-over. The new
 `register_entry_keys` walks `resolved_transactions`, which under
@@ -241,7 +241,7 @@ compilation still dominates wall time. Spot-check:
   register_entry_keys via psql, JIT off: ~150ms
   Full HTTP request, JIT off:            ~450ms warm
 
-PR #45 restored the `ALTER ROLE coffer_app SET jit = off` workaround.
+PR \#45 restored the `ALTER ROLE coffer_app SET jit = off` workaround.
 The simpler RLS chain still helped — pre-ADR-0022 register reads
 were ~1.6s warm, post are ~450ms — but the JIT cost moved from the
 RLS subqueries to the view's join structure rather than vanishing.
@@ -283,8 +283,8 @@ and `docs/follow-ups.md` "View join cost".
 
 **Negative**
 
-- Migration cost was real. Phase 1 shipped as PRs #44 (schema +
-  importer + API EF + tests) and #46 (investment importer port);
+- Migration cost was real. Phase 1 shipped as PRs \#44 (schema +
+  importer + API EF + tests) and \#46 (investment importer port);
   ~1700 LOC across ~30 files. Phase 2 (drops + lots/merge_candidates
   FK retarget) is still pending. ADR-0019's `counterparty_id` /
   `txn_group_id` / `leg_index` columns remain on the legacy
@@ -330,7 +330,7 @@ Two-phase, **not** the big-bang originally planned. Justified because:
 3. A phased dual-write would add 2-3× the migration work for migration
    mechanics that nobody benefits from.
 
-**Phase 1 (shipped 2026-05-12, PRs #44 + #46):**
+**Phase 1 (shipped 2026-05-12, PRs \#44 + \#46):**
 - Migration 022 creates `txn_headers` / `txn_legs` /
   `txn_header_overrides` / `txn_leg_overrides` / `txn_header_tags`
   alongside the legacy tables. RLS + indexes set up.
