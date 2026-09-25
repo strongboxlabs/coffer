@@ -196,6 +196,41 @@ describe('BankRegisterPage', () => {
         ).toBeInTheDocument();
     });
 
+    // The window is EMPTY while the month buckets still exist — they come from
+    // their own query, not from the window, so this state is reachable in
+    // normal use (a filter that matches nothing).
+    //
+    // This failed before the overlays moved out of RegisterShell. The shell
+    // passes its children through RegisterStates, which REPLACES them with the
+    // empty placeholder, so everything rendered inside it — the popover, the
+    // delete confirm, the context menu — was unmounted by the list's own
+    // state. RegisterDateJumpPopover's own doc comment promises "Mounted
+    // always; visible only while open"; on this page that was false.
+    it('keeps the date-jump popover reachable when the window is empty', async () => {
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+        vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
+        vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([TEST_ACCOUNT]);
+        // Two buckets minimum — the shortcut is deliberately suppressed below
+        // that, so one bucket would make this pass for the wrong reason.
+        vi.spyOn(apiModule, 'fetchIndexBuckets').mockResolvedValue([
+            { yearMonth: '2026-01', count: 3, sampleHeaderId: 'h-jan' },
+            { yearMonth: '2026-02', count: 5, sampleHeaderId: 'h-feb' },
+        ]);
+
+        renderRegister();
+        await screen.findByText(/no transactions in this account/i);
+
+        await userEvent.keyboard('{Control>}j{/Control}');
+
+        expect(
+            await screen.findByRole('dialog', { name: /jump to date/i }),
+        ).toBeInTheDocument();
+    });
+
     it('numbers rows from 1 and declares the total unknown', async () => {
         // `aria-rowindex` was fed straight from virtuoso's logical index,
         // which carries a 1,000,000 front-shift offset so rows can be

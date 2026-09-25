@@ -74,21 +74,26 @@ if ! dotnet build Coffer.slnx --configuration Release >"$logdir/build.log" 2>&1;
     exit 1
 fi
 
-# Shard filters. S4 below is the complement of s1..s3, so these must be edited as a
-# set: narrowing one shard without widening another drops tests from the run
-# silently, and a green result would then mean less than it appears to.
-launch s1 api_shard \
-    "FullyQualifiedName~Integration.Transactions&FullyQualifiedName!~Integration.Transactions.MergeCandidates&FullyQualifiedName!~Integration.Transactions.InvestmentTransactionsEndpoints&FullyQualifiedName!~Integration.Transactions.PatchTransaction&FullyQualifiedName!~Integration.Transactions.BulkTransactions&FullyQualifiedName!~Integration.Transactions.BalanceMergeHideSync&FullyQualifiedName!~Integration.Transactions.InKindTransfer"
-launch s1b api_shard \
-    "FullyQualifiedName~Integration.Transactions.MergeCandidates|FullyQualifiedName~Integration.Transactions.InvestmentTransactionsEndpoints|FullyQualifiedName~Integration.Transactions.PatchTransaction|FullyQualifiedName~Integration.Transactions.BulkTransactions|FullyQualifiedName~Integration.Transactions.BalanceMergeHideSync|FullyQualifiedName~Integration.Transactions.InKindTransfer"
-launch s2 api_shard \
-    "FullyQualifiedName~Integration.Auth|FullyQualifiedName~Integration.Accounts|FullyQualifiedName~Integration.Meta"
-launch s3 api_shard \
-    "FullyQualifiedName~Integration.FeedConnections|FullyQualifiedName~Integration.Backup|FullyQualifiedName~Integration.Reporting|FullyQualifiedName~Integration.Mcp|FullyQualifiedName~Integration.Ingest"
-launch s4 api_shard \
-    "FullyQualifiedName!~Integration.Transactions&FullyQualifiedName!~Integration.Auth&FullyQualifiedName!~Integration.Accounts&FullyQualifiedName!~Integration.Meta&FullyQualifiedName!~Integration.FeedConnections&FullyQualifiedName!~Integration.Backup&FullyQualifiedName!~Integration.Reporting&FullyQualifiedName!~Integration.Mcp&FullyQualifiedName!~Integration.Ingest&FullyQualifiedName!~Integration.Stress"
-launch importer importer_shard
+# Shard filters live in ONE file, sourced here and by the local pre-push gate. This block
+# used to carry the strings inline, under a comment claiming they were defined
+# "here, once, for both modes" — while the local gate held its own copy. See
+# scripts/dotnet-shard-filters.sh for the partition and the Stress carve-out.
+filters="$repo_root/scripts/dotnet-shard-filters.sh"
+if [[ ! -f "$filters" ]]; then
+    echo "ci-dotnet-shards: missing $filters — cannot determine the shard" >&2
+    echo "  partition, and running an arbitrary subset would report a green" >&2
+    echo "  result for tests that never ran." >&2
+    exit 2
+fi
+# shellcheck source=scripts/dotnet-shard-filters.sh
+source "$filters"
 
+launch s1  api_shard "$SHARD_FILTER_s1"
+launch s1b api_shard "$SHARD_FILTER_s1b"
+launch s2  api_shard "$SHARD_FILTER_s2"
+launch s3  api_shard "$SHARD_FILTER_s3"
+launch s4  api_shard "$SHARD_FILTER_s4"
+launch importer importer_shard
 failures=()
 for name in "${!PID[@]}"; do
     if wait "${PID[$name]}"; then

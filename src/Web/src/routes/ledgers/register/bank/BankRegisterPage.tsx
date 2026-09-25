@@ -2011,10 +2011,6 @@ function RegisterTable({
                     oldestLabel={oldestPostedAtLabel}
                 />
             </RegisterScrollSurface>
-            <RegisterDateJumpPopover
-                buckets={[...indexBuckets]}
-                onSeek={onSeekBucket}
-            />
 
             <RegisterBulkActionBar
                 selectedCount={selectedCount}
@@ -2033,81 +2029,97 @@ function RegisterTable({
                 moveDisabled={selectionHasReadOnly}
                 moveDisabledTitle="Selection includes rows whose canonical owner is elsewhere (investment header, or split counter-side). Move those from the source register."
             />
-            {/* Row context menu. Rendered as a sibling at the section
-                root so it isn't clipped by the virtualizer's
-                position:absolute children. The component handles its
-                own outside-click + Esc dismissal; we just provide
-                state and items. */}
-            {contextMenu ? (
-                <ContextMenu
-                    anchor={contextMenu.anchor}
-                    items={buildBankRowMenuItems(contextMenu.target, {
-                        onApprove,
-                        onEdit: (target) => startEdit(target.headerId),
-                        onDuplicate: (target) => {
-                            // Open the new-transaction form prefilled
-                            // from the source. One path: a split-parent
-                            // carries all its legs (every posting), a
-                            // single row carries just itself — both via
-                            // rowsToDuplicatePrefill. posted_at defaults
-                            // to today in the form's own derivation.
-                            const rows = contextMenu.splitLegs ?? [target];
-                            setDuplicateSource(rowsToDuplicatePrefill(rows));
-                            startCreate();
-                        },
-                        onCreateReminder: (target) => {
-                            // ADR-0051 slice C: reuse the Duplicate row->prefill
-                            // mapping, but route it to the reminder editor (with
-                            // a blank schedule) instead of the new-txn form.
-                            const rows = contextMenu.splitLegs ?? [target];
-                            setReminderFrom({
-                                sourceAccountId: currentAccountId,
-                                prefill: rowsToDuplicatePrefill(rows),
-                            });
-                        },
-                        onShowOtherSide,
-                        onRequestDelete: (target) =>
-                            setPendingDelete({ kind: 'single', target }),
-                        onShowRawData: setRawDataTarget,
-                    }, {
-                        originatingSplit: contextMenu.originatingSplit,
-                        noAuthoring: isCategory,
-                    })}
-                    onClose={closeContextMenu}
-                />
-            ) : null}
-            {/* Destructive-action confirm. Drives single-row + bulk
-                delete; the dialog stays mounted under the modal scrim
-                until the user confirms or cancels. Copy varies by
-                policy: manual entries hard-delete (cannot be undone),
-                feed/import rows soft-hide (reversible via "show
-                hidden" once that lands). */}
-            {rawDataTarget !== null ? (
-                <RawDataModal
-                    target={rawDataTarget}
-                    legs={rawDataLegs.data ?? []}
-                    onClose={() => setRawDataTarget(null)}
-                />
-            ) : null}
-            <RegisterDeleteConfirm
-                pending={pendingDelete}
-                selectedCount={selectedCount}
-                allMode={selection.selection.kind === 'all'}
-                isConfirming={pendingDelete?.kind === 'bulk' && isBulkDeleting}
-                onConfirmSingle={(target) => void onDelete(target)}
-                onConfirmBulk={onBulkDelete}
-                onCancel={() => setPendingDelete(null)}
-            />
-            {reminderFrom !== null ? (
-                <ReminderEditorDialog
-                    ledgerId={ledgerId}
-                    reminderId={null}
-                    fromTransaction={reminderFrom}
-                    onClose={() => setReminderFrom(null)}
-                    onSaved={() => setReminderFrom(null)}
-                />
-            ) : null}
         </RegisterShell>
+
+        {/* Overlays render OUTSIDE RegisterShell, as they already did on the
+            investment register. The shell passes its children through
+            RegisterStates, which REPLACES them with a placeholder while the
+            list is loading, errored or empty — so anything rendered inside it
+            is unmounted by the list's own state. Harmless for list content,
+            wrong for a modal: a bulk delete that clears the last matching rows
+            flips isEmpty true and unmounts the confirm dialog mid-operation,
+            and Cmd/Ctrl+J stops working under a filter that matches nothing.
+
+            RegisterBulkActionBar deliberately stays inside — it belongs to the
+            list, and the investment register keeps it there too. */}
+        <RegisterDateJumpPopover
+            buckets={[...indexBuckets]}
+            onSeek={onSeekBucket}
+        />
+        {/* Row context menu. Rendered as a sibling at the section
+            root so it isn't clipped by the virtualizer's
+            position:absolute children. The component handles its
+            own outside-click + Esc dismissal; we just provide
+            state and items. */}
+        {contextMenu ? (
+            <ContextMenu
+                anchor={contextMenu.anchor}
+                items={buildBankRowMenuItems(contextMenu.target, {
+                    onApprove,
+                    onEdit: (target) => startEdit(target.headerId),
+                    onDuplicate: (target) => {
+                        // Open the new-transaction form prefilled
+                        // from the source. One path: a split-parent
+                        // carries all its legs (every posting), a
+                        // single row carries just itself — both via
+                        // rowsToDuplicatePrefill. posted_at defaults
+                        // to today in the form's own derivation.
+                        const rows = contextMenu.splitLegs ?? [target];
+                        setDuplicateSource(rowsToDuplicatePrefill(rows));
+                        startCreate();
+                    },
+                    onCreateReminder: (target) => {
+                        // ADR-0051 slice C: reuse the Duplicate row->prefill
+                        // mapping, but route it to the reminder editor (with
+                        // a blank schedule) instead of the new-txn form.
+                        const rows = contextMenu.splitLegs ?? [target];
+                        setReminderFrom({
+                            sourceAccountId: currentAccountId,
+                            prefill: rowsToDuplicatePrefill(rows),
+                        });
+                    },
+                    onShowOtherSide,
+                    onRequestDelete: (target) =>
+                        setPendingDelete({ kind: 'single', target }),
+                    onShowRawData: setRawDataTarget,
+                }, {
+                    originatingSplit: contextMenu.originatingSplit,
+                    noAuthoring: isCategory,
+                })}
+                onClose={closeContextMenu}
+            />
+        ) : null}
+        {/* Destructive-action confirm. Drives single-row + bulk
+            delete; the dialog stays mounted under the modal scrim
+            until the user confirms or cancels. Copy varies by
+            policy: manual entries hard-delete (cannot be undone),
+            feed/import rows soft-hide (reversible via "show
+            hidden" once that lands). */}
+        {rawDataTarget !== null ? (
+            <RawDataModal
+                target={rawDataTarget}
+                legs={rawDataLegs.data ?? []}
+                onClose={() => setRawDataTarget(null)}
+            />
+        ) : null}
+        <RegisterDeleteConfirm
+            pending={pendingDelete}
+            selectedCount={selectedCount}
+            allMode={selection.selection.kind === 'all'}
+            isConfirming={pendingDelete?.kind === 'bulk' && isBulkDeleting}
+            onConfirmSingle={(target) => void onDelete(target)}
+            onConfirmBulk={onBulkDelete}
+            onCancel={() => setPendingDelete(null)}
+        />
+        {reminderFrom !== null ? (
+            <ReminderEditorDialog
+                ledgerId={ledgerId}
+                reminderId={null}
+                fromTransaction={reminderFrom}
+                onClose={() => setReminderFrom(null)}
+                onSaved={() => setReminderFrom(null)}
+            />
+        ) : null}
         </TagColorsProvider>
     );
 
