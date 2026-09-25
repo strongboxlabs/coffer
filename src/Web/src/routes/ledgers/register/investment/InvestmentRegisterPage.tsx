@@ -8,10 +8,10 @@ import { Upload, RefreshCw } from 'lucide-react';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
 import { Button } from '@/components/ui/Button';
-import { Modal } from '@/components/ui/Modal';
 import { MainArea } from '@/components/ui/SidebarLayout';
 import {
     ApiError,
+    approveInvestmentTransaction,
     bulkDeleteTransactions,
     bulkSetReconStatus,
     deleteInvestmentTransaction,
@@ -55,6 +55,9 @@ import { InvestmentTxnRowEdit } from '../../investment-edit/InvestmentTxnRowEdit
 import { legsToDraft } from '../../investment-edit/legsToDraft';
 import type { InvestmentTxnDraft } from '../../investment-edit/validation';
 import { ReminderEditorDialog } from '../../reminders/ReminderEditorDialog';
+import { TagColorsProvider } from '@/components/tags/TagColorsContext';
+import { RawDataModal } from '../shell/RawDataModal';
+import { REGISTER_SELECT_ALL_LABEL } from '../shell/registerLabels';
 import { RegisterTopBar } from '../shell/RegisterTopBar';
 import { RegisterShell } from '../shell/RegisterShell';
 import { RegisterScrollSurface } from '../shell/RegisterScrollSurface';
@@ -592,6 +595,36 @@ export function InvestmentRegisterPage() {
         },
     });
 
+    // Accept an imported row as-is, from the row menu — the bank register has
+    // offered this since slice 2c and this one never did, so the only way to
+    // accept an investment row was to open the editor and re-save every field
+    // through a wholesale PATCH. Going through the dedicated route matters for
+    // the same reason: a PATCH IS the new state of the row, so accepting via
+    // one writes back whatever the client reconstructed, and accepting should
+    // change nothing.
+    const approveMutation = useMutation<RegisterEntry | null, ApiError, string>({
+        mutationFn: (headerId) =>
+            approveInvestmentTransaction(ledgerId, headerId, accountId),
+        onSuccess: (_entry, headerId) => {
+            // Flip the flag on the loaded row rather than refetching the window:
+            // the row does not move and a refresh would cost the scroll position.
+            register.mutateEntries((entry) => {
+                const id = entry.kind === 'txn'
+                    ? entry.txn.headerId
+                    : entry.legs[0]!.headerId;
+                if (id !== headerId) return entry;
+                return entry.kind === 'txn'
+                    ? { ...entry, txn: { ...entry.txn, needsReview: false } }
+                    : { ...entry, legs: entry.legs.map((l) => ({ ...l, needsReview: false })) };
+            });
+            // Accepting clears the row's review flag, which is what lights the
+            // sidebar dot — invalidate so it resets live when this was the
+            // account's last pending item.
+            queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+        },
+    });
+
+
     // Bulk recon-status mutation (ADR-0024). Identical wiring to the
     // bank register: one round-trip per status, server resolves the
     // predicate + applies the status in a single atomic UPDATE, and the
@@ -774,6 +807,18 @@ export function InvestmentRegisterPage() {
         const isTargetSplit =
             target.accountPostingsOnHeader < target.headerTotalPostings;
         const items: ContextMenuItem[] = [];
+        // Accept sits at the top when the row still carries the review flag,
+        // matching the bank register: it is the primary action on a freshly
+        // imported row, and burying it behind Edit is what made the editor the
+        // only route to it. A target-split is read-only here (ADR-0036), so it
+        // is excluded alongside Edit and Delete.
+        if (target.needsReview && !isTargetSplit) {
+            items.push({
+                id: 'accept',
+                label: 'Accept',
+                onSelect: () => approveMutation.mutate(target.headerId),
+            });
+        }
         if (!isTargetSplit) {
             items.push({
                 id: 'edit',
@@ -814,6 +859,9 @@ export function InvestmentRegisterPage() {
                             payee: target.payee,
                             memo: target.headerMemo ?? target.memo,
                             checkNumber: target.checkNumber,
+                            // A duplicate copies the event, tags included —
+                            // the same fields Duplicate already carried.
+                            tags: target.tags,
                         },
                         await queryClient.fetchQuery({
                             queryKey: ['header-legs', ledgerId, target.headerId],
@@ -940,6 +988,9 @@ export function InvestmentRegisterPage() {
             payee: canonical.payee,
             memo: canonical.headerMemo ?? canonical.memo,
             checkNumber: canonical.checkNumber,
+            // Header-level, so every leg of the header carries the same array
+            // — the canonical one is as good as any.
+            tags: canonical.tags,
         };
 
         // Upgrade path: bank-shape sync row. Two sub-cases:
@@ -1038,6 +1089,13 @@ export function InvestmentRegisterPage() {
         : null;
 
     return (
+        // Tag chips take their colour from here (ADR-0077 D4): the rows carry
+        // NAMES only, and the provider joins name -> colour from the same
+        // ['tags', ledgerId] query the filter and the Tags panel use, so a
+        // recolor there repaints this register too. The bank register has
+        // wrapped since the colours shipped; this one did not, because it
+        // rendered no chips to colour.
+        <TagColorsProvider ledgerId={ledgerId}>
         <MainArea>
             <RegisterTopBar
                 ledgerId={ledgerId}
@@ -1047,19 +1105,28 @@ export function InvestmentRegisterPage() {
                     <>
                         {/* Single file-import affordance — OFX/QFX
                             (ADR-0031 Phase 4) and QIF (ADR-0042) are
-                            distinguished by the picked file's extension. */}
-                        <Button
-                            type="button"
-                            variant="secondary"
-                            size="sm"
-                            title="Import statement file (OFX / QFX / QIF)"
-                            onClick={() => setImportDialogOpen(true)}
-                            className="gap-1.5"
-                        >
-                            <Upload className="size-icon-sm" aria-hidden />
-                            Import
-                        </Button>
-                        {account?.feedConnectionId !== null
+                            distinguished by the picked file's extension.
+
+                            Gated on isActive, as the bank register gates it: a
+                            retired brokerage was still inviting new rows into an
+                            account the user had deliberately closed, and the
+                            import would succeed. Deactivating an account is a
+                            statement that nothing more should land in it. */}
+                        {account?.isActive ? (
+                            <Button
+                                type="button"
+                                variant="secondary"
+                                size="sm"
+                                title="Import statement file (OFX / QFX / QIF)"
+                                onClick={() => setImportDialogOpen(true)}
+                                className="gap-1.5"
+                            >
+                                <Upload className="size-icon-sm" aria-hidden />
+                                Import
+                            </Button>
+                        ) : null}
+                        {account?.isActive
+                        && account?.feedConnectionId !== null
                         && account?.feedConnectionId !== undefined ? (
                             // Per-account SimpleFIN sync — parity with the bank
                             // register; only when this account is bound to a feed
@@ -1146,7 +1213,13 @@ export function InvestmentRegisterPage() {
                         resultCount={filterResultCount}
                         statusCounts={statusCounts}
                         onNew={startCreate}
-                        newDisabled={isCreatingNew || editingHeaderId !== null}
+                        // Matches the bank register: an open row editor does not
+                        // block starting a new transaction. Investment disabled the
+                        // button instead, which reads as broken — a greyed control
+                        // with no explanation of what to close first. Bank's
+                        // startCreate closes the open editor and opens the new-row
+                        // form, which is what the click plainly means.
+                        newDisabled={isCreatingNew}
                         newButtonTitle="New investment transaction (N)"
                     />
                 )}
@@ -1190,12 +1263,16 @@ export function InvestmentRegisterPage() {
                         allVisibleSelected={allVisibleSelected}
                         onToggleAll={() => selection.toggleAll()}
                         disabled={visibleRowsForSelection.length === 0}
-                        selectAllLabel="Select all transactions in this account"
+                        selectAllLabel={REGISTER_SELECT_ALL_LABEL}
                     />
                     <span role="columnheader" className="truncate">Date</span>
                     <span role="columnheader" className="truncate">Action</span>
                     <span role="columnheader" className="truncate">Payee · Memo</span>
-                    <span role="columnheader" className="truncate">Category | Transfer · Fee</span>
+                    {/* The "|" announces the three account sub-slots; tags join
+                        them with a "·" the way the bank header reads
+                        "Category · tags", since they are a fourth thing in the
+                        same cell rather than a fourth account. */}
+                    <span role="columnheader" className="truncate">Category | Transfer · Fee · Tags</span>
                     <span role="columnheader" className="truncate">Security · Shares @ Price</span>
                     <span role="columnheader" className="truncate text-right">Amount</span>
                     <span role="columnheader" className="truncate text-right">Balance</span>
@@ -1235,7 +1312,7 @@ export function InvestmentRegisterPage() {
                             atTimelineHead={register.atTimelineHead}
                             atTimelineTail={register.atTimelineTail}
                             oldestLabel={oldestPostedAtLabel}
-                            renderRow={(_, row) => {
+                            renderRow={(index, row) => {
                                 // ── Collapsed split-parent (ADR-0028
                                 // refinement 2026-06): a bank-shape
                                 // target-split cluster. Read-only here;
@@ -1252,6 +1329,7 @@ export function InvestmentRegisterPage() {
                                     return (
                                         <RegisterRow
                                             strategy={investmentRowStrategy}
+                                            rowIndex={index}
                                             variant="split-parent"
                                             row={aggregate}
                                             accountPaths={accountPaths}
@@ -1304,6 +1382,7 @@ export function InvestmentRegisterPage() {
                                     return (
                                         <RegisterRow
                                             strategy={investmentRowStrategy}
+                                            rowIndex={index}
                                             variant="split-leg"
                                             row={leg}
                                             accountPaths={accountPaths}
@@ -1501,6 +1580,7 @@ export function InvestmentRegisterPage() {
                                 return (
                                     <RegisterRow
                                         strategy={investmentRowStrategy}
+                                        rowIndex={index}
                                         variant="txn"
                                         row={txn}
                                         accountPaths={accountPaths}
@@ -1544,8 +1624,10 @@ export function InvestmentRegisterPage() {
                     with bank: the footer's `alwaysVisible` default makes
                     it a persistent "N rows loaded" status strip, with the
                     selection Σ + action buttons appearing only once a row
-                    is checked. No `extraActions` (the bank-only
-                    Categorize / Tag placeholders don't apply here). */}
+                    is checked. No `extraActions` — and neither does bank
+                    pass any, despite a long-standing comment here claiming
+                    it had Categorize / Tag placeholders to be excluded
+                    from. */}
                 <RegisterBulkActionBar
                     selectedCount={selectedCount}
                     selectedSum={selectedSum}
@@ -1651,6 +1733,7 @@ export function InvestmentRegisterPage() {
                 />
             ) : null}
         </MainArea>
+        </TagColorsProvider>
     );
 }
 
@@ -1660,79 +1743,6 @@ export function InvestmentRegisterPage() {
  * exists for debugging (especially classifier coverage on sync
  * rows). Esc + backdrop click + close button all dismiss.
  */
-function RawDataModal({
-    target,
-    legs,
-    onClose,
-}: {
-    target: InvestmentRowType;
-    legs: readonly InvestmentRowType[];
-    onClose: () => void;
-}) {
-    // The PROVIDER's verbatim JSON is the headline payload — the user
-    // asked for "raw SimpleFIN data" and that's what they get. Pretty-
-    // printed so the formatting is scannable. NULL when the row was
-    // synced before storage existed OR is manual/MD-imported; in that
-    // case we fall back to the SPA-side row view (still useful for
-    // debugging the rest of the pipeline).
-    const provider = target.providerRawPayload;
-    const providerPretty = provider
-        ? safePrettyJson(provider)
-        : null;
-    const fallback = JSON.stringify({ row: target, legs }, null, 2);
-    const json = providerPretty ?? fallback;
-    const hasProvider = providerPretty !== null;
-
-    return (
-        <Modal open onClose={onClose} titleId="raw-data-title" className="max-w-3xl">
-            <div className="flex max-h-[80vh] flex-col gap-3 p-4">
-                <div className="flex items-center justify-between gap-2">
-                    <h2 id="raw-data-title" className="text-sm font-semibold text-text">
-                        {hasProvider ? 'Raw provider data' : 'Raw row data'}
-                        {!hasProvider ? (
-                            <span className="ml-2 text-[0.6875rem] font-normal text-text-muted">
-                                (provider payload not captured — synced before storage existed; re-sync to backfill)
-                            </span>
-                        ) : null}
-                    </h2>
-                    <button
-                        type="button"
-                        onClick={onClose}
-                        className="rounded px-2 py-1 text-xs text-text-muted hover:bg-surface-hover hover:text-text"
-                        aria-label="Close"
-                    >
-                        Close
-                    </button>
-                </div>
-                <pre className="flex-1 overflow-auto rounded bg-surface-muted p-3 text-[0.6875rem] font-mono leading-tight text-text">
-                    {json}
-                </pre>
-                <div className="flex justify-end">
-                    <button
-                        type="button"
-                        onClick={() => {
-                            void navigator.clipboard.writeText(json);
-                        }}
-                        className="rounded border border-border px-2 py-1 text-xs text-text-muted hover:bg-surface-hover hover:text-text"
-                    >
-                        Copy JSON
-                    </button>
-                </div>
-            </div>
-        </Modal>
-    );
-}
-
-function safePrettyJson(raw: string): string {
-    try {
-        return JSON.stringify(JSON.parse(raw), null, 2);
-    } catch {
-        // Malformed JSON: show the original string so we can still
-        // debug. Shouldn't happen in practice — the server stores
-        // the value as JSONB which validates on write.
-        return raw;
-    }
-}
 
 /**
  * Narrow the account-scoped window to investment entries on the `kind`

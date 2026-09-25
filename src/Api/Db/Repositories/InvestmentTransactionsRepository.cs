@@ -242,9 +242,9 @@ public sealed class InvestmentTransactionsRepository
             Id = headerId,
             LedgerId = ledgerId,
             Origin = "manual",
-            Payee = request.Payee,
-            Memo = request.Memo,
-            CheckNumber = request.CheckNumber,
+            Payee = HeaderText.Normalize(request.Payee),
+            Memo = HeaderText.Normalize(request.Memo),
+            CheckNumber = HeaderText.Normalize(request.CheckNumber),
             PostedAt = postedAt,
             // NOT NULL since mig 189 — see TransactionsRepository.
             TransactedAt = request.TransactedAt ?? postedAt,
@@ -292,6 +292,16 @@ public sealed class InvestmentTransactionsRepository
             {
                 firstHoldingsLegId = otherId;
             }
+        }
+
+        // Tags on create (ADR-0009: a tag is a property of the EVENT). Same
+        // helper, dictionary and create-on-first-use semantics as the bank
+        // create path — an investment txn is an event like any other, and the
+        // legs it happens to have do not enter into it.
+        if (request.Tags is { Count: > 0 } tags)
+        {
+            await HeaderTags.ApplyAsync(_db, ledgerId, headerId, tags, cancellationToken)
+                .ConfigureAwait(false);
         }
 
         // Flush the header alone so its row exists when the leg
@@ -452,6 +462,20 @@ public sealed class InvestmentTransactionsRepository
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        // ONE transaction for the whole method, opened before the first read —
+        // the boundary the bank PATCH has always had, and for the reason it
+        // documents: the ledger-membership guard has to run inside the
+        // transaction that later writes, or there is a TOCTOU window between
+        // the endpoint's cross-ledger check and these writes.
+        //
+        // This used to open two transactions further down — one inside the
+        // merge branch, one after validation — so every read above them,
+        // including the membership guard and the whole action x field matrix
+        // validation, ran unprotected. `await using` rolls back on any early
+        // return, so the failure paths below need no commit.
+        await using var transaction = await _db.Database
+            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
         var existing = await _db.TxnHeaders
             .FirstOrDefaultAsync(
                 h => h.Id == headerId && h.LedgerId == ledgerId,
@@ -499,8 +523,6 @@ public sealed class InvestmentTransactionsRepository
                 .Select(l => new { l.AccountId, SecurityId = l.SecurityId!.Value })
                 .ToListAsync(cancellationToken).ConfigureAwait(false);
 
-            await using var mergeTx = await _db.Database
-                .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             existing.IsMergedInto = winner.Id;   // editor row → loser
             winner.IsMergeWinner = true;          // candidate → winner (idempotent)
             // ...and the loser is no longer awaiting review. The bank editor has
@@ -602,7 +624,7 @@ public sealed class InvestmentTransactionsRepository
                 }
             }
 
-            await mergeTx.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return PatchResult.Ok();
         }
 
@@ -665,9 +687,6 @@ public sealed class InvestmentTransactionsRepository
 
         var totalCommission = asCreate.FeeAmount ?? 0m;
 
-        await using var transaction = await _db.Database
-            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-
         // Drop existing legs + lots tied to this header. CASCADE on
         // the lots FK (leg_id) handles per-lot cleanup; explicit
         // delete keeps the change tracker in sync. With the holdings
@@ -697,24 +716,35 @@ public sealed class InvestmentTransactionsRepository
         // are past recovering; from here on both paths keep the original.
         await HeaderOriginals.CaptureAsync(_db, existing, cancellationToken)
             .ConfigureAwait(false);
-        existing.Payee        = asCreate.Payee;
-        existing.Memo         = asCreate.Memo;
-        existing.CheckNumber  = asCreate.CheckNumber;
+        existing.Payee        = HeaderText.Normalize(asCreate.Payee);
+        existing.Memo         = HeaderText.Normalize(asCreate.Memo);
+        existing.CheckNumber  = HeaderText.Normalize(asCreate.CheckNumber);
         existing.PostedAt     = asCreate.PostedAt;
         // NOT NULL since mig 189: a null request value means "no distinct tax
         // date", stored as the posted date. This is the in-place UPDATE path — the
         // one the create-path coalesce above does not cover.
         existing.TransactedAt = asCreate.TransactedAt ?? asCreate.PostedAt;
         existing.Action       = asCreate.Action;
-        // Clear the needs-review flag — a successful investment PATCH
-        // IS the user's act of approval. Unlike the bank-shape PATCH
-        // (which uses an explicit Approve=true flag because the user
-        // may also "save" without approving), the investment editor's
-        // only Save-pressed exit IS Accept; there's no concept of
-        // "save changes but leave it flagged for later." Aligns the
-        // register's reconciliation indicator with the row's actual
-        // upgraded state.
-        existing.NeedsReview = false;
+        // Approve only when ASKED to, matching the bank PATCH.
+        //
+        // This used to clear the flag unconditionally, justified by "the
+        // investment editor's only Save-pressed exit IS Accept". That was a
+        // claim about one client, applied to the endpoint: every other caller —
+        // MCP, a direct PATCH, a script correcting a typo across a ledger —
+        // accepted every row it touched, and nobody could fix an imported row
+        // and leave it queued. The editor still sends approve: true on a
+        // needs-review row, so its behaviour is unchanged.
+        if (request.Approve == true) existing.NeedsReview = false;
+
+        // Tags, on the same presence contract as the bank PATCH: null leaves
+        // them alone, [] clears them. The pairing is to the HEADER and the
+        // header id is stable across the wholesale leg reshape below, so an
+        // edit to a buy's fee never disturbs its tags.
+        if (request.Tags is { } tags)
+        {
+            await HeaderTags.ApplyAsync(_db, ledgerId, headerId, tags, cancellationToken)
+                .ConfigureAwait(false);
+        }
 
         // Multi-posting grouping is implicit via shared header_id —
         // see CreateAsync's note. Build leg specs first; insert as
@@ -1248,14 +1278,13 @@ public sealed class InvestmentTransactionsRepository
         var windowStart = anchor.PostedAt.AddDays(-7);
         var windowEnd = anchor.PostedAt.AddDays(7);
 
-        var q =
+        // Settledness, and nothing else — the whole of the bank candidate rule.
+        // An accepted, un-merged, effectively-visible row inside the window.
+        // Merge-winners ARE valid (folding into a prior winner keeps the graph
+        // one-hop), which is why is_merge_winner is not tested here.
+        var settledInWindow =
             from rv in _db.ResolvedTransactions.AsNoTracking()
             where rv.HeaderId != headerId
-                && rv.AccountId == holdingsAccountId
-                && rv.PostingRole == PostingRoles.Security
-                && rv.SecurityId != null
-                && rv.Quantity != null
-                && rv.InvestmentAction != null
                 && !rv.NeedsReview
                 && rv.IsMergedInto == null
                 && !rv.IsHidden
@@ -1263,35 +1292,151 @@ public sealed class InvestmentTransactionsRepository
                 && rv.PostedAt <= windowEnd
             select rv;
 
-        // Only when OFX resolved the ticker to a security already mapped.
-        if (anchor.IngestSecurityId is { } knownSecurityId)
-            q = q.Where(rv => rv.SecurityId == knownSecurityId);
+        // (A) Bank's rule, applied to the brokerage: the same effective cash on
+        // the same account. This used to be a match on the SECURITY leg's amount
+        // instead, which silently added a SHAPE constraint to a rule that is
+        // supposed to constrain settledness only — a candidate had to already be
+        // investment-shaped, with a security leg on the Holdings sibling.
+        //
+        // The commonest duplicate on a brokerage has no such leg. A dividend
+        // recorded as cash is (brokerage cash, income category); a feed-delivered
+        // INVBANKTRAN row is (brokerage cash, category) with no action at all.
+        // Neither could ever be offered, so the merge panel came up empty on
+        // exactly the rows it exists for.
+        var byAmount = principal == 0m
+            ? new List<Guid>()
+            : await settledInWindow
+                .Where(rv => rv.AccountId == anchor.SourceAccountId)
+                .GroupBy(rv => rv.HeaderId)
+                // Sign-insensitive: the anchor's principal is a magnitude, and a
+                // buy's cash leg is negative where a dividend's is positive.
+                // Written as two equalities rather than Math.Abs so it translates
+                // to SQL over the aggregate.
+                .Where(g => g.Sum(x => x.Amount) == principal
+                         || g.Sum(x => x.Amount) == -principal)
+                .Select(g => g.Key)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
 
-        q = principal != 0m
-            ? q.Where(rv => (rv.Amount < 0 ? -rv.Amount : rv.Amount) == principal)
-            : q.Where(rv => (rv.Quantity < 0 ? -rv.Quantity : rv.Quantity) == shares);
+        // (B) The cash-neutral case, which bank has no analogue for: a reinvest
+        // moves no cash on the brokerage, so (A) can never see it. Match the
+        // share count on the Holdings sibling instead.
+        //
+        // The view COALESCEs security_id and quantity across a posting's sibling
+        // legs, so those two cannot tell a security posting's cash leg from its
+        // holdings leg. Pinning account_id to the Holdings sibling can.
+        var byShares = shares == 0m
+            ? new List<Guid>()
+            : await settledInWindow
+                .Where(rv => rv.AccountId == holdingsAccountId
+                    && rv.PostingRole == PostingRoles.Security
+                    && rv.Quantity != null
+                    && (rv.Quantity < 0 ? -rv.Quantity : rv.Quantity) == shares)
+                .Select(rv => rv.HeaderId)
+                .Distinct()
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
 
-        var rows = await q
+        var matched = byAmount.Union(byShares).ToList();
+        if (matched.Count == 0) return Array.Empty<InvestmentMergeCandidateDto>();
+
+        // The security leg, for the candidates that have one. It carries what the
+        // chip shows — ticker, shares, price — and the trade's PRINCIPAL, which
+        // the cash leg cannot supply on a reinvest (that nets to zero).
+        var securityLegs = await _db.ResolvedTransactions.AsNoTracking()
+            .Where(rv => matched.Contains(rv.HeaderId)
+                && rv.AccountId == holdingsAccountId
+                && rv.PostingRole == PostingRoles.Security
+                && rv.Quantity != null)
             .Select(rv => new
             {
                 rv.HeaderId,
-                rv.InvestmentAction,
+                rv.PostedAt,
+                rv.SecurityId,
                 rv.SecurityTicker,
                 rv.Quantity,
                 rv.UnitPrice,
                 rv.Amount,
-                rv.PostedAt,
-                rv.Payee,
+                rv.InvestmentAction,
             })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
+        // One per header: a header with two matching holdings legs would
+        // otherwise be offered twice and spend two of the caller's limit slots.
+        var securityByHeader = securityLegs
+            .GroupBy(l => l.HeaderId)
+            .ToDictionary(g => g.Key, g => g.First());
 
-        return rows
-            // One row per HEADER. The view is per-leg, so a header carrying more
-            // than one matching holdings leg would otherwise be offered twice and
-            // spend two of the caller's limit slots on one candidate.
-            .GroupBy(r => r.HeaderId)
-            .Select(g => g.First())
+        // The brokerage leg, for every candidate: date and payee come from here,
+        // and so does the money on a candidate with no security leg.
+        var cashLegs = await _db.ResolvedTransactions.AsNoTracking()
+            .Where(rv => matched.Contains(rv.HeaderId)
+                && rv.AccountId == anchor.SourceAccountId)
+            .GroupBy(rv => new { rv.HeaderId, rv.PostedAt, rv.Payee, rv.InvestmentAction })
+            .Select(g => new
+            {
+                g.Key.HeaderId,
+                g.Key.PostedAt,
+                g.Key.Payee,
+                g.Key.InvestmentAction,
+                Amount = g.Sum(x => x.Amount),
+            })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var cashByHeader = cashLegs
+            .GroupBy(l => l.HeaderId)
+            .ToDictionary(g => g.Key, g => g.First());
+
+        return matched
+            // A candidate whose cash moved the OPPOSITE way is not a duplicate
+            // — it is the other side of the trade. A sell that brought in
+            // $167.38 and a buy that spent $167.38 on the same security, the
+            // same day, are the same magnitude and opposite events, and
+            // offering one as the other's twin invites a merge that tombstones
+            // a real transaction.
+            //
+            // This was never right: before the widening, the amount match ran
+            // on the security leg with Math.Abs, so the pair matched there too.
+            // The widening was supposed to bring this to the bank rule, which
+            // compares the SIGNED sum (`g.Sum(...) == targetSourceAmount`) —
+            // getting that wrong left the defect in place under a comment
+            // claiming parity.
+            //
+            // Skipped when the anchor moved no cash: a reinvest nets to zero on
+            // the brokerage, so it has no direction for a candidate to
+            // contradict, and matching there is by share count or by the feed's
+            // stated total instead.
+            .Where(id => sourceAmount == 0m
+                || !cashByHeader.TryGetValue(id, out var cash)
+                || cash.Amount == 0m
+                || Math.Sign(cash.Amount) == Math.Sign(sourceAmount))
+            // Narrow by security ONLY where the candidate has one to contradict.
+            // A cash-shape candidate carries no security because it has not been
+            // classified yet — which is what makes it the duplicate worth
+            // offering — so excluding it here would re-close the gap that
+            // widening (A) opened.
+            .Where(id => anchor.IngestSecurityId is not { } known
+                || !securityByHeader.TryGetValue(id, out var leg)
+                || leg.SecurityId == known)
+            .Select(id =>
+            {
+                securityByHeader.TryGetValue(id, out var sec);
+                cashByHeader.TryGetValue(id, out var cash);
+                // Every investment event has a brokerage cash leg, so `cash`
+                // is the normal source; fall back rather than assume.
+                var postedAt = cash?.PostedAt ?? sec?.PostedAt ?? anchor.PostedAt;
+                return new
+                {
+                    HeaderId = id,
+                    PostedAt = postedAt,
+                    Action = sec?.InvestmentAction ?? cash?.InvestmentAction,
+                    Ticker = sec?.SecurityTicker,
+                    sec?.Quantity,
+                    sec?.UnitPrice,
+                    Amount = sec?.Amount ?? cash?.Amount ?? 0m,
+                    Payee = cash?.Payee,
+                };
+            })
             .OrderBy(r => Math.Abs((r.PostedAt - anchor.PostedAt).TotalDays))
             .ThenByDescending(r => r.PostedAt)
             .Take(limit)
@@ -1299,8 +1444,8 @@ public sealed class InvestmentTransactionsRepository
                 r.HeaderId,
                 r.PostedAt,
                 (int)Math.Round((r.PostedAt - anchor.PostedAt).TotalDays),
-                r.InvestmentAction,
-                r.SecurityTicker,
+                r.Action,
+                r.Ticker,
                 r.Quantity,
                 r.UnitPrice,
                 r.Amount,
@@ -1326,6 +1471,40 @@ public sealed class InvestmentTransactionsRepository
         await HeaderOriginals.CaptureAsync(_db, header, cancellationToken)
             .ConfigureAwait(false);
         header.PostedAt = postedAt;
+    }
+
+    /// <summary>Outcome of <see cref="ApproveAsync"/>.</summary>
+    public enum ApproveOutcome { Ok, HeaderNotFound }
+
+    /// <summary>
+    /// Clear <c>needs_review</c> on an investment header, changing nothing else.
+    /// </summary>
+    /// <remarks>
+    /// Idempotent: an already-accepted row is Ok, not an error — accepting twice
+    /// is the same request, and a 422 on the second click of a button that
+    /// looked enabled is a worse answer than doing nothing.
+    ///
+    /// <para>No shape gate. Accepting touches one boolean that exists on every
+    /// header, so refusing a bank-shape row here would buy nothing and would
+    /// make the two registers disagree about a row they can both display.</para>
+    /// </remarks>
+    public async Task<ApproveOutcome> ApproveAsync(
+        Guid ledgerId,
+        Guid headerId,
+        CancellationToken cancellationToken = default)
+    {
+        var header = await _db.TxnHeaders
+            .FirstOrDefaultAsync(h => h.Id == headerId && h.LedgerId == ledgerId,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (header is null) return ApproveOutcome.HeaderNotFound;
+
+        if (header.NeedsReview)
+        {
+            header.NeedsReview = false;
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        }
+        return ApproveOutcome.Ok;
     }
 
     // ----------------------------------------------------------------

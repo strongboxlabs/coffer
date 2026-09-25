@@ -157,7 +157,6 @@ public sealed class BalanceConsistencyTests
             $"/api/ledgers/{ledger.LedgerId}/transactions/{survivorId}",
             new PatchTransactionRequest
             {
-                MergeFromHeaderId = loserId,
                 Postings = new PatchTransactionPostings
                 {
                     SourceAccountId = bank.Id,
@@ -171,6 +170,11 @@ public sealed class BalanceConsistencyTests
                     },
                 },
             });
+        // Then fold, as a command. It used to ride on the PATCH above;
+        // a merge is not a field edit and no longer can.
+        patchResp = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/transactions/{survivorId}/merge",
+            new MergeTransactionRequest { FromHeaderId = loserId });
         Assert.True(
             patchResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)patchResp.StatusCode}: {await patchResp.Content.ReadAsStringAsync()}");

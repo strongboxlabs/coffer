@@ -1,6 +1,21 @@
 # 0020 — Multi-ledger support: row-level `ledger_id` scoping with RLS
 
-* Status: Accepted (Phase A done in PR 2.x; Phase D / RLS turn-on done in PR 3.8 on 2026-05-10)
+* Status: Accepted — **but its RLS MECHANISM was superseded by migrations 071 and 072.**
+
+> **Read this before writing an RLS policy for a new table.** This ADR says derived
+> tables inherit their ledger transitively and that "RLS policies on derived tables
+> are subqueries against the anchor". That is no longer how it works, and copying it
+> will produce a policy that is both wrong in shape and drastically slower.
+>
+> Migration 071 denormalised `ledger_id` onto the five hot-path tables because the
+> anchor-subquery policies were multiplying recompute cost **180×**; migration 072
+> flattened the rest. Every ledger-scoped table now carries its own `ledger_id`, kept
+> coherent by a composite FK to its parent rather than by the subquery, and its policy
+> reads `ledger_id` directly. The "two copies of the same fact" this ADR's rationale
+> set out to avoid was accepted deliberately, with the FK as the guard.
+>
+> The anchor-table list below is also stale: `merge_rules` and `transaction_rules`
+> were dropped by migration 044.
 * Date: 2026-05-09
 * Affects: a small set of "anchor" tables (accounts, securities, feed_connections, tags, merge_rules, transaction_rules); Phase 3 auth (ADR-0013); the API surface; the importer CLI
 

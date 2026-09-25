@@ -38,6 +38,8 @@ const BROKERAGE: AccountSummary = {
     isTradeCommission: false,
 };
 
+const RECALLED_CATEGORY_ID = '00000000-0000-0000-0000-000000000301';
+
 const CATEGORY: AccountSummary = {
     id: CATEGORY_ID,
     ledgerId: LEDGER_ID,
@@ -56,6 +58,15 @@ const CATEGORY: AccountSummary = {
 
 // A valid `misc` draft: non-zero amount + a category (misc layout is
 // [security?, amount, category, fee?]; security is optional for misc).
+/** The category a recall chip suggests — deliberately NOT the one the draft
+ *  starts on, so applying it is observable. */
+const RECALLED_CATEGORY: AccountSummary = {
+    ...CATEGORY,
+    id: RECALLED_CATEGORY_ID,
+    name: 'Dividend Income',
+    categoryKind: 'income',
+};
+
 function miscDraft(amount: number): InvestmentTxnDraft {
     return {
         brokerageAccountId: ACCOUNT_ID,
@@ -73,6 +84,7 @@ function miscDraft(amount: number): InvestmentTxnDraft {
         transferAccountId: null,
         feeAccountId: null,
         feeAmount: null,
+        tags: [],
     };
 }
 
@@ -176,7 +188,7 @@ describe('InvestmentTxnRowEdit — parity with the bank editor', () => {
                 <InvestmentTxnRowEdit
                     ledgerId={LEDGER_ID}
                     brokerageAccountId={ACCOUNT_ID}
-                    accounts={[BROKERAGE, CATEGORY]}
+                    accounts={[BROKERAGE, CATEGORY, RECALLED_CATEGORY]}
                     isTradeCommission={false}
                     cols="1fr"
                     onCancel={onCancel}
@@ -244,6 +256,178 @@ describe('InvestmentTxnRowEdit — parity with the bank editor', () => {
         fireEvent.keyDown(screen.getByLabelText('Memo'), { key: 'Enter', shiftKey: true });
 
         expect(patchSpy).not.toHaveBeenCalled();
+    });
+
+    // Tags (ADR-0009) had no field on this editor at all, so the only route to
+    // a tagged investment header was the MCP bulk tool — and the register
+    // blanked them on the way back out.
+    describe('tags', () => {
+        it('seeds the tag editor from the row and sends the set on save', async () => {
+            const patchSpy = vi
+                .spyOn(apiModule, 'patchInvestmentTransaction')
+                .mockResolvedValue(null);
+            renderEditor({
+                mode: {
+                    kind: 'edit',
+                    headerId: HEADER_ID,
+                    initialDraft: { ...miscDraft(-75), tags: ['roth'] },
+                    onSaved: vi.fn(),
+                },
+            });
+
+            // Seeded: the chip for the row's existing tag is on screen.
+            expect(await screen.findByText('roth')).toBeInTheDocument();
+
+            fireEvent.keyDown(screen.getByLabelText('Memo'), { key: 'Enter' });
+
+            await waitFor(() => expect(patchSpy).toHaveBeenCalledTimes(1));
+            expect(patchSpy.mock.calls[0]![2]).toMatchObject({ tags: ['roth'] });
+        });
+
+        it('sends [] rather than omitting the field when every tag is removed', async () => {
+            // The server reads an omitted `tags` as "leave them alone", so
+            // omitting an emptied list would make a tag impossible to remove
+            // from this surface — the save would look like it worked.
+            const patchSpy = vi
+                .spyOn(apiModule, 'patchInvestmentTransaction')
+                .mockResolvedValue(null);
+            renderEditor({
+                mode: {
+                    kind: 'edit',
+                    headerId: HEADER_ID,
+                    initialDraft: { ...miscDraft(-75), tags: ['roth'] },
+                    onSaved: vi.fn(),
+                },
+            });
+
+            const remove = await screen.findByRole('button', { name: /remove tag roth/i });
+            fireEvent.click(remove);
+            await waitFor(() => expect(screen.queryByText('roth')).toBeNull());
+
+            fireEvent.keyDown(screen.getByLabelText('Memo'), { key: 'Enter' });
+
+            await waitFor(() => expect(patchSpy).toHaveBeenCalledTimes(1));
+            const body = patchSpy.mock.calls[0]![2] as { tags?: readonly string[] };
+            expect(body.tags).toEqual([]);
+        });
+    });
+
+    // Similar-payees recall. The endpoint always worked for a brokerage row —
+    // a feed row lands bank-shape wherever it is bound — but this editor never
+    // called it, so the one surface where the suggestion is most repetitive
+    // (a quarterly dividend) was the one that never offered it.
+    describe('similar-payees recall', () => {
+        const SUGGESTION = {
+            payee: 'Acme Corp Dividend',
+            counterpartyAccountId: RECALLED_CATEGORY.id,
+            counterpartyAccountName: RECALLED_CATEGORY.name,
+            useCount: 3,
+            lastUsedAt: '2026-04-01T12:00:00Z',
+        };
+
+        it('applies the recalled payee AND category to the draft', async () => {
+            vi.spyOn(apiModule, 'fetchSimilarPayees').mockResolvedValue([SUGGESTION]);
+            const patchSpy = vi
+                .spyOn(apiModule, 'patchInvestmentTransaction')
+                .mockResolvedValue(null);
+            renderEditor();
+
+            const chip = await screen.findByRole(
+                'button', { name: /Acme Corp Dividend/i });
+            fireEvent.click(chip);
+
+            fireEvent.keyDown(screen.getByLabelText('Memo'), { key: 'Enter' });
+
+            await waitFor(() => expect(patchSpy).toHaveBeenCalledTimes(1));
+            // Both halves of the pair, not just the payee — a chip that moved
+            // only the name would look like it had half-failed.
+            expect(patchSpy.mock.calls[0]![2]).toMatchObject({
+                payee: 'Acme Corp Dividend',
+                categoryAccountId: RECALLED_CATEGORY.id,
+            });
+        });
+
+        it('recalls the payee alone on an action with no category slot', async () => {
+            // A buy's layout is [security, shares, price, amount, fee] — there
+            // is nowhere to put the counterparty half. The chip is still
+            // offered, because the PAYEE is the repeated thing and applies
+            // whatever the shape; it just drops its second half rather than
+            // claiming to set something it will skip.
+            vi.spyOn(apiModule, 'fetchSimilarPayees').mockResolvedValue([SUGGESTION]);
+            const patchSpy = vi
+                .spyOn(apiModule, 'patchInvestmentTransaction')
+                .mockResolvedValue(null);
+            renderEditor({
+                mode: {
+                    kind: 'edit',
+                    headerId: HEADER_ID,
+                    // A VALID buy — the matrix requires security/shares/price,
+                    // and Enter refuses to save an invalid draft, so a bare
+                    // action swap would time out rather than assert anything.
+                    initialDraft: {
+                        ...miscDraft(-75),
+                        action: 'buy' as const,
+                        securityId: '00000000-0000-0000-0000-0000000004ec',
+                        shares: 2,
+                        price: 10,
+                        amount: 20,
+                        categoryAccountId: null,
+                    },
+                    onSaved: vi.fn(),
+                },
+            });
+
+            const chip = await screen.findByRole(
+                'button', { name: /Acme Corp Dividend/i });
+            // The counterparty is not named, because it will not be applied.
+            expect(chip).not.toHaveTextContent(RECALLED_CATEGORY.name);
+
+            fireEvent.click(chip);
+            fireEvent.keyDown(screen.getByLabelText('Memo'), { key: 'Enter' });
+
+            await waitFor(() => expect(patchSpy).toHaveBeenCalledTimes(1));
+            const body = patchSpy.mock.calls[0]![2] as {
+                payee?: string | null; categoryAccountId?: string | null;
+            };
+            expect(body.payee).toBe('Acme Corp Dividend');
+            // Anchored on a null START value, so "did not apply" is a real
+            // observation rather than the fixture agreeing with itself.
+            expect(body.categoryAccountId).toBeNull();
+        });
+
+        it('recalls a payee whose counterparty is a Holdings sub-account', async () => {
+            // The case from the dev rig: the row carrying the curated name was
+            // a settled BUY, whose counterparty is the structural Holdings
+            // sibling (ADR-0019). Dropping such suggestions server-side to
+            // avoid an unusable "-> Holdings" chip also dropped the payee, so
+            // recall went silent on exactly the brokerage rows that had a name
+            // worth reusing.
+            vi.spyOn(apiModule, 'fetchSimilarPayees').mockResolvedValue([{
+                ...SUGGESTION,
+                counterpartyAccountId: HOLDINGS_SIBLING_ID,
+                counterpartyAccountName: 'Brokerage Holdings',
+            }]);
+            const patchSpy = vi
+                .spyOn(apiModule, 'patchInvestmentTransaction')
+                .mockResolvedValue(null);
+            renderEditor();   // action 'misc' — HAS a category slot
+
+            const chip = await screen.findByRole(
+                'button', { name: /Acme Corp Dividend/i });
+            expect(chip).not.toHaveTextContent('Brokerage Holdings');
+
+            fireEvent.click(chip);
+            fireEvent.keyDown(screen.getByLabelText('Memo'), { key: 'Enter' });
+
+            await waitFor(() => expect(patchSpy).toHaveBeenCalledTimes(1));
+            const body = patchSpy.mock.calls[0]![2] as {
+                payee?: string | null; categoryAccountId?: string | null;
+            };
+            expect(body.payee).toBe('Acme Corp Dividend');
+            // A category slot EXISTS here, so this pins the Holdings check
+            // rather than the action check: the draft's own category stands.
+            expect(body.categoryAccountId).toBe(CATEGORY.id);
+        });
     });
 
     it('disables its controls while the HOST is saving', async () => {

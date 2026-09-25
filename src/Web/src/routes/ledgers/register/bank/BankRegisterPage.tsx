@@ -10,9 +10,12 @@ import {
     createTransaction,
     deleteTransaction,
     fetchAccounts,
+    fetchHeaderLegs,
     fetchPayees,
     fetchTags,
+    approveTransaction,
     fetchVisibleLedgers,
+    mergeTransaction,
     patchTransaction,
     syncAccount,
 } from '@/lib/api';
@@ -85,6 +88,8 @@ import {
 } from './columns';
 import { RegisterRow } from '../shell/RegisterRow';
 import { TagColorsProvider } from '@/components/tags/TagColorsContext';
+import { RawDataModal } from '../shell/RawDataModal';
+import { REGISTER_SELECT_ALL_LABEL } from '../shell/registerLabels';
 import { bankRowStrategy } from '../strategies/bankRowStrategy';
 import { RegisterBulkActionBar } from '../shell/RegisterBulkActionBar';
 import { buildBankRowMenuItems } from './bankRowMenu';
@@ -338,7 +343,16 @@ export function BankRegisterPage() {
 
     const patchMutation = useMutation({
         mutationFn: (args: { headerId: string; body: PatchTransactionRequest }) =>
-            patchTransaction(ledgerId, args.headerId, args.body, accountId),
+            // A merge is a command with its own route. The editor produces a
+            // merge-only body by construction (the fields are moot once a
+            // candidate is armed), so the presence of mergeFromHeaderId IS the
+            // signal — there is no mixed edit-and-merge save to disambiguate.
+            // The server would reject it either way now: the field is
+            // [JsonIgnore] on the PATCH contract.
+            args.body.mergeFromHeaderId
+                ? mergeTransaction(
+                      ledgerId, args.headerId, args.body.mergeFromHeaderId, accountId)
+                : patchTransaction(ledgerId, args.headerId, args.body, accountId),
         onSuccess: (savedEntry, args) => {
             queryClient.invalidateQueries({ queryKey: ['payees', ledgerId] });
             // Any save can clear / drop a `needs_review` row: an
@@ -531,17 +545,16 @@ export function BankRegisterPage() {
         [register],
     );
 
-    // Slice 2c.6a: approve via PATCH with `approve: true`. The
-    // dedicated POST /approve endpoint was retired so the typical
-    // bank-feed flow (edit-then-approve) lands in one round-trip;
-    // approve-as-is is still a single call with an otherwise-empty
-    // body. patchTransaction returns the freshly-resolved register
-    // entry when account-scoped, which the register window already
-    // ignores for this lightweight mutation (optimistic patch fires
-    // in onMutate).
+    // Approve-as-is is a COMMAND, so it posts to a route that says so rather
+    // than sending a PATCH whose entire body is one flag. The edit-then-approve
+    // flow still rides on the PATCH and stays one atomic round-trip — splitting
+    // THAT would let the edit land and the approval fail, leaving the row
+    // changed but still queued.
+    //
+    // Returns the freshly-resolved register entry when account-scoped, which
+    // this mutation ignores: the optimistic patch already fired in onMutate.
     const approveMutation = useMutation<RegisterEntry | null, ApiError, { headerId: string }>({
-        mutationFn: (args) =>
-            patchTransaction(ledgerId, args.headerId, { approve: true }, accountId),
+        mutationFn: (args) => approveTransaction(ledgerId, args.headerId, accountId),
         onMutate: (args) => patchHeaderNeedsReview(args.headerId, false),
         onSuccess: () => {
             // Approve clears the row's `needs_review`. Invalidate the
@@ -782,10 +795,6 @@ export function BankRegisterPage() {
         [visibleEntries, expandedGroups],
     );
 
-    /** User-facing "row count" — count of register entries (not raw
-     *  transactions). A 14-leg paycheck is ONE entry, not 14 rows. */
-    const visibleEntryCount = visibleEntries.length;
-
     const currency = account?.currencyCode ?? 'USD';
 
     function toggleGroupExpanded(groupId: string) {
@@ -888,7 +897,6 @@ export function BankRegisterPage() {
                     <RegisterTable
                         ledgerId={ledgerId}
                         displayRows={displayRows}
-                        rowCount={visibleEntryCount}
                         currency={currency}
                         today={today}
                         selection={selection}
@@ -995,10 +1003,6 @@ interface RegisterTableProps {
      *  similar-payees fetch (slice 2c.6c) has a per-ledger key. */
     ledgerId: string;
     displayRows: readonly DisplayRow<BankRow>[];
-    /** Underlying transaction count (after filter, before split-collapse).
-     *  Used for the "N rows loaded" footer copy — users care about the
-     *  transaction count, not the post-collapse row count. */
-    rowCount: number;
     currency: string;
     today: Date;
     /** Bulk-selection facade (ADR-0024). Owns the discriminated
@@ -1149,7 +1153,6 @@ interface RegisterTableProps {
 function RegisterTable({
     ledgerId,
     displayRows,
-    rowCount,
     currency,
     today,
     selection,
@@ -1355,6 +1358,17 @@ function RegisterTable({
         | { kind: 'bulk' }
         | null
     >(null);
+
+    // Right-click -> "Show raw data". Diagnostic only: the provider's verbatim
+    // payload when there is one, else a dump of the row and its legs. The legs
+    // come from the shared ['header-legs'] cache the editor also fills, so
+    // opening this on a row the editor has already touched costs no request.
+    const [rawDataTarget, setRawDataTarget] = useState<BankRow | null>(null);
+    const rawDataLegs = useQuery({
+        queryKey: ['header-legs', ledgerId, rawDataTarget?.headerId ?? ''],
+        queryFn: () => fetchHeaderLegs(ledgerId, rawDataTarget!.headerId),
+        enabled: rawDataTarget !== null,
+    });
 
     // Resolve selected leg ids → the owning header set + the sum of
     // their amounts. Multi-selected legs from the same header
@@ -1685,6 +1699,12 @@ function RegisterTable({
                     variant="split-parent"
                     row={parentRow}
                     rowIndex={index}
+                    // Cmd/Ctrl-click toggles selection here as it does on a
+                    // plain row and on BOTH investment variants. Without it the
+                    // modifier fell through to a plain focus, so the same
+                    // gesture on the same-looking row did two different things
+                    // depending on whether the row was a split.
+                    cmdClickToggles
                     accountPaths={accountPaths}
                     // `parentRow` is a synthesized representative carrying the
                     // group's NET amount, so it cannot answer "which
@@ -1926,7 +1946,7 @@ function RegisterTable({
                         allVisibleSelected={allVisibleSelected}
                         onToggleAll={handleSelectAll}
                         disabled={visibleRowsForSelection.length === 0}
-                        selectAllLabel="Select all transactions in this account matching the current filter"
+                        selectAllLabel={REGISTER_SELECT_ALL_LABEL}
                     />
                     <span role="columnheader" className="truncate">
                         Date
@@ -1948,7 +1968,6 @@ function RegisterTable({
             <RegisterScrollSurface
                 scrollRef={setScrollParent}
                 scrollRegionId="register-scroll-region"
-                ariaRowCount={rowCount}
                 scrollTrack={sort.column === 'date' ? (
                     <RegisterScrollTrack
                         // Date-asc → oldest-first buckets so the rail's top
@@ -2049,6 +2068,7 @@ function RegisterTable({
                         onShowOtherSide,
                         onRequestDelete: (target) =>
                             setPendingDelete({ kind: 'single', target }),
+                        onShowRawData: setRawDataTarget,
                     }, {
                         originatingSplit: contextMenu.originatingSplit,
                         noAuthoring: isCategory,
@@ -2062,6 +2082,13 @@ function RegisterTable({
                 policy: manual entries hard-delete (cannot be undone),
                 feed/import rows soft-hide (reversible via "show
                 hidden" once that lands). */}
+            {rawDataTarget !== null ? (
+                <RawDataModal
+                    target={rawDataTarget}
+                    legs={rawDataLegs.data ?? []}
+                    onClose={() => setRawDataTarget(null)}
+                />
+            ) : null}
             <RegisterDeleteConfirm
                 pending={pendingDelete}
                 selectedCount={selectedCount}

@@ -13,7 +13,7 @@ docs ([database-schema.md](database-schema.md), [operations.md](operations.md)).
 1. [Project Overview](#1-project-overview)
 2. [System Architecture](#2-system-architecture)
 3. [Data Model](#3-data-model)
-4. [Transaction Override Layer](#4-transaction-override-layer)
+4. [Current Values and Captured Originals](#4-current-values-and-captured-originals)
 5. [Transaction Merge Pipeline](#5-transaction-merge-pipeline)
 6. [Implementation Notes](#6-implementation-notes)
 7. [Moneydance Migration Plan](#7-moneydance-migration-plan)
@@ -49,11 +49,11 @@ Coffer is a self-hosted personal finance application intended to replace Moneyda
 | ORM / data access | **EF Core end-to-end** in the API (LINQ for queries; `HasDbFunction` for complex Postgres functions; `ExecuteUpdate`/`ExecuteDelete` for set-based mutations). Dapper stays in the importer for its bulk-insert hot path. See [decisions/0005-dapper-and-efcore.md](decisions/0005-dapper-and-efcore.md) as realigned in PR 3.6.5. |
 | Database | PostgreSQL 16+ |
 | Caching | None. Redis was provisioned but never wired and was removed in v0.5.0; the product is single-instance self-hosted. A cache (report/balance, or a distributed sync lock) is a later call if a multi-instance shape ever lands. |
-| Real-time | Server-Sent Events (SSE) via `System.Net.ServerSentEvents`; plain HTTP `POST` for commands; PG `LISTEN`/`NOTIFY` internally. **No SignalR / WebSockets.** See [decisions/0012-sse-and-plain-http-no-signalr.md](decisions/0012-sse-and-plain-http-no-signalr.md). |
+| Real-time | **Not built.** ADR-0012 chose Server-Sent Events over SignalR/WebSockets *when* real-time lands, and that choice stands — but no SSE endpoint, no `LISTEN`/`NOTIFY` and no push of any kind exists in the app today. The SPA refreshes by invalidating React Query keys (ADR-0079). ADR-0096 states the position plainly: Coffer has no way to tell anyone anything. See [decisions/0012-sse-and-plain-http-no-signalr.md](decisions/0012-sse-and-plain-http-no-signalr.md). |
 | Authentication | WebAuthn / FIDO2 passkeys (YubiKey, Windows Hello, Touch ID, phone) via `Fido2.AspNet`; multi-credential per account; one-time recovery codes; cookie session. See [decisions/0013-webauthn-passkey-auth.md](decisions/0013-webauthn-passkey-auth.md). |
 | API documentation | Built-in OpenAPI generator (`Microsoft.AspNetCore.OpenApi`, .NET 10 in-box) |
 | Frontend | Vite + React + TypeScript + Tailwind v4 + TanStack Query + TanStack Router + react-virtuoso. UI primitives are hand-rolled in the shadcn/ui idiom (`class-variance-authority` + `cn(twMerge(clsx))`), not pulled via the shadcn CLI — see ADR-0021 + `src/Web/src/components/ui/` for the in-repo primitives (Button, Typeahead, ContextMenu, ConfirmDialog, StatusBadge, etc.). |
-| Charts | Recharts / Nivo — fully interactive, drillable (Phase 8) |
+| Charts | **No charting library.** ADR-0099 decided against one: the single chart in the product (`SpendCurve`) is hand-rolled inline SVG. `package.json` carries neither Recharts nor Nivo. |
 | Containerization | Docker Compose — postgres + the single-container api/spa (ADR-0059) |
 | Reverse proxy | Traefik — TLS termination, routing, internet-accessible |
 | Bank feed | SimpleFIN Bridge (via MX) — $15/year, up to 25 institutions |
@@ -80,9 +80,8 @@ flowchart TD
     subgraph Backend ["Backend (Docker Compose)"]
         IMP[Import &\nnormalization]
         API[".NET Minimal API\n+ SPA static files (ADR-0059)"]
-        SYNC[SimpleFINSyncService\nIHostedService]
+        SYNC[IngestOrchestrator\n+ FeedSyncJobHandler]
         PG[(PostgreSQL 16)]
-        PG -->|LISTEN/NOTIFY| API
     end
 
     subgraph Ingestion
@@ -99,10 +98,23 @@ flowchart TD
     SF --> SYNC
     IMP --> PG
     SYNC --> PG
-    SYNC -->|SSE| API
 ```
 
-### 2.2 Real-time / streaming
+> The SSE edge and the `LISTEN`/`NOTIFY` edge this diagram used to draw are gone
+> because neither exists — see §2.2. The SPA learns about a completed sync by
+> invalidating its own query keys, not by being told.
+
+### 2.2 Real-time / streaming — **planned, not built**
+
+> **Status (2026-09-24): none of this exists.** There is no SSE endpoint, no
+> `LISTEN`/`NOTIFY`, and no push of any kind. The SPA keeps itself current by
+> invalidating React Query keys after its own writes (ADR-0079); a change made in
+> another tab, by MCP, or by a background sync is not pushed. ADR-0096 says it
+> outright: Coffer has no way to tell anyone anything.
+>
+> The section is kept because the DECISION stands — when real-time lands it will be
+> SSE, not SignalR — and because the diagrams in §2.1 and §2.3 still show the intended
+> shape. Read the tables below as the design, not as the system.
 
 Two patterns, picked for the actual usage shape (single user, server-pushed sync events, button-triggered actions). See [decisions/0012-sse-and-plain-http-no-signalr.md](decisions/0012-sse-and-plain-http-no-signalr.md) for the trade-off analysis.
 
@@ -114,12 +126,20 @@ Two patterns, picked for the actual usage shape (single user, server-pushed sync
 
 **No SignalR, no WebSockets.** SignalR's strengths (multi-client fan-out, transport negotiation, backplane) are sized for many users on flaky networks across multiple replicas, which Coffer is not. The "bidirectional" interaction in this app is a command followed by a streamed status — natively HTTP-shaped.
 
-### 2.3 Sync pipeline flow
+### 2.3 Sync pipeline flow — **the intended shape, partly built**
+
+> The sequence below shows `MergeEvaluator`, auto-merge by confidence score, a rules
+> engine and an SSE push. **None of those four exist.** What ships: the orchestrator
+> dedups on `external_id`, inserts unmatched rows with `needs_review = true`, and the
+> user merges by hand from the editor's "possible matches" panel. Auto-merge was
+> abandoned rather than deferred — see the merge pipeline section — and the rules
+> engine is still an open backlog item.
+
 
 ```mermaid
 sequenceDiagram
     participant Timer as Scheduler
-    participant Sync as SimpleFINSyncService
+    participant Sync as IngestOrchestrator
     participant SF as SimpleFIN API
     participant ME as MergeEvaluator
     participant RE as RuleEngine
@@ -219,7 +239,7 @@ The Vite + React SPA works in Safari on iOS and Chrome on Android without any na
 
 - **Register layout:** a dense spreadsheet-style column grid is unusable on a narrow screen. Use a responsive layout that switches to a card-per-transaction view (amount + payee + date + category) at narrow viewports. react-virtuoso works correctly in both layouts.
 - **Touch targets:** shadcn/ui components are touch-friendly by default. Ensure action buttons (categorize, hide, split) have minimum 44px touch targets.
-- **Reports / charts:** Recharts is fully responsive via the `ResponsiveContainer` wrapper. No extra work needed.
+- **Reports / charts:** there is no chart library to be responsive (ADR-0099). The one chart, `SpendCurve`, is inline SVG with a `viewBox`, which scales by construction.
 - **Merge review queue:** the side-by-side comparison view needs to stack vertically on mobile — design as a column layout with a clear "match" / "no match" action bar at the bottom of the screen.
 
 ---
@@ -244,7 +264,7 @@ Moneydance is a genuine double-entry accounting system. Confirmed by Moneydance 
 | `loan` | Amortizing loans (mortgages, auto loans) — distinct from `liability` because loans carry payment-schedule metadata (APR, term, compounding). See [decisions/0016-moneydance-account-translation.md](decisions/0016-moneydance-account-translation.md). |
 | `category` | Budgeting concept — the "other side" of income/spending transactions. The income-vs-expense distinction lives in `category_kind`, not in this column. See [decisions/0017-account-discriminator.md](decisions/0017-account-discriminator.md). |
 
-`category_kind` is `'income'` or `'expense'`, set if and only if `account_type = 'category'`.
+`category_kind` is `'income'`, `'expense'` or `'adjustment'`, set if and only if `account_type = 'category'`. **`adjustment`** was added by migration 224 (amending ADR-0017) for entries that are neither earned nor spent — a property revaluation booked as an expense category made one month compute to negative total spend and two whole years to negative income. A report that sums {income, expense} and ignores `adjustment` reintroduces exactly that.
 
 **Hierarchy.** `parent_id` is a self-referencing FK and is only allowed on `category` rows (enforced by CHECK constraint). Real-account hierarchy (e.g. a placeholder "Checking" parent grouping two same-bank checking accounts in MD's data) is **not** modelled; those become flat top-level accounts. Categories form a tree freely — a parent category can have its own direct transactions and child categories, both, or neither. There is no `is_placeholder` column; the "this is just a folder" property is derived in the UI as "has children AND no own transactions".
 
@@ -273,7 +293,30 @@ The full ERD lives in [database-schema.md](database-schema.md) alongside the col
 | `ledger_operation_errors` | SimpleFIN `errlist[]` entries persisted per run (slice 2c.1, migration 038). |
 | `ledger_operation_promotions` | Promote-on-clear events: bank-side amount delta between the pending hold and the cleared transaction (slice 2c.1, migration 038). |
 | `recurring_transactions` | Recurring/scheduled transaction templates (Moneydance "reminders") |
-| `tags` | User-defined transaction tags |
+| `tags` | User-defined transaction tags (ADR-0009); the join is `txn_header_tags`, so a tag belongs to the EVENT rather than to a leg. |
+
+**The sixteen rows above are the ledger's core, not the schema.** `AppDbContext`
+maps **52** tables. The rest fall into groups that this document does not otherwise
+describe, listed here so the omission is deliberate rather than a gap someone has to
+rediscover:
+
+| Group | Tables |
+|---|---|
+| Ledger root + membership | `ledgers`, `user_ledger_grants`, `user_account_groups`, `user_account_group_members`, `user_preferences` |
+| Derived / materialized | `txn_header_account_balances` (where the running balance lives), `realized_gains`, `txn_header_originals`, `txn_header_tags`, `txn_leg_recon` |
+| Investment detail | `security_components`, `security_splits`, `provider_security_mappings`, `loan_terms` |
+| Budgets + reminders | `budget_targets`, `recurring_occurrence_exceptions` |
+| Ingest config | `feed_connection_accounts`, `feed_csv_mappings` |
+| Scheduling | `scheduled_jobs`, `global_scheduled_jobs` |
+| Snapshots + backups | `ledger_snapshots`, `ledger_snapshot_parts`, `backup_settings`, `backup_pins`, `drive_sync` |
+| Identity + auth | `users`, `webauthn_credentials`, `webauthn_pending_challenges`, `auth_sessions`, `recovery_codes`, `bootstrap_tokens`, `invites` |
+| MCP | `mcp_access_tokens`, `mcp_tool_invocations` |
+| Notifications + audit | `ledger_events`, `system_events`, `ledger_notification_subscribers`, `notification_subscribers`, `admin_audit_events` |
+| Deployment | `system_settings`, `__schema_migrations` |
+
+Column-level detail for every one of them is in
+[database-schema.md](database-schema.md); this list exists so "what tables are
+there?" has a complete answer somewhere in this document.
 
 The detailed column-level schema is in [database-schema.md](database-schema.md).
 
@@ -415,9 +458,9 @@ Only `ledger_operations` from this section's original cast is documented column-
 
 ### 6.1 Running balance recompute
 
-The `balance_after` column on `txn_legs` is a stored running balance, recomputed by the Postgres function `fn_recompute_balances_for_account`. It walks an account's legs ordered by `(txn_headers.posted_at, txn_legs.id)` from the earliest affected point forward — correct even when a Moneydance import arrives out of date order. Migration 090 (ADR-0034) first drove this from triggers; **migration 102 dropped those triggers and moved the call to the API call sites** — every EF Core writer invokes the function through a `HasDbFunction` binding after its mutation (no raw SQL, per the data-access rules). See [decisions/0004-balance-after-trigger.md](decisions/0004-balance-after-trigger.md) for the original decision and [decisions/0022-txn-headers-and-legs.md](decisions/0022-txn-headers-and-legs.md) for the header/leg split.
+Running balance is stored per `(header, account)` in `txn_header_account_balances` (migration 089), recomputed by the Postgres function `fn_recompute_balances_for_account`. It walks an account's headers ordered by `(posted_at, seq)` from the earliest affected point forward — `seq` since migration 096, because `id` is not a time order — correct even when a Moneydance import arrives out of date order. The older per-leg `txn_legs.balance_after` column was dropped by migration 092. Migration 090 (ADR-0034) first drove the recompute from triggers; **migration 102 dropped those triggers and moved the call to the API call sites** — every EF Core writer invokes the function through a `HasDbFunction` binding after its mutation (no raw SQL, per the data-access rules). See [decisions/0004-balance-after-trigger.md](decisions/0004-balance-after-trigger.md) for the original decision and [decisions/0022-txn-headers-and-legs.md](decisions/0022-txn-headers-and-legs.md) for the header/leg split.
 
-**Consequence:** a mutation that bypasses the tracked EF path (direct SQL, an `ExecuteUpdate` outside a call site that recomputes) won't refresh `balance_after`. The per-ledger verify-and-heal endpoint (operations.md → *Diagnostics*) re-runs the recompute and reports/repairs any drift — the backstop for that case.
+**Consequence:** a mutation that bypasses the tracked EF path (direct SQL, an `ExecuteUpdate` outside a call site that recomputes) won't refresh the stored balance. The backstop is a PAIR of endpoints, not one: `GET .../balances/health` reports drift and writes nothing, `POST .../balances/repair` fixes it (operations.md → *Diagnostics*). They were one POST that healed as a side effect until migration 206 split calculation from persistence — asking the question used to rewrite the answer.
 
 ### 6.2 Cursor-based pagination for the register
 
@@ -431,9 +474,13 @@ read-path keeps the keys function and runs the row fetch as LINQ over
 for why entries are the unit, and [database-schema.md](database-schema.md#functions)
 for the function signatures.
 
-The composite cursor is `(posted_at, created_at, entry_key)` —
-`created_at` is the same-day tiebreaker (migration 029) so a freshly
-created manual transaction sorts above older same-day rows.
+The composite cursor is `(posted_at, header_seq, entry_key)`.
+`seq` is the same-day tiebreaker so a freshly created manual
+transaction sorts above older same-day rows — migration 029 used
+`created_at` for this and **migration 097 replaced it with `seq`**,
+which is monotonic per ledger and immutable (a trigger rejects updates
+to it), where two rows inserted in the same millisecond were not
+ordered by `created_at` at all.
 Pagination is **bidirectional sliding-window** (migration 031): one
 page request takes an optional cursor plus a direction (`before` /
 `after`) and returns the next page in that direction along with two
@@ -447,12 +494,21 @@ into so the receiving register opens already focused on the
 counterparty leg, regardless of how deep in history the row sits.
 
 The order across both Q1 (the entry-key function) and Q2 (the LINQ
-row fetch in `RegisterRepository`) is uniform time-DESC even when
-walking forward in time:
+row fetch in `RegisterRepository`) is the same, and it is **not fixed
+to date-descending** — migration 166 parameterised it. `p_sort_column`
+is whitelisted (`date` / `amount` / `payee` / `category`, plus
+`security` / `shares` / `price` / `action` on an investment register)
+and `p_sort_dir` picks the direction; anything else falls back to
+`date`. Date-descending is the default, and in that case reads:
 
 ```
-ORDER BY posted_at DESC, MAX(created_at) DESC, COALESCE(txn_group_id, id) DESC
+ORDER BY posted_at DESC, MAX(header_seq) DESC, entry_key DESC
 ```
+
+The entry key itself is asymmetric per ADR-0036 — the header id when
+the viewing account owns every posting on it, else the leg id — so a
+target-split cluster pages as its own entry rather than as part of the
+originating header's.
 
 For `direction='after'`, Q1 walks the keys ASC for the LIMIT scan
 (strictly newer than the cursor) and the outer SELECT flips them
@@ -524,7 +580,7 @@ to enable Confirm — the typed-confirm primitive lives on
 
 See [database-schema.md](database-schema.md) §"Indexes" for the complete list with rationale. The hot-path indexes (post-ADR-0022) are:
 
-- `idx_txn_headers_ledger_visible` — `(ledger_id, posted_at DESC, id DESC)` partial `WHERE NOT is_hidden AND is_merged_into IS NULL` — drives register pagination via `register_entry_keys`.
+- `idx_txn_headers_ledger_posted_seq` — `(ledger_id, posted_at DESC, seq DESC)` (migration 095) — the read-path index that drives register pagination via `register_entry_keys`, matching the cursor's own ordering. (An earlier `idx_txn_headers_ledger_visible` on `(…, id DESC)` was attributed this role here; `id` is not a time order, which is why 095 added `seq` and an index over it.)
 - `uq_txn_legs_posting` — `(header_id, posting_index, account_id)` — two-legs-per-posting invariant + leg upsert key.
 - `idx_txn_legs_account_id` — per-account leg lookup + running-balance trigger scan.
 - `uq_txn_headers_ledger_external_id` — `(ledger_id, external_id) WHERE external_id IS NOT NULL` — idempotent re-import / re-sync key at the event level (ADR-0022).
@@ -539,13 +595,13 @@ A materialized view pre-aggregating account balances by month is planned for Pha
 ```mermaid
 flowchart LR
     subgraph Services [".NET Backend"]
-        SYNC[SimpleFINSyncService\nIHostedService]
-        ME[MergeEvaluator]
-        RE[TransactionRuleEngine]
+        SYNC[IngestOrchestrator\n+ SimpleFinPullProvider]
+        ME["MergeEvaluator\n(not built)"]
+        RE["TransactionRuleEngine\n(not built)"]
         RR[RegisterRepository\nEF Core LINQ + HasDbFunction]
-        TR[TransactionsRepository\n+ Overrides repo]
-        RS[ReportService]
-        SSE[SseController]
+        TR[TransactionsRepository]
+        RS[ReportingRepository]
+        SSE["SseController\n(not built)"]
     end
 
     subgraph Data
@@ -573,12 +629,12 @@ flowchart LR
 
 | Service / class | Responsibility |
 |---|---|
-| `SimpleFinSyncService` | Server-side orchestrator for the Sync-now flow (Phase 5 slice 2b+). Walks the SimpleFIN connection, FITID-dedups against existing `txn_headers`, inserts unmatched rows directly with `needs_review=true`. Hand-driven merge (slice 2c.6) replaces the original auto-merge plan; no `MergeEvaluator` component exists. |
+| `IngestOrchestrator` + `SimpleFinPullProvider` | Server-side orchestrator for the Sync-now flow, driven by `FeedSyncJobHandler`. Walks the SimpleFIN connection, FITID-dedups against existing `txn_headers`, inserts unmatched rows with `needs_review=true`. Hand-driven merge replaces the original auto-merge plan; no `MergeEvaluator` exists. (This row used to name a `SimpleFinSyncService`, which never existed under that name.) |
 | `TransactionRuleEngine` | *Not built.* Original plan was a transaction-rules engine running rule rows over each sync; the rules table was dropped in migration 044 and the feature is parked as "Rule-based auto-categorization on sync" in the open-work backlog. |
 | `RegisterRepository` (EF Core) | Cursor-paginated register queries against `resolved_transactions`; uses `HasDbFunction` to bind the `register_entry_keys` Postgres function for keyset pagination. |
-| `TransactionsRepository` + `TransactionOverridesRepository` | Manual-transaction create, recon-status / delete mutations, override-layer PATCH path. EF Core; no raw SQL. |
+| `TransactionsRepository` | Manual-transaction create, recon-status / delete mutations, the PATCH path. EF Core; no raw SQL. The `TransactionOverridesRepository` this row used to name retired with ADR-0025 — and the override layer it wrote to was inverted by ADR-0100, so there is nothing for a second repository to own. |
 | `ReportService` | Aggregation queries for spending trends, net worth, cashflow. (Phase 8; the MCP reporting layer per ADR-0063 is the first slice.) |
-| `SseController` | Subscribes to Npgsql LISTEN; streams new transactions and sync status to frontend. (Phase 5+) |
+| ~~`SseController`~~ | **Not built.** No SSE endpoint and no `LISTEN`/`NOTIFY` exist; the SPA refreshes through React Query invalidation (ADR-0079). Listed here as absent rather than deleted, because the surrounding table annotates other unbuilt components the same way and silently dropping the row would read as "it shipped". |
 
 ---
 

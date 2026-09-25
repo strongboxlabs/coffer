@@ -316,7 +316,34 @@ public sealed class PatchTransactionRequest
     /// allowed — one-hop collapse); and the two must differ. Origin is NOT
     /// constrained — a candidate may be manual, bank-fed, or imported.</para>
     /// </summary>
+    /// <remarks>
+    /// <para><b>Not settable from the wire.</b> Merging is a COMMAND and has its
+    /// own route; this property survives only so that route can reuse the one
+    /// repository method that performs the fold. <c>[JsonIgnore]</c> is what
+    /// makes the extraction real rather than advisory — without it the old
+    /// merge-by-PATCH shape keeps working, and a second way to do one thing is
+    /// a second place for its invariants to drift.</para>
+    /// </remarks>
+    [JsonIgnore]
     public Guid? MergeFromHeaderId { get; init; }
+}
+
+/// <summary>
+/// Body of
+/// <c>POST /api/ledgers/{ledgerId}/transactions/{headerId}/merge</c> and its
+/// investment twin.
+/// </summary>
+/// <remarks>
+/// Direction is INVERTED, and the field is named to say so: the URL's
+/// <c>headerId</c> is the LOSER and <see cref="FromHeaderId"/> is the surviving
+/// WINNER. The user picked the canonical row in the candidates panel, so that is
+/// the row that keeps its identity, its postings and any losers it has already
+/// absorbed; the fresh review row is what disappears.
+/// </remarks>
+public sealed class MergeTransactionRequest
+{
+    /// <summary>The SURVIVING transaction — see the type's remarks.</summary>
+    public Guid FromHeaderId { get; init; }
 }
 
 // ----------------------------------------------------------------------

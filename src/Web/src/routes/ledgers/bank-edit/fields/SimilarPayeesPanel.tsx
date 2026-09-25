@@ -27,11 +27,25 @@ export function SimilarPayeesPanel({
     accountPaths,
     disabled,
     onApply,
+    showsCounterparty = () => true,
 }: {
     suggestions: readonly SimilarPayeeDto[];
     accountPaths: Map<string, string>;
     disabled: boolean;
     onApply: (suggestion: SimilarPayeeDto) => void;
+    /** Whether this chip's counterparty half will actually be APPLIED when the
+     *  chip is clicked. A chip that shows "→ X" and then does not set X reads
+     *  as half-broken, so the arrow and the account name are rendered only
+     *  when the caller can take them.
+     *
+     *  Defaults to true, which is the bank editor: every suggestion it gets
+     *  names a category or a transfer account, both of which its posting
+     *  picker accepts. The investment editor cannot always take one — a sell
+     *  has no category slot, and on a brokerage a prior buy's counterparty is
+     *  the structural Holdings sub-account (ADR-0019) that no picker offers —
+     *  but the PAYEE is still worth recalling, so the chip stays and loses its
+     *  second half. */
+    showsCounterparty?: (suggestion: SimilarPayeeDto) => boolean;
 }) {
     if (suggestions.length === 0) return null;
     return (
@@ -40,18 +54,27 @@ export function SimilarPayeesPanel({
             {suggestions.map((s) => {
                 const counterpartyLabel =
                     accountPaths.get(s.counterpartyAccountId) ?? s.counterpartyAccountName;
+                const withCounterparty = showsCounterparty(s);
                 return (
                     <button
                         key={`${s.payee}::${s.counterpartyAccountId}`}
                         type="button"
                         disabled={disabled}
                         onClick={() => onApply(s)}
-                        title={`Apply payee "${s.payee}" → "${counterpartyLabel}" (used ${s.useCount}×)`}
+                        title={
+                            withCounterparty
+                                ? `Apply payee "${s.payee}" → "${counterpartyLabel}" (used ${s.useCount}×)`
+                                : `Apply payee "${s.payee}" (used ${s.useCount}×)`
+                        }
                         className="inline-flex items-baseline gap-1 rounded border border-border bg-surface px-1.5 py-0.5 text-text hover:border-accent hover:bg-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
                     >
                         <span className="font-medium">{s.payee}</span>
-                        <span className="text-text-subtle">→</span>
-                        <span>{counterpartyLabel}</span>
+                        {withCounterparty ? (
+                            <>
+                                <span className="text-text-subtle">→</span>
+                                <span>{counterpartyLabel}</span>
+                            </>
+                        ) : null}
                         {s.useCount > 1 ? (
                             <span className="text-text-subtle">×{s.useCount}</span>
                         ) : null}

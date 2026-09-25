@@ -8,11 +8,20 @@ import {
     fetchHoldings,
     fetchInvestmentMergeCandidates,
     fetchSecurities,
+    fetchPayees,
+    fetchSimilarPayees,
+    fetchTags,
+    mergeInvestmentTransaction,
     patchInvestmentTransaction,
 } from '@/lib/api';
 import { AddSecurityDialog } from '../components/AddSecurityDialog';
 import { Button } from '@/components/ui/Button';
 import { FieldLabel } from '@/components/ui/FieldLabel';
+import { buildAccountPathMap } from '@/lib/accountPath';
+import { Typeahead } from '@/components/ui/Typeahead';
+import { TagsInput } from '../bank-edit/fields/TagsInput';
+import { SimilarPayeesPanel } from '../bank-edit/fields/SimilarPayeesPanel';
+import { DateField } from '../components/DateField';
 import { formatCurrency } from '@/lib/money';
 import type {
     AccountSummary,
@@ -20,6 +29,7 @@ import type {
     InvestmentMergeCandidate,
     LedgerInvestmentAction,
     PatchInvestmentTransactionRequest,
+    PayeeSuggestion,
     RegisterEntry,
 } from '@/lib/types';
 
@@ -211,6 +221,7 @@ export function InvestmentTxnRowEdit({
     const {
         draft, errors, isValid,
         setAction, setPostedAt, setTransactedAt, setPayee, setMemo, setCheckNumber,
+        setTags,
         setSecurityId, setShares, setPrice, setAmount,
         setCategoryAccountId, setTransferAccountId,
         setFeeAccountId, setFeeAmount,
@@ -262,6 +273,57 @@ export function InvestmentTxnRowEdit({
     // Armed merge target — set when the user clicks a "Possible match" chip,
     // sent as a merge-only PATCH on save. Null = no merge. The chip is a
     // toggle; the candidate is authoritative so there's no form pre-fill.
+    // The ledger's payee vocabulary, for the Payee typeahead. Same query key
+    // and staleTime as the bank editor's, so the two share one cache entry
+    // rather than each holding their own copy of the same list.
+    //
+    // Only the TYPEAHEAD is mirrored so far. Bank's similar-payees recall panel
+    // — which suggests the (payee, counterparty) pair chosen last time — is NOT
+    // yet here, and the reason is scope, not domain: it applies perfectly well.
+    // CategoryAccountId is REQUIRED on dividend_cash / dividend_reinvest / divx
+    // / misc and FeeAccountId adds one on any action, so a dividend carries an
+    // income category leg exactly as a bank row carries its category. Recall is
+    // tracked as outstanding rather than declined.
+    const payeesQuery = useQuery({
+        queryKey: ['payees', ledgerId],
+        queryFn: () => fetchPayees(ledgerId),
+        staleTime: 30_000,
+    });
+
+    // The ledger's tag dictionary, for the TagsInput autocomplete. Same query
+    // key as the bank editor's, so both editors share one cache entry and a tag
+    // created from either surface autocompletes in the other without a refetch.
+    const tagsQuery = useQuery({
+        queryKey: ['tags', ledgerId],
+        queryFn: () => fetchTags(ledgerId),
+        staleTime: 30_000,
+    });
+
+    // Similar-payees recall (slice 2c.6c), the same endpoint and the same query
+    // key the bank editor uses — so opening a row in either editor warms the
+    // other's cache and the two can never disagree about what was recalled.
+    //
+    // The endpoint never needed a change for this: a feed row lands BANK-shape
+    // whatever account it is bound for — two legs, (real account,
+    // Uncategorized), with the investment detail parked in the ingest_*
+    // carriers until someone classifies it — so its anchor resolves here
+    // exactly as it does on a checking account. This editor simply never
+    // asked, and a dividend categorised the same way every quarter had to be
+    // categorised by hand every quarter.
+    const recallHeaderId = mode.kind === 'edit' ? mode.headerId : null;
+    const similarPayeesQuery = useQuery({
+        queryKey: ['similar-payees', ledgerId, recallHeaderId],
+        queryFn: () => fetchSimilarPayees(ledgerId, recallHeaderId!),
+        enabled: recallHeaderId !== null,
+        staleTime: Infinity, // static list; no refetch while the editor is open
+    });
+
+    // Account-id -> full slash path, so a recalled counterparty reads as its
+    // parent->child chain rather than a bare leaf name. Built from the account
+    // list the editor already takes, rather than adding a prop the two call
+    // sites would both have to thread through.
+    const accountPaths = useMemo(() => buildAccountPathMap(accounts), [accounts]);
+
     const [mergeFromHeaderId, setMergeFromHeaderId] = useState<string | null>(null);
 
     const [saveError, setSaveError] = useState<string | null>(null);
@@ -278,6 +340,13 @@ export function InvestmentTxnRowEdit({
     // onSaved handler is responsible for refreshing it.
     function invalidateAfterSave() {
         queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+        // The payee vocabulary is per-LEDGER, not per-register, so a payee first
+        // used on a brokerage row belongs in it. Only the bank register was
+        // invalidating this key, so the effect was one-directional and easy to
+        // miss: a bank save refreshed the list for every editor, an investment
+        // save refreshed it for none — the new name stayed absent from every
+        // typeahead until the cache expired or the page reloaded.
+        queryClient.invalidateQueries({ queryKey: ['payees', ledgerId] });
         queryClient.invalidateQueries({ queryKey: ['holdings'] });
         queryClient.invalidateQueries({ queryKey: ['securities', ledgerId] });
         // Lots may have changed for sell-side actions; invalidate
@@ -323,11 +392,19 @@ export function InvestmentTxnRowEdit({
     });
 
     const patchMutation = useMutation({
-        mutationFn: (body: PatchInvestmentTransactionRequest) =>
-            mode.kind === 'edit'
-                ? patchInvestmentTransaction(
-                      ledgerId, mode.headerId, body, brokerageAccountId)
-                : Promise.reject(new Error('patchMutation in non-edit mode')),
+        mutationFn: (body: PatchInvestmentTransactionRequest) => {
+            if (mode.kind !== 'edit') {
+                return Promise.reject(new Error('patchMutation in non-edit mode'));
+            }
+            // A merge is a command with its own route — see the bank page for the
+            // same dispatch. handleSave sends a merge-only body, so the field's
+            // presence is the signal; the PATCH contract no longer accepts it.
+            return body.mergeFromHeaderId
+                ? mergeInvestmentTransaction(
+                      ledgerId, mode.headerId, body.mergeFromHeaderId, brokerageAccountId)
+                : patchInvestmentTransaction(
+                      ledgerId, mode.headerId, body, brokerageAccountId);
+        },
         onSuccess: (entry, body) => {
             setSaveError(null);
             invalidateAfterSave();
@@ -343,7 +420,7 @@ export function InvestmentTxnRowEdit({
         },
     });
 
-    /// Escape cancels, as it does on a bank row.
+    /// Escape cancels and Enter saves, as they do on a bank row.
     function handleKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
         // `defaultPrevented` is the guard, copied deliberately from the bank
         // editor: a picker that closed its own panel on Escape marks the event,
@@ -352,7 +429,31 @@ export function InvestmentTxnRowEdit({
         if (event.key === 'Escape' && !event.defaultPrevented) {
             event.preventDefault();
             onCancel();
+            return;
         }
+
+        // Enter saves. The bank editor has had this on its text fields; here it
+        // sits on the container so it works from any field, and the same
+        // exclusions apply:
+        //
+        //   * defaultPrevented — a picker that consumed Enter to choose an option
+        //     must not also submit the row behind it.
+        //   * Shift+Enter — a newline in the memo textarea.
+        //   * a textarea at all — Enter is a newline there, which is why the bank
+        //     editor pairs it with the Shift check on that field specifically.
+        //   * a button — Enter on a focused button is that button's click, and
+        //     hijacking it would fire Save from Cancel.
+        if (event.key !== 'Enter' || event.shiftKey || event.defaultPrevented) return;
+        const target = event.target as HTMLElement | null;
+        const tag = target?.tagName;
+        if (tag === 'TEXTAREA' || tag === 'BUTTON') return;
+
+        event.preventDefault();
+        // Route through the same gate the button uses rather than calling
+        // handleSave directly — otherwise Enter would submit an invalid draft
+        // that the disabled button is refusing.
+        if (disabled || (mergeFromHeaderId === null && !isValid)) return;
+        handleSave();
     }
 
     function handleSave() {
@@ -382,6 +483,17 @@ export function InvestmentTxnRowEdit({
                 // on the request, so this is safe to pass through
                 // even on actions that don't need a security.
                 const body = draftToPatchRequest(draft);
+                // Saving a needs-review row IS the Accept action, so the flag
+                // rides along and the row is accepted in the same transaction
+                // as the edit. The server no longer infers it: a successful
+                // PATCH used to clear needs_review unconditionally, which meant
+                // every other client accepted whatever it touched and nobody
+                // could correct an imported row and leave it queued. An
+                // already-accepted row omits the field, so a no-op re-save
+                // stays semantically idempotent — same shape as the bank editor.
+                if (mode.needsReview === true) {
+                    body.approve = true;
+                }
                 if (mode.providerSecurityHint && draft.securityId !== null) {
                     body.providerSecurityHint = mode.providerSecurityHint;
                 }
@@ -396,6 +508,32 @@ export function InvestmentTxnRowEdit({
 
     const action = draft.action;
     const layout = action ? ACTION_LAYOUTS[action] : [];
+    // Recall is offered on EVERY action. It was gated to actions with a
+    // category slot, on the reasoning that a suggestion is one (payee,
+    // counterparty) pair and there is nowhere to put the counterparty half of
+    // one on a buy or a sell. That threw away the half that matters: the payee
+    // is the repeated thing, and on a brokerage the row carrying the name the
+    // user curated is very often a buy.
+    const recallSuggestions = similarPayeesQuery.data ?? [];
+
+    // The Holdings sub-accounts in this ledger. A prior settled buy's
+    // counterparty IS one (ADR-0019) — structural, not a category, and offered
+    // by no picker — so its half of the pair cannot be applied.
+    const holdingsAccountIds = useMemo(
+        () => new Set(
+            accounts
+                .map((a) => a.holdingsAccountId)
+                .filter((id): id is string => id !== null),
+        ),
+        [accounts],
+    );
+
+    // Whether a suggestion's counterparty half can be taken: the action must
+    // have a category slot to put it in, and it must be something that slot
+    // accepts.
+    const canApplyCounterparty = (counterpartyAccountId: string) =>
+        layout.includes('category')
+        && !holdingsAccountIds.has(counterpartyAccountId);
     // The host's flag counts too — in 'fire' mode it is the only one that can
     // ever be true.
     const disabled = mutation.isPending || isSaving === true;
@@ -450,20 +588,21 @@ export function InvestmentTxnRowEdit({
                     </select>
                 </div>
 
-                <div className="flex flex-col gap-1 text-xs">
-                    <FieldLabel htmlFor={dateId}>Date</FieldLabel>
-                    <input
+                {/* The shared DateField, not a hand-rolled type="date".
+                    Both editors were spelling the same input twice, and only
+                    one of the two copies had the keyboard shortcuts — so `t`,
+                    `y` and +/- worked on a bank row and silently did nothing on
+                    an investment one. autoFocus is preserved: without it focus
+                    stays on the register grid behind and the first keystroke
+                    after opening a row goes nowhere. */}
+                <div className="text-xs">
+                    <DateField
                         id={dateId}
-                        type="date"
+                        label="Date"
                         value={draft.postedAt}
-                        onChange={(e) => setPostedAt(e.target.value)}
-                        // Opening the editor puts the caret here, as the bank
-                        // editor does in both its layouts. Without it focus stayed
-                        // on the register grid behind, so the first keystroke after
-                        // opening a row went nowhere.
+                        onChange={setPostedAt}
                         autoFocus
                         disabled={disabled}
-                        className="h-control-28px rounded border border-border bg-surface px-2 font-mono text-xs"
                     />
                 </div>
 
@@ -471,21 +610,19 @@ export function InvestmentTxnRowEdit({
                     sends postedAt for blank rather than null, because the
                     investment PATCH is wholesale-replace and an omitted field
                     CLEARS the stored value. */}
-                <div className="flex flex-col gap-1 text-xs">
-                    {/* "(optional)" goes in the LABEL, following Fee: a
-                        `placeholder` is inert on type="date" — the browser's own
-                        mm/dd/yyyy mask occupies that space — so the text inputs'
-                        placeholder convention cannot carry it here. */}
-                    <FieldLabel htmlFor={taxDateId}>Tax date (optional)</FieldLabel>
-                    <input
+                {/* "(optional)" goes in the LABEL, following Fee: a
+                    `placeholder` is inert on type="date" — the browser's own
+                    mm/dd/yyyy mask occupies that space — so the text inputs'
+                    placeholder convention cannot carry it here. The hint rides
+                    in DateField's tooltip alongside the shortcut list. */}
+                <div className="text-xs">
+                    <DateField
                         id={taxDateId}
-                        type="date"
+                        label="Tax date (optional)"
                         value={draft.transactedAt}
-                        onChange={(e) => setTransactedAt(e.target.value)}
+                        onChange={setTransactedAt}
                         disabled={disabled}
-                        aria-label="Tax date"
-                        title="Leave blank when the tax date is the same as the posted date"
-                        className="h-control-28px rounded border border-border bg-surface px-2 font-mono text-xs"
+                        hint="Leave blank when the tax date is the same as the posted date"
                     />
                 </div>
 
@@ -508,15 +645,50 @@ export function InvestmentTxnRowEdit({
             <div className="col-span-full flex gap-3 pb-2">
                 <div className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
                     <FieldLabel htmlFor={payeeId}>Payee</FieldLabel>
-                    <input
-                        id={payeeId}
-                        type="text"
+                    {/* The same Typeahead the bank editor uses, over the same
+                        ledger-wide payee list. This was a bare text input, so a
+                        payee typed on a brokerage row had to be retyped exactly
+                        or it silently became a second, near-identical entry in a
+                        vocabulary that is ledger-wide, not per-register. */}
+                    <Typeahead<PayeeSuggestion>
+                        items={payeesQuery.data ?? []}
                         value={draft.payee}
-                        onChange={(e) => setPayee(e.target.value)}
+                        onChange={setPayee}
+                        getKey={(p) => p.name}
+                        getLabel={(p) => p.name}
                         disabled={disabled}
-                        placeholder="(optional)"
-                        className="h-control-28px w-full rounded border border-border bg-surface px-2 text-xs"
+                        aria-label="Payee"
                     />
+                    {/* Recall chips, under the payee exactly as on a bank row.
+                        Offered on every action: the payee is the repeated
+                        thing, and it is applicable whatever the shape.
+
+                        The counterparty half is applied only when there is a
+                        category slot to put it in AND it is not a Holdings
+                        sub-account — and the chip hides its "→ X" in exactly
+                        the cases it will not apply it, so a chip never claims
+                        to do something it then skips.
+
+                        The fee slot is also a category counterparty, but which
+                        of the two a suggestion meant is not recoverable from
+                        the pair, so it lands on the category and the user moves
+                        it if they meant the fee. */}
+                    {recallSuggestions.length > 0 ? (
+                        <SimilarPayeesPanel
+                            suggestions={recallSuggestions}
+                            accountPaths={accountPaths}
+                            disabled={disabled}
+                            showsCounterparty={(s) =>
+                                canApplyCounterparty(s.counterpartyAccountId)
+                            }
+                            onApply={(s) => {
+                                setPayee(s.payee);
+                                if (canApplyCounterparty(s.counterpartyAccountId)) {
+                                    setCategoryAccountId(s.counterpartyAccountId);
+                                }
+                            }}
+                        />
+                    ) : null}
                 </div>
                 <div className="flex min-w-0 flex-[2] flex-col gap-1 text-xs">
                     <FieldLabel htmlFor={memoId}>Memo</FieldLabel>
@@ -541,6 +713,29 @@ export function InvestmentTxnRowEdit({
                         className="h-control-28px w-full rounded border border-border bg-surface px-2 text-xs"
                     />
                 </div>
+            </div>
+
+            {/* Row 2b: tags (ADR-0009 — a property of the EVENT, so it applies
+                to every action and sits with the header-level fields rather
+                than among the action x field matrix below).
+
+                Same component, same ledger dictionary and same create-on-
+                first-use semantics as the bank editor. Before this the field
+                did not exist on this surface at all: a tag could only reach an
+                investment header through the MCP bulk tool, and the register
+                then blanked it on the way back out, so it was invisible even
+                once written. One TagsInput for the whole event — the legs the
+                action derives never carry their own, exactly as a bank split's
+                postings do not. */}
+            <div className="col-span-full flex flex-col gap-1 pb-2 text-xs">
+                <TagsInput
+                    label="Tags"
+                    tags={draft.tags}
+                    allTags={tagsQuery.data ?? []}
+                    onChange={setTags}
+                    disabled={disabled}
+                    aria-label="Tags"
+                />
             </div>
 
             {/* Merge candidates — settled rows this fresh row could fold
@@ -718,9 +913,6 @@ export function InvestmentTxnRowEdit({
             <div className="col-span-full -mx-3 flex items-center justify-between gap-2 border-t border-border/30 px-3 pt-2">
                 <div className="flex items-center gap-3">{footerLeading}</div>
                 <div className="flex items-center gap-2">
-                    {saveError ? (
-                        <span className="text-xs text-state-danger" role="alert">{saveError}</span>
-                    ) : null}
                     <Button type="button" variant="secondary" size="sm" onClick={onCancel} disabled={disabled}>
                         Cancel
                     </Button>
@@ -733,6 +925,16 @@ export function InvestmentTxnRowEdit({
                         // fields are discarded, so Save stays enabled purely
                         // on the merge stamp (mirrors bank).
                         disabled={disabled || (mergeFromHeaderId === null && !isValid)}
+                        // A disabled control that does not say why is a dead end:
+                        // the validator already produces a message per field and
+                        // nothing was showing them, so the only feedback was a
+                        // button that would not press. Bank has done this since
+                        // ADR-0023; same treatment, same source of truth.
+                        title={
+                            mergeFromHeaderId === null && !isValid
+                                ? Object.values(errors).filter(Boolean).join('\n')
+                                : undefined
+                        }
                     >
                         {(() => {
                             const isMerging = mergeFromHeaderId !== null;
@@ -747,6 +949,20 @@ export function InvestmentTxnRowEdit({
                     </Button>
                 </div>
             </div>
+
+            {/* The bank editor's error treatment: a bordered block on its own
+                line BELOW the action row. It used to be a bare span INSIDE that
+                row, between the footer slot and Cancel — where a server message
+                of any length fights the buttons for a flex row's width, and the
+                thing you need to read is the thing that gets squeezed. */}
+            {saveError ? (
+                <p
+                    role="alert"
+                    className="col-span-full -mx-3 mt-2 rounded border border-state-danger/40 bg-state-danger-soft px-2 py-1 text-[0.6875rem] text-state-danger"
+                >
+                    {saveError}
+                </p>
+            ) : null}
         </div>
     );
 }

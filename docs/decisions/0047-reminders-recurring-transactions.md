@@ -1,6 +1,16 @@
 # 0047 — Reminders / recurring transactions / calendar
 
-* Status: Accepted
+* Status: Accepted — **two of its deferrals shipped under their own ADRs.**
+
+> *Auto-commit firing* ("`auto_commit_days_before` is captured, not acted on") shipped
+> as ADR-0097 + migration 219's `reminder-auto-post` job. Migration 219's header
+> records the defect this ADR left behind: the value "validates, persists and
+> round-trips on edit, and NOTHING HAS EVER FIRED IT".
+>
+> *Loan-account-driven reminders* — the "separate ADR" referred to below without a
+> name — is ADR-0078, with migration 168's `recurring_transactions.loan_account_id`.
+> `is_loan_reminder` is consequently no longer "preserved but inert": it selects the
+> live amortization split.
 * Date: 2026-06-12
 * Related: ADR-0010 (recurring_transactions Phase-1 schema, "schema-
   ready, UI-deferred"), ADR-0027 (investment action catalog), ADR-0019

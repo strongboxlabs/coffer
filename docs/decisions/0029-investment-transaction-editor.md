@@ -186,6 +186,113 @@ entry patterns from ADR-0024 / ADR-0025.
   - **Splitting / merging investment with non-investment txns** —
     separate, lower-priority slice.
 
+### Amendment (2026-09): three parity corrections
+
+The merge slice parked above has long since shipped. Reviewing it against
+the bank editor turned up three places where the investment side had
+quietly acquired a rule the bank side does not have. All three are
+corrections toward bank, not new behaviour — the divergences were
+accidents of how each surface grew, not decisions anyone recorded.
+
+**1. Merge candidates constrain settledness only.** The bank rule is: any
+accepted, un-merged, effectively-visible row on the same account, same
+effective amount, within ±7 days. The investment query additionally
+required a candidate to carry a SECURITY leg on the Holdings sibling,
+with a non-null quantity and action — a SHAPE constraint on a rule about
+settledness.
+
+The consequence was that the commonest duplicate on a brokerage could
+never be offered. A dividend the user already recorded as cash is
+(brokerage cash, income category) with no holdings leg at all; a
+feed-delivered `INVBANKTRAN` row is (brokerage cash, Uncategorized) with
+no action either. The merge panel came up empty on exactly the rows it
+exists for.
+
+The amount match now runs on the brokerage cash leg, which is bank's rule
+verbatim. The share match on the Holdings sibling is kept ALONGSIDE it,
+because it covers a case bank has no analogue for: a reinvest moves no
+cash, so an amount match can never see one. A candidate's ticker, share
+count and price still come from its security leg when it has one, and are
+null on the chip when it does not.
+
+The `ingest_security_id` narrowing still applies — but only to candidates
+that HAVE a security to contradict. A cash-shape row carries none
+*because* it has not been classified yet, which is precisely what makes it
+the duplicate worth offering.
+
+**Direction is part of the rule.** Bank compares the SIGNED sum on the
+source account; the investment query compared magnitudes — on the
+security leg with `Math.Abs` before the widening, and on the brokerage leg
+with the same absolute comparison after it, under a comment claiming
+parity it did not have. So a sell that brought in $167.38 was offered the
+buy that spent $167.38 on the same security the same day: the same
+magnitude, the opposite event, and a merge that would tombstone a real
+transaction and halve the position. Found on the dev rig immediately
+after release.
+
+A candidate whose cash moved the opposite way is now dropped. The check
+is applied once over every match path, not inside the amount match,
+because the share match can pair a sell with a buy by `|quantity|` just
+as readily. It is skipped when the anchor moved no cash: a reinvest nets
+to zero on the brokerage and so has no direction for a candidate to
+contradict.
+
+**2. One transaction per PATCH, opened before the first read.** The bank
+`PatchAsync` opens its transaction as its first statement, and says why:
+the ledger-membership guard must run inside the transaction that later
+writes, or there is a TOCTOU window between the endpoint's cross-ledger
+check and the writes. The investment `PatchAsync` opened two transactions
+further down — one inside the merge branch, one after validation — so the
+membership guard, the merge branch's eligibility checks and the whole
+action × field matrix validation ran unprotected.
+
+This has no single-threaded symptom, which is why every integration test
+passed before and after. It is pinned by a source-level assertion
+(`WriteTransactionBoundaryTests`) rather than a concurrency harness: a
+test that can only be written as a race is a test that gets skipped.
+
+**3. Similar-payees recall reaches the investment editor.** The endpoint
+needed nothing: a feed row lands BANK-shape whatever account it is bound
+for — two legs, (real account, Uncategorized), with the investment detail
+parked in the `ingest_*` carriers until someone classifies it — so its
+anchor resolves on a brokerage exactly as on a checking account. The
+investment editor simply never called it, and a dividend categorised the
+same way every quarter had to be categorised by hand every quarter.
+
+Two rules make it fit this editor:
+
+A suggestion is one (payee, counterparty) pair, and the two halves are
+NOT equally applicable on a brokerage. The payee is the repeated thing
+and applies whatever the shape; the counterparty often has nowhere to go.
+So the halves are treated separately:
+
+  - **The chip is offered on every action.** The payee is always applied.
+  - **The counterparty is applied only into a category slot** — an action
+    whose layout has one (`dividend_cash`, `dividend_reinvest`, `divx`,
+    `misc`) — and only when it is not a Holdings sub-account. The fee slot
+    is also a category counterparty, but which of the two a suggestion
+    meant is not recoverable from the pair, so it lands on the category.
+  - **The chip hides its "→ X" in exactly the cases it will not apply X**,
+    so a chip never advertises something it then skips.
+
+**Corrected 2026-09 (same day, from the dev rig).** Both of those rules
+started stricter and were wrong for it. The chips were gated to actions
+with a category slot, and the repository dropped any suggestion whose
+counterparty was a Holdings sub-account — reasoning that "categorise it
+as Holdings" is meaningless (ADR-0019: it is structural), which is true.
+
+What that missed is that dropping the row discards its PAYEE, and on a
+brokerage the row carrying the name the user curated is very often
+exactly that buy: a settled buy has two legs, one on the brokerage, and
+its other leg IS the Holdings sibling. On the dev rig a curated payee sat
+on such a buy and recall stayed silent — twice over, since the row being
+edited was a sell, which has no category slot and so showed no panel at
+all.
+
+The repository now returns the row and the caller decides which half it
+can take. The rule of thumb this leaves: filter at the point of USE, not
+at the source, when the thing being filtered is one half of a value.
+
 ## Consequences
 
   - Investment txn create / edit moves to a dedicated endpoint;

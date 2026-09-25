@@ -43,7 +43,7 @@ literal MD-register clone.
 | 3 | date + check# / tax-date sub  | 6.5rem               |
 | 4 | action chip                   | 6rem                 |
 | 5 | description (payee + memo)    | `minmax(5rem, 1fr)`  |
-| 6 | category · transfer · fee     | 20rem                |
+| 6 | category · transfer · fee · tags | 20rem             |
 | 7 | security · qty @ price        | `minmax(5rem, 1fr)`  |
 | 8 | amount + fee subtitle         | 7rem                 |
 | 9 | cash balance                  | 6.5rem               |
@@ -92,8 +92,10 @@ Renderer:
     and both-populated all valid shapes.
   - **Line 2**: fee chip (typically "Investment Fees"). Renders
     only when present.
-  - **Empty cell** when none of the four are set (e.g., solo Buy
-    where Holdings sibling is stripped).
+  - **Line 3**: header tags, wrapping. Renders only when the
+    header carries any. See the 2026-09 refinement below.
+  - **Empty cell** when none of the five are set (e.g., an untagged
+    solo Buy where the Holdings sibling is stripped).
 
 **No positional placeholders.** Earlier iterations used em-dashes
 on empty halves of line 1 and a "|" separator between category and
@@ -312,6 +314,49 @@ investment events: runs of `kind:'txn'` target legs sharing
 as one `kind:'group'` entry (legs in `legIndex` order, count fields
 retained for read-only detection). The `legBalanceOverrides`
 fabricated-balance plumbing was removed.
+
+### Refinement (2026-09): investment rows carry header tags
+
+The original slot-6 renderer blanked tags outright
+(`RegisterRepository.ProjectInvestmentEvent` set `Tags =
+Array.Empty<string>()`, commented "Investments carry no tags, whatever
+the legs held"), and the investment write contracts had no `Tags` field
+at all. The reasoning was the aggregation: an investment event's legs
+collapse to one row, so "which leg's tags?" looked like a question
+needing an answer.
+
+It was never a real question. Tags pair to the **header**
+(`txn_header_tags` is keyed `(header_id, tag_id)` — there is no leg
+column anywhere in the schema), and the resolved view's `tags` subquery
+keys on `h.id`, so every leg of a header already carries the identical
+array. Collapsing N legs to one row makes tags *simpler* here than on
+the bank register, where a split header repeats the same array across
+each of its leg rows. ADR-0009 puts tags on the EVENT, and an investment
+transaction is an event.
+
+What the blanking actually produced:
+
+  - A tag could still reach an investment header — the MCP
+    `set_transaction_tags` tool has no shape gate — and the register then
+    dropped it on the way out, so it was invisible even once written. The
+    register's own tag FILTER matched those rows, which made a tag look
+    like it matched a row that showed no tag.
+  - The bank register and the investment register disagreed about a
+    ledger-wide dimension, for no reason a user could infer.
+
+Now: `Tags` on `CreateInvestmentTransactionRequest` and
+`PatchInvestmentTransactionRequest` (the latter on the bank PATCH's
+PRESENCE rule — omitted leaves them alone, `[]` clears them — not
+ADR-0025's wholesale-replace, so another caller's partial PATCH cannot
+silently strip them); one `TagsInput` on the investment editor, with the
+header-level fields rather than among the action × field matrix, since
+tags apply to every action; chips on line 3 of slot 6; and the tag
+machinery itself extracted to `HeaderTags` so both write paths share one
+implementation rather than two that can drift. The 64-character / 20-tag
+caps moved to `TagValidation` and are now enforced on both surfaces.
+
+The per-leg `TagsPlaceholder` in the bank splits grid is unaffected: it
+is still a reserved layout slot, and per-leg tags still do not exist.
 
 ## Consequences
 

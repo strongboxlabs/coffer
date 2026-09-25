@@ -67,6 +67,38 @@ export function patchInvestmentTransaction(
 }
 
 /**
+ * Accept an imported investment row as-is, changing no field.
+ *
+ * The twin of `approveTransaction`. Accepting through a wholesale PATCH would
+ * mean re-sending every field, and any field the caller rebuilds imperfectly
+ * gets silently written back — accepting should change nothing.
+ */
+export function approveInvestmentTransaction(
+    ledgerId: string,
+    headerId: string,
+    accountId?: string,
+): Promise<RegisterEntry | null> {
+    const base = `/api/ledgers/${encodeURIComponent(ledgerId)}/investment-transactions/${encodeURIComponent(headerId)}/approve`;
+    const url = accountId ? `${base}?account_id=${encodeURIComponent(accountId)}` : base;
+    return request<RegisterEntry | null>(url, { method: 'POST' });
+}
+
+/**
+ * Fold `headerId` into `fromHeaderId` — the investment twin of
+ * `mergeTransaction`, same inverted direction and same response (the SURVIVOR).
+ */
+export function mergeInvestmentTransaction(
+    ledgerId: string,
+    headerId: string,
+    fromHeaderId: string,
+    accountId?: string,
+): Promise<RegisterEntry | null> {
+    const base = `/api/ledgers/${encodeURIComponent(ledgerId)}/investment-transactions/${encodeURIComponent(headerId)}/merge`;
+    const url = accountId ? `${base}?account_id=${encodeURIComponent(accountId)}` : base;
+    return request<RegisterEntry | null>(url, { method: 'POST', body: { fromHeaderId } });
+}
+
+/**
  * DELETE /api/ledgers/{ledgerId}/investment-transactions/{headerId} —
  * hard-delete manual rows / soft-hide imported rows (mirrors the
  * bank-side policy; load-bearing for the queued SimpleFIN

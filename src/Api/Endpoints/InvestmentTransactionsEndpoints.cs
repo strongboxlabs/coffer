@@ -33,6 +33,17 @@ public static class InvestmentTransactionsEndpoints
         group.MapPost("/", CreateAsync);
         group.MapPatch("/{headerId:guid}", PatchAsync);
         group.MapDelete("/{headerId:guid}", DeleteAsync);
+        // A COMMAND, not a field edit. `{mergeFromHeaderId}` as the entire PATCH
+        // body was using PATCH as a verb — it names an action rather than
+        // describing a new state of the row. Mirrors the bank
+        // /transactions/{id}/merge route exactly, including the inverted
+        // direction.
+        group.MapPost("/{headerId:guid}/merge", MergeAsync);
+        // Accept-as-is, the investment twin of the bank route. Until this
+        // existed there was no way to accept an investment row without opening
+        // the editor and re-saving every field through a wholesale PATCH — the
+        // bank register has offered it from the row menu since slice 2c.
+        group.MapPost("/{headerId:guid}/approve", ApproveAsync);
         // "Possible matches" for the editor's merge panel (mirrors the bank
         // /transactions/{id}/merge-candidates route).
         group.MapGet("/{headerId:guid}/merge-candidates", MergeCandidatesAsync);
@@ -81,6 +92,12 @@ public static class InvestmentTransactionsEndpoints
         if (visible is null)
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
+
+        if (request.Tags is { } tags
+            && TagValidation.ValidateTags(tags) is { } tagsRejection)
+        {
+            return tagsRejection;
+        }
 
         var result = await investmentTxns.CreateAsync(
             ledgerId, request, cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -135,6 +152,12 @@ public static class InvestmentTransactionsEndpoints
         if (visible is null)
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
+
+        if (request.Tags is { } tags
+            && TagValidation.ValidateTags(tags) is { } tagsRejection)
+        {
+            return tagsRejection;
+        }
 
         var result = await investmentTxns.PatchAsync(
             ledgerId, headerId, request, cancellationToken).ConfigureAwait(false);
@@ -216,6 +239,114 @@ public static class InvestmentTransactionsEndpoints
     /// brokerage feed — see ADR-0029). Triggers recompute after
     /// the row state change.
     /// </summary>
+    /// <summary>
+    /// <c>POST /api/ledgers/{ledgerId}/investment-transactions/{headerId}/merge</c>
+    /// — fold this row into the one named in the body.
+    /// </summary>
+    /// <remarks>
+    /// <para>Direction is INVERTED, and worth restating wherever a merge can be
+    /// started: the URL's <paramref name="headerId"/> is the LOSER, and
+    /// <c>fromHeaderId</c> is the surviving WINNER — the canonical row the user
+    /// picked in the candidates panel, which keeps its identity, its lots and
+    /// any losers it already absorbed.</para>
+    ///
+    /// <para>Clearing <c>needs_review</c> on the loser is the repository's job,
+    /// not this route's. A folded-away row is resolved by definition, and an
+    /// invariant that depends on a caller remembering to pair two fields is not
+    /// an invariant — that is exactly how investment losers stayed queued and
+    /// kept the sidebar's review dot lit in 0.94.0.</para>
+    /// </remarks>
+    /// <summary>
+    /// <c>POST /api/ledgers/{ledgerId}/investment-transactions/{headerId}/approve</c>
+    /// — accept an imported investment row as-is, changing no field.
+    /// </summary>
+    /// <remarks>
+    /// Idempotent. Goes through the repository's own approve path rather than a
+    /// wholesale PATCH: a PATCH IS the new state of the row, so accepting via
+    /// one means re-sending every field, and any field the caller reconstructs
+    /// imperfectly is silently written back. Accepting should change nothing.
+    /// </remarks>
+    private static async Task<IResult> ApproveAsync(
+        Guid ledgerId,
+        Guid headerId,
+        Guid? account_id,
+        ICurrentUserAccessor currentUser,
+        LedgersRepository ledgers,
+        InvestmentTransactionsRepository investmentTxns,
+        RegisterRepository register,
+        CancellationToken cancellationToken)
+    {
+        var visible = await ledgers.GetVisibleByIdAsync(
+            currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
+        if (visible is null)
+            return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
+                "Ledger not found or not visible to this user.");
+
+        var outcome = await investmentTxns.ApproveAsync(ledgerId, headerId, cancellationToken)
+            .ConfigureAwait(false);
+        if (outcome == InvestmentTransactionsRepository.ApproveOutcome.HeaderNotFound)
+            return BusinessError.Problem(BusinessError.Codes.TransactionNotInLedger,
+                "Transaction does not belong to this ledger.");
+
+        if (account_id is { } rid)
+        {
+            var entry = await register.GetEntryForHeaderAsync(
+                headerId, rid, cancellationToken).ConfigureAwait(false);
+            if (entry is not null) return Results.Ok(entry);
+        }
+        return Results.NoContent();
+    }
+
+    private static async Task<IResult> MergeAsync(
+        Guid ledgerId,
+        Guid headerId,
+        MergeTransactionRequest request,
+        Guid? account_id,
+        ICurrentUserAccessor currentUser,
+        LedgersRepository ledgers,
+        InvestmentTransactionsRepository investmentTxns,
+        RegisterRepository register,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        if (request.FromHeaderId == Guid.Empty)
+            return BusinessError.Problem(BusinessError.Codes.TransactionAccountRequired,
+                "fromHeaderId is required.");
+
+        var visible = await ledgers.GetVisibleByIdAsync(
+            currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
+        if (visible is null)
+            return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
+                "Ledger not found or not visible to this user.");
+
+        var result = await investmentTxns.PatchAsync(
+            ledgerId, headerId,
+            new PatchInvestmentTransactionRequest { MergeFromHeaderId = request.FromHeaderId },
+            cancellationToken).ConfigureAwait(false);
+
+        if (result.PatchFail is { } pf)
+        {
+            var (code, message) = MapPatchFailure(pf);
+            return BusinessError.Problem(code, message);
+        }
+        if (result.CreateFail is { } cf)
+        {
+            var (code, message) = MapFailure(cf);
+            return BusinessError.Problem(code, message);
+        }
+
+        // The SURVIVOR is what the caller needs back: the row named in the URL
+        // is now a tombstone and has left the register.
+        if (account_id is { } rid)
+        {
+            var entry = await register.GetEntryForHeaderAsync(
+                request.FromHeaderId, rid, cancellationToken).ConfigureAwait(false);
+            if (entry is not null) return Results.Ok(entry);
+        }
+        return Results.NoContent();
+    }
+
     private static async Task<IResult> DeleteAsync(
         Guid ledgerId,
         Guid headerId,

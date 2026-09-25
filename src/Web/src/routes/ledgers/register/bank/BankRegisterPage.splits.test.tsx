@@ -191,6 +191,24 @@ beforeEach(() => {
     vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue(ACCOUNTS);
 });
 
+describe('a collapsed split row answers the selection modifier', () => {
+    it('toggles selection on Cmd-click, as a plain row and both investment rows do', async () => {
+        // The modifier toggled selection on a plain bank row and on BOTH
+        // investment row variants, but fell through to a plain focus here — so
+        // the same gesture on two rows that look alike did two different
+        // things, and the one it did nothing useful on was the row that stands
+        // for a whole multi-leg header.
+        const toggle = await openRegister();
+        const parent = toggle.closest('[role="row"]') as HTMLElement;
+        const box = within(parent).getByRole('checkbox');
+        expect(box).not.toBeChecked();
+
+        fireEvent.click(parent, { metaKey: true });
+
+        await waitFor(() => expect(box).toBeChecked());
+    });
+});
+
 describe('a collapsed split row says what it is', () => {
     it('names the category that carries the group, not just a count', async () => {
         // The defect this closes: the expand toggle occupied the whole

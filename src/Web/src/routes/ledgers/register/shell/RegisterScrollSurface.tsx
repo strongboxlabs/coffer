@@ -17,8 +17,6 @@ export interface RegisterScrollSurfaceProps {
     scrollRef: (el: HTMLDivElement | null) => void;
     /** Id for the scroll region (focus / scroll-into-view targeting). */
     scrollRegionId?: string;
-    /** `aria-rowcount` for the grid. */
-    ariaRowCount?: number;
     /** The list itself (Virtuoso / empty state). */
     children: ReactNode;
     /** Scroll-track overlay (RegisterScrollTrack), sibling of the list. */
@@ -28,7 +26,6 @@ export interface RegisterScrollSurfaceProps {
 export function RegisterScrollSurface({
     scrollRef,
     scrollRegionId,
-    ariaRowCount,
     children,
     scrollTrack,
 }: RegisterScrollSurfaceProps) {
@@ -42,7 +39,20 @@ export function RegisterScrollSurface({
             <div
                 ref={scrollRef}
                 role="grid"
-                aria-rowcount={ariaRowCount}
+                // -1 is ARIA's "the total is not known", and it is the honest
+                // answer for a sliding window: the register holds at most ~1100
+                // entries and both edges page, so the rows in the DOM are a
+                // slice whose offset into the account is not derivable here.
+                //
+                // Bank used to pass the LOADED count, which announced "of 87"
+                // on an account with 43,000 entries — a number that also
+                // changed as the user scrolled. A real total is obtainable (the
+                // scroll-rail buckets sum to it), but pairing it with a
+                // window-local aria-rowindex would announce "row 5 of 43082"
+                // for a row that is the 12,000th, which is a worse lie than no
+                // total. Fixed here rather than per-page so the two registers
+                // cannot drift.
+                aria-rowcount={-1}
                 id={scrollRegionId}
                 className={
                     'absolute inset-0 overflow-y-auto pr-12'

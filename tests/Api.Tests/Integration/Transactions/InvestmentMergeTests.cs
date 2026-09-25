@@ -124,9 +124,9 @@ public sealed class InvestmentMergeTests
         }
 
         // Fold the loser into the winner (merge-only PATCH; account_id → survivor entry).
-        var resp = await client.PatchAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}?account_id={brokerage.Id}",
-            new PatchInvestmentTransactionRequest { MergeFromHeaderId = winner });
+        var resp = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}/merge?account_id={brokerage.Id}",
+            new MergeTransactionRequest { FromHeaderId = winner });
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
         await using var db = _fixture.NewDbContext();
@@ -160,17 +160,17 @@ public sealed class InvestmentMergeTests
         var loser = await ImportReinvestAsync(client, ledger, brokerage.Id);
 
         // Self-merge: rejected.
-        var self = await client.PatchAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}",
-            new PatchInvestmentTransactionRequest { MergeFromHeaderId = loser });
+        var self = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}/merge",
+            new MergeTransactionRequest { FromHeaderId = loser });
         Assert.Equal(HttpStatusCode.UnprocessableEntity, self.StatusCode);
         using (var doc = JsonDocument.Parse(await self.Content.ReadAsStringAsync()))
             Assert.Equal("merge-source-invalid", doc.RootElement.GetProperty("code").GetString());
 
         // Editor is a SETTLED row (winner, not needs_review) → can't be a loser.
-        var settledEditor = await client.PatchAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{winner}",
-            new PatchInvestmentTransactionRequest { MergeFromHeaderId = loser });
+        var settledEditor = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{winner}/merge",
+            new MergeTransactionRequest { FromHeaderId = loser });
         Assert.Equal(HttpStatusCode.UnprocessableEntity, settledEditor.StatusCode);
     }
 
@@ -217,9 +217,9 @@ public sealed class InvestmentMergeTests
             buyDate, shares: 50m, amount: 1000m, price: 20m);
         await MarkNeedsReviewAsync(loser);
 
-        var merge = await client.PatchAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}?account_id={brokerage.Id}",
-            new PatchInvestmentTransactionRequest { MergeFromHeaderId = winner });
+        var merge = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}/merge?account_id={brokerage.Id}",
+            new MergeTransactionRequest { FromHeaderId = winner });
         Assert.Equal(HttpStatusCode.OK, merge.StatusCode);
 
         // DIRECT PROBE: no open lot may remain tied to a leg of the merged loser.
@@ -312,9 +312,9 @@ public sealed class InvestmentMergeTests
             Assert.NotEqual("reconciling", pre);
         }
 
-        var resp = await client.PatchAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}?account_id={brokerage.Id}",
-            new PatchInvestmentTransactionRequest { MergeFromHeaderId = winner });
+        var resp = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}/merge?account_id={brokerage.Id}",
+            new MergeTransactionRequest { FromHeaderId = winner });
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
         await using var db = _fixture.NewDbContext();
@@ -523,9 +523,9 @@ public sealed class InvestmentMergeTests
             shares: 6.584m, amount: 316.37m, price: 48.051337m);
         var loser = await ImportReinvestAsync(client, ledger, brokerage.Id);
 
-        var patch = await client.PatchAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}",
-            new PatchInvestmentTransactionRequest { MergeFromHeaderId = winner });
+        var patch = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}/merge",
+            new MergeTransactionRequest { FromHeaderId = winner });
         Assert.Equal(HttpStatusCode.NoContent, patch.StatusCode);
 
         await using var db = _fixture.NewDbContext();
@@ -585,9 +585,9 @@ public sealed class InvestmentMergeTests
         // The dot is lit: one imported row awaits review.
         Assert.Equal(1, await ReviewCountAsync(client, ledger, brokerage.Id));
 
-        var patch = await client.PatchAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}",
-            new PatchInvestmentTransactionRequest { MergeFromHeaderId = winner });
+        var patch = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}/merge",
+            new MergeTransactionRequest { FromHeaderId = winner });
         Assert.Equal(HttpStatusCode.NoContent, patch.StatusCode);
 
         // ...and goes out, because nothing is left to review.
@@ -608,6 +608,190 @@ public sealed class InvestmentMergeTests
     /// <summary>
     /// Import the reinvest statement and return the header it created.
     /// </summary>
+    /// <summary>
+    /// A row whose cash moved the OTHER way is not a candidate.
+    /// </summary>
+    /// <remarks>
+    /// <para>A sell that brought in $167.38 and a buy that spent $167.38 on the
+    /// same security, the same day, are the same magnitude and opposite events.
+    /// Offering one as the other's twin invites a merge that tombstones a real
+    /// transaction and silently halves the position.</para>
+    ///
+    /// <para>The bank rule compares the SIGNED sum on the source account
+    /// (<c>g.Sum(...) == targetSourceAmount</c>). The investment query compared
+    /// magnitudes — first on the security leg with <c>Math.Abs</c>, then, after
+    /// the widening meant to bring it to bank parity, on the brokerage leg with
+    /// the same absolute comparison. Found on real data: a feed-delivered sell
+    /// was offered the settled buy that closed the same lot.</para>
+    /// </remarks>
+    [Fact]
+    public async Task A_row_whose_cash_moved_the_other_way_is_not_a_candidate()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
+        var income = await ledger.AddCategoryAsync("Dividend Income", kind: "income");
+        var securityId = await ledger.AddSecurityAsync("SIGN", ticker: "SIGN");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var date = new DateTime(2026, 1, 20, 12, 0, 0, DateTimeKind.Utc);
+
+        // Settled BUY: brokerage cash goes OUT (-42.50).
+        var buy = await BuyAsync(client, ledger, brokerage.Id, securityId,
+            date, shares: 1m, amount: 42.50m, price: 42.50m);
+
+        // Settled dividend: brokerage cash comes IN (+42.50). Same magnitude,
+        // same window, same security — the control that proves the filter is
+        // about DIRECTION and not just "fewer candidates".
+        var inbound = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions",
+            new CreateInvestmentTransactionRequest
+            {
+                BrokerageAccountId = brokerage.Id,
+                PostedAt = date,
+                Action = "dividend_cash",
+                SecurityId = securityId,
+                CategoryAccountId = income.Id,
+                Amount = 42.50m,
+            });
+        Assert.Equal(HttpStatusCode.Created, inbound.StatusCode);
+        var inboundId = (await inbound.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("headerId").GetGuid();
+
+        // The anchor: a feed row whose cash also comes IN (+42.50).
+        var loser = await ImportCashDividendAsync(client, ledger, brokerage.Id);
+
+        var candidates = await client.GetFromJsonAsync<List<InvestmentMergeCandidateDto>>(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}/merge-candidates");
+
+        // The same-direction row is offered; the opposite-direction buy is not.
+        Assert.Contains(candidates!, c => c.HeaderId == inboundId);
+        Assert.DoesNotContain(candidates!, c => c.HeaderId == buy);
+    }
+
+    /// <summary>
+    /// A settled row with no SECURITY leg is still a merge candidate.
+    /// </summary>
+    /// <remarks>
+    /// <para>The bank candidate rule constrains settledness and nothing else: any
+    /// accepted, un-merged, visible row on the same account, same effective
+    /// amount, within +/-7 days. The investment rule added a SHAPE constraint on
+    /// top — a candidate had to carry a security leg on the Holdings sibling,
+    /// with a non-null quantity and action.</para>
+    ///
+    /// <para>So the commonest duplicate on a brokerage could not be offered. A
+    /// dividend the user already recorded as cash has an income leg and a
+    /// brokerage cash leg and no holdings leg at all; the same dividend arriving
+    /// again from the broker's feed found nothing to fold into, and the merge
+    /// panel stayed empty on exactly the row it exists for.</para>
+    /// </remarks>
+    [Fact]
+    public async Task A_settled_cash_dividend_is_offered_as_a_candidate()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
+        var income = await ledger.AddCategoryAsync("Dividend Income", kind: "income");
+        var securityId = await ledger.AddSecurityAsync("DIVX", ticker: "DIVX");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        // The settled twin: a dividend already recorded as CASH. The action x
+        // field matrix requires a security — it names what PAID the dividend —
+        // but the event holds no position, so there is no holdings leg and no
+        // quantity. That is the shape the old rule could not see.
+        var settled = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions",
+            new CreateInvestmentTransactionRequest
+            {
+                BrokerageAccountId = brokerage.Id,
+                PostedAt = new DateTime(2026, 1, 20, 12, 0, 0, DateTimeKind.Utc),
+                Action = "dividend_cash",
+                SecurityId = securityId,
+                CategoryAccountId = income.Id,
+                Amount = 316.37m,
+            });
+        Assert.Equal(HttpStatusCode.Created, settled.StatusCode);
+        var settledId = (await settled.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("headerId").GetGuid();
+
+        // Premise: it really has no holdings/security leg to be matched on.
+        await using (var db = _fixture.NewDbContext())
+        {
+            var hasSecurityLeg = await db.TxnLegs.AsNoTracking()
+                .AnyAsync(l => l.HeaderId == settledId && l.Quantity != null);
+            Assert.False(hasSecurityLeg,
+                "fixture drifted: this candidate is supposed to be cash-shape.");
+        }
+
+        var loser = await ImportReinvestAsync(client, ledger, brokerage.Id);
+
+        var candidates = await client.GetFromJsonAsync<List<InvestmentMergeCandidateDto>>(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}/merge-candidates");
+
+        var only = Assert.Single(candidates!);
+        Assert.Equal(settledId, only.HeaderId);
+        // The chip has no ticker or share count to show, and says so with nulls
+        // rather than being dropped.
+        Assert.Null(only.SecurityTicker);
+        Assert.Null(only.Shares);
+    }
+
+    /// <summary>
+    /// A feed-delivered brokerage CASH row gets a merge panel of its own.
+    /// </summary>
+    /// <remarks>
+    /// The other side of the same gap. An <c>INVBANKTRAN</c> — a cash movement in
+    /// the brokerage's cash sub-account — imports as a bank-shape row: no action,
+    /// no security, no holdings leg. It anchors fine (the brokerage owns a
+    /// Holdings sibling, which is what the anchor keys on), and then every
+    /// candidate was filtered out by the shape rule, so the row that most needs
+    /// deduping was the one that could never be deduped.
+    /// </remarks>
+    [Fact]
+    public async Task A_feed_delivered_brokerage_cash_row_is_offered_its_twin()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
+        var income = await ledger.AddCategoryAsync("Dividend Income", kind: "income");
+        var securityId = await ledger.AddSecurityAsync("CASHX", ticker: "CASHX");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var settled = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions",
+            new CreateInvestmentTransactionRequest
+            {
+                BrokerageAccountId = brokerage.Id,
+                PostedAt = new DateTime(2026, 1, 20, 12, 0, 0, DateTimeKind.Utc),
+                Action = "dividend_cash",
+                SecurityId = securityId,
+                CategoryAccountId = income.Id,
+                Amount = 42.50m,
+            });
+        Assert.Equal(HttpStatusCode.Created, settled.StatusCode);
+        var settledId = (await settled.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("headerId").GetGuid();
+
+        var loser = await ImportCashDividendAsync(client, ledger, brokerage.Id);
+
+        // Premise: the imported row is bank-shape and awaiting review.
+        await using (var db = _fixture.NewDbContext())
+        {
+            var header = await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == loser);
+            Assert.Null(header.Action);
+            Assert.True(header.NeedsReview);
+        }
+
+        var candidates = await client.GetFromJsonAsync<List<InvestmentMergeCandidateDto>>(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}/merge-candidates");
+
+        var only = Assert.Single(candidates!);
+        Assert.Equal(settledId, only.HeaderId);
+    }
+
     private static async Task<Guid> ImportReinvestAsync(
         HttpClient client, SyntheticLedger ledger, Guid brokerageId)
     {
@@ -648,6 +832,85 @@ public sealed class InvestmentMergeTests
     /// A REINVEST whose TOTAL is the only usable number: the cash movement is 0.00
     /// and 6.584 x 48.05 rounds to 316.36, not the 316.37 the statement settles.
     /// </summary>
+    /// <summary>
+    /// Import an <c>INVBANKTRAN</c> — a cash movement inside an investment
+    /// statement. Routes through the BANK-shape mapper, so the row lands with no
+    /// action and no security: the feed-delivered brokerage cash row.
+    /// </summary>
+    private static async Task<Guid> ImportCashDividendAsync(
+        HttpClient client, SyntheticLedger ledger, Guid brokerageId)
+    {
+        var content = new MultipartFormDataContent();
+        var body = new ByteArrayContent(Encoding.UTF8.GetBytes(OfxCashDividendStatement));
+        body.Headers.ContentType = new MediaTypeHeaderValue("application/x-ofx");
+        content.Add(body, "file", "statement.qfx");
+        content.Add(new StringContent(brokerageId.ToString()), "accountId");
+        content.Add(new StringContent("inv:brokerX:INV-0001"), "providerAccountId");
+
+        var resp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/import", content);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        await using var db = ledger.NewDbContext();
+        return (await db.TxnHeaders.AsNoTracking()
+            .SingleAsync(h => h.LedgerId == ledger.LedgerId
+                && h.ExternalId == "INV-FITID-CASHDIV")).Id;
+    }
+
+    /// <summary>
+    /// A cash dividend delivered as INVBANKTRAN rather than INCOME — the same
+    /// money, in the shape a feed uses when it does not classify the event.
+    /// </summary>
+    private const string OfxCashDividendStatement = """
+        OFXHEADER:100
+        DATA:OFXSGML
+        VERSION:102
+        SECURITY:NONE
+        ENCODING:USASCII
+        CHARSET:1252
+        COMPRESSION:NONE
+        OLDFILEUID:NONE
+        NEWFILEUID:NONE
+
+        <OFX>
+        <SIGNONMSGSRSV1>
+        <SONRS>
+        <STATUS><CODE>0<SEVERITY>INFO</STATUS>
+        <DTSERVER>20260201120000
+        <LANGUAGE>ENG
+        </SONRS>
+        </SIGNONMSGSRSV1>
+        <INVSTMTMSGSRSV1>
+        <INVSTMTTRNRS>
+        <TRNUID>0
+        <STATUS><CODE>0<SEVERITY>INFO</STATUS>
+        <INVSTMTRS>
+        <DTASOF>20260131120000
+        <CURDEF>USD
+        <INVACCTFROM>
+        <BROKERID>brokerX
+        <ACCTID>INV-0001
+        </INVACCTFROM>
+        <INVTRANLIST>
+        <DTSTART>20260101
+        <DTEND>20260131
+        <INVBANKTRAN>
+        <STMTTRN>
+        <TRNTYPE>CREDIT
+        <DTPOSTED>20260120
+        <TRNAMT>42.50
+        <FITID>INV-FITID-CASHDIV
+        <NAME>DIVIDEND RECEIVED
+        </STMTTRN>
+        <SUBACCTFUND>CASH
+        </INVBANKTRAN>
+        </INVTRANLIST>
+        </INVSTMTRS>
+        </INVSTMTTRNRS>
+        </INVSTMTMSGSRSV1>
+        </OFX>
+        """;
+
     private const string OfxReinvestStatement = """
         OFXHEADER:100
         DATA:OFXSGML

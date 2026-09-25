@@ -196,6 +196,38 @@ describe('BankRegisterPage', () => {
         ).toBeInTheDocument();
     });
 
+    it('numbers rows from 1 and declares the total unknown', async () => {
+        // `aria-rowindex` was fed straight from virtuoso's logical index,
+        // which carries a 1,000,000 front-shift offset so rows can be
+        // prepended without going negative — so this announced the first row
+        // of the register as row 1,000,001. Its paired `aria-rowcount` was the
+        // LOADED entry count, making the whole announcement "row 1000001 of
+        // 87" on an account with tens of thousands of rows.
+        const txns = [
+            makeTxn({ id: 't1', payee: 'Coffee Shop' }),
+            makeTxn({ id: 't2', payee: 'Paycheck' }),
+        ];
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: txns.map(entryOf),
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+        vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
+        vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([TEST_ACCOUNT]);
+
+        renderRegister();
+
+        const first = (await screen.findByText('Coffee Shop')).closest('[role="row"]');
+        const second = screen.getByText('Paycheck').closest('[role="row"]');
+        expect(first).toHaveAttribute('aria-rowindex', '1');
+        expect(second).toHaveAttribute('aria-rowindex', '2');
+
+        // -1 is ARIA's "not known", and it is the honest answer for a sliding
+        // window: the rows in the DOM are a slice whose offset into the
+        // account is not derivable here.
+        expect(first!.closest('[role="grid"]')).toHaveAttribute('aria-rowcount', '-1');
+    });
+
     it('renders the populated register without an idle row-count footer', async () => {
         // Assert on the table chrome rather than cell formatting: the
         // header select-all is enabled once entries load (disabled when
@@ -589,6 +621,13 @@ it('toggles the Scheduled filter', async () => {
         });
         vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
         vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([TEST_ACCOUNT]);
+        // Accept-as-is is a COMMAND with its own route now, not a PATCH whose
+        // entire body was one flag. Spying on patchTransaction as well pins that
+        // it is NOT used — otherwise this test would keep passing if the call
+        // quietly went back to the old shape.
+        const approveSpy = vi
+            .spyOn(apiModule, 'approveTransaction')
+            .mockResolvedValue(null);
         const patchSpy = vi
             .spyOn(apiModule, 'patchTransaction')
             .mockResolvedValue(null);
@@ -608,13 +647,13 @@ it('toggles the Scheduled filter', async () => {
         await user.click(acceptItem);
 
         await waitFor(() => {
-            expect(patchSpy).toHaveBeenCalledWith(
+            expect(approveSpy).toHaveBeenCalledWith(
                 LEDGER_ID,
                 txn.headerId,
-                { approve: true },
                 ACCOUNT_ID,
             );
         });
+        expect(patchSpy).not.toHaveBeenCalled();
         // Approve clears the row's needs_review → invalidate accounts so
         // the sidebar dot resets live (no reload).
         await waitFor(() => {
@@ -829,7 +868,36 @@ it('toggles the Scheduled filter', async () => {
             ).not.toBeInTheDocument();
         });
 
-        it('drops Duplicate from the row menu — the other door to the editor', async () => {
+        it('offers Show raw data and renders the provider payload', async () => {
+        // The modal lived inside InvestmentRegisterPage and was typed on its
+        // row, so it was investment-only — never by decision. Most feed rows
+        // land on a BANK register, so the side that needed "why did this import
+        // like this?" was the side without it.
+        const txn = makeTxn({
+            id: 'raw1',
+            payee: 'Synced Row',
+            providerRawPayload: '{"id":"sf-42","description":"SYNCED ROW"}',
+        });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(txn)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+        vi.spyOn(apiModule, 'fetchHeaderLegs').mockResolvedValue([]);
+
+        renderRegister();
+
+        fireEvent.contextMenu(await screen.findByText('Synced Row'));
+        const item = await screen.findByRole('menuitem', { name: /show raw data/i });
+        fireEvent.click(item);
+
+        // The provider's own payload is the headline, pretty-printed — not the
+        // SPA's view of the row, which is only the fallback.
+        expect(await screen.findByText(/Raw provider data/i)).toBeInTheDocument();
+        expect(await screen.findByText(/sf-42/)).toBeInTheDocument();
+    });
+
+    it('drops Duplicate from the row menu — the other door to the editor', async () => {
             // The builder is unit-tested; this asserts the WIRING, so the
             // option cannot sit there unpassed while the menu still offers it.
             mockTree([entryOf(makeTxn({ id: 'c1', accountId: CHILD_ID, payee: 'Market' }))]);
@@ -944,6 +1012,11 @@ it('toggles the Scheduled filter', async () => {
             },
         ]);
         // The server folds the loser away and returns the SURVIVOR's entry.
+        // Merging is a COMMAND with its own route; patchTransaction is spied too
+        // so a silent return to merge-by-PATCH fails rather than passing.
+        const mergeSpy = vi
+            .spyOn(apiModule, 'mergeTransaction')
+            .mockResolvedValue(entryOf(winner));
         const patchSpy = vi
             .spyOn(apiModule, 'patchTransaction')
             .mockResolvedValue(entryOf(winner));
@@ -964,15 +1037,19 @@ it('toggles the Scheduled filter', async () => {
             await screen.findByRole('button', { name: /fold into selected/i }),
         );
 
-        await waitFor(() => expect(patchSpy).toHaveBeenCalled());
+        await waitFor(() => expect(mergeSpy).toHaveBeenCalled());
         // EXACT, not objectContaining: the body carries the merge stamp and
         // nothing else. It used to pair an `approve: true`, which put the
         // "a merged loser is not awaiting review" invariant in the caller —
-        // so clients that did not send it left the row flagged. The server
-        // owns it now, and this pins the body against the flag creeping back.
-        expect(patchSpy.mock.calls[0]![2]).toEqual({
-            mergeFromHeaderId: WINNER_HEADER,
-        });
+        // so clients that did not send it left the row flagged. The server owns
+        // it now, and the route has no approve field at all, which is a stronger
+        // guarantee than pinning a body shape: there is nothing to creep back.
+        //
+        // The WINNER is the third argument — the direction is inverted, and
+        // asserting it here is what catches a swap of loser and survivor.
+        expect(mergeSpy.mock.calls[0]![1]).toBe(LOSER_HEADER);
+        expect(mergeSpy.mock.calls[0]![2]).toBe(WINNER_HEADER);
+        expect(patchSpy).not.toHaveBeenCalled();
 
         await waitFor(() => {
             expect(screen.queryByText('imported dupe')).not.toBeInTheDocument();

@@ -73,6 +73,49 @@ export function patchTransaction(
 }
 
 /**
+ * Accept a bank-feed row as-is, changing no field.
+ *
+ * A command, so it gets a route rather than a PATCH whose whole body was
+ * `{approve: true}` — that was using PATCH as a verb. The editor's
+ * edit-AND-accept save still rides on the PATCH, deliberately: splitting it
+ * would let an edit succeed and its approval fail, leaving the row changed but
+ * still queued.
+ *
+ * Idempotent — approving an accepted row succeeds.
+ */
+export function approveTransaction(
+    ledgerId: string,
+    headerId: string,
+    accountId?: string,
+): Promise<RegisterEntry | null> {
+    const base = `/api/ledgers/${encodeURIComponent(ledgerId)}/transactions/${encodeURIComponent(headerId)}/approve`;
+    const url = accountId ? `${base}?account_id=${encodeURIComponent(accountId)}` : base;
+    return request<RegisterEntry | null>(url, { method: 'POST' });
+}
+
+/**
+ * Fold `headerId` into `fromHeaderId`.
+ *
+ * DIRECTION IS INVERTED: `headerId` (the row being edited) is the LOSER, and
+ * `fromHeaderId` is the surviving WINNER — the canonical row picked in the
+ * candidates panel. The response is the SURVIVOR's register entry, because the
+ * edited row has become a tombstone and left the register.
+ *
+ * No approve flag: clearing the loser's review state is the server's job, so it
+ * cannot depend on a caller remembering to pair two fields.
+ */
+export function mergeTransaction(
+    ledgerId: string,
+    headerId: string,
+    fromHeaderId: string,
+    accountId?: string,
+): Promise<RegisterEntry | null> {
+    const base = `/api/ledgers/${encodeURIComponent(ledgerId)}/transactions/${encodeURIComponent(headerId)}/merge`;
+    const url = accountId ? `${base}?account_id=${encodeURIComponent(accountId)}` : base;
+    return request<RegisterEntry | null>(url, { method: 'POST', body: { fromHeaderId } });
+}
+
+/**
  * GET /api/ledgers/{ledgerId}/transactions/{headerId}/similar-payees
  * — slice 2c.6c Tier 1 recall. Bank-feed editor concern: server
  * reads the row's raw bank payee and returns up to 5 prior

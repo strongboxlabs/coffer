@@ -189,10 +189,16 @@ API, future sync worker, tests — not just bulk imports.
 
 4. **Bulk operations preserve transactionality.** Multi-row INSERT via
    `unnest()` is a single statement inside the surrounding
-   transaction. Statement-level triggers (e.g. `balance_after`) fire
-   once per statement with all affected rows in scope; if anything
-   later in the transaction fails, ROLLBACK undoes both the bulk
-   insert and the trigger's effects.
+   transaction, so a later failure rolls the whole thing back.
+
+   This rule used to cite "statement-level triggers (e.g. `balance_after`)"
+   as the mechanism. There are no such triggers: migration 102 dropped the
+   balance family, and the only triggers left in the schema are the two
+   `txn_headers` immutability guards — as §3.3 of this document already
+   says, so the two contradicted each other. Derived state is recomputed
+   by an EF `SaveChangesInterceptor` after the write, inside the same
+   transaction, which preserves the same rollback property by a different
+   route.
 
 5. **No DDL inside data-write transactions.** `ALTER TABLE`,
    `DISABLE TRIGGER`, `CREATE INDEX`, etc. inside a write transaction
@@ -208,10 +214,19 @@ API, future sync worker, tests — not just bulk imports.
    ROLLBACK, assert zero rows) for any new repository is good
    practice.
 
-7. **Single-writer concurrency model.** Coffer is a single-user app.
-   We do not currently need row-level locking strategies, optimistic
-   concurrency tokens, or conflict-resolution rules. If we ever go
-   multi-user, this section gets superseded by a new ADR.
+7. **Concurrency.** Multi-user shipped in 0.34.0 (ADR-0083): per-ledger
+   owner / editor / viewer grants, member management and invite links.
+   This rule used to say "Coffer is a single-user app … if we ever go
+   multi-user, this section gets superseded by a new ADR" — the ADR
+   exists and the rule did not follow it.
+
+   What has NOT changed is that there are still no optimistic
+   concurrency tokens and no conflict-resolution rules; a second editor
+   on the same row is last-write-wins. That is now a gap rather than a
+   property of the product. Where concurrency IS handled it is handled
+   explicitly and per-path: the transaction boundary on a write covers
+   its own read-then-write (see the PATCH paths), and long operations
+   take a named lock rather than relying on there being one user.
 
 ---
 
@@ -238,7 +253,7 @@ Per [decisions/0005-dapper-and-efcore.md](decisions/0005-dapper-and-efcore.md), 
 | Layer | Default | Notes |
 |---|---|---|
 | **API** (`src/Api/`) | **EF Core via `AppDbContext`** | Routine CRUD, transactional inserts, view-backed reads, `ExecuteUpdate`/`ExecuteDelete` for set-based mutations. The Dapper package is not referenced by the API at all. |
-| **Register query** (PR 3.7+) | **EF Core via [`MR.EntityFrameworkCore.KeysetPagination`](https://github.com/mrahhal/MR.EntityFrameworkCore.KeysetPagination)** | The composite-cursor `(posted_at, id)` paging is the one place ADR-0005 originally carved out for Dapper. The library generates a correct keyset-WHERE shape over EF, so the API can stay on one ORM. |
+| **Register query** (PR 3.7+) | **EF Core over the Postgres function `register_entry_keys`**, bound with `HasDbFunction` | Keyset paging is the one place ADR-0005 originally carved out for Dapper. It is a Postgres function rather than raw SQL in C#, so the API stays on one ORM. The cursor is `(posted_at, header_seq, entry_key)` — `seq` replaced `created_at` in migration 097, and the entry key is asymmetric per ADR-0036. **`MR.EntityFrameworkCore.KeysetPagination` is still a package reference but is never called** — this row used to name it as the mechanism; it is dead weight and should come out of `Api.csproj`. |
 | **Importer** (`src/Importer.Moneydance/`) | **Dapper** | Bulk-insert patterns (108k+ rows in a single transaction), `unnest(@arr1, @arr2)` array-parameter inserts, deferred constraint timing — these are the genuine Dapper sweet spots. The importer never adopted EF and won't until there's a concrete reason to. |
 | **Tests** | Same as the layer they test | Test helpers (arrange / assert) use the same data-access layer as the production code under test, so a test isn't more permissive than the path it covers. |
 
@@ -290,7 +305,7 @@ When in doubt: if the operation is "the authenticated user doing a thing in thei
 - Functional components only.
 - TanStack Query for server state; Zustand or React Context for local UI state. No Redux.
 - TanStack Router with **code-based routing** (not file-based) — the route tree in `src/router.ts` reads top-to-bottom with no codegen step.
-- Tailwind v3 + hand-built primitives following shadcn/ui conventions (we don't pull shadcn via its CLI; we write the ~5 source files we need ourselves). No CSS-in-JS.
+- Tailwind **v4** + hand-built primitives following shadcn/ui conventions (we don't pull shadcn via its CLI; we write the source files we need ourselves). No CSS-in-JS. v4 is CSS-first: there is no `tailwind.config.*` and no PostCSS config — the design tokens live in an `@theme` block in `src/index.css`, and the Vite plugin does the rest.
 - Prefer composition over hooks-with-side-effects. No "magic" hooks that secretly mutate global state.
 - `@simplewebauthn/browser` is the WebAuthn client. Don't improvise base64url encoding or `navigator.credentials` invocation.
 
@@ -314,23 +329,32 @@ src/Web/
 ├── tsconfig.{json,app,node}.json    Strict TS, project references
 ├── vite.config.ts          /api proxy + Vitest test config (uses defineConfig from vitest/config so the `test` block types)
 ├── eslint.config.js        Flat config, typescript-eslint + react-hooks + react-refresh
-├── tailwind.config.ts      Tailwind v3 — content globs only
-├── postcss.config.js       Tailwind + autoprefixer
 ├── index.html              Vite entry
 ├── vitest.setup.ts         Extends expect with @testing-library/jest-dom
 └── src/
     ├── main.tsx            QueryClientProvider + RouterProvider mount
     ├── App.tsx             Pure components only (RootLayout, AuthedOutlet)
     ├── router.ts           Route tree (code-based) + auth-check beforeLoad
-    ├── index.css           Tailwind directives
-    ├── lib/
-    │   ├── api.ts          Typed fetch wrapper + ApiError + ProblemDetails decode
+    ├── index.css           The @theme token block (Tailwind v4 is CSS-first) + the
+    │                       four [data-theme] blocks
+    ├── lib/                ~32 modules. The ones worth knowing by name:
+    │   ├── api.ts          Barrel re-export; the per-domain clients live in lib/api/
+    │   ├── api/_request.ts Typed fetch wrapper + ApiError + ProblemDetails decode
     │   ├── auth.ts         WebAuthn login ceremony via @simplewebauthn/browser
     │   ├── cn.ts           clsx + tailwind-merge helper
-    │   └── types.ts        Shared API response types
-    ├── components/ui/      Hand-built primitives (Button, Input, Label)
+    │   ├── theme.ts        Theme + accent selection, persisted per device
+    │   ├── types/          Shared API response types, split per domain
+    │   └── useWindowedRegister.ts   The register's bidirectional page window
+    ├── components/ui/      ~25 hand-built primitives — Button, Input, Label,
+    │                       Typeahead, ContextMenu, ConfirmDialog, Modal,
+    │                       StatusBadge, KpiTile, Chip, Panel, Toolbar, …
     └── routes/             One folder per route, route component lives here
 ```
+
+The counts are deliberately approximate and the lists deliberately partial — a
+file-by-file tree in prose is a thing that goes stale between the PR that adds a
+file and the next person to read it. What must stay true is the SHAPE: primitives
+in `components/ui/`, per-domain clients under `lib/api/`, one folder per route.
 
 ---
 
@@ -458,6 +482,10 @@ The body emitted:
 | Domain vocabulary | [glossary.md](glossary.md) |
 | Decisions with rationale | [decisions/](decisions/) (ADRs) |
 | Per-phase implementation notes | top-level [README.md](../README.md) status table; PR descriptions |
+| Open work, ranked | the open-work backlog — maintainer-only, excluded from the public mirror |
+| Closed work, with what was learned | the closed-work log |
+| Upgrade + migration procedure | [upgrading.md](upgrading.md) |
+| These standards | [engineering-standards.md](engineering-standards.md) |
 
 ### 6.2 ADR format
 
@@ -495,7 +523,16 @@ Documentation updates ship in the same commit/PR as the code change. Stale docs 
 - Pin major versions; let minors float within a single major.
 - Prefer the standard library over a third-party package for trivial helpers.
 - Adding a new top-level dependency requires a one-line justification in the commit message: "why this, why now, why not stdlib".
-- Run a vulnerability scan in CI on every push.
+- **Vulnerability scanning is Dependabot, not a CI job.** This bullet used to read
+  "run a vulnerability scan in CI on every push"; no such job exists in any
+  workflow. `.github/dependabot.yml` opens PRs on its own schedule, and
+  `dotnet restore --force` re-runs the NuGet audit (which is why `Api.Tests.csproj`
+  carries pinned transitive versions with a comment each). If you want a push gate,
+  that is work to do rather than a rule to cite.
+- **A package that is referenced but never called is a dependency too.** Check
+  before adding, and check when removing a subsystem: the register's keyset paging
+  moved to a Postgres function and left `MR.EntityFrameworkCore.KeysetPagination`
+  behind as a reference with no call sites.
 
 ---
 
@@ -510,13 +547,36 @@ Documentation updates ship in the same commit/PR as the code change. Stale docs 
 
 ## 9. CI
 
-CI runs on every push and PR:
+**CI runs on PULL REQUESTS, not on push.** `ci.yml` has no `push: main` trigger,
+and says why in a comment: a PR's run already validated that exact tree, so
+re-running on merge doubles the work — **the local preflight is the gate for a
+direct push to main**. It also carries `paths-ignore` for `**.md`, `docs/**` and
+`mockups/**`, so a docs-only change skips the heavy workflow entirely and
+`doc-link.yml` covers it instead.
 
-1. Validates SQL migrations apply cleanly to a fresh PG 16 container.
-2. Runs every script in `db/test/` against the migrated DB.
-3. (Phase 3+) builds the .NET solution and runs unit + integration tests.
-4. (Phase 4+) builds the frontend and runs Vitest.
-5. Checks that documentation cross-references resolve (no broken internal links).
+Only `secret-gate.yml` runs on both push and PR, because key material reaching
+main is not something a skipped workflow may miss.
+
+Four jobs in `ci.yml`:
+
+1. **`schema-and-trigger`** — validates SQL migrations apply cleanly to a fresh
+   PG 16 container, then runs every script in `db/test/` against the migrated DB.
+2. **`api-no-raw-sql-audit`** — runs `scripts/audit-no-raw-sql.sh`, which fails on
+   unsanctioned raw SQL in `src/Api/`. The data-access rules in §4 are enforced,
+   not merely written down.
+3. **`dotnet-test`** — builds the solution and runs the suite, sharded (see §9.1).
+4. **`web-build-test`** — builds the frontend and runs Vitest.
+
+Plus two workflows of their own:
+
+5. **`doc-link.yml`** — checks documentation cross-references resolve. It is a LINK
+   checker and nothing more: it cannot tell you a document has become false, which
+   is why §6 puts that burden on the author.
+6. **`secret-gate.yml`** — the key-material and identity deny-list, so a key or a
+   personal identifier cannot reach a public mirror.
+
+There is **no vulnerability-scan job**, despite what §10 used to imply: dependency
+alerts come from Dependabot on its own schedule, not from a gate on push.
 
 A red CI never merges. If CI is flaky, fix the flake — don't retry.
 

@@ -18,6 +18,8 @@ interface BankRowMenuActions {
     onShowOtherSide: (counterpartyAccountId: string, headerId: string) => void;
     /** Open the destructive single-row confirm dialog for `target`. */
     onRequestDelete: (target: BankRow) => void;
+    /** Open the diagnostic raw-payload modal for `target`. */
+    onShowRawData: (target: BankRow) => void;
 }
 
 /**
@@ -120,6 +122,23 @@ export function buildBankRowMenuItems(
             onSelect: () => actions.onApprove(target.headerId),
         });
     }
+    // Edit, offered wherever the row is editable FROM THIS REGISTER. The
+    // split-parent branch above has always had it and the investment register
+    // has always had it; a plain bank row — much the commonest row in the app —
+    // did not, so the only ways in were a double-click or Enter, neither of
+    // which the menu advertised.
+    //
+    // Gated on cross-domain rather than on `noAuthoring`: that flag is about
+    // AUTHORING a new transaction on a category register, which Duplicate does
+    // and editing an existing row does not.
+    if (!isCrossDomainTarget) {
+        items.push({
+            id: 'edit',
+            label: 'Edit',
+            onSelect: () => actions.onEdit(target),
+            shortcutHint: 'Enter',
+        });
+    }
     if (!isCrossDomainTarget && !opts?.noAuthoring) {
         items.push({
             id: 'duplicate',
@@ -147,6 +166,19 @@ export function buildBankRowMenuItems(
             actions.onShowOtherSide(target.counterpartyAccountId, target.headerId);
         },
         disabled: target.counterpartyAccountId === null,
+    });
+    // Diagnostic, and offered on EVERY row including the read-only ones — the
+    // question it answers ("why did this import like this?") is asked most often
+    // of a row you cannot edit from here. Same position as the investment
+    // register's: after Show other side, before Delete.
+    //
+    // It was investment-only, which was never a decision: the modal was declared
+    // inside that page and typed on its row. Most feed rows land on a BANK
+    // register, so the side that needed it more was the side without it.
+    items.push({
+        id: 'raw',
+        label: 'Show raw data',
+        onSelect: () => actions.onShowRawData(target),
     });
     if (!isCrossDomainTarget) {
         items.push({

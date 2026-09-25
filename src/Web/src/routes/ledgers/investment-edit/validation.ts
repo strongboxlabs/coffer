@@ -35,6 +35,15 @@ export interface InvestmentTxnDraft {
     transferAccountId: string | null;
     feeAccountId: string | null;
     feeAmount: number | null;
+    /**
+     * Header-level tags (ADR-0009). Always an array, never null — the editor
+     * sends it on every save, so an emptied list clears the header's tags
+     * rather than leaving them alone.
+     *
+     * Not in ACTION_LAYOUTS and not validated: tags apply to every action
+     * because they describe the event, not its shape.
+     */
+    tags: readonly string[];
 }
 
 /**
@@ -198,6 +207,11 @@ export function draftToCreateRequest(
         transferAccountId: draft.transferAccountId,
         feeAccountId: draft.feeAccountId,
         feeAmount: draft.feeAmount,
+        // Always sent, never omitted. The editor holds the whole tag set, so an
+        // emptied list has to reach the server as [] — omitting it is the
+        // server's "leave them alone", which would make a tag impossible to
+        // remove from this surface.
+        tags: draft.tags,
     };
 }
 
@@ -233,5 +247,10 @@ export function draftToPatchRequest(
         transferAccountId: draft.transferAccountId,
         feeAccountId: draft.feeAccountId,
         feeAmount: draft.feeAmount,
+        // Always sent, never omitted. The editor holds the whole tag set, so an
+        // emptied list has to reach the server as [] — omitting it is the
+        // server's "leave them alone", which would make a tag impossible to
+        // remove from this surface.
+        tags: draft.tags,
     };
 }

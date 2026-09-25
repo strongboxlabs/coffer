@@ -2,6 +2,17 @@
 
 **Status:** Accepted (Option B; four decisions resolved below; implementation in slices)
 
+> **Its cited premise was inverted by ADR-0100 (2026-09-23).** The three decision
+> drivers below appeal to ADR-0003 — "raw feed rows are immutable; user actions live
+> in an overlay". ADR-0003 is superseded: the canonical `txn_headers` / `txn_legs`
+> rows now hold the CURRENT values and the feed's originals go to the sidecar
+> `txn_header_originals`.
+>
+> The CONCLUSION still holds, for a reason this ADR does not give: clearing is
+> genuinely per-account state on a shared header, so `txn_leg_recon` is an overlay
+> because reconciliation is one, not because raw legs are immutable. If you are here
+> to decide something adjacent, take the conclusion and not the argument.
+
 ## Context
 
 Reconciliation status (`uncleared` / `reconciling` / `cleared`) is stored **per

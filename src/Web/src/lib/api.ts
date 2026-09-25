@@ -107,12 +107,16 @@ export {
 export {
     createTransaction,
     patchTransaction,
+    approveTransaction,
+    mergeTransaction,
     fetchSimilarPayees,
     fetchMergeCandidates,
 } from './api/bank';
 export {
     createInvestmentTransaction,
     patchInvestmentTransaction,
+    approveInvestmentTransaction,
+    mergeInvestmentTransaction,
     deleteInvestmentTransaction,
     fetchInvestmentMergeCandidates,
     fetchOpenLots,

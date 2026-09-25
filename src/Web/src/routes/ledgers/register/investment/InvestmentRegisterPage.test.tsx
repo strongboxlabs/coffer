@@ -1109,6 +1109,166 @@ describe('InvestmentRegisterPage', () => {
         expect(screen.queryByText(/edit selected/i)).not.toBeInTheDocument();
     });
 
+    // The grid's announced position. `aria-rowindex` was fed straight from
+    // virtuoso's logical index, which carries a 1,000,000 front-shift offset
+    // so rows could be prepended without going negative — so a screen reader
+    // was told the first row of the register was row 1,000,001. The paired
+    // `aria-rowcount` was the LOADED count, which made the announcement "row
+    // 1000001 of 87".
+    describe('announced row positions', () => {
+        it('numbers rows from 1 and declares the total unknown', async () => {
+            const rows = [
+                makeTxn({ id: 'a1', payee: 'first row' }),
+                makeTxn({ id: 'a2', payee: 'second row' }),
+            ];
+            vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+                entries: rows.map(entryOf),
+                cursorForOlder: null,
+                cursorForNewer: null,
+            });
+
+            renderPage();
+
+            const first = (await screen.findByText('first row')).closest('[role="row"]');
+            const second = screen.getByText('second row').closest('[role="row"]');
+            expect(first).toHaveAttribute('aria-rowindex', '1');
+            expect(second).toHaveAttribute('aria-rowindex', '2');
+
+            // -1 is ARIA's "not known". The window is a slice of the account,
+            // so any concrete total here would be one the index cannot be read
+            // against.
+            const grid = first!.closest('[role="grid"]');
+            expect(grid).toHaveAttribute('aria-rowcount', '-1');
+        });
+    });
+
+    // Two things the register said that were not true of it.
+    describe('what the rows and the header claim', () => {
+        it('says the select-all checkbox is filter-scoped, because it is', async () => {
+            // It said "Select all transactions in this account". This register
+            // has the same filter bar as bank's, so the checkbox selects the
+            // FILTERED set — a screen-reader user was told they were about to
+            // act on every transaction in the account.
+            vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+                entries: [entryOf(makeTxn({ id: 's1', payee: 'a row' }))],
+                cursorForOlder: null,
+                cursorForNewer: null,
+            });
+
+            renderPage();
+
+            expect(await screen.findByText('a row')).toBeInTheDocument();
+            expect(
+                screen.getByRole('checkbox', { name: /matching the current filter/i }),
+            ).toBeInTheDocument();
+        });
+
+        it('shows a pointer cursor, because double-click opens the editor', async () => {
+            // The rows wire onDoubleClickEdit, and showed an arrow — the one
+            // cursor that says "nothing happens here".
+            const txn = makeTxn({ id: 'c1', payee: 'clickable' });
+            vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+                entries: [entryOf(txn)],
+                cursorForOlder: null,
+                cursorForNewer: null,
+            });
+
+            renderPage();
+
+            const row = (await screen.findByText('clickable')).closest('[role="row"]')!;
+            expect(row.className).toContain('cursor-pointer');
+        });
+    });
+
+    // Tags are header-level (ADR-0009) and were blanked on this register — the
+    // API replaced the row's array with an empty one on the way out, so a
+    // tagged brokerage row looked untagged while the tag FILTER still matched
+    // it. Nothing here had a fixture with a non-empty `tags`.
+    describe('header tags', () => {
+        it('renders the header tags on an investment row', async () => {
+            const txn = makeTxn({
+                id: 'tagged1',
+                payee: 'tagged buy',
+                tags: ['roth', 'long-hold'],
+            });
+            vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+                entries: [entryOf(txn)],
+                cursorForOlder: null,
+                cursorForNewer: null,
+            });
+
+            renderPage();
+
+            expect(await screen.findByText('roth')).toBeInTheDocument();
+            expect(screen.getByText('long-hold')).toBeInTheDocument();
+        });
+
+        it('renders tags on a row with no category, transfer or fee chip', async () => {
+            // Slot 6's early-out ran on the three account chips alone. A plain
+            // buy populates none of them, so a tagged one would have rendered
+            // an empty cell — the commonest shape on a brokerage register.
+            const txn = makeTxn({
+                id: 'tagged2',
+                payee: 'plain buy',
+                investmentAction: 'buy',
+                counterpartyAccountName: null,
+                tags: ['roth'],
+            });
+            vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+                entries: [entryOf(txn)],
+                cursorForOlder: null,
+                cursorForNewer: null,
+            });
+
+            renderPage();
+
+            // Anchor on the row first: a bare queryBy would pass on the frame
+            // before the register has rendered anything at all.
+            expect(await screen.findByText('plain buy')).toBeInTheDocument();
+            expect(screen.getByText('roth')).toBeInTheDocument();
+        });
+
+        it('colours a tag chip from the ledger palette', async () => {
+            // ADR-0077 D4 said coloured chips were "a bank-register concern
+            // only" — which followed from this register rendering no chips at
+            // all, not from anything about colour. Without the
+            // TagColorsProvider wrapper the chips render, and render grey, on
+            // this register alone: the same tag would be two different colours
+            // depending on which register you were looking at.
+            vi.spyOn(apiModule, 'fetchTags').mockResolvedValue([
+                { id: 'tag-1', name: 'roth', color: '#336699', usageCount: 1 },
+            ]);
+            const txn = makeTxn({ id: 'coloured', payee: 'coloured buy', tags: ['roth'] });
+            vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+                entries: [entryOf(txn)],
+                cursorForOlder: null,
+                cursorForNewer: null,
+            });
+
+            renderPage();
+
+            const chip = await screen.findByText('roth');
+            // Anchored on the resolved colour, not merely on "has a style":
+            // an unwrapped chip still renders, just without one.
+            await waitFor(() =>
+                expect(chip).toHaveStyle({ backgroundColor: '#336699' }));
+        });
+
+        it('renders no tag chips on an untagged row', async () => {
+            const txn = makeTxn({ id: 'untagged', payee: 'no tags here', tags: [] });
+            vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+                entries: [entryOf(txn)],
+                cursorForOlder: null,
+                cursorForNewer: null,
+            });
+
+            renderPage();
+
+            expect(await screen.findByText('no tags here')).toBeInTheDocument();
+            expect(screen.queryByText('roth')).toBeNull();
+        });
+    });
+
     // A cash-neutral event nets to ZERO on the brokerage sleeve by
     // construction — a reinvestment is income +X and security −X — so ADR-0028's
     // Amount is a true and useless $0.00. 38.8% of dev's brokerage entries are
@@ -1220,6 +1380,11 @@ describe('InvestmentRegisterPage', () => {
                 payee: 'the keeper',
             },
         ]);
+        // Merging is a COMMAND with its own route, mirroring bank. The PATCH
+        // spy stays so a silent return to merge-by-PATCH fails the test.
+        const mergeSpy = vi
+            .spyOn(apiModule, 'mergeInvestmentTransaction')
+            .mockResolvedValue(entryOf(survivorRow));
         const patchSpy = vi
             .spyOn(apiModule, 'patchInvestmentTransaction')
             .mockResolvedValue(entryOf(survivorRow));
@@ -1237,11 +1402,12 @@ describe('InvestmentRegisterPage', () => {
             await screen.findByRole('button', { name: /fold into selected/i }),
         );
 
-        await waitFor(() => expect(patchSpy).toHaveBeenCalled());
-        // The PATCH carried the survivor as the merge target.
-        expect(patchSpy.mock.calls[0]![2]).toEqual(
-            expect.objectContaining({ mergeFromHeaderId: SURVIVOR_HEADER }),
-        );
+        await waitFor(() => expect(mergeSpy).toHaveBeenCalled());
+        // Direction is inverted: the URL names the LOSER, the body the SURVIVOR.
+        // Asserting both positions is what catches a swap of the two.
+        expect(mergeSpy.mock.calls[0]![1]).toBe(LOSER_HEADER);
+        expect(mergeSpy.mock.calls[0]![2]).toBe(SURVIVOR_HEADER);
+        expect(patchSpy).not.toHaveBeenCalled();
 
         // The loser is gone from the window…
         await waitFor(() => {
@@ -1250,6 +1416,90 @@ describe('InvestmentRegisterPage', () => {
         // …and the survivor appears exactly once, not duplicated onto the
         // loser's row.
         expect(screen.getAllByText('the keeper')).toHaveLength(1);
+    });
+
+    it('offers Accept on an unreviewed row, and it reaches the dedicated route', async () => {
+        // Bank has offered this from the row menu since slice 2c; investment
+        // never did, so accepting an imported row meant opening the editor and
+        // re-saving every field through a wholesale PATCH — which writes back
+        // whatever the client reconstructed, when accepting should change
+        // nothing.
+        const txn = makeTxn({
+            id: 't-accept',
+            headerId: '00000000-0000-0000-0000-0000000000e1',
+            payee: 'imported buy',
+            needsReview: true,
+        });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(txn)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+        const approveSpy = vi
+            .spyOn(apiModule, 'approveInvestmentTransaction')
+            .mockResolvedValue(null);
+        const patchSpy = vi
+            .spyOn(apiModule, 'patchInvestmentTransaction')
+            .mockResolvedValue(null);
+
+        renderPage();
+
+        const cell = await screen.findByText(txn.payee!);
+        fireEvent.contextMenu(cell.closest('[role="row"]') as HTMLElement);
+        fireEvent.click(await screen.findByRole('menuitem', { name: /^Accept$/ }));
+
+        await waitFor(() => {
+            expect(approveSpy).toHaveBeenCalledWith(
+                LEDGER_ID, '00000000-0000-0000-0000-0000000000e1', ACCOUNT_ID,
+            );
+        });
+        // Accepting must not re-save the row's fields.
+        expect(patchSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not offer Accept on a row that is already accepted', async () => {
+        const txn = makeTxn({
+            id: 't-done',
+            headerId: '00000000-0000-0000-0000-0000000000e2',
+            payee: 'already accepted',
+            needsReview: false,
+        });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(txn)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+
+        renderPage();
+
+        const cell = await screen.findByText(txn.payee!);
+        fireEvent.contextMenu(cell.closest('[role="row"]') as HTMLElement);
+        // Anchored on the menu being open before asserting the absence — a bare
+        // queryBy would pass on the frame before the menu renders at all.
+        expect(await screen.findByRole('menuitem', { name: /^Edit$/ })).toBeInTheDocument();
+        expect(screen.queryByRole('menuitem', { name: /^Accept$/ })).toBeNull();
+    });
+
+    it('hides Import and Sync on a retired brokerage', async () => {
+        // Deactivating an account is a statement that nothing more should land
+        // in it. The bank register has gated both on isActive; this one invited
+        // new rows into an account the user had deliberately closed, and the
+        // import would have succeeded.
+        vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([
+            { ...TEST_ACCOUNT, isActive: false, feedConnectionId: 'fc-1' },
+        ]);
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+
+        renderPage();
+
+        // Anchor on the page having rendered before asserting absence.
+        expect(await screen.findByText(/Brokerage/i)).toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /^Import$/ })).toBeNull();
+        expect(screen.queryByRole('button', { name: /sync account/i })).toBeNull();
     });
 });
 
@@ -1373,4 +1623,3 @@ describe('InvestmentRegisterPage — focus anchoring', () => {
         ).toBe('false');
     });
 });
-

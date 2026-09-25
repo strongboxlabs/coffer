@@ -130,5 +130,5 @@ overridden date moves" means in practice.
 - **Surfaces (does not cause) a pre-existing modeling gap:** in-kind transfers /
   rollovers recorded as sell+buy now show a fabricated realized gain (and the
   destination basis was reset to transfer-date market). The fix is the
-  transfer-shares action + a data scrub — its own slice (see docs/follow-ups.md).
+  transfer-shares action + a data scrub — its own slice (see docs/maintainer/follow-ups.md).
   FIFO is correct given the recorded actions; it just made the issue visible.

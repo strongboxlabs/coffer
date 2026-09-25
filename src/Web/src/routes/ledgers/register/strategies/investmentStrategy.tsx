@@ -3,6 +3,7 @@ import { Chip } from '@/components/ui/Chip';
 import { categoryChipVariant } from '@/lib/categoryChip';
 import { displayAccountPath } from '@/lib/accountPath';
 import { ProvenanceIcon } from '@/components/register/ProvenanceIcon';
+import { TagChip } from '@/components/tags/TagChip';
 import { formatShares, formatPrice, formatCurrency } from '@/lib/money';
 import { taxDateSubLabel } from '../bank/columns';
 
@@ -14,7 +15,7 @@ import { taxDateSubLabel } from '../bank/columns';
  * Slot layout (9-column grid — see `../investment/columns.ts`):
  *   1 status     2 checkbox    3 date + tax date   4 Action chip + check#
  *   5 Description (payee + memo)
- *   6 Category | Transfer (line 1)  ·  Fee category (line 2)
+ *   6 Category | Transfer (line 1)  ·  Fee category (line 2)  ·  Tags (line 3)
  *   7 Security · Shares @ Price            ← new vs bank
  *   8 Amount + fee subtitle
  *   9 Cash balance
@@ -154,7 +155,11 @@ export const investmentStrategy = {
         const hasCategory = !!txn.categoryAccountName;
         const hasTransfer = !!txn.transferAccountName;
         const hasFee = !!txn.feeCategoryName;
-        if (!hasCategory && !hasTransfer && !hasFee) return null;
+        // Tags are header-level (ADR-0009) and apply to every action, so they
+        // can be the ONLY thing in this cell — a tagged plain buy has no
+        // category, transfer or fee chip. They count toward the early-out.
+        const hasTags = txn.tags.length > 0;
+        if (!hasCategory && !hasTransfer && !hasFee && !hasTags) return null;
 
         const categoryVariant = hasCategory
             ? categoryChipVariant(
@@ -210,6 +215,17 @@ export const investmentStrategy = {
                     >
                         <span className="truncate">{displayAccountPath(accountPaths, txn.feeCategoryId, txn.feeCategoryName)}</span>
                     </Chip>
+                ) : null}
+                {/* Tags wrap beneath the account chips, in the same cell and the
+                    same order as the bank register's category · tags column —
+                    one row of chips per header, since the aggregator collapses
+                    an investment event's legs into a single row. */}
+                {hasTags ? (
+                    <span className="flex flex-wrap gap-1">
+                        {txn.tags.map((tag) => (
+                            <TagChip key={tag} name={tag} />
+                        ))}
+                    </span>
                 ) : null}
             </>
         );

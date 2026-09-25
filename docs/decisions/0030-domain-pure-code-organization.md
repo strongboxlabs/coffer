@@ -238,7 +238,7 @@ These need their own design work before the implementation slice:
   `[JsonPolymorphic]`), with the SPA narrowing per account-domain.
   Full spec inline in §2 above. No DB data migration; no contract
   versioning (single in-repo client).
-* `docs/follow-ups.md` "Domain-split the remaining mega-files"
+* `docs/maintainer/follow-ups.md` "Domain-split the remaining mega-files"
   entry continues to track the next big-file targets
   (BankRegisterPage, TxnRowEdit, FeedConnectionsPage,
   SecurityDetailPage, TransactionsRepository,

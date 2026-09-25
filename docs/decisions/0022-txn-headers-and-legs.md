@@ -257,7 +257,7 @@ scan still trips it (282 functions) for ~70-100 ms of compile with no
 execution benefit. Lifting the override would only regress reports;
 counterparty denorm measured cheap (~2 ms, won't do). It is the
 deliberate, measured optimum, not a workaround. See ADR-0046's close-out
-and `docs/follow-ups.md` "View join cost".
+and `docs/maintainer/follow-ups.md` "View join cost".
 
 ## Consequences
 

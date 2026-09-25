@@ -252,13 +252,18 @@ function renderSplitLegBody(
 // Investment-specific container attributes (preserved exactly as the
 // three former investment components emitted them): `data-headerid` on
 // the txn + split-parent rows (not legs), `data-focused` on every
-// variant. No `aria-rowindex` / `data-scheduled` (those were bank-only).
+// variant. `aria-rowindex` is emitted here too now: it was bank-only, so a
+// screen reader moving through a brokerage register was told nothing about
+// where it was. `data-scheduled` stays bank-only (investment rows are never
+// scheduled).
 function investmentContainerAttrs(
     row: InvestmentRow,
     ctx: RegisterRowContainerCtx,
 ) {
     return {
         dataAttrs: {
+            'aria-rowindex':
+                ctx.rowIndex !== undefined ? ctx.rowIndex + 1 : undefined,
             'data-headerid': ctx.variant === 'split-leg' ? undefined : row.headerId,
             'data-focused': ctx.focused ? 'true' : 'false',
         },
@@ -269,7 +274,10 @@ function investmentContainerAttrs(
 export const investmentRowStrategy: RegisterRowStrategy<InvestmentRow> = {
     cols: INVESTMENT_REGISTER_COLS,
     rowClassName: 'items-start py-1.5',
-    cursorClassName: 'cursor-default',
+    // These rows open the editor on double-click (the page wires
+    // onDoubleClickEdit), so an arrow cursor said the opposite of what is true.
+    // Bank has always used the pointer for the same affordance.
+    cursorClassName: 'cursor-pointer',
     containerAttrs: investmentContainerAttrs,
     renderBody(row, ctx) {
         switch (ctx.variant) {

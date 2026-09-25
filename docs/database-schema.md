@@ -677,7 +677,28 @@ erDiagram
     users ||--o{ system_settings : "updated by"
     ledgers ||--o{ ledger_snapshots : "snapshot of"
     users ||--o{ ledger_snapshots : "created by"
+    ledger_snapshots ||--o{ ledger_snapshot_parts : "chunked into"
+
+    %% Budgets, CSV layouts, events and audit — documented below but
+    %% previously absent from this diagram entirely.
+    ledgers ||--o{ budget_targets : "budgeted in"
+    ledgers ||--o{ feed_csv_mappings : "import layouts for"
+    ledgers ||--o{ ledger_events : "raised in"
+    ledgers ||--o{ ledger_notification_subscribers : "notified for"
+    users ||--o{ ledger_notification_subscribers : "subscribed by"
+    users ||--o{ notification_subscribers : "subscribed by"
+    users ||--o{ admin_audit_events : "acted by"
+
+    %% Which import wrote a row, so an import can be undone (mig 221).
+    ledger_operations ||--o{ txn_headers : "wrote"
 ```
+
+> **`system_events` and `__schema_migrations` are deliberately absent.** Neither
+> carries a `ledger_id` or a `user_id` — `system_events` is deployment-scoped by
+> design (ADR-0096 D3) and has no foreign key to draw — so they have sections under
+> **Tables** but no entity here. Noted so the gap is not re-reported as an omission.
+
+
 
 ---
 
@@ -767,7 +788,7 @@ Server-side state for in-flight WebAuthn ceremonies (per ADR-0013). Rows live ~6
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
 | `id` | `UUID` | PK | |
-| `flow` | `TEXT` | NOT NULL CHECK in (`setup`, `login`, `register`, `invite`) | The ceremony shape this challenge was issued for. The `/complete` consumer must request the same flow it was issued for; mismatched flows fail the lookup. `register` (migration 140) is the add-a-passkey ceremony for an already-authenticated user, distinct from `setup` (which also creates the user). `invite` (migration 176, ADR-0083 slice B) is the invite-redeem ceremony — a scoped, repeatable clone of the first-user `setup` ceremony that `InvitesEndpoints` runs when a recipient redeems an invite link. |
+| `flow` | `TEXT` | NOT NULL CHECK in (`setup`, `login`, `register`, `invite`, `masterkey-reveal`, `backup-passphrase-reveal`) | The ceremony shape this challenge was issued for. The `/complete` consumer must request the same flow it was issued for; mismatched flows fail the lookup. `register` (migration 140) is the add-a-passkey ceremony for an already-authenticated user, distinct from `setup` (which also creates the user). `invite` (migration 176, ADR-0083 slice B) is the invite-redeem ceremony — a scoped, repeatable clone of the first-user `setup` ceremony that `InvitesEndpoints` runs when a recipient redeems an invite link. |
 | `user_id` | `UUID` | FK → `users(id)` ON DELETE CASCADE | NULL during the bootstrap setup flow (the user row doesn't exist yet — it's created at /complete in the same transaction as the credential). For login, the resolved user. |
 | `options_json` | `TEXT` | NOT NULL | Fido2NetLib's `CredentialCreateOptions` / `AssertionOptions` JSON serialisation. The challenge bytes live inside. |
 | `metadata_json` | `TEXT` | | Per-flow scratch: setup stores the proposed username + display name + the predetermined user_id here so `/complete` can build the user row; login leaves it NULL. |
@@ -830,7 +851,7 @@ Both real accounts (bank, credit_card, investment, asset, liability, loan) **and
 | `parent_id` | `UUID` | composite FK `(parent_id, ledger_id)` → `accounts(id, ledger_id)` ON DELETE SET NULL (parent_id) | NULL for top-level. Allowed only when `account_type='category'`. Composite FK `accounts_parent_id_ledger_fkey` (migration 121) — the scoped `SET NULL (parent_id)` clears only the reference, leaving the row's NOT-NULL `ledger_id` intact. |
 | `name` | `TEXT` | NOT NULL | Display name |
 | `account_type` | `TEXT` | NOT NULL CHECK in (`bank`, `credit_card`, `investment`, `asset`, `liability`, `loan`, `category`) | |
-| `category_kind` | `TEXT` | CHECK in (NULL, `income`, `expense`) | Set if and only if `account_type='category'` |
+| `category_kind` | `TEXT` | CHECK in (NULL, `income`, `expense`, `adjustment`) | Set if and only if `account_type='category'` |
 | `currency_code` | `TEXT` | NOT NULL DEFAULT `'USD'` | ISO 4217 |
 | `opening_balance` | `NUMERIC(19,4)` | NOT NULL DEFAULT 0 | Balance at start of tracking. Must be `0` for categories. |
 | `opened_on` | `DATE` | NULL | The account's "Start Date" (the opening balance's as-of date). MD records it for most account types; seeded on import from the MD `acct` item's creation stamp — `date_created` (`yyyyMMdd` int) when present, else `creation_date` (epoch millis, read as its UTC date; MD stamps these at local noon so the day is stable) — and editable in Coffer later. The importer's upsert uses `COALESCE(accounts.opened_on, EXCLUDED.opened_on)` — seed-once, never overwriting a Coffer-side edit. NULL for categories (their opening balance is forced to 0). Added in migration 127 (ADR-0050); importer population landed later, and since MD import is a one-shot bootstrap with no re-import path, **migration 196** backfills already-imported ledgers by mining the same fields from `provider_raw_payload`. |
@@ -849,6 +870,7 @@ Both real accounts (bank, credit_card, investment, asset, liability, loan) **and
 | `is_trade_commission` | `BOOLEAN` | NOT NULL DEFAULT FALSE; CHECK (`is_trade_commission = FALSE OR account_type = 'investment'`) | **On a brokerage (`account_type='investment'`)**: when TRUE, `recompute_holdings_cost_basis()` adds `posting_role='fee'` leg amounts from this brokerage's transactions into cost basis (and into `lots.unit_cost` on the function's next reset). Default FALSE. Migration 054 added the column; migration 056 narrowed semantics from per-category to per-brokerage and added the CHECK so non-investment accounts can't carry it. Typical settings: taxable brokerage = TRUE; 401k where in-transaction "fees" are administrative = FALSE. |
 | `tax_status` | `TEXT` | CHECK in (NULL, `taxable`, `tax_deferred`, `tax_free`, `other`) | ADR-0066 (migration 149). The account's tax treatment, orthogonal to `account_type` (a brokerage and a Roth IRA are both `investment`). Importer seeds a best-guess from the source account name/type; Coffer owns it thereafter (import-once). Distinguishes 1099-B-relevant taxable accounts from tax-deferred/tax-free for reporting. |
 | `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+| `import_provider_key` | `TEXT` | CHECK length ≤ 64 (`ck_accounts_import_provider_key_length`) | Migration 223: which file provider this account's imports default to, so the import dialog can preselect it. Free text rather than an enum because the provider set is open — a new `IFileProvider` must not need a migration to be selectable. |
 
 **Cross-column CHECK constraints (migration 007):**
 
@@ -959,7 +981,7 @@ can be cleared in one account while still uncleared in the other.
 | `payee` | `TEXT` | | The current value. Mutable: both PATCH paths assign it, and the feed's is captured to `txn_header_originals` on the first edit (mig 230). Before that migration this column was raw-and-immutable and the edit lived in `txn_header_overrides`; the flip exists because a nullable override column could not express a CLEARED payee. |
 | `memo` | `TEXT` | | Raw event memo (Moneydance's `txn.memo`, e.g. "Electronic/ACH Credit"). Per-split memos live on `txn_legs.leg_memo`. |
 | `posted_at` | `TIMESTAMPTZ` | NOT NULL | The current value (mig 230 — see `payee`). NOT NULL, so a PATCH naming it with an explicit null is rejected (`transaction-date-null`) rather than ignored. |
-| `transacted_at` | `TIMESTAMPTZ` | | The current value (mig 230 — see `payee`). NOT NULL since mig 189: "no distinct tax date" is stored as the posted date, so there is no null state and an explicit null is rejected the same way. |
+| `transacted_at` | `TIMESTAMPTZ` | NOT NULL (mig 189) | The current value (mig 230 — see `payee`). NOT NULL since mig 189: "no distinct tax date" is stored as the posted date, so there is no null state and an explicit null is rejected the same way. |
 | `check_number` | `TEXT` | | Paper-check number (Moneydance's `chk` field). |
 | `is_pending` | `BOOLEAN` | NOT NULL DEFAULT FALSE | Bank-side state — TRUE while the bank itself has not cleared the transaction. Mutable: the sync service flips T→F in place on a future sync that returns the same FITID with `pending: false` (slice 2c promote-on-clear). Orthogonal to `needs_review`. |
 | `is_hidden` | `BOOLEAN` | NOT NULL DEFAULT FALSE | Soft-delete at the header level. The DELETE endpoint flips this to TRUE for any feed-sourced row (i.e. `external_id IS NOT NULL`, which after mig 105 covers SimpleFIN syncs alongside every other ingest path); manual rows (`origin='manual'`, no `external_id`) get hard-deleted instead. Canonical since mig 230: `txn_header_overrides.is_hidden` was dropped with its table, having had exactly one writer in the repository — a test fixture. |
@@ -982,6 +1004,7 @@ can be cleared in one account while still uncleared in the other.
 | `is_recurring_template` | `BOOLEAN` | NOT NULL DEFAULT FALSE | Migration 124 (ADR-0048): TRUE marks this header as a recurring-series **template**, not a live event. The `live_txn_headers` / `template_txn_headers` views partition on this flag so the register only ever sees live rows; templates fire occurrences via `recurring_transactions.template_header_id`. |
 | `recurring_transaction_id` | `UUID` | FK → `recurring_transactions(id)` | Migration 124: on a **fired** occurrence, back-reference to the series that produced it. NULL on ordinary rows and on templates. |
 | `occurrence_date` | `DATE` | | Migration 124: the series occurrence date a fired row materializes (paired with `recurring_transaction_id`). |
+| `ledger_operation_id` | `UUID` | FK → `ledger_operations(id)` ON DELETE SET NULL | Migration 221: which import wrote this row, so `POST /ledger-operations/{id}/undo-import` can hide exactly that set. **ON DELETE SET NULL is load-bearing** — `AuditRetentionService` prunes `ledger_operations`, and CASCADE would delete the transactions with the audit row. The consequence is that undo expires with the retention window. |
 | `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
 
 > **Re-importing a file backfills these carriers.** A row imported before a carrier column existed has no way to acquire it otherwise, so the file-import dedup path fills `provider_raw_payload` and every `ingest_*` column above **over NULL only** when it re-sees a row it already knows (by `external_id`, or by `(fi_id, fitid)` for OFX). It never overwrites a stored value and never touches money, payee or memo — so it is safe on an accepted row and is the repair path for an unreviewed one. Before this, re-import reported a dedup and changed nothing.
@@ -1244,7 +1267,7 @@ sub-select (the `security_splits` pattern).
 | `sell_leg_id` | `UUID` | NOT NULL FK → `txn_legs(id)` ON DELETE CASCADE; UNIQUE | The holdings-side disposal leg. |
 | `sold_at` | `TIMESTAMPTZ` | NOT NULL | |
 | `quantity` | `NUMERIC` | NOT NULL | Shares disposed (absolute). |
-| `proceeds` | `NUMERIC` | NOT NULL | `−leg.amount`, net of a sell-side fee when the brokerage folds fees. |
+| `proceeds` | `numeric(19,2)` | NOT NULL | `−leg.amount`, net of a sell-side fee when the brokerage folds fees. **Scaled by migration 182** — these columns were unconstrained `NUMERIC`, and after migration 180 widened `lots.unit_cost` they could hold values that overflowed .NET `decimal` on read, which killed the `realized_gains` MCP tool and its report outright. The sibling money columns (`proceeds_lt`, `cost_basis_sold`, `cost_basis_sold_lt`, `realized_gain`, `realized_gain_lt`) carry the same scale; `quantity` is `numeric(25,12)`. |
 | `cost_basis_sold` | `NUMERIC` | NOT NULL | Σ consumed FIFO lot cost. |
 | `realized_gain` | `NUMERIC` | NOT NULL | `proceeds − cost_basis_sold`. |
 | `proceeds_lt` | `NUMERIC` | NOT NULL DEFAULT 0 | Long-term portion of proceeds — lots held > 1 year at sale (migration 169, ADR-0064). Short-term proceeds = `proceeds − proceeds_lt`. |
@@ -1391,6 +1414,7 @@ Templates for scheduled/recurring transactions. Originates from Moneydance "remi
 | `auto_commit_days_before` | `INTEGER` | | If set, an occurrence auto-fires this many days before its due date (mig 124, ADR-0047); NULL = manual confirm only. |
 | `template_header_id` | `UUID` | composite FK `(template_header_id, ledger_id)` → `txn_headers(id, ledger_id)` ON DELETE RESTRICT, DEFERRABLE INITIALLY DEFERRED | The template `txn_headers` row this series fires from (mig 124, ADR-0048 — templates live in `txn_headers` with `is_recurring_template=true`, surfaced via the `template_txn_headers` view). DEFERRABLE because it and `txn_headers.recurring_transaction_id` reference each other (resolved at commit during snapshot restore). |
 | `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+| `estimate_sample_count` | `INTEGER` | CHECK > 0 when set (`ck_recurring_transactions_estimate_sample_count`) | Migration 220: how many prior occurrences an ESTIMATED reminder averages to produce its amount. NULL on a fixed-amount series. Partial index `idx_recurring_transactions_estimated` backs the auto-post job's scan; the samples themselves come from `reminder_estimate_samples`. |
 
 ### `recurring_occurrence_exceptions`
 
@@ -1608,7 +1632,7 @@ The single per-ledger daily scheduler (migration 136). One row per `(ledger_id, 
 | Column | Type | Constraints / FK | Notes |
 |---|---|---|---|
 | `ledger_id` | `UUID` | PK part; FK → `ledgers(id)` ON DELETE CASCADE | The ledger. |
-| `job_type` | `TEXT` | PK part; CHECK `IN ('quote-refresh','snapshot')` | The scheduled work. |
+| `job_type` | `TEXT` | PK part; CHECK `IN ('quote-refresh','snapshot','feed-sync','reminder-auto-post')` — `feed-sync` added by mig 215, `reminder-auto-post` by mig 219 | The scheduled work. |
 | `enabled` | `BOOLEAN` | NOT NULL DEFAULT FALSE | Whether it runs (opt-in). |
 | `hour_local` | `SMALLINT` | NOT NULL DEFAULT 19, CHECK 0–23 | Time-of-day hour in `timezone` (migration 136). |
 | `minute_local` | `SMALLINT` | NOT NULL DEFAULT 0, CHECK 0–59 | Time-of-day minute in `timezone`. |
@@ -1616,6 +1640,10 @@ The single per-ledger daily scheduler (migration 136). One row per `(ledger_id, 
 | `configured_by_user_id` | `UUID` | NOT NULL FK → `users(id)` ON DELETE RESTRICT | Run attribution / pref resolution. |
 | `last_run_at` / `next_run_at` | `TIMESTAMPTZ` | NULL | Worker bookkeeping; `next_run_at` NULL when disabled. |
 | `created_at` / `updated_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+| `consecutive_failures` | `INTEGER` | NOT NULL DEFAULT 0 | Migration 194: how many runs in a row have thrown. Drives the disable-after-N rule so a permanently broken job stops retrying daily forever. |
+| `last_error` | `TEXT` | NULL | Migration 194: the last failure's message, kept so the admin UI can say WHY a job stopped rather than only that it did. |
+| `last_failure_at` | `TIMESTAMPTZ` | NULL | Migration 194: when that failure happened. |
+| `disabled_reason` | `TEXT` | NULL | Migration 216: why the scheduler turned this job off — distinguishes "the user disabled it" from "it failed too many times", which the `enabled` flag alone cannot. |
 
 Partial index `idx_scheduled_jobs_due (next_run_at) WHERE enabled` for the worker's "what's due?" query. RLS: per-ledger-visibility policy `scheduled_jobs_per_ledger` (a ledger setting, not a personal pref). The worker reads via the BYPASSRLS service role — a background tick has no request user, so the RLS app role would be fail-closed.
 
@@ -1634,6 +1662,8 @@ Deployment-wide (non-ledger) sibling of `scheduled_jobs` (migration 139, ADR-006
 | `configured_by_user_id` | `UUID` | FK → `users(id)` ON DELETE SET NULL | The admin who configured it. SET NULL (not RESTRICT) so the deployment's backup schedule + passphrase survive the configuring admin's removal — attribution is nice-to-have, the schedule is operationally critical. |
 | `last_run_at` / `next_run_at` | `TIMESTAMPTZ` | NULL | Worker bookkeeping. |
 | `created_at` / `updated_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+| `consecutive_failures` / `last_error` / `last_failure_at` | — | | Migration 194, same three columns and the same disable-after-N rule as the per-ledger twin. |
+| `disabled_reason` | `TEXT` | NULL | Migration 216, as above. |
 
 ### `system_settings`
 
@@ -1758,7 +1788,7 @@ Admin "never delete" pins for backup artifacts (migration 144, ADR-0062 ④b+c).
 
 ### `ledger_snapshots`
 
-Server-side capped snapshots of the user-curated ledger graph (migration 111, ADR-0037) — the in-place recovery half of the backup design (weekly auto-snaps + manual). Capped at 5 per ledger (auto-evicted first) in `LedgerSnapshotsRepository`, **not** a DB constraint (the eviction rule is nicer in LINQ than SQL). `content` is gzip JSON of the in-scope per-ledger tables built by `fn_ledger_snapshot_payload`; operational state (feed_connections, ledger operations, sessions) and the materialized `txn_header_account_balances` are excluded — balances are re-derived on restore.
+Server-side capped snapshots of the user-curated ledger graph (migration 111, ADR-0037) — the in-place recovery half of the backup design (weekly auto-snaps + manual). Capped at 5 per ledger (auto-evicted first) in `LedgerSnapshotsRepository`, **not** a DB constraint (the eviction rule is nicer in LINQ than SQL). **Where the payload lives depends on the snapshot's format version, and `content` is only the v1 answer.** v1 put gzip JSON in `content`; v2 (migration 179) leaves `content` empty and writes `content_json`; v3 (migration 193) leaves `content_json` NULL and chunks the payload into `ledger_snapshot_parts`, which is what the `ledger_snapshot_parts` section below describes. The API discriminates on `content.Length > 0`. In every version the scope is the same: the in-scope per-ledger tables built by `fn_ledger_snapshot_payload`, with operational state (feed_connections, ledger operations, sessions) and the materialized `txn_header_account_balances` excluded — balances are re-derived on restore.
 
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
@@ -1771,6 +1801,7 @@ Server-side capped snapshots of the user-curated ledger graph (migration 111, AD
 | `schema_version` | `text` | NOT NULL | DB schema version at capture; restore refuses on mismatch. |
 | `content` | `bytea` | NOT NULL | gzip-compressed JSON of the in-scope tables. |
 | `content_size_uncompressed` | `integer` | NOT NULL CHECK (`>= 0`) | Uncompressed byte count for the SPA's "N MB before compression" display without decompressing. |
+| `content_json` | `jsonb` | NULL | Migration 179 (format v2): the payload, when the snapshot is v2. NULL on v1 (payload in `content`) and on v3 (payload chunked into `ledger_snapshot_parts`). The API discriminates on `content.Length > 0`; see the format note above. |
 
 Indexes: `idx_ledger_snapshots_ledger_created (ledger_id, created_at DESC)`, `idx_ledger_snapshots_ledger_kind_created (ledger_id, kind, created_at)`. No RLS — access is mediated by the repository/service layer. Migration 112 later extended the snapshot scope (recurring transactions + splits).
 
@@ -1872,11 +1903,13 @@ See `db/migrations/023_swing_view_and_trigger_onto_headers_and_legs.sql` for the
 
 ## Functions
 
-The API uses Postgres-side functions for read paths whose shape doesn't
-fit cleanly in LINQ. Every function is bound to EF via
-`HasDbFunction` in `AppDbContext.OnModelCreating`; the C# instance
-method on `AppDbContext` is a translation anchor only — its body is
-never executed.
+The API uses Postgres-side functions for paths whose shape doesn't fit
+cleanly in LINQ — read paths and set-based recomputes both. **Twenty** are
+bound to EF via `HasDbFunction` in `AppDbContext.OnModelCreating`; the C#
+instance method on `AppDbContext` is a translation anchor only — its body is
+never executed. Five are documented in full below and the other fifteen are
+tabulated after them; this section used to expand the five and stop, which
+read as though there were only five.
 
 ### `register_entry_keys(p_account_ids, p_ledger_id, p_cursor_entry_key, p_cursor_seq, p_direction, p_limit, p_hidden, p_search, p_date_from, p_date_to, p_amount_min, p_amount_max, p_security_id, p_tag, p_category_id, p_status, p_today, p_sort_column, p_sort_dir)`
 
@@ -2010,6 +2043,34 @@ migration-177 backfill applies the identical logic to historical trade legs
 (taking the last trade of each `(security, UTC-day)`), covering the Dapper
 importer path the interceptor doesn't see.
 
+### The rest of the bound functions
+
+Twenty functions are bound via `HasDbFunction`; the five above are documented in
+full because their signatures are read-path contracts callers have to match. The
+remainder are listed rather than expanded — each is a single-purpose call whose
+shape lives in its migration — so that this section answers "what runs in the
+database" completely rather than partially.
+
+| Function | What it does | Notes |
+|---|---|---|
+| `recompute_balances_for_account(account_id, from_posted_at)` | Rebuilds `txn_header_account_balances` for one account from the first affected header forward. | The canonical balance algorithm. Migration 102 dropped the trigger family that used to call it; the `LegDerivedRecomputeInterceptor` calls it now, and bulk paths that bypass the change tracker call `LegDerivedRecomputeService` explicitly. |
+| `account_balance_walk(account_id, …)` | The pure walk — computes what the balance SHOULD be without writing. | Migration 206 split this out of the recompute so the drift check could be a genuine read. `GET .../balances/health` uses it; `POST .../balances/repair` is what persists. |
+| `account_balance_as_of_instants(…)` | Account balances at a set of instants, in one round trip. | Feeds net-worth-over-time and the as-of reporting surfaces. |
+| `recompute_holdings_for_brokerage(account_id)` | Rebuilds `holdings` + `lots` for every security in one brokerage. | Called by `HoldingsRecomputeInterceptor` after an investment write. |
+| `recompute_holdings_for_account_security(account_id, security_id)` | The narrow version — one `(account, security)` pair. | Used when the affected pair is known, which is the common case. |
+| `holdings_cost_basis_as_of(…)` | FIFO cost basis for a position at an instant. | Rewritten by migration 229 to order by the EFFECTIVE posted date, then again by 230 when effective and raw collapsed into one column. |
+| `holdings_market_value_as_of_set(…)` | Market value for a set of positions at an instant. | Same 229 / 230 history as the cost-basis walk — they had to move together or a row would sort one way on screen and another in the FIFO walk. |
+| `realized_gains_walk(…)` | Replays disposals to produce realized gain rows. | Migration 182 scaled its money columns after unscaled `NUMERIC` overflowed .NET `decimal` on read. |
+| `recompute_posting_counts_for_header(header_id)` | Refreshes the denormalized posting counts on a header. | ADR-0046: the counts are what let the register decide split-vs-flat without a second query. |
+| `reminder_occurrence_lock(recurring_transaction_id, occurrence_date)` | Advisory lock for one series occurrence. | Stops the auto-post job and a hand-fire from materializing the same occurrence twice. |
+| `reminder_estimate_samples(recurring_transaction_id, …)` | The prior amounts an estimated reminder averages over. | Backs `estimate_sample_count`. |
+| `ledger_snapshot_payload(ledger_id)` | Builds a snapshot's payload from the in-scope tables. | The whitelist lives in `LedgerSnapshotPayload`, not here. |
+| `ledger_snapshot_write(…)` / `ledger_snapshot_restore(…)` | Write and replay a snapshot payload. | v3 chunks through `ledger_snapshot_parts`; `ledger_snapshot_restore_stored` is the stored-payload variant. |
+| `ledger_delete(ledger_id)` | Deletes a ledger and everything scoped to it. | One function so the delete order is stated once rather than reconstructed by an ORM. |
+
+`account_path(account_id)` is documented above but is NOT one of the twenty — it is
+called from SQL (the resolved view) rather than bound through EF.
+
 ### Trigger functions
 
 The balance-after maintenance + posting-pair invariant trigger
@@ -2027,7 +2088,7 @@ The recompute aggregates leg amounts per header (the **header-walk**), then runn
 
 Invariant: for any **visible** header (`is_merged_into IS NULL` AND `COALESCE(h.is_hidden, FALSE) = FALSE`) and any account it touches, `balance_after` equals `opening_balance` + the sum of net-per-header amounts for that account, summed across every earlier visible header in canonical `(posted_at, seq)` order. Hidden headers are excluded — the recompute predicate matches the resolved view's so the rows you can't see don't count against the rows you can. Amounts and dates come off `txn_legs` / `txn_headers` directly: migrations 099 / 101 / 103 taught the recompute to COALESCE through the override layer, and migration 230 removed the layer, so the COALESCE went with it.
 
-**Mig 102** dropped the entire balance-trigger family. The recompute function stays as the algorithm but is invoked from API call sites instead: the `BalanceRecomputeInterceptor` (`SaveChangesInterceptor`) scans `ChangeTracker` and fires the recompute automatically for every API write; bulk paths that bypass the ChangeTracker (`ExecuteUpdateAsync` / `ExecuteDeleteAsync` / Dapper) invoke `BalanceRecomputeService` explicitly. **Mig 103** added `is_hidden` to the canonical recompute predicate set, so soft-delete (the bank + investment + bulk DELETE soft-hide branches) removes the row from the balance walk in the same SaveChanges that hides it from the register. See [decisions/0034-header-walk-running-balance.md](decisions/0034-header-walk-running-balance.md) for the rationale and [decisions/0032-triggers-as-last-resort.md](decisions/0032-triggers-as-last-resort.md) for the broader posture.
+**Mig 102** dropped the entire balance-trigger family. The recompute function stays as the algorithm but is invoked from API call sites instead: the `LegDerivedRecomputeInterceptor` (`SaveChangesInterceptor`) scans `ChangeTracker` and fires the recompute automatically for every API write; bulk paths that bypass the ChangeTracker (`ExecuteUpdateAsync` / `ExecuteDeleteAsync` / Dapper) invoke `LegDerivedRecomputeService` explicitly. **Mig 103** added `is_hidden` to the canonical recompute predicate set, so soft-delete (the bank + investment + bulk DELETE soft-hide branches) removes the row from the balance walk in the same SaveChanges that hides it from the register. See [decisions/0034-header-walk-running-balance.md](decisions/0034-header-walk-running-balance.md) for the rationale and [decisions/0032-triggers-as-last-resort.md](decisions/0032-triggers-as-last-resort.md) for the broader posture.
 
 End-to-end test: `tests/Api.Tests/Integration/Transactions/BalanceConsistencyTests.cs`.
 
@@ -2077,14 +2138,13 @@ Exactly one row by invariant. No deferred trigger needed.
 | `idx_txn_legs_header_posting` | `txn_legs(header_id, posting_index)` | "All legs of this header" — drives AssembleEntries. |
 | `idx_txn_legs_account_id` | `txn_legs(account_id)` | Per-account leg lookup + running-balance trigger scan. |
 | `idx_txn_legs_security_id` | `txn_legs(security_id) WHERE security_id IS NOT NULL` | Per-security investment register query. |
-| `idx_txn_account_date` | `transactions(account_id, feed_posted_at DESC, id DESC)` *(legacy)* | Pre-ADR-0022 register pagination. Unused. Drops with `transactions`. |
-| `idx_txn_external`, `idx_txn_merge_window`, `idx_txn_payee_trgm`, `idx_txn_group`, `idx_txn_counterparty`, `idx_txn_security` | `transactions` *(legacy)* | All unused as of migration 023; drop with `transactions`. |
+
 | `idx_holdings_account` | `holdings(account_id, security_id)` | Per-account positions |
 | `idx_prices_security_date` | `security_prices(security_id, price_date DESC)` | Latest price lookup |
 | `idx_lots_holding` | `lots(holding_id) WHERE is_closed = FALSE` | Open-lot scan for sell-side matching |
 | `idx_ledger_operations_started` | `ledger_operations(started_at DESC)` | Sync history list |
 | `idx_recurring_active_due` | `recurring_transactions(next_due_date) WHERE is_active = TRUE` | Due-date scan |
-| `idx_transaction_tags_tag` | `transaction_tags(tag_id, transaction_id)` | Tag-first lookups |
+| `idx_txn_header_tags_tag` | `txn_header_tags(tag_id, header_id)` | Tag-first lookups |
 | `uq_securities_cusip_per_ledger` | `securities(ledger_id, cusip) WHERE cusip IS NOT NULL` | Per-ledger CUSIP uniqueness. Replaced the global `uq_securities_cusip` (migration 002) in migration 048 — two ledgers can each hold the same CUSIP. |
 | `uq_securities_ticker_per_ledger` | `securities(ledger_id, LOWER(ticker)) WHERE ticker IS NOT NULL` | Per-ledger, case-insensitive ticker uniqueness (migration 048). |
 | `uq_securities_external_id_per_ledger` | `securities(ledger_id, external_id) WHERE external_id IS NOT NULL` | Idempotent source-system upsert (Moneydance imports), scoped per-ledger so two ledgers can each carry the same MD security id. Replaced the global `uq_securities_external_id` in migration 014. |

@@ -50,10 +50,17 @@ const ROW_ACTIONS = /<RowActionsButton/;
  *
  * The register trio is Rule 10's stated partial exception — and the ADR is
  * careful to call it "a gap, not a clean bill of health". It is listed here on
- * the same terms: selecting rows reveals a bulk bar carrying Categorize / Move
- * / Delete, so those actions have a visible path, while Accept, Duplicate,
- * Create reminder and Show other side remain right-click-only. Anyone adding a
- * row action there should ask whether it also belongs on the bulk bar.
+ * the same terms: selecting rows reveals a bulk bar carrying recon status,
+ * Delete, Unhide and Move to account, so those actions have a visible path,
+ * while Accept, Edit, Duplicate, Create reminder, Show other side and Show raw
+ * data remain right-click-only. Anyone adding a row action there should ask
+ * whether it also belongs on the bulk bar.
+ *
+ * This block, the two rationales below and the same claim in RowActionsButton
+ * all used to say the bar carried "Categorize / Move / Delete". Categorize and
+ * Tag are not on it and never have been — they are blocked on bulk write
+ * endpoints that do not exist — so three copies of one sentence advertised a
+ * visible path that was not there.
  */
 const EXCEPTIONS: ReadonlyMap<string, string> = new Map([
     [
@@ -63,11 +70,13 @@ const EXCEPTIONS: ReadonlyMap<string, string> = new Map([
     ],
     [
         'routes/ledgers/register/bank/BankRegisterPage.tsx',
-        'Bank register. Selection reveals a bulk bar carrying Categorize / Move / Delete.',
+        'Bank register. Selection reveals a bulk bar carrying recon status, Delete, '
+        + 'Unhide and Move to account.',
     ],
     [
         'routes/ledgers/register/investment/InvestmentRegisterPage.tsx',
-        'Investment register. Selection reveals a bulk bar carrying Categorize / Move / Delete.',
+        'Investment register. Selection reveals a bulk bar carrying recon status, '
+        + 'Delete, Unhide and Move to account.',
     ],
 ]);
 

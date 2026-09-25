@@ -69,9 +69,19 @@ an absent-vs-null sentinel. The server validates the `#rrggbb` *shape*
 lower-cased. Register chips are coloured **client-side**: the resolved
 view is unchanged (ADR-0076 keeps one filter definition and no view
 churn), so a `TagColorsProvider` joins tag name → colour from the shared
-`['tags', ledgerId]` query and a `TagChip` tints each chip. Investment
-register rows aggregate per holding and don't render header-level tags, so
-coloured chips are a bank-register concern only.
+`['tags', ledgerId]` query and a `TagChip` tints each chip.
+
+**Amended 2026-09.** This originally ended "Investment register rows
+aggregate per holding and don't render header-level tags, so coloured
+chips are a bank-register concern only." That followed from the
+investment register blanking tags, not from anything about colour. Tags
+now render on investment rows too (ADR-0028's 2026-09 refinement), and
+they are coloured by the same `TagColorsProvider` / `TagChip` pair, from
+the same `['tags', ledgerId]` query — the mechanism needed no change,
+only a second mount point. `InvestmentRegisterPage` wraps its
+`MainArea` in the provider exactly as `BankRegisterPage` does; without
+it the chips render, and render grey, so one tag would be two colours
+depending on which register you were reading.
 
 ### D5 — Orphan cleanup is manual
 
@@ -107,4 +117,4 @@ change.
   repaints all of them.
 - **Deferred:** bulk-tag from the register selection (still blocked on the
   Phase 6 override-write surface), multi-tag / untagged filtering, and
-  clear-colour-to-gray. Tracked in `docs/follow-ups.md`.
+  clear-colour-to-gray. Tracked in `docs/maintainer/follow-ups.md`.

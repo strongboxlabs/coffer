@@ -44,6 +44,16 @@ export interface CreateInvestmentTransactionRequest {
     feeAmount?: number | null;
     /** ADR-0031 Phase 3d.2 — mirrors PATCH; see PatchInvestmentTransactionRequest. */
     providerSecurityHint?: ProviderSecurityHint | null;
+    /**
+     * Tags to attach to the new header — same field and semantics as the bank
+     * create surface. Case-insensitive create-on-first-use against the ledger's
+     * tag dictionary; omitted / `[]` both produce an untagged transaction.
+     *
+     * Per ADR-0009 a tag belongs to the EVENT, so this is header-level on an
+     * investment txn exactly as it is on a bank split — the legs, however many
+     * the action derives, do not each carry their own.
+     */
+    tags?: readonly string[] | null;
 }
 
 /**
@@ -77,6 +87,20 @@ export interface PatchInvestmentTransactionRequest {
      * ticker auto-resolves without prompting.
      */
     providerSecurityHint?: ProviderSecurityHint | null;
+    /** When `true`, clears `needsReview` on this transaction in the same
+     *  transaction as the edit — mirrors the bank PATCH. Omit it to save
+     *  changes and leave the row queued for review, which was impossible
+     *  before: a successful investment PATCH used to accept unconditionally. */
+    approve?: boolean;
+    /**
+     * Replace the header's tag set in the same PATCH. Unlike every other field
+     * on this contract, tags follow the bank PATCH's PRESENCE rule rather than
+     * ADR-0025's "supplied set IS the new state": omitted leaves them alone,
+     * `[]` clears them. The editor always sends the array, so the distinction
+     * only matters to other callers.
+     */
+    tags?: readonly string[] | null;
+
     /**
      * Investment merge (mirrors bank `mergeFromHeaderId`). When set, the
      * PATCHed row (the edited row) is the LOSER and folds into this

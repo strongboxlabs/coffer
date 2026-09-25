@@ -150,7 +150,7 @@ surfaced in each ledger's Settings.
 | Engine | `pg_dump --format=custom --no-owner` (as `coffer_service`, so it reads every row + keeps GRANTs) → chunked AES-256-GCM, keyed by Argon2id over a passphrase. |
 | Passphrase (app/scheduled) | Set once by an admin in **System → Backups**; sealed under the master KEK and stored in the DB (never plaintext). Drives both on-demand and scheduled backups. Viewable again via **Show** behind a passkey prompt (ADR-0092 D5b) — the server unseals it on every scheduled run, so offering no way to look it up only meant a forgotten passphrase silently made every backup unrestorable. |
 | Create | Admin panel (on demand), the daily schedule, or the CLI: `coffer-api backup --out <path>` with `COFFER_BACKUP_PASSPHRASE` set. |
-| Storage | Encrypted `.cofferbak` artifacts under `data/backups/` (the Docker volume), pruned by a tiered GFS policy: daily for `Api:Backup:RetentionDailyDays` (7), then weekly for `RetentionWeeklyWeeks` (8), then monthly for `RetentionMonthlyMonths` (12). On-box is a rolling working set; download via the admin panel to keep long-term copies off-host. |
+| Storage | Encrypted `.cofferbak` artifacts under `data/backups/` (the Docker volume), pruned by a tiered GFS policy: 7 daily, then 8 weekly, then 12 monthly. **These are admin-editable in System → Backups and persisted in the `backup_settings` table (ADR-0074) — they are not startup options.** This row used to name `Api:Backup:RetentionDailyDays` / `RetentionWeeklyWeeks` / `RetentionMonthlyMonths`; those keys do not exist, so setting them in `.env` silently changes nothing. The only backup key left in `ApiOptions` is `Compress`. On-box is a rolling working set; download via the admin panel to keep long-term copies off-host. |
 | Restore | Two paths, both in the UI (ADR-0094 removed the `coffer-api restore` CLI). On a **fresh** install (pre-auth): the **bootstrap UI** ([decisions/0061-bootstrap-restore.md](decisions/0061-bootstrap-restore.md)) — the setup screen offers *Restore from a backup*, uploads the `.cofferbak` + passphrase, and applies it on the next boot. On a **running** install, an **admin** can restore in-app — **System → Backups → Restore** (ADR-0071 D3): upload + passphrase behind a typed-confirmation gate; it stages + restarts like the bootstrap path and signs everyone out. This is the "migrate from another install" path. The dump carries the schema at the version it was taken from, and the next normal boot migrates it forward (a 188-era backup restored onto a 192 build applies 189→192 on that boot). **Every restore path wipes the schema to empty first**, dropping only what the service role owns and leaving install-managed extensions intact; pg_restore into a populated schema collides on every existing object and merges what it can, which is a hybrid of two installs rather than a restore. |
 
 Bring the **same master key** to the recovery host so the restored `wrapped_lek` columns
@@ -435,8 +435,13 @@ Two schedulers, deliberately separate because their scope differs.
 
 | Scope | Table | Jobs |
 |---|---|---|
-| Per ledger | `scheduled_jobs` | `quote-refresh` (security prices), `snapshot` (per-ledger point-in-time snapshot) |
+| Per ledger | `scheduled_jobs` | `quote-refresh` (security prices), `snapshot` (per-ledger point-in-time snapshot), `feed-sync` (migration 215), **`reminder-auto-post`** (migration 219) |
 | Deployment-wide | `global_scheduled_jobs` | `backup` (whole-DB encrypted backup, [ADR-0060](decisions/0060-whole-db-backup-and-admin-role.md)) |
+
+> **`reminder-auto-post` writes financial transactions.** It is the only scheduled
+> job that does, which is why it is called out here: this table listed two per-ledger
+> job types for a while after four existed, and a Day-2 "what runs on its own" table
+> that omits the one job that can post money is the wrong one to be incomplete.
 
 Both run **daily at a local time-of-day you choose**, stored as hour + minute plus an
 IANA timezone id (e.g. `America/New_York`) rather than a fixed offset, so the run time
@@ -522,18 +527,26 @@ docker compose exec api dotnet coffer-api.dll bootstrap-token
 > `docker compose exec api coffer-api …` exits 127 with "executable file not
 > found in $PATH".
 
-### Verify + heal stored balances against the canonical recompute
+### Verify stored balances against the canonical recompute — then repair, separately
 
-When a register row is suspected to display a stale running balance, hit the per-ledger
-verify-and-heal endpoint:
+When a register row is suspected to display a stale running balance, ASK first. The
+check and the cure are two endpoints, and the check writes nothing:
 
 ```
-POST /api/ledgers/{ledgerId}/balances/health
+GET  /api/ledgers/{ledgerId}/balances/health      # read-only report
+POST /api/ledgers/{ledgerId}/balances/repair      # the deliberate fix
 ```
 
-It snapshots every `txn_header_account_balances` row in the ledger, re-runs
-`fn_recompute_balances_for_account` for every account, and returns a
-`BalanceHealthReport`:
+> **This section used to say the check was a `POST` that healed as a side effect, and
+> that a non-empty `drifted` array meant drift "has now been healed".** That was true
+> once and is now exactly backwards: an operator who reads drift, believes it is
+> repaired and never calls `/repair` leaves the ledger stale. Migration 206 split
+> calculation from persistence for a reason the endpoint's own remarks record — asking
+> the question rewrote the answer, and on one ledger a diagnostic silently rewrote
+> 2,741 rows.
+
+`GET /balances/health` walks every account with the pure walk, compares against the
+stored `txn_header_account_balances` rows, and returns a `BalanceHealthReport`:
 
 ```json
 {
@@ -555,9 +568,22 @@ It snapshots every `txn_header_account_balances` row in the ledger, re-runs
 }
 ```
 
-The recompute is idempotent — it's both the diagnostic and the cure. A non-empty
-`drifted` array means drift WAS present at snapshot time AND has now been healed; the
-next call should return `healthy: true`.
+A non-empty `drifted` array means drift is present **now**. Nothing has changed.
+`POST /balances/repair` is what rewrites the stored rows; re-run the GET afterwards to
+confirm `healthy: true`. The repair takes write access deliberately — under a read
+policy a viewer's heal would be silently no-op'd by RLS and still report success.
+
+#### The whole-ledger version
+
+Balances are one of four derived projections. For all of them:
+
+```
+GET  /api/ledgers/{ledgerId}/balances/consistency
+POST /api/ledgers/{ledgerId}/balances/consistency/{projection}/repair
+```
+
+Same split, same reason: the report is read-only, and there is one repair per
+projection so a reader is never told about a problem the product cannot fix.
 
 ---
 

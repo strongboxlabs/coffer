@@ -129,11 +129,11 @@ every writer calls a recompute helper. Trade-off:
 
 | Trigger | Discipline cost if moved | Chain risk | Decision |
 |---|---|---|---|
-| `trg_headers_balance_after_update` | High (every header date change) | Medium (kicks off leg UPDATEs) | **Removed mig 102** — moved to `BalanceRecomputeInterceptor` per ADR-0034 §"Why an interceptor and not a trigger" |
+| `trg_headers_balance_after_update` | High (every header date change) | Medium (kicks off leg UPDATEs) | **Removed mig 102** — moved to `LegDerivedRecomputeInterceptor` per ADR-0034 §"Why an interceptor and not a trigger" |
 | `trg_legs_balance_after_*` (3) | High (every leg write) | Low (no other trigger reads balance_after) | **Removed mig 102** — same |
 | `trg_header_overrides_recompute_*` (3, mig 099) | High | Medium | **Removed mig 102** — same |
 | `trg_leg_overrides_recompute_*` (3, mig 101) | High | Medium | **Removed mig 102** — same |
-| `trg_txn_legs_recompute_*` (4, holdings/lots) | Very high (holdings + lots, multiple tables) | Low (idempotent recompute) | **Removed mig 104** — moved to `HoldingsRecomputeInterceptor` (sibling of `BalanceRecomputeInterceptor`); call-site recompute for the `insert_investment_legs` TVF path (`InvestmentTransactionsRepository.Create/PatchAsync`) and importer Dapper path |
+| `trg_txn_legs_recompute_*` (4, holdings/lots) | Very high (holdings + lots, multiple tables) | Low (idempotent recompute) | **Removed mig 104** — moved to `HoldingsRecomputeInterceptor` (sibling of `LegDerivedRecomputeInterceptor`); call-site recompute for the `insert_investment_legs` TVF path (`InvestmentTransactionsRepository.Create/PatchAsync`) and importer Dapper path |
 | `trg_accounts_recompute_on_commission_flip` | Small (a thin `RETURNS TABLE(recomputed_count INTEGER)` SQL wrapper bound via `HasDbFunction` lets the API invoke the recompute via LINQ — same pattern as `insert_investment_legs`) | Low | **Removed mig 088** — `AccountsRepository.SetIsTradeCommissionAsync` calls the recompute explicitly after flipping the flag |
 
 **Balance triggers retired in mig 102.** The family broke four
@@ -141,11 +141,11 @@ times under EF's batched `SaveChanges` (cascade-from-header DELETE
 order, override-on-posted_at bypass, override-on-amount bypass, and
 the merge-with-reshape batch-fire-order bug). The structural fix:
 move the recompute to API call sites via a `SaveChangesInterceptor`
-in C# (`BalanceRecomputeInterceptor`) that scans `ChangeTracker` and
+in C# (`LegDerivedRecomputeInterceptor`) that scans `ChangeTracker` and
 invokes the recompute SQL function (`fn_recompute_balances_for_account`)
 once per save. Bulk paths that bypass the ChangeTracker
 (`ExecuteUpdateAsync` / `ExecuteDeleteAsync`, Dapper, raw SQL) invoke
-`BalanceRecomputeService` explicitly. See
+`LegDerivedRecomputeService` explicitly. See
 [ADR-0034](0034-header-walk-running-balance.md) for the full
 rationale and the interceptor design.
 
@@ -165,7 +165,7 @@ both ends, and invokes `HoldingsRecomputeService` (which calls
 `recompute_holdings_cost_basis` via a new TVF wrapper) after the
 save. The `insert_investment_legs(jsonb)` TVF path bypasses the
 ChangeTracker (raw SQL), so `InvestmentTransactionsRepository.Create/PatchAsync`
-calls both `BalanceRecomputeService` and `HoldingsRecomputeService`
+calls both `LegDerivedRecomputeService` and `HoldingsRecomputeService`
 explicitly after each TVF insert — same #4 call-site pattern as
 `BulkTransactionsRepository`. The importer's end-of-import
 `RecomputeCostBasisAsync(ledgerId)` (Dapper) is unchanged.

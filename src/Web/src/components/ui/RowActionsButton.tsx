@@ -16,11 +16,15 @@ import { IconButton } from './IconButton';
 // a replacement.
 //
 // NOT applied to the register, but that is a judgement about density, not a
-// clean bill of health. Selecting rows reveals a bulk bar covering Categorize /
-// Move / Delete, so those have a visible path; Accept, Duplicate, Create
-// reminder and Show other side remain right-click-only. A control on every row
-// of a dense grid would cost more than it buys, so the gap is recorded in
-// ADR-0021 Rule 10 rather than closed here.
+// clean bill of health. Selecting rows reveals a bulk bar covering recon status,
+// Delete, Unhide and Move to account, so those have a visible path; Accept, Edit,
+// Duplicate, Create reminder, Show other side and Show raw data remain
+// right-click-only. A control on every row of a dense grid would cost more than it
+// buys, so the gap is recorded in ADR-0021 Rule 10 rather than closed here.
+//
+// (This comment used to name "Categorize / Move / Delete". Categorize is not on
+// the bar and never has been — it is blocked on a bulk endpoint that does not
+// exist — so the comment was advertising a visible path that was not there.)
 
 export function RowActionsButton({
     label,

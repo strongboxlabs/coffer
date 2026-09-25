@@ -32,6 +32,9 @@ export function hintToDraft(
         payee: string | null;
         memo: string | null;
         checkNumber: string | null;
+        /** Header-level tags (ADR-0009) as the row carries them. Optional so
+         *  callers holding only the text fields still typecheck. */
+        tags?: readonly string[];
     },
     legs: readonly InvestmentRow[],
     ingestSecurityId: string | null,
@@ -147,6 +150,9 @@ export function hintToDraft(
         // it categorised under.
         feeAccountId: null,
         feeAmount: ingestFee,
+        // A feed row can already carry tags — a rule, an earlier merge, or the
+        // MCP bulk tool. Upgrading it to investment shape must not drop them.
+        tags: header.tags ?? [],
     };
 }
 

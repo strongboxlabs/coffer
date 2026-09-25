@@ -103,6 +103,76 @@ public sealed class SimilarPayeesTests
     private static string Url(Guid ledgerId, Guid headerId) =>
         $"/api/ledgers/{ledgerId}/transactions/{headerId}/similar-payees";
 
+    /// <summary>
+    /// Recall works on a BROKERAGE row, including when the prior row's
+    /// counterparty is the Holdings sibling.
+    /// </summary>
+    /// <remarks>
+    /// <para>A feed row lands bank-shape whatever account it is destined for: two
+    /// legs, (real account, Uncategorized), with the investment detail parked in
+    /// the ingest_* carriers until the user classifies it. So the anchor side of
+    /// recall needed nothing added for brokerages — the investment editor simply
+    /// never asked for it, and a dividend the user categorises the same way every
+    /// quarter had to be re-categorised by hand every quarter.</para>
+    ///
+    /// <para>A prior settled BUY of the same security has exactly two legs, one
+    /// of them on the brokerage, so it satisfies every clause — and its "other
+    /// leg" is the Holdings sub-account. That is structural (ADR-0019), not a
+    /// counterparty anyone chooses, and it was briefly excluded here for that
+    /// reason. Excluding it dropped the row's PAYEE too, which is the half worth
+    /// recalling and is very often carried by exactly that buy: on the dev rig,
+    /// a curated name sat on a settled buy and recall went silent. So the row is
+    /// returned, and the caller decides which half it can apply — the investment
+    /// editor takes the payee always and the counterparty only into a category
+    /// slot.</para>
+    /// </remarks>
+    [Fact]
+    public async Task Recall_on_a_brokerage_offers_both_the_category_and_the_holdings_row()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
+        var dividends = await ledger.AddCategoryAsync("Dividend Income", kind: "income");
+        // Where a feed row's second leg sits before anyone classifies it.
+        var unclassified = await ledger.AddCategoryAsync("Uncategorized");
+
+        // Prior settled row: the same feed payee, categorised as income. This is
+        // the pair recall exists to bring back.
+        await SeedBankFeedAsync(
+            ledger, brokerage.Id, dividends.Id, 120.00m,
+            new DateTime(2026, 1, 5, 12, 0, 0, DateTimeKind.Utc),
+            bankPayee: "ACME CORP DIVIDEND", needsReview: false);
+
+        // Prior settled row with the SAME feed payee whose other leg is the
+        // Holdings sibling — the shape a settled buy leaves behind.
+        Assert.NotNull(brokerage.HoldingsAccountId);
+        await SeedBankFeedAsync(
+            ledger, brokerage.Id, brokerage.HoldingsAccountId!.Value, 120.00m,
+            new DateTime(2026, 1, 6, 12, 0, 0, DateTimeKind.Utc),
+            bankPayee: "ACME CORP DIVIDEND", needsReview: false);
+
+        // The anchor: the same dividend arriving again, awaiting review.
+        var anchorId = await SeedBankFeedAsync(
+            ledger, brokerage.Id, unclassified.Id, 120.00m,
+            new DateTime(2026, 4, 5, 12, 0, 0, DateTimeKind.Utc),
+            bankPayee: "ACME CORP DIVIDEND", needsReview: true);
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var suggestions = await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
+            Url(ledger.LedgerId, anchorId));
+
+        // Both prior rows are offered, and each names its own counterparty —
+        // the category on one, the Holdings sibling on the other. Which half a
+        // caller can USE is the caller's decision; the repository does not
+        // pre-empt it by dropping the row.
+        Assert.Equal(2, suggestions!.Count);
+        Assert.All(suggestions!, sug => Assert.Equal("ACME CORP DIVIDEND", sug.Payee));
+        Assert.Contains(suggestions!, sug => sug.CounterpartyAccountId == dividends.Id);
+        Assert.Contains(suggestions!,
+            sug => sug.CounterpartyAccountId == brokerage.HoldingsAccountId!.Value);
+    }
+
     [Fact]
     public async Task Returns_payee_and_category_from_a_single_prior_approved_match()
     {

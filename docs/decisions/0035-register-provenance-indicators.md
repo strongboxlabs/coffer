@@ -334,7 +334,7 @@ orchestrator / mapper bugs before they leak into user data.
   107 adds them at the tail of the column list.
 
 - Cross-source FITID dedup against MD-preserved OFX rows
-  (`docs/follow-ups.md` entry) becomes more interesting now: an
+  (`docs/maintainer/follow-ups.md` entry) becomes more interesting now: an
   MD-bootstrapped row with `provider_key='ofx'` and an
   `online_match_fitid` matches the shape of an incoming OFX file
   importer's row. The OR-branch dedup the follow-up captures is

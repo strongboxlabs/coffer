@@ -7,12 +7,12 @@ namespace Coffer.Api.Db.Repositories;
 /// <summary>
 /// Per-ledger tag-dictionary management (Tags v1) — the admin surface over the
 /// <c>tags</c> table + <c>txn_header_tags</c> junction that assignment
-/// (<see cref="TransactionsRepository"/>'s <c>ApplyTagsAsync</c>) and the register
+/// (<see cref="HeaderTags"/>, which every write path calls) and the register
 /// filter only ever touched implicitly. List-with-usage, rename / recolor, merge,
 /// delete (delete-in-use is allowed — the junction FK is <c>ON DELETE CASCADE</c>),
 /// and cleanup-unused. Ledger-scoped; RLS enforces the same isolation at the data
 /// layer. Tag names are matched case-insensitively within a ledger (mirroring
-/// ApplyTagsAsync's resolve), so both writers keep the dictionary free of
+/// HeaderTags' resolve), so both writers keep the dictionary free of
 /// case-only duplicates. The register's <c>tags</c> view column is computed live
 /// from the junction, so every mutation here is reflected with no recompute.
 /// </summary>

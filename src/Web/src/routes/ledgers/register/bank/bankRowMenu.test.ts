@@ -56,6 +56,7 @@ const noopActions = {
     onCreateReminder: () => {},
     onShowOtherSide: () => {},
     onRequestDelete: () => {},
+    onShowRawData: () => {},
 };
 
 const ids = (row: BankRow, opts?: { originatingSplit?: boolean; noAuthoring?: boolean }) =>
@@ -95,29 +96,45 @@ describe('buildBankRowMenuItems — originating split-parent', () => {
         ]);
     });
 
-    it('without the flag, a split counter-side stays read-only (show-other-side only)', () => {
+    it('without the flag, a split counter-side offers nothing that MUTATES it', () => {
         // Contrast: same txnGroupId-bearing row, but NOT flagged as an
         // originating parent → the existing ADR-0036 counter-side guard
         // makes it read-only. Locks that this change is opt-in.
+        //
+        // "Read-only" is about mutation, not about the item COUNT: the two
+        // items here navigate and inspect, and "Show raw data" is offered on
+        // every row precisely because "why did this import like this?" is
+        // asked most often of a row you cannot edit from here. The investment
+        // register puts its raw item outside the same guard.
         const row = makeRow({
             id: 'counter',
             txnGroupId: '00000000-0000-0000-0000-0000000000bb',
             counterpartyAccountId: '00000000-0000-0000-0000-0000000000c1',
         });
-        expect(ids(row)).toEqual(['show-other-side']);
+        expect(ids(row)).toEqual(['show-other-side', 'raw']);
+        // The assertion that carries the meaning: nothing here changes the row.
+        for (const mutating of ['edit', 'accept', 'duplicate', 'create-reminder', 'delete']) {
+            expect(ids(row)).not.toContain(mutating);
+        }
     });
 });
 
 describe('buildBankRowMenuItems — single editable row', () => {
-    it('offers Duplicate + Create reminder + Show other side + Delete', () => {
+    it('offers Edit + Duplicate + Create reminder + Show other side + Raw + Delete', () => {
+        // Edit was missing here and present on BOTH the split-parent branch
+        // above and the investment register — so the commonest row in the app
+        // was the one row whose menu did not name the action its double-click
+        // and its Enter key both perform.
         const row = makeRow({
             id: 'plain',
             counterpartyAccountId: '00000000-0000-0000-0000-0000000000c1',
         });
         expect(ids(row)).toEqual([
+            'edit',
             'duplicate',
             'create-reminder',
             'show-other-side',
+            'raw',
             'delete',
         ]);
     });
@@ -130,9 +147,11 @@ describe('buildBankRowMenuItems — single editable row', () => {
         });
         expect(ids(row)).toEqual([
             'accept',
+            'edit',
             'duplicate',
             'create-reminder',
             'show-other-side',
+            'raw',
             'delete',
         ]);
     });

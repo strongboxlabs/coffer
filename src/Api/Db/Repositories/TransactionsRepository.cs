@@ -93,8 +93,8 @@ public sealed class TransactionsRepository
             // path (manual rows can be hard-deleted; imported rows
             // become is_hidden=true to preserve audit).
             Origin = "manual",
-            Payee = payee,
-            Memo = memo,
+            Payee = HeaderText.Normalize(payee),
+            Memo = HeaderText.Normalize(memo),
             CheckNumber = checkNumber,
             PostedAt = postedAt,
             // NOT NULL since mig 189: a null request value means "no distinct tax
@@ -111,12 +111,12 @@ public sealed class TransactionsRepository
         }
 
         // Slice 2c.6b: tags on create. Same create-on-first-use,
-        // case-insensitive lookup as the PATCH surface — calling
-        // ApplyTagsAsync against the freshly-added header keeps the
+        // case-insensitive lookup as the PATCH surface — calling the one
+        // HeaderTags helper against the freshly-added header keeps the
         // semantics symmetric.
         if (tags is not null && tags.Count > 0)
         {
-            await ApplyTagsAsync(ledgerId, headerId, tags, cancellationToken)
+            await HeaderTags.ApplyAsync(_db, ledgerId, headerId, tags, cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -551,8 +551,8 @@ public sealed class TransactionsRepository
     /// than silently tagging a subset. <paramref name="tags"/> is a replace-set — the
     /// complete set to assign to each header; an empty list clears all tags. Runs in
     /// one transaction; tag resolution (create-on-first-use) happens ONCE for the batch
-    /// (see <see cref="ResolveTagIdsAsync"/>). dryRun validates + reports the header
-    /// count and normalized tag set without writing.
+    /// (see <see cref="HeaderTags.ResolveTagIdsAsync"/>). dryRun validates +
+    /// reports the header count and normalized tag set without writing.
     /// </summary>
     public async Task<SetTagsOutcome> SetTransactionTagsAsync(
         Guid ledgerId,
@@ -588,10 +588,12 @@ public sealed class TransactionsRepository
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
         // Resolve target tag-ids ONCE for the batch, then diff each header against it.
-        var targetTagIds = await ResolveTagIdsAsync(ledgerId, tags, cancellationToken)
+        var targetTagIds = await HeaderTags
+            .ResolveTagIdsAsync(_db, ledgerId, tags, cancellationToken)
             .ConfigureAwait(false);
         foreach (var headerId in ids)
-            await DiffHeaderTagPairingsAsync(ledgerId, headerId, targetTagIds, cancellationToken)
+            await HeaderTags
+                .DiffHeaderTagPairingsAsync(_db, ledgerId, headerId, targetTagIds, cancellationToken)
                 .ConfigureAwait(false);
 
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
@@ -793,6 +795,16 @@ public sealed class TransactionsRepository
             from leg in _db.TxnLegs
             where leg.HeaderId == h.Id && leg.AccountId != anchor.SourceAccountId
             join account in _db.Accounts on leg.AccountId equals account.Id
+            // A Holdings SUB-ACCOUNT can be the counterparty here — on a
+            // brokerage, a prior settled buy's "other leg" is exactly that.
+            // Such a suggestion is NOT dropped, even though "categorise it as
+            // Holdings" is meaningless: the pair's other half, the PAYEE, is
+            // the part worth recalling, and a settled buy is often the only
+            // row that carries the name the user curated. The caller decides
+            // which half it can apply (the investment editor applies the payee
+            // always and the counterparty only into a category slot); throwing
+            // the whole row away here to avoid an unusable half also threw away
+            // the useful one.
             select new
             {
                 // The suggestion IS the curated name, which is the canonical
@@ -1209,7 +1221,7 @@ public sealed class TransactionsRepository
 
         if (request.Tags is { } tags)
         {
-            await ApplyTagsAsync(ledgerId, headerId, tags, cancellationToken)
+            await HeaderTags.ApplyAsync(_db, ledgerId, headerId, tags, cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -1292,130 +1304,6 @@ public sealed class TransactionsRepository
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return PatchResult.Ok;
-    }
-
-    /// <summary>
-    /// Replace the tag set on a header with the supplied names
-    /// (slice 2c.6b). Idempotent; create-on-first-use within the
-    /// ledger; case-insensitive match, first user-supplied casing
-    /// wins on insert.
-    ///
-    /// <para>Diff-against-current: existing pairings whose tag is
-    /// not in the new set are removed; new pairings are added. Tag
-    /// rows are inserted into the ledger dictionary only when no
-    /// existing tag matches (lower-case comparison) — orphan tags
-    /// from prior removals stay in the dictionary (they may be
-    /// referenced by other transactions; dictionary cleanup is a
-    /// separate concern).</para>
-    /// </summary>
-    private async Task ApplyTagsAsync(
-        Guid ledgerId,
-        Guid headerId,
-        IReadOnlyList<string> tags,
-        CancellationToken cancellationToken)
-    {
-        var targetTagIds = await ResolveTagIdsAsync(ledgerId, tags, cancellationToken)
-            .ConfigureAwait(false);
-        await DiffHeaderTagPairingsAsync(ledgerId, headerId, targetTagIds, cancellationToken)
-            .ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Resolve tag NAMES to their ids within the ledger's dictionary, creating a row
-    /// on first use (tracked; INSERTed on the next SaveChanges). Normalizes first:
-    /// trim, drop empties, case-insensitive dedupe with the first user casing winning
-    /// on insert.
-    ///
-    /// <para>Resolve ONCE per unit of work. The bulk path
-    /// (<see cref="SetTransactionTagsAsync"/>) calls this a single time for the whole
-    /// batch, so if two headers both introduce the same brand-new name it maps to ONE
-    /// dictionary row — a per-header re-query would miss the prior iteration's
-    /// tracker-pending insert and create a duplicate.</para>
-    /// </summary>
-    private async Task<HashSet<Guid>> ResolveTagIdsAsync(
-        Guid ledgerId,
-        IReadOnlyList<string> tags,
-        CancellationToken cancellationToken)
-    {
-        var distinct = tags
-            .Select(t => t.Trim())
-            .Where(t => t.Length > 0)
-            .GroupBy(t => t.ToLowerInvariant())
-            .Select(g => g.First())
-            .ToList();
-        var distinctLower = distinct
-            .Select(t => t.ToLowerInvariant())
-            .ToHashSet();
-
-        // Resolve every requested tag against the ledger's dictionary (one round
-        // trip) — anything that doesn't come back is inserted on first use.
-        var existing = await _db.Tags
-            .Where(t => t.LedgerId == ledgerId
-                        && distinctLower.Contains(t.Name.ToLower()))
-            .ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
-        var existingByLower = existing.ToDictionary(
-            t => t.Name.ToLowerInvariant(),
-            t => t);
-
-        var targetTagIds = new HashSet<Guid>();
-        foreach (var name in distinct)
-        {
-            var lower = name.ToLowerInvariant();
-            if (existingByLower.TryGetValue(lower, out var match))
-            {
-                targetTagIds.Add(match.Id);
-            }
-            else
-            {
-                var fresh = new TagRow
-                {
-                    Id = Guid.NewGuid(),
-                    LedgerId = ledgerId,
-                    Name = name, // preserve user casing on first use
-                };
-                _db.Tags.Add(fresh);
-                targetTagIds.Add(fresh.Id);
-            }
-        }
-        return targetTagIds;
-    }
-
-    /// <summary>
-    /// Replace ONE header's tag pairings with <paramref name="targetTagIds"/>
-    /// (diff-against-current: drop pairings not in the target, add the missing ones).
-    /// Idempotent; only pushes changes into the change tracker — the caller owns the
-    /// SaveChanges / commit boundary.
-    /// </summary>
-    private async Task DiffHeaderTagPairingsAsync(
-        Guid ledgerId,
-        Guid headerId,
-        HashSet<Guid> targetTagIds,
-        CancellationToken cancellationToken)
-    {
-        var current = await _db.TxnHeaderTags
-            .Where(t => t.HeaderId == headerId)
-            .ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
-        var currentTagIds = current.Select(t => t.TagId).ToHashSet();
-
-        foreach (var existingPair in current)
-        {
-            if (!targetTagIds.Contains(existingPair.TagId))
-                _db.TxnHeaderTags.Remove(existingPair);
-        }
-        foreach (var targetTagId in targetTagIds)
-        {
-            if (!currentTagIds.Contains(targetTagId))
-            {
-                _db.TxnHeaderTags.Add(new TxnHeaderTagRow
-                {
-                    HeaderId = headerId,
-                    TagId = targetTagId,
-                    LedgerId = ledgerId,
-                });
-            }
-        }
     }
 
     /// <summary>
@@ -1602,9 +1490,12 @@ public sealed class TransactionsRepository
         await HeaderOriginals.CaptureAsync(_db, header, cancellationToken)
             .ConfigureAwait(false);
 
-        if (r.HasPayee) header.Payee = r.Payee;
-        if (r.HasMemo) header.Memo = r.Memo;
-        if (r.HasCheckNumber) header.CheckNumber = r.CheckNumber;
+        // Normalized here rather than trusted from the request: the editors
+        // disagreed about trimming and only one of them did it, so the same
+        // keystrokes stored different bytes per register. See HeaderText.
+        if (r.HasPayee) header.Payee = HeaderText.Normalize(r.Payee);
+        if (r.HasMemo) header.Memo = HeaderText.Normalize(r.Memo);
+        if (r.HasCheckNumber) header.CheckNumber = HeaderText.Normalize(r.CheckNumber);
         // Non-null guaranteed by the HeaderDateNull gate in the validate phase.
         if (r.HasPostedAt) header.PostedAt = r.PostedAt!.Value;
         if (r.HasTransactedAt) header.TransactedAt = r.TransactedAt!.Value;

@@ -1,9 +1,9 @@
 import { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
-import { fetchLedgerOperations } from '@/lib/api';
+import { fetchLedgerOperations, undoImport } from '@/lib/api';
 import { errorMessage } from '@/lib/errorMessage';
-import type { LedgerOperationSummary } from '@/lib/types';
+import type { LedgerOperationSummary, UndoImportResult } from '@/lib/types';
 import {
     familyClass,
     formatRelative,
@@ -129,7 +129,7 @@ export function ActivityPanel({ ledgerId }: { ledgerId: string }) {
                 ) : (
                     <ul className="divide-y divide-border/60">
                         {runs.map((r) => (
-                            <ActivityRow key={r.id} run={r} />
+                            <ActivityRow key={r.id} run={r} ledgerId={ledgerId} />
                         ))}
                     </ul>
                 )}
@@ -138,7 +138,29 @@ export function ActivityPanel({ ledgerId }: { ledgerId: string }) {
     );
 }
 
-function ActivityRow({ run }: { run: LedgerOperationSummary }) {
+/**
+ * Which runs can be undone.
+ *
+ * A file import writes rows that carry its stamp and nothing else identifies
+ * them, which is exactly what `undo-import` removes. A live-feed sync is NOT
+ * undoable here: its rows dedup on the provider's own id, so re-syncing brings
+ * them straight back and "undo" would be a lie. Quote refreshes and snapshot
+ * restores write nothing stamped this way at all.
+ */
+function isUndoableImport(run: LedgerOperationSummary): boolean {
+    return run.family === 'ingest'
+        && (run.providerKey === 'file' || run.providerKey === 'ofx'
+            || run.providerKey === 'qif' || run.providerKey === 'csv')
+        && (run.status === 'completed' || run.status === 'partial');
+}
+
+function ActivityRow({
+    run,
+    ledgerId,
+}: {
+    run: LedgerOperationSummary;
+    ledgerId: string;
+}) {
     return (
         <li className="flex items-start gap-3 px-4 py-2.5 text-sm">
             <span
@@ -173,7 +195,135 @@ function ActivityRow({ run }: { run: LedgerOperationSummary }) {
                         </span>
                     ) : null}
                 </div>
+                {isUndoableImport(run) ? (
+                    <UndoImportAction ledgerId={ledgerId} operationId={run.id} />
+                ) : null}
             </div>
         </li>
+    );
+}
+
+/**
+ * Undo one import, from the place the imports are listed.
+ *
+ * WHY IT IS HERE. The endpoint has always existed, and the import dialog has
+ * always been its only caller — so the undo lived exactly as long as that
+ * dialog stayed open. Close it, or go and look at what actually landed, and the
+ * only way back was a hand-written API call. An import you have not looked at
+ * is the one you are least likely to want to undo; the affordance belonged
+ * where you go to look.
+ *
+ * The flow is the dialog's, deliberately unchanged: a dry run first, so the
+ * confirm can state how many transactions will go and how many of them have
+ * been edited since. The count is reported, never a reason to refuse — whose
+ * edits they are is the user's call — but an undo that silently discards work
+ * is the kind of helpful delete nobody forgives.
+ */
+function UndoImportAction({
+    ledgerId,
+    operationId,
+}: {
+    ledgerId: string;
+    operationId: string;
+}) {
+    const queryClient = useQueryClient();
+    const [preview, setPreview] = useState<UndoImportResult | null>(null);
+    const [error, setError] = useState<string | null>(null);
+    const [done, setDone] = useState<number | null>(null);
+
+    const dryRun = useMutation({
+        mutationFn: () => undoImport(ledgerId, operationId, { dryRun: true }),
+        onSuccess: (r) => { setError(null); setPreview(r); },
+        onError: (e) => setError(errorMessage(e)),
+    });
+
+    const confirm = useMutation({
+        mutationFn: () => undoImport(ledgerId, operationId),
+        onSuccess: (r) => {
+            setPreview(null);
+            setDone(r.deleted);
+            // The register, the balances and the activity list are all stale now.
+            queryClient.invalidateQueries({ queryKey: ['ledger-operations', ledgerId] });
+            queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+            queryClient.invalidateQueries({ queryKey: ['register'] });
+        },
+        onError: (e) => setError(errorMessage(e)),
+    });
+
+    if (done !== null) {
+        return (
+            <div className="mt-1 text-[0.6875rem] text-text-subtle">
+                Undone — {done} transaction{done === 1 ? '' : 's'} removed.
+            </div>
+        );
+    }
+
+    if (error !== null) {
+        return (
+            <div className="mt-1 text-[0.6875rem] text-state-danger">
+                {error}{' '}
+                <button
+                    type="button"
+                    className="underline"
+                    onClick={() => { setError(null); setPreview(null); }}
+                >
+                    Dismiss
+                </button>
+            </div>
+        );
+    }
+
+    if (preview !== null) {
+        // TooLarge is the server refusing a PARTIAL undo rather than leaving a
+        // half-removed import behind. Say so plainly; there is no action to offer.
+        if (preview.tooLarge) {
+            return (
+                <div className="mt-1 text-[0.6875rem] text-state-danger">
+                    Too large to undo in one go ({preview.found} transactions), so
+                    nothing was touched — a partial undo would leave an import that
+                    no longer matches itself.
+                </div>
+            );
+        }
+        return (
+            <div className="mt-1 flex flex-wrap items-center gap-2 text-[0.6875rem]">
+                <span className="text-text-muted">
+                    Remove {preview.found} transaction
+                    {preview.found === 1 ? '' : 's'}?
+                    {preview.edited > 0 ? (
+                        <span className="ml-1 text-state-danger">
+                            {preview.edited} {preview.edited === 1 ? 'has' : 'have'} been
+                            edited since — those edits go too.
+                        </span>
+                    ) : null}
+                </span>
+                <button
+                    type="button"
+                    className="rounded px-1.5 py-0.5 font-semibold text-state-danger underline disabled:opacity-60"
+                    disabled={confirm.isPending}
+                    onClick={() => confirm.mutate()}
+                >
+                    {confirm.isPending ? 'Removing…' : 'Yes, remove them'}
+                </button>
+                <button
+                    type="button"
+                    className="rounded px-1.5 py-0.5 underline"
+                    onClick={() => setPreview(null)}
+                >
+                    Cancel
+                </button>
+            </div>
+        );
+    }
+
+    return (
+        <button
+            type="button"
+            className="mt-1 text-[0.6875rem] text-text-subtle underline disabled:opacity-60"
+            disabled={dryRun.isPending}
+            onClick={() => dryRun.mutate()}
+        >
+            {dryRun.isPending ? 'Checking…' : 'Undo this import'}
+        </button>
     );
 }

@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace Coffer.Api.Contracts;
 
 /// <summary>
@@ -132,6 +134,23 @@ public sealed class CreateInvestmentTransactionRequest
     /// prompting.
     /// </summary>
     public ProviderSecurityHint? ProviderSecurityHint { get; init; }
+
+    /// <summary>
+    /// Tags to attach to the new header — the same field, semantics and
+    /// dictionary as the bank create surface
+    /// (<see cref="CreateTransactionRequest.Tags"/>): case-insensitive
+    /// create-on-first-use, first casing wins. Omitted / null / <c>[]</c> all
+    /// produce an untagged transaction.
+    /// </summary>
+    /// <remarks>
+    /// ADR-0009 puts tags on the EVENT, and an investment txn is an event, so
+    /// there was never a shape reason for this to be bank-only — the field
+    /// simply did not exist here, which left the MCP bulk tool as the only way
+    /// to tag an investment header, and the register then dropped the tags on
+    /// the floor when it drew the row. Tags apply to the header regardless of
+    /// how many legs it has, exactly as they do for a bank split.
+    /// </remarks>
+    public IReadOnlyList<string>? Tags { get; init; }
 }
 
 /// <summary>
@@ -164,6 +183,34 @@ public sealed class ConvertInKindTransferRequest
 /// </remarks>
 public sealed class PatchInvestmentTransactionRequest
 {
+    /// <summary>
+    /// When <c>true</c>, clears <c>needs_review</c> on this transaction in the
+    /// same Postgres transaction as the edit — the same contract the bank PATCH
+    /// has always had. Idempotent on an already-accepted row.
+    /// </summary>
+    /// <remarks>
+    /// <para>Until this existed, a successful investment PATCH cleared the flag
+    /// UNCONDITIONALLY, on the reasoning that "the investment editor's only
+    /// Save-pressed exit IS Accept". That was true of the editor and false of
+    /// the endpoint: any other client — MCP, a direct PATCH, a script fixing a
+    /// typo across a ledger — silently accepted every row it touched, and there
+    /// was no way to correct an imported row and leave it queued for review.
+    /// The bank side has always been able to.</para>
+    ///
+    /// <para>Investment conforms to bank here rather than the reverse. The
+    /// alternative — extracting approve into its own endpoint on both sides —
+    /// would undo a documented decision (the dedicated POST /approve route was
+    /// deliberately collapsed into PATCH so the accept flow stays one
+    /// round-trip) and would cost a second request on the commonest path.</para>
+    ///
+    /// <para>A MERGE still clears the flag regardless of this field: a
+    /// folded-away row is resolved, not awaiting review, and leaving it queued
+    /// keeps the sidebar's review dot lit on an account whose register has
+    /// nothing to show. That is enforced server-side on both paths precisely so
+    /// it cannot depend on a caller remembering.</para>
+    /// </remarks>
+    public bool? Approve { get; init; }
+
     public Guid? BrokerageAccountId { get; init; }
     public DateTime? PostedAt { get; init; }
     public string? Action { get; init; }
@@ -201,7 +248,34 @@ public sealed class PatchInvestmentTransactionRequest
     /// posted date. A merge-only PATCH carries just this field — no other
     /// fields are read (the loser is tombstoned, not reshaped).
     /// </summary>
+    /// <remarks>
+    /// <para><b>Not settable from the wire.</b> Merging is a COMMAND and has its
+    /// own route; this property survives only so that route can reuse the one
+    /// repository method that performs the fold. <c>[JsonIgnore]</c> is what
+    /// makes the extraction real rather than advisory — without it the old
+    /// merge-by-PATCH shape keeps working, and a second way to do one thing is
+    /// a second place for its invariants to drift.</para>
+    /// </remarks>
+    [JsonIgnore]
     public Guid? MergeFromHeaderId { get; init; }
+
+    /// <summary>
+    /// Replace the tag set on this header in the same PATCH — same contract as
+    /// <see cref="PatchTransactionRequest.Tags"/>. When supplied, the resulting
+    /// <c>txn_header_tags</c> pairings match exactly <see cref="Tags"/>.
+    /// <list type="bullet">
+    ///   <item><c>null</c> / omitted → tags untouched.</item>
+    ///   <item><c>[]</c> → all tags removed.</item>
+    /// </list>
+    /// Matching against the ledger dictionary is case-insensitive; the first
+    /// user-supplied casing wins on insert.
+    /// </summary>
+    /// <remarks>
+    /// Tags survive the wholesale posting replacement this PATCH performs: the
+    /// pairing is to the HEADER, and the header id is stable across a reshape.
+    /// Editing a buy's fee does not disturb its tags.
+    /// </remarks>
+    public IReadOnlyList<string>? Tags { get; init; }
 }
 
 /// <summary>

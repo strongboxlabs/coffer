@@ -1167,9 +1167,11 @@ if (args.Length > 0 && !args[0].StartsWith('-'))
 {
     await Console.Error.WriteLineAsync(
         $"coffer-api: unknown subcommand '{args[0]}'.\n"
-        + "Available: bootstrap-token, backup, restore.\n"
+        + "Available: bootstrap-token, backup.\n"
         + "`rotate-kek` was removed in ADR-0092 — rotate the master key from the admin UI "
         + "(System → Encryption).\n"
+        + "`restore` was removed in ADR-0094 — restore from the bootstrap screen on a fresh "
+        + "install, or System → Backups → Restore on a running one.\n"
         + "Run with no arguments to start the server.");
     return 2;
 }

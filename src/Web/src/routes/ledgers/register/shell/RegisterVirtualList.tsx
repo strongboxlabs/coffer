@@ -2,6 +2,7 @@ import { useMemo, useState, type ReactNode, type Ref } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 
 import { buildTimelineSentinels } from './registerSentinels';
+import { toWindowIndex } from './registerWindowIndex';
 
 /**
  * The shared register list — the ONE `<Virtuoso>` both the bank and investment
@@ -74,6 +75,11 @@ export interface RegisterVirtualListProps<Row> {
     scrollParent: HTMLElement | null;
     rows: readonly Row[];
     getRowId: (row: Row) => string;
+    /** Called per rendered row. `index` is the row's position within the
+     *  LOADED WINDOW (0-based) — not virtuoso's logical index, which carries
+     *  the front-shift offset below and would number the first row 1,000,000.
+     *  It feeds `aria-rowindex`, so the announced position has to be one a
+     *  listener can act on. */
     renderRow: (index: number, row: Row) => ReactNode;
     /** A row's posted date (YYYY-MM-DD…) for viewport-month tracking; return
      *  undefined for rows without a date (the update is skipped). */
@@ -154,7 +160,9 @@ export function RegisterVirtualList<Row>({
             // Pre-fetch margin so the loading state doesn't pop in at the edge.
             increaseViewportBy={{ top: 400, bottom: 400 }}
             components={components}
-            itemContent={(index, row) => renderRow(index, row)}
+            itemContent={(index, row) =>
+                renderRow(toWindowIndex(index, offset, rows.length), row)
+            }
             // Drive the scroll-track marker from the actual visible range.
             // virtuoso emits logical indices (offset by firstItemIndex) when it
             // is set; fall back to a local-index reading if the subtraction

@@ -1,6 +1,13 @@
 # 0026 — Per-ledger encryption key (LEK) wrapping app-level secrets
 
-* Status: Accepted
+* Status: Accepted — **§Rotation superseded by ADR-0092 D4 and ADR-0094 D4.**
+
+> The rotation section below describes a `coffer-api rotate-kek` CLI driven by
+> `COFFER_MASTER_KEK_BASE64` / `COFFER_MASTER_KEK_NEW_BASE64`. **None of that exists.**
+> The subcommand was removed (running it now prints a pointer to the UI), and the env
+> channel was removed with it — `MasterKeyLoader` has exactly two sources, `None` and
+> `File`. Rotation is System → Encryption in the admin UI, coordinated by
+> `MasterKeyRotationCoordinator`. The LEK design in the rest of this ADR stands.
 * Date: 2026-05-15
 * Refines: [ADR-0014](0014-encryption-at-rest.md)
 

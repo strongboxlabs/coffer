@@ -127,9 +127,9 @@ public sealed class BalanceMergeHideSyncTests
                 .ExecuteUpdateAsync(s2 => s2.SetProperty(h => h.NeedsReview, true));
         }
 
-        var patch = await s.Client.PatchAsJsonAsync(
-            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{a}",
-            new PatchTransactionRequest { MergeFromHeaderId = dup });
+        var patch = await s.Client.PostAsJsonAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{a}/merge",
+            new MergeTransactionRequest { FromHeaderId = dup });
         Assert.True(
             patch.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"merge PATCH failed: {(int)patch.StatusCode} {await patch.Content.ReadAsStringAsync()}");
@@ -165,9 +165,9 @@ public sealed class BalanceMergeHideSyncTests
 
         Assert.Equal(-50m, await ReadBalanceAsync(s, c));
 
-        var patch = await s.Client.PatchAsJsonAsync(
-            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{a}",
-            new PatchTransactionRequest { MergeFromHeaderId = dup });
+        var patch = await s.Client.PostAsJsonAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{a}/merge",
+            new MergeTransactionRequest { FromHeaderId = dup });
         Assert.True(patch.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent);
 
         Assert.Equal(-40m, await ReadBalanceAsync(s, c));
@@ -200,9 +200,9 @@ public sealed class BalanceMergeHideSyncTests
         }
         Assert.Equal(-50m, await ReadBalanceAsync(s, c));
 
-        var patch = await s.Client.PatchAsJsonAsync(
-            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{a}",
-            new PatchTransactionRequest { MergeFromHeaderId = dup });
+        var patch = await s.Client.PostAsJsonAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{a}/merge",
+            new MergeTransactionRequest { FromHeaderId = dup });
         Assert.True(patch.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"PATCH failed: {(int)patch.StatusCode} {await patch.Content.ReadAsStringAsync()}");
 
@@ -246,7 +246,6 @@ public sealed class BalanceMergeHideSyncTests
             $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{a}",
             new PatchTransactionRequest
             {
-                MergeFromHeaderId = dup,
                 Postings = new PatchTransactionPostings
                 {
                     SourceAccountId = s.Bank.Id,
@@ -256,6 +255,11 @@ public sealed class BalanceMergeHideSyncTests
                     },
                 },
             });
+        // Then fold, as a command. It used to ride on the PATCH above;
+        // a merge is not a field edit and no longer can.
+        patch = await s.Client.PostAsJsonAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{a}/merge",
+            new MergeTransactionRequest { FromHeaderId = dup });
         Assert.True(patch.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"PATCH failed: {(int)patch.StatusCode} {await patch.Content.ReadAsStringAsync()}");
 
@@ -363,9 +367,9 @@ public sealed class BalanceMergeHideSyncTests
         Assert.Equal(-50m, await ReadBalanceAsync(s, c));
 
         // Merge loser into winner via SPA PATCH.
-        var patch = await s.Client.PatchAsJsonAsync(
-            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winner}",
-            new PatchTransactionRequest { MergeFromHeaderId = loser });
+        var patch = await s.Client.PostAsJsonAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winner}/merge",
+            new MergeTransactionRequest { FromHeaderId = loser });
         Assert.True(patch.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"PATCH failed: {(int)patch.StatusCode} {await patch.Content.ReadAsStringAsync()}");
 
@@ -432,9 +436,9 @@ public sealed class BalanceMergeHideSyncTests
         Assert.Equal(-50m, await ReadBalanceAsync(s, c));
 
         // Merge loser into winner.
-        var patch = await s.Client.PatchAsJsonAsync(
-            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winner}",
-            new PatchTransactionRequest { MergeFromHeaderId = loser });
+        var patch = await s.Client.PostAsJsonAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winner}/merge",
+            new MergeTransactionRequest { FromHeaderId = loser });
         Assert.True(patch.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"PATCH failed: {(int)patch.StatusCode} {await patch.Content.ReadAsStringAsync()}");
 
@@ -540,9 +544,12 @@ public sealed class BalanceMergeHideSyncTests
                 Payee = "Test Bank",
                 Memo = "Interest Paid USD special other Interest:Interest Earned",
                 PostedAt = new DateTime(2026, 4, 30, 0, 0, 0, DateTimeKind.Utc),
-                MergeFromHeaderId = loserId,
-                Approve = true,
             });
+        // Then fold, as a command. It used to ride on the PATCH above;
+        // a merge is not a field edit and no longer can.
+        patchResp = await s.Client.PostAsJsonAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winnerId}/merge",
+            new MergeTransactionRequest { FromHeaderId = loserId });
         Assert.True(patchResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"PATCH failed: {(int)patchResp.StatusCode} {await patchResp.Content.ReadAsStringAsync()}");
 
@@ -627,9 +634,12 @@ public sealed class BalanceMergeHideSyncTests
                 Payee = "Test Bank",
                 Memo = "Interest Paid USD special other Interest:Interest Earned",
                 PostedAt = new DateTime(2026, 4, 30, 0, 0, 0, DateTimeKind.Utc),
-                MergeFromHeaderId = loserId,
-                Approve = true,
             });
+        // Then fold, as a command. It used to ride on the PATCH above;
+        // a merge is not a field edit and no longer can.
+        patchResp = await s.Client.PostAsJsonAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winnerId}/merge",
+            new MergeTransactionRequest { FromHeaderId = loserId });
         Assert.True(patchResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"PATCH failed: {(int)patchResp.StatusCode} {await patchResp.Content.ReadAsStringAsync()}");
 
@@ -719,9 +729,12 @@ public sealed class BalanceMergeHideSyncTests
                 Payee = "Test Bank",
                 Memo = "Interest Paid USD special other Interest:Interest Earned",
                 PostedAt = new DateTime(2026, 4, 30, 0, 0, 0, DateTimeKind.Utc),
-                MergeFromHeaderId = loserId,
-                Approve = true,
             });
+        // Then fold, as a command. It used to ride on the PATCH above;
+        // a merge is not a field edit and no longer can.
+        p1 = await s.Client.PostAsJsonAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winnerId}/merge",
+            new MergeTransactionRequest { FromHeaderId = loserId });
         Assert.True(p1.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"PATCH 1 failed: {(int)p1.StatusCode} {await p1.Content.ReadAsStringAsync()}");
 
@@ -837,9 +850,12 @@ public sealed class BalanceMergeHideSyncTests
                 Payee = "Test Bank",
                 Memo = "Interest Paid USD",
                 PostedAt = new DateTime(2026, 4, 30, 0, 0, 0, DateTimeKind.Utc),
-                MergeFromHeaderId = loserId,
-                Approve = true,
             });
+        // Then fold, as a command. It used to ride on the PATCH above;
+        // a merge is not a field edit and no longer can.
+        p1 = await s.Client.PostAsJsonAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winnerId}/merge",
+            new MergeTransactionRequest { FromHeaderId = loserId });
         Assert.True(p1.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent);
 
         // PATCH 2: override on may31.
@@ -904,9 +920,9 @@ public sealed class BalanceMergeHideSyncTests
             await db.TxnHeaders.Where(h => h.Id == winner)
                 .ExecuteUpdateAsync(s2 => s2.SetProperty(h => h.NeedsReview, true));
         }
-        var patch = await s.Client.PatchAsJsonAsync(
-            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winner}",
-            new PatchTransactionRequest { MergeFromHeaderId = loser });
+        var patch = await s.Client.PostAsJsonAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winner}/merge",
+            new MergeTransactionRequest { FromHeaderId = loser });
         Assert.True(patch.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent);
 
         // After merge: balance(C) = -25.

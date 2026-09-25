@@ -1,6 +1,6 @@
 # 0083 — Multi-user: role enforcement, per-ledger sharing, invite links, ledger lifecycle
 
-* Status: Accepted (slice A backend shipped; slice A UI + slice B invites to follow)
+* Status: Accepted — **fully shipped in 0.34.0.** Both of the slices this line once listed as "to follow" are done: the members UI (`MembersPanel`) and invite links (`InvitesEndpoints`, `InvitesRepository`, the `invites` table, `InviteLinkModal`, `InvitePage`).
 * Date: 2026-07-23
 * Related: ADR-0013 (WebAuthn auth + bootstrap ceremony — invites generalize its
   token), ADR-0020 (multi-ledger RLS + the owner/editor/viewer role matrix this

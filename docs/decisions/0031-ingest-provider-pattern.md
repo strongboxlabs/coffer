@@ -417,7 +417,7 @@ Each slice is an independent PR:
    matches an incoming OFX FITID is NOT yet implemented — the
    orchestrator's file dedup is origin-scoped on `external_id`
    per mig 105; the OR-branch on `(online_match_fi_id,
-   online_match_fitid)` is captured in `docs/follow-ups.md`.
+   online_match_fitid)` is captured in `docs/maintainer/follow-ups.md`.
 5. **Phase 5** — CSV generic provider + `feed_csv_mappings` schema
    + column-mapping wizard UI.
 6. **Phase 6** — per-BROKERAGE CSV providers as needed. Shipped for

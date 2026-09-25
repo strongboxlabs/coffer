@@ -191,9 +191,9 @@ public sealed class InvestmentPatchParityTests
                 $"UPDATE txn_headers SET needs_review = TRUE WHERE id = {loser}");
         }
 
-        var merge = await client.PatchAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}",
-            new PatchInvestmentTransactionRequest { MergeFromHeaderId = winner });
+        var merge = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}/merge",
+            new MergeTransactionRequest { FromHeaderId = winner });
         Assert.Equal(HttpStatusCode.NoContent, merge.StatusCode);
 
         // Premise: the survivor adopted the loser's date.
@@ -626,4 +626,138 @@ public sealed class InvestmentPatchParityTests
             .SumAsync(g => g.RealizedGain);
     }
 
+    /// <summary>
+    /// An investment edit can leave the row queued for review.
+    /// </summary>
+    /// <remarks>
+    /// <para>The capability the investment path did not have. A successful PATCH
+    /// used to clear <c>needs_review</c> UNCONDITIONALLY, justified by "the
+    /// investment editor's only Save-pressed exit IS Accept" — a claim about one
+    /// client, applied to the endpoint. Every other caller (MCP, a direct PATCH,
+    /// a script fixing a typo across a ledger) therefore accepted every row it
+    /// touched, and nobody could correct an imported row and leave it for
+    /// later. The bank path has always been able to.</para>
+    ///
+    /// <para>No test failed when the behaviour changed, which is why it survived:
+    /// nothing asserted the implicit clear in either direction. These three do,
+    /// and each one fails if the flag stops being honoured.</para>
+    /// </remarks>
+    [Fact]
+    public async Task An_investment_edit_without_approve_leaves_the_row_queued()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
+        var securityId = await ledger.AddSecurityAsync("APPX", ticker: "APPX");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var postedAt = new DateTime(2026, 7, 1, 12, 0, 0, DateTimeKind.Utc);
+        var headerId = await BuyAsync(client, ledger, brokerage.Id, securityId,
+            postedAt, shares: 10m, amount: 1000m, price: 100m);
+        await SetNeedsReviewAsync(headerId, true);
+
+        var patch = await client.PatchAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{headerId}",
+            new PatchInvestmentTransactionRequest
+            {
+                BrokerageAccountId = brokerage.Id,
+                PostedAt = postedAt,
+                Action = "buy",
+                SecurityId = securityId,
+                Shares = 10m,
+                Price = 100m,
+                Amount = 1000m,
+                Memo = "corrected a typo, still wants reviewing",
+            });
+        Assert.True(patch.IsSuccessStatusCode, await patch.Content.ReadAsStringAsync());
+
+        Assert.True(await NeedsReviewAsync(headerId),
+            "the edit accepted the row without being asked to");
+    }
+
+    /// <summary>approve: true accepts it, in the same transaction as the edit.</summary>
+    [Fact]
+    public async Task An_investment_edit_with_approve_accepts_the_row()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
+        var securityId = await ledger.AddSecurityAsync("APPY", ticker: "APPY");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var postedAt = new DateTime(2026, 7, 2, 12, 0, 0, DateTimeKind.Utc);
+        var headerId = await BuyAsync(client, ledger, brokerage.Id, securityId,
+            postedAt, shares: 10m, amount: 1000m, price: 100m);
+        await SetNeedsReviewAsync(headerId, true);
+
+        var patch = await client.PatchAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{headerId}",
+            new PatchInvestmentTransactionRequest
+            {
+                BrokerageAccountId = brokerage.Id,
+                PostedAt = postedAt,
+                Action = "buy",
+                SecurityId = securityId,
+                Shares = 10m,
+                Price = 100m,
+                Amount = 1000m,
+                Approve = true,
+            });
+        Assert.True(patch.IsSuccessStatusCode, await patch.Content.ReadAsStringAsync());
+
+        Assert.False(await NeedsReviewAsync(headerId));
+    }
+
+    /// <summary>
+    /// A merge accepts the loser whether or not the caller asked.
+    /// </summary>
+    /// <remarks>
+    /// The one case that must NOT become opt-in. A folded-away row is resolved,
+    /// not awaiting review, and leaving it queued keeps the sidebar's review dot
+    /// lit on an account whose register has nothing to show — the exact defect
+    /// fixed in 0.94.0. Enforced in the repository so it cannot depend on a
+    /// caller remembering to pair the two.
+    /// </remarks>
+    [Fact]
+    public async Task A_merge_still_accepts_the_loser_without_being_asked()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
+        var securityId = await ledger.AddSecurityAsync("APPZ", ticker: "APPZ");
+
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var winner = await BuyAsync(client, ledger, brokerage.Id, securityId,
+            new DateTime(2026, 7, 3, 12, 0, 0, DateTimeKind.Utc),
+            shares: 10m, amount: 1000m, price: 100m);
+        var loser = await BuyAsync(client, ledger, brokerage.Id, securityId,
+            new DateTime(2026, 7, 4, 12, 0, 0, DateTimeKind.Utc),
+            shares: 10m, amount: 1000m, price: 100m);
+        await SetNeedsReviewAsync(loser, true);
+
+        var merge = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{loser}/merge",
+            new MergeTransactionRequest { FromHeaderId = winner });
+        Assert.Equal(HttpStatusCode.NoContent, merge.StatusCode);
+
+        Assert.False(await NeedsReviewAsync(loser),
+            "a folded-away row must not stay queued — it lights the sidebar dot");
+    }
+
+    private async Task SetNeedsReviewAsync(Guid headerId, bool value)
+    {
+        await using var db = _fixture.NewDbContext();
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $"UPDATE txn_headers SET needs_review = {value} WHERE id = {headerId}");
+    }
+
+    private async Task<bool> NeedsReviewAsync(Guid headerId)
+    {
+        await using var db = _fixture.NewDbContext();
+        return (await db.TxnHeaders.AsNoTracking()
+            .SingleAsync(h => h.Id == headerId)).NeedsReview;
+    }
 }

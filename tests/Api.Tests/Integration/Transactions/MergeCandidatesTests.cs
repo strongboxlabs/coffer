@@ -86,6 +86,25 @@ public sealed class MergeCandidatesTests
             $"/api/ledgers/{ledgerId}/transactions/{headerId}")
         { Content = JsonContent.Create(body) };
 
+    /// <summary>
+    /// Fold <paramref name="headerId"/> (the LOSER) into
+    /// <paramref name="fromHeaderId"/> (the surviving WINNER).
+    /// </summary>
+    /// <remarks>
+    /// Merging is a command with its own route; it used to be a PATCH carrying
+    /// <c>MergeFromHeaderId</c>. Several of these calls also sent
+    /// <c>Approve = true</c> alongside it, which was always redundant — the
+    /// repository clears <c>needs_review</c> on a folded-away row itself,
+    /// precisely so the invariant cannot depend on a caller pairing two fields.
+    /// The route has no approve field, so that redundancy is now unexpressible
+    /// rather than merely discouraged.
+    /// </remarks>
+    private static HttpRequestMessage Merge(
+        Guid ledgerId, Guid headerId, Guid fromHeaderId) =>
+        new(HttpMethod.Post,
+            $"/api/ledgers/{ledgerId}/transactions/{headerId}/merge")
+        { Content = JsonContent.Create(new MergeTransactionRequest { FromHeaderId = fromHeaderId }) };
+
     // -- GET merge-candidates -----------------------------------------
 
     [Fact]
@@ -654,12 +673,7 @@ public sealed class MergeCandidatesTests
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
-        var response = await client.SendAsync(Patch(ledger.LedgerId, targetId,
-            new PatchTransactionRequest
-            {
-                Approve = true,
-                MergeFromHeaderId = manualId,
-            }));
+        var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, manualId));
         // Minimal patch body without account_id / postings → server
         // returns 204 (no surviving-entry resolve needed). Real SPA
         // calls supply account_id and get 200 + resolved entry — see
@@ -719,8 +733,7 @@ public sealed class MergeCandidatesTests
 
         // Merge stamp ONLY — the body the SPA now sends, and the one an API
         // client would write by hand.
-        var response = await client.SendAsync(Patch(ledger.LedgerId, targetId,
-            new PatchTransactionRequest { MergeFromHeaderId = manualId }));
+        var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, manualId));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
         await using var db = _fixture.NewDbContext();
@@ -754,12 +767,7 @@ public sealed class MergeCandidatesTests
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
-        var response = await client.SendAsync(Patch(ledger.LedgerId, targetId,
-            new PatchTransactionRequest
-            {
-                Approve = true,
-                MergeFromHeaderId = manualId,
-            }));
+        var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, manualId));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
         // The survivor now shows the imported date (03-06), not its own
@@ -795,8 +803,7 @@ public sealed class MergeCandidatesTests
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
-        var response = await client.SendAsync(Patch(ledger.LedgerId, targetId,
-            new PatchTransactionRequest { Approve = true, MergeFromHeaderId = manualId }));
+        var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, manualId));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
         await using var db = _fixture.NewDbContext();
@@ -831,8 +838,7 @@ public sealed class MergeCandidatesTests
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
-        var response = await client.SendAsync(Patch(ledger.LedgerId, targetId,
-            new PatchTransactionRequest { MergeFromHeaderId = otherBankRowId }));
+        var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, otherBankRowId));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
         await using var db = _fixture.NewDbContext();
@@ -868,8 +874,7 @@ public sealed class MergeCandidatesTests
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
-        var response = await client.SendAsync(Patch(ledger.LedgerId, targetId,
-            new PatchTransactionRequest { MergeFromHeaderId = pendingSourceId }));
+        var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, pendingSourceId));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal("merge-source-invalid",
@@ -913,8 +918,7 @@ public sealed class MergeCandidatesTests
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
-        var response = await client.SendAsync(Patch(ledger.LedgerId, freshTargetId,
-            new PatchTransactionRequest { MergeFromHeaderId = winnerId, Approve = true }));
+        var response = await client.SendAsync(Merge(ledger.LedgerId, freshTargetId, winnerId));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
         await using var verifyDb = _fixture.NewDbContext();
@@ -951,8 +955,7 @@ public sealed class MergeCandidatesTests
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
-        var response = await bobClient.SendAsync(Patch(bob.LedgerId, bobTargetId,
-            new PatchTransactionRequest { MergeFromHeaderId = aliceManualId }));
+        var response = await bobClient.SendAsync(Merge(bob.LedgerId, bobTargetId, aliceManualId));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal("merge-source-invalid",
@@ -972,8 +975,7 @@ public sealed class MergeCandidatesTests
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
-        var response = await client.SendAsync(Patch(ledger.LedgerId, headerId,
-            new PatchTransactionRequest { MergeFromHeaderId = headerId }));
+        var response = await client.SendAsync(Merge(ledger.LedgerId, headerId, headerId));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal("merge-source-invalid",
@@ -1010,8 +1012,7 @@ public sealed class MergeCandidatesTests
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
-        var response = await client.SendAsync(Patch(ledger.LedgerId, secondTargetId,
-            new PatchTransactionRequest { MergeFromHeaderId = manualId }));
+        var response = await client.SendAsync(Merge(ledger.LedgerId, secondTargetId, manualId));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal("merge-source-invalid",
@@ -1048,8 +1049,7 @@ public sealed class MergeCandidatesTests
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
-        var response = await client.SendAsync(Patch(ledger.LedgerId, targetId,
-            new PatchTransactionRequest { MergeFromHeaderId = manualId }));
+        var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, manualId));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal("merge-source-invalid",
@@ -1081,8 +1081,7 @@ public sealed class MergeCandidatesTests
 
         await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
-        var response = await client.SendAsync(Patch(ledger.LedgerId, targetId,
-            new PatchTransactionRequest { MergeFromHeaderId = manualId }));
+        var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, manualId));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal("merge-source-invalid",

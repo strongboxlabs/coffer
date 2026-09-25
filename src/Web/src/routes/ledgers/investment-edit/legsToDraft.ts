@@ -53,6 +53,11 @@ export function legsToDraft(
         payee: string | null;
         memo: string | null;
         checkNumber: string | null;
+        /** Header-level tags (ADR-0009) as the register row carries them.
+         *  Optional so callers that only have the header's text fields still
+         *  typecheck; absent seeds an empty set, which on save would CLEAR the
+         *  header's tags — every live caller passes the row's `tags`. */
+        tags?: readonly string[];
     },
     legs: readonly InvestmentLegView[],
 ): InvestmentTxnDraft {
@@ -123,6 +128,7 @@ export function legsToDraft(
         feeAmount: feeCategoryLeg !== null
             ? Math.abs(feeCategoryLeg.amount)
             : null,
+        tags: header.tags ?? [],
     };
 }
 
@@ -144,6 +150,11 @@ function transferSharesToDraft(
         payee: string | null;
         memo: string | null;
         checkNumber: string | null;
+        /** Header-level tags (ADR-0009) as the register row carries them.
+         *  Optional so callers that only have the header's text fields still
+         *  typecheck; absent seeds an empty set, which on save would CLEAR the
+         *  header's tags — every live caller passes the row's `tags`. */
+        tags?: readonly string[];
     },
     legs: readonly InvestmentLegView[],
 ): InvestmentTxnDraft {
@@ -189,6 +200,7 @@ function transferSharesToDraft(
         transferAccountId: destBrokerage,
         feeAccountId: null,
         feeAmount: null,
+        tags: header.tags ?? [],
     };
 }
 

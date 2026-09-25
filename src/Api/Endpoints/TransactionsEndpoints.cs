@@ -51,10 +51,21 @@ public static class TransactionsEndpoints
         group.MapPost("/", CreateAsync);
         group.MapPatch("/{headerId:guid}", PatchAsync);
         group.MapPut("/{headerId:guid}/recon-status", SetReconStatusAsync);
-        // (slice 2c.6a) The POST /{headerId}/approve route was
-        // collapsed into PATCH with `approve: true`. The bank-feed
-        // accept flow always edits at least one field anyway
-        // (category / payee), so one round-trip is the natural shape.
+        // COMMANDS, not field edits. A PATCH whose entire body was one flag
+        // was using PATCH as a verb: `{approve: true}` and `{mergeFromHeaderId}`
+        // do not describe a new state of the row, they name an action. Both now
+        // have a route that says what they are, and the empty-body guard below
+        // stops reading as "this PATCH is nearly empty, so allow these three
+        // exceptions".
+        //
+        // `approve` STAYS on PATCH as well, deliberately. The editor's accept is
+        // an edit AND an approval, and splitting it would make an edit that
+        // succeeded followed by an approval that failed leave the row changed
+        // but still queued. One round-trip keeps it atomic — which is the
+        // reasoning that collapsed the original POST /approve route in slice
+        // 2c.6a, and it still holds for the flow that edits.
+        group.MapPost("/{headerId:guid}/approve", ApproveAsync);
+        group.MapPost("/{headerId:guid}/merge", MergeAsync);
         group.MapDelete("/{headerId:guid}", DeleteAsync);
         group.MapPost("/{headerId:guid}/unhide", UnhideAsync);
         group.MapPost("/{headerId:guid}/move-account", MoveAccountAsync);
@@ -540,7 +551,7 @@ public static class TransactionsEndpoints
 
         if (request.Tags is { } tags)
         {
-            var tagsRejection = ValidateTags(tags);
+            var tagsRejection = TagValidation.ValidateTags(tags);
             if (tagsRejection is not null) return tagsRejection;
         }
 
@@ -585,36 +596,6 @@ public static class TransactionsEndpoints
         return Results.Created(
             $"/api/ledgers/{ledgerId}/transactions/{headerId}",
             new { headerId });
-    }
-
-    /// <summary>
-    /// Per-tag validation (slice 2c.6b). Empty list is legal — it
-    /// means "clear all tags." Each name is trimmed; empty-after-
-    /// trim is a hard 422 (no silent drops). Name length and total
-    /// count are capped to keep payloads predictable.
-    /// </summary>
-    private const int MaxTagNameLength = 64;
-    private const int MaxTagsPerHeader = 20;
-
-    private static IResult? ValidateTags(IReadOnlyList<string> tags)
-    {
-        if (tags.Count > MaxTagsPerHeader)
-            return BusinessError.Problem(
-                BusinessError.Codes.TransactionTagsTooMany,
-                $"At most {MaxTagsPerHeader} tags may be applied to one transaction.");
-        foreach (var raw in tags)
-        {
-            var trimmed = raw?.Trim();
-            if (string.IsNullOrEmpty(trimmed))
-                return BusinessError.Problem(
-                    BusinessError.Codes.TransactionTagEmpty,
-                    "Tag names cannot be empty or whitespace-only.");
-            if (trimmed.Length > MaxTagNameLength)
-                return BusinessError.Problem(
-                    BusinessError.Codes.TransactionTagTooLong,
-                    $"Tag names must be {MaxTagNameLength} characters or fewer.");
-        }
-        return null;
     }
 
     /// <summary>
@@ -670,10 +651,10 @@ public static class TransactionsEndpoints
         // Slice 2c.6b: `tags: []` (clear) and `tags: [...]` (set)
         // are both valid standalone PATCHes.
         var hasTags = request.Tags is not null;
-        // Slice 2c.6d: a merge stamp alone is also a valid PATCH
-        // (rare, but supports "merge without editing anything else").
-        var hasMerge = request.MergeFromHeaderId is not null;
-        if (!hasHeaderField && !hasPostings && !hasApprove && !hasTags && !hasMerge)
+        // No hasMerge: a merge cannot arrive on this route any more. It is a
+        // command with its own POST, and MergeFromHeaderId is [JsonIgnore] so a
+        // body carrying it is simply a body that set nothing.
+        if (!hasHeaderField && !hasPostings && !hasApprove && !hasTags)
             return BusinessError.Problem(BusinessError.Codes.TransactionPatchEmpty,
                 "Supply at least one header field, a postings reshape, tags, approve=true, or mergeFromHeaderId.");
 
@@ -688,7 +669,7 @@ public static class TransactionsEndpoints
 
         if (request.Tags is { } tags)
         {
-            var tagsRejection = ValidateTags(tags);
+            var tagsRejection = TagValidation.ValidateTags(tags);
             if (tagsRejection is not null) return tagsRejection;
         }
 
@@ -710,31 +691,7 @@ public static class TransactionsEndpoints
             ledgerId, headerId, request, cancellationToken).ConfigureAwait(false);
         if (outcome != TransactionsRepository.PatchResult.Ok)
         {
-            return outcome switch
-            {
-                TransactionsRepository.PatchResult.HeaderNotInLedger =>
-                    BusinessError.Problem(BusinessError.Codes.TransactionNotInLedger,
-                        "Transaction does not belong to this ledger."),
-                TransactionsRepository.PatchResult.PostingsLegNotInHeader =>
-                    BusinessError.Problem(BusinessError.Codes.TransactionPostingLegNotInHeader,
-                        "A posting's legId does not match any existing leg on this transaction."),
-                TransactionsRepository.PatchResult.PostingsDuplicateLegId =>
-                    BusinessError.Problem(BusinessError.Codes.TransactionPostingLegIdDuplicated,
-                        "Two postings carry the same legId. Each posting must reference a distinct existing leg, or omit legId to create a new one."),
-                TransactionsRepository.PatchResult.PostingsSourceAccountMismatch =>
-                    BusinessError.Problem(BusinessError.Codes.TransactionSourceAccountMismatch,
-                        "The supplied sourceAccountId does not match the transaction's source-side legs."),
-                TransactionsRepository.PatchResult.MergeSourceInvalid =>
-                    BusinessError.Problem(BusinessError.Codes.MergeSourceInvalid,
-                        "The row you're merging is no longer a fresh review row, or mergeFromHeaderId isn't a settled, visible transaction in this ledger."),
-                TransactionsRepository.PatchResult.HeaderNotBankShape =>
-                    BusinessError.Problem(BusinessError.Codes.TransactionHeaderIsInvestment,
-                        "Header is an investment transaction; use /api/ledgers/{ledgerId}/investment-transactions/{headerId}."),
-                TransactionsRepository.PatchResult.HeaderDateNull =>
-                    BusinessError.Problem(BusinessError.Codes.TransactionDateNull,
-                        "postedAt and transactedAt cannot be null. Omit the field to leave the date unchanged."),
-                _ => Results.Problem("Unknown patch result.", statusCode: 500),
-            };
+            return MapPatchFailure(outcome);
         }
 
         // PATCH succeeded. When the caller supplies an account_id
@@ -937,6 +894,147 @@ public static class TransactionsEndpoints
     /// (ADR-0072 D2). Un-hide a soft-hidden transaction so it returns to the
     /// register. Idempotent — un-hiding a visible row is a no-op (204).
     /// </summary>
+    /// <summary>
+    /// <c>POST /api/ledgers/{ledgerId}/transactions/{headerId}/approve</c> —
+    /// accept a bank-feed row as-is, changing no field.
+    /// </summary>
+    /// <remarks>
+    /// Idempotent: approving an already-accepted row is a success, not a 422.
+    /// The caller that wants to edit AND accept in one atomic write still sends
+    /// <c>approve: true</c> on the PATCH; this route is for the accept that
+    /// changes nothing, which had been expressing itself as a PATCH with an
+    /// otherwise-empty body.
+    /// </remarks>
+    /// <summary>
+    /// One place the PATCH outcomes become HTTP, shared by PATCH and by the two
+    /// command routes that delegate to the same repository method.
+    /// </summary>
+    /// <remarks>
+    /// Extracted when approve and merge got their own routes. Three copies of a
+    /// switch over the same enum is three places for a new member to be
+    /// forgotten, and the symptom of forgetting one is a 500 on a case the
+    /// repository handles deliberately.
+    /// </remarks>
+    private static IResult MapPatchFailure(TransactionsRepository.PatchResult outcome) =>
+        outcome switch
+        {
+                TransactionsRepository.PatchResult.HeaderNotInLedger =>
+                    BusinessError.Problem(BusinessError.Codes.TransactionNotInLedger,
+                        "Transaction does not belong to this ledger."),
+                TransactionsRepository.PatchResult.PostingsLegNotInHeader =>
+                    BusinessError.Problem(BusinessError.Codes.TransactionPostingLegNotInHeader,
+                        "A posting's legId does not match any existing leg on this transaction."),
+                TransactionsRepository.PatchResult.PostingsDuplicateLegId =>
+                    BusinessError.Problem(BusinessError.Codes.TransactionPostingLegIdDuplicated,
+                        "Two postings carry the same legId. Each posting must reference a distinct existing leg, or omit legId to create a new one."),
+                TransactionsRepository.PatchResult.PostingsSourceAccountMismatch =>
+                    BusinessError.Problem(BusinessError.Codes.TransactionSourceAccountMismatch,
+                        "The supplied sourceAccountId does not match the transaction's source-side legs."),
+                TransactionsRepository.PatchResult.MergeSourceInvalid =>
+                    BusinessError.Problem(BusinessError.Codes.MergeSourceInvalid,
+                        "The row you're merging is no longer a fresh review row, or mergeFromHeaderId isn't a settled, visible transaction in this ledger."),
+                TransactionsRepository.PatchResult.HeaderNotBankShape =>
+                    BusinessError.Problem(BusinessError.Codes.TransactionHeaderIsInvestment,
+                        "Header is an investment transaction; use /api/ledgers/{ledgerId}/investment-transactions/{headerId}."),
+                TransactionsRepository.PatchResult.HeaderDateNull =>
+                    BusinessError.Problem(BusinessError.Codes.TransactionDateNull,
+                        "postedAt and transactedAt cannot be null. Omit the field to leave the date unchanged."),
+                _ => Results.Problem("Unknown patch result.", statusCode: 500),
+            };
+
+    private static async Task<IResult> ApproveAsync(
+        Guid ledgerId,
+        Guid headerId,
+        Guid? account_id,
+        ICurrentUserAccessor currentUser,
+        LedgersRepository ledgers,
+        RegisterRepository register,
+        TransactionsRepository transactions,
+        CancellationToken cancellationToken)
+    {
+        var visible = await ledgers.GetVisibleByIdAsync(
+            currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
+        if (visible is null)
+            return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
+                "Ledger not found or not visible to this user.");
+
+        var outcome = await transactions.PatchAsync(
+            ledgerId, headerId, new PatchTransactionRequest { Approve = true },
+            cancellationToken).ConfigureAwait(false);
+
+        if (outcome != TransactionsRepository.PatchResult.Ok)
+            return MapPatchFailure(outcome);
+
+        // Same courtesy the PATCH route does: hand back the resolved row when the
+        // caller says which register it is looking at, so the SPA can patch it in
+        // place instead of refetching a window.
+        if (account_id is { } rid)
+        {
+            var entry = await register.GetEntryForHeaderAsync(
+                headerId, rid, cancellationToken).ConfigureAwait(false);
+            if (entry is not null) return Results.Ok(entry);
+        }
+        return Results.NoContent();
+    }
+
+    /// <summary>
+    /// <c>POST /api/ledgers/{ledgerId}/transactions/{headerId}/merge</c> — fold
+    /// this row into the one named in the body.
+    /// </summary>
+    /// <remarks>
+    /// <para>Direction is INVERTED and worth restating at every entry point: the
+    /// URL's <paramref name="headerId"/> is the LOSER, and
+    /// <c>fromHeaderId</c> is the surviving WINNER. The user picked the
+    /// canonical row in the candidates panel, so that is the row that keeps its
+    /// identity, postings and any losers it already absorbed.</para>
+    ///
+    /// <para>No <c>approve</c> field: clearing <c>needs_review</c> on the loser
+    /// is the repository's job, because a folded-away row is resolved by
+    /// definition and an invariant that depends on a caller remembering to pair
+    /// two fields is not an invariant.</para>
+    /// </remarks>
+    private static async Task<IResult> MergeAsync(
+        Guid ledgerId,
+        Guid headerId,
+        MergeTransactionRequest request,
+        Guid? account_id,
+        ICurrentUserAccessor currentUser,
+        LedgersRepository ledgers,
+        RegisterRepository register,
+        TransactionsRepository transactions,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        if (request.FromHeaderId == Guid.Empty)
+            return BusinessError.Problem(BusinessError.Codes.TransactionAccountRequired,
+                "fromHeaderId is required.");
+
+        var visible = await ledgers.GetVisibleByIdAsync(
+            currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
+        if (visible is null)
+            return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
+                "Ledger not found or not visible to this user.");
+
+        var outcome = await transactions.PatchAsync(
+            ledgerId, headerId,
+            new PatchTransactionRequest { MergeFromHeaderId = request.FromHeaderId },
+            cancellationToken).ConfigureAwait(false);
+
+        if (outcome != TransactionsRepository.PatchResult.Ok)
+            return MapPatchFailure(outcome);
+
+        // The SURVIVOR is what the caller needs back — the edited row is now a
+        // tombstone and has left the register.
+        if (account_id is { } rid)
+        {
+            var entry = await register.GetEntryForHeaderAsync(
+                request.FromHeaderId, rid, cancellationToken).ConfigureAwait(false);
+            if (entry is not null) return Results.Ok(entry);
+        }
+        return Results.NoContent();
+    }
+
     private static async Task<IResult> UnhideAsync(
         Guid ledgerId,
         Guid headerId,

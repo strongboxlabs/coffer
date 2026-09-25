@@ -392,11 +392,17 @@ public sealed record BalanceHealthDriftDto(
     decimal Diff);
 
 /// <summary>
-/// Result of <c>POST /api/ledgers/{ledgerId}/balances/health</c>.
-/// <see cref="Healthy"/> mirrors <c>Drifted.Count == 0</c>; if any
-/// drift was present, the recompute side-effect has already healed
-/// the rows.
+/// Result of <c>GET /api/ledgers/{ledgerId}/balances/health</c>.
+/// <see cref="Healthy"/> mirrors <c>Drifted.Count == 0</c>.
 /// </summary>
+/// <remarks>
+/// Drift reported here is drift present NOW. This comment used to say the
+/// endpoint was a POST and that "the recompute side-effect has already healed
+/// the rows" — true before migration 206 split calculation from persistence, and
+/// the exact opposite of the truth after it. Repair is a separate, deliberate
+/// <c>POST .../balances/repair</c>. A caller that believes this report healed
+/// anything leaves the ledger stale.
+/// </remarks>
 public sealed record BalanceHealthReport(
     bool Healthy,
     int AccountsChecked,

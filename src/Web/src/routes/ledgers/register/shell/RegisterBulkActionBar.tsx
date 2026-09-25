@@ -28,8 +28,11 @@ interface RegisterBulkActionBarProps {
     onRequestBulkDelete: () => void;
     /** Clear the active selection. */
     onClearSelection: () => void;
-    /** Active status filter — Unhide shows only in the Hidden view; the
-     *  Categorize / Tag placeholders show only outside it. */
+    /** Active status filter — Unhide shows only in the Hidden view. (This
+     *  comment used to add "the Categorize / Tag placeholders show only
+     *  outside it"; there are no such buttons here and never have been —
+     *  bulk categorise and tag are blocked on write endpoints that do not
+     *  exist.) */
     statusFilter: StatusFilter;
     /** ADR-0072 D2 — Unhide the selection (Hidden view only). */
     onBulkUnhide: () => void;

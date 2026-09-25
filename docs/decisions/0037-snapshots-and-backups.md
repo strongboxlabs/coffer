@@ -1,6 +1,18 @@
 # 0037 — Snapshots and backups
 
-* Status: Accepted
+* Status: Accepted for SNAPSHOTS — **the backups half was superseded by ADR-0060,
+  ADR-0062, ADR-0074 and ADR-0087.**
+
+> The per-ledger `coffer-backup-v1` envelope described below — a passphrase-wrapped
+> gzip JSON export of one ledger — **was never built**. Backups are whole-database
+> `pg_dump --format=custom`, chunked AES-256-GCM into `.cofferbak`, scheduled through
+> `global_scheduled_jobs`, with Drive mirroring and admin-editable GFS retention.
+>
+> The snapshot half's scope list is also drifted: the live whitelist is
+> `LedgerSnapshotPayload`, which excludes `ledgers`, names
+> `user_account_groups` / `user_account_group_members`, carries `txn_header_originals`
+> rather than the dropped override tables, and includes `security_splits` and the
+> recurring-transaction tables that this ADR omits.
 * Date: 2026-06-08
 * Related: [ADR-0014](0014-encryption-at-rest.md) (per-ledger LEK, master KEK), [ADR-0031](0031-ingest-provider-pattern.md) (the JSON-walker pattern this reuses for restore)
 

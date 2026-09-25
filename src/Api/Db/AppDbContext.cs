@@ -11,9 +11,10 @@ namespace Coffer.Api.Db;
 /// ADR-0005 (as realigned in PR 3.6.5 and PR 3.7), the API runs on EF
 /// Core end-to-end: routine CRUD, transactional inserts,
 /// <c>ExecuteUpdate</c>/<c>ExecuteDelete</c> for set-based mutations,
-/// view-backed reads, and the register-query keyset pagination via
-/// <c>MR.EntityFrameworkCore.KeysetPagination</c>. Dapper stays in the
-/// importer for its bulk-insert hot path.
+/// view-backed reads, and the register-query keyset pagination — which is a
+/// Postgres function (<c>register_entry_keys</c>) bound through
+/// <c>HasDbFunction</c>, not a library. Dapper stays in the importer for its
+/// bulk-insert hot path.
 /// </summary>
 /// <remarks>
 /// <para>Schema is owned by the SQL files under <c>db/migrations/</c>;

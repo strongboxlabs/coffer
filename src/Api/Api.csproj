@@ -14,7 +14,7 @@
          the assembly by the StampGitVersion target below and surfaced
          via GET /api/meta/version. We compose InformationalVersion
          ourselves, so suppress the SDK's automatic +<sha> append. -->
-    <Version>0.100.2</Version>
+    <Version>0.102.0</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 
@@ -126,7 +126,6 @@
     <PackageReference Include="Microsoft.OpenApi" Version="2.12.2" />
     <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.12" />
     <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0" />
-    <PackageReference Include="MR.EntityFrameworkCore.KeysetPagination" Version="1.6.0" />
     <PackageReference Include="Npgsql" Version="10.0.3" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
     <PackageReference Include="Npgsql.OpenTelemetry" Version="10.0.3" />

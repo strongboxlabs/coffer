@@ -679,8 +679,6 @@ public sealed class RegisterRepository
             HasOverrides = projection.HasOverrides,
             // The synthesized row reads as the header itself, not a child.
             LegIndex = 0,
-            // Investments carry no tags (ADR-0028), whatever the legs held.
-            Tags = Array.Empty<string>(),
             CounterpartyId = projection.CounterpartyId,
             CounterpartyAccountId = projection.CounterpartyAccountId,
             CounterpartyAccountName = projection.CounterpartyAccountName,

@@ -37,6 +37,7 @@ function emptyDraft(): InvestmentTxnDraft {
         transferAccountId: null,
         feeAccountId: null,
         feeAmount: null,
+        tags: [],
     };
 }
 

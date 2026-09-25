@@ -37,6 +37,7 @@ export interface InvestmentTxnDraftHook {
     setTransferAccountId:  (next: string | null) => void;
     setFeeAccountId:       (next: string | null) => void;
     setFeeAmount:          (next: number | null) => void;
+    setTags:               (next: readonly string[]) => void;
     /** Reset to a fresh draft (cancel + start over). */
     reset: () => void;
 }
@@ -58,6 +59,7 @@ function makeInitial(brokerageAccountId: string): InvestmentTxnDraft {
         transferAccountId: null,
         feeAccountId: null,
         feeAmount: null,
+        tags: [],
     };
 }
 
@@ -107,6 +109,7 @@ export function useInvestmentTxnDraft(args: {
         setTransferAccountId:  (v) => update('transferAccountId', v),
         setFeeAccountId:       (v) => update('feeAccountId', v),
         setFeeAmount:          (v) => update('feeAmount', v),
+        setTags:               (v) => update('tags', v),
         reset:                 () => setDraft(initial),
     };
 }
@@ -115,6 +118,20 @@ function shallowEqual<T extends object>(a: T, b: T): boolean {
     const ak = Object.keys(a) as (keyof T)[];
     const bk = Object.keys(b) as (keyof T)[];
     if (ak.length !== bk.length) return false;
-    for (const k of ak) if (a[k] !== b[k]) return false;
+    for (const k of ak) {
+        const av = a[k];
+        const bv = b[k];
+        // `tags` is the one array-valued field. Identity would make the draft
+        // dirty the moment TagsInput hands back a new array with the same
+        // contents — which it does on every keystroke that resolves to no
+        // change — and the unsaved-changes prompt would fire on cancel from an
+        // untouched row.
+        if (Array.isArray(av) && Array.isArray(bv)) {
+            if (av.length !== bv.length) return false;
+            if (av.some((x, i) => x !== bv[i])) return false;
+            continue;
+        }
+        if (av !== bv) return false;
+    }
     return true;
 }

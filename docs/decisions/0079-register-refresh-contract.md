@@ -27,7 +27,7 @@ stays mounted leaves it stale. Concretely (writer audit, 2026-07-17):
   it existed.
 - Settings sync (per-connection + Sync all), reminder-fire, snapshot restore,
   and opening-balance edits refreshed a register only on remount.
-- `docs/follow-ups.md`'s SSE item (Phase 5+) already planned to *"invalidate the
+- `docs/maintainer/follow-ups.md`'s SSE item (Phase 5+) already planned to *"invalidate the
   register queries; TanStack handles refetch"* — a plan that would ship broken
   for the same reason (the rows aren't a query).
 
@@ -74,6 +74,37 @@ Establish one canonical invalidation contract for register data:
   membership. The `useInfiniteQuery` port stays a possible future cleanup, but
   it must preserve the virtuoso index math and the discard-and-reseed-on-
   head-insert behavior this contract relies on.
+
+### Amendment (2026-09): the index space is internal, and the grid says so
+
+`firstItemIndex` is seeded to 1,000,000 so pages can be prepended without the
+index going negative. That number was reaching `aria-rowindex` unchanged, so a
+screen reader was told the register's first row was **row 1,000,001** — and its
+paired `aria-rowcount` was the LOADED entry count, making the full
+announcement "row 1000001 of 87" on an account with tens of thousands of rows.
+The investment register announced neither, so moving through it said nothing
+about position at all.
+
+The offset is now stripped at the one place it enters the row callback
+(`toWindowIndex`), so `renderRow` receives a **window-local** index and both
+registers emit `aria-rowindex` from it. `aria-rowcount` is a hardcoded `-1` on
+the shared scroll surface — ARIA's "the total is not known", which is the
+honest answer for a sliding window whose offset into the account is not
+derivable client-side.
+
+A real total IS obtainable (the scroll-rail buckets sum to it), and it was
+tempting to use. It was rejected: pairing a true total with a window-local
+index would announce "row 5 of 43082" for a row that is the 12,000th, which is
+a worse lie than no total at all. Announcing a true ABSOLUTE index would need
+the window's base tracked through every prepend and eviction, and it is
+unknowable anyway on a `focusHeaderId` deep link — so the announcement would
+degrade mid-session, which is worse than a consistent one.
+
+`toWindowIndex` is exported and unit-tested as a pure function rather than
+through the component, and that is deliberate: **under jsdom virtuoso emits
+LOCAL indices** — `firstItemIndex` needs layout to take effect — so a
+rendered-DOM assertion reads "1" and "2" whether or not the subtraction
+happens. A DOM test here is green against the bug it is supposed to catch.
 
 ## Alternatives considered
 

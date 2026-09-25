@@ -118,6 +118,24 @@ draft via `legsToDraft`. Duplicate and "Create reminder" reuse the same fetch
 Duplicate, and the raw-data modal — no reliance on the register window,
 which no longer carries raw legs.
 
+### 7. Tags sit with the header fields, not in the action matrix
+
+The `TagsInput` renders between Payee/Memo and the action-specific row,
+outside `ACTION_LAYOUTS`. Tags are a property of the **event** (ADR-0009):
+they apply to every action, so putting a `tags` key in the matrix would mean
+repeating it on all ten rows and inviting someone to leave it off one.
+
+`InvestmentTxnDraft.tags` is therefore always an array, never null, and
+`validate()` ignores it — there is no action for which a tag is required or
+forbidden. Both request builders send it unconditionally, because the server
+reads an omitted `tags` as "leave them alone": omitting an emptied list would
+make a tag impossible to remove from this surface, and the save would look
+like it had worked.
+
+One input for the whole event. The legs an action derives never carry tags of
+their own, exactly as a bank split's postings do not — `txn_header_tags` has
+no leg column.
+
 ## Out of scope here
 
 - **FIFO consumption preview popover** — ships in A4.c.4 (`GET .../lots`
