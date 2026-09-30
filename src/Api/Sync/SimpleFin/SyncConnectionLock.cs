@@ -37,7 +37,7 @@ namespace Coffer.Api.Sync.SimpleFin;
 /// <para>The lock is non-blocking. <see cref="TryAcquire"/> returns
 /// <c>null</c> when another caller already holds the lock for that
 /// connection — the caller should map that to
-/// <see cref="SimpleFinSyncService.FailureReason.SyncInProgress"/>
+/// <see cref="Coffer.Api.Ingest.IngestFailureReason.SyncInProgress"/>
 /// just like the DB-layer unique-violation. Acquired locks
 /// release on dispose; the typical caller pattern is
 /// <c>using var _ = _lock.TryAcquire(id);</c>.</para>

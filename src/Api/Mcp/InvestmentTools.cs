@@ -283,8 +283,13 @@ public static class InvestmentTools
 
     [McpServerTool(Name = "price_history"), Description(
         "Recorded price points for one security over an optional date window " +
-        "(date, close, high, low, volume), oldest first. Resolve securityId via " +
-        "list_securities.")]
+        "(date, close, high, low, volume, source), oldest first. Resolve " +
+        "securityId via list_securities. `source` says where the figure came " +
+        "from — manual, a quote feed, an import or a trade — and they are not " +
+        "equally trustworthy. `unbacked` marks a price that says a trade " +
+        "produced it while no trade currently does, usually because that trade " +
+        "was deleted or edited; it MAY still be correct, so treat it as a " +
+        "caution and not as an error.")]
     public static async Task<IReadOnlyList<PricePoint>> PriceHistory(
         InvestmentReportingRepository repository,
         [Description("Ledger id (GUID) from list_ledgers.")] Guid ledgerId,

@@ -55,6 +55,12 @@ export interface ConsistencyMismatch {
     accountId?: string | null;
     securityId?: string | null;
     headerId?: string | null;
+    /** ISO date (`YYYY-MM-DD`) where the projection is per-(security, day). */
+    priceDate?: string | null;
+    /** What KIND of finding this is, where a projection has more than one.
+     *  `orphaned` is reported but not repairable. Null where the projection has
+     *  a single kind. */
+    reason?: string | null;
 }
 
 /** Mirror of API `Coffer.Api.Contracts.ProjectionConsistency`. */
@@ -74,4 +80,24 @@ export interface ProjectionConsistency {
 export interface LedgerConsistencyReport {
     healthy: boolean;
     projections: ProjectionConsistency[];
+    /** Advisory, not findings — see {@link UnbackedPriceAdvisory}. Takes no
+     *  part in `healthy`. */
+    unbackedPrices: UnbackedPriceAdvisory[];
+}
+
+/**
+ * Mirror of API `Coffer.Api.Contracts.UnbackedPriceAdvisory`. A security
+ * holding prices that claim a trade produced them while no trade currently
+ * does. Advisory: the price may still be right, and nothing records which
+ * transaction wrote it, so it can only be inferred.
+ */
+export interface UnbackedPriceAdvisory {
+    securityId: string;
+    security: string;
+    count: number;
+    earliest: string;
+    latest: string;
+    /** Quantity held now at the latest price; 0 once the position is sold,
+     *  which sorts it last without hiding it. */
+    holdingValue: number;
 }

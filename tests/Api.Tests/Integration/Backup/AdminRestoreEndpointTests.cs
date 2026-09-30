@@ -3,7 +3,10 @@ using System.Text;
 
 using Microsoft.AspNetCore.Mvc.Testing;
 
+using Microsoft.Extensions.DependencyInjection;
+
 using Coffer.Api.Backup;
+using Coffer.Api.Crypto;
 using Coffer.Api.Endpoints;
 using Coffer.Api.Tests.Integration.Infra;
 
@@ -125,6 +128,146 @@ public sealed class AdminRestoreEndpointTests
         Assert.True(BootstrapRestoreStaging.IsPending());
         Assert.True(fake.Requested);
         BootstrapRestoreStaging.Clear();
+    }
+
+    /// <summary>
+    /// A backup directory of this test's own, so a planted artifact cannot be
+    /// seen by the retention or listing tests sharing the process.
+    /// </summary>
+    private static string NewBackupDir() =>
+        Path.Combine(Path.GetTempPath(), "coffer-restore-tests", Guid.NewGuid().ToString("N"));
+
+    /// <summary>
+    /// Plant an artifact in the backup store the way a scheduled backup would,
+    /// and return its id.
+    /// </summary>
+    /// <remarks>
+    /// Written straight to the directory rather than through
+    /// <see cref="BackupStore.CreateAsync"/>, which shells out to pg_dump —
+    /// these tests are about the restore SOURCE, not about producing a real
+    /// dump. The name has to match the store's id pattern exactly
+    /// (<c>coffer-yyyyMMddTHHmmssfffZ-</c> + 8 hex); anything else resolves to
+    /// null and the test would pass for the wrong reason.
+    /// </remarks>
+    private static string WriteStoredBackup(string dir, byte[] artifact)
+    {
+        Directory.CreateDirectory(dir);
+        var id = "coffer-"
+            + DateTime.UtcNow.ToString("yyyyMMdd'T'HHmmssfff'Z'", System.Globalization.CultureInfo.InvariantCulture)
+            + "-" + Guid.NewGuid().ToString("N")[..8];
+        File.WriteAllBytes(Path.Combine(dir, id + ".cofferbak"), artifact);
+        return id;
+    }
+
+    // --- restore a backup this install already holds -------------------------
+    //
+    // The artifact Coffer wrote, on Coffer's own disk, sent back over the
+    // internet to reach it. That round trip is not merely wasteful: a 141 MB
+    // .cofferbak exceeds Cloudflare's 100 MB request-body cap, which is not a
+    // setting on Free or Pro — so the documented "raise your proxy's limit"
+    // remedy does not exist for that deployment, and restore was impossible
+    // through the front door.
+
+    [Fact]
+    public async Task Restores_a_stored_backup_by_id_without_an_upload()
+    {
+        BootstrapRestoreStaging.Clear();
+        var fake = new FakeRestarter();
+        var dir = NewBackupDir();
+        await using var factory = new ApiFactory(_fixture)
+            .WithService<IApplicationRestarter>(_ => fake)
+            .WithConfig("Api:Backup:Directory", dir);
+        using var client = factory.CreateClient();
+
+        var id = WriteStoredBackup(dir, MakeArtifact("pw"));
+
+        using var content = new MultipartFormDataContent
+        {
+            { new StringContent(id), "backupId" },
+            { new StringContent("pw"), "passphrase" },
+            { new StringContent(AdminBackupsEndpoints.RestoreConfirmPhrase), "confirm" },
+        };
+        var resp = await client.PostAsync("/api/admin/backups/restore", content);
+
+        Assert.Equal(HttpStatusCode.Accepted, resp.StatusCode);
+        Assert.True(BootstrapRestoreStaging.IsPending());
+        Assert.True(fake.Requested);
+        BootstrapRestoreStaging.Clear();
+    }
+
+    [Fact]
+    public async Task An_unknown_stored_id_is_refused_and_nothing_is_staged()
+    {
+        BootstrapRestoreStaging.Clear();
+        await using var factory = new ApiFactory(_fixture)
+            .WithConfig("Api:Backup:Directory", NewBackupDir());
+        using var client = factory.CreateClient();
+
+        using var content = new MultipartFormDataContent
+        {
+            { new StringContent("no-such-backup"), "backupId" },
+            { new StringContent("pw"), "passphrase" },
+            { new StringContent(AdminBackupsEndpoints.RestoreConfirmPhrase), "confirm" },
+        };
+        var resp = await client.PostAsync("/api/admin/backups/restore", content);
+
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
+        // Resolved through the store, never by building a path from the id — so a
+        // traversal attempt is just an id the store does not own.
+        Assert.False(BootstrapRestoreStaging.IsPending());
+    }
+
+    [Fact]
+    public async Task Naming_both_a_stored_id_and_an_upload_is_refused()
+    {
+        BootstrapRestoreStaging.Clear();
+        var dir = NewBackupDir();
+        await using var factory = new ApiFactory(_fixture)
+            .WithConfig("Api:Backup:Directory", dir);
+        using var client = factory.CreateClient();
+
+        var id = WriteStoredBackup(dir, MakeArtifact("pw"));
+
+        using var content = new MultipartFormDataContent
+        {
+            { new ByteArrayContent(MakeArtifact("pw")), "archive", "dr.cofferbak" },
+            { new StringContent(id), "backupId" },
+            { new StringContent("pw"), "passphrase" },
+            { new StringContent(AdminBackupsEndpoints.RestoreConfirmPhrase), "confirm" },
+        };
+        var resp = await client.PostAsync("/api/admin/backups/restore", content);
+
+        // Which one is being restored would be a guess, and this is the one
+        // operation where guessing is unrecoverable.
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
+        Assert.False(BootstrapRestoreStaging.IsPending());
+    }
+
+    [Fact]
+    public async Task The_kek_preflight_reads_a_stored_backup_in_place()
+    {
+        var dir = NewBackupDir();
+        await using var factory = new ApiFactory(_fixture)
+            .WithConfig("Api:Backup:Directory", dir);
+        using var client = factory.CreateClient();
+
+        // v2 artifact sealed under THIS install's KEK, so the check has something
+        // to compare and must report a match.
+        var master = factory.Services.GetRequiredService<MasterKey>();
+        var id = WriteStoredBackup(dir,
+            MakeArtifact("pw", KekFingerprint.Compute(master.KeyBytes)));
+
+        using var content = new MultipartFormDataContent
+        {
+            { new StringContent(id), "backupId" },
+        };
+        var resp = await client.PostAsync("/api/admin/backups/restore/validate", content);
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        using var doc = await System.Text.Json.JsonDocument.ParseAsync(
+            await resp.Content.ReadAsStreamAsync());
+        Assert.True(doc.RootElement.GetProperty("hasFingerprint").GetBoolean());
+        Assert.True(doc.RootElement.GetProperty("compatible").GetBoolean());
     }
 
     // --- adopt the source install's key (ADR-0092 D4) ------------------------

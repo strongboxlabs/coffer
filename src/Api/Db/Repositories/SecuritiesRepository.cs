@@ -386,9 +386,30 @@ public sealed class SecuritiesRepository
                 High: p.High,
                 Low: p.Low,
                 Volume: p.Volume,
-                Source: p.Source))
+                Source: p.Source,
+                Unbacked: false))
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
+
+        // The unbacked dates in ONE pass, then stamped onto the page. The
+        // per-row predicate rescans the security's legs for every price:
+        // measured at 728ms against 14ms over a 1,229-price history, so a
+        // security with a long history made its own price list slow.
+        if (items.Count > 0)
+        {
+            var unbacked = (await _db.UnbackedPriceDates(ledgerId, securityId)
+                    .AsNoTracking()
+                    .ToListAsync(cancellationToken)
+                    .ConfigureAwait(false))
+                .Select(d => d.PriceDate)
+                .ToHashSet();
+            if (unbacked.Count > 0)
+            {
+                items = items
+                    .Select(i => unbacked.Contains(i.AsOf) ? i with { Unbacked = true } : i)
+                    .ToList();
+            }
+        }
 
         string? nextCursor = null;
         if (items.Count > pageSize)

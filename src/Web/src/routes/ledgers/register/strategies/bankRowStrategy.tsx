@@ -112,107 +112,15 @@ function renderTxnBody(txn: BankRow, ctx: RegisterRowBodyCtx): ReactNode {
     );
 }
 
-/**
- * One entry per DISTINCT counterparty across a split group, in first-seen
- * order, with amounts summed and legs counted.
- *
- * Deduplication is not cosmetic. An ADR-0036 target cluster's legs frequently
- * share ONE counterparty, so a naive per-leg list prints the same category
- * three times; and a paycheck's Medicare Tax can appear twice (regular plus
- * surtax), which a reader expects to see added up, not listed twice.
- *
- * Amounts come from the LEGS and never from the parent row: a split parent's
- * `amount` is the group's NET, so pairing it with any one category would
- * attribute a whole paycheck to it.
- */
-interface SplitCategoryEntry {
-    id: string | null | undefined;
-    label: string | null | undefined;
-    name: string | null | undefined;
-    type: string | null | undefined;
-    sum: number;
-    legCount: number;
-}
-
-function summarizeSplitCategories(
-    legs: readonly BankRow[],
-    accountPaths?: ReadonlyMap<string, string>,
-): readonly SplitCategoryEntry[] {
-    const byId = new Map<string, SplitCategoryEntry>();
-    for (const leg of legs) {
-        // Key on the id when there is one; fall back to the name so two
-        // uncategorised legs do not merge into one misleading entry.
-        const key = leg.counterpartyAccountId ?? `name:${leg.counterpartyAccountName ?? ''}`;
-        const found = byId.get(key);
-        if (found !== undefined) {
-            found.sum += leg.amount;
-            found.legCount += 1;
-            continue;
-        }
-        byId.set(key, {
-            id: leg.counterpartyAccountId,
-            name: leg.counterpartyAccountName,
-            type: leg.counterpartyAccountType,
-            label: displayAccountPath(
-                accountPaths, leg.counterpartyAccountId, leg.counterpartyAccountName,
-            ),
-            sum: leg.amount,
-            legCount: 1,
-        });
-    }
-    return [...byId.values()];
-}
-
-/**
- * Which category stands for the whole split in one line.
- *
- * The ACTIVE FILTER WINS, because the row is on screen BECAUSE of it: the
- * server filters at entry level, so filtering by Insurance/Health returns the
- * paycheck, and the one thing the collapsed row has to answer is "which leg
- * matched, and for how much".
- *
- * Failing that, the largest entry by ABSOLUTE summed amount. On both real
- * shapes in this repo — a paycheck (gross pay against a dozen deductions) and
- * a two-way grocery split — one entry carries most of the group, and it is the
- * one a human would name the transaction after. "Most common category" is a
- * coin flip on both (a paycheck's deductions are all distinct; a two-way split
- * ties), and "sign matches the net" discriminates nothing on an all-negative
- * split.
- */
-function leadSplitCategory(
-    entries: readonly SplitCategoryEntry[],
-    filterCategoryId?: string | null,
-): { entry: SplitCategoryEntry; matchedFilter: boolean } | null {
-    if (entries.length === 0) return null;
-    if (filterCategoryId != null) {
-        const hit = entries.find((e) => e.id != null && e.id === filterCategoryId);
-        if (hit !== undefined) return { entry: hit, matchedFilter: true };
-    }
-    let best = entries[0]!;
-    for (const e of entries) {
-        // Strictly greater, so a tie keeps the first-seen (leg order) entry.
-        if (Math.abs(e.sum) > Math.abs(best.sum)) best = e;
-    }
-    return { entry: best, matchedFilter: false };
-}
-
 function renderSplitParentBody(row: BankRow, ctx: RegisterRowBodyCtx<BankRow>): ReactNode {
     // The page synthesizes the representative parent row as the canonical
     // leg with the group's amount + balance-after-last-leg, so the cells
     // read off `row` directly (same fields the former SplitParentRowCells
     // computed from canonical / groupAmount / groupBalanceAfter).
-    const { currency, today, expand, accountPaths, legs, filterCategoryId } = ctx;
+    const { currency, today, expand } = ctx;
     const status = resolveRowStatus(row, today);
     const scheduled = status === 'scheduled';
     const taxDateLabel = taxDateSubLabel(row);
-    // The collapsed row used to show NO category anywhere — the expand toggle
-    // occupied the whole cell. That is worst immediately after a category
-    // filter, which matches per LEG on the server and hands back a group whose
-    // row then names neither the matching leg nor its amount.
-    const lead = leadSplitCategory(
-        summarizeSplitCategories(legs ?? [], accountPaths),
-        filterCategoryId,
-    );
     return (
         <>
             <span role="cell" className="font-mono tabular-nums">
@@ -253,41 +161,30 @@ function renderSplitParentBody(row: BankRow, ctx: RegisterRowBodyCtx<BankRow>): 
                     </span>
                 ) : null}
             </span>
-            {/* Combined category · tags column. The split parent leads with
-                the category that stands for the group — at the cell's LEFT
-                edge, exactly where a flat row's chip sits, so the column reads
-                straight down rather than alternating between two shapes — and
-                pins the expand toggle to the right. Tags belong to the header
-                so they wrap beneath. */}
+            {/* Combined category · tags column, holding the expand toggle.
+                Tags belong to the header so they wrap beneath.
+
+                NO LEAD CATEGORY HERE, deliberately. #547 put one at the cell's
+                left edge — the category that "stands for the group", the
+                filter-matched leg or else the largest by absolute summed
+                amount. Removed 2026-09-25.
+
+                It was never requested; it came out of an adversarial review,
+                and it read as misleading precisely because of the property it
+                was designed for. Sitting at the same left edge as a flat row's
+                chip, it makes the column read straight down — which means it
+                makes a heuristic PICK look like the definite category a flat
+                row states. A split has N categories; naming one of them there
+                asserts something untrue. The tie-break compounded it: largest
+                absolute sum, chosen over two alternatives on the evidence of
+                two shapes in this repo.
+
+                If a collapsed split should ever answer "which leg matched the
+                active filter, and for how much", that is a different and
+                narrower feature — and the only half of this one that answered
+                a question the user had actually asked. */}
             <span role="cell" className="min-w-0 space-y-1">
                 <span className="flex min-w-0 items-center gap-1">
-                    {lead !== null ? (
-                        <Chip
-                            variant={categoryChipVariant(
-                                lead.entry.name ?? null, lead.entry.type ?? null, lead.entry.id ?? null,
-                            )}
-                            className="min-w-0 max-w-full truncate"
-                            title={
-                                lead.matchedFilter
-                                    ? `${lead.entry.label} — matches the active category filter`
-                                    : lead.entry.label ?? undefined
-                            }
-                        >
-                            <span className="truncate">{lead.entry.label}</span>
-                        </Chip>
-                    ) : (
-                        <span className="text-text-subtle">—</span>
-                    )}
-                    {/* The matched leg's own summed amount, shown ONLY when the
-                        filter picked this category. Unfiltered it would be
-                        noise — and worse, a second figure on a row whose
-                        Amount column already shows the group's net, inviting
-                        the reader to subtract one from the other. */}
-                    {lead?.matchedFilter === true ? (
-                        <span className="shrink-0 font-mono text-[0.625rem] tabular-nums text-text-muted">
-                            {formatSignedAmount(lead.entry.sum, currency)}
-                        </span>
-                    ) : null}
                     <button
                         type="button"
                         aria-expanded={expand?.expanded ?? false}

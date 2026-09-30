@@ -564,6 +564,7 @@ const PRICE_SOURCE_LABELS: Record<string, string> = {
     fetch: 'Market data',
     manual: 'Manual',
     import: 'Imported',
+    trade: 'From a trade',
 };
 function priceSourceLabel(source: string): string {
     return PRICE_SOURCE_LABELS[source] ?? source;
@@ -646,7 +647,27 @@ function PricesTable({
                                 {p.volume !== null ? formatInteger(p.volume) : '—'}
                             </td>
                             <td className="px-4 py-2 text-left text-[0.6875rem] text-text-muted">
-                                {priceSourceLabel(p.source)}
+                                {/* Struck through, and ONLY the source word — a
+                                    struck-through row reads as deleted, and this
+                                    row is not. What is no longer true is the
+                                    claim the word makes: that a trade produced
+                                    this price. The title carries the rest,
+                                    because a strikethrough alone is a rebus. */}
+                                {p.unbacked ? (
+                                    <span
+                                        className="line-through decoration-state-warning decoration-2"
+                                        title={
+                                            'No transaction currently produces this price — '
+                                            + 'the trade behind it was deleted or edited. '
+                                            + 'It may still be correct. Edit it to keep it '
+                                            + 'as a price you set, or delete it.'
+                                        }
+                                    >
+                                        {priceSourceLabel(p.source)}
+                                    </span>
+                                ) : (
+                                    priceSourceLabel(p.source)
+                                )}
                             </td>
                             <td className="px-4 py-2 text-right text-[0.6875rem] text-text-subtle">
                                 edit →

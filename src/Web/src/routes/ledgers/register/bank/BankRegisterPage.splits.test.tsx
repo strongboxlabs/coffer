@@ -210,30 +210,30 @@ describe('a collapsed split row answers the selection modifier', () => {
 });
 
 describe('a collapsed split row says what it is', () => {
-    it('names the category that carries the group, not just a count', async () => {
-        // The defect this closes: the expand toggle occupied the whole
-        // category cell, so a collapsed split showed NO category anywhere —
-        // worst right after a category filter, which matches per LEG on the
-        // server and hands back the whole group.
-        await openRegister();
-        expect(screen.getByText('Salary')).toBeInTheDocument();
-    });
+    it('names NO single category, because a split does not have one', async () => {
+        // #547 led this row with "the category that stands for the group" —
+        // the filter-matched leg, else the largest by absolute summed amount.
+        // Removed 2026-09-25: it was never requested, and it read as a claim
+        // rather than a summary. The chip sat at the same left edge as a flat
+        // row's category chip, which is what made the column read straight
+        // down — and what made a heuristic pick look like the definite answer
+        // a flat row gives. This paycheck has three categories; naming one of
+        // them there says something untrue.
+        //
+        // Asserting the ABSENCE of all three, not just one, so a partial
+        // reinstatement fails too.
+        const btn = await openRegister();
+        const parentRow = btn.closest('[role="row"]') as HTMLElement;
 
-    it('picks the largest leg by absolute amount, not the first one', async () => {
-        // Gross pay is leg 0 here, so assert the rule rather than the
-        // coincidence: reorder the legs and the answer must not change.
-        await openRegister([{
-            kind: 'group', txn: null, groupId: GROUP_ID,
-            legs: [PAYCHECK_LEGS[1]!, PAYCHECK_LEGS[2]!, PAYCHECK_LEGS[0]!],
-        }]);
-        expect(screen.getByText('Salary')).toBeInTheDocument();
-        expect(screen.queryByText('Federal Income Tax')).toBeNull();
+        expect(parentRow).not.toHaveTextContent('Salary');
+        expect(parentRow).not.toHaveTextContent('Federal Income Tax');
+        expect(parentRow).not.toHaveTextContent('Medical Insurance');
     });
 
     it('keeps the leg count in the toggle, where a screen reader still reads it', async () => {
-        // The count must stay in TEXT. Moving it to an aria-label would make
-        // it the button's whole accessible name and hide the category chip
-        // beside it — the opposite of the fix.
+        // The count must stay in TEXT, not an aria-label: it is the only
+        // thing the collapsed row says about its contents, so a screen
+        // reader has to reach it as content rather than as a button name.
         expect(await openRegister()).toHaveTextContent('3 splits');
     });
 
@@ -297,6 +297,74 @@ describe('the keyboard route into a split', () => {
 
         await waitFor(() => expect(btn).toHaveAttribute('aria-expanded', 'true'));
         expect(screen.queryByLabelText('Posting 1 amount')).toBeNull();
+    });
+});
+
+describe('ArrowRight / ArrowLeft on a split parent', () => {
+    it('expands on ArrowRight and collapses on ArrowLeft', async () => {
+        // These are the conventional treegrid disclosure keys and were unbound
+        // everywhere in the SPA. #547 gave the split parent Enter-to-edit but
+        // left expansion reachable from the keyboard only by Tabbing to the
+        // toggle — which works, and is not what a keyboard user reaches for.
+        const user = userEvent.setup();
+        const btn = await openRegister();
+
+        // Focus the ROW, not the toggle — the toggle is deliberately excluded
+        // (see the BUTTON test below).
+        await user.click(btn.closest('[role="row"]')!);
+
+        await user.keyboard('{ArrowRight}');
+        await waitFor(() => expect(btn).toHaveAttribute('aria-expanded', 'true'));
+        // Anchored on leg-only data, so its presence is meaningful rather than
+        // a pending frame that happens to be empty.
+        expect(screen.getByText('Federal Tax')).toBeInTheDocument();
+
+        await user.keyboard('{ArrowLeft}');
+        await waitFor(() => expect(btn).toHaveAttribute('aria-expanded', 'false'));
+        expect(screen.queryByText('Federal Tax')).toBeNull();
+    });
+
+    it('is a no-op when the row is already in the asked-for state', async () => {
+        // ArrowLeft on a collapsed row must NOT preventDefault — the key stays
+        // the browser's. Asserting the state is unchanged and, more to the
+        // point, that nothing else fired.
+        const user = userEvent.setup();
+        const btn = await openRegister();
+        await user.click(btn.closest('[role="row"]')!);
+
+        await user.keyboard('{ArrowLeft}');
+
+        expect(btn).toHaveAttribute('aria-expanded', 'false');
+        expect(screen.queryByText('Federal Tax')).toBeNull();
+        expect(screen.queryByLabelText('Posting 1 amount')).toBeNull();
+    });
+
+    it('yields to a focused toggle rather than acting from the row as well', async () => {
+        // Same guard as the Enter branch. A row carries buttons, and arrows are
+        // how a focused control moves between its own options, so the row
+        // handler must not also fire.
+        //
+        // The visible consequence is that the arrows are dead while focus sits
+        // ON the toggle — accepted, because the toggle answers Enter and Space
+        // there, and the alternative is a row handler racing whatever control
+        // has focus.
+        const user = userEvent.setup();
+        const btn = await openRegister();
+
+        // BOTH steps matter. Clicking the row first sets the hook's focused-row
+        // id; only then does moving DOM focus to the toggle isolate the BUTTON
+        // guard as the thing under test.
+        //
+        // Without the click this test passed with the guard deleted, because
+        // the handler bailed on a null focused row instead — green for a reason
+        // that had nothing to do with what it claimed to check.
+        await user.click(btn.closest('[role="row"]')!);
+        btn.focus();
+
+        await user.keyboard('{ArrowRight}');
+
+        expect(btn).toHaveAttribute('aria-expanded', 'false');
+        expect(screen.queryByText('Federal Tax')).toBeNull();
     });
 });
 

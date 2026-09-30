@@ -1,3 +1,4 @@
+import { formatBytes } from '@/lib/format';
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
@@ -249,18 +250,34 @@ function SnapshotRow({
                         <p className="text-xs text-text-subtle">
                             {formatBytes(snapshot.contentSizeUncompressed)} · schema {snapshot.schemaVersion}
                         </p>
+                        {!snapshot.restorable ? (
+                            <p className="text-xs text-text-muted">
+                                Retired by an app upgrade — it can no longer be
+                                restored. Delete is still available.
+                            </p>
+                        ) : null}
                     </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
-                    <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        onClick={onRestore}
-                        disabled={disabled}
-                    >
-                        Restore
-                    </Button>
+                    {/* Restore is OMITTED, not disabled, when the schema has moved
+                        on. A disabled control still advertises an action, and the
+                        row already says why in words; a greyed button would just
+                        invite hovering it to find out. The panel used to offer
+                        Restore on every row and let the server refuse AFTER the
+                        confirm — so a pre-upgrade snapshot, taken precisely
+                        because an upgrade is risky, announced its uselessness at
+                        the moment it was needed. */}
+                    {snapshot.restorable ? (
+                        <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={onRestore}
+                            disabled={disabled}
+                        >
+                            Restore
+                        </Button>
+                    ) : null}
                     <Button
                         type="button"
                         variant="ghost"
@@ -310,8 +327,3 @@ function formatDateTime(iso: string): string {
     }).format(d);
 }
 
-function formatBytes(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}

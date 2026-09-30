@@ -1,16 +1,16 @@
 # 0063 — MCP server (AI report-building over Coffer data)
 
 * Status: Accepted (v1 = v0.5.0, built + validated end-to-end with Claude Desktop);
-  v2 shipped (v0.6.0 — see "## v2 slice" below) EXCEPT time-weighted return, which
-  is unconditionally `null` pending a historical-valuation feed (IRR is the live
-  figure; see the `returns` note below — tracked as Track-2 "historical valuations"
-  in follow-ups.md). v0.7.0 (ADR-0065/0066/0067) added
+  v2 shipped (v0.6.0 — see "## v2 slice" below). Time-weighted return was
+  unconditionally `null` here pending a historical-valuation feed; that feed has
+  since landed, and `ReturnsCalculator.Twr` computes it over the window it can
+  cover, reporting `TimeWeightedUnavailableReason` plus the covered range when it
+  cannot. v0.7.0 (ADR-0065/0066/0067) added
   `find_in_kind_transfer_candidates`, allocation `dimension` + look-through, and
   tax_status / classification fields on the list tools. A later read-surface pass
   added fail-loud enum params (an unknown value errors with the valid list instead
   of silently defaulting), `list_upcoming_reminders`, `list_tags`, and a tag filter
-  on `list_transactions` / `transaction_summary` (see follow-ups.md "MCP hardening
-  + capabilities").
+  on `list_transactions` / `transaction_summary`.
 * Date: 2026-06-25 (v1); 2026-06-26 (v2 slice)
 * Related: ADR-0013 (WebAuthn auth — reused for OAuth login/consent), ADR-0020
   (RLS / `app.user_id` — the real authorization boundary), ADR-0027/0029

@@ -205,7 +205,8 @@ Removal happens **one trigger per slice**, each with:
 4. **Commit message documents the API surface that now owns the
    invariant.**
 
-Removal order (tracked in the open-work backlog):
+Removal order — all five shipped, so the list below is the record; the backlog
+entry that tracked it was resolved and deleted:
 
 1. ~~`trg_validate_posting_role`~~ — done in migration 084.
 2. ~~`trg_validate_posting_cardinality_insert` / `_update`~~ — done in migration 085.

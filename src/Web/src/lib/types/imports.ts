@@ -1,12 +1,12 @@
 // Mirror of API `Coffer.Api.Contracts.UndoImportResult` (mig 221).
 
 export interface UndoImportResult {
-    /** Transactions still carrying this import's stamp. */
+    /** Transactions still carrying this import's stamp.
+     *
+     *  There is deliberately no `edited` count beside it any more. Undo is
+     *  offered in a modal right after the import that created these rows, so
+     *  nobody has edited them yet — see `UndoImportResult` on the API side. */
     found: number;
-    /** How many of them have been edited since. Reported so a confirm can say
-     *  so — never a reason to refuse, because whose edits they are is the
-     *  user's call. */
-    edited: number;
     /** Rows removed outright. An undo does NOT hide: a hidden row keeps its
      *  `external_id`, and the import dedup matches on that and never on
      *  `is_hidden`, so hiding would make the same file un-importable — the

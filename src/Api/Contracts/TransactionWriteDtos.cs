@@ -675,21 +675,25 @@ public sealed record MergeCandidatePostingDto(
 /// Outcome of undoing one import (mig 221).
 /// </summary>
 /// <param name="Found">Transactions still carrying this import's stamp.</param>
-/// <param name="Edited">
-/// How many of them the user has since edited (they have a
-/// <c>txn_header_originals</c> row — migration 230). Reported so a confirm dialog
-/// can say so; never a reason to refuse, because whose edits they are is the
-/// user's call.
 ///
-/// <para>The signal got STRICTLY better at 230 without changing its intent. It
-/// used to be "has an override row", which missed every investment edit (that
-/// path wrote the canonical row and created no override) — under-reporting
-/// exactly the work an undo would destroy. Both paths now capture an original,
-/// so both count. The one false positive survives: a merge stamps the winner's
-/// date, which captures an original, so a merged-into row reads as edited even
-/// if no field was typed. That errs toward warning, which is the right
-/// direction for a confirm dialog.</para>
-/// </param>
+/// <remarks>
+/// NO "Edited" COUNT, deliberately. This used to carry one — how many of the
+/// found rows had a <c>txn_header_originals</c> row — so the confirm dialog
+/// could say "N of them have been edited". Removed 2026-09-25.
+///
+/// <para>Undo is offered in a modal immediately after the import that created
+/// the rows. Nobody has edited them yet, so the warning answered a question
+/// nobody was in a position to have: it was reliably zero, and the one thing
+/// that made it non-zero was a merge stamping the winner's date. Wipe the
+/// import out; that is what undo is for.</para>
+///
+/// <para>It also made <c>txn_header_originals</c> mean two things at once —
+/// "the feed's value before the user changed it", which is its ADR-0100
+/// purpose, and "the user edited this in Coffer", which is what the count read
+/// it as. Those diverge the moment an importer seeds originals it already has
+/// (Moneydance keeps the bank's string beside the user's cleaned one), and the
+/// count would then report every imported row as edited.</para>
+/// </remarks>
 /// <param name="Deleted">
 /// Rows removed outright. An undo does NOT hide: a hidden row keeps its
 /// <c>external_id</c>, the import dedup matches on that and never on <c>is_hidden</c>,
@@ -704,6 +708,5 @@ public sealed record MergeCandidatePostingDto(
 /// </param>
 public sealed record UndoImportResult(
     int Found,
-    int Edited,
     int Deleted,
     bool TooLarge);

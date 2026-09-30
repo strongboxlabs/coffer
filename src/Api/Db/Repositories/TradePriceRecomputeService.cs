@@ -24,29 +24,32 @@ public sealed class TradePriceRecomputeService
     public TradePriceRecomputeService(AppDbContext db) => _db = db;
 
     /// <summary>
-    /// Upsert a <c>trade</c>-source price for every distinct (ledger, security,
-    /// day) in <paramref name="trades"/>. Dedupes to one call per key, keeping
-    /// the LAST price in enumeration order for a repeated key. Empty input is a
-    /// no-op.
+    /// Re-derive and write the <c>trade</c>-source price for every distinct
+    /// (ledger, security, day) touched. Empty input is a no-op.
     /// </summary>
-    public async Task UpsertAsync(
-        IEnumerable<(Guid LedgerId, Guid SecurityId, DateOnly Day, decimal Price)> trades,
+    /// <remarks>
+    /// Callers name the DAY, never a price. Migration 234's
+    /// <c>fn_trade_price_reseed</c> decides what that day's price is, by the one
+    /// rule the consistency check also reads.
+    /// <para>
+    /// This used to take the price of whatever leg the save touched and write it
+    /// straight through. That meant correcting one leg seeded its price even when
+    /// a later leg on the same day was the one the rule names — so the writer and
+    /// the checker ran different rules, and the check reported the difference as
+    /// drift on a ledger that was fine. Passing keys instead of prices makes that
+    /// class of disagreement unrepresentable.
+    /// </para>
+    /// </remarks>
+    public async Task ReseedAsync(
+        IEnumerable<(Guid LedgerId, Guid SecurityId, DateOnly Day)> days,
         CancellationToken cancellationToken = default)
     {
-        // Dedupe per (ledger, security, day); last write wins. A multi-leg event
-        // on one (security, day) — or two trades of the same security the same
-        // day in one SaveChanges — collapses to a single upsert.
-        var deduped = new Dictionary<(Guid, Guid, DateOnly), decimal>();
-        foreach (var (ledgerId, securityId, day, price) in trades)
-            deduped[(ledgerId, securityId, day)] = price;
-
-        foreach (var ((ledgerId, securityId, day), price) in deduped)
+        // One call per distinct key; a multi-leg event on one (security, day)
+        // collapses to a single re-derivation.
+        foreach (var (ledgerId, securityId, day) in days.Distinct())
         {
-            // EF's HasDbFunction binding requires us to materialise the result;
-            // the row is discarded — the side effect on security_prices is the
-            // point.
-            _ = await _db.SecurityPriceUpsertFromTrade(ledgerId, securityId, day, price)
-                .Select(r => r.SecurityId)
+            _ = await _db.TradePriceReseed(ledgerId, securityId, day)
+                .Select(r => r.Price)
                 .FirstAsync(cancellationToken)
                 .ConfigureAwait(false);
         }

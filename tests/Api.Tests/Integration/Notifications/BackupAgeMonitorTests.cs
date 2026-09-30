@@ -56,7 +56,7 @@ public sealed class BackupAgeMonitorTests : IDisposable
     }
 
     private BackupAgeMonitor Monitor() => new(
-        new BackupStore(_dir, NullLogger<BackupStore>.Instance),
+        new BackupStore(_dir, NullLogger<BackupStore>.Instance, 1024 * 1024),
         new NotificationPublisher(
             _fixture.NewServiceFactory(),
             _fixture.NewLedgerKeyService(),

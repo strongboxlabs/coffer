@@ -31,8 +31,9 @@ import type { SetupInfoResponse } from '@/lib/auth';
 
 const TEST_TOKEN = 'test-bootstrap-token';
 
-// /info carries no payload since ADR-0088; it exists to validate the token.
-const DEFAULT_INFO: SetupInfoResponse = {};
+// /info validates the token and carries the restore part size (ADR-0101) —
+// the one deployment value this pre-auth page cannot read anywhere else.
+const DEFAULT_INFO: SetupInfoResponse = { restorePartSizeBytes: 49 * 1024 * 1024 };
 
 function renderSetupRaw() {
     const queryClient = new QueryClient({

@@ -8,11 +8,20 @@ namespace Coffer.Api.Contracts;
 /// <param name="AccountId">Set where the projection is per-account.</param>
 /// <param name="SecurityId">Set where it is per-(account, security).</param>
 /// <param name="HeaderId">Set where it is per-header.</param>
+/// <param name="PriceDate">Set where it is per-(security, day).</param>
+/// <param name="Reason">What KIND of finding this is, where a projection has
+/// more than one. Null where it has only one. Carried as data rather than left
+/// for a reader to infer from <paramref name="Field"/>: the UI has to present
+/// an unrepairable finding differently from a repairable one, and sniffing
+/// prose for that is a bug waiting on a reworded label.</param>
 /// <remarks>
 /// The ids are carried separately from <paramref name="Scope"/> so a repair can
 /// target exactly what was reported. The first version had only the display
 /// string, and the posting-count repair parsed a Guid back out of
 /// <c>"header {guid}"</c> — which works right up until someone rewords the label.
+/// <paramref name="PriceDate"/> is here for the same reason: the trade-price
+/// repair needs the day, and the day was otherwise only legible inside
+/// <paramref name="Scope"/>.
 /// </remarks>
 public sealed record ConsistencyMismatch(
     string Scope,
@@ -21,7 +30,9 @@ public sealed record ConsistencyMismatch(
     decimal Expected,
     Guid? AccountId = null,
     Guid? SecurityId = null,
-    Guid? HeaderId = null)
+    Guid? HeaderId = null,
+    DateOnly? PriceDate = null,
+    string? Reason = null)
 {
     public decimal Diff => Expected - Stored;
 }
@@ -40,8 +51,16 @@ public static class ConsistencyProjections
     public const string RealizedGains = "realized_gains";
     public const string PostingCounts = "posting_counts";
 
+    /// <summary>
+    /// Trade-derived <c>security_prices</c> (migration 232). Maintained by
+    /// <c>TradePriceFromLegInterceptor</c> like the other four — what was
+    /// singular about it is that it was the one derived figure this report did
+    /// not examine, while feeding valuation, allocation and returns.
+    /// </summary>
+    public const string TradePrices = "trade_prices";
+
     public static readonly IReadOnlyList<string> All =
-        [Balances, Holdings, RealizedGains, PostingCounts];
+        [Balances, Holdings, RealizedGains, PostingCounts, TradePrices];
 
     public static bool IsKnown(string projection) => All.Contains(projection);
 }
@@ -70,13 +89,44 @@ public sealed record ProjectionConsistency(
 /// whim, and repairing is a separate deliberate act.
 /// </para>
 /// <para>
-/// <b>Not covered:</b> trade-derived <c>security_prices</c>. A trade leg seeds a
-/// price row, but the per-day source-priority rule means a MISSING row is
-/// legitimate whenever a manual or fetched price already owns that day — so a
-/// naive check reports drift that is not there. Left out deliberately rather
-/// than shipped wrong.
+/// <b>Trade-derived <c>security_prices</c> is now covered</b> (migration 232),
+/// the way this note said it would have to be. It was left out because a naive
+/// row-presence check reports drift that is not there: the per-day
+/// source-priority rule makes a MISSING trade price legitimate whenever a
+/// <c>fetch</c> close or a <c>manual</c> gap-fill already owns that day. The
+/// check asks what the rule IMPLIES instead — last trade of the day by
+/// <c>h.seq</c>, comparable only against import/simplefin/trade rows — and it
+/// lives in SQL beside the writer it checks, so the two cannot drift apart.
 /// </para>
 /// </remarks>
 public sealed record LedgerConsistencyReport(
     bool Healthy,
-    IReadOnlyList<ProjectionConsistency> Projections);
+    IReadOnlyList<ProjectionConsistency> Projections,
+    IReadOnlyList<UnbackedPriceAdvisory> UnbackedPrices);
+
+/// <summary>
+/// One security holding prices that claim a trade produced them while no trade
+/// currently does. ADVISORY — deliberately not a projection and not counted in
+/// <see cref="LedgerConsistencyReport.Healthy"/>.
+/// </summary>
+/// <remarks>
+/// <c>security_prices</c> records THAT a trade wrote a row and never WHICH one,
+/// so this can only be inferred by re-deriving and finding nothing — which
+/// cannot tell a deleted trade (ADR-0084 D4 keeps its price on purpose) from a
+/// rule change from an edit. Reporting all three as defects marked a sound
+/// ledger broken: 130 rows on one install, none of them repairable.
+/// <para>
+/// Grouped per security because that is the unit someone acts on, and ordered
+/// by what the holding is worth now, so what still carries money comes first.
+/// </para>
+/// </remarks>
+/// <param name="Count">How many of this security's prices are unbacked.</param>
+/// <param name="HoldingValue">Quantity held now at the latest price; 0 for a
+/// position since sold, which sorts it last without hiding it.</param>
+public sealed record UnbackedPriceAdvisory(
+    Guid SecurityId,
+    string Security,
+    int Count,
+    DateOnly Earliest,
+    DateOnly Latest,
+    decimal HoldingValue);

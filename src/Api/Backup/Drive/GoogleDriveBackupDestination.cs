@@ -1,3 +1,6 @@
+using System.Globalization;
+using System.Text.RegularExpressions;
+
 using Microsoft.Extensions.Logging;
 
 using Coffer.Api.Crypto;
@@ -12,7 +15,7 @@ namespace Coffer.Api.Backup.Drive;
 /// <see cref="DriveSyncRepository"/> + opens it with the master KEK; the
 /// connection lifecycle (connect / disconnect) stays in <see cref="DriveSyncService"/>.
 /// </summary>
-public sealed class GoogleDriveBackupDestination : IBackupDestination
+public sealed partial class GoogleDriveBackupDestination : IBackupDestination
 {
     private readonly DriveSyncRepository _repo;
     private readonly LedgerKeyService _keys;
@@ -41,10 +44,49 @@ public sealed class GoogleDriveBackupDestination : IBackupDestination
 
     public string Name => "google-drive";
 
-    private static string StripExtension(string remoteName) =>
-        remoteName.EndsWith(RemoteExtension, StringComparison.Ordinal)
-            ? remoteName[..^RemoteExtension.Length]
-            : remoteName;
+    /// <summary>
+    /// The bare artifact id a Drive file belongs to — the key dedup and
+    /// retention work in. Handles both shapes a backup is stored in:
+    /// <c>{id}.cofferbak</c> and one part of a set,
+    /// <c>{id}.cofferbak.002-of-003</c> (ADR-0101).
+    /// </summary>
+    private static string StripExtension(string remoteName)
+    {
+        var name = remoteName;
+        var ext = name.LastIndexOf(RemoteExtension, StringComparison.Ordinal);
+        // A part suffix follows the extension rather than replacing it, so the
+        // id is everything before the LAST ".cofferbak" — and a name that has
+        // none (a stray, a legacy *.ledgrbak) is returned whole, which is what
+        // makes the mirror sweep it.
+        return ext >= 0 ? name[..ext] : name;
+    }
+
+    /// <summary>
+    /// The part number and the set size a Drive file declares, or
+    /// <c>(null, 0)</c> when it is a whole artifact. Parses the
+    /// <c>.002-of-003</c> tail written by <see cref="BackupStore.PartName"/>.
+    /// </summary>
+    /// <remarks>
+    /// The COUNT is read here rather than recomputed because it is the only
+    /// record of how the set was cut. The part size is configurable, so a set
+    /// written under one value must still read as complete under another.
+    /// </remarks>
+    private static (int? Part, int Declared) PartOf(string remoteName)
+    {
+        var ext = remoteName.LastIndexOf(RemoteExtension, StringComparison.Ordinal);
+        if (ext < 0) return (null, 0);
+        var tail = remoteName[(ext + RemoteExtension.Length)..];
+        if (tail.Length == 0) return (null, 0);
+        // ".002-of-003"
+        var m = PartSuffix().Match(tail);
+        return m.Success
+            ? (int.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture),
+               int.Parse(m.Groups[2].Value, CultureInfo.InvariantCulture))
+            : (null, 0);
+    }
+
+    [GeneratedRegex(@"^\.(\d{3})-of-(\d{3})$")]
+    private static partial Regex PartSuffix();
 
     public async Task<bool> IsEnabledAsync(CancellationToken ct = default)
     {
@@ -118,40 +160,110 @@ public sealed class GoogleDriveBackupDestination : IBackupDestination
         return (creds, conn.FolderId);
     }
 
-    private async Task PushOneAsync(
-        DriveCredentials creds, string folderId, BackupFileInfo info, CancellationToken ct)
+    /// <summary>
+    /// Upload the parts of one artifact that Drive does not already have.
+    /// </summary>
+    /// <remarks>
+    /// A backup over <see cref="BackupStore.PartSizeBytes"/> goes up as several
+    /// files (ADR-0101) rather than one, for the reason the user asked for:
+    /// one interrupted 141 MB upload restarts from zero, where one interrupted
+    /// part of three costs a third. It also means the copy sitting in Drive is
+    /// already in the shape a restore through a body-capped proxy can accept.
+    /// <para>Only MISSING parts are sent, so a run that died halfway resumes
+    /// instead of re-uploading what landed.</para>
+    /// </remarks>
+    private async Task<bool> PushOneAsync(
+        DriveCredentials creds, string folderId, BackupFileInfo info,
+        IReadOnlySet<int> alreadyThere, CancellationToken ct)
     {
-        await using var content = _store.OpenRead(info.Id)
-            ?? throw new DriveOAuthException($"Backup {info.Id} vanished before upload.");
-        // Upload as {id}.cofferbak so the Drive file is recognizable + downloads
-        // with the right extension; dedup + retention strip it back to the id.
-        await _drive.UploadAsync(creds, folderId, info.Id + RemoteExtension, content, ct).ConfigureAwait(false);
+        var count = _store.PartCountFor(info.SizeBytes);
+        var sent = false;
+        for (var part = 1; part <= count; part++)
+        {
+            if (alreadyThere.Contains(part)) continue;
+
+            await using var content = count == 1
+                ? _store.OpenRead(info.Id)
+                : _store.OpenReadPart(info.Id, part);
+            if (content is null)
+                throw new DriveOAuthException($"Backup {info.Id} vanished before upload.");
+
+            // Named {id}.cofferbak for a whole artifact, {id}.cofferbak.002-of-003
+            // for a part; dedup + retention strip either back to the id.
+            await _drive.UploadAsync(
+                creds, folderId, BackupStore.PartName(info.Id, part, count), content, ct)
+                .ConfigureAwait(false);
+            sent = true;
+        }
+        return sent;
     }
 
     /// <summary>Make the Drive folder MIRROR the local backup set (ADR-0074): upload
-    /// every local backup missing from Drive, then delete every remote file whose
+    /// every local backup Drive is missing, then delete every remote file whose
     /// bare id isn't a current local backup. Matching strips a trailing
-    /// <c>.cofferbak</c> but compares the whole remaining name, so a legacy
-    /// <c>*.ledgrbak</c> (or any stray upload) never matches a local id and is
-    /// swept. Local retention (<see cref="BackupStore"/>) is the single source of
-    /// truth for what to keep; Drive just reflects it — there is no separate Drive
-    /// retention, and a pin is preserved simply by being a local backup.
+    /// <c>.cofferbak</c> and any <c>.002-of-003</c> part tail but compares the
+    /// whole remaining name, so a legacy <c>*.ledgrbak</c> (or any stray upload)
+    /// never matches a local id and is swept. Local retention
+    /// (<see cref="BackupStore"/>) is the single source of truth for what to
+    /// keep; Drive just reflects it — there is no separate Drive retention, and
+    /// a pin is preserved simply by being a local backup.
+    /// <para>A backup over <see cref="BackupStore.PartSizeBytes"/> is several
+    /// Drive files (ADR-0101) that count as ONE backup: present means every part
+    /// is present, and a set missing parts is completed rather than restarted.
+    /// An artifact uploaded whole before parts existed stays whole — it is
+    /// present, so nothing re-uploads gigabytes to change its shape.</para>
     /// <para>SAFETY: the delete side is skipped when there are zero local backups,
     /// so a wiped or unmounted backups directory can never nuke the cloud copies.</para>
-    /// Returns the number of artifacts uploaded.</summary>
+    /// Returns the number of artifacts uploaded (an artifact completed from
+    /// partial parts counts once, not once per part).</summary>
     private async Task<int> MirrorAsync(DriveCredentials creds, string folderId, CancellationToken ct)
     {
         var local = _store.List();
         var localIds = local.Select(b => b.Id).ToHashSet(StringComparer.Ordinal);
         var remote = await _drive.ListAsync(creds, folderId, ct).ConfigureAwait(false);
-        var remoteIds = remote.Select(a => StripExtension(a.Name)).ToHashSet(StringComparer.Ordinal);
 
-        // Upload local backups the folder is missing (match by bare id).
-        var uploaded = 0;
-        foreach (var b in local.Where(b => !remoteIds.Contains(b.Id)))
+        // Group the folder by artifact id. The value is the set of part numbers
+        // present; a whole {id}.cofferbak reads as part 1, which is exactly what
+        // it is when the count is 1 — and when it ISN'T (a pre-ADR-0101 upload
+        // of a large artifact), the "already complete" test below still treats
+        // it as the whole backup, so it is left alone.
+        var remoteParts = new Dictionary<string, HashSet<int>>(StringComparer.Ordinal);
+        var remoteDeclaredCount = new Dictionary<string, int>(StringComparer.Ordinal);
+        var wholeUploads = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var a in remote)
         {
-            await PushOneAsync(creds, folderId, b, ct).ConfigureAwait(false);
-            uploaded++;
+            var id = StripExtension(a.Name);
+            var (part, declared) = PartOf(a.Name);
+            if (part is null) wholeUploads.Add(id);
+            else remoteDeclaredCount[id] = declared;
+            if (!remoteParts.TryGetValue(id, out var set))
+                remoteParts[id] = set = [];
+            set.Add(part ?? 1);
+        }
+
+        // Upload what the folder is missing (match by bare id, then by part).
+        var uploaded = 0;
+        foreach (var b in local)
+        {
+            // Already there whole — including a large artifact uploaded before
+            // parts existed. Re-cutting it would spend its whole size in
+            // bandwidth to arrive at the same bytes.
+            if (wholeUploads.Contains(b.Id)) continue;
+
+            // Complete means "every part the SET SAYS it has" — the count read
+            // off the remote names, not recomputed from the current part size.
+            // Api:Backup:PartSizeMb is configurable, and recomputing would make
+            // every set cut under the old value look short the moment someone
+            // changed it, re-uploading the whole artifact alongside the parts
+            // already there.
+            var have = remoteParts.TryGetValue(b.Id, out var set) ? set : [];
+            var declared = remoteDeclaredCount.TryGetValue(b.Id, out var n)
+                ? n
+                : _store.PartCountFor(b.SizeBytes);
+            if (have.Count >= declared) continue;
+
+            if (await PushOneAsync(creds, folderId, b, have, ct).ConfigureAwait(false))
+                uploaded++;
         }
 
         // Delete everything on Drive that isn't a current local backup — sweeps

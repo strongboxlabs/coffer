@@ -13,6 +13,14 @@ public static class BackupContracts
     /// and Drive retention.</summary>
     public sealed record BackupSummary(string Id, long SizeBytes, DateTime CreatedAtUtc, bool Pinned);
 
+    /// <summary>
+    /// Acknowledgement of one received restore part (ADR-0101).
+    /// <see cref="ReceivedBytes"/> is the running total, so a client that lost
+    /// track after a dropped connection can tell where it got to.
+    /// </summary>
+    public sealed record RestorePartAccepted(
+        int Part, int PartCount, long ReceivedBytes, bool Complete);
+
     /// <summary>Body for <c>PUT /api/admin/backups/passphrase</c>.</summary>
     public sealed record SetBackupPassphraseRequest(string Passphrase);
 

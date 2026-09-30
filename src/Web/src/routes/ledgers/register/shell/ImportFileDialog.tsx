@@ -1,3 +1,7 @@
+import { formatBytes } from '@/lib/format';
+
+/** This dialog has always shown MB to two decimals. */
+const formatBytes2 = (b: number) => formatBytes(b, 2);
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 
@@ -450,7 +454,7 @@ function PickStep({
                     />
                     {file !== null ? (
                         <p className="mt-2 text-xs text-text-subtle">
-                            {file.name} — {formatBytes(file.size)}
+                            {file.name} — {formatBytes2(file.size)}
                         </p>
                     ) : null}
                 </div>
@@ -802,18 +806,11 @@ function ResultStep({
                                 {/* An undo that silently discards someone's edits is
                                     the kind of helpful delete nobody forgives. Said,
                                     never used to refuse. */}
-                                {/* Now a DESTRUCTIVE warning, not a note. Undo removes
-                                    the rows outright — it has to, or the same file
-                                    could never be imported again — so any editing done
-                                    since is gone with them. Re-importing brings the
-                                    transactions back, not the edits. */}
-                                {preview.data.edited > 0 ? (
-                                    <p className="mt-1">
-                                        <strong>{preview.data.edited}</strong> of them
-                                        {preview.data.edited === 1 ? ' has' : ' have'}{' '}
-                                        been edited since — those edits will be lost.
-                                    </p>
-                                ) : null}
+                                {/* No "N of them have been edited" line. This dialog is
+                                    the one that just did the import, so there has been
+                                    no chance to edit anything — the count was reliably
+                                    zero and the sentence only ever added doubt to an
+                                    action the user had just chosen. */}
                             </>
                         )}
                     </div>
@@ -880,8 +877,3 @@ function ResultStep({
     );
 }
 
-function formatBytes(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-}

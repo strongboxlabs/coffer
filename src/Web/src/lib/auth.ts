@@ -15,6 +15,10 @@
 import { startAuthentication, startRegistration } from '@simplewebauthn/browser';
 
 import { ApiError, request, type InvitePreview } from './api';
+// The slicing and ordering rules are the admin restore's — one
+// implementation, because the two paths must assemble bytes identically
+// and a disagreement surfaces only as a wrong-passphrase error.
+import { uploadRestoreFromParts, uploadRestoreInParts } from './api/backup';
 
 // Derive the wire types from the library's own function signatures
 // rather than depending on @simplewebauthn/types (deprecated at v11).
@@ -121,11 +125,23 @@ export async function performRecoveryLogin(
 // --- Setup (first-run registration) ----------------------------------
 
 /**
- * Mirror of API `SetupInfoResponse`. Intentionally empty (ADR-0088) — /info
- * exists to validate the bootstrap token, and there is no ledger list to offer
- * on a fresh install.
+ * Mirror of API `SetupInfoResponse`. /info exists to validate the bootstrap
+ * token — there is no ledger list to offer on a fresh install (ADR-0088) — and
+ * it carries the one deployment value the pre-auth restore form needs.
  */
-export type SetupInfoResponse = Record<string, never>;
+export interface SetupInfoResponse {
+    /**
+     * How large a piece to cut a restore artifact into when it is too big to
+     * send in one request (ADR-0101), from `Api:Backup:PartSizeMb`.
+     *
+     * It rides on /info because this page has no other read: it runs before
+     * any account exists, so it cannot reach an admin endpoint. Hardcoding it
+     * would make the setting silently not apply to the restore that needs it
+     * most — a fresh install, behind a proxy the operator has just stood up,
+     * with the machine it is replacing already gone.
+     */
+    restorePartSizeBytes: number;
+}
 
 /** Mirror of API `SetupBeginRequest`. */
 interface SetupBeginRequest {
@@ -377,7 +393,34 @@ export function performLogout(): Promise<void> {
     return request<void>('/api/auth/logout', { method: 'POST' });
 }
 
-// --- Bootstrap restore (ADR-0061) ------------------------------------
+// --- Bootstrap restore (ADR-0061, parts per ADR-0101) -----------------
+
+/**
+ * Send a restore artifact to the bootstrap path in pieces (ADR-0101), because
+ * it is too large to arrive in one request.
+ *
+ * This is the disaster-recovery path: the install is gone, the artifact is on
+ * a laptop, and the only route back is an upload through whatever proxy was
+ * just stood up in front of the replacement. If that proxy is Cloudflare on
+ * Free or Pro, it refuses anything over 100 MB and there is no setting to
+ * change — so sending it whole is not slow, it is impossible.
+ *
+ * Takes either one file to slice, or a set of `*-of-*` files exactly as they
+ * were downloaded from off-host storage.
+ */
+export async function uploadSetupRestoreParts(
+    token: string,
+    source: File | { parts: File[] },
+    partSizeBytes: number,
+    onProgress?: (sentBytes: number, totalBytes: number) => void,
+): Promise<void> {
+    const url = `/api/auth/setup/${encodeURIComponent(token)}/restore/parts`;
+    if ('parts' in source) {
+        await uploadRestoreFromParts(source.parts, onProgress, url);
+        return;
+    }
+    await uploadRestoreInParts(source, partSizeBytes, onProgress, url);
+}
 
 /**
  * Upload an encrypted backup to the restore branch of the bootstrap UI.
@@ -389,11 +432,14 @@ export function performLogout(): Promise<void> {
  */
 export async function restoreFromBackup(
     token: string,
-    archive: File,
+    /** The artifact, or `{ uploadedParts: true }` when it was sent ahead in
+     *  pieces by {@link uploadSetupRestoreParts}. */
+    archive: File | { uploadedParts: true },
     passphrase: string,
 ): Promise<void> {
     const form = new FormData();
-    form.append('archive', archive);
+    if (archive instanceof File) form.append('archive', archive);
+    else form.append('useUploadedParts', 'true');
     form.append('passphrase', passphrase);
 
     const response = await fetch(

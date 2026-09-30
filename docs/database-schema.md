@@ -1803,7 +1803,7 @@ Server-side capped snapshots of the user-curated ledger graph (migration 111, AD
 | `content_size_uncompressed` | `integer` | NOT NULL CHECK (`>= 0`) | Uncompressed byte count for the SPA's "N MB before compression" display without decompressing. |
 | `content_json` | `jsonb` | NULL | Migration 179 (format v2): the payload, when the snapshot is v2. NULL on v1 (payload in `content`) and on v3 (payload chunked into `ledger_snapshot_parts`). The API discriminates on `content.Length > 0`; see the format note above. |
 
-Indexes: `idx_ledger_snapshots_ledger_created (ledger_id, created_at DESC)`, `idx_ledger_snapshots_ledger_kind_created (ledger_id, kind, created_at)`. No RLS — access is mediated by the repository/service layer. Migration 112 later extended the snapshot scope (recurring transactions + splits).
+Indexes: `idx_ledger_snapshots_ledger_created (ledger_id, created_at DESC)`, `idx_ledger_snapshots_ledger_kind_created (ledger_id, kind, created_at)`. **RLS** since migration 231: `ledger_snapshots_read` (SELECT) and `ledger_snapshots_write`, both keyed `ledger_id IN (SELECT ledger_id FROM user_ledger_grants WHERE user_id = current_app_user_id())`. The write policy does NOT narrow to owner/editor as its siblings do, deliberately: creating and deleting a snapshot require only ledger VISIBILITY at the endpoint, so a narrower policy would remove a capability from inside a migration rather than add defence. Before 231 access was mediated only by the repository/service layer, which left the table readable by anything reaching the database as `coffer_app` outside that gate. Migration 112 later extended the snapshot scope (recurring transactions + splits).
 
 ### `ledger_snapshot_parts`
 
@@ -1818,7 +1818,7 @@ Capture writes one table's rows here in chunks of 2000 (`fn_snapshot_write_part`
 | `seq` | `integer` | NOT NULL; PK part 3 | 0-based chunk index within `(snapshot_id, part_name)`. `seq = 0` is written even for an empty table, so the key exists as `'[]'`: migration 188's restore assertion distinguishes an absent key from an empty one, and skipping the write would drop the key for any ledger with an empty in-scope table. |
 | `content` | `jsonb` | NOT NULL | Always a jsonb **array** of that chunk's rows, never an object and never NULL. jsonb rather than text so Postgres TOAST-compresses it on disk — which is what replaced the v1 hand-rolled gzip. Size accounting sums per-chunk `octet_length`, so the figure runs a few bytes per chunk above the v2 number for the same data; it is a display value for the SPA, not a checksum. |
 
-Indexes: the primary key `(snapshot_id, part_name, seq)` is the only one, and it covers both access paths exactly — "any parts for this snapshot?" (the format gate) and "this table's chunks in order" (the restore loop). RLS: **none** — and inherited rather than chosen. `ledger_snapshots` has no policies either, so the parts table follows the table it belongs to rather than introducing a second, subtly different posture for the same data; both hold a full copy of every row of a ledger — the same rows their source tables protect with RLS — gated only by the API's `LedgerAuthorizer`. Adding RLS to both is a behaviour change to an existing table and is tracked as "RLS on the snapshot tables" in the open-work backlog. Grants mirror `ledger_snapshots`: SELECT/INSERT/UPDATE/DELETE to `coffer_app` (capture and restore run request-side, as the caller, not `SECURITY DEFINER`), everything to `coffer_service`. Not captured by `fn_ledger_snapshot_payload` / `_part_names` — it *is* the snapshot storage, and a snapshot cannot contain itself (the reason `SchemaDriftGuardTests` gives for excluding `ledger_snapshots`); it also falls outside that guard entirely, since the guard classifies tables carrying `ledger_id` and this one reaches its ledger transitively through `snapshot_id`.
+Indexes: the primary key `(snapshot_id, part_name, seq)` is the only one, and it covers both access paths exactly — "any parts for this snapshot?" (the format gate) and "this table's chunks in order" (the restore loop). **RLS** since migration 231, and it follows `ledger_snapshots` as it always did — both hold a full copy of every row of a ledger, so a single posture for the two is the point. Because this table carries NO `ledger_id` (it reaches its ledger through `snapshot_id`), the policies cannot be keyed the way its siblings are: `ledger_snapshot_parts_read` / `_write` join through the parent — `EXISTS (SELECT 1 FROM ledger_snapshots s JOIN user_ledger_grants ulg ON ulg.ledger_id = s.ledger_id WHERE s.id = snapshot_id AND ulg.user_id = current_app_user_id())`. Written as an explicit grant check rather than leaning on the parent row being filtered by its own RLS, which would also work but makes the requirement something the reader has to infer. Grants mirror `ledger_snapshots`: SELECT/INSERT/UPDATE/DELETE to `coffer_app` (capture and restore run request-side, as the caller, not `SECURITY DEFINER`), everything to `coffer_service`. Not captured by `fn_ledger_snapshot_payload` / `_part_names` — it *is* the snapshot storage, and a snapshot cannot contain itself (the reason `SchemaDriftGuardTests` gives for excluding `ledger_snapshots`); it also falls outside that guard entirely, since the guard classifies tables carrying `ledger_id` and this one reaches its ledger transitively through `snapshot_id`.
 
 ### `user_account_groups`
 
@@ -2043,9 +2043,27 @@ migration-177 backfill applies the identical logic to historical trade legs
 (taking the last trade of each `(security, UTC-day)`), covering the Dapper
 importer path the interceptor doesn't see.
 
+**The rule now lives in `fn_trade_price_for_day` (migration 234), and the writer
+calls it.** Until then it was written out by hand four times and the writer did
+not apply it at all: `TradePriceFromLegInterceptor` upserted the price of
+whatever leg a save happened to touch. Correcting one leg of a multi-leg day
+therefore seeded that leg's price, while `fn_trade_price_check` — correctly
+applying "last trade of the day" — derived a different one and reported the
+difference as drift. Neither side was buggy on its own terms; they were running
+different rules. The interceptor now names the (security, day) it touched and
+`fn_trade_price_reseed` decides the price.
+
+Two hand-written copies remain, deliberately: the importer's `TradePriceSeedStep`
+(Dapper set-based, because the importer never touches EF) and
+`fn_trade_price_check` itself. The checker re-states the rule rather than calling
+it so that it can catch the WRITERS diverging — a checker that reuses the
+writer's code cannot catch the writer being wrong. That has a matching blind
+spot, recorded in FU-048: when the RULE is wrong, both sides compute the same
+wrong answer and the check reports healthy.
+
 ### The rest of the bound functions
 
-Twenty functions are bound via `HasDbFunction`; the five above are documented in
+Twenty-five functions are bound via `HasDbFunction`; the five above are documented in
 full because their signatures are read-path contracts callers have to match. The
 remainder are listed rather than expanded — each is a single-purpose call whose
 shape lives in its migration — so that this section answers "what runs in the
@@ -2062,14 +2080,21 @@ database" completely rather than partially.
 | `holdings_market_value_as_of_set(…)` | Market value for a set of positions at an instant. | Same 229 / 230 history as the cost-basis walk — they had to move together or a row would sort one way on screen and another in the FIFO walk. |
 | `realized_gains_walk(…)` | Replays disposals to produce realized gain rows. | Migration 182 scaled its money columns after unscaled `NUMERIC` overflowed .NET `decimal` on read. |
 | `recompute_posting_counts_for_header(header_id)` | Refreshes the denormalized posting counts on a header. | ADR-0046: the counts are what let the register decide split-vs-flat without a second query. |
+| `fn_unbacked_price_dates(ledger_id, security_id)` | The dates where this security holds a trade-source price no trade derives. | Migration 241. ONE pass — the per-row `fn_price_is_unbacked` rescans the security's legs per price and measured 728ms against 14ms over a 1,229-price history, so anything covering a whole history uses this. |
+| `fn_unbacked_price_securities(ledger_id)` | One row per security holding such prices, ordered by what the holding is worth now. | Migration 240. Advisory behind the consistency panel — never a finding; see ADR-0084 D6. |
+| `fn_price_is_unbacked(ledger_id, security_id, price_date, source)` | Whether one stored price claims a trade produced it while none does. | Migration 240. Per-row; use `fn_unbacked_price_dates` for more than a handful. |
+| `fn_leg_prices_a_day(quantity, unit_price, action, provider_action)` | Whether a security leg is a genuine price observation. | Migrations 235 → 237 → **238**, ADR-0084 D6. An ALLOW-LIST of executions (`buy`, `buyx`, `sell`, `sellx`, `dividend_reinvest`) minus the Moneydance `ShrsIn`/`ShrsOut` that map onto them. Anything else — `transfer_shares`, or an action added later — prices no day until it is named. 235 and 237 were exclusion lists and failed open, which is why there were three passes. Shared by the rule and the checker so the two cannot disagree about what counts. |
+| `fn_trade_price_for_day(ledger_id, security_id, day)` | THE rule: what a day's trade-derived price is, or NULL. | Migration 234. Ordered `h.seq DESC, abs(amount) DESC, l.id DESC` — the last two make it total, so the answer cannot vary between runs. |
+| `fn_trade_price_reseed(ledger_id, security_id, day)` | Derives the day's price by that rule and rank-gates it into `security_prices`. | Migration 234. The writer's entry point: `TradePriceFromLegInterceptor` names the (security, day) it touched, never a price. |
+| `fn_trade_price_check(ledger_id)` | Reads back what the trade-price rule IMPLIES for every `(security, UTC-day)` it covers, with `reason` NULL where the stored row agrees, `missing`/`value` where it does not, and **`orphaned`** for a stored trade price nothing derives any more. | Migration 232; **233** added `account_id` / `header_id`; **239** added `orphaned` (reported, never auto-repaired — ADR-0084 D4 keeps some deliberately; `account_id`/`header_id` are NULL there, which is what points the UI at the price list) after the first real run reported rows by bare GUID, which no one could act on. The reader half of `security_price_upsert_from_trade` — see the note below on why it is a fourth copy of the same predicate rather than a call into the writer. |
 | `reminder_occurrence_lock(recurring_transaction_id, occurrence_date)` | Advisory lock for one series occurrence. | Stops the auto-post job and a hand-fire from materializing the same occurrence twice. |
 | `reminder_estimate_samples(recurring_transaction_id, …)` | The prior amounts an estimated reminder averages over. | Backs `estimate_sample_count`. |
 | `ledger_snapshot_payload(ledger_id)` | Builds a snapshot's payload from the in-scope tables. | The whitelist lives in `LedgerSnapshotPayload`, not here. |
 | `ledger_snapshot_write(…)` / `ledger_snapshot_restore(…)` | Write and replay a snapshot payload. | v3 chunks through `ledger_snapshot_parts`; `ledger_snapshot_restore_stored` is the stored-payload variant. |
 | `ledger_delete(ledger_id)` | Deletes a ledger and everything scoped to it. | One function so the delete order is stated once rather than reconstructed by an ORM. |
 
-`account_path(account_id)` is documented above but is NOT one of the twenty — it is
-called from SQL (the resolved view) rather than bound through EF.
+`account_path(account_id)` is documented above but is NOT one of the twenty-five — it
+is called from SQL (the resolved view) rather than bound through EF.
 
 ### Trigger functions
 

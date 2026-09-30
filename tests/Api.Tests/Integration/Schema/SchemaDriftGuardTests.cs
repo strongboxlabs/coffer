@@ -2,6 +2,7 @@ using System.Data.Common;
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Globalization;
 using System.Text.RegularExpressions;
 
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -9,6 +10,7 @@ using Microsoft.EntityFrameworkCore;
 
 using Coffer.Api.Contracts;
 using Coffer.Api.Db.Entities;
+using Coffer.Api.Migrations;
 using Coffer.Api.Tests.Integration.Infra;
 
 namespace Coffer.Api.Tests.Integration.Schema;
@@ -393,5 +395,121 @@ public sealed class SchemaDriftGuardTests
             "ON DELETE SET NULL foreign key(s) that null a NOT NULL column — deleting the parent "
             + "throws 23502 (broke snapshot restore, mig 183): " + string.Join(", ", broken)
             + ". Use ON DELETE SET NULL (nullable_column) to null only the nullable FK column.");
+    }
+
+    // -----------------------------------------------------------------
+    // Guard 6 — a migration COMMENT must not assert a stale NUMERIC scale.
+    // -----------------------------------------------------------------
+
+    // Claims that are wrong-but-frozen. engineering-standards.md §3.1: once a
+    // migration is committed to main it is never edited, so a stale header cannot
+    // be corrected in place — it is recorded here, with the doc that carries the
+    // real value, instead of being silently tolerated.
+    //
+    // Key is "<migration number>:<table>.<column>:<claimed precision>,<claimed scale>".
+    private static readonly HashSet<string> FrozenScaleClaims = new()
+    {
+        // mig 113's header documents shares as "NUMERIC(28,8) per holdings.quantity".
+        // mig 043 — seventy migrations earlier — had already moved that column to
+        // (25,12). database-schema.md carries the correct value.
+        "113:holdings.quantity:28,8",
+
+        // mig 155 narrates the BEFORE state deliberately: "security_prices.price was
+        // NUMERIC(25,12) while its own high / low columns are NUMERIC(19,4)". The
+        // sentence exists to explain why that same migration constrains price to
+        // (19,4) — the claim is past tense, not a description of the result.
+        "155:security_prices.price:25,12",
+    };
+
+    // NUMERIC(p,s) is masked before the line is split on commas, because the
+    // literal contains one: splitting first turns "NUMERIC(19,4)" into two
+    // fragments and loses the claim.
+    private static readonly Regex NumericLiteral =
+        new(@"NUMERIC\(\s*(\d+)\s*,\s*(\d+)\s*\)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex MaskedClaim = new(@"«(\d+):(\d+)»", RegexOptions.Compiled);
+    private static readonly Regex QualifiedColumn =
+        new(@"\b([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)\b", RegexOptions.Compiled);
+
+    [Fact]
+    public async Task Migration_comments_do_not_assert_a_stale_numeric_scale()
+    {
+        // WHY: migration headers are load-bearing documentation here. 205 and 209
+        // each rounded money at a scale a stale header asserted, and 209 put three
+        // disposals a cent out on a real ledger. The column-side guard above pins
+        // the columns; this is its comment-side twin.
+        //
+        // A claim is one fragment (comma/semicolon-delimited) of a comment line
+        // holding exactly one `table.column` and exactly one NUMERIC(p,s). That
+        // pairing rule matters: a greedy same-line match reads
+        // "holdings.cost_basis NUMERIC(19,4), lots.unit_cost NUMERIC(25,12)" as a
+        // claim that lots.unit_cost is (19,4), which is a parser artifact, not drift.
+        var dir = MigrationsDirectoryLocator.Locate(AppContext.BaseDirectory);
+
+        await using var db = _fixture.NewDbContext();
+        var conn = db.Database.GetDbConnection();
+        await conn.OpenAsync();
+
+        var actual = new Dictionary<string, (int Precision, int Scale)>();
+        await using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = @"
+                SELECT table_name, column_name, numeric_precision, numeric_scale
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND data_type = 'numeric'
+                  AND numeric_precision IS NOT NULL AND numeric_scale IS NOT NULL";
+            await using var r = await cmd.ExecuteReaderAsync();
+            while (await r.ReadAsync())
+                actual[$"{r.GetString(0)}.{r.GetString(1)}"] = (r.GetInt32(2), r.GetInt32(3));
+        }
+
+        var stale = new List<string>();
+        var verified = 0;
+
+        foreach (var path in Directory.EnumerateFiles(dir, "*.sql").OrderBy(p => p))
+        {
+            var migration = Path.GetFileName(path).Split('_')[0];
+            foreach (var raw in await File.ReadAllLinesAsync(path))
+            {
+                var line = raw.TrimStart();
+                if (!line.StartsWith("--", StringComparison.Ordinal)) continue;
+
+                var masked = NumericLiteral.Replace(line, m => $"«{m.Groups[1].Value}:{m.Groups[2].Value}»");
+                foreach (var fragment in masked.Split(',', ';'))
+                {
+                    var claims = MaskedClaim.Matches(fragment);
+                    var columns = QualifiedColumn.Matches(fragment);
+                    if (claims.Count != 1 || columns.Count != 1) continue;
+
+                    var column = $"{columns[0].Groups[1].Value}.{columns[0].Groups[2].Value}";
+                    // A comment may name a table that has since been dropped, or a
+                    // non-column dotted token. Unverifiable, not drift.
+                    if (!actual.TryGetValue(column, out var live)) continue;
+
+                    var precision = int.Parse(claims[0].Groups[1].Value, CultureInfo.InvariantCulture);
+                    var scale = int.Parse(claims[0].Groups[2].Value, CultureInfo.InvariantCulture);
+                    verified++;
+
+                    if (precision == live.Precision && scale == live.Scale) continue;
+                    if (FrozenScaleClaims.Contains($"{migration}:{column}:{precision},{scale}")) continue;
+
+                    stale.Add($"mig {migration}: says {column} is NUMERIC({precision},{scale}), "
+                        + $"schema says ({live.Precision},{live.Scale})");
+                }
+            }
+        }
+
+        // Floor. Every check here is an absence check, and a parser that silently
+        // stops matching reports the same clean result as a correct corpus. The
+        // known-good claims are the proof it is still reading.
+        Assert.True(verified >= 6,
+            $"Only {verified} NUMERIC(p,s) claim(s) in migration comments could be checked against "
+            + "the live schema. The corpus has several; this guard has stopped parsing them, so a "
+            + "clean result from it would mean nothing.");
+
+        Assert.True(stale.Count == 0,
+            "Migration comment(s) assert a NUMERIC scale the schema does not have — the failure mode "
+            + "that put three disposals a cent out in mig 209: " + string.Join("; ", stale)
+            + ". The migration cannot be edited (engineering-standards §3.1), so correct the value in "
+            + "database-schema.md and add the claim to FrozenScaleClaims with the reason.");
     }
 }

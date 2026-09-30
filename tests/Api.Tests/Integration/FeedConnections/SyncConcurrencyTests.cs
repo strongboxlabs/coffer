@@ -63,7 +63,7 @@ public sealed class SyncConcurrencyTests
     /// returns the supplied body on /accounts.</summary>
     private async Task<(ApiFactory Factory, SyntheticLedger Ledger,
                        FeedConnectionSummary Connection)>
-        ConnectAsync(string accountsBody)
+        ConnectAsync(string accountsBody, Func<Exception>? failSyncWith = null)
     {
         var ledger = await SyntheticLedger.CreateAsync(_fixture);
         var keys = _fixture.NewLedgerKeyService();
@@ -76,13 +76,18 @@ public sealed class SyncConcurrencyTests
             await seed.SaveChangesAsync();
         }
         const string accessUrl = "https://u:p@bridge.simplefin.org/simplefin/access/abc";
+        // The POST leg is the setup-token claim and must succeed for the connection
+        // to exist at all; only the GET (the sync itself) fails when asked to.
         var factory = new ApiFactory(_fixture).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(req =>
-                req.Method == HttpMethod.Post
-                    ? new HttpResponseMessage(HttpStatusCode.OK)
-                        { Content = new StringContent(accessUrl) }
-                    : new HttpResponseMessage(HttpStatusCode.OK)
-                        { Content = new StringContent(accountsBody) }));
+            {
+                if (req.Method == HttpMethod.Post)
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                        { Content = new StringContent(accessUrl) };
+                if (failSyncWith is not null) throw failSyncWith();
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                    { Content = new StringContent(accountsBody) };
+            }));
         var client = await AuthedClientAsync(factory, ledger);
         var createResp = await client.PostAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/feed-connections",
@@ -232,6 +237,113 @@ public sealed class SyncConcurrencyTests
             .CountAsync(r => r.FeedConnectionId == setup.Connection.Id
                           && r.Status == "completed");
         Assert.Equal(1, live);
+    }
+
+    /// <summary>
+    /// A provider timeout must close its run, not strand it.
+    /// </summary>
+    /// <remarks>
+    /// HttpClient signals a timeout with <see cref="TaskCanceledException"/>, which is
+    /// not a <c>SimpleFinException</c> — so it unwound straight past the orchestrator
+    /// catch that stamps the run <c>failed</c>, leaving the row <c>running</c> with no
+    /// <c>completed_at</c>. The partial unique index then rejected the next sync on
+    /// that connection as "already running" until the 10-minute reaper caught up.
+    /// Observed in production as a sync stuck on RUNNING.
+    /// </remarks>
+    [Theory]
+    [InlineData("timeout")]
+    [InlineData("network")]
+    public async Task A_provider_transport_failure_closes_the_run(string kind)
+    {
+        var setup = await ConnectAsync("""
+            {"connections":[
+              {"conn_id":"c-A","name":"Bank A","org_id":"banka",
+               "sfin_url":"https://sfin/banka"}
+            ],"errlist":[],"accounts":[]}
+            """,
+            failSyncWith: () => kind == "timeout"
+                // What HttpClient throws when ITS timeout fires: a cancellation
+                // nobody asked for.
+                ? new TaskCanceledException(
+                    "The request was canceled due to the configured "
+                    + "HttpClient.Timeout of 100 seconds elapsing.",
+                    new TimeoutException())
+                : new HttpRequestException("Connection refused"));
+
+        await using var factory = setup.Factory;
+        using var client = await AuthedClientAsync(factory, setup.Ledger);
+        var sync = await client.PostAsync(
+            $"/api/ledgers/{setup.Ledger.LedgerId}/feed-connections/{setup.Connection.Id}/sync",
+            content: null);
+
+        // A provider fault, reported as one — not a 500 from an unhandled throw.
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, sync.StatusCode);
+
+        await using var db = _fixture.NewDbContext();
+        var run = await db.LedgerOperations.AsNoTracking()
+            .Where(r => r.FeedConnectionId == setup.Connection.Id)
+            .OrderByDescending(r => r.StartedAt)
+            .FirstAsync();
+
+        // The whole point: no row left RUNNING, so the next sync is not blocked.
+        Assert.Equal("failed", run.Status);
+        Assert.NotNull(run.CompletedAt);
+        Assert.False(string.IsNullOrWhiteSpace(run.ErrorMessage));
+
+        Assert.Equal(0, await db.LedgerOperations.AsNoTracking()
+            .CountAsync(r => r.FeedConnectionId == setup.Connection.Id
+                          && r.Status == "running"));
+    }
+
+    /// <summary>
+    /// A cancelled sync must close its run too, on the way out.
+    /// </summary>
+    /// <remarks>
+    /// Host shutdown or a disconnected client cancels the request token. The pull is
+    /// over either way, and a run left <c>running</c> blocks the next sync on that
+    /// connection, so the row is stamped before the cancellation continues to unwind
+    /// — and stamped under <c>CancellationToken.None</c>, because saving under the
+    /// very token that just aborted the work throws and strands the row again.
+    /// </remarks>
+    [Fact]
+    public async Task A_cancelled_sync_closes_its_run_before_unwinding()
+    {
+        var setup = await ConnectAsync("""
+            {"connections":[
+              {"conn_id":"c-A","name":"Bank A","org_id":"banka",
+               "sfin_url":"https://sfin/banka"}
+            ],"errlist":[],"accounts":[]}
+            """,
+            // A plain OperationCanceledException, not the TaskCanceledException an
+            // HttpClient timeout raises — this is the shape of a real cancellation,
+            // and it must NOT be laundered into a provider fault.
+            failSyncWith: () => new OperationCanceledException());
+
+        await using var factory = setup.Factory;
+        using var client = await AuthedClientAsync(factory, setup.Ledger);
+        try
+        {
+            await client.PostAsync(
+                $"/api/ledgers/{setup.Ledger.LedgerId}/feed-connections/{setup.Connection.Id}/sync",
+                content: null);
+        }
+        catch (Exception)
+        {
+            // The cancellation is expected to keep unwinding; what it must not do is
+            // leave the run open behind it.
+        }
+
+        await using var db = _fixture.NewDbContext();
+        Assert.Equal(0, await db.LedgerOperations.AsNoTracking()
+            .CountAsync(r => r.FeedConnectionId == setup.Connection.Id
+                          && r.Status == "running"));
+
+        var run = await db.LedgerOperations.AsNoTracking()
+            .Where(r => r.FeedConnectionId == setup.Connection.Id)
+            .OrderByDescending(r => r.StartedAt)
+            .FirstAsync();
+        Assert.Equal("failed", run.Status);
+        Assert.NotNull(run.CompletedAt);
     }
 
     [Fact]

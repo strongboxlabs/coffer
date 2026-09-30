@@ -84,7 +84,8 @@ export function repairBalances(
 
 /**
  * GET /api/ledgers/{id}/balances/consistency — READ-ONLY check of every derived
- * projection (balances, holdings, realized gains, posting counts). Writes nothing.
+ * projection (balances, holdings, realized gains, posting counts, prices from
+ * trades). Writes nothing.
  */
 export function checkLedgerConsistency(
     ledgerId: string,

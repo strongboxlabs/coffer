@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useNavigate, useRouterState } from '@tanstack/react-router';
+import { Link, useNavigate, useRouterState } from '@tanstack/react-router';
 
 import {
     deleteLedger,
+    fetchLedgerEvents,
     fetchVisibleLedgers,
     renameLedger,
     checkLedgerConsistency,
@@ -12,6 +13,8 @@ import {
 } from '@/lib/api';
 import type { LedgerConsistencyReport, ProjectionConsistency, ConsistencyMismatch } from '@/lib/types';
 import { errorMessage } from '@/lib/errorMessage';
+import { formatLedgerDateTime } from '@/lib/dates';
+import { formatCurrency } from '@/lib/money';
 import { invalidateLedgerRegister } from '@/lib/registerInvalidation';
 import { Button } from '@/components/ui/Button';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
@@ -80,6 +83,27 @@ export function GeneralPanel({ ledgerId }: { ledgerId: string }) {
     const consistencyMutation = useMutation({
         mutationFn: () => checkLedgerConsistency(ledgerId),
     });
+
+    // What the SCHEDULED monitor last found, so this panel can say so on arrival.
+    //
+    // The finding used to live only on the Notifications tab. That assumed the
+    // reader arrives by following the link there — but the alert arrives out of
+    // band (healthchecks.io, email), and someone acting on it opens Settings and
+    // lands HERE, on the default tab, where the page looked entirely healthy. An
+    // alert the product sends and then does not acknowledge in its own UI reads as
+    // a false alarm, which is how a real finding gets ignored.
+    //
+    // Cheap: a bounded read of the event log, not the consistency walk. Running
+    // the walk itself on mount is what the `check` param exists to avoid.
+    const eventsQuery = useQuery({
+        queryKey: ['ledger-events', ledgerId],
+        queryFn: () => fetchLedgerEvents(ledgerId),
+    });
+    // resolvedAt is derived server-side from the surrounding rows, so a later
+    // consistency.ok clears this without anything mutating the append-only log.
+    const unresolvedDrift = eventsQuery.data?.find(
+        (e) => e.eventKey === 'consistency.drift' && e.resolvedAt === null,
+    );
 
     // Arriving from a drift notification runs the check once, so the finding hands
     // over its own fix instead of leaving the reader on a panel that shows nothing
@@ -177,12 +201,34 @@ export function GeneralPanel({ ledgerId }: { ledgerId: string }) {
                     <span className="font-medium">Maintenance</span>
                 </PanelHead>
                 <PanelBody className="space-y-3">
+                    {/* Only while unresolved. Repeating a finding the log has since
+                        called healthy would train the reader to dismiss the banner,
+                        which is the same way the original alert stopped landing. */}
+                    {unresolvedDrift ? (
+                        <div
+                            role="status"
+                            className="rounded border border-state-warning/40 bg-state-warning-soft p-3 text-sm text-state-warning"
+                        >
+                            <p className="font-medium">
+                                The scheduled check reported drift on{' '}
+                                <time dateTime={unresolvedDrift.occurredAt}>
+                                    {formatLedgerDateTime(unresolvedDrift.occurredAt)}
+                                </time>
+                                , and nothing has reported it healthy since.
+                            </p>
+                            <p className="mt-1 text-xs">
+                                {unresolvedDrift.summary} Run the check to see which
+                                figures disagree — each one it names can be repaired
+                                from here.
+                            </p>
+                        </div>
+                    ) : null}
                     <div className="flex items-start justify-between gap-3">
                         <p className="text-sm text-text-muted">
                             Compare every stored figure against a fresh calculation
                             from the transactions — balances, holdings, realized
-                            gains and posting counts. Read-only: it reports what
-                            disagrees and changes nothing.
+                            gains, posting counts and prices from trades. Read-only:
+                            it reports what disagrees and changes nothing.
                         </p>
                         <Button
                             type="button"
@@ -206,6 +252,7 @@ export function GeneralPanel({ ledgerId }: { ledgerId: string }) {
                     ) : null}
                     {consistencyMutation.data ? (
                         <ConsistencySummary
+                            ledgerId={ledgerId}
                             report={consistencyMutation.data}
                             onRepair={(projection) => repairMutation.mutate(projection)}
                             repairing={
@@ -288,6 +335,23 @@ const PROJECTION_LABELS: Record<string, string> = {
     holdings: 'Holdings and cost basis',
     realized_gains: 'Realized gains',
     posting_counts: 'Posting counts',
+    trade_prices: 'Prices from trades',
+};
+
+/**
+ * What pressing Repair will actually DO, per projection.
+ *
+ * A report that names a disagreement and offers a button gives the reader no way to
+ * judge whether pressing it is safe — "stored 20.3898, expected 0.9868" is a fact,
+ * not a decision. These say which direction the write goes and what it cannot touch,
+ * so the choice can be made without reading the migration.
+ */
+const REPAIR_EFFECT: Record<string, string> = {
+    balances: 'Repair replays each account from its opening balance and rewrites the running balances. It does not change any transaction.',
+    holdings: 'Repair replays the FIFO walk and rewrites quantity and cost basis for the positions listed. It does not change any transaction.',
+    realized_gains: 'Repair replays the FIFO walk and rewrites the realized gain rows for the positions listed. It does not change any transaction.',
+    posting_counts: 'Repair recounts the postings on each header listed. It does not change any amount.',
+    trade_prices: "Repair writes the expected price — what the day's last trade implies — over the stored one. A price you entered by hand, or one from a quote feed, outranks a trade and is never overwritten. Rows saying no trade implies the price any more are NOT repaired here: some are worth keeping, so open the security and decide in its price list. It does not change any transaction.",
 };
 
 /**
@@ -299,10 +363,12 @@ const PROJECTION_LABELS: Record<string, string> = {
  * it is never the first button anyone presses.
  */
 function ConsistencySummary({
+    ledgerId,
     report,
     onRepair,
     repairing,
 }: {
+    ledgerId: string;
     report: LedgerConsistencyReport;
     onRepair: (projection: string) => void;
     repairing: string | null;
@@ -332,20 +398,79 @@ function ConsistencySummary({
                                     )}
                                 </p>
                                 {!p.healthy && p.mismatches.length > 0 ? (
-                                    <ul className="mt-1 space-y-0.5 text-xs">
-                                        {p.mismatches.slice(0, 5).map((m: ConsistencyMismatch, i: number) => (
-                                            <li key={`${m.scope}-${m.field}-${i}`}>
-                                                {m.scope} · {m.field}: stored {m.stored},
-                                                expected {m.expected}
-                                            </li>
-                                        ))}
-                                        {p.mismatchedCount > 5 ? (
-                                            <li>
-                                                …and {p.mismatchedCount - 5} more
-                                            </li>
+                                    <>
+                                        {/* Every disagreement the report returned,
+                                            not a sample of five. Someone deciding
+                                            whether to repair is deciding about ALL
+                                            of them, and "…and 1 more" hides the one
+                                            that might be the reason not to — the
+                                            list is already bounded server-side.
+                                            Scrolls rather than growing forever. */}
+                                        <ul className="mt-1 max-h-fixed-256px space-y-0.5 overflow-y-auto text-xs">
+                                            {p.mismatches.map((m: ConsistencyMismatch, i: number) => (
+                                                <li key={`${m.scope}-${m.field}-${i}`}>
+                                                    {/* Where the report can name the
+                                                        transaction behind the figure,
+                                                        it links to it. Judging whether
+                                                        to repair means looking at that
+                                                        trade, and retyping a date into
+                                                        a register to find it is work
+                                                        the row already has the answer
+                                                        to. */}
+                                                    {m.accountId && m.headerId ? (
+                                                        <Link
+                                                            to="/ledgers/$ledgerId/accounts/$accountId"
+                                                            params={{
+                                                                ledgerId,
+                                                                accountId: m.accountId,
+                                                            }}
+                                                            search={{ focus: m.headerId }}
+                                                            className="underline underline-offset-2 hover:opacity-80"
+                                                        >
+                                                            {m.scope}
+                                                        </Link>
+                                                    ) : m.securityId ? (
+                                                        /* No transaction behind this one — an orphaned price.
+                                                           The remedy is in the security's price list, so that
+                                                           is where the row points. */
+                                                        <Link
+                                                            to="/ledgers/$ledgerId/securities/$securityId"
+                                                            params={{
+                                                                ledgerId,
+                                                                securityId: m.securityId,
+                                                            }}
+                                                            className="underline underline-offset-2 hover:opacity-80"
+                                                        >
+                                                            {m.scope}
+                                                        </Link>
+                                                    ) : (
+                                                        m.scope
+                                                    )}{' '}
+                                                    · {m.field}
+                                                    {/* Only where there IS a difference. An orphan reports the
+                                                        stored price as both, because nothing derives it — so
+                                                        "stored X, expected X" would be noise dressed as a
+                                                        finding. */}
+                                                    {m.stored === m.expected
+                                                        ? null
+                                                        : `: stored ${m.stored}, expected ${m.expected}`}
+                                                </li>
+                                            ))}
+                                        </ul>
+                                        {p.mismatchedCount > p.mismatches.length ? (
+                                            <p className="mt-1 text-xs">
+                                                Showing {p.mismatches.length} of{' '}
+                                                {p.mismatchedCount}. Repair fixes all of
+                                                them, not only the ones listed.
+                                            </p>
                                         ) : null}
-                                    </ul>
+                                        <p className="mt-2 text-xs">
+                                            {REPAIR_EFFECT[p.projection] ??
+                                                'Repair recalculates these figures from the transactions and stores the result.'}
+                                        </p>
+                                    </>
                                 ) : null}
+
                             </div>
                             {!p.healthy ? (
                                 <Button
@@ -364,6 +489,48 @@ function ConsistencySummary({
                     </div>
                 );
             })}
+
+            {/* ADVISORY, and styled as one: neutral, below the findings, no
+                count in any headline and no button. A price nothing derives may
+                be perfectly correct — security_prices records THAT a trade wrote
+                a row and never WHICH one, so this is inferred, and ADR-0084 D4
+                keeps the price a deleted trade left behind on purpose. Reporting
+                it as a defect marked a sound ledger broken with 130 rows nobody
+                could act on. */}
+            {report.unbackedPrices.length > 0 ? (
+                <div className="rounded border border-border bg-surface-muted p-3 text-sm">
+                    <p className="font-medium text-text">Prices worth a look</p>
+                    <p className="mt-1 text-xs text-text-muted">
+                        These securities have prices recorded as coming from a trade,
+                        but no transaction currently produces them — usually because
+                        the trade was deleted or edited since. They may still be
+                        correct. Open a security to see its prices; editing or
+                        deleting one takes it off this list.
+                    </p>
+                    <ul className="mt-2 max-h-fixed-256px space-y-0.5 overflow-y-auto text-xs">
+                        {report.unbackedPrices.map((u) => (
+                            <li key={u.securityId}>
+                                <Link
+                                    to="/ledgers/$ledgerId/securities/$securityId"
+                                    params={{ ledgerId, securityId: u.securityId }}
+                                    className="text-accent underline underline-offset-2 hover:text-accent-hover"
+                                >
+                                    {u.security}
+                                </Link>{' '}
+                                <span className="text-text-muted">
+                                    · {u.count} price{u.count === 1 ? '' : 's'}
+                                    {u.earliest === u.latest
+                                        ? ` on ${u.earliest}`
+                                        : `, ${u.earliest} to ${u.latest}`}
+                                    {u.holdingValue > 0
+                                        ? ` · you hold ${formatCurrency(u.holdingValue)}`
+                                        : ' · no longer held'}
+                                </span>
+                            </li>
+                        ))}
+                    </ul>
+                </div>
+            ) : null}
         </div>
     );
 }

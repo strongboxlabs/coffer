@@ -27,7 +27,7 @@ stays mounted leaves it stale. Concretely (writer audit, 2026-07-17):
   it existed.
 - Settings sync (per-connection + Sync all), reminder-fire, snapshot restore,
   and opening-balance edits refreshed a register only on remount.
-- `docs/maintainer/follow-ups.md`'s SSE item (Phase 5+) already planned to *"invalidate the
+- `docs/maintainer/follow-ups.md` FU-035 (the SSE item, Phase 5+) already planned to *"invalidate the
   register queries; TanStack handles refetch"* — a plan that would ship broken
   for the same reason (the rows aren't a query).
 

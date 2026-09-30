@@ -159,12 +159,88 @@ public sealed class LedgersRepository
     }
 
     /// <summary>
+    /// Wrap a LEK for every ledger that still has none. Returns how many rows
+    /// were given one.
+    /// </summary>
+    /// <remarks>
+    /// <para>Migration 035 shipped <c>wrapped_lek</c> nullable and said "a
+    /// subsequent migration sets NOT NULL once backfill is verified complete".
+    /// That migration could never have been written, because wrapping a LEK
+    /// needs the master KEK and SQL does not have it. So the backfill has to
+    /// live here, in the process that holds the key, and the constraint can
+    /// only follow in a LATER release — migrations run before this code on the
+    /// same boot, so a NOT NULL added today would fail on the very rows it is
+    /// waiting for.</para>
+    ///
+    /// <para>WHERE THE NULLS COME FROM, which is not where the follow-up said.
+    /// <see cref="CreateWithOwnerAsync"/> has wrapped a LEK in the ledger's own
+    /// INSERT since ADR-0026, so nothing the API creates is ever NULL. The gap
+    /// is the Moneydance importer: it is a separate binary with no master KEK
+    /// and inserts <c>ledgers (id, name)</c> directly, so every ledger it
+    /// creates starts without one. Migration-seeded ledgers (014, 055) are the
+    /// same shape.</para>
+    ///
+    /// <para>Idempotent, and safe to run on every boot: the conditional UPDATE
+    /// matches only NULL rows, so a second run touches nothing.</para>
+    ///
+    /// <para>AND THE COLUMN STAYS NULLABLE. Migration 035's promised NOT NULL is
+    /// not deferred here, it is declined. ADR-0088 removed the seeded default
+    /// ledger, so a Moneydance import into a fresh install has to CREATE its
+    /// ledger (<c>--ledger-name</c>), and the importer cannot supply a wrapped
+    /// LEK — it is a separate binary with no master KEK. A NOT NULL would
+    /// therefore not be waiting on legacy rows; it would reject the import. The
+    /// only way to satisfy it is to hand the master key to a second process,
+    /// which trades a real widening of the key's blast radius for a constraint.
+    /// This backfill is the resolution instead: the window where a ledger lacks
+    /// a LEK is bounded by the next boot, and nothing can seal a secret for it
+    /// in the meantime without going through the lazy path below.</para>
+    /// </remarks>
+    public async Task<int> BackfillMissingWrappedLeksAsync(
+        Crypto.LedgerKeyService ledgerKeys,
+        CancellationToken cancellationToken = default)
+    {
+        await using var db = _serviceFactory.Create();
+
+        var ledgerIds = await db.Ledgers
+            .AsNoTracking()
+            .Where(l => l.WrappedLek == null)
+            .Select(l => l.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var wrapped = 0;
+        foreach (var ledgerId in ledgerIds)
+        {
+            // One fresh LEK per ledger — never a shared key. Conditional on
+            // still-NULL so a concurrent EnsureWrappedLekAsync cannot be
+            // overwritten: whoever lands first owns it.
+            var freshWrapped = ledgerKeys.CreateWrappedLek();
+            var touched = await db.Ledgers
+                .Where(l => l.Id == ledgerId && l.WrappedLek == null)
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(l => l.WrappedLek, freshWrapped)
+                    .SetProperty(l => l.LekKekId, ledgerKeys.CurrentKekId)
+                    .SetProperty(l => l.LekCreatedAt, DateTime.UtcNow),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            wrapped += touched;
+        }
+
+        return wrapped;
+    }
+
+    /// <summary>
     /// Lazy LEK backfill (ADR-0026 follow-through). Returns the
     /// ledger's wrapped LEK, generating one if the row pre-dates
     /// migration 035 and still carries NULL. Atomic against
     /// concurrent callers via a conditional UPDATE — whichever
     /// caller wins the race owns the LEK and subsequent callers
     /// read the surviving value.
+    ///
+    /// <para>Still needed alongside
+    /// <see cref="BackfillMissingWrappedLeksAsync"/>: an importer run can
+    /// create a ledger while the API is already up, so a NULL can appear
+    /// between boots.</para>
     /// </summary>
     /// <returns>The wrapped LEK bytes, or null if the ledger row
     /// itself doesn't exist (caller should have already passed a

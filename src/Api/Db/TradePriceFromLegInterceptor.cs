@@ -153,11 +153,16 @@ public sealed class TradePriceFromLegInterceptor : SaveChangesInterceptor
 
         // Trade shape: a priced security leg. A priceless leg (unit_price 0/NULL)
         // or a zero-quantity leg is not a trade.
+        //
+        // The leg's own price is NOT captured. It says only that this (security,
+        // day) needs re-deriving; migration 234's rule decides what the price is,
+        // reading every leg on the day rather than the one that happened to be
+        // saved.
         if (leg.SecurityId is not Guid securityId) return;
         if (leg.Quantity is not decimal qty || qty == 0m) return;
         if (leg.UnitPrice is not decimal price || price <= 0m) return;
 
-        snap.Add(leg.HeaderId, securityId, leg.LedgerId, price);
+        snap.Add(leg.HeaderId, securityId, leg.LedgerId);
     }
 
     // ----- post-save upsert -----
@@ -177,7 +182,7 @@ public sealed class TradePriceFromLegInterceptor : SaveChangesInterceptor
             .ToDictionaryAsync(h => h.Id, h => h.PostedAt, cancellationToken)
             .ConfigureAwait(false);
 
-        var trades = new List<(Guid LedgerId, Guid SecurityId, DateOnly Day, decimal Price)>();
+        var days = new List<(Guid LedgerId, Guid SecurityId, DateOnly Day)>();
         foreach (var leg in snap.Legs)
         {
             if (!postedAtByHeader.TryGetValue(leg.HeaderId, out var postedAt)) continue;
@@ -191,23 +196,23 @@ public sealed class TradePriceFromLegInterceptor : SaveChangesInterceptor
                 : postedAt.ToUniversalTime();
             var day = DateOnly.FromDateTime(utc);
 
-            trades.Add((leg.LedgerId, leg.SecurityId, day, leg.Price));
+            days.Add((leg.LedgerId, leg.SecurityId, day));
         }
 
-        if (trades.Count == 0) return;
+        if (days.Count == 0) return;
 
         var service = new TradePriceRecomputeService(db);
-        await service.UpsertAsync(trades, cancellationToken).ConfigureAwait(false);
+        await service.ReseedAsync(days, cancellationToken).ConfigureAwait(false);
     }
 
     // ----- per-context snapshot type -----
 
     private sealed class Snapshot
     {
-        public List<(Guid HeaderId, Guid SecurityId, Guid LedgerId, decimal Price)> Legs { get; }
+        public List<(Guid HeaderId, Guid SecurityId, Guid LedgerId)> Legs { get; }
             = new();
 
-        public void Add(Guid headerId, Guid securityId, Guid ledgerId, decimal price) =>
-            Legs.Add((headerId, securityId, ledgerId, price));
+        public void Add(Guid headerId, Guid securityId, Guid ledgerId) =>
+            Legs.Add((headerId, securityId, ledgerId));
     }
 }

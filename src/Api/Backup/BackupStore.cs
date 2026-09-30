@@ -22,14 +22,22 @@ public sealed partial class BackupStore
     // the random suffix only guards the rare same-millisecond filename clash.
     private const string TimestampFormat = "yyyyMMdd'T'HHmmssfff'Z'";
 
+    /// <summary>
+    /// The size each off-host part is cut to, from
+    /// <c>Api:Backup:PartSizeMb</c> (ADR-0101). Default 49 MB.
+    /// </summary>
+    public long PartSizeBytes { get; }
+
     private readonly string _directory;
     private readonly ILogger<BackupStore> _logger;
 
-    public BackupStore(string directory, ILogger<BackupStore> logger)
+    public BackupStore(string directory, ILogger<BackupStore> logger, long partSizeBytes)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(directory);
+        ArgumentOutOfRangeException.ThrowIfLessThan(partSizeBytes, 1);
         _directory = directory;
         _logger = logger;
+        PartSizeBytes = partSizeBytes;
     }
 
     /// <summary>
@@ -92,6 +100,59 @@ public sealed partial class BackupStore
         var path = ResolvePath(id);
         return path is null ? null : new FileStream(
             path, FileMode.Open, FileAccess.Read, FileShare.Read);
+    }
+
+    /// <summary>
+    /// How many files this artifact is pushed off-host as. One for anything at
+    /// or under <see cref="PartSizeBytes"/>.
+    /// </summary>
+    /// <remarks>
+    /// The artifact on disk is always ONE file — splitting happens only at the
+    /// boundary that needs it. Locally there is no size limit to clear, and a
+    /// single file is what an operator copying it out by hand wants; a download
+    /// is a RESPONSE, which no proxy caps the way it caps a request body.
+    /// </remarks>
+    public int PartCountFor(long sizeBytes) =>
+        sizeBytes <= PartSizeBytes
+            ? 1
+            : (int)((sizeBytes + PartSizeBytes - 1) / PartSizeBytes);
+
+    /// <summary>The filename a given part is stored under off-host.</summary>
+    /// <remarks>
+    /// <c>{id}.cofferbak.002-of-003</c>. The count is IN the name so a folder of
+    /// parts is self-describing: whoever is looking at the Drive folder — or has
+    /// just downloaded the set onto a laptop on the day the install is gone —
+    /// can see both the order and whether the set is complete, with no manifest
+    /// file to lose. It is also what lets the restore form accept the parts as
+    /// they were downloaded, in any order the file picker hands them over. A
+    /// single-part artifact keeps the plain <c>{id}.cofferbak</c> name, so
+    /// nothing about existing backups changes.
+    /// </remarks>
+    public static string PartName(string id, int part, int partCount) =>   // name only — no size involved
+        partCount <= 1
+            ? id + Extension
+            : string.Create(CultureInfo.InvariantCulture,
+                $"{id}{Extension}.{part:000}-of-{partCount:000}");
+
+    /// <summary>
+    /// Open one part of a stored artifact — a bounded window onto the single
+    /// file — or null when the id is unknown or the part is out of range.
+    /// Parts are 1-based; every part but the last is exactly
+    /// <see cref="PartSizeBytes"/> long, which is what lets a receiver check a
+    /// set is whole from the byte count alone.
+    /// </summary>
+    public Stream? OpenReadPart(string id, int part)
+    {
+        var path = ResolvePath(id);
+        if (path is null || part < 1) return null;
+
+        var size = new FileInfo(path).Length;
+        var count = PartCountFor(size);
+        if (part > count) return null;
+
+        var offset = (long)(part - 1) * PartSizeBytes;
+        var length = Math.Min(PartSizeBytes, size - offset);
+        return new PartStream(path, offset, length);
     }
 
     /// <summary>Delete one artifact. Idempotent — an unknown id returns false.</summary>
@@ -231,6 +292,80 @@ public sealed partial class BackupStore
         try { File.Delete(path); }
         catch (IOException ex) { _logger.LogWarning(ex, "Could not delete {Path}.", path); }
         catch (UnauthorizedAccessException ex) { _logger.LogWarning(ex, "Could not delete {Path}.", path); }
+    }
+
+    /// <summary>
+    /// A read-only window onto a byte range of a file. Seeded at
+    /// <c>offset</c> and length-capped, so a caller that streams it to a
+    /// response or an upload sees exactly one part and cannot read past it.
+    /// </summary>
+    private sealed class PartStream : Stream
+    {
+        private readonly FileStream _file;
+        private readonly long _length;
+        private long _position;
+
+        public PartStream(string path, long offset, long length)
+        {
+            _file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            _file.Seek(offset, SeekOrigin.Begin);
+            _length = length;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        // Known up front, so the response carries a Content-Length and the
+        // browser can show real progress rather than an indeterminate spinner.
+        public override long Length => _length;
+        public override long Position
+        {
+            get => _position;
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            Read(buffer.AsSpan(offset, count));
+
+        public override int Read(Span<byte> buffer)
+        {
+            var room = (int)Math.Min(buffer.Length, _length - _position);
+            if (room <= 0) return 0;
+            var read = _file.Read(buffer[..room]);
+            _position += read;
+            return read;
+        }
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var room = (int)Math.Min(buffer.Length, _length - _position);
+            if (room <= 0) return 0;
+            var read = await _file.ReadAsync(buffer[..room], cancellationToken).ConfigureAwait(false);
+            _position += read;
+            return read;
+        }
+
+        public override Task<int> ReadAsync(
+            byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) _file.Dispose();
+            base.Dispose(disposing);
+        }
+
+        public override async ValueTask DisposeAsync()
+        {
+            await _file.DisposeAsync().ConfigureAwait(false);
+            await base.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     [GeneratedRegex(@"^coffer-\d{8}T\d{9}Z-[0-9a-f]{8}$")]

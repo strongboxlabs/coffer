@@ -877,6 +877,48 @@ public sealed class SyntheticLedger
         }
     }
 
+    /// <summary>
+    /// Seed the <c>trade</c>-source <c>security_prices</c> rows that a real write
+    /// would have left behind, for every trade leg raw-seeded into this ledger.
+    /// </summary>
+    /// <remarks>
+    /// The same trap as <see cref="RecomputePostingCountsAsync"/>: raw seeds bypass
+    /// <c>TradePriceFromLegInterceptor</c>, so a fixture built from them has trade
+    /// legs and no prices — which the trade-prices consistency check reports as
+    /// drift, correctly. Call this wherever a fixture is meant to stand for a
+    /// CONSISTENT ledger; leave it out where the missing prices are the point.
+    /// <para>
+    /// Passes only the (security, day) keys: migration 234's rule decides the
+    /// price. Restating "last trade of the day" here in LINQ would make the
+    /// fixture a copy of the rule, free to drift from it and to agree with a
+    /// checker that is wrong.
+    /// </para>
+    /// </remarks>
+    public async Task RecomputeTradePricesAsync(CancellationToken cancellationToken = default)
+    {
+        await using var db = NewDbContext();
+        var rows = await db.TxnLegs.AsNoTracking()
+            .Where(l => l.LedgerId == LedgerId
+                     && l.SecurityId != null
+                     && l.Quantity != null && l.Quantity != 0m
+                     && l.UnitPrice != null && l.UnitPrice > 0m)
+            .Join(db.TxnHeaders.AsNoTracking().Where(h => !h.IsRecurringTemplate),
+                  l => l.HeaderId, h => h.Id,
+                  (l, h) => new { h.PostedAt, l.SecurityId })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var days = rows
+            .Select(r => (LedgerId,
+                          SecurityId: r.SecurityId!.Value,
+                          Day: DateOnly.FromDateTime(r.PostedAt)))
+            .Distinct();
+
+        await new TradePriceRecomputeService(db)
+            .ReseedAsync(days, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
     public async Task RecomputeBalancesAsync(
         IEnumerable<Guid> accountIds, CancellationToken cancellationToken = default)
     {

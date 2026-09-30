@@ -1279,6 +1279,23 @@ function RegisterTable({
         scrollRowIntoView: (localIndex) =>
             virtuosoRef.current?.scrollIntoView({ index: localIndex }),
         enabled: editingHeaderId === null && !isCreatingNew,
+        // ArrowRight expands a focused split parent, ArrowLeft collapses it —
+        // the conventional treegrid keys, previously unbound. #547 gave the
+        // split parent Enter-to-edit but left expansion reachable only by
+        // Tabbing to the toggle, which works and is not what a keyboard user
+        // reaches for on a disclosure row.
+        //
+        // No-ops deliberately when the row is not a split parent, or when it is
+        // already in the asked-for state: without preventDefault the browser
+        // keeps the key, so ArrowLeft on a collapsed row still does whatever it
+        // would otherwise do.
+        onExpandCollapseRow: (currentId, expand, e) => {
+            const row = displayRows.find((r) => displayRowId(r) === currentId);
+            if (row?.kind !== 'split-parent') return;
+            if (row.expanded === expand) return;
+            e.preventDefault();
+            onToggleGroupExpanded(row.groupId);
+        },
         onEnterRow: (currentId, e) => {
             // Enter opens the editor on the focused row — the keyboard twin
             // of double-click, which both editable shapes already wire to

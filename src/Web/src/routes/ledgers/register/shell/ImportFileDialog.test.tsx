@@ -84,7 +84,7 @@ describe('ImportFileDialog undo', () => {
         // the confirm can state a real number. A single click that deletes money is
         // not an affordance worth having.
         const undo = vi.spyOn(apiModule, 'undoImport').mockResolvedValue({
-            found: 47, edited: 0, deleted: 0, tooLarge: false,
+            found: 47, deleted: 0, tooLarge: false,
         });
 
         const { user } = await atResultStep();
@@ -104,7 +104,7 @@ describe('ImportFileDialog undo', () => {
         // "Confirm undo" sitting beside "Import another" and "Done" — one mis-click
         // from deleting the rows, with no way back but closing the dialog.
         const undo = vi.spyOn(apiModule, 'undoImport').mockResolvedValue({
-            found: 47, edited: 0, deleted: 0, tooLarge: false,
+            found: 47, deleted: 0, tooLarge: false,
         });
 
         const { user } = await atResultStep();
@@ -122,28 +122,18 @@ describe('ImportFileDialog undo', () => {
         expect(undo.mock.calls[0]?.[2]).toMatchObject({ dryRun: true });
     });
 
-    it('says how many of the rows have been edited since', async () => {
-        // An undo that silently discards someone's edits is the kind of helpful
-        // delete nobody forgives.
+    it('never warns about edits — this dialog just did the import', async () => {
+        // The confirm used to carry "N of them have been edited since — those
+        // edits will be lost". Removed 2026-09-25: undo is offered here, in the
+        // modal that performed the import, so nobody has had the chance to edit
+        // anything. The count was reliably zero and the sentence only added
+        // doubt to an action the user had just chosen.
+        //
+        // Anchored on the confirm copy first, which appears only once the dry
+        // run resolves — so the absence below is judged on a settled frame and
+        // not on a pending one.
         vi.spyOn(apiModule, 'undoImport').mockResolvedValue({
-            found: 47, edited: 3, deleted: 0, tooLarge: false,
-        });
-
-        const { user } = await atResultStep();
-        await user.click(screen.getByRole('button', { name: /undo this import/i }));
-
-        const confirm = await screen.findByRole('alert');
-        // The consequence, not just the count: undo hard-deletes, so those edits go.
-        expect(confirm.textContent)
-            .toMatch(/3 of them have been edited since .+ those edits will be lost/i);
-    });
-
-    it('does not warn about edits when there are none', async () => {
-        // Keeps the test above from passing on a component that always shows the
-        // warning. Anchored on the confirm copy, which only appears once the dry run
-        // has resolved, so the absence below is judged on a settled frame.
-        vi.spyOn(apiModule, 'undoImport').mockResolvedValue({
-            found: 47, edited: 0, deleted: 0, tooLarge: false,
+            found: 47, deleted: 0, tooLarge: false,
         });
 
         const { user } = await atResultStep();
@@ -152,12 +142,13 @@ describe('ImportFileDialog undo', () => {
         const confirm = await screen.findByRole('alert');
         expect(confirm.textContent).toMatch(/remove 47 transactions/i);
         expect(confirm.textContent).not.toMatch(/edited since/i);
+        expect(confirm.textContent).not.toMatch(/edits will be lost/i);
     });
 
     it('removes the rows only after the confirm, and names the real recovery', async () => {
         const undo = vi.spyOn(apiModule, 'undoImport')
-            .mockResolvedValueOnce({ found: 47, edited: 0, deleted: 0, tooLarge: false })
-            .mockResolvedValueOnce({ found: 47, edited: 0, deleted: 47, tooLarge: false });
+            .mockResolvedValueOnce({ found: 47, deleted: 0, tooLarge: false })
+            .mockResolvedValueOnce({ found: 47, deleted: 47, tooLarge: false });
 
         const { user } = await atResultStep();
         await user.click(screen.getByRole('button', { name: /undo this import/i }));
@@ -188,8 +179,8 @@ describe('ImportFileDialog undo', () => {
         // Asserting the API call and the copy was not enough: both were right while
         // the visible consequence was wrong.
         vi.spyOn(apiModule, 'undoImport')
-            .mockResolvedValueOnce({ found: 47, edited: 0, deleted: 0, tooLarge: false })
-            .mockResolvedValueOnce({ found: 47, edited: 0, deleted: 47, tooLarge: false });
+            .mockResolvedValueOnce({ found: 47, deleted: 0, tooLarge: false })
+            .mockResolvedValueOnce({ found: 47, deleted: 47, tooLarge: false });
 
         const { user, onUndone } = await atResultStep();
         await user.click(screen.getByRole('button', { name: /undo this import/i }));
@@ -204,7 +195,7 @@ describe('ImportFileDialog undo', () => {
 
     it('refuses an import too large to undo without pretending to try', async () => {
         vi.spyOn(apiModule, 'undoImport').mockResolvedValue({
-            found: 20000, edited: 0, deleted: 0, tooLarge: true,
+            found: 20000, deleted: 0, tooLarge: true,
         });
 
         const { user } = await atResultStep();

@@ -433,6 +433,18 @@ export function InvestmentRegisterPage() {
             virtuosoRef.current?.scrollIntoView({ index: localIndex }),
         enabled: editingHeaderId === null && !isCreatingNew,
         onCreate: startCreate,
+        // ArrowRight / ArrowLeft expand and collapse a focused split parent,
+        // matching bank. A target-split cluster is read-only for EDITING, but
+        // its legs are still worth opening, so expansion is bound here too.
+        // No-op when the row is not a disclosure row or is already in the
+        // asked-for state — leaving the default intact.
+        onExpandCollapseRow: (currentId, expand, e) => {
+            const row = displayRows.find((r) => displayRowId(r) === currentId);
+            if (row?.kind !== 'split-parent') return;
+            if (row.expanded === expand) return;
+            e.preventDefault();
+            toggleGroupExpanded(row.groupId);
+        },
         onEnterRow: (currentId, e) => {
             const row = displayRows.find((r) => displayRowId(r) === currentId);
             // Only flat originating-side `txn` rows are editable. A

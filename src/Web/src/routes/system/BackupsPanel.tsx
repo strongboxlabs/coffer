@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import {
+    BACKUPS_QUERY_KEY,
     createBackup,
     deleteBackup,
     downloadBackup,
@@ -15,6 +16,7 @@ import {
     unpinBackup,
 } from '@/lib/api';
 import { errorMessage } from '@/lib/errorMessage';
+import { formatBytes } from '@/lib/format';
 import type { BackupRetention, BackupSummary } from '@/lib/types';
 import { Button } from '@/components/ui/Button';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
@@ -26,7 +28,9 @@ import { GoogleDriveSyncCard } from './components/GoogleDriveSyncCard';
 import { RestoreBackupCard } from './components/RestoreBackupCard';
 import { SetBackupPassphraseDialog } from './components/SetBackupPassphraseDialog';
 
-const BACKUPS_KEY = ['admin-backups'] as const;
+// Re-exported name for the shared key — the restore card reads the same
+// entry, so an invalidation here reaches it too.
+const BACKUPS_KEY = BACKUPS_QUERY_KEY;
 const SCHEDULE_KEY = ['admin-backup-schedule'] as const;
 
 /**
@@ -47,6 +51,16 @@ export function BackupsPanel() {
     const [passphraseOpen, setPassphraseOpen] = useState(false);
     const [deleteTarget, setDeleteTarget] = useState<BackupSummary | null>(null);
     const [actionError, setActionError] = useState<string | null>(null);
+    /**
+     * What just succeeded, said out loud.
+     *
+     * Creating a backup used to confirm nothing: a row appeared somewhere in a
+     * list that already had rows, after a pause long enough to wonder whether
+     * the click registered. Failure was announced and success was not, which
+     * leaves the one outcome you most want to be sure of as the one you have
+     * to infer.
+     */
+    const [actionNotice, setActionNotice] = useState<string | null>(null);
     /** Revealed backup passphrase (ADR-0092 D7). Component state only — never the
      *  query cache, and dropped when the panel unmounts. */
     const [revealedPassphrase, setRevealedPassphrase] = useState<string | null>(null);
@@ -58,17 +72,28 @@ export function BackupsPanel() {
 
     const createMutation = useMutation({
         mutationFn: createBackup,
-        onSuccess: () => {
+        onSuccess: (created) => {
             setActionError(null);
+            // Names the artifact's size, so it is unambiguous WHICH row is the
+            // new one and obvious that real bytes were written — an empty or
+            // truncated dump would say so here.
+            setActionNotice(`Backup created — ${formatBytes(created.sizeBytes)}.`);
             queryClient.invalidateQueries({ queryKey: BACKUPS_KEY });
         },
-        onError: (err) => setActionError(errorMessage(err, 'Backup failed.')),
+        onError: (err) => {
+            setActionNotice(null);
+            setActionError(errorMessage(err, 'Backup failed.'));
+        },
     });
 
     const deleteMutation = useMutation({
         mutationFn: (id: string) => deleteBackup(id),
         onSuccess: () => {
             setActionError(null);
+            // Cleared rather than replaced: the deleted row vanishing is its
+            // own confirmation, and leaving "Backup created" sitting above a
+            // list you have just deleted from would describe the wrong thing.
+            setActionNotice(null);
             queryClient.invalidateQueries({ queryKey: BACKUPS_KEY });
         },
         onError: (err) => setActionError(errorMessage(err, 'Delete failed.')),
@@ -87,6 +112,7 @@ export function BackupsPanel() {
         mutationFn: ({ id, pin }: { id: string; pin: boolean }) => (pin ? pinBackup(id) : unpinBackup(id)),
         onSuccess: () => {
             setActionError(null);
+            setActionNotice(null);
             queryClient.invalidateQueries({ queryKey: BACKUPS_KEY });
         },
         onError: (err) => setActionError(errorMessage(err, 'Could not change the pin.')),
@@ -204,6 +230,10 @@ export function BackupsPanel() {
 
             {actionError !== null ? (
                 <p role="alert" className="text-xs text-state-danger">{actionError}</p>
+            ) : null}
+
+            {actionNotice !== null ? (
+                <p role="status" className="text-xs text-state-success">{actionNotice}</p>
             ) : null}
 
             {backupsQuery.isPending ? (
@@ -445,11 +475,4 @@ function formatDateTime(iso: string): string {
     return new Intl.DateTimeFormat(undefined, {
         month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit',
     }).format(new Date(iso));
-}
-
-function formatBytes(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }

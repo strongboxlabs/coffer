@@ -153,7 +153,19 @@ public sealed record SecurityPriceRowDto(
     decimal? Low,
     long? Volume,
     /// <summary>Price origin (ADR-0054 D2 / ADR-0070): import | fetch | manual | simplefin.</summary>
-    string Source);
+    string Source,
+    /// <summary>
+    /// The row says a trade produced it, and no trade currently does — usually
+    /// because that trade was deleted or edited since (migration 240).
+    /// </summary>
+    /// <remarks>
+    /// ADVISORY. <c>security_prices</c> records THAT a trade wrote a row and
+    /// never WHICH one, so this is inferred by re-deriving and finding nothing;
+    /// ADR-0084 D4 keeps the price a deleted trade left behind on purpose, so a
+    /// flagged row may be perfectly correct. Editing it makes it <c>manual</c>
+    /// and clears the flag; deleting it removes the row.
+    /// </remarks>
+    bool Unbacked);
 
 /// <summary>Cursor-paginated prices page (matches the transactions shape).</summary>
 public sealed record SecurityPricesPage(

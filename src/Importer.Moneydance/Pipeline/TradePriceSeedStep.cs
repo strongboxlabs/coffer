@@ -60,7 +60,12 @@ internal sealed class TradePriceSeedStep
                   AND l.unit_price IS NOT NULL
                   AND l.unit_price > 0
                   AND h.is_recurring_template = FALSE
-                ORDER BY l.security_id, (h.posted_at AT TIME ZONE 'UTC')::date, h.seq DESC
+                -- Identical to fn_trade_price_for_day (migration 234). Without the
+                -- last two columns a header carrying several security legs ties on
+                -- seq and Postgres picks arbitrarily, so the importer could seed a
+                -- price the checker would never derive.
+                ORDER BY l.security_id, (h.posted_at AT TIME ZONE 'UTC')::date,
+                         h.seq DESC, abs(l.amount) DESC, l.id DESC
                 ON CONFLICT (security_id, price_date) DO UPDATE
                     SET price         = EXCLUDED.price,
                         source        = 'trade',

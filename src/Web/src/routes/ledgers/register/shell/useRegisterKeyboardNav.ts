@@ -57,6 +57,22 @@ export interface UseRegisterKeyboardNavArgs<Row> {
     /** Optional `N`-to-create handler. When omitted (investment),
      *  the `N` shortcut is not bound. */
     onCreate?: () => void;
+    /** Optional ArrowRight / ArrowLeft handler for disclosure rows —
+     *  `expand` is true for ArrowRight, false for ArrowLeft. These are the
+     *  conventional treegrid expand/collapse keys, and before this they were
+     *  unbound everywhere in the SPA: a split parent could only be opened from
+     *  the keyboard by Tabbing to its toggle.
+     *
+     *  Same contract as `onEnterRow`, deliberately: the page resolves the id,
+     *  decides whether the row is a disclosure row AND whether the state would
+     *  actually change, and calls `e.preventDefault()` itself only when it
+     *  acts. A press that changes nothing must leave the default intact —
+     *  ArrowLeft on an already-collapsed row is the browser's to handle. */
+    onExpandCollapseRow?: (
+        focusedRowId: string,
+        expand: boolean,
+        e: globalThis.KeyboardEvent,
+    ) => void;
 }
 
 export interface UseRegisterKeyboardNavResult {
@@ -79,6 +95,7 @@ export function useRegisterKeyboardNav<Row>({
     enabled,
     onEnterRow,
     onCreate,
+    onExpandCollapseRow,
 }: UseRegisterKeyboardNavArgs<Row>): UseRegisterKeyboardNavResult {
     const [focusedRowId, setFocusedRowIdState] = useState<string | null>(null);
     // Mirror of focusedRowId in a ref so rapid-fire keydown handlers
@@ -211,11 +228,27 @@ export function useRegisterKeyboardNav<Row>({
                 if (!enabled) return;
                 e.preventDefault();
                 moveFocus(-1);
+            } else if (
+                onExpandCollapseRow
+                && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')
+            ) {
+                if (isTypingTarget) return;
+                if (!enabled) return;
+                // Both guards are the ones the Enter branch learned the hard
+                // way, and they matter here for the same reason: a row carries
+                // buttons, and arrows are how a focused control moves between
+                // its own options. Acting as well would make one keypress do
+                // two things.
+                if (e.defaultPrevented) return;
+                if (tag === 'BUTTON') return;
+                const currentId = focusedRowIdRef.current;
+                if (currentId === null) return;
+                onExpandCollapseRow(currentId, e.key === 'ArrowRight', e);
             }
         }
         document.addEventListener('keydown', onDocKeyDown);
         return () => document.removeEventListener('keydown', onDocKeyDown);
-    }, [enabled, onCreate, onEnterRow, moveFocus]);
+    }, [enabled, onCreate, onEnterRow, onExpandCollapseRow, moveFocus]);
 
     return { focusedRowId, setFocusedRowId, focusedRowIdRef, moveFocus };
 }

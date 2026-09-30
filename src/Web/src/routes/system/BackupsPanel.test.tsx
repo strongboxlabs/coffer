@@ -5,6 +5,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 import { BackupsPanel } from './BackupsPanel';
 import * as apiModule from '@/lib/api';
+// The panel reaches the API through the barrel; the RestoreBackupCard it
+// renders imports from the backup module directly. Both now read ONE query
+// entry (BACKUPS_QUERY_KEY), so whichever mounts first supplies the fetcher
+// for it — and a spy on only one of the two bindings leaves the other live,
+// which in jsdom means a real request that never settles.
+import * as backupModule from '@/lib/api/backup';
 import type { BackupSchedule, BackupSummary } from '@/lib/types';
 
 // Smoke tests for the admin Backups panel (ADR-0060). Behaviour locked down:
@@ -35,6 +41,9 @@ describe('BackupsPanel', () => {
 
     it('gates create + schedule until a passphrase is set', async () => {
         vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchRestoreLimits')
+            .mockResolvedValue({ partSizeBytes: 49 * 1024 * 1024 });
         vi.spyOn(apiModule, 'fetchBackupSchedule').mockResolvedValue(SCHEDULE_OFF);
 
         renderPanel();
@@ -54,6 +63,9 @@ describe('BackupsPanel', () => {
             { id: 'coffer-20260623T031500000Z-0a1b2c3d', sizeBytes: 2048, createdAtUtc: '2026-06-23T03:15:00Z', pinned: false },
         ];
         vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue(backups);
+        vi.spyOn(backupModule, 'fetchBackups').mockResolvedValue(backups);
+        vi.spyOn(backupModule, 'fetchRestoreLimits')
+            .mockResolvedValue({ partSizeBytes: 49 * 1024 * 1024 });
         vi.spyOn(apiModule, 'fetchBackupSchedule').mockResolvedValue({
             ...SCHEDULE_OFF, passphraseConfigured: true,
         });
@@ -64,9 +76,13 @@ describe('BackupsPanel', () => {
         expect(await screen.findByRole('button', { name: /change/i })).toBeInTheDocument();
         expect(screen.getByRole('button', { name: /create backup/i })).toBeEnabled();
 
-        // The artifact row renders with a Download action and its size.
-        expect(await screen.findByRole('button', { name: /download/i })).toBeInTheDocument();
-        expect(screen.getByText(/2\.0 KB/)).toBeInTheDocument();
+        // The artifact row renders with a Download action and its size. Scoped
+        // to the row: the restore picker below lists the same backup with the
+        // same size, so an unscoped query now matches twice.
+        const download = await screen.findByRole('button', { name: /download/i });
+        const row = download.closest('li');
+        expect(row).not.toBeNull();
+        expect(within(row!).getByText(/2\.0 KB/)).toBeInTheDocument();
 
         // Restore-from-backup is now an in-app admin action (ADR-0071 D3).
         expect(screen.getByRole('button', { name: /restore database/i })).toBeInTheDocument();
@@ -74,6 +90,9 @@ describe('BackupsPanel', () => {
 
     it('offers Show only once a passphrase exists (ADR-0092 D7)', async () => {
         vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchRestoreLimits')
+            .mockResolvedValue({ partSizeBytes: 49 * 1024 * 1024 });
         vi.spyOn(apiModule, 'fetchBackupSchedule').mockResolvedValue(SCHEDULE_OFF);
 
         renderPanel();
@@ -89,6 +108,9 @@ describe('BackupsPanel', () => {
         // way to look it up, a forgotten one meant every backup silently became
         // unrestorable.
         vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchRestoreLimits')
+            .mockResolvedValue({ partSizeBytes: 49 * 1024 * 1024 });
         vi.spyOn(apiModule, 'fetchBackupSchedule').mockResolvedValue({
             ...SCHEDULE_OFF, passphraseConfigured: true,
         });
@@ -115,6 +137,9 @@ describe('BackupsPanel', () => {
         // Leaving the OLD value on screen after a change is actively misleading — the
         // operator would copy it straight into their password manager.
         vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchRestoreLimits')
+            .mockResolvedValue({ partSizeBytes: 49 * 1024 * 1024 });
         vi.spyOn(apiModule, 'fetchBackupSchedule').mockResolvedValue({
             ...SCHEDULE_OFF, passphraseConfigured: true,
         });
@@ -142,6 +167,9 @@ describe('BackupsPanel', () => {
 
     it('surfaces a refused reveal without showing anything', async () => {
         vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchRestoreLimits')
+            .mockResolvedValue({ partSizeBytes: 49 * 1024 * 1024 });
         vi.spyOn(apiModule, 'fetchBackupSchedule').mockResolvedValue({
             ...SCHEDULE_OFF, passphraseConfigured: true,
         });
@@ -155,5 +183,36 @@ describe('BackupsPanel', () => {
         await user.click(await screen.findByRole('button', { name: /^show$/i }));
 
         expect(await screen.findByText(/timed out or was not allowed/i)).toBeInTheDocument();
+    });
+
+    it('confirms a created backup, naming its size', async () => {
+        // Creating one used to announce nothing: a row appeared somewhere in a
+        // list that already had rows, after a pause long enough to wonder
+        // whether the click registered. Failure was announced and success was
+        // not, leaving the outcome you most want to be sure of as the one you
+        // had to infer.
+        vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchRestoreLimits')
+            .mockResolvedValue({ partSizeBytes: 49 * 1024 * 1024 });
+        vi.spyOn(apiModule, 'fetchBackupSchedule').mockResolvedValue({
+            ...SCHEDULE_OFF, passphraseConfigured: true,
+        });
+        vi.spyOn(apiModule, 'createBackup').mockResolvedValue({
+            id: 'coffer-20260929T130600000Z-0a1b2c3d',
+            sizeBytes: 22.2 * 1024 * 1024,
+            createdAtUtc: '2026-09-29T13:06:00Z',
+            pinned: false,
+        });
+        const user = userEvent.setup();
+        renderPanel();
+
+        await user.click(await screen.findByRole('button', { name: /create backup/i }));
+
+        // The size is part of the confirmation: it says real bytes were
+        // written, which an empty or truncated dump would not.
+        const notice = await screen.findByRole('status');
+        expect(notice).toHaveTextContent(/backup created/i);
+        expect(notice).toHaveTextContent(/22\.2 MB/);
     });
 });

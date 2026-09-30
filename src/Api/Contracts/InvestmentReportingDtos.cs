@@ -189,7 +189,18 @@ public sealed record SecurityInfo(
     string? TaxCharacter,
     bool IsActive);
 
-public sealed record PricePoint(DateOnly PriceDate, decimal Price, decimal? High, decimal? Low, long? Volume);
+/// <param name="Source">Where the price came from (ADR-0054 D2 / ADR-0070):
+/// <c>import</c>, <c>fetch</c>, <c>manual</c>, <c>simplefin</c> or
+/// <c>trade</c>. Without it a reader cannot tell a figure someone typed from a
+/// quote-feed close from one derived off a transaction, which are not equally
+/// trustworthy.</param>
+/// <param name="Unbacked">The row says a trade produced it and no trade
+/// currently does. ADVISORY — it may still be correct, since ADR-0084 D4 keeps
+/// the price a deleted trade left behind, and nothing records WHICH transaction
+/// wrote a price, so this is inferred.</param>
+public sealed record PricePoint(
+    DateOnly PriceDate, decimal Price, decimal? High, decimal? Low, long? Volume,
+    string Source, bool Unbacked);
 
 /// <summary>Group dimension for investment income.</summary>
 public enum InvestmentIncomeGroupBy { Security, Account }

@@ -222,6 +222,13 @@ services:
       # COFFER_MCP_ENABLED=true in .env to expose /mcp + the Connected-apps
       # token UI for AI clients (Claude, etc.).
       COFFER_API__Mcp__Enabled: ${COFFER_MCP_ENABLED:-false}
+      # How large a piece a backup is cut into when it has to cross a boundary
+      # that caps request size — an off-host upload, or a restore coming back in
+      # (ADR-0101). Default 49 MB: under Cloudflare's 100 MB proxied-body cap,
+      # which is NOT raisable on Free or Pro, and under the common 50 MB limits.
+      # Lower it if something in front of Coffer is stricter; lowering it is also
+      # how you exercise the split path on a small ledger.
+      COFFER_API__Backup__PartSizeMb: ${COFFER_BACKUP_PART_SIZE_MB:-49}
       # Workstation GC (memory-footprint tuning). Server GC — the ASP.NET Core
       # default — allocates a heap per logical CPU and is lazy about returning
       # memory, so on a multi-core host with no pressure the process climbs to

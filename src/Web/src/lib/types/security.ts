@@ -142,8 +142,12 @@ export interface SecurityPriceRow {
     high: number | null;
     low: number | null;
     volume: number | null;
-    /** Price origin: 'import' | 'fetch' | 'manual' | 'simplefin'. */
+    /** Price origin: 'import' | 'fetch' | 'manual' | 'simplefin' | 'trade'. */
     source: string;
+    /** The row says a trade produced it and none currently does. Advisory: it
+     *  may still be correct — a price left behind by a deleted trade is kept on
+     *  purpose. Editing the row makes it `manual` and clears this. */
+    unbacked: boolean;
 }
 
 export interface SecurityPricesPage {

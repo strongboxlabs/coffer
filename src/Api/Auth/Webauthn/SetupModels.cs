@@ -16,7 +16,14 @@ namespace Coffer.Api.Auth.Webauthn;
 /// ledger?"), and ledgers are created afterwards from the hub. The endpoint
 /// remains because token validation is its real job.
 /// </remarks>
-public sealed record SetupInfoResponse();
+/// <param name="RestorePartSizeBytes">
+/// The size the setup page must cut a restore artifact into when it is too
+/// large to send in one request (ADR-0101), from <c>Api:Backup:PartSizeMb</c>.
+/// Carried on this response because the pre-auth page has no other read to get
+/// it from, and a hardcoded value would make the setting silently not apply to
+/// the one restore path that has no fallback.
+/// </param>
+public sealed record SetupInfoResponse(long RestorePartSizeBytes);
 
 /// <summary>
 /// JSON request body for <c>POST /api/auth/setup/{token}/begin</c>. The

@@ -264,6 +264,30 @@ public sealed class BackupOptions
     // backup_settings (ADR-0074), no longer a startup option — see
     // BackupSettingsRepository.
 
+    /// <summary>
+    /// The size, in MB, each piece is cut to when a backup is sent somewhere
+    /// that caps how much can arrive in one request — an off-host upload, or a
+    /// restore coming back in (ADR-0101). Default 49.
+    /// </summary>
+    /// <remarks>
+    /// Configurable because the caps it exists to clear differ per deployment
+    /// and several cannot be raised at all: Cloudflare refuses a proxied body
+    /// over 100 MB on Free and Pro, and that is not a setting. 49 clears both
+    /// that and the common 50 MB limits, with room for multipart framing.
+    /// <para>Lowering it is also the only way to exercise the split path on a
+    /// small ledger, where a backup would otherwise never reach one part —
+    /// a feature that cannot be tried without recompiling does not get tried.</para>
+    /// <para>Safe to change at any time. A part set already written off-host
+    /// carries its own count in its filenames, and an upload in flight is
+    /// validated against the size the CLIENT declares, so neither is read back
+    /// through this value.</para>
+    /// </remarks>
+    public int PartSizeMb { get; init; } = 49;
+
+    /// <summary><see cref="PartSizeMb"/> in bytes, floored at 1 MB so a
+    /// mistyped 0 cannot mean "every byte is its own part".</summary>
+    public long PartSizeBytes => Math.Max(1, PartSizeMb) * 1024L * 1024L;
+
     /// <summary><c>pg_dump --compress</c> value for the custom-format dump
     /// (ADR-0062). Default <c>zstd</c> — ~10% smaller than the historical zlib at
     /// similar/faster speed; PG16 restore reads it. Set e.g. <c>zstd:19</c> for a

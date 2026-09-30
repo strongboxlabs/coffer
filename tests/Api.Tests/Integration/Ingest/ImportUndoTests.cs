@@ -302,40 +302,6 @@ public sealed class ImportUndoTests
     }
 
     [Fact]
-    public async Task Undo_reports_how_many_rows_the_user_has_since_edited()
-    {
-        // An undo that silently discards someone's edits is the kind of helpful delete
-        // nobody forgives. The count is reported, never used to refuse — whose edits
-        // they are is the user's call.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
-        using var client = await AuthedClientAsync(factory, ledger);
-
-        var import = await ImportAsync(client, ledger.LedgerId, brokerage.Id);
-
-        Guid editedId;
-        await using (var seed = _fixture.NewDbContext())
-        {
-            editedId = (await seed.TxnHeaders
-                .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif")
-                .OrderBy(h => h.PostedAt)
-                .FirstAsync()).Id;
-        }
-        // Through the fixture helper, which produces the same state a real edit
-        // does (mig 230: the header takes the new value, its feed values are
-        // captured to txn_header_originals) — the count keys on that capture.
-        await ledger.EditHeaderAsync(editedId, payee: "renamed by hand");
-
-        var resp = await client.PostAsync(
-            UndoUrl(ledger.LedgerId, import.SyncRunId, dryRun: true), null);
-        var result = await resp.Content.ReadFromJsonAsync<UndoImportResult>();
-
-        Assert.Equal(2, result!.Found);
-        Assert.Equal(1, result.Edited);
-    }
-
-    [Fact]
     public async Task An_import_into_another_ledger_cannot_be_undone_from_this_one()
     {
         // Defence in depth over RLS: the lookup is keyed on ledger_id too, so a guessed

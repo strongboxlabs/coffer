@@ -18,7 +18,21 @@ public sealed record SnapshotSummaryDto(
     string SchemaVersion,
     /// <summary>Uncompressed JSON size in bytes. The SPA renders this
     /// as "47 MB before compression" on the snapshots panel.</summary>
-    int ContentSizeUncompressed);
+    int ContentSizeUncompressed,
+    /// <summary>
+    /// Whether a restore of this snapshot could succeed right now — that is,
+    /// whether <see cref="SchemaVersion"/> still matches the live schema
+    /// (ADR-0037 Phase 1 refuses a cross-version restore).
+    ///
+    /// <para>Computed SERVER-side on purpose. The refusal rule lives in
+    /// LedgerSnapshotsRepository, and a SPA that re-derived it by comparing
+    /// against /api/meta/version would be a second implementation of the same
+    /// rule, free to drift from the one that actually decides. The panel used
+    /// to offer Restore on every row and let the server refuse after the
+    /// confirm — the user learned their pre-upgrade snapshot was worthless at
+    /// the moment they needed it.</para>
+    /// </summary>
+    bool Restorable);
 
 /// <summary>Response shape for the create endpoint. Mirrors the
 /// summary DTO plus a sentinel for the SkippedDueToFullPool outcome

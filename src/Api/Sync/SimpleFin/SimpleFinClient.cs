@@ -21,7 +21,7 @@ namespace Coffer.Api.Sync.SimpleFin;
 ///     read after exchange, used to populate
 ///     <c>feed_connections.institution_name</c> for the wizard.
 ///   • <see cref="GetAccountsWithTransactionsAsync"/> — full sync
-///     pull, called from <see cref="SimpleFinSyncService"/>.
+///     pull, called from <see cref="Coffer.Api.Ingest.SimpleFin.SimpleFinPullProvider"/>.
 /// </summary>
 /// <remarks>
 /// <para>The <see cref="HttpClient"/> instance is obtained via
@@ -96,8 +96,8 @@ public sealed class SimpleFinClient
 
         using var request = new HttpRequestMessage(HttpMethod.Post, claimUrl);
         request.Content = new ByteArrayContent(Array.Empty<byte>());
-        var response = await _http.SendAsync(request, cancellationToken)
-                                  .ConfigureAwait(false);
+        var response = await SendOrFaultAsync(request, "setup-token exchange", cancellationToken)
+            .ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
         {
             throw new SimpleFinException(
@@ -185,7 +185,7 @@ public sealed class SimpleFinClient
     /// <summary>
     /// Fetch every account on the SimpleFIN feed + its transactions
     /// since <paramref name="startDate"/>. The full sync path; called
-    /// from <see cref="SimpleFinSyncService"/> on a Sync-now click.
+    /// from <see cref="Coffer.Api.Ingest.SimpleFin.SimpleFinPullProvider"/> on a Sync-now click.
     /// </summary>
     /// <param name="accessUrl">Plaintext SimpleFIN access URL.
     /// Caller has already unwrapped it from the sealed column on
@@ -241,8 +241,8 @@ public sealed class SimpleFinClient
         using var request = new HttpRequestMessage(HttpMethod.Get, uri.NoCredentials);
         request.Headers.Authorization = uri.AuthHeader;
 
-        var response = await _http.SendAsync(request, cancellationToken)
-                                  .ConfigureAwait(false);
+        var response = await SendOrFaultAsync(request, "/accounts fetch", cancellationToken)
+            .ConfigureAwait(false);
 
         // Defensive: 403 is a distinct outcome — the access URL is
         // revoked / expired. NOT an exception; caller flips the
@@ -518,4 +518,43 @@ public sealed class SimpleFinClient
         }
         return Encoding.UTF8.GetString(Convert.FromBase64String(s));
     }
+
+    /// <summary>
+    /// Send a request, turning a transport failure into a
+    /// <see cref="SimpleFinException"/>.
+    /// </summary>
+    /// <remarks>
+    /// Every provider fault has to arrive as this type, because it is the only one
+    /// the ingest orchestrator catches — and that catch is what stamps the run
+    /// <c>failed</c>. A raw <see cref="TaskCanceledException"/> from an HttpClient
+    /// timeout unwound past it, leaving the row <c>running</c> with no
+    /// <c>completed_at</c>; the partial unique index then rejected every later sync
+    /// on that connection as "already running", so a single timeout wedged the feed
+    /// and the four-hourly schedule failed against it silently from then on.
+    /// <para>
+    /// The <c>when</c> guard keeps a GENUINE cancellation — host shutdown, client
+    /// disconnect — distinguishable from a timeout. Only the timeout is a provider
+    /// fault; a real cancellation must keep unwinding as cancellation.
+    /// </para>
+    /// </remarks>
+    private async Task<HttpResponseMessage> SendOrFaultAsync(
+        HttpRequestMessage request, string what, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+        catch (TaskCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new SimpleFinException(
+                $"SimpleFIN {what} timed out. The provider did not respond in time; "
+                + "the operation was not completed.", ex);
+        }
+        catch (HttpRequestException ex)
+        {
+            throw new SimpleFinException(
+                $"SimpleFIN {what} could not reach the provider: {ex.Message}", ex);
+        }
+    }
+
 }

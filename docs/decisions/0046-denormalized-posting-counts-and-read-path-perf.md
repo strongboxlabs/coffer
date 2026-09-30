@@ -110,10 +110,9 @@ workload, not debt:
   off vs ~1755 ms on. Lifting `jit = off` would only regress reports.
 
 So `jit = off` stays, reclassified from interim stopgap to deliberate
-configuration. Rationale lives at the `ALTER ROLE` line in
-`db/init/00-init-roles.sh`; the follow-up
-(`docs/maintainer/follow-ups.md` "View join cost + role-level JIT-off workaround")
-is marked RESOLVED with the measurement table.
+configuration. Rationale and the measurement table live at the `ALTER ROLE`
+line in `db/init/00-init-roles.sh`. The follow-up entry that tracked this was
+resolved and deleted, per that file's lifecycle.
 
 ## Consequences
 

@@ -59,8 +59,54 @@ public static class SetupEndpoints
         // bootstrap-token-gated like the rest of setup; multipart upload, so opt
         // out of antiforgery (the token is the auth).
         group.MapPost("/restore", RestoreFromBackupAsync).DisableAntiforgery();
+        // ...and the same restore sent in pieces, for an artifact too big to
+        // arrive in one request (ADR-0101). This is the path that needs it MOST:
+        // a fresh install restoring from a copy kept off-host is exactly the
+        // case where the machine is gone and the only route back is an upload
+        // through whatever proxy the operator has just stood up.
+        group.MapPost("/restore/parts", RestorePartAsync).DisableAntiforgery();
 
         return routes;
+    }
+
+    /// <summary>
+    /// <c>POST /api/auth/setup/{token}/restore/parts</c> (ADR-0101) — receive
+    /// one piece of a restore artifact too large to send in one request.
+    /// </summary>
+    /// <remarks>
+    /// Gated by the same unconsumed bootstrap token as the rest of setup, and
+    /// nothing here is destructive: parts accumulate in staging, and only the
+    /// <c>/restore</c> call that names them stages an actual restore.
+    /// <para>The ordering and size rules are the admin path's, for the reason
+    /// given there: a mis-assembled archive fails to decrypt, and a decrypt
+    /// failure is reported as a wrong passphrase. On a fresh install, being
+    /// sent to look at the passphrase would be a dead end — there is no second
+    /// copy of anything to check it against.</para>
+    /// </remarks>
+    private static async Task<IResult> RestorePartAsync(
+        string token,
+        HttpRequest request,
+        ServiceDbContextFactory serviceFactory,
+        CancellationToken cancellationToken)
+    {
+        await using (var db = serviceFactory.Create())
+        {
+            if (!await IsTokenValidAsync(db, token, cancellationToken).ConfigureAwait(false))
+                return Results.Problem("Invalid or expired bootstrap token.",
+                    statusCode: StatusCodes.Status401Unauthorized);
+        }
+
+        if (!request.HasFormContentType)
+            return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
+                "Send multipart/form-data with 'archive', 'part', 'partCount' and 'partSizeBytes'.");
+
+        var sizeFeature = request.HttpContext.Features.Get<IHttpMaxRequestBodySizeFeature>();
+        if (sizeFeature is { IsReadOnly: false }) sizeFeature.MaxRequestBodySize = null;
+
+        var form = await request.ReadFormAsync(cancellationToken).ConfigureAwait(false);
+        var problem = await RestorePartProtocol.AcceptAsync(form, cancellationToken)
+            .ConfigureAwait(false);
+        return problem;
     }
 
     /// <summary>
@@ -92,24 +138,49 @@ public static class SetupEndpoints
                 "Send multipart/form-data with an 'archive' file and a 'passphrase' field.");
 
         // Allow a large upload — a whole-DB backup can be sizeable. Lift Kestrel's
-        // per-request cap for this request; the multipart length limit (~128 MB
-        // default) is the practical ceiling for the UI path, with `coffer-api
-        // restore` as the fallback for anything larger.
+        // per-request cap for this request; the multipart limit is 4 GiB
+        // (ADR-0094), and there is no CLI fallback any more — that command was
+        // removed by the same ADR. An artifact too big for one request goes
+        // through /restore/parts instead (ADR-0101).
         var sizeFeature = request.HttpContext.Features.Get<IHttpMaxRequestBodySizeFeature>();
         if (sizeFeature is { IsReadOnly: false }) sizeFeature.MaxRequestBodySize = null;
 
         var form = await request.ReadFormAsync(cancellationToken).ConfigureAwait(false);
         var passphrase = form["passphrase"].ToString();
         var file = form.Files["archive"] ?? form.Files.FirstOrDefault();
-        if (file is null || file.Length == 0 || string.IsNullOrEmpty(passphrase))
+        // The artifact either arrives here, or arrived already as parts
+        // (ADR-0101) that this call now names.
+        var useParts = string.Equals(
+            form["useUploadedParts"].ToString(), "true", StringComparison.OrdinalIgnoreCase);
+        var hasUpload = file is not null && file.Length > 0;
+
+        if (useParts && hasUpload)
             return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
-                "Both a backup file ('archive') and a 'passphrase' are required.");
+                "Send either 'archive' or 'useUploadedParts', not both.");
+        if (!useParts && !hasUpload)
+            return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
+                "A backup file ('archive') or uploaded parts ('useUploadedParts') are required.");
+        if (string.IsNullOrEmpty(passphrase))
+            return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
+                "A 'passphrase' is required.");
 
         // Stage the upload, then verify the passphrase opens it before committing
         // the request — a wrong passphrase must fail now, not after the restart.
+        // That verification is also what catches a part set that arrived short:
+        // it happens here, before the restart, rather than at the boot that
+        // would already have wiped the schema.
         BootstrapRestoreStaging.EnsureDir();
-        await using (var dest = File.Create(BootstrapRestoreStaging.ArchivePath))
-            await file.CopyToAsync(dest, cancellationToken).ConfigureAwait(false);
+        if (useParts)
+        {
+            if (!BootstrapRestoreStaging.PromoteUpload())
+                return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
+                    "No uploaded parts to restore — send the parts first.");
+        }
+        else
+        {
+            await using var dest = File.Create(BootstrapRestoreStaging.ArchivePath);
+            await file!.CopyToAsync(dest, cancellationToken).ConfigureAwait(false);
+        }
         try
         {
             await using var verify = File.OpenRead(BootstrapRestoreStaging.ArchivePath);
@@ -142,6 +213,7 @@ public static class SetupEndpoints
     private static async Task<IResult> InfoAsync(
         string token,
         ServiceDbContextFactory serviceFactory,
+        Microsoft.Extensions.Options.IOptions<Coffer.Api.Configuration.ApiOptions> backup,
         CancellationToken cancellationToken)
     {
         await using var db = serviceFactory.Create();
@@ -156,7 +228,11 @@ public static class SetupEndpoints
         // which made the choice actively misleading. Migration 186 drops them, and
         // ledgers are now created after setup from the hub. Token validation above
         // is what this endpoint is actually for.
-        return Results.Ok(new SetupInfoResponse());
+        // The part size travels with the token check because the setup page has
+        // no other authenticated read, and hardcoding it in the SPA would make
+        // Api:Backup:PartSizeMb silently not apply to the one restore path that
+        // cannot fall back to anything else.
+        return Results.Ok(new SetupInfoResponse(backup.Value.Backup.PartSizeBytes));
     }
 
     private static async Task<IResult> BeginAsync(

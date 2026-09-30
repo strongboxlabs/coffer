@@ -51,43 +51,50 @@ public sealed class LedgerConsistencyRepository
     {
         var projections = new List<ProjectionConsistency>
         {
-            await CheckBalancesAsync(ledgerId, cancellationToken).ConfigureAwait(false),
-            await CheckHoldingsAsync(ledgerId, cancellationToken).ConfigureAwait(false),
-            await CheckRealizedGainsAsync(ledgerId, cancellationToken).ConfigureAwait(false),
-            await CheckPostingCountsAsync(ledgerId, cancellationToken).ConfigureAwait(false),
+            (await CheckBalancesAsync(ledgerId, cancellationToken).ConfigureAwait(false)).Projection,
+            (await CheckHoldingsAsync(ledgerId, cancellationToken).ConfigureAwait(false)).Projection,
+            (await CheckRealizedGainsAsync(ledgerId, cancellationToken).ConfigureAwait(false)).Projection,
+            (await CheckPostingCountsAsync(ledgerId, cancellationToken).ConfigureAwait(false)).Projection,
+            (await CheckTradePricesAsync(ledgerId, cancellationToken).ConfigureAwait(false)).Projection,
         };
+
+        // Advisory, so it takes no part in Healthy: a price nothing derives may
+        // be perfectly correct, and the ledger is not broken for holding one.
+        var labels = await SecurityLabelsAsync(ledgerId, cancellationToken)
+            .ConfigureAwait(false);
+        var unbacked = (await _db.UnbackedPriceSecurities(ledgerId)
+                .AsNoTracking()
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false))
+            .Select(u => new UnbackedPriceAdvisory(
+                SecurityId: u.SecurityId,
+                Security: labels.GetValueOrDefault(u.SecurityId, "(security)"),
+                Count: (int)u.UnbackedCount,
+                Earliest: u.Earliest,
+                Latest: u.Latest,
+                HoldingValue: u.HoldingValue))
+            .ToList();
 
         return new LedgerConsistencyReport(
             Healthy: projections.All(p => p.Healthy),
-            Projections: projections);
+            Projections: projections,
+            UnbackedPrices: unbacked);
     }
 
     /// <summary>Running balances, via the read-only walk (mig 206).</summary>
-    private async Task<ProjectionConsistency> CheckBalancesAsync(
+    private async Task<CheckResult> CheckBalancesAsync(
         Guid ledgerId, CancellationToken cancellationToken)
     {
         var report = await _register.CheckBalancesAsync(ledgerId, cancellationToken)
                                     .ConfigureAwait(false);
-        var mismatches = report.Drifted
-            .Take(MaxMismatchesPerProjection)
-            .Select(d => new ConsistencyMismatch(
-                Scope: d.AccountName + " @ " + d.PostedAt.ToString("yyyy-MM-dd"),
-                Field: "balance_after",
-                Stored: d.StoredBefore,
-                Expected: d.RecomputedAfter,
-                AccountId: d.AccountId,
-                HeaderId: d.HeaderId))
-            .ToList();
-
-        return new ProjectionConsistency(
-            ConsistencyProjections.Balances, report.Healthy, report.RowsChecked, report.DriftedCount, mismatches);
+        return BalancesFrom(report);
     }
 
     /// <summary>
     /// Holdings quantity and cost basis, against the same FIFO walk the recompute
     /// persists (mig 202).
     /// </summary>
-    private async Task<ProjectionConsistency> CheckHoldingsAsync(
+    private async Task<CheckResult> CheckHoldingsAsync(
         Guid ledgerId, CancellationToken cancellationToken)
     {
         var stored = await _db.Holdings.AsNoTracking()
@@ -117,11 +124,13 @@ public sealed class LedgerConsistencyRepository
             .ToDictionary(r => (r.AccountId, r.SecurityId));
 
         var names = await AccountNamesAsync(ledgerId, cancellationToken).ConfigureAwait(false);
+        var securities = await SecurityLabelsAsync(ledgerId, cancellationToken).ConfigureAwait(false);
         var mismatches = new List<ConsistencyMismatch>();
         foreach (var h in stored)
         {
             if (!walked.TryGetValue((h.AccountId, h.SecurityId), out var w)) continue;
-            var scope = names.GetValueOrDefault(h.AccountId, "(account)") + " / " + h.SecurityId;
+            var scope = names.GetValueOrDefault(h.AccountId, "(account)")
+                        + " / " + securities.GetValueOrDefault(h.SecurityId, "(security)");
             if (w.Quantity != h.Quantity)
                 mismatches.Add(new ConsistencyMismatch(scope, "quantity", h.Quantity, w.Quantity,
                     AccountId: h.AccountId, SecurityId: h.SecurityId));
@@ -167,7 +176,7 @@ public sealed class LedgerConsistencyRepository
     /// answer, not a false positive bolted onto this one.
     /// </para>
     /// </remarks>
-    private async Task<ProjectionConsistency> CheckRealizedGainsAsync(
+    private async Task<CheckResult> CheckRealizedGainsAsync(
         Guid ledgerId, CancellationToken cancellationToken)
     {
         var positions = await _db.Holdings.AsNoTracking()
@@ -256,7 +265,7 @@ public sealed class LedgerConsistencyRepository
     /// mode a consistency check can least afford: cry wolf once and it gets
     /// ignored forever.
     /// </remarks>
-    private async Task<ProjectionConsistency> CheckPostingCountsAsync(
+    private async Task<CheckResult> CheckPostingCountsAsync(
         Guid ledgerId, CancellationToken cancellationToken)
     {
         var actual = await _db.TxnLegs.AsNoTracking()
@@ -271,9 +280,12 @@ public sealed class LedgerConsistencyRepository
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
+        // No cap here, for the reason spelled out on the realized-gains compare:
+        // Build reports mismatches.Count as the TOTAL, so stopping at the display
+        // cap made a badly drifted ledger report exactly 100 — understating itself
+        // at the moment it most needs not to, and capping the repair with it.
         var mismatches = actual
             .Where(a => a.Stored != a.Total)
-            .Take(MaxMismatchesPerProjection)
             .Select(a => new ConsistencyMismatch(
                 Scope: "header " + a.HeaderId,
                 Field: "header_total_postings",
@@ -283,6 +295,73 @@ public sealed class LedgerConsistencyRepository
             .ToList();
 
         return Build(ConsistencyProjections.PostingCounts, actual.Count, mismatches);
+    }
+
+    /// <summary>
+    /// Trade-derived <c>security_prices</c>, via <c>fn_trade_price_check</c>
+    /// (migration 232).
+    /// </summary>
+    /// <remarks>
+    /// The rule lives in the function, not here, and that is the point: it is a
+    /// reader of migration 177's rank-gated writer, and a re-statement of the
+    /// writer's logic in LINQ would be a second copy free to drift from the
+    /// thing it is checking. The function already treats the days a
+    /// <c>fetch</c> or <c>manual</c> price legitimately outranks as consistent,
+    /// which is why this projection could not simply ask "is there a row?".
+    ///
+    /// <para>The function returns the days it EXAMINED, not only the ones that
+    /// disagree, so <c>Checked</c> means here what it means everywhere else in
+    /// this report — and a healthy ledger does not report "0 examined", which
+    /// would be indistinguishable from a query that silently returns nothing.
+    /// No cap on the scan for the same reason the realized-gains check has
+    /// none: <see cref="Build"/> reports the true total and truncates only what
+    /// is displayed.</para>
+    /// </remarks>
+    private async Task<CheckResult> CheckTradePricesAsync(
+        Guid ledgerId, CancellationToken cancellationToken)
+    {
+        var examined = await _db.TradePriceCheck(ledgerId)
+            .AsNoTracking()
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var labels = await SecurityLabelsAsync(ledgerId, cancellationToken).ConfigureAwait(false);
+        var accounts = await TradingAccountsAsync(ledgerId, cancellationToken)
+            .ConfigureAwait(false);
+        var mismatches = examined
+            .Where(d => d.Drifted)
+            .Select(d => new ConsistencyMismatch(
+                // Security, account, day — the three things needed to go find the
+                // trade behind the expected figure and judge it. The header id
+                // travels separately so a link can target it exactly.
+                Scope: labels.GetValueOrDefault(d.SecurityId, "(security)")
+                       + (d.AccountId is not Guid acct
+                            ? ""
+                            : " · " + accounts.GetValueOrDefault(
+                                  acct, (Id: acct, Name: "(account)")).Name)
+                       + " · " + d.PriceDate.ToString("yyyy-MM-dd"),
+                // Said the way a reader can act on. "missing" means the day's trade
+                // seeded no price at all; the other means a row is sitting on that
+                // day claiming a price the day's last trade does not imply — which
+                // is what a since-corrected trade leaves behind (ADR-0084 D4).
+                Field: d.Reason == "missing"
+                    ? "no price for the day's trade"
+                    : "price disagrees with the day's last trade",
+                // A missing row stores nothing; 0 is the honest reading of
+                // "there is no stored value", and Diff then equals the whole
+                // expected price rather than a difference against a fiction.
+                Stored: d.StoredPrice ?? 0m,
+                Expected: d.ExpectedPrice,
+                AccountId: d.AccountId is Guid a
+                    ? accounts.GetValueOrDefault(a, (Id: a, Name: "")).Id
+                    : null,
+                SecurityId: d.SecurityId,
+                HeaderId: d.HeaderId,
+                PriceDate: d.PriceDate,
+                Reason: d.Reason))
+            .ToList();
+
+        return Build(ConsistencyProjections.TradePrices, examined.Count, mismatches);
     }
 
     /// <summary>
@@ -311,7 +390,7 @@ public sealed class LedgerConsistencyRepository
         {
             var healed = await _register.VerifyAndHealBalancesAsync(ledgerId, cancellationToken)
                                         .ConfigureAwait(false);
-            return await CheckBalancesFromAsync(healed).ConfigureAwait(false);
+            return (await CheckBalancesFromAsync(healed).ConfigureAwait(false)).Projection;
         }
 
         var before = projection switch
@@ -322,14 +401,59 @@ public sealed class LedgerConsistencyRepository
                 await CheckRealizedGainsAsync(ledgerId, cancellationToken).ConfigureAwait(false),
             ConsistencyProjections.PostingCounts =>
                 await CheckPostingCountsAsync(ledgerId, cancellationToken).ConfigureAwait(false),
+            ConsistencyProjections.TradePrices =>
+                await CheckTradePricesAsync(ledgerId, cancellationToken).ConfigureAwait(false),
             _ => throw new ArgumentOutOfRangeException(nameof(projection), projection,
                      "Unknown projection."),
         };
-        if (before.Healthy) return before;
+        if (before.Projection.Healthy) return before.Projection;
+
+        // EVERY branch below targets before.AllMismatches, never
+        // before.Projection.Mismatches. The latter is capped at
+        // MaxMismatchesPerProjection for display; repairing from it fixes the first
+        // hundred disagreements and reports the repair it just performed, so a
+        // ledger with five hundred needs five clicks and says so nowhere.
+        if (projection == ConsistencyProjections.TradePrices)
+        {
+            // Repaired through migration 177's OWN upsert primitive, one drifted
+            // day at a time, rather than by writing security_prices from here.
+            // The eligibility rule is already restated in four places (see
+            // database-schema.md under security_price_upsert_from_trade); a fifth
+            // copy living in the repair would mean a ledger could be "repaired"
+            // into a state the writer would never produce.
+            //
+            // The primitive is rank-gated, so a day a fetch/manual price has
+            // taken ownership of since the check ran is left alone rather than
+            // clobbered — the repair cannot undo a truer price.
+            //
+            // missing / value only, read from the function rather than filtered
+            // out of AllMismatches. An ORPHAN also carries a SecurityId and a
+            // PriceDate, so a shape-based filter would sweep it in and re-upsert
+            // its own price over itself — a write that changes nothing, restamps
+            // the row, and leaves the re-check still reporting it, which reads as
+            // a repair that failed. The reason is the thing that matters, so the
+            // reason is what this selects on. Uncapped, like AllMismatches.
+            var repairable = await _db.TradePriceCheck(ledgerId)
+                .AsNoTracking()
+                .Where(d => d.Reason == "missing" || d.Reason == "value")
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            foreach (var d in repairable)
+            {
+                _ = await _db.SecurityPriceUpsertFromTrade(
+                        ledgerId, d.SecurityId, d.PriceDate, d.ExpectedPrice)
+                    .ToListAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            return (await CheckTradePricesAsync(ledgerId, cancellationToken)
+                .ConfigureAwait(false)).Projection;
+        }
 
         if (projection == ConsistencyProjections.PostingCounts)
         {
-            foreach (var headerId in before.Mismatches
+            foreach (var headerId in before.AllMismatches
                          .Select(m => m.HeaderId).Where(id => id is not null)
                          .Select(id => id!.Value).Distinct())
             {
@@ -339,39 +463,60 @@ public sealed class LedgerConsistencyRepository
                     .ConfigureAwait(false);
             }
 
-            return before;
+            return before.Projection;
         }
 
         // Holdings and realized gains are the SAME projection from the writer's point
         // of view — recompute_holdings_cost_basis rebuilds quantity, cost basis and
         // realized_gains together — so both repair through one call over the
         // disagreeing pairs.
-        var pairs = before.Mismatches
+        var pairs = before.AllMismatches
             .Where(m => m.AccountId is not null && m.SecurityId is not null)
             .Select(m => (m.AccountId!.Value, m.SecurityId!.Value))
             .Distinct()
             .ToList();
         await _holdings.RecomputeAsync(pairs, cancellationToken).ConfigureAwait(false);
-        return before;
+        return before.Projection;
     }
 
     /// <summary>Shape a balance-repair result as a projection report.</summary>
-    private Task<ProjectionConsistency> CheckBalancesFromAsync(BalanceHealthReport report) =>
-        Task.FromResult(new ProjectionConsistency(
-            ConsistencyProjections.Balances,
-            report.Healthy,
-            report.RowsChecked,
-            report.DriftedCount,
-            report.Drifted
-                .Take(MaxMismatchesPerProjection)
-                .Select(d => new ConsistencyMismatch(
-                    Scope: d.AccountName + " @ " + d.PostedAt.ToString("yyyy-MM-dd"),
-                    Field: "balance_after",
-                    Stored: d.StoredBefore,
-                    Expected: d.RecomputedAfter,
-                    AccountId: d.AccountId,
-                    HeaderId: d.HeaderId))
-                .ToList()));
+    private Task<CheckResult> CheckBalancesFromAsync(BalanceHealthReport report) =>
+        Task.FromResult(BalancesFrom(report));
+
+    /// <summary>
+    /// Shape a <see cref="BalanceHealthReport"/> as this class's check result.
+    /// </summary>
+    /// <remarks>
+    /// One builder for both entry points — the check and the post-repair report —
+    /// because they had drifted into two copies of the same projection with the
+    /// same six field mappings, which is how a repair ends up describing a row
+    /// differently from the check that found it.
+    /// <para>
+    /// Uncapped on the way in: <c>Drifted</c> is the full set (<c>DriftedCount</c>
+    /// is its own <c>Count</c>), and the cap belongs on the way out.
+    /// </para>
+    /// </remarks>
+    private static CheckResult BalancesFrom(BalanceHealthReport report)
+    {
+        var mismatches = report.Drifted
+            .Select(d => new ConsistencyMismatch(
+                Scope: d.AccountName + " @ " + d.PostedAt.ToString("yyyy-MM-dd"),
+                Field: "balance_after",
+                Stored: d.StoredBefore,
+                Expected: d.RecomputedAfter,
+                AccountId: d.AccountId,
+                HeaderId: d.HeaderId))
+            .ToList();
+
+        return new CheckResult(
+            new ProjectionConsistency(
+                ConsistencyProjections.Balances,
+                report.Healthy,
+                report.RowsChecked,
+                report.DriftedCount,
+                mismatches.Take(MaxMismatchesPerProjection).ToList()),
+            mismatches);
+    }
 
     private async Task<Dictionary<Guid, string>> AccountNamesAsync(
         Guid ledgerId, CancellationToken cancellationToken) =>
@@ -382,11 +527,88 @@ public sealed class LedgerConsistencyRepository
             .ConfigureAwait(false))
         .ToDictionary(a => a.Id, a => a.Name);
 
-    private static ProjectionConsistency Build(
+    /// <summary>
+    /// Display labels for this ledger's securities — ticker where there is one,
+    /// otherwise the name, and both where they differ.
+    /// </summary>
+    /// <remarks>
+    /// A report a reader cannot act on is not a report. This projection shipped
+    /// naming rows by bare GUID (`security 9705c7fa-… on 2006-01-06`), which tells
+    /// someone deciding whether to repair absolutely nothing about which holding
+    /// is affected — they would have to go look up the id by hand, six times, to
+    /// form a view. The holdings check had the same hole on its security half.
+    /// </remarks>
+    private async Task<Dictionary<Guid, string>> SecurityLabelsAsync(
+        Guid ledgerId, CancellationToken cancellationToken) =>
+        (await _db.Securities.AsNoTracking()
+            .Where(x => x.LedgerId == ledgerId)
+            .Select(x => new { x.Id, x.Ticker, x.Name })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false))
+        .ToDictionary(
+            x => x.Id,
+            x => string.IsNullOrWhiteSpace(x.Ticker) ? x.Name
+                 : string.Equals(x.Ticker, x.Name, StringComparison.OrdinalIgnoreCase) ? x.Ticker!
+                 : $"{x.Ticker} — {x.Name}");
+
+    /// <summary>
+    /// Account names for display, with a holdings sibling resolved to the brokerage
+    /// it belongs to.
+    /// </summary>
+    /// <remarks>
+    /// A security leg lives on the holdings sibling, which is a system account the
+    /// reader never navigates to and may not recognise — and whose register is not
+    /// where the trade is read. Both the name and the id resolve to the BROKERAGE,
+    /// so the row names, and can link to, the account someone would actually open.
+    /// <para>
+    /// Safe to redirect the id because nothing repairs by it: the trade-price repair
+    /// targets (security, day). It is carried for navigation only.
+    /// </para>
+    /// </remarks>
+    private async Task<Dictionary<Guid, (Guid Id, string Name)>> TradingAccountsAsync(
+        Guid ledgerId, CancellationToken cancellationToken)
+    {
+        var rows = await _db.Accounts.AsNoTracking()
+            .Where(a => a.LedgerId == ledgerId)
+            .Select(a => new { a.Id, a.Name, a.HoldingsAccountId })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var map = rows.ToDictionary(a => a.Id, a => (a.Id, a.Name));
+        foreach (var brokerage in rows.Where(a => a.HoldingsAccountId is not null))
+            map[brokerage.HoldingsAccountId!.Value] = (brokerage.Id, brokerage.Name);
+        return map;
+    }
+
+    private static CheckResult Build(
         string name, int checkedCount, List<ConsistencyMismatch> mismatches) =>
-        new(name,
-            Healthy: mismatches.Count == 0,
-            Checked: checkedCount,
-            MismatchedCount: mismatches.Count,
-            Mismatches: mismatches.Take(MaxMismatchesPerProjection).ToList());
+        new(new ProjectionConsistency(
+                name,
+                Healthy: mismatches.Count == 0,
+                Checked: checkedCount,
+                MismatchedCount: mismatches.Count,
+                Mismatches: mismatches.Take(MaxMismatchesPerProjection).ToList()),
+            mismatches);
+
+    /// <summary>
+    /// One projection's check result, carrying the UNTRUNCATED mismatch list beside
+    /// the client-facing <see cref="ProjectionConsistency"/>.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ProjectionConsistency.Mismatches"/> is capped at
+    /// <see cref="MaxMismatchesPerProjection"/> because it is what the client
+    /// renders, and a badly drifted ledger should not ship forty thousand rows to
+    /// draw a list of a hundred. The REPAIR needs all of them.
+    /// <para>
+    /// Until this type existed the repairs iterated that capped list, so a ledger
+    /// with five hundred disagreeing headers was repaired a hundred at a time —
+    /// and each pass reported the repair it had just performed, so nothing on
+    /// screen said four more were needed. A repair that silently fixes what fits
+    /// in the display is the same class of defect as a check that disagrees with
+    /// its own repair: it trains the reader to believe a problem is handled.
+    /// </para>
+    /// </remarks>
+    private sealed record CheckResult(
+        ProjectionConsistency Projection,
+        IReadOnlyList<ConsistencyMismatch> AllMismatches);
 }

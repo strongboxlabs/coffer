@@ -217,7 +217,9 @@ public sealed class IngestOrchestrator
             run.Status = "failed";
             run.ErrorMessage = $"Access URL decrypt failed: {ex.Message}";
             run.CompletedAt = DateTime.UtcNow;
-            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            // See the SimpleFinException catch below: closing a run is never the
+            // thing to cancel.
+            await _db.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
             _logger.LogError(ex,
                 "Ingest pull for connection {ConnectionId} failed: access URL ciphertext could not be unwrapped under the current master KEK",
                 connectionId);
@@ -242,11 +244,26 @@ public sealed class IngestOrchestrator
             run.Status = "failed";
             run.ErrorMessage = ex.Message;
             run.CompletedAt = DateTime.UtcNow;
-            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            // CancellationToken.None, not the request's: if the caller's token is
+            // what aborted the pull, saving under it throws too and the run is left
+            // open — which is the state that wedges the connection. Closing a run is
+            // never the thing to cancel.
+            await _db.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
             _logger.LogWarning(ex,
                 "Ingest pull for connection {ConnectionId} failed: the provider faulted.",
                 connectionId);
             return IngestPullOutcome.Fail(IngestFailureReason.ProviderFault);
+        }
+        catch (OperationCanceledException)
+        {
+            // Host shutdown or a disconnected client. The pull is over either way,
+            // and an open run blocks the next sync on this connection, so close it
+            // before letting the cancellation continue to unwind.
+            run.Status = "failed";
+            run.ErrorMessage = "The sync was cancelled before it finished.";
+            run.CompletedAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+            throw;
         }
 
         // Defensive 403 path: provider detected revoked / expired

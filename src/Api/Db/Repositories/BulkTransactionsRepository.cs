@@ -449,26 +449,12 @@ internal sealed class BulkTransactionsRepository
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        // How many of them the user has since edited. Reported, never used to refuse:
-        // whose edits they are is their call, but an undo that silently discards work
-        // is the kind of "helpful" delete nobody forgives.
-        //
-        // "Edited" is "has an original on file" (mig 230): every edit on BOTH
-        // write paths captures one. It used to be "has an override row", which
-        // counted bank edits only — an investment edit wrote the canonical row
-        // and created nothing, so this under-reported exactly the work an undo
-        // destroys. A merge still counts as an edit, because it stamps the
-        // winner's date and so captures an original; for a warning dialog,
-        // erring toward telling you is the right direction.
-        var edited = ids.Count == 0
-            ? 0
-            : await _db.TxnHeaderOriginals
-                .AsNoTracking()
-                .Where(o => o.LedgerId == ledgerId && EF.Constant(ids.ToArray()).Contains(o.HeaderId))
-                .Select(o => o.HeaderId)
-                .Distinct()
-                .CountAsync(cancellationToken)
-                .ConfigureAwait(false);
+        // No "how many have been edited" count here any more. Undo is offered in a
+        // modal immediately after the import that created these rows, so nobody has
+        // edited them yet — the number was reliably zero, and the only thing that
+        // made it non-zero was a merge stamping the winner's date. See
+        // UndoImportResult for the rest of the reasoning, including why reading
+        // txn_header_originals as an "edited in Coffer" signal is a trap.
 
         // A PARTIAL undo is worse than none — it leaves a half-removed import that no
         // longer matches its own operation and cannot be finished by repeating the call.
@@ -476,13 +462,13 @@ internal sealed class BulkTransactionsRepository
         if (ids.Count > SelectionLimits.MaxIds)
         {
             return new UndoImportResult(
-                Found: ids.Count, Edited: edited, Deleted: 0, TooLarge: true);
+                Found: ids.Count, Deleted: 0, TooLarge: true);
         }
 
         if (dryRun || ids.Count == 0)
         {
             return new UndoImportResult(
-                Found: ids.Count, Edited: edited, Deleted: 0, TooLarge: false);
+                Found: ids.Count, Deleted: 0, TooLarge: false);
         }
 
         // AN UNDO REMOVES THE ROWS OUTRIGHT. An earlier version hid them, on the
@@ -518,7 +504,7 @@ internal sealed class BulkTransactionsRepository
         }
 
         return new UndoImportResult(
-            Found: ids.Count, Edited: edited, Deleted: hard, TooLarge: false);
+            Found: ids.Count, Deleted: hard, TooLarge: false);
     }
 
     /// <param name="hardDeleteSourcedRows">

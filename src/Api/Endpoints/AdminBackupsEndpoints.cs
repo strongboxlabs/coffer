@@ -1,3 +1,5 @@
+using System.Globalization;
+
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
@@ -33,6 +35,8 @@ namespace Coffer.Api.Endpoints;
 ///   * POST   /api/admin/backups/restore/validate — pre-flight KEK-compat check (ADR-0074)
 ///   * POST   /api/admin/backups            — create one now (stored passphrase)
 ///   * GET    /api/admin/backups            — list stored artifacts
+///   * POST   /api/admin/backups/restore/parts — upload one part of a large restore
+///   * GET    /api/admin/backups/restore/limits — the configured part size
 ///   * GET    /api/admin/backups/{id}       — download a .cofferbak
 ///   * DELETE /api/admin/backups/{id}       — delete one
 ///   * PUT    /api/admin/backups/passphrase — set / rotate the backup passphrase
@@ -76,6 +80,9 @@ public static class AdminBackupsEndpoints
         // backup's header to learn, before committing, whether it was sealed under
         // this install's Master KEK.
         group.MapPost("/restore/validate", ValidateRestoreAsync).DisableAntiforgery();
+        group.MapPost("/restore/parts", UploadRestorePartAsync).DisableAntiforgery();
+        group.MapGet("/restore/limits", (BackupStore store) =>
+            Results.Ok(new { partSizeBytes = store.PartSizeBytes }));
 
         group.MapPost("/", CreateAsync);
         group.MapGet("/", ListAsync);
@@ -102,6 +109,7 @@ public static class AdminBackupsEndpoints
         HttpRequest request,
         MasterKey masterKey,
         IApplicationRestarter restarter,
+        BackupStore store,
         CancellationToken cancellationToken)
     {
         if (!request.HasFormContentType)
@@ -121,9 +129,37 @@ public static class AdminBackupsEndpoints
             string.Equals(form["acknowledgeKekMismatch"].ToString(), "true", StringComparison.OrdinalIgnoreCase);
         var file = form.Files["archive"] ?? form.Files.FirstOrDefault();
 
-        if (file is null || file.Length == 0 || string.IsNullOrEmpty(passphrase))
+        // A stored backup is restored by NAME, not by sending it back. The
+        // artifact is already on this disk — Coffer wrote it there — so uploading
+        // it is a round trip of the whole archive to reach a file the server is
+        // sitting on. It is also the round trip that fails: a 141 MB .cofferbak
+        // exceeds Cloudflare's 100 MB request-body cap, which is not a setting on
+        // Free or Pro, so the documented "raise your proxy's limit" remedy does
+        // not exist for that deployment shape.
+        //
+        // Upload stays for the case that genuinely needs it: a fresh install, or
+        // an artifact kept somewhere else, where the file is not on this disk.
+        var storedId = form["backupId"].ToString().Trim();
+        var hasUpload = file is not null && file.Length > 0;
+        // The third source: an artifact sent ahead of this call in pieces, because
+        // it was too big to send in one (ADR-0101).
+        var useParts = string.Equals(
+            form["useUploadedParts"].ToString(), "true", StringComparison.OrdinalIgnoreCase);
+
+        var sources = (storedId.Length > 0 ? 1 : 0) + (hasUpload ? 1 : 0) + (useParts ? 1 : 0);
+        if (sources > 1)
             return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
-                "Both a backup file ('archive') and a 'passphrase' are required.");
+                "Name one backup only — 'archive', 'backupId', or 'useUploadedParts' — "
+                + "otherwise which one is being restored is ambiguous.");
+
+        if (sources == 0)
+            return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
+                "A backup is required: upload one ('archive'), name a stored one "
+                + "('backupId'), or finish a part upload ('useUploadedParts').");
+
+        if (string.IsNullOrEmpty(passphrase))
+            return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
+                "A 'passphrase' is required.");
 
         // Blunt typed-confirmation gate — a restore replaces everything.
         if (!string.Equals(confirm.Trim(), RestoreConfirmPhrase, StringComparison.OrdinalIgnoreCase))
@@ -132,8 +168,34 @@ public static class AdminBackupsEndpoints
                 "and data across the deployment, and signs everyone out.");
 
         BootstrapRestoreStaging.EnsureDir();
-        await using (var dest = File.Create(BootstrapRestoreStaging.ArchivePath))
-            await file.CopyToAsync(dest, cancellationToken).ConfigureAwait(false);
+        if (useParts)
+        {
+            // The parts were checked for order and size as they arrived; all that
+            // is left is that something arrived at all. If the set is short, the
+            // passphrase check below fails on a truncated archive — before
+            // anything destructive, which is where every other bad input lands too.
+            if (!BootstrapRestoreStaging.PromoteUpload())
+                return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
+                    "No uploaded parts to restore — send the parts first.");
+        }
+        else if (storedId.Length > 0)
+        {
+            // Resolved through the store rather than by pasting the id into a path:
+            // the id comes from a request, and building a path out of it invites
+            // traversal. OpenRead returns null for anything the store does not own.
+            await using var src = store.OpenRead(storedId);
+            if (src is null)
+                return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
+                    "No stored backup with that id. It may have aged out under the "
+                    + "retention policy since the list was loaded.");
+            await using var dest = File.Create(BootstrapRestoreStaging.ArchivePath);
+            await src.CopyToAsync(dest, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await using var dest = File.Create(BootstrapRestoreStaging.ArchivePath);
+            await file!.CopyToAsync(dest, cancellationToken).ConfigureAwait(false);
+        }
 
         // Adopt path (ADR-0092 D4): the operator has the SOURCE install's key and
         // wants its sealed secrets carried over rather than re-established. Validate
@@ -366,6 +428,36 @@ public static class AdminBackupsEndpoints
     }
 
     /// <summary>
+    /// Receive one part of a restore artifact too large to send in one request
+    /// (ADR-0101). Parts arrive in order and accumulate in staging; the restore
+    /// itself is a separate, confirmed call with <c>useUploadedParts=true</c>.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately NOT gated by the typed confirmation: nothing here is
+    /// destructive — an upload never followed by a confirmed restore leaves a
+    /// file in staging and no more. Putting the gate on the upload instead would
+    /// mean typing the phrase before a transfer that can take minutes, and then
+    /// acting on a confirmation given long before the thing it confirmed existed.
+    /// <para>The assembly rules live in <see cref="RestorePartProtocol"/>,
+    /// shared with the pre-auth bootstrap restore: the two paths must agree on
+    /// how bytes are stitched together, and nothing would catch them drifting
+    /// short of a restore that fails to decrypt.</para>
+    /// </remarks>
+    private static async Task<IResult> UploadRestorePartAsync(
+        HttpRequest request, CancellationToken cancellationToken)
+    {
+        if (!request.HasFormContentType)
+            return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
+                "Send multipart/form-data with 'archive', 'part', and 'partCount'.");
+
+        var sizeFeature = request.HttpContext.Features.Get<IHttpMaxRequestBodySizeFeature>();
+        if (sizeFeature is { IsReadOnly: false }) sizeFeature.MaxRequestBodySize = null;
+
+        var form = await request.ReadFormAsync(cancellationToken).ConfigureAwait(false);
+        return await RestorePartProtocol.AcceptAsync(form, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Verify the assertion and return the stored backup passphrase (ADR-0092 D7).
     /// </summary>
     private static async Task<IResult> RevealPassphraseAsync(
@@ -453,22 +545,33 @@ public static class AdminBackupsEndpoints
     private static async Task<IResult> ValidateRestoreAsync(
         HttpRequest request,
         MasterKey masterKey,
+        BackupStore store,
         CancellationToken cancellationToken)
     {
         if (!request.HasFormContentType)
             return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
-                "Send multipart/form-data with 'archive' (the backup file or its leading bytes).");
+                "Send multipart/form-data with 'archive' (the backup file or its "
+                + "leading bytes) or 'backupId' (a stored backup).");
 
         var form = await request.ReadFormAsync(cancellationToken).ConfigureAwait(false);
         var file = form.Files["archive"] ?? form.Files.FirstOrDefault();
-        if (file is null || file.Length == 0)
+        // A stored backup is checked in place. Without this the pre-flight would be
+        // the one step still demanding an upload, and the KEK answer would be
+        // missing from exactly the path that exists to avoid uploading.
+        var storedId = form["backupId"].ToString().Trim();
+        if (storedId.Length == 0 && (file is null || file.Length == 0))
             return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
-                "A backup file ('archive') is required.");
+                "A backup is required: either 'archive' or 'backupId'.");
         try
         {
             // Reads only the header (no passphrase needed) — the UI uploads just a
             // small leading slice, so this never streams a whole backup.
-            await using var stream = file.OpenReadStream();
+            await using var stream = storedId.Length > 0
+                ? store.OpenRead(storedId)
+                : file!.OpenReadStream();
+            if (stream is null)
+                return BusinessError.Problem(BusinessError.Codes.BackupRestoreInvalid,
+                    "No stored backup with that id.");
             var backupFingerprint = await BackupCrypto.ReadKekFingerprintAsync(stream, cancellationToken)
                 .ConfigureAwait(false);
             var hasFingerprint = backupFingerprint.Length > 0;

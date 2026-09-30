@@ -77,7 +77,8 @@ public sealed class AppDbContext : DbContext
     // binding.
     internal DbSet<FeedConnectionAccountRow> FeedConnectionAccounts => Set<FeedConnectionAccountRow>();
     // Sync activity log (slice 2c.1, migration 038). Internal —
-    // writes are driven by SimpleFinSyncService, reads by the
+    // writes are driven by the ingest orchestrator (ADR-0031 Phase 2
+    // replaced the pre-Phase-2 SimpleFinSyncService), reads by the
     // Provider-run audit (ADR-0055; formerly sync_runs).
     internal DbSet<LedgerOperationRow> LedgerOperations => Set<LedgerOperationRow>();
     internal DbSet<LedgerOperationErrorRow> LedgerOperationErrors => Set<LedgerOperationErrorRow>();
@@ -1670,6 +1671,45 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.LastUsedAt).HasColumnName("last_used_at");
         });
 
+        // fn_trade_price_check (migration 232) result type. Same keyless pattern.
+        modelBuilder.Entity<TradePriceCheckRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.SecurityId).HasColumnName("security_id");
+            b.Property(x => x.PriceDate).HasColumnName("price_date");
+            b.Property(x => x.ExpectedPrice).HasColumnName("expected_price");
+            b.Property(x => x.StoredPrice).HasColumnName("stored_price");
+            b.Property(x => x.StoredSource).HasColumnName("stored_source");
+            b.Property(x => x.Reason).HasColumnName("reason");
+            b.Property(x => x.AccountId).HasColumnName("account_id");
+            b.Property(x => x.HeaderId).HasColumnName("header_id");
+        });
+
+        // fn_unbacked_price_dates (migration 241) result type.
+        modelBuilder.Entity<UnbackedPriceDateRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.PriceDate).HasColumnName("price_date");
+        });
+
+        // fn_unbacked_price_securities (migration 240) result type.
+        modelBuilder.Entity<UnbackedPriceSecurityRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.SecurityId).HasColumnName("security_id");
+            b.Property(x => x.UnbackedCount).HasColumnName("unbacked_count");
+            b.Property(x => x.Earliest).HasColumnName("earliest");
+            b.Property(x => x.Latest).HasColumnName("latest");
+            b.Property(x => x.HoldingValue).HasColumnName("holding_value");
+        });
+
+        // fn_trade_price_reseed (migration 234) result type.
+        modelBuilder.Entity<TradePriceReseedRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.Price).HasColumnName("price");
+        });
+
         // recompute_holdings_for_brokerage (migration 088) result type.
         // Wrapper over the void recompute_holdings_cost_basis; returns
         // the count of holdings under the brokerage for diagnostics.
@@ -1900,6 +1940,38 @@ public sealed class AppDbContext : DbContext
                     types: new[] { typeof(Guid), typeof(int) })!)
             .HasName("ledger_payee_suggestions");
 
+        // Migration 232 — the trade-price consistency check. The rank rule stays in
+        // SQL beside the writer it checks (mig 177) rather than being restated
+        // in LINQ, where it could drift from the thing it is verifying.
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(TradePriceCheck), InternalInstance,
+                    types: new[] { typeof(Guid) })!)
+            .HasName("fn_trade_price_check");
+
+        // Migration 234 — the writer's entry point. Callers name the (security,
+        // day) they touched; the rule lives in SQL and decides the price.
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(TradePriceReseed), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(Guid), typeof(DateOnly) })!)
+            .HasName("fn_trade_price_reseed");
+
+        // Migration 240 — the advisory list behind the consistency panel.
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(UnbackedPriceSecurities), InternalInstance,
+                    types: new[] { typeof(Guid) })!)
+            .HasName("fn_unbacked_price_securities");
+
+        // Migration 241 — the one-pass form. Anything covering a whole price
+        // history uses this; the per-row predicate is 54x dearer.
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(UnbackedPriceDates), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(Guid) })!)
+            .HasName("fn_unbacked_price_dates");
+
         // Migration 088 — see RecomputeHoldingsForBrokerage method below.
         // Wrapper over recompute_holdings_cost_basis so AccountsRepository
         // can invoke it via LINQ instead of relying on the now-removed
@@ -2121,6 +2193,65 @@ public sealed class AppDbContext : DbContext
     internal IQueryable<PayeeSuggestionRow> LedgerPayeeSuggestions(
         Guid ledgerId, int limit) =>
         FromExpression(() => LedgerPayeeSuggestions(ledgerId, limit));
+
+    /// <summary>
+    /// Maps to <c>fn_trade_price_check(p_ledger_id UUID)</c> in migration 232.
+    /// Returns one row per (security, day) migration 177's rank rule implies a
+    /// trade-derived <c>security_prices</c> entry for, with
+    /// <c>Reason</c> null where the stored state agrees — so one scan yields
+    /// both the examined count and the disagreements. A day a <c>fetch</c> or
+    /// <c>manual</c> price legitimately outranks always reads as consistent,
+    /// which is the whole reason a naive row-presence check could not be
+    /// shipped.
+    /// </summary>
+    internal IQueryable<TradePriceCheckRow> TradePriceCheck(Guid ledgerId) =>
+        FromExpression(() => TradePriceCheck(ledgerId));
+
+    /// <summary>
+    /// Maps to <c>fn_trade_price_reseed(p_ledger_id, p_security_id, p_day)</c>
+    /// (migration 234). Derives the day's price by the one rule and rank-gates it
+    /// into <c>security_prices</c>, returning the price written or NULL.
+    /// </summary>
+    /// <remarks>
+    /// The writer's entry point: callers name the (security, day) they touched
+    /// rather than a price. Before this, <c>TradePriceFromLegInterceptor</c>
+    /// upserted the price of whatever leg the save happened to touch, so editing
+    /// one leg could seed a figure the rule would never have chosen — and the
+    /// consistency check, correctly applying the rule, reported the difference as
+    /// drift. It was not drift; the two sides were running different rules.
+    /// </remarks>
+    /// <summary>
+    /// Maps to <c>fn_unbacked_price_securities(p_ledger_id)</c> (migration 240).
+    /// One row per security holding prices nothing derives — advisory, never a
+    /// finding: the table records no link to the transaction that wrote a price,
+    /// so this is inferred, and ADR-0084 D4 keeps some of them on purpose.
+    /// </summary>
+    /// <summary>
+    /// Maps to <c>fn_price_is_unbacked(ledger, security, date, source)</c>
+    /// (migration 240): the row claims a trade produced it and none currently
+    /// does. Advisory — see <see cref="UnbackedPriceSecurities"/>.
+    /// </summary>
+    [DbFunction("fn_price_is_unbacked")]
+    internal static bool PriceIsUnbacked(
+        Guid ledgerId, Guid securityId, DateOnly priceDate, string source) =>
+        throw new InvalidOperationException("Only callable inside an EF query.");
+
+    /// <summary>
+    /// Maps to <c>fn_unbacked_price_dates(ledger, security)</c> (migration 241):
+    /// the dates where this security holds a trade-source price no trade
+    /// derives. One pass — see the migration for why the per-row predicate is
+    /// not used across a whole price history.
+    /// </summary>
+    internal IQueryable<UnbackedPriceDateRow> UnbackedPriceDates(
+        Guid ledgerId, Guid securityId) =>
+        FromExpression(() => UnbackedPriceDates(ledgerId, securityId));
+
+    internal IQueryable<UnbackedPriceSecurityRow> UnbackedPriceSecurities(Guid ledgerId) =>
+        FromExpression(() => UnbackedPriceSecurities(ledgerId));
+
+    internal IQueryable<TradePriceReseedRow> TradePriceReseed(
+        Guid ledgerId, Guid securityId, DateOnly day) =>
+        FromExpression(() => TradePriceReseed(ledgerId, securityId, day));
 
     /// <summary>
     /// Maps to <c>recompute_holdings_for_brokerage(p_holdings_account_id UUID)</c>

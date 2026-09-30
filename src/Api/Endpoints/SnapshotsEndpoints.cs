@@ -57,6 +57,7 @@ public static class SnapshotsEndpoints
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         LedgerSnapshotsRepository snapshots,
+        MetaRepository meta,
         CancellationToken cancellationToken)
     {
         var visible = await ledgers.GetVisibleByIdAsync(
@@ -77,7 +78,10 @@ public static class SnapshotsEndpoints
         return result.Outcome switch
         {
             LedgerSnapshotsRepository.CreateOutcome.Created =>
-                Results.Ok(new CreateSnapshotResponse(ToSummary(result.Row!))),
+                Results.Ok(new CreateSnapshotResponse(ToSummary(
+                    result.Row!,
+                    await meta.GetLatestSchemaScriptAsync(cancellationToken)
+                        .ConfigureAwait(false) ?? string.Empty))),
             LedgerSnapshotsRepository.CreateOutcome.AtCap =>
                 BusinessError.Problem(BusinessError.Codes.SnapshotManualAtCap,
                     "This ledger has 5 snapshots already. Delete one before creating another."),
@@ -97,6 +101,7 @@ public static class SnapshotsEndpoints
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         LedgerSnapshotsRepository snapshots,
+        MetaRepository meta,
         CancellationToken cancellationToken)
     {
         var visible = await ledgers.GetVisibleByIdAsync(
@@ -106,7 +111,10 @@ public static class SnapshotsEndpoints
                 "Ledger not found or not visible to this user.");
 
         var rows = await snapshots.ListAsync(ledgerId, cancellationToken).ConfigureAwait(false);
-        return Results.Ok(rows.Select(ToSummary).ToList());
+        // Read once for the whole list, not per row.
+        var liveSchemaVersion = await meta.GetLatestSchemaScriptAsync(cancellationToken)
+            .ConfigureAwait(false) ?? string.Empty;
+        return Results.Ok(rows.Select(r => ToSummary(r, liveSchemaVersion)).ToList());
     }
 
     /// <summary>
@@ -210,7 +218,15 @@ public static class SnapshotsEndpoints
         return trimmed;
     }
 
-    private static SnapshotSummaryDto ToSummary(Coffer.Api.Db.Entities.LedgerSnapshotRow row)
+    /// <param name="liveSchemaVersion">
+    /// The latest applied migration script name. Compared ORDINALLY, the same
+    /// way <c>LedgerSnapshotsRepository.RestoreAsync</c> compares it before
+    /// refusing — if these two ever disagree the panel offers a Restore the
+    /// server will reject, which is the defect this field exists to close.
+    /// </param>
+    private static SnapshotSummaryDto ToSummary(
+        Coffer.Api.Db.Entities.LedgerSnapshotRow row,
+        string liveSchemaVersion)
         => new(
             Id: row.Id,
             CreatedAt: row.CreatedAt,
@@ -218,5 +234,7 @@ public static class SnapshotsEndpoints
             Kind: row.Kind,
             Description: row.Description,
             SchemaVersion: row.SchemaVersion,
-            ContentSizeUncompressed: row.ContentSizeUncompressed);
+            ContentSizeUncompressed: row.ContentSizeUncompressed,
+            Restorable: string.Equals(
+                row.SchemaVersion, liveSchemaVersion, StringComparison.Ordinal));
 }

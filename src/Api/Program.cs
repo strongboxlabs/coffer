@@ -276,7 +276,8 @@ builder.Services.AddSingleton(sp =>
         ? Path.Combine(AppContext.BaseDirectory, "data", "backups")
         : backup.Directory;
     return new Coffer.Api.Backup.BackupStore(
-        dir, sp.GetRequiredService<ILogger<Coffer.Api.Backup.BackupStore>>());
+        dir, sp.GetRequiredService<ILogger<Coffer.Api.Backup.BackupStore>>(),
+        backup.PartSizeBytes);
 });
 builder.Services.AddScoped<Coffer.Api.Backup.BackupManager>();
 // "Never delete" pins (ADR-0062 ④b+c) — excluded from retention.
@@ -1043,6 +1044,45 @@ if (!app.Configuration.GetValue<bool>("Migrations:Skip"))
         .GetRequiredService<ILoggerFactory>().CreateLogger("Coffer.Api.Migrations");
     var migrationsDirectory = MigrationsDirectoryLocator.Locate(AppContext.BaseDirectory);
     MigrationRunner.Run(apiOpts.ServiceConnectionString, migrationsDirectory, migrationLogger);
+}
+
+// -- LEK backfill. AFTER migrations, for the same reason reconciliation is.
+//
+// Migration 035 shipped `ledgers.wrapped_lek` nullable and promised "a subsequent
+// migration sets NOT NULL once backfill is verified complete". No such migration could
+// exist: wrapping a LEK needs the master KEK, which SQL does not have. So the backfill
+// runs here, in the process that holds the key, and the constraint can only follow in a
+// LATER release — migrations run before this line on the same boot.
+//
+// The NULLs are not API-created ledgers (CreateWithOwnerAsync has wrapped one in the
+// ledger's own INSERT since ADR-0026); they come from the Moneydance importer, a
+// separate binary with no KEK that inserts `ledgers (id, name)` directly.
+//
+// Does not abort the boot, matching the reconciliation posture below: a ledger without
+// a LEK is exactly as usable as it was a moment ago — nothing can seal a secret for it
+// until it has one, which is the lazy path's job — so crash-looping would turn a
+// deferred repair into an outage.
+{
+    using var scope = app.Services.CreateScope();
+    var lekLogger = scope.ServiceProvider
+        .GetRequiredService<ILoggerFactory>().CreateLogger("Coffer.Api.LedgerKeys");
+    try
+    {
+        var wrapped = await scope.ServiceProvider
+            .GetRequiredService<Coffer.Api.Db.Repositories.LedgersRepository>()
+            .BackfillMissingWrappedLeksAsync(
+                scope.ServiceProvider.GetRequiredService<Coffer.Api.Crypto.LedgerKeyService>());
+        if (wrapped > 0)
+            lekLogger.LogInformation(
+                "Wrapped a ledger encryption key for {Count} ledger(s) that had none.", wrapped);
+    }
+    catch (Exception ex)
+    {
+        lekLogger.LogError(ex,
+            "LEK backfill FAILED. Ledgers without a wrapped_lek keep working until something "
+            + "tries to seal a secret for them, which then falls back to the lazy per-ledger "
+            + "path. Check the master key if this repeats.");
+    }
 }
 
 // -- post-restore KEK reconciliation (ADR-0092 D5). AFTER migrations, deliberately:

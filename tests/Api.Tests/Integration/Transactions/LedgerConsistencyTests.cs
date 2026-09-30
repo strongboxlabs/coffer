@@ -48,10 +48,12 @@ public sealed class LedgerConsistencyTests
         var sec = await ledger.AddSecurityAsync("Index Fund", "IDX");
         await ledger.AddBoundaryPositionAsync(
             brokerage.Id, holdings, sec, Boundary.Typical, Utc(2026, 1, 10));
-        // Raw seeds bypass the interceptor, so the posting counts would sit at the
-        // column default and the check would flag them — correctly. Recompute so
-        // the fixture matches what a real write path leaves behind.
+        // Raw seeds bypass the interceptors, so the posting counts would sit at the
+        // column default and the trade legs would have seeded no prices — both of
+        // which the check would flag, correctly. Recompute so the fixture matches
+        // what a real write path leaves behind.
         await ledger.RecomputePostingCountsAsync();
+        await ledger.RecomputeTradePricesAsync();
         return ledger;
     }
 
@@ -73,7 +75,7 @@ public sealed class LedgerConsistencyTests
 
         // Guards the opposite failure: a report that checks nothing is trivially
         // healthy and would never catch anything.
-        Assert.Equal(4, report.Projections.Count);
+        Assert.Equal(ConsistencyProjections.All.Count, report.Projections.Count);
         Assert.All(report.Projections, p => Assert.True(p.Checked > 0,
             p.Projection + " checked nothing"));
     }
@@ -372,6 +374,145 @@ public sealed class LedgerConsistencyTests
                 .Where(p => !p.Healthy).Select(p => p.Projection)));
     }
 
+    // ------------------------------------------------------------------
+    // A repair must fix everything it found, not everything it DISPLAYED.
+    //
+    // ProjectionConsistency.Mismatches is capped at 100 because it is what the
+    // client renders. Every repair used to iterate that capped list, so a ledger
+    // with more than a hundred disagreements was repaired a hundred at a time —
+    // and each pass returned the repair it had just performed, so the reader was
+    // shown a success and no indication that more clicks were needed. These tests
+    // drift MORE than the cap and demand one call clears it.
+    // ------------------------------------------------------------------
+
+    /// <summary>The display cap. Mirrors the private constant in the repository.</summary>
+    private const int DisplayCap = 100;
+
+    [Fact]
+    public async Task Repairing_posting_counts_past_the_display_cap_takes_one_call()
+    {
+        const int Headers = DisplayCap + 5;
+
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var groceries = await ledger.AddCategoryAsync("groceries");
+        for (var i = 0; i < Headers; i++)
+        {
+            await ledger.AddTransactionPairAsync(
+                bank.Id, groceries.Id, -25m, Utc(2026, 5, 10).AddMinutes(i));
+        }
+        await ledger.RecomputePostingCountsAsync();
+
+        await using (var seed = _fixture.NewDbContext())
+        {
+            await seed.Database.ExecuteSqlInterpolatedAsync($@"
+                UPDATE txn_legs SET header_total_postings = header_total_postings + 1
+                 WHERE ledger_id = {ledger.LedgerId};");
+        }
+
+        await using var db = _fixture.NewDbContext();
+        var repo = RepoFor(db);
+
+        var found = Assert.Single(
+            (await repo.CheckAsync(ledger.LedgerId)).Projections,
+            p => p.Projection == ConsistencyProjections.PostingCounts);
+
+        // The report is honest about the total while showing only a page of it —
+        // and the gap between these two numbers is what the repair used to lose.
+        Assert.True(found.MismatchedCount > DisplayCap,
+            $"fixture drifted only {found.MismatchedCount}; it must exceed the cap to prove anything");
+        Assert.Equal(DisplayCap, found.Mismatches.Count);
+
+        await repo.RepairAsync(ledger.LedgerId, ConsistencyProjections.PostingCounts);
+
+        var after = Assert.Single(
+            (await repo.CheckAsync(ledger.LedgerId)).Projections,
+            p => p.Projection == ConsistencyProjections.PostingCounts);
+        Assert.True(after.Healthy,
+            $"{after.MismatchedCount} of {found.MismatchedCount} survived ONE repair — "
+            + "the repair is reading the truncated display list");
+    }
+
+    [Fact]
+    public async Task Repairing_trade_prices_past_the_display_cap_takes_one_call()
+    {
+        const int Days = DisplayCap + 5;
+
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
+        var holdings = brokerage.HoldingsAccountId!.Value;
+        var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
+
+        // Raw seeds bypass the interceptor, so each day is a trade with no price.
+        for (var i = 0; i < Days; i++)
+        {
+            await ledger.AddInvestmentBuyAsync(
+                brokerage.Id, holdings, security, 1m, 100m + i, Utc(2026, 1, 1).AddDays(i));
+        }
+
+        await using var db = _fixture.NewDbContext();
+        var repo = RepoFor(db);
+
+        var found = Assert.Single(
+            (await repo.CheckAsync(ledger.LedgerId)).Projections,
+            p => p.Projection == ConsistencyProjections.TradePrices);
+        Assert.True(found.MismatchedCount > DisplayCap,
+            $"fixture drifted only {found.MismatchedCount}; it must exceed the cap to prove anything");
+        Assert.Equal(DisplayCap, found.Mismatches.Count);
+
+        await repo.RepairAsync(ledger.LedgerId, ConsistencyProjections.TradePrices);
+
+        var after = Assert.Single(
+            (await repo.CheckAsync(ledger.LedgerId)).Projections,
+            p => p.Projection == ConsistencyProjections.TradePrices);
+        Assert.True(after.Healthy,
+            $"{after.MismatchedCount} of {found.MismatchedCount} survived ONE repair — "
+            + "the repair is reading the truncated display list");
+    }
+
+    [Fact]
+    public async Task Repairing_holdings_past_the_display_cap_takes_one_call()
+    {
+        const int Positions = DisplayCap + 5;
+
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
+        var holdings = brokerage.HoldingsAccountId!.Value;
+
+        for (var i = 0; i < Positions; i++)
+        {
+            var sec = await ledger.AddSecurityAsync($"Fund {i}", $"F{i}");
+            await ledger.AddBoundaryPositionAsync(
+                brokerage.Id, holdings, sec, Boundary.Typical, Utc(2026, 1, 10));
+        }
+
+        await using (var seed = _fixture.NewDbContext())
+        {
+            await seed.Database.ExecuteSqlInterpolatedAsync($@"
+                UPDATE holdings SET cost_basis = cost_basis + 500
+                 WHERE ledger_id = {ledger.LedgerId};");
+        }
+
+        await using var db = _fixture.NewDbContext();
+        var repo = RepoFor(db);
+
+        var found = Assert.Single(
+            (await repo.CheckAsync(ledger.LedgerId)).Projections,
+            p => p.Projection == ConsistencyProjections.Holdings);
+        Assert.True(found.MismatchedCount > DisplayCap,
+            $"fixture drifted only {found.MismatchedCount}; it must exceed the cap to prove anything");
+        Assert.Equal(DisplayCap, found.Mismatches.Count);
+
+        await repo.RepairAsync(ledger.LedgerId, ConsistencyProjections.Holdings);
+
+        var after = Assert.Single(
+            (await repo.CheckAsync(ledger.LedgerId)).Projections,
+            p => p.Projection == ConsistencyProjections.Holdings);
+        Assert.True(after.Healthy,
+            $"{after.MismatchedCount} of {found.MismatchedCount} survived ONE repair — "
+            + "the repair is reading the truncated display list");
+    }
+
     [Fact]
     public async Task Repair_is_a_no_op_when_nothing_disagrees()
     {
@@ -420,19 +561,41 @@ public sealed class LedgerConsistencyTests
     }
 
     [Fact]
-    public void Every_named_projection_is_repairable()
+    public async Task Every_named_projection_is_repairable()
     {
         // The rule this file exists to enforce: nothing is reported that cannot be
-        // fixed. If a projection is added to the report, it must be added to the
-        // repair dispatch too, and this fails until it is.
-        Assert.Equal(
-            new[]
-            {
-                ConsistencyProjections.Balances,
-                ConsistencyProjections.Holdings,
-                ConsistencyProjections.RealizedGains,
-                ConsistencyProjections.PostingCounts,
-            },
-            ConsistencyProjections.All);
+        // fixed. A projection added to the report without a branch in the repair
+        // dispatch throws ArgumentOutOfRangeException, and this fails until it is
+        // added.
+        //
+        // This used to compare ConsistencyProjections.All against a second hardcoded
+        // copy of itself, which fails when the roster changes but proves nothing
+        // about repairability — the thing the comment claimed it enforced. Adding a
+        // projection and its repair in one commit would have been just as red as
+        // adding it without one.
+        var ledger = await InvestedLedgerAsync();
+
+        await using var db = _fixture.NewDbContext();
+        var repo = RepoFor(db);
+
+        Assert.NotEmpty(ConsistencyProjections.All);
+        foreach (var projection in ConsistencyProjections.All)
+        {
+            var result = await repo.RepairAsync(ledger.LedgerId, projection);
+            Assert.Equal(projection, result.Projection);
+        }
+    }
+
+    [Fact]
+    public async Task An_unknown_projection_is_refused()
+    {
+        // The other half of the guard above: RepairAsync must reject a name it does
+        // not dispatch rather than silently reporting success, or the loop up there
+        // would pass for a projection nobody implemented.
+        var ledger = await InvestedLedgerAsync();
+
+        await using var db = _fixture.NewDbContext();
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => RepoFor(db).RepairAsync(ledger.LedgerId, "not_a_projection"));
     }
 }

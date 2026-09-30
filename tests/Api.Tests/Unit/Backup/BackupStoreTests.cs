@@ -27,7 +27,10 @@ public sealed class BackupStoreTests : IDisposable
         catch { /* best-effort cleanup */ }
     }
 
-    private BackupStore NewStore() => new(_dir, NullLogger<BackupStore>.Instance);
+    private const long TestPartSize = 1024 * 1024;
+
+    private BackupStore NewStore() =>
+        new(_dir, NullLogger<BackupStore>.Instance, TestPartSize);
 
     // Retention is now passed per-create (ADR-0074: the policy lives in
     // backup_settings, resolved by BackupManager and handed to CreateAsync).

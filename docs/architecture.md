@@ -35,11 +35,22 @@ Coffer is a self-hosted personal finance application intended to replace Moneyda
 - Handle investment accounts, holdings, and tax-lot tracking
 - Support multiple users with per-ledger access roles (owner / editor / viewer), member + admin management, and invite links (ADR-0083, delivered 0.34.0)
 
-### 1.2 Non-goals (deferred)
+### 1.2 Non-goals and deferred work
+
+Two different things, kept apart on purpose: a non-goal is a decision not to build
+something, a deferral is work that is queued. Tax-lot selection sat in the combined
+list and read as the former when it is the latter.
+
+**Non-goals** — not planned:
 
 - Native mobile apps (the SPA is responsive; no native app)
 - Direct OFX/direct-connect banking (SimpleFIN covers this)
-- Tax-lot selection UI (schema supports it; UI deferred)
+
+**Deferred** — intended, not scheduled:
+
+- Tax-lot selection UI. The schema supports it and the per-security "Edit Lots"
+  affordance is a shaped, queued item in the maintainer backlog — it waits on the
+  editor and FIFO lot-closure work, not on a decision.
 
 ### 1.3 Technology stack
 

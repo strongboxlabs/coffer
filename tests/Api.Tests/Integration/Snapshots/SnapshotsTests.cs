@@ -730,6 +730,65 @@ public sealed class SnapshotsTests
             doc.RootElement.GetProperty("code").GetString());
     }
 
+    [Fact]
+    public async Task List_says_which_snapshots_are_restorable_and_agrees_with_the_refusal()
+    {
+        // The panel hides Restore on !Restorable. That flag and the endpoint's
+        // refusal are two readings of one rule, so the thing worth testing is
+        // that they AGREE — a flag that said "restorable" on a row the server
+        // rejects would be the defect this closes, just moved.
+        //
+        // Both snapshots are created through the API, then one is forged stale
+        // the same way the refusal test above does it.
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var freshResp = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots",
+            new CreateSnapshotRequest("fresh"));
+        Assert.Equal(HttpStatusCode.OK, freshResp.StatusCode);
+        var fresh = (await freshResp.Content.ReadFromJsonAsync<CreateSnapshotResponse>())!.Snapshot!;
+
+        var staleResp = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots",
+            new CreateSnapshotRequest("stale"));
+        Assert.Equal(HttpStatusCode.OK, staleResp.StatusCode);
+        var stale = (await staleResp.Content.ReadFromJsonAsync<CreateSnapshotResponse>())!.Snapshot!;
+
+        // A snapshot the API just made is on the live schema by construction —
+        // assert it BEFORE forging anything, so "restorable" is not a value that
+        // merely happens to be true.
+        Assert.True(fresh.Restorable);
+        Assert.True(stale.Restorable);
+
+        await using (var db = _fixture.NewDbContext())
+        {
+            await db.LedgerSnapshots
+                .Where(s => s.Id == stale.Id)
+                .ExecuteUpdateAsync(s => s.SetProperty(
+                    x => x.SchemaVersion, "001_some_ancient_mig.sql"));
+        }
+
+        var listResp = await client.GetAsync($"/api/ledgers/{ledger.LedgerId}/snapshots");
+        Assert.Equal(HttpStatusCode.OK, listResp.StatusCode);
+        var list = (await listResp.Content.ReadFromJsonAsync<List<SnapshotSummaryDto>>())!;
+
+        Assert.True(list.Single(s => s.Id == fresh.Id).Restorable);
+        Assert.False(list.Single(s => s.Id == stale.Id).Restorable);
+
+        // ...and the flag matches what actually happens: the one marked
+        // not-restorable is refused, the one marked restorable is not.
+        var refused = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots/{stale.Id}/restore", content: null);
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, refused.StatusCode);
+
+        // 204, not 200 — a successful restore returns NoContent.
+        var accepted = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots/{fresh.Id}/restore", content: null);
+        Assert.Equal(HttpStatusCode.NoContent, accepted.StatusCode);
+    }
+
     // -----------------------------------------------------------------
     // Cross-ledger probe / not-found / delete
     // -----------------------------------------------------------------

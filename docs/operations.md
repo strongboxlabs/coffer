@@ -125,11 +125,12 @@ Nothing to clean up in `.env` afterwards: no environment variable carries the ke
 how you read the current one — which is the value to back up after a rotation, since a
 `.cofferbak` is bound to the KEK era it was taken under.
 
-> The `rotate-kek` CLI subcommand was removed in ADR-0092. Rotation is routine
-> hygiene rather than disaster recovery, so an operator who can't sign in needs
-> recovery codes, not a rotation. (`restore` remains a CLI command because it
-> genuinely can't be a UI one — it skips migrations, so it works on a schema too
-> broken for the app to serve.)
+> The `rotate-kek` CLI subcommand was removed in ADR-0092, and `restore` in
+> ADR-0094. Rotation is routine hygiene rather than disaster recovery, so an
+> operator who can't sign in needs recovery codes, not a rotation. The restore
+> CLI's justification — "it skips migrations, so it works on a schema too broken
+> to serve" — turned out to be circular: every restore path wipes the schema to
+> empty first, so a broken schema is answered by reinstalling.
 
 ---
 
@@ -151,7 +152,7 @@ surfaced in each ledger's Settings.
 | Passphrase (app/scheduled) | Set once by an admin in **System → Backups**; sealed under the master KEK and stored in the DB (never plaintext). Drives both on-demand and scheduled backups. Viewable again via **Show** behind a passkey prompt (ADR-0092 D5b) — the server unseals it on every scheduled run, so offering no way to look it up only meant a forgotten passphrase silently made every backup unrestorable. |
 | Create | Admin panel (on demand), the daily schedule, or the CLI: `coffer-api backup --out <path>` with `COFFER_BACKUP_PASSPHRASE` set. |
 | Storage | Encrypted `.cofferbak` artifacts under `data/backups/` (the Docker volume), pruned by a tiered GFS policy: 7 daily, then 8 weekly, then 12 monthly. **These are admin-editable in System → Backups and persisted in the `backup_settings` table (ADR-0074) — they are not startup options.** This row used to name `Api:Backup:RetentionDailyDays` / `RetentionWeeklyWeeks` / `RetentionMonthlyMonths`; those keys do not exist, so setting them in `.env` silently changes nothing. The only backup key left in `ApiOptions` is `Compress`. On-box is a rolling working set; download via the admin panel to keep long-term copies off-host. |
-| Restore | Two paths, both in the UI (ADR-0094 removed the `coffer-api restore` CLI). On a **fresh** install (pre-auth): the **bootstrap UI** ([decisions/0061-bootstrap-restore.md](decisions/0061-bootstrap-restore.md)) — the setup screen offers *Restore from a backup*, uploads the `.cofferbak` + passphrase, and applies it on the next boot. On a **running** install, an **admin** can restore in-app — **System → Backups → Restore** (ADR-0071 D3): upload + passphrase behind a typed-confirmation gate; it stages + restarts like the bootstrap path and signs everyone out. This is the "migrate from another install" path. The dump carries the schema at the version it was taken from, and the next normal boot migrates it forward (a 188-era backup restored onto a 192 build applies 189→192 on that boot). **Every restore path wipes the schema to empty first**, dropping only what the service role owns and leaving install-managed extensions intact; pg_restore into a populated schema collides on every existing object and merges what it can, which is a hybrid of two installs rather than a restore. |
+| Restore | Two paths, both in the UI (ADR-0094 removed the `coffer-api restore` CLI). On a **fresh** install (pre-auth): the **bootstrap UI** ([decisions/0061-bootstrap-restore.md](decisions/0061-bootstrap-restore.md)) — the setup screen offers *Restore from a backup*, uploads the `.cofferbak` + passphrase, and applies it on the next boot. On a **running** install, an **admin** can restore in-app — **System → Backups → Restore** (ADR-0071 D3): upload + passphrase behind a typed-confirmation gate; **rolling THIS install back needs no upload at all** — pick one of its own stored backups from the list and it is read off disk ([decisions/0101-a-backup-too-big-to-send.md](decisions/0101-a-backup-too-big-to-send.md) D1); it stages + restarts like the bootstrap path and signs everyone out. This is the "migrate from another install" path. The dump carries the schema at the version it was taken from, and the next normal boot migrates it forward (a 188-era backup restored onto a 192 build applies 189→192 on that boot). **Every restore path wipes the schema to empty first**, dropping only what the service role owns and leaving install-managed extensions intact; pg_restore into a populated schema collides on every existing object and merges what it can, which is a hybrid of two installs rather than a restore. |
 
 Bring the **same master key** to the recovery host so the restored `wrapped_lek` columns
 + the sealed backup passphrase decrypt as-is; WebAuthn login survives if the RP
@@ -228,7 +229,12 @@ the fresh box:
    replaces (ADR-0094).
 2. **Restore.** Open the setup link the installer printed → **Restore from a backup** → upload your
    `.cofferbak` + passphrase, and paste the source install's **master key** in the
-   source-key field. It is validated against the archive's KEK fingerprint *before*
+   source-key field. A backup larger than `COFFER_BACKUP_PART_SIZE_MB` (49 by
+   default) is stored off-host as several `….cofferbak.001-of-003` files
+   (ADR-0101) — **select all of them together**; the form orders them and sends
+   them one at a time, so nothing in front of Coffer sees a body big enough to
+   refuse. It tells you by name if the set is short. The same applies on the
+   **setup screen** of a fresh install, which is where a real recovery starts. It is validated against the archive's KEK fingerprint *before*
    anything destructive runs, then adopted, so the sealed secrets come across too. Leave
    it empty and the restore still succeeds — D5 reconciliation clears what won't open
    and tells you what to re-establish.
@@ -237,9 +243,12 @@ the fresh box:
 
 Not using `install.sh` — k8s, your own orchestration, a host you'd rather configure by
 hand? The compose-level steps below are the same sequence, done manually. The upload
-ceiling is no longer a reason to prefer them: it is 4 GiB (ADR-0094), and if a *proxy*
-in front of Coffer caps the body, raise it there or restore over `http://localhost` with
-nothing in the path.
+ceiling is no longer a reason to prefer them: Coffer's own limit is 4 GiB (ADR-0094),
+and a *proxy* that caps the request body is handled by sending the artifact in parts
+(ADR-0101) rather than by reconfiguring the proxy — which matters because Cloudflare's
+100 MB cap on Free and Pro is not a setting at all. Set
+`COFFER_BACKUP_PART_SIZE_MB` in `.env` if something in front of Coffer is stricter
+than the 49 MB default.
 
 **On the source install — export an artifact:**
 

@@ -13,8 +13,8 @@ import type { UndoImportResult } from '../types/imports';
  * Undo one import, or count what it would remove.
  *
  * `dryRun` returns the counts and changes nothing, so a confirm can state how
- * many transactions will go and how many of them have been edited since.
- * Deleting money on an unconfirmed click is not something to make easy.
+ * many transactions will go. Deleting money on an unconfirmed click is not
+ * something to make easy.
  */
 export async function undoImport(
     ledgerId: string,

@@ -22,6 +22,14 @@ export interface SnapshotSummary {
     /** Uncompressed JSON size in bytes. Rendered as "47 MB before
      *  compression" on the snapshots panel. */
     contentSizeUncompressed: number;
+    /** Whether a restore could succeed right now — `schemaVersion` still
+     *  matches the live schema.
+     *
+     *  Server-computed, and NOT re-derived here on purpose: the refusal rule
+     *  belongs to the endpoint that enforces it, and comparing against
+     *  `/api/meta/version` in the SPA would be a second copy free to drift
+     *  from the one that actually decides. */
+    restorable: boolean;
 }
 
 export interface CreateSnapshotRequest {

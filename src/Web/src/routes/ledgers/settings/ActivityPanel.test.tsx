@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
+import { render, screen } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 import { ActivityPanel } from './ActivityPanel';
@@ -50,95 +49,30 @@ function renderPanel() {
     );
 }
 
-describe('ActivityPanel — undo import', () => {
+describe('ActivityPanel is a log, not a control surface', () => {
     beforeEach(() => {
         vi.restoreAllMocks();
     });
 
-    it('offers an undo on a file import, and reaching it calls the endpoint', async () => {
+    it('offers no undo — or any other action — on a listed operation', async () => {
+        // The panel briefly carried "Undo this import" (added 2026-09-23,
+        // removed 2026-09-25). A log reports what ran; putting an irreversible
+        // hard-delete of transactions in a list of past events is a category
+        // error, and the context is worst there — one summarised line from days
+        // ago, versus the import modal where you have just seen what landed.
+        //
+        // Anchored on "12 new" — the fixture's own txns_inserted summary, which
+        // renders ONLY on a row. The first version of this anchored on
+        // /file import/i and was worthless: PROVIDER_OPTIONS carries a "File
+        // import" filter option, so the anchor matched the dropdown and the
+        // absences below were judged against a panel whose rows had not
+        // rendered. It passed with an undo button injected.
         vi.spyOn(apiModule, 'fetchLedgerOperations').mockResolvedValue([op({})]);
-        const undoSpy = vi
-            .spyOn(apiModule, 'undoImport')
-            .mockResolvedValue({ found: 12, edited: 0, deleted: 0, tooLarge: false });
 
         renderPanel();
 
-        const user = userEvent.setup();
-        await user.click(await screen.findByRole('button', { name: /undo this import/i }));
-
-        // The DRY RUN is the point: nothing is deleted to find out what would be.
-        await waitFor(() => {
-            expect(undoSpy).toHaveBeenCalledWith(
-                LEDGER_ID, '00000000-0000-0000-0000-00000000f001', { dryRun: true },
-            );
-        });
-    });
-
-    it('says how many edited rows the undo would take with it', async () => {
-        vi.spyOn(apiModule, 'fetchLedgerOperations').mockResolvedValue([op({})]);
-        vi.spyOn(apiModule, 'undoImport')
-            .mockResolvedValue({ found: 12, edited: 3, deleted: 0, tooLarge: false });
-
-        renderPanel();
-        const user = userEvent.setup();
-        await user.click(await screen.findByRole('button', { name: /undo this import/i }));
-
-        // Anchored on the count that came back, then on the warning: a confirm
-        // that does not say what is about to be destroyed is not a confirm.
-        expect(await screen.findByText(/remove 12 transactions/i)).toBeInTheDocument();
-        expect(screen.getByText(/3 have been edited since/i)).toBeInTheDocument();
-    });
-
-    it('only deletes after the confirm is clicked', async () => {
-        vi.spyOn(apiModule, 'fetchLedgerOperations').mockResolvedValue([op({})]);
-        const undoSpy = vi
-            .spyOn(apiModule, 'undoImport')
-            .mockResolvedValue({ found: 12, edited: 0, deleted: 12, tooLarge: false });
-
-        renderPanel();
-        const user = userEvent.setup();
-        await user.click(await screen.findByRole('button', { name: /undo this import/i }));
-        await screen.findByText(/remove 12 transactions/i);
-
-        // Still only the dry run at this point — the preview must not delete.
-        expect(undoSpy).toHaveBeenCalledTimes(1);
-        expect(undoSpy.mock.calls[0]![2]).toEqual({ dryRun: true });
-
-        await user.click(screen.getByRole('button', { name: /yes, remove them/i }));
-
-        await waitFor(() => expect(undoSpy).toHaveBeenCalledTimes(2));
-        // The real call carries no dryRun.
-        expect(undoSpy.mock.calls[1]![2]).toBeUndefined();
-        expect(await screen.findByText(/undone — 12 transactions removed/i)).toBeInTheDocument();
-    });
-
-    it('does not offer an undo on a live-feed sync', async () => {
-        // Undoing a SimpleFIN sync would be a lie: its rows dedup on the
-        // provider's own id, so the next sync brings them straight back.
-        vi.spyOn(apiModule, 'fetchLedgerOperations')
-            .mockResolvedValue([op({ providerKey: 'simplefin', triggeredVia: 'manual' })]);
-        vi.spyOn(apiModule, 'undoImport').mockResolvedValue(
-            { found: 0, edited: 0, deleted: 0, tooLarge: false },
-        );
-
-        renderPanel();
-
-        // Anchored on the row being present before asserting the absence — a
-        // bare queryBy would pass on the loading frame, before anything renders.
-        expect(await screen.findByText(/SimpleFIN|simplefin/i)).toBeInTheDocument();
-        expect(screen.queryByRole('button', { name: /undo this import/i })).toBeNull();
-    });
-
-    it('explains a refusal rather than offering an action that cannot work', async () => {
-        vi.spyOn(apiModule, 'fetchLedgerOperations').mockResolvedValue([op({})]);
-        vi.spyOn(apiModule, 'undoImport')
-            .mockResolvedValue({ found: 25000, edited: 0, deleted: 0, tooLarge: true });
-
-        renderPanel();
-        const user = userEvent.setup();
-        await user.click(await screen.findByRole('button', { name: /undo this import/i }));
-
-        expect(await screen.findByText(/too large to undo/i)).toBeInTheDocument();
-        expect(screen.queryByRole('button', { name: /yes, remove them/i })).toBeNull();
+        expect(await screen.findByText(/12 new/i)).toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /undo/i })).toBeNull();
+        expect(screen.queryByText(/remove \d+ transaction/i)).toBeNull();
     });
 });

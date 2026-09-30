@@ -23,6 +23,55 @@ public static class BootstrapRestoreStaging
     /// endpoint streams the upload straight to it before verifying.</summary>
     public static string ArchivePath => Path.Combine(Dir, "archive.cofferbak");
 
+    /// <summary>
+    /// Where a multi-part upload accumulates before it becomes the archive
+    /// (ADR-0101). Separate from <see cref="ArchivePath"/> on purpose: a
+    /// half-received upload must never be mistaken for a backup anyone asked to
+    /// restore, and only <see cref="PromoteUploadAsync"/> — called after the
+    /// caller states how many parts there were and the count checks out — turns
+    /// one into the other.
+    /// </summary>
+    private static string UploadPath => Path.Combine(Dir, "upload.cofferbak");
+
+    /// <summary>Bytes received so far, or null when no upload is in progress.</summary>
+    public static long? UploadedBytes() =>
+        File.Exists(UploadPath) ? new FileInfo(UploadPath).Length : null;
+
+    /// <summary>
+    /// Append one part to the in-progress upload. <paramref name="part"/> is
+    /// 1-based and must be the next one expected, which is derived from what has
+    /// already landed rather than tracked in memory — so an interrupted upload
+    /// resumes after a restart, and two browser tabs cannot interleave into a
+    /// corrupt archive that only fails at decrypt.
+    /// </summary>
+    public static async Task AppendUploadAsync(
+        int part, Stream content, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(content);
+        EnsureDir();
+        // Part 1 starts a fresh upload — the only way to abandon a stalled one
+        // without an explicit reset call.
+        if (part == 1) TryDelete(UploadPath);
+        await using var dest = new FileStream(
+            UploadPath, FileMode.Append, FileAccess.Write, FileShare.None);
+        await content.CopyToAsync(dest, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Make the completed upload the archive to restore. Returns false when
+    /// nothing was uploaded.
+    /// </summary>
+    public static bool PromoteUpload()
+    {
+        if (!File.Exists(UploadPath)) return false;
+        TryDelete(ArchivePath);
+        File.Move(UploadPath, ArchivePath);
+        return true;
+    }
+
+    /// <summary>Discard an in-progress upload.</summary>
+    public static void ClearUpload() => TryDelete(UploadPath);
+
     /// <summary>True when a complete restore request is staged (all three files).</summary>
     public static bool IsPending() =>
         File.Exists(MarkerPath) && File.Exists(ArchivePath) && File.Exists(PassphrasePath);
@@ -79,6 +128,7 @@ public static class BootstrapRestoreStaging
     public static void Clear()
     {
         TryDelete(ArchivePath);
+        TryDelete(UploadPath);
         TryDelete(PassphrasePath);
         TryDelete(SourceKeyPath);
         TryDelete(MarkerPath);

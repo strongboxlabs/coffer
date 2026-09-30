@@ -120,13 +120,13 @@ Snapshots/backup work belongs in **per-ledger** settings because they're per-led
 3. **Passphrase-derived encryption for backups.** Drive (or any off-host destination) is untrusted storage. The passphrase is the one thing the user must safeguard separately.
 4. **Manual-at-cap refuses, doesn't evict.** Manual snaps are explicit intent; silent eviction would surprise the user.
 5. **Re-derive balances on restore.** Don't back up `txn_header_account_balances`; rebuild via `fn_recompute_balances_for_account` after the row insert.
-6. **Phase 1 = refuse cross-version restore.** Forward-migration of older payloads is a separate problem deserving its own ADR; deferring keeps Phase 1 scope honest.
+6. **Refuse cross-version restore — and this is the settled posture, not a phase.** Written here as "Phase 1", which read as a staging post on the way to forward-migration. It is not. A snapshot is an *undo* for something you are about to do — a bulk edit, an import — and it is restored minutes later on the same build. The cross-version case is what **backups** are for, and they are the answer the Snapshots panel gives in as many words. Decided 2026-09-25; see "Out of scope" below.
 7. **Phase 1 = manual backups only.** No scheduled Drive backups in v1. Same backup engine; scheduling + Drive auth land later.
 
 ## Out of scope (deferred)
 
 * **Google Drive integration** — OAuth, token storage, upload/download, scheduling. Phase 2 of the backups track.
-* **Forward-migration on restore** — own ADR. Needed when schema drift between backup and live DB becomes a real pain point.
+* **Forward-migration on restore** — **not a goal** (2026-09-25). This used to read "own ADR, needed when schema drift becomes a real pain point", which invited someone to build it the first time a snapshot went stale. Two reasons it stays out. A snapshot's job is undoing something you just did, on the build you are running; the tool for surviving an upgrade is a backup, which is what the Snapshots panel tells you to take. And the cost compounds — migration 188 made the version guard load-bearing for *correctness*, dropping the realized-gains recompute and capturing the derived rows in the payload because "restore REFUSES a cross-schema-version restore … so the derivation logic cannot have changed in between". Lifting the guard means reworking what 188 captured, to buy a capability nobody asked for. The UI no longer offers Restore on a retired snapshot (`SnapshotSummaryDto.Restorable`), so the staleness is visible rather than discovered at restore time.
 * **Merge-into-existing-ledger restore** — never going to ship; merge semantics for a backup are a swamp.
 * **Cross-ledger / whole-system backup** — operator concern (the sysadmin runs `pg_dump`); Coffer's surface stays user-bound per ledger.
 * **Backup file portability between Coffer versions** — implies forward-migration (above) and a backwards-compatibility contract we're not ready to commit to.

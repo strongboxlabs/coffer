@@ -48,7 +48,7 @@ Domain terms that appear in code, commit messages, and other docs. Add a term wh
 
 **`share_decimals`** — Per-security precision for share quantities (Moneydance's `dec` field). Stocks/ETFs typically use 4, mutual funds 5. The investment mapper looks this up so a `samt` of 1,000,000 means 100 shares for `dec=4` and 10 shares for `dec=5`.
 
-**Holdings sibling** — A system-managed `account_type='investment'` row at the root, paired 1-1 with a brokerage account via the brokerage's `holdings_account_id` self-FK. Hosts the holdings-side legs of every investment transaction (buys, sells, dividend reinvests, etc.) so the brokerage account itself stays purely a cash account. `is_system=TRUE` keeps the sibling out of normal account lists. See [decisions/0019-symmetric-postings.md](decisions/0019-symmetric-postings.md).
+**Holdings sibling** — A system-managed `account_type='investment'` row at the root, paired 1-1 with a brokerage account via the brokerage's `holdings_account_id` self-FK. Hosts the holdings-side legs of every investment transaction (buys, sells, dividend reinvests, etc.) so the brokerage account itself stays purely a cash account. `is_system=TRUE` keeps the sibling out of normal account lists. Originated in [decisions/0019-symmetric-postings.md](decisions/0019-symmetric-postings.md), which ADR-0022 superseded — the current headers+legs model is [decisions/0022-txn-headers-and-legs.md](decisions/0022-txn-headers-and-legs.md).
 
 **Leg** — One row of a paired posting. Every Moneydance split decomposes into two legs (origin + counterparty). `leg_index` is the original MD split index, preserved for ordering inside a `txn_group_id` group.
 

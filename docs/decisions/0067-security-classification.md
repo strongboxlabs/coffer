@@ -2,8 +2,8 @@
 
 * Status: Accepted — shipped v0.7.0 (mig 150; mig 153 made `asset_class =
   'multi_asset'` the single look-through signal, dropping `needs_look_through`).
-  Provider auto-classify + manual look-through population deferred (see
-  docs/maintainer/follow-ups.md "Investment-model slice")
+  Provider auto-classify deferred (see docs/maintainer/follow-ups.md FU-032);
+  manual look-through population has since shipped.
 * Date: 2026-06-26
 * Related: ADR-0063 (`allocation` tool consumes this), ADR-0054 (market-data
   provider — future auto-classify), ADR-0066 (account tax_status — distinct axis)

@@ -10,10 +10,18 @@ import {
     fetchSetupInfo,
     performSetup,
     restoreFromBackup,
+    uploadSetupRestoreParts,
     waitForServerBack,
     type SetupCompleteResponse,
     type SetupInfoResponse,
 } from '@/lib/auth';
+import {
+    backupPartCount,
+    orderBackupParts,
+    parseBackupPartName,
+    BACKUP_PART_SIZE_FALLBACK,
+} from '@/lib/api/backup';
+import { formatBytes } from '@/lib/format';
 import { errorMessage } from '@/lib/errorMessage';
 import { usernameProblem } from '@/lib/username';
 import { RecoveryCodes } from '@/components/RecoveryCodes';
@@ -112,9 +120,15 @@ export function SetupPage() {
         );
     }
 
-    // infoQuery's value is empty (ADR-0088); it is awaited purely so an invalid
-    // or expired bootstrap token surfaces before the form renders.
-    return <SetupChooser token={token} />;
+    // Awaited so an invalid or expired bootstrap token surfaces before the form
+    // renders. It also carries the restore part size (ADR-0101) — the only
+    // deployment value this pre-auth page needs and cannot read anywhere else.
+    return (
+        <SetupChooser
+            token={token}
+            partSizeBytes={infoQuery.data?.restorePartSizeBytes ?? BACKUP_PART_SIZE_FALLBACK}
+        />
+    );
 }
 
 /**
@@ -122,14 +136,20 @@ export function SetupPage() {
  * backup. Both are gated by the same one-shot bootstrap token; the choice
  * only routes to the create ceremony or the restore upload.
  */
-function SetupChooser({ token }: { token: string }) {
+function SetupChooser({ token, partSizeBytes }: { token: string; partSizeBytes: number }) {
     const [mode, setMode] = useState<'choose' | 'create' | 'restore'>('choose');
 
     if (mode === 'create') {
         return <SetupForm token={token} onBack={() => setMode('choose')} />;
     }
     if (mode === 'restore') {
-        return <RestoreFlow token={token} onBack={() => setMode('choose')} />;
+        return (
+            <RestoreFlow
+                token={token}
+                partSizeBytes={partSizeBytes}
+                onBack={() => setMode('choose')}
+            />
+        );
     }
 
     return (
@@ -514,15 +534,70 @@ function SetupForm({ token, onBack }: SetupFormProps) {
  * back and then sends the user to /login (the restored credentials, not
  * a freshly-created one).
  */
-function RestoreFlow({ token, onBack }: { token: string; onBack: () => void }) {
+function RestoreFlow({
+    token,
+    partSizeBytes,
+    onBack,
+}: {
+    token: string;
+    partSizeBytes: number;
+    onBack: () => void;
+}) {
     const fileId = useId();
     const passphraseId = useId();
-    const [file, setFile] = useState<File | null>(null);
+    /** One whole backup, or the set of parts it was stored as off-host. */
+    const [source, setSource] = useState<File | { parts: File[] } | null>(null);
+    /** Why a picked set is not a restorable backup — by name, before uploading. */
+    const [pickError, setPickError] = useState<string | null>(null);
     const [passphrase, setPassphrase] = useState('');
     const [restarting, setRestarting] = useState(false);
+    const [sentBytes, setSentBytes] = useState<number | null>(null);
+
+    function pickFiles(files: FileList | null) {
+        setPickError(null);
+        const picked = files ? [...files] : [];
+        if (picked.length === 0) return setSource(null);
+        if (picked.length === 1 && parseBackupPartName(picked[0].name) === null)
+            return setSource(picked[0]);
+
+        const result = orderBackupParts(picked);
+        if ('error' in result) {
+            setSource(null);
+            setPickError(result.error);
+            return;
+        }
+        setSource(result);
+    }
+
+    const totalBytes =
+        source === null
+            ? 0
+            : source instanceof File
+              ? source.size
+              : source.parts.reduce((n, f) => n + f.size, 0);
 
     const restoreMutation = useMutation({
-        mutationFn: () => restoreFromBackup(token, file!, passphrase),
+        mutationFn: async () => {
+            // Anything that will not fit in one request goes ahead in pieces,
+            // and the restore call then names them (ADR-0101). On a fresh
+            // install this is not an optimisation: a proxy that caps the body
+            // refuses the whole artifact outright, and there is no CLI left to
+            // fall back to.
+            const needsParts =
+                source !== null &&
+                ('parts' in source || source.size > partSizeBytes);
+
+            if (needsParts) {
+                setSentBytes(0);
+                try {
+                    await uploadSetupRestoreParts(token, source!, partSizeBytes, setSentBytes);
+                } finally {
+                    setSentBytes(null);
+                }
+                return restoreFromBackup(token, { uploadedParts: true }, passphrase);
+            }
+            return restoreFromBackup(token, source as File, passphrase);
+        },
         onSuccess: () => setRestarting(true),
     });
 
@@ -533,7 +608,12 @@ function RestoreFlow({ token, onBack }: { token: string; onBack: () => void }) {
     const restoreError = restoreMutation.error
         ? errorMessage(restoreMutation.error, 'Restore failed.')
         : null;
-    const submitDisabled = restoreMutation.isPending || file === null || passphrase.length === 0;
+    const progress =
+        sentBytes === null
+            ? null
+            : `Uploading — ${formatBytes(sentBytes)} of ${formatBytes(totalBytes)} sent.`;
+    const submitDisabled =
+        restoreMutation.isPending || source === null || passphrase.length === 0;
 
     return (
         <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center px-6 py-12">
@@ -569,16 +649,41 @@ function RestoreFlow({ token, onBack }: { token: string; onBack: () => void }) {
                     >
                         <div className="space-y-1.5">
                             <FieldLabel htmlFor={fileId}>Backup file</FieldLabel>
+                            {/* No accept filter: a part's extension is
+                                .003-of-005, which cannot be enumerated, and a
+                                filter that hides the files an operator arrived
+                                with is worse than none. */}
                             <input
                                 id={fileId}
                                 type="file"
-                                accept=".cofferbak,application/octet-stream"
+                                multiple
                                 disabled={restoreMutation.isPending}
-                                onChange={(event) =>
-                                    setFile(event.target.files?.[0] ?? null)
-                                }
+                                onChange={(event) => pickFiles(event.target.files)}
                                 className="block w-full text-sm text-text file:mr-3 file:rounded file:border file:border-border file:bg-surface-muted file:px-3 file:py-1.5 file:text-sm"
                             />
+                            {source !== null && 'parts' in source ? (
+                                <p className="text-[0.6875rem] text-text-muted">
+                                    {source.parts.length} parts · {formatBytes(totalBytes)},
+                                    sent one at a time.
+                                </p>
+                            ) : null}
+                            {source instanceof File && source.size > partSizeBytes ? (
+                                <p className="text-[0.6875rem] text-text-muted">
+                                    {formatBytes(source.size)} — sent in{' '}
+                                    {backupPartCount(source.size, partSizeBytes)} parts,
+                                    so a proxy that caps request size does not refuse it.
+                                </p>
+                            ) : null}
+                            {pickError ? (
+                                <p role="alert" className="text-[0.6875rem] text-state-danger">
+                                    {pickError}
+                                </p>
+                            ) : null}
+                            <p className="text-[0.6875rem] text-text-muted">
+                                A large backup is stored as several
+                                <code className="mx-1">.cofferbak.001-of-003</code>
+                                files. Select all of them together.
+                            </p>
                         </div>
 
                         <div className="space-y-1.5">
@@ -597,6 +702,13 @@ function RestoreFlow({ token, onBack }: { token: string; onBack: () => void }) {
                                 verified before anything is changed.
                             </p>
                         </div>
+
+                        {progress ? (
+                            <p role="status" className="text-[0.6875rem] text-text-muted">
+                                {progress} Nothing is replaced until every part has
+                                arrived.
+                            </p>
+                        ) : null}
 
                         {restoreError ? (
                             <p
