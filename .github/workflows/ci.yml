@@ -115,7 +115,7 @@ jobs:
         # Must match SHARD_NAMES in scripts/ci-dotnet-shards.sh. An unknown name
         # there exits 2 rather than running nothing, so a typo fails loudly instead
         # of reporting a green build that tested nothing.
-        shard: [s1, s1b, s2, s3, s4, importer]
+        shard: [trx_a, trx_b, trx_c, feeds, accounts, backup, ingest, rest, importer]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
