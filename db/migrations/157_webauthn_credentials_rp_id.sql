@@ -1,0 +1,13 @@
+-- 157_webauthn_credentials_rp_id.sql
+-- ADR-0013 follow-through. Record the WebAuthn Relying Party ID (the domain a
+-- passkey was registered against) on each credential so that:
+--   * registration excludes only *same-RP* credentials -- a credential from a
+--     previous RP (e.g. after a domain rename or an ADR-0061 restore onto a new
+--     RP id) no longer blocks re-enrolling the same authenticator, which was a
+--     lockout trap;
+--   * stale (wrong-RP) passkeys are distinguishable from live ones.
+-- Nullable: rows predating this migration have an unknown RP (NULL) and are
+-- treated as "not the current RP" for exclusion -- they can't collide anyway.
+-- Column inherits the existing table grants; webauthn_credentials is accessed
+-- only via the BYPASSRLS service role, so no policy change is needed.
+ALTER TABLE webauthn_credentials ADD COLUMN rp_id text;

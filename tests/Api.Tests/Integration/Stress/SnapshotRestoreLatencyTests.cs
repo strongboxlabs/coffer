@@ -1,0 +1,285 @@
+using System.Net;
+using System.Net.Http.Json;
+using System.Diagnostics;
+
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.EntityFrameworkCore;
+using Xunit.Abstractions;
+
+using Coffer.Api.Contracts;
+using Coffer.Api.Tests.Integration.Infra;
+
+namespace Coffer.Api.Tests.Integration.Stress;
+
+/// <summary>
+/// The scale lane: snapshot create + restore against a ~50k-transaction,
+/// 200-holding ledger. Deliberately OUTSIDE the default test run — the
+/// <c>Integration.Stress</c> namespace is excluded from the sharded suite
+/// (<c>scripts/ci-dotnet-shards.sh</c>), because building the fixture takes minutes
+/// and would dominate every ordinary run. Invoke it explicitly by filtering on this
+/// namespace:
+/// <code>dotnet test --filter "FullyQualifiedName~Integration.Stress"</code>
+/// </summary>
+/// <remarks>
+/// <para>This exists because restore latency was completely unmeasured. The restore
+/// time that motivated mig 188 came from real data, and the
+/// representative fixture is far too small to reproduce it (19 headers, 1
+/// holding) — so the payoff of that change was reasoned and unit-tested but never
+/// timed. Nothing here asserts a speedup: it asserts restore stays well inside its
+/// timeout at scale, and prints the timings so a regression is visible.</para>
+/// <para>Parameterised over <see cref="Boundary.Positions"/> like every other
+/// financial suite: the money comparison across the restore is only as good as
+/// the magnitudes in the fixture, and the scale seeder alone produces none that
+/// approach where money math breaks. The boundary position is added ON TOP of
+/// the scale ledger rather than replacing it, so the aggregates span both
+/// magnitudes in one SUM.</para>
+/// <para>The thresholds are deliberately loose. This runs on whatever hardware the
+/// lane is invoked on, so a tight bound would be a flake generator. The value is
+/// the printed numbers plus a guard against the failure found on a real install —
+/// a restore exceeding its command timeout.</para>
+/// </remarks>
+[Collection(ApiCollection.Name)]
+public sealed class SnapshotRestoreLatencyTests
+{
+    /// <summary>
+    /// The failure found on a real install was a 30s command timeout; the cap is now 600s
+    /// (SnapshotOpTimeoutSeconds). Fail well before that so there is headroom to
+    /// diagnose rather than a hard stop at the cap.
+    /// </summary>
+    private static readonly TimeSpan RestoreBudget = TimeSpan.FromSeconds(120);
+
+    private readonly PostgresFixture _fixture;
+    private readonly ITestOutputHelper _output;
+
+    public SnapshotRestoreLatencyTests(PostgresFixture fixture, ITestOutputHelper output)
+    {
+        _fixture = fixture;
+        _output = output;
+    }
+
+    [Theory]
+    [MemberData(nameof(Boundary.Positions), MemberType = typeof(Boundary))]
+    public async Task Snapshot_create_and_restore_stay_within_budget_at_scale(Boundary.Position p)
+    {
+        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var scale = StressLedger.Scale.Default;
+
+        var seedElapsed = await StressLedger.SeedAsync(_fixture, ledger, scale);
+        _output.WriteLine($"seed:    {seedElapsed.TotalSeconds,7:F1}s  (target {scale.TotalTxns:N0} txns)");
+
+        // Prove the scale actually materialised — a silently-small ledger would
+        // make every timing below meaningless.
+        var counts = await ReadCountsAsync(ledger.LedgerId);
+        _output.WriteLine(
+            $"seeded:  {counts.Headers:N0} headers, {counts.Legs:N0} legs, " +
+            $"{counts.Holdings:N0} holdings, {counts.Lots:N0} lots, {counts.Gains:N0} realized gains");
+
+        Assert.Equal(scale.TotalTxns, counts.Headers);
+        Assert.Equal(scale.Holdings, counts.Holdings);
+        Assert.Equal(scale.Holdings * scale.BuysPerHolding, counts.Lots);
+        // Sells must have produced realized gains, or the FIFO path went unexercised.
+        Assert.True(counts.Gains > 0, "no realized_gains rows — the disposals did not close any lots");
+
+        // One position at the magnitude under test, ON TOP of the scale ledger.
+        //
+        // The money aggregates below then SUM across both magnitudes at once,
+        // which is where scale-dependent precision actually breaks — a 12dp
+        // quantity inside a 50k-row total, rather than alone in a small fixture.
+        // The normal-lane counterpart (SnapshotMoneyRoundTripTests) already
+        // covers the matrix in isolation and runs on every push; what this adds
+        // is the interaction with scale, which is the only thing the stress lane
+        // can say that the cheap lane cannot.
+        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var brokerage = await ledger.AddInvestmentAccountAsync($"Boundary {p.Name}");
+        var security = await ledger.AddSecurityAsync($"Boundary {p.Name}", "BDY");
+
+        // Through the WRITE PATH, not SyntheticLedger.AddBoundaryPositionAsync.
+        //
+        // The raw seeder writes holdings and cost basis but NO `lots` rows —
+        // migration 202 made the FIFO walk pure, so lots are written by the
+        // investment-transaction endpoint and by snapshot restore, not by a raw
+        // insert. AssertLedgerIsConsistentAsync checks
+        // SUM(lots.quantity) = holdings.quantity per holding, so a raw-seeded
+        // position drifts it immediately. Posting the buy gives a position with
+        // real lots, which is also what the restore has to reproduce.
+        var buy = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions",
+            new CreateInvestmentTransactionRequest
+            {
+                BrokerageAccountId = brokerage.Id,
+                Action = "buy",
+                SecurityId = security,
+                Shares = p.Quantity,
+                Price = p.BuyPrice,
+                PostedAt = new DateTime(2021, 6, 1, 0, 0, 0, DateTimeKind.Utc),
+            });
+        Assert.Equal(HttpStatusCode.Created, buy.StatusCode);
+
+        // Re-read AFTER the boundary buy: `counts` above proved the seed
+        // materialised at the declared scale, but the ledger that actually gets
+        // snapshotted is that plus this position, and the round-trip comparison
+        // below must be against what was snapshotted.
+        var baseline = await ReadCountsAsync(ledger.LedgerId);
+        Assert.Equal(counts.Headers + 1, baseline.Headers);
+
+        // Systemic invariants must hold at scale, not just in the small fixture.
+        await AssertLedgerIsConsistentAsync(ledger.LedgerId);
+
+        // Money BEFORE the round trip. The counts below prove the graph came back;
+        // only this proves the VALUES did. A restore that reinserted every row with a
+        // corrupted amount would satisfy every other assertion in this test.
+        var moneyBefore = await ReadMoneyAsync(ledger.LedgerId);
+
+        var createWatch = Stopwatch.StartNew();
+        var createResp = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots", new CreateSnapshotRequest("stress"));
+        createWatch.Stop();
+        Assert.Equal(HttpStatusCode.OK, createResp.StatusCode);
+        var snap = (await createResp.Content.ReadFromJsonAsync<CreateSnapshotResponse>())!.Snapshot!;
+        _output.WriteLine(
+            $"create:  {createWatch.Elapsed.TotalSeconds,7:F1}s  " +
+            $"({snap.ContentSizeUncompressed / (1024.0 * 1024.0):F1} MB payload)");
+
+        var restoreWatch = Stopwatch.StartNew();
+        var restoreResp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots/{snap.Id}/restore", content: null);
+        restoreWatch.Stop();
+        Assert.Equal(HttpStatusCode.NoContent, restoreResp.StatusCode);
+        _output.WriteLine($"restore: {restoreWatch.Elapsed.TotalSeconds,7:F1}s  (budget {RestoreBudget.TotalSeconds:F0}s)");
+
+        // The ledger must still be consistent after a full round trip, and the
+        // graph must be intact rather than partially restored.
+        var afterCounts = await ReadCountsAsync(ledger.LedgerId);
+        Assert.Equal(baseline, afterCounts);
+        await AssertLedgerIsConsistentAsync(ledger.LedgerId);
+
+        // Correctness at scale, not just latency and row counts: every money total
+        // must come back identical to the cent.
+        var moneyAfter = await ReadMoneyAsync(ledger.LedgerId);
+        _output.WriteLine(
+            $"money:   legs {moneyAfter.LegAmount:N2}  basis {moneyAfter.CostBasis:N2}  " +
+            $"qty {moneyAfter.Quantity:N6}  gains {moneyAfter.RealizedGain:N2}");
+        Assert.Equal(moneyBefore, moneyAfter);
+
+        // Measure, don't assert: how long the FIFO recompute that mig 188 removed
+        // from restore actually takes at this scale. Two reasons to keep this here
+        // rather than reason about it — it quantifies what mig 188 saved (restore
+        // used to pay this on top of the number above), and it is the baseline for
+        // the follow-up that optimises the walk itself, which still runs on EVERY
+        // transaction write via the interceptors.
+        var fifoElapsed = await TimeFifoRecomputeAsync(ledger.LedgerId);
+        _output.WriteLine(
+            $"fifo:    {fifoElapsed.TotalSeconds,7:F1}s  " +
+            $"(removed from restore by mig 188; still runs on every txn write)");
+
+        Assert.True(
+            restoreWatch.Elapsed < RestoreBudget,
+            $"restore took {restoreWatch.Elapsed.TotalSeconds:F1}s, over the {RestoreBudget.TotalSeconds:F0}s budget");
+    }
+
+    private async Task<TimeSpan> TimeFifoRecomputeAsync(Guid ledgerId)
+    {
+        await using var db = _fixture.NewServiceFactory().Create();
+        // This is the operation whose cost is in question — it must not be cut off
+        // by the 30s Npgsql default while we are trying to measure it.
+        db.Database.SetCommandTimeout(600);
+
+        var watch = Stopwatch.StartNew();
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $"SELECT recompute_holdings_cost_basis({ledgerId})");
+        watch.Stop();
+        return watch.Elapsed;
+    }
+
+    // A record CLASS, not a struct: EF's ad-hoc SqlQuery mapping requires a
+    // non-interface reference type. Records still give the value equality the
+    // before/after comparison relies on.
+    private sealed record Money(
+        decimal LegAmount, decimal CostBasis, decimal Quantity,
+        decimal RealizedGain, decimal Balances);
+
+    /// <summary>Every money aggregate a restore could silently corrupt.</summary>
+    private async Task<Money> ReadMoneyAsync(Guid ledgerId)
+    {
+        await using var db = _fixture.NewServiceFactory().Create();
+        db.Database.SetCommandTimeout(600);
+        return await db.Database.SqlQuery<Money>($"""
+            SELECT
+              (SELECT COALESCE(SUM(amount), 0)      FROM txn_legs        WHERE ledger_id = {ledgerId}) AS "LegAmount",
+              (SELECT COALESCE(SUM(cost_basis), 0)  FROM holdings        WHERE ledger_id = {ledgerId}) AS "CostBasis",
+              (SELECT COALESCE(SUM(quantity), 0)    FROM holdings        WHERE ledger_id = {ledgerId}) AS "Quantity",
+              (SELECT COALESCE(SUM(realized_gain),0) FROM realized_gains WHERE ledger_id = {ledgerId}) AS "RealizedGain",
+              (SELECT COALESCE(SUM(balance_after),0) FROM txn_header_account_balances b
+                 JOIN txn_headers h ON h.id = b.header_id
+                WHERE h.ledger_id = {ledgerId}) AS "Balances"
+            """).SingleAsync();
+    }
+
+    private readonly record struct Counts(int Headers, int Legs, int Holdings, int Lots, int Gains);
+
+    private async Task<Counts> ReadCountsAsync(Guid ledgerId)
+    {
+        await using var db = _fixture.NewServiceFactory().Create();
+        return new Counts(
+            await db.TxnHeaders.CountAsync(h => h.LedgerId == ledgerId),
+            await db.TxnLegs.CountAsync(l => l.LedgerId == ledgerId),
+            await db.Holdings.CountAsync(h => h.LedgerId == ledgerId),
+            await db.Database.SqlQuery<int>(
+                $"SELECT count(*)::int AS \"Value\" FROM lots WHERE ledger_id = {ledgerId}").SingleAsync(),
+            await db.Database.SqlQuery<int>(
+                $"SELECT count(*)::int AS \"Value\" FROM realized_gains WHERE ledger_id = {ledgerId}").SingleAsync());
+    }
+
+    /// <summary>
+    /// The same systemic invariants the representative fixture asserts, applied at
+    /// scale: every header balances, and holdings reconcile with their open lots.
+    /// Magnitude bugs surface here and nowhere smaller.
+    /// </summary>
+    private async Task AssertLedgerIsConsistentAsync(Guid ledgerId)
+    {
+        await using var db = _fixture.NewServiceFactory().Create();
+
+        var unbalanced = await db.Database.SqlQuery<int>($"""
+            SELECT count(*)::int AS "Value" FROM (
+                SELECT l.header_id
+                  FROM txn_legs l
+                  JOIN live_txn_headers h ON h.id = l.header_id
+                 WHERE l.ledger_id = {ledgerId}
+                 GROUP BY l.header_id
+                HAVING SUM(l.amount) <> 0
+            ) d
+            """).SingleAsync();
+        Assert.Equal(0, unbalanced);
+
+        var drifted = await db.Database.SqlQuery<int>($"""
+            SELECT count(*)::int AS "Value" FROM (
+                SELECT h.id
+                  FROM holdings h
+                  LEFT JOIN lots l ON l.holding_id = h.id AND l.is_closed = FALSE
+                 WHERE h.ledger_id = {ledgerId}
+                 GROUP BY h.id, h.quantity
+                HAVING COALESCE(SUM(l.quantity), 0) <> h.quantity
+            ) d
+            """).SingleAsync();
+        Assert.Equal(0, drifted);
+
+        var negative = await db.Holdings
+            .CountAsync(h => h.LedgerId == ledgerId && h.Quantity < 0);
+        Assert.Equal(0, negative);
+    }
+
+    private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
+    {
+        var cookieValue = await ledger.IssueSessionCookieAsync();
+        var client = factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            HandleCookies = false,
+        });
+        client.DefaultRequestHeaders.Add("Cookie", $"__Host-coffer.session={cookieValue}");
+        // A 50k-transaction snapshot + restore runs far past HttpClient's 100s default.
+        client.Timeout = TimeSpan.FromMinutes(15);
+        return client;
+    }
+}

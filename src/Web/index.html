@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Coffer</title>
+    <!-- Pre-paint theme (public/theme-init.js): a plain blocking script, so it runs before
+         the first paint, and a file rather than inline, so the CSP's script-src 'self'
+         allows it (FU-091). The fonts are bundled from @fontsource in main.tsx: loading them
+         from Google told a third party every time Coffer was opened. -->
+    <script src="/theme-init.js"></script>
+  </head>
+  <body class="bg-surface-muted text-text font-sans antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

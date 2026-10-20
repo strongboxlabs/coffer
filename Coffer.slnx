@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Api/Api.csproj" />
+    <Project Path="src/Importer.Moneydance/Importer.Moneydance.csproj" />
+    <Project Path="src/Importer.Moneydance.Cli/Importer.Moneydance.Cli.csproj" />
+    <Project Path="src/Coffer.Domain.Investment/Coffer.Domain.Investment.csproj" />
+    <Project Path="src/Coffer.Domain.Reminders/Coffer.Domain.Reminders.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Api.Tests/Api.Tests.csproj" />
+    <Project Path="tests/Importer.Moneydance.Tests/Importer.Moneydance.Tests.csproj" />
+  </Folder>
+</Solution>

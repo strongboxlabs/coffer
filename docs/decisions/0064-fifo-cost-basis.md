@@ -1,0 +1,166 @@
+# 0064 — FIFO cost basis (replacing average cost)
+
+* Status: Accepted — landed with the MCP v2 slice, v0.6.0. **Amended by
+  [ADR-0065](0065-transfer-shares-in-kind.md)** (v0.7.0, mig 152): the FIFO consume
+  loop gained a lot-availability gate (consume only lots whose creating-leg header
+  `posted_at` ≤ the disposal time) so an in-kind transfer-in lot — which carries an
+  earlier `acquired_at` than its arrival — can't be consumed by an earlier sale; a
+  `transfer_shares` disposal consumes lots + reduces basis but records no realized
+  gain.
+* Date: 2026-06-26
+* Related: ADR-0027 (investment action catalog), ADR-0029 (action × field matrix),
+  ADR-0039/0040/0041 (recompute ordering), ADR-0063 (MCP — the `realized_gains`
+  tool that surfaced this), ADR-0065 (transfer-shares — amends this recompute)
+
+## Context
+
+Coffer displayed holding cost basis using **average cost** (the recompute
+function's running `v_running_basis / v_running_qty`), while *also* maintaining
+the `lots` table with **FIFO** consumption (mig 054, "for a future per-lot tax
+surface"). The two diverge the moment a security is partially sold, so the
+displayed basis (average) and the lots (FIFO) disagreed.
+
+Building the MCP `realized_gains` tool (ADR-0063 v2) forced the question: a
+realized-gain figure must reconcile with the basis shown everywhere else. The
+owner's call: **be consistent — switch the whole app to FIFO.** FIFO is also the
+tax-correct default for US individual equities (average cost isn't permitted for
+stocks), and the FIFO lot machinery already exists — only the *derivation of the
+holding's basis* was average-cost.
+
+## Decisions
+
+### D1 — Holding cost basis is FIFO (the open-lot cost)
+A holding's `cost_basis` becomes the sum of its **open FIFO lots'** cost
+(Σ remaining-qty × lot `unit_cost`), not the average-cost running basis. The
+recompute function already consumes lots FIFO on each sell; we change the
+*basis trajectory* to track that consumption instead of average cost. With no
+sells, FIFO ≡ average cost, so buy-only histories are unchanged.
+
+### D1a — Lot invariant: every acquiring leg has a lot row
+FIFO basis is derived from the `lots` table, so **every buy-side holdings leg
+must have a `lots` row** — this is a maintained invariant, not something the
+recompute self-heals (a self-heal would race the create path, which already
+inserts the lot in the same unit of work, and mask a real producer bug). All
+producers uphold it: the API create path (`_db.Lots.Add` from the domain
+`InvestmentHoldingsImpact.NewLot`), the API edit/PATCH path (drops + rebuilds
+legs *and* lots), and the importer (`BuildHoldingsImpact` → `BulkReplaceLots`).
+The recompute only *resets + consumes* lots; it never invents them. Tests seed
+lots the same way production does (`InsertLotForHeader`), so they exercise the
+real path rather than a parallel one.
+
+### D2 — Realized gains are persisted (new `realized_gains` table)
+The recompute walk already knows, at each sell, which FIFO lots it consumes and
+their cost. It now records one `realized_gains` row per sell leg:
+proceeds (the security-leg market amount, net of a sell-side fee when the
+brokerage's `is_trade_commission` is set — mirroring how buys fold fees into
+basis), cost basis consumed, and realized gain = proceeds − cost consumed.
+Keyed by the sell leg; recompute deletes + repopulates rows in its (account,
+security) scope each run, so it's always consistent with the lots. This is the
+home for the `realized_gains` MCP tool and a future short-/long-term breakdown.
+
+### D3 — One-shot full recompute backfill
+The migration rewrites `recompute_holdings_cost_basis` and runs it ledger-wide,
+so every holding's basis converges to FIFO and `realized_gains` is populated for
+all history in one pass (the established mig-068/116/117/118 pattern).
+
+### D4 — Validate against brokerage statements before release
+Per the standing rule that investment numbers must reconcile with reality:
+holdings basis + realized gains are checked against brokerage statements in dev
+before the release. Sell-side fee treatment (D2) is the most uncertain detail and
+is the focus of that check.
+
+### D5 — Short-/long-term split (mig 169)
+The D2 "future short-/long-term breakdown" lands: `realized_gains` gains
+`proceeds_lt` / `cost_basis_sold_lt` / `realized_gain_lt` — the **long-term**
+portion of each sale (short-term = total − LT, derived in the reporting layer, so
+no redundant column pair). The recompute's sell branch already visits each consumed
+lot with its `acquired_at` (preserved across splits, so the holding period runs
+from the original purchase); it now buckets each consumed portion as long-term iff
+`sold_at > acquired_at + 1 year` (US "more than one year"; exactly one year is
+short-term), accumulating the LT cost and apportioning proceeds to LT by consumed-
+share share (multiply-before-divide, so an exactly-divisible split stays exact). A
+sale straddling the 1-year line splits across both buckets; a `transfer_shares`
+disposal still records no row. `RealizedGainsAsync` + the `realized_gains` MCP tool
+surface the split. Chosen over a per-lot `realized_gain_lots` detail table: the
+breakdown on the existing row answers the ask without the extra schema, and the
+FIFO engine stays the single source. The one-shot recompute backfills all history.
+
+### D6 — The walk orders by the EFFECTIVE date (mig 229)
+
+Every holdings function read the raw `txn_headers.posted_at`, while the register
+renders `COALESCE(o.posted_at, h.posted_at)` — the user's curated date. So a row
+could sit in one place on screen and in another in the walk that decides which
+lots a sale consumes, which basis it books and which period the gain lands in.
+
+Already live rather than hypothetical: an investment merge stamps a `posted_at`
+override on the SURVIVOR (it adopts the folded row's date), so every merge winner
+had a displayed date its cost basis did not know about.
+
+`holdings_fifo_walk`, `holdings_cost_basis_as_of` and
+`holdings_market_value_as_of_set` all moved together. Moving only the walk would
+have made the as-of feeders disagree with it — a position inside the cutoff for
+cost basis and outside it for market value at the same instant. Date semantics
+have to be uniform across them or the reports contradict each other.
+
+NOT `resolved_transactions`: its `amount` is `COALESCE(lo.amount, l.amount)`,
+which would fold LEG overrides into cost basis, and it COALESCEs `security_id`
+and `quantity` across a posting's sibling legs, which would double-count every
+holdings leg against its cash twin. The walk joins `txn_header_overrides`
+directly instead.
+
+`is_hidden` stays raw in these functions, deliberately:
+`txn_header_overrides.is_hidden` is only ever carried forward by the override
+upsert, never set — hiding writes `txn_headers.is_hidden`. If that changes, these
+predicates need the same treatment.
+
+Verified by equivalence rather than by fixture: the migration was applied to a
+clone of the real dev database and `holdings`, `lots` and `realized_gains`
+checksummed identical before and after, which is what "no row without an
+overridden date moves" means in practice.
+
+## Consequences
+
+- Every holding with a partial-sale history gets a (correct, FIFO) basis that
+  differs from the old average-cost figure; unrealized gains, the Overview, and
+  the Portfolio View move accordingly. Buy-only holdings are unchanged.
+- Investment tests that asserted average-cost basis values for sell histories are
+  updated to the FIFO expectations.
+- `realized_gains` becomes a first-class, queryable surface (MCP + future UI).
+- Tax-method correctness for US equities; groundwork for lot-level tax reporting.
+- **Surfaces (does not cause) a pre-existing modeling gap:** in-kind transfers /
+  rollovers recorded as sell+buy now show a fabricated realized gain (and the
+  destination basis was reset to transfer-date market). The fix is the
+  transfer-shares action + a data scrub — its own slice (see docs/maintainer/follow-ups.md).
+  FIFO is correct given the recorded actions; it just made the issue visible.
+
+## Amendment, 2026-10-20 — a sale cannot take more than was held (FU-097, migration 256)
+
+A disposal larger than the open lots was accepted without a word. The walk drained every
+lot and stopped with the excess unread, so the holding took the full sale and went
+negative, a short position the app does not model. The gain row booked the unmatched
+shares at zero cost, overstating the gain by their whole proceeds.
+`investment-txn-insufficient-shares` was declared and never returned.
+
+- **The walk reports it.** `holdings_fifo_walk` gains `o_shortfall`, the shares its
+  disposals could not match, and `p_exclude_header_id`, which leaves one transaction out.
+  The body is the migration-230 definition with only those edits.
+- **The write paths refuse to make it worse.** An investment create or edit reads each
+  affected position's shortfall before and after, inside the transaction, and refuses with
+  `investment-txn-insufficient-shares` when any one grew. The rule is "worse", not "short":
+  a position that is short already, such as an imported residue, stays editable, so it can
+  be cleaned up. It is per position, so improving one does not license overselling another.
+  It covers the indirect cases too: a buy edited down under a later sale, or a sale moved
+  before its shares arrived.
+- **The editor's lot preview asks the same walk** about the sale's own date, without the
+  sale (`?as_of=&exclude_header_id=`). It used to read `lots`, which FIFO drains in place,
+  so it only knew today. On a since-closed account it warned about every historical edit
+  while a real oversell went through.
+- **Positions already short are reported, not repaired** (decided 2026-10-20). The
+  purchase they are missing is not in the data, so any repair would invent a cost basis
+  or cut the sale. The consistency report lists them (`holdings_fifo_shortfalls`, the
+  `Oversold` section), they count against `Healthy`, and the monitor's warning names them
+  with the fix: correct the sale, or enter the missing purchase. Settings links each to
+  its register and offers no repair button.
+- **Not refused, only reported.** A delete or hide of a purchase, a merge, and the
+  importers can still leave a position short. They go through other paths, and the
+  monitor reports what they leave within a check, twice a day.

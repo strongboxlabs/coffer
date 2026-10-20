@@ -1,0 +1,104 @@
+namespace Coffer.Api.Contracts;
+
+/// <summary>
+/// Wire shapes for the admin backup surface (ADR-0060,
+/// <c>/api/admin/backups</c>). The encrypted artifact bytes and the passphrase
+/// never appear here — only metadata + a "configured" flag.
+/// </summary>
+public static class BackupContracts
+{
+    /// <summary>One stored backup artifact. <see cref="Id"/> is the opaque
+    /// filename stem used in the download / delete / pin routes.
+    /// <see cref="Pinned"/> = a "never delete" pin (ADR-0062): excluded from local
+    /// and Drive retention.</summary>
+    public sealed record BackupSummary(string Id, long SizeBytes, DateTime CreatedAtUtc, bool Pinned);
+
+    /// <summary>
+    /// A manual backup that was accepted (FU-065). It runs off the request, so the answer to
+    /// <c>POST /api/admin/backups</c> is this, not the backup: poll
+    /// <c>GET /api/admin/backups/runs/{runId}</c> for <see cref="BackupRunResponse"/>.
+    /// </summary>
+    public sealed record BackupRunAccepted(Guid RunId);
+
+    /// <summary>
+    /// How a manual backup is going. <see cref="State"/> is <c>running</c>, <c>succeeded</c>
+    /// (<see cref="Backup"/> is set) or <c>failed</c> (<see cref="Error"/> says why, without
+    /// the server detail that stays in the log).
+    /// </summary>
+    public sealed record BackupRunResponse(
+        Guid RunId, string State, DateTime StartedAtUtc, DateTime? FinishedAtUtc,
+        BackupSummary? Backup, string? Error);
+
+    /// <summary>
+    /// Acknowledgement of one received restore part (ADR-0101).
+    /// <see cref="ReceivedBytes"/> is the running total, so a client that lost
+    /// track after a dropped connection can tell where it got to.
+    /// </summary>
+    public sealed record RestorePartAccepted(
+        int Part, int PartCount, long ReceivedBytes, bool Complete);
+
+    /// <summary>Body for <c>PUT /api/admin/backups/passphrase</c>.</summary>
+    public sealed record SetBackupPassphraseRequest(string Passphrase);
+
+    /// <summary>
+    /// Response for <c>POST /api/admin/backups/passphrase/reveal</c> (ADR-0092 D7) —
+    /// the stored backup passphrase in cleartext. Returned only from a POST carrying a
+    /// verified fresh assertion, with <c>Cache-Control: no-store</c>.
+    /// </summary>
+    public sealed record RevealPassphraseResponse(string Passphrase);
+
+    /// <summary>Response for the backup schedule (<c>GET/PUT
+    /// /api/admin/backups/schedule</c>): the daily schedule plus whether a
+    /// passphrase has been set (the panel disables enabling until it is).</summary>
+    /// <remarks>
+    /// The health fields carry the same caveats as <c>ScheduleDto</c>: LastRunAt means
+    /// attempted rather than succeeded, and LastError can be set on a run that did not
+    /// fail. They are here because the backup schedule is the one an operator is least
+    /// likely to look at until it matters — a deployment whose backups quietly stopped
+    /// is the outage this whole surface exists for.
+    /// </remarks>
+    public sealed record BackupScheduleResponse(
+        bool Enabled,
+        int HourLocal,
+        int MinuteLocal,
+        string? Timezone,
+        DateTime? LastRunAt,
+        DateTime? NextRunAt,
+        bool PassphraseConfigured,
+        int ConsecutiveFailures = 0,
+        string? LastError = null,
+        DateTime? LastFailureAt = null,
+        string? DisabledReason = null,
+        DateTime? LastSuccessAt = null,
+        DateTime? NothingDoneSince = null);
+
+    /// <summary>Body for <c>PUT /api/admin/backups/schedule</c>.</summary>
+    public sealed record SetBackupScheduleRequest(
+        bool Enabled,
+        int HourLocal,
+        int MinuteLocal,
+        string? Timezone = null);
+
+    /// <summary>Response for the backup retention policy (<c>GET/PUT
+    /// /api/admin/backups/retention</c>, ADR-0074). The GFS tiers — the single
+    /// source of truth that governs local pruning AND the Google Drive mirror.</summary>
+    public sealed record BackupRetentionResponse(
+        int RetentionDaily,
+        int RetentionWeekly,
+        int RetentionMonthly);
+
+    /// <summary>Body for <c>PUT /api/admin/backups/retention</c>.</summary>
+    public sealed record SetBackupRetentionRequest(
+        int RetentionDaily,
+        int RetentionWeekly,
+        int RetentionMonthly);
+
+    /// <summary>Pre-flight KEK-compatibility check for a restore
+    /// (<c>POST /api/admin/backups/restore/validate</c>, ADR-0074 / ADR-0071 D4).
+    /// <see cref="HasFingerprint"/> is false for a v1 backup (no fingerprint —
+    /// unverifiable). <see cref="Compatible"/> = the backup was sealed under THIS
+    /// install's Master KEK, so its sealed secrets (backup passphrase, Drive
+    /// token) will unseal after restore; when false, a cross-install restore
+    /// still restores data + passkeys but those secrets need re-establishing.</summary>
+    public sealed record BackupKekCheckResponse(bool HasFingerprint, bool Compatible);
+}

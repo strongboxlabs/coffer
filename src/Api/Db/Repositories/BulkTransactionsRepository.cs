@@ -1,0 +1,1101 @@
+using Microsoft.EntityFrameworkCore;
+
+using Coffer.Api.Contracts;
+using Coffer.Api.Db.Entities;
+
+namespace Coffer.Api.Db.Repositories;
+
+/// <summary>
+/// Write gateway for register-scale bulk operations (ADR-0024).
+/// Resolves <see cref="SelectionRequest"/> into a header-level LINQ
+/// predicate, then issues one Postgres statement per operation via EF
+/// <c>ExecuteUpdateAsync</c> / <c>ExecuteDeleteAsync</c>. Atomic in
+/// one transaction; no row-by-row round-trips even when the
+/// selection covers tens of thousands of headers.
+/// </summary>
+/// <remarks>
+/// <para>Distinct from <see cref="TransactionsRepository"/> (single-
+/// header writes) because the surface and the SQL shape are different
+/// — the single-row endpoints stay simple, the bulk endpoints live
+/// here. Both paths hit the same RLS-bound <see cref="AppDbContext"/>
+/// (coffer_app role), so the predicate's ledger guard relies on the
+/// session's <c>app.user_id</c> grant filtering inaccessible rows
+/// out before the UPDATE/DELETE applies.</para>
+///
+/// <para>The bulk-recon-status path is all-or-nothing inside one
+/// <c>UPDATE</c> — Postgres applies it as a single atomic statement
+/// (ADR-0024 §"Partial failure"). The bulk-delete path splits hard-
+/// delete vs soft-hide along the <c>external_id IS NULL</c> seam,
+/// running both branches inside one EF transaction so the user's
+/// "Delete N rows" stays atomic even when N spans the two policies.
+/// </para>
+///
+/// <para><b>Balance + holdings recompute</b>. <c>ExecuteUpdateAsync</c> /
+/// <c>ExecuteDeleteAsync</c> BYPASS the <c>ChangeTracker</c>, so BOTH
+/// derived-data interceptors (<see cref="LegDerivedRecomputeInterceptor"/>
+/// for balances and <see cref="HoldingsRecomputeInterceptor"/> for
+/// holdings/lots) are blind to these writes. Every content-mutating bulk
+/// method below therefore invokes <see cref="LegDerivedRecomputeService"/>
+/// AND <see cref="HoldingsRecomputeService"/> explicitly after the
+/// statement runs — the one place in the API where the call-site pattern
+/// (#4) applies because of EF's bulk-method semantics. The balance anchor
+/// is the EFFECTIVE date (<c>COALESCE(override.posted_at, header.posted_at)</c>)
+/// to match the recompute function's walk; the holdings recompute targets
+/// the (account, security) pairs of any investment-shape legs in the
+/// selection. Status-only bulk paths (recon-status) touch no
+/// balance/holdings-relevant column and skip both recompute calls.</para>
+///
+/// <para><b>Posting counts</b> (mig 120) are NOT recomputed here:
+/// the recon-status path is status-only (no leg structure change),
+/// and bulk-delete removes / hides WHOLE headers (a vanished or
+/// hidden header has no surviving legs whose counts could be stale,
+/// and other headers are untouched). No posting-count recompute
+/// call is needed on either path.</para>
+/// </remarks>
+internal sealed class BulkTransactionsRepository
+{
+    private readonly AppDbContext _db;
+    private readonly LegDerivedRecomputeService _balances;
+    private readonly HoldingsRecomputeService _holdings;
+    private readonly TimeProvider _clock;
+
+    public BulkTransactionsRepository(
+        AppDbContext db,
+        LegDerivedRecomputeService balances,
+        HoldingsRecomputeService holdings,
+        TimeProvider clock)
+    {
+        _db = db;
+        _balances = balances;
+        _holdings = holdings;
+        _clock = clock;
+    }
+
+    /// <summary>
+    /// Build the IQueryable that materialises the user's
+    /// selection over <see cref="AppDbContext.TxnHeaders"/>. Applied
+    /// uniformly across summary / bulk-update / bulk-delete so the
+    /// three operations see exactly the same row set.
+    /// </summary>
+    /// <remarks>
+    /// Returns null when the selection is structurally empty — an
+    /// "explicit" mode with no ids passed. The caller surfaces this
+    /// as the <c>selection-empty</c> 422 rather than firing a noop
+    /// UPDATE.
+    /// </remarks>
+    private async Task<IQueryable<TxnHeaderRow>?> BuildSelectionQueryAsync(
+        Guid ledgerId,
+        SelectionRequest selection,
+        CancellationToken cancellationToken = default)
+    {
+        // Ledger scope is always enforced — RLS will also block
+        // cross-ledger rows, but keying the LINQ predicate on
+        // ledger_id keeps the query plan tight (and survives if the
+        // app.user_id session var is ever misconfigured).
+        IQueryable<TxnHeaderRow> q = _db.TxnHeaders
+            .Where(h => h.LedgerId == ledgerId && h.IsMergedInto == null);
+
+        if (selection.Kind == "explicit")
+        {
+            // Explicit = exactly the header ids the user checked, regardless of
+            // visibility. Hidden-view rows carry is_hidden=true; applying the
+            // all-mode visibility scope here (an explicit selection has no
+            // statusFilter, so the scope would default to visible-only) would
+            // drop them from the summary + bulk ops — the "check a hidden row
+            // and the bulk bar vanishes" bug (ADR-0072 D1). The ids already come
+            // from what the user sees, so no visibility filter is needed.
+            if (selection.HeaderIds.Count == 0) return null;
+            var ids = selection.HeaderIds.ToArray();
+            q = q.Where(h => EF.Constant(ids).Contains(h.Id));
+            return q;
+        }
+
+        // "all" mode — predicate over the current view filter, including the
+        // visibility scope (ADR-0072 D1): the "hidden" filter selects the hidden
+        // recovery view; every other filter selects visible rows. is_hidden is
+        // canonical since mig 230, so this matches what the register shows by
+        // reading the same column the register reads.
+        var hiddenScope = string.Equals(selection.StatusFilter, "hidden", StringComparison.Ordinal);
+        q = q.Where(h => h.IsHidden == hiddenScope);
+
+        // Reconciliation status is per-account (ADR-0082): the cleared /
+        // uncleared cases below evaluate the account's own leg. The register
+        // always scopes those filters to an account; when it isn't set the
+        // per-account predicate matches nothing (defensive — no wrong select).
+        var scopeAccountId = selection.AccountId;
+        // Every per-account predicate below works over a SET, because a
+        // CATEGORY register can be widened to its descendants (mig 226). One
+        // account is an array of one; no account is empty, which matches
+        // nothing — the same defensive behaviour the scalar had.
+        //
+        // This is resolved BEFORE the origination predicate on purpose. The
+        // register-filter intersection further down is an INTERSECTION: it can
+        // only ever remove headers, so widening it alone left the widened
+        // select-all empty, because the headers of a rollup's children never
+        // entered this query in the first place.
+        var scopeIds = selection.AccountId is { } scopeId
+            ? (selection.IncludeSubcategories
+                ? (await CategoryTree
+                    .DescendantsAsync(_db, ledgerId, scopeId, includeRoot: true,
+                        cancellationToken)
+                    .ConfigureAwait(false)).ToArray()
+                : [scopeId])
+            : Array.Empty<Guid>();
+
+        if (selection.AccountId.HasValue)
+        {
+            // Restrict to headers the account ORIGINATES (ADR-0036), not
+            // merely touches: the header has a leg on `accountId` whose
+            // denormalized posting counts (migration 120) show the account
+            // is touched by EVERY posting of the header
+            // (account_postings_on_header == header_total_postings).
+            //
+            // A header where account_postings_on_header <
+            // header_total_postings is a target-split — its canonical
+            // owner is another account, and deleting / re-statusing it
+            // from THIS account's register would wrongly mutate the
+            // owning account's transaction (ADR-0036 read-only rule).
+            // Using the denormalized counts keeps this an Any()/EXISTS
+            // (cheap), not a per-row COUNT(DISTINCT) subquery.
+            //
+            // Applying it uniformly here makes all-mode summary +
+            // recon-status + delete act ONLY on headers this account
+            // owns: the typed-confirm count the user sees matches exactly
+            // what gets deleted, and bulk ops can never reach a header
+            // owned by another account. That server-side guarantee is
+            // what lets the SPA drop its all-mode delete gate — the
+            // client no longer has to audit unloaded rows for read-only
+            // target-splits. (The 'explicit' branch above stays
+            // unchanged: explicit selections are audited row-by-row on
+            // the client for read-only rows before they reach here.)
+            q = q.Where(h => _db.TxnLegs.Any(
+                l => l.HeaderId == h.Id
+                    && EF.Constant(scopeIds).Contains(l.AccountId)
+                    && l.AccountPostingsOnHeader == l.HeaderTotalPostings));
+        }
+
+        // The recon-status views and "scheduled" are the register's own rule, applied
+        // by the register's own primitive below (register_filtered_entries, ADR-0076),
+        // not restated here. A restatement drifted: it judged "future" by an instant
+        // where the register uses the user's local date, and it kept pending rows the
+        // register leaves out, so a bulk clear over "all uncleared" could act on rows
+        // the reader was not shown. Today is the client's local date, sent
+        // with the selection like SelectedAt; the app clock's UTC date stands in for a
+        // caller that sends none, as it does for the register's counts.
+        var today = selection.Today ?? DateOnly.FromDateTime(_clock.GetUtcNow().UtcDateTime);
+        string? registerStatus = null;
+        switch (selection.StatusFilter)
+        {
+            case "all":
+                // No status restriction.
+                break;
+            case "cleared":
+            case "uncleared":
+            case "reconciling":
+                // Per-account (ADR-0082). With no account in scope these match
+                // nothing, as they always have: the primitive needs the account set.
+                if (scopeIds.Length == 0) return q.Where(_ => false);
+                registerStatus = selection.StatusFilter;
+                break;
+            case "scheduled":
+                if (scopeIds.Length > 0)
+                {
+                    registerStatus = selection.StatusFilter;
+                    break;
+                }
+                // Ledger-wide (an API caller; both registers always scope to an
+                // account): the register's rule, posted after the local today.
+                var tomorrow = today.AddDays(1).ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+                q = q.Where(h => h.PostedAt >= tomorrow);
+                break;
+            case "needs_review":
+                // The bank-feed review FLAG (migration 037, ADR-0031
+                // Phase 3c) — a separate dimension from the recon
+                // status, mirroring the register's "Needs review" tab
+                // (passesStatusFilter → txn.needsReview). Without this
+                // case a select-all on that tab fell back to "all" and
+                // silently widened the selection to the whole account.
+                q = q.Where(h => h.NeedsReview);
+                break;
+            case "hidden":
+                // Visibility scope, not a recon status — the base predicate above
+                // already restricted to hidden rows (ADR-0072 D1). No further
+                // status restriction.
+                break;
+            default:
+                // Filtered out at endpoint validation, but defensive:
+                // an unknown filter shouldn't silently match
+                // everything.
+                return q.Where(_ => false);
+        }
+
+        // Structured/search filter (mig 164/167): narrow the 'all' selection to
+        // headers with a matching leg, so a select-all under an active filter
+        // covers exactly what the register shows — not the whole account. Reuses
+        // the SAME register_filtered_entries primitive the register page / rail /
+        // counts use (ADR-0076), so the selection set can't drift from the
+        // displayed set. The recon-status views and "scheduled" go through it too
+        // (see the switch above); needs_review and hidden are applied there.
+        var registerFilter = new RegisterFilter(
+            Search: selection.Search,
+            DateFrom: selection.DateFrom,
+            DateTo: selection.DateTo,
+            AmountMin: selection.AmountMin,
+            AmountMax: selection.AmountMax,
+            SecurityId: selection.SecurityId,
+            Tag: selection.Tag,
+            CategoryId: selection.CategoryId,
+            Status: registerStatus,
+            Today: today,
+            // Carried, not dropped: `IsActive` counts it, so a select-all whose
+            // ONLY active dimension is the subtree still takes this branch.
+            IncludeSubcategories: selection.IncludeSubcategories);
+        if (selection.AccountId.HasValue && registerFilter.IsActive)
+        {
+            // The SAME scope resolved above — the selected set is defined to be
+            // what the reader is looking at.
+            // hidden = null: visibility scope is already applied by `q` above.
+            var matchingHeaderIds = _db.RegisterFilteredEntries(
+                    scopeIds, ledgerId, null,
+                    registerFilter.Search, registerFilter.DateFrom, registerFilter.DateTo,
+                    registerFilter.AmountMin, registerFilter.AmountMax, registerFilter.SecurityId,
+                    registerFilter.Tag, registerFilter.CategoryId, registerFilter.Status, registerFilter.Today)
+                .Select(r => r.HeaderId)
+                .Distinct();
+            q = q.Where(h => matchingHeaderIds.Contains(h.Id));
+        }
+
+        // The selection-time anchor: rows created after the user
+        // clicked select-all are not part of the predicate. Captures
+        // Gmail's "everything I had selected at click time" semantics
+        // without client-side id tracking.
+        var selectedAt = selection.SelectedAt;
+        q = q.Where(h => h.CreatedAt <= selectedAt);
+
+        if (selection.ExcludeIds.Count > 0)
+        {
+            var excluded = selection.ExcludeIds.ToArray();
+            q = q.Where(h => !EF.Constant(excluded).Contains(h.Id));
+        }
+
+        return q;
+    }
+
+    /// <summary>
+    /// Resolve the selection, count it, and (for account-scoped
+    /// selections) sum the source-leg amount. Account-scope is the
+    /// precondition for a meaningful sum — across mixed currencies
+    /// the sum has no single denomination, so we return null.
+    /// </summary>
+    public async Task<SelectionSummary?> GetSelectionSummaryAsync(
+        Guid ledgerId,
+        SelectionRequest selection,
+        CancellationToken cancellationToken = default)
+    {
+        var query = await BuildSelectionQueryAsync(ledgerId, selection, cancellationToken)
+            .ConfigureAwait(false);
+        if (query is null) return null;
+
+        var count = await query
+            .CountAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (count == 0)
+        {
+            return new SelectionSummary(0, selection.AccountId.HasValue ? 0m : null);
+        }
+
+        decimal? sumOnAccount = null;
+        if (selection.AccountId.HasValue)
+        {
+            var accountId = selection.AccountId.Value;
+            // Sum the EFFECTIVE leg amounts on the source account across
+            // every matching header (override-aware, via the view — the
+            // total must match what the user sees). One row per leg on
+            // this account; splits contribute multiple legs.
+            sumOnAccount = await _db.ResolvedTransactions
+                .Where(rv => rv.AccountId == accountId
+                    && query.Any(h => h.Id == rv.HeaderId))
+                .SumAsync(rv => (decimal?)rv.Amount, cancellationToken)
+                .ConfigureAwait(false)
+                ?? 0m;
+        }
+
+        return new SelectionSummary(count, sumOnAccount);
+    }
+
+    /// <summary>
+    /// Set <c>status</c> on every header in the selection inside one
+    /// atomic UPDATE. Audit columns (<c>cleared_at</c>,
+    /// <c>cleared_by_user_id</c>) move in lockstep with the new
+    /// status so the DB CHECK
+    /// <c>(status='cleared') ⇔ (cleared_at IS NOT NULL)</c> stays
+    /// satisfied. Returns the number of rows affected.
+    /// </summary>
+    /// <remarks>Status / cleared_at / cleared_by_user_id are not
+    /// balance-affecting columns; no recompute needed on this path.
+    /// The bypass-the-interceptor concern called out in the class
+    /// comment doesn't apply here.</remarks>
+    public async Task<int> BulkSetReconStatusAsync(
+        Guid ledgerId,
+        SelectionRequest selection,
+        Guid accountId,
+        string newStatus,
+        Guid currentUserId,
+        CancellationToken cancellationToken = default)
+    {
+        var query = await BuildSelectionQueryAsync(ledgerId, selection, cancellationToken)
+            .ConfigureAwait(false);
+        if (query is null) return 0;
+
+        // Reconciliation is per-account (ADR-0082): bulk-recon targets the
+        // selected transactions' legs on `accountId` (the register's account —
+        // supplied explicitly since an 'explicit' selection carries no account).
+        var legIds = await _db.TxnLegs
+            .Where(l => l.AccountId == accountId
+                && query.Select(h => h.Id).Contains(l.HeaderId))
+            .Select(l => l.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (legIds.Count == 0) return 0;
+
+        var clearedAt = newStatus == "cleared" ? (DateTime?)_clock.GetUtcNow().UtcDateTime : null;
+        var clearedBy = newStatus == "cleared" ? (Guid?)currentUserId : null;
+
+        await using var transaction = await _db.Database
+            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+        // Update the legs that already carry an overlay row...
+        await _db.TxnLegRecon
+            .Where(r => legIds.Contains(r.LegId))
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(r => r.Status, _ => newStatus)
+                    .SetProperty(r => r.ClearedAt, _ => clearedAt)
+                    .SetProperty(r => r.ClearedByUserId, _ => clearedBy),
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        // ...and insert one for each leg that doesn't have it yet.
+        var existing = (await _db.TxnLegRecon
+            .Where(r => legIds.Contains(r.LegId))
+            .Select(r => r.LegId)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false)).ToHashSet();
+        foreach (var legId in legIds)
+        {
+            if (existing.Contains(legId)) continue;
+            _db.TxnLegRecon.Add(new TxnLegReconRow
+            {
+                LegId = legId,
+                LedgerId = ledgerId,
+                Status = newStatus,
+                ClearedAt = clearedAt,
+                ClearedByUserId = clearedBy,
+            });
+        }
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return legIds.Count;
+    }
+
+    /// <summary>
+    /// Apply the per-row hard-delete vs soft-hide policy across the
+    /// entire selection inside one transaction. Manual entries
+    /// (<c>external_id IS NULL</c>) are physically removed; feed /
+    /// import rows are flagged <c>is_hidden=true</c>.
+    /// </summary>
+    /// <remarks>Balance recompute is invoked explicitly via
+    /// <see cref="LegDerivedRecomputeService"/> at the end for both
+    /// branches. Reason: <c>ExecuteDeleteAsync</c> AND
+    /// <c>ExecuteUpdateAsync</c> bypass the EF ChangeTracker, so
+    /// <see cref="LegDerivedRecomputeInterceptor"/> doesn't see them.
+    /// The soft-hide branch flips <c>is_hidden</c>, which became
+    /// balance-relevant in mig 103 (hidden rows are excluded from the
+    /// balance walk) — same #4 call-site pattern as the hard-delete
+    /// branch.</remarks>
+    /// <summary>
+    /// Remove every transaction a given import created — the answer to "I uploaded that
+    /// twice".
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// File imports have no dedup and will not get one. CSV rows carry no issuer id
+    /// (unlike OFX's FITID), so any per-row identity has to be derived from content, and
+    /// content cannot separate two genuinely identical transactions — same date, same
+    /// amount, same merchant. A content hash collapses them and silently eats a real
+    /// row; folding in the row ordinal duplicates the whole file the moment a download
+    /// window shifts. Both failure modes are silent, in a ledger reconciled against real
+    /// balances.
+    /// </para>
+    /// <para>
+    /// So the mistake is not prevented by guessing, it is UNDONE exactly. Mig 221 stamps
+    /// <c>ledger_operation_id</c> on every row an import writes, and this deletes that
+    /// set and nothing else. No inference anywhere.
+    /// </para>
+    /// <para>
+    /// Delegates to <see cref="BulkDeleteAsync"/> rather than issuing its own delete:
+    /// that method already captures (account, effective posted_at) pairs BEFORE the
+    /// cascade fires so the balance recompute anchors correctly, and duplicating a
+    /// money-touching delete to save one call is how the two copies drift.
+    /// </para>
+    /// </remarks>
+    public async Task<UndoImportResult> UndoImportAsync(
+        Guid ledgerId,
+        Guid ledgerOperationId,
+        bool dryRun,
+        CancellationToken cancellationToken = default)
+    {
+        var ids = await _db.TxnHeaders
+            .AsNoTracking()
+            .Where(h => h.LedgerId == ledgerId
+                        && h.LedgerOperationId == ledgerOperationId
+                        && h.IsMergedInto == null)
+            .Select(h => h.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        // No "how many have been edited" count here any more. Undo is offered in a
+        // modal immediately after the import that created these rows, so nobody has
+        // edited them yet — the number was reliably zero, and the only thing that
+        // made it non-zero was a merge stamping the winner's date. See
+        // UndoImportResult for the rest of the reasoning, including why reading
+        // txn_header_originals as an "edited in Coffer" signal is a trap.
+
+        // A PARTIAL undo is worse than none — it leaves a half-removed import that no
+        // longer matches its own operation and cannot be finished by repeating the call.
+        // Refuse loudly instead. MaxIds is 10_000, far above any real statement.
+        if (ids.Count > SelectionLimits.MaxIds)
+        {
+            return new UndoImportResult(
+                Found: ids.Count, Deleted: 0, TooLarge: true);
+        }
+
+        if (dryRun || ids.Count == 0)
+        {
+            return new UndoImportResult(
+                Found: ids.Count, Deleted: 0, TooLarge: false);
+        }
+
+        // AN UNDO REMOVES THE ROWS OUTRIGHT. An earlier version hid them, on the
+        // reasoning that hiding is reversible and deleting is not. That was the wrong
+        // recovery to optimise for.
+        //
+        // The thing a person does after undoing an import is import the file again —
+        // wrong account, wrong file, wrong day. A hidden row keeps its external_id, the
+        // dedup lookup matches on external_id and never on is_hidden, and the soft-hide
+        // path deliberately leaves is_hidden alone so a re-sync cannot undo a manual
+        // hide. So the re-import matched every hidden row, counted it already-known,
+        // inserted nothing, and left the register empty while reporting success. Hiding
+        // did not preserve recoverability; it blocked the only recovery there was.
+        //
+        // For a file import the FILE is the backup, which is a better recovery story
+        // than an invisible row nothing can bring back.
+        var (hard, soft) = await BulkDeleteAsync(
+            ledgerId,
+            new SelectionRequest { Kind = "explicit", HeaderIds = ids },
+            hardDeleteSourcedRows: true,
+            cancellationToken).ConfigureAwait(false);
+
+        // Zero unless a reminder occurrence somehow carried an import's stamp, which an
+        // import cannot produce. Surfaced rather than silently added to the total: a row
+        // that survived as hidden when the caller was told it was deleted is exactly the
+        // discrepancy that would send someone re-importing into a duplicate.
+        if (soft != 0)
+        {
+            throw new InvalidOperationException(
+                "Undo hid " + soft + " row(s) instead of removing them; a re-import "
+                + "would then skip them as already-known. Check what wrote a reminder "
+                + "occurrence under an import's ledger_operation_id.");
+        }
+
+        return new UndoImportResult(
+            Found: ids.Count, Deleted: hard, TooLarge: false);
+    }
+
+    /// <param name="hardDeleteSourcedRows">
+    /// Remove feed-sourced rows (<c>external_id</c> set) outright instead of hiding
+    /// them. Used ONLY by undo-import, and load-bearing there.
+    /// <para>
+    /// The default is to hide such a row, so a later re-sync upserts into it rather than
+    /// resurrecting something the user deleted. That rule is wrong for an undo, because
+    /// the thing a person does after undoing an import is IMPORT THE FILE AGAIN — and a
+    /// hidden row still matches the dedup lookup (which filters on external_id and never
+    /// on is_hidden), so the re-import counts every row already-known, inserts nothing,
+    /// and leaves the register empty while reporting success. Hiding does not preserve
+    /// recoverability for an import; it blocks the only recovery there is.
+    /// </para>
+    /// <para>
+    /// Reminder occurrences are still never hard-deleted, even here. Their
+    /// (recurring_transaction_id, occurrence_date) stamp IS the slot's idempotency key
+    /// (mig 218), and removing it makes reminder-auto-post re-post the occurrence on the
+    /// next tick — a loop the user cannot escape. An import cannot create one, so the
+    /// carve-out is unreachable from undo; it is kept because "unreachable today" is not
+    /// a reason to arm a footgun.
+    /// </para>
+    /// </param>
+    public async Task<(int HardDeleted, int SoftHidden)> BulkDeleteAsync(
+        Guid ledgerId,
+        SelectionRequest selection,
+        bool hardDeleteSourcedRows = false,
+        CancellationToken cancellationToken = default)
+    {
+        var query = await BuildSelectionQueryAsync(ledgerId, selection, cancellationToken)
+            .ConfigureAwait(false);
+        if (query is null) return (0, 0);
+
+        await using var transaction = await _db.Database
+            .BeginTransactionAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        // Capture (account_id, EFFECTIVE posted_at) pairs for BOTH
+        // branches BEFORE the ExecuteDelete / ExecuteUpdate runs —
+        // once the hard-delete cascade fires the legs are gone, and
+        // ExecuteUpdate (the soft-hide branch) bypasses the
+        // ChangeTracker so the interceptor can't see it. Mig 103 made
+        // is_hidden balance-relevant, so the soft-hide path now needs
+        // the same explicit recompute as the hard-delete path.
+        //
+        // The anchor MUST be the EFFECTIVE date —
+        // COALESCE(override.posted_at, header.posted_at) — because
+        // fn_recompute_balances_for_account walks by the effective date
+        // (mig 103), and bank date edits land on txn_headers.posted_at
+        // (ADR-0003). Anchoring on the raw header date would leave the
+        // [effective, raw) range unrecomputed when an override moved the
+        // header earlier than its raw date. The single-row interceptor
+        // resolves the same COALESCE in CaptureSnapshotAsync.
+        var hardAffected = await query
+            .Where(h => h.ExternalId == null)
+            .SelectMany(
+                h => _db.TxnLegs.Where(l => l.HeaderId == h.Id),
+                (h, l) => new
+                {
+                    l.AccountId,
+                    PostedAt = h.PostedAt,
+                })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var softAffected = await query
+            .Where(h => h.ExternalId != null)
+            .SelectMany(
+                h => _db.TxnLegs.Where(l => l.HeaderId == h.Id),
+                (h, l) => new
+                {
+                    l.AccountId,
+                    PostedAt = h.PostedAt,
+                })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        // Holdings + lots are ALSO derived from these legs, by a SEPARATE
+        // recompute interceptor that the bulk path likewise bypasses.
+        // Capture the (holdings-account, security) pairs of every
+        // investment-shape leg in the WHOLE selection — across BOTH
+        // branches: a hard delete cascades the leg + its lot away
+        // (lots.leg_id ON DELETE CASCADE, mig 123) and a soft-hide makes
+        // the leg invisible to the holdings walk (mig 117). Either way the
+        // holding must be rebuilt from the surviving legs, or it keeps the
+        // removed buy's shares/cost-basis (silent holdings drift).
+        var holdingsAffected = await query
+            .SelectMany(
+                h => _db.TxnLegs.Where(l => l.HeaderId == h.Id
+                    && l.SecurityId != null && l.Quantity != null),
+                (h, l) => new { l.AccountId, l.SecurityId })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        // Hard-delete manual rows (external_id IS NULL). CASCADE on
+        // txn_legs / txn_header_originals /
+        // txn_header_tags handles the cleanup.
+        // A REMINDER OCCURRENCE IS NEVER HARD-DELETED, here as on the single-delete
+        // path (TransactionsRepository.DeleteAsync).
+        //
+        // The (recurring_transaction_id, occurrence_date) stamp on the row IS the slot's
+        // idempotency key (mig 218). Hard-deleting takes the stamp with it, the slot
+        // reads un-acted, and reminder-auto-post (mig 219) posts it straight back on the
+        // next tick — a loop the user cannot escape. The single-delete path was fixed for
+        // this and bulk delete was missed, so selecting auto-posted occurrences in the
+        // register and deleting them resurrected every one of them.
+        // The reminder-occurrence carve-out holds in BOTH modes; only the external_id
+        // half relaxes.
+        var hardDeleted = await query
+            .Where(h => (hardDeleteSourcedRows || h.ExternalId == null)
+                        && (h.RecurringTransactionId == null || h.OccurrenceDate == null
+                            || h.IsRecurringTemplate))
+            .ExecuteDeleteAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        // Soft-hide everything else. Re-source / re-sync upserts
+        // back into the same row but leaves is_hidden alone.
+        // Everything else soft-hides: feed-sourced rows (external_id set) AND reminder
+        // occurrences, which keep their stamp so the slot stays consumed.
+        // In hard mode only the reminder occurrences are left to hide — everything else
+        // is already gone, and the ExternalId half of this predicate would match nothing
+        // anyway.
+        var softHidden = await query
+            .Where(h => (!hardDeleteSourcedRows && h.ExternalId != null)
+                        || (h.RecurringTransactionId != null && h.OccurrenceDate != null
+                            && !h.IsRecurringTemplate))
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(h => h.IsHidden, _ => true)
+                    // Soft-delete also clears needs_review (ADR-0052 D3) so a
+                    // deleted row can't linger in the review queue as
+                    // hidden-but-pending.
+                    .SetProperty(h => h.NeedsReview, _ => false),
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        // Explicit balance recompute — both branches bypass the
+        // interceptor (ExecuteDelete + ExecuteUpdate).
+        var affected = hardAffected.Concat(softAffected).ToList();
+        if (affected.Count > 0)
+        {
+            await _balances.RecomputeAsync(
+                affected.Select(a => (a.AccountId, a.PostedAt)),
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        // Explicit holdings/lots recompute — the bulk path bypasses the
+        // HoldingsRecomputeInterceptor for the same reason (ExecuteDelete /
+        // ExecuteUpdate don't touch the ChangeTracker). The service dedupes
+        // (account, security) pairs; a non-investment selection captures
+        // none and this is a no-op.
+        if (holdingsAffected.Count > 0)
+        {
+            await _holdings.RecomputeAsync(
+                holdingsAffected.Select(a => (a.AccountId, a.SecurityId!.Value)),
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return (hardDeleted, softHidden);
+    }
+
+    /// <summary>
+    /// Bulk un-hide the selection (ADR-0072 D2): flip <c>is_hidden</c> back to
+    /// false. The selection is expected to carry <c>StatusFilter = "hidden"</c>
+    /// (the Hidden view), so <see cref="BuildSelectionQueryAsync"/> already scopes to
+    /// hidden rows. Un-hidden rows re-enter the balance + holdings walks, so both
+    /// are recomputed explicitly — <c>ExecuteUpdateAsync</c> bypasses the
+    /// interceptor, same #4 call-site pattern as bulk-delete's soft-hide branch.
+    /// Returns the number un-hidden.
+    /// </summary>
+    public async Task<int> BulkUnhideAsync(
+        Guid ledgerId,
+        SelectionRequest selection,
+        CancellationToken cancellationToken = default)
+    {
+        var query = await BuildSelectionQueryAsync(ledgerId, selection, cancellationToken)
+            .ConfigureAwait(false);
+        if (query is null) return 0;
+
+        await using var transaction = await _db.Database
+            .BeginTransactionAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        // Capture (account, EFFECTIVE posted_at) + investment (account, security)
+        // pairs BEFORE the ExecuteUpdate (which bypasses the ChangeTracker), same
+        // as the bulk-delete soft-hide branch. Anchor on the effective date so the
+        // recompute walk (mig 103) covers the right range.
+        var affected = await query
+            .SelectMany(
+                h => _db.TxnLegs.Where(l => l.HeaderId == h.Id),
+                (h, l) => new
+                {
+                    l.AccountId,
+                    PostedAt = h.PostedAt,
+                })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var holdingsAffected = await query
+            .SelectMany(
+                h => _db.TxnLegs.Where(l => l.HeaderId == h.Id
+                    && l.SecurityId != null && l.Quantity != null),
+                (h, l) => new { l.AccountId, l.SecurityId })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var unhidden = await query
+            .ExecuteUpdateAsync(
+                setters => setters.SetProperty(h => h.IsHidden, _ => false),
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        if (affected.Count > 0)
+        {
+            await _balances.RecomputeAsync(
+                affected.Select(a => (a.AccountId, a.PostedAt)),
+                cancellationToken).ConfigureAwait(false);
+        }
+        if (holdingsAffected.Count > 0)
+        {
+            await _holdings.RecomputeAsync(
+                holdingsAffected.Select(a => (a.AccountId, a.SecurityId!.Value)),
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return unhidden;
+    }
+
+    /// <summary>Outcome of a move-to-account (ADR-0072 D3).</summary>
+    public enum MoveAccountOutcome
+    {
+        HeaderNotFound, NotBankShape, NotOnSourceAccount,
+        AccountDomainCrossed, TargetInactive,
+        TargetInvalid, TargetSameAsSource, SplitToInvestment, Collision, Moved,
+        SplitFromInvestment,
+    }
+
+    /// <summary>
+    /// Move a single transaction from <paramref name="sourceAccountId"/> to
+    /// <paramref name="targetAccountId"/> (ADR-0072 D3): repoint the source-side
+    /// leg(s) — one per posting — then recompute both accounts. What may move
+    /// is <see cref="CheckHeadersAsync"/>, shared with the bulk path.
+    /// ExecuteUpdate bypasses the interceptor, so the balance recompute is
+    /// explicit for both accounts.
+    /// </summary>
+    public async Task<MoveAccountOutcome> MoveAccountAsync(
+        Guid ledgerId, Guid headerId, Guid sourceAccountId, Guid targetAccountId,
+        CancellationToken cancellationToken = default)
+    {
+        if (sourceAccountId == targetAccountId) return MoveAccountOutcome.TargetSameAsSource;
+
+        var target = await _db.Accounts.AsNoTracking()
+            .Where(a => a.Id == targetAccountId && a.LedgerId == ledgerId)
+            .Select(a => new { a.AccountType, a.IsActive })
+            .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (target is null) return MoveAccountOutcome.TargetInvalid;
+
+        var sourceType = await _db.Accounts.AsNoTracking()
+            .Where(a => a.Id == sourceAccountId && a.LedgerId == ledgerId)
+            .Select(a => a.AccountType)
+            .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (sourceType is null) return MoveAccountOutcome.NotOnSourceAccount;
+        if (CrossesCategoryBoundary(sourceType, target.AccountType))
+            return MoveAccountOutcome.AccountDomainCrossed;
+        if (!target.IsActive) return MoveAccountOutcome.TargetInactive;
+
+        var postedAt = await _db.TxnHeaders.AsNoTracking()
+            .Where(h => h.Id == headerId && h.LedgerId == ledgerId)
+            .Select(h => (DateTime?)h.PostedAt)
+            .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (postedAt is not { } effectivePostedAt) return MoveAccountOutcome.HeaderNotFound;
+        if (!await _db.TxnLegs.AnyAsync(
+                l => l.HeaderId == headerId && l.AccountId == sourceAccountId,
+                cancellationToken).ConfigureAwait(false))
+            return MoveAccountOutcome.NotOnSourceAccount;
+
+        // The same rule the bulk path asks, over a selection of one.
+        var header = _db.TxnHeaders.Where(h => h.Id == headerId && h.LedgerId == ledgerId);
+        var verdict = await CheckHeadersAsync(
+            header, sourceType, target.AccountType, sourceAccountId, targetAccountId,
+            cancellationToken).ConfigureAwait(false);
+        switch (verdict)
+        {
+            case MoveVerdict.InvestmentShape: return MoveAccountOutcome.NotBankShape;
+            case MoveVerdict.SplitToInvestment: return MoveAccountOutcome.SplitToInvestment;
+            case MoveVerdict.SplitFromInvestment: return MoveAccountOutcome.SplitFromInvestment;
+            case MoveVerdict.Collision: return MoveAccountOutcome.Collision;
+        }
+
+        await using var transaction = await _db.Database
+            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        var converting = await TransfersToConvertAsync(
+            header, sourceType, target.AccountType, sourceAccountId,
+            cancellationToken).ConfigureAwait(false);
+        await _db.TxnLegs
+            .Where(l => l.HeaderId == headerId && l.AccountId == sourceAccountId)
+            .ExecuteUpdateAsync(s => s.SetProperty(l => l.AccountId, _ => targetAccountId), cancellationToken)
+            .ConfigureAwait(false);
+        await ClearInvestmentEventAsync(converting, cancellationToken).ConfigureAwait(false);
+        await _balances.RecomputeAsync(
+            new[] { (sourceAccountId, effectivePostedAt), (targetAccountId, effectivePostedAt) },
+            cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return MoveAccountOutcome.Moved;
+    }
+
+    /// <summary>Outcome of a bulk move-to-account (ADR-0072 D3).</summary>
+    public enum BulkMoveOutcome
+    {
+        TargetInvalid, SourceScopeRequired, TargetSameAsSource,
+        SplitToInvestment, Collision, InvestmentShape, Moved,
+        /// <summary>A category leg would land on a money account, or a money
+        /// leg on a category — see <see cref="CrossesCategoryBoundary"/>.</summary>
+        AccountDomainCrossed,
+
+        /// <summary>The target has been deactivated. Moving rows OFF an
+        /// inactive account stays legal — that is how one is cleaned up.</summary>
+        TargetInactive,
+
+        /// <summary>A split cannot leave an investment account for a bank —
+        /// the reverse of <see cref="SplitToInvestment"/>.</summary>
+        SplitFromInvestment,
+    }
+
+    /// <summary>
+    /// The three kinds of thing a leg can sit on, for the purpose of moving it.
+    /// </summary>
+    /// <remarks>
+    /// Mirrors the split the register router already makes — investment
+    /// accounts get their own page, everything else shares the bank register,
+    /// and a category's register is that page viewed from the other side. The
+    /// banking domain is deliberately WIDE: bank, credit card, asset,
+    /// liability, loan and cash all render the same row shape, so a leg means
+    /// the same thing on any of them.
+    /// </remarks>
+    private static string MoveDomain(string accountType) => accountType switch
+    {
+        "category" => "category",
+        "investment" => "investment",
+        _ => "banking",
+    };
+
+    // =========================================================================
+    // THE MOVE RULE — one implementation, asked by both the single-row and the
+    // bulk path (ADR-0072 D3, as decided 2026-10-09).
+    //
+    // They used to be two, and they drifted: the bulk path refused banking ↔
+    // investment, the single-row path allowed it, and the SPA's picker carried a
+    // third copy. An attempt to reconcile them by hand revoked a decision record
+    // and was caught only by the tests that encode it. So the rule now lives
+    // here once, and each path supplies a header query — one header, or the
+    // whole selection — and maps the verdict onto its own outcome enum.
+    //
+    //   * A category and an account are not interchangeable. The move is
+    //     `UPDATE txn_legs SET account_id = target WHERE account_id = source`;
+    //     crossing that boundary leaves a transaction with no category at all.
+    //   * Banking and investment accounts ARE interchangeable, both ways, for a
+    //     cash row — a brokerage deposit filed against checking, or the reverse.
+    //     A split may not cross in either direction.
+    //   * An investment event's money leg stays where it is, because its
+    //     holdings would stay behind — with one exception, below.
+    // =========================================================================
+
+    private enum MoveVerdict
+    {
+        Allowed, InvestmentShape, SplitToInvestment, SplitFromInvestment, Collision,
+    }
+
+    /// <summary>
+    /// The account-level half of the rule: would the move put a category leg on
+    /// a money account, or a money leg on a category? Checked before any
+    /// selection is built, so an empty selection still reports it.
+    /// </summary>
+    private static bool CrossesCategoryBoundary(string sourceType, string targetType) =>
+        (MoveDomain(sourceType) == "category") != (MoveDomain(targetType) == "category");
+
+    /// <summary>
+    /// THE EXCEPTION: investment <c>transfer</c>s that are only cash, between the
+    /// brokerage and ONE banking account — no security leg, no second posting,
+    /// and nothing on the far side but a banking account.
+    /// </summary>
+    /// <remarks>
+    /// An MD-imported contribution from checking arrives as exactly this. Moved
+    /// off the brokerage onto a bank, it touches no investment account, so it
+    /// stops being an investment event and is converted to a plain transfer
+    /// (<see cref="ClearInvestmentEventAsync"/>). A brokerage → brokerage
+    /// transfer does not qualify: after the move it would still touch one.
+    /// Nothing else derived is stranded — holdings, lots and realized gains are
+    /// all keyed off security legs, which this has none of by definition.
+    /// </remarks>
+    private IQueryable<TxnHeaderRow> CashOnlyTransfers(
+        IQueryable<TxnHeaderRow> headers, Guid sourceAccountId) =>
+        headers.Where(h => h.Action == "transfer"
+            && !_db.TxnLegs.Any(l => l.HeaderId == h.Id
+                && (l.SecurityId != null || l.PostingIndex > 0))
+            && !_db.TxnLegs.Any(l => l.HeaderId == h.Id
+                && l.AccountId != sourceAccountId
+                && _db.Accounts.Any(a => a.Id == l.AccountId
+                    && (a.AccountType == "investment" || a.AccountType == "category"))));
+
+    /// <summary>True when the move goes from an investment account to a bank,
+    /// which is the only direction that can convert a transfer.</summary>
+    private static bool InvestmentToBanking(string sourceType, string targetType) =>
+        MoveDomain(sourceType) == "investment" && MoveDomain(targetType) == "banking";
+
+    /// <summary>The header-level half of the rule, for one header or many.</summary>
+    private async Task<MoveVerdict> CheckHeadersAsync(
+        IQueryable<TxnHeaderRow> headers, string sourceType, string targetType,
+        Guid sourceAccountId, Guid targetAccountId, CancellationToken cancellationToken)
+    {
+        var sourceDomain = MoveDomain(sourceType);
+        var targetDomain = MoveDomain(targetType);
+
+        // An investment event's MONEY leg stays put. Its CATEGORY leg does not
+        // need to: holdings and lots derive only from legs carrying a
+        // security_id (migration 068), and a security leg lives on the holdings
+        // sibling, which no one browses — so recategorising a dividend touches
+        // no holding at all. Refusing it left investment income stuck in
+        // whatever category it imported under.
+        //
+        // The cash leg of an investment event that landed in a BANK stays
+        // refused too, and that is not about holdings: the register treats such
+        // a row as read-only there ("edit + delete belong on the brokerage
+        // register"), and a move that bypassed it would contradict the surface.
+        if (sourceDomain != "category")
+        {
+            var blocked = headers.Where(h => h.Action != null);
+            if (InvestmentToBanking(sourceType, targetType))
+            {
+                var convertible = CashOnlyTransfers(headers, sourceAccountId).Select(h => h.Id);
+                blocked = blocked.Where(h => !convertible.Contains(h.Id));
+            }
+            if (await blocked.AnyAsync(cancellationToken).ConfigureAwait(false))
+                return MoveVerdict.InvestmentShape;
+        }
+
+        // posting_index > 0 ⇒ the header is a split. The "single banking leg"
+        // half of the rule, and it binds BOTH directions: a split's postings
+        // cannot all be re-pointed as one cash movement either way.
+        var splits = headers.Where(h => _db.TxnLegs.Any(l => l.HeaderId == h.Id && l.PostingIndex > 0));
+        if (targetDomain == "investment"
+            && await splits.AnyAsync(cancellationToken).ConfigureAwait(false))
+            return MoveVerdict.SplitToInvestment;
+        if (sourceDomain == "investment" && targetDomain == "banking"
+            && await splits.AnyAsync(cancellationToken).ConfigureAwait(false))
+            return MoveVerdict.SplitFromInvestment;
+
+        // The target is already a leg on the transaction (a self-transfer).
+        if (await headers.AnyAsync(
+                h => _db.TxnLegs.Any(l => l.HeaderId == h.Id && l.AccountId == targetAccountId),
+                cancellationToken).ConfigureAwait(false))
+            return MoveVerdict.Collision;
+
+        return MoveVerdict.Allowed;
+    }
+
+    /// <summary>
+    /// The transfers this move will convert. Resolved BEFORE the legs move: a
+    /// bulk selection is scoped to the source account, so asked afterwards it
+    /// would match nothing and the conversion would silently not happen.
+    /// </summary>
+    private async Task<List<Guid>> TransfersToConvertAsync(
+        IQueryable<TxnHeaderRow> headers, string sourceType, string targetType,
+        Guid sourceAccountId, CancellationToken cancellationToken) =>
+        InvestmentToBanking(sourceType, targetType)
+            ? await CashOnlyTransfers(headers, sourceAccountId).Select(h => h.Id)
+                .ToListAsync(cancellationToken).ConfigureAwait(false)
+            : [];
+
+    /// <summary>
+    /// Take the investment event off transfers that no longer touch an
+    /// investment account: <c>action</c> on the header and <c>posting_role</c> on
+    /// EVERY leg, together.
+    /// </summary>
+    /// <remarks>
+    /// Both or neither — <c>posting_role IS NOT NULL ⇔ action IS NOT NULL</c>
+    /// (migration 057). Its trigger was dropped in migration 084, so nothing in
+    /// the database checks it any more; it holds only because every writer keeps
+    /// it. The SPA's investment aggregator dispatches on posting_role, so a leg
+    /// left carrying 'transfer' on a bank-to-bank transaction would read as half
+    /// of an investment event with no other half.
+    /// </remarks>
+    private async Task ClearInvestmentEventAsync(
+        IReadOnlyCollection<Guid> headerIds, CancellationToken cancellationToken)
+    {
+        if (headerIds.Count == 0) return;
+        await _db.TxnLegs
+            .Where(l => headerIds.Contains(l.HeaderId))
+            .ExecuteUpdateAsync(s => s.SetProperty(l => l.PostingRole, _ => (string?)null),
+                cancellationToken).ConfigureAwait(false);
+        await _db.TxnHeaders
+            .Where(h => headerIds.Contains(h.Id))
+            .ExecuteUpdateAsync(s => s.SetProperty(h => h.Action, _ => (string?)null),
+                cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Move the whole selection to <paramref name="targetAccountId"/> (ADR-0072
+    /// D3). The selection is account-scoped — its AccountId is the source. Same
+    /// rule as the single move (<see cref="CheckHeadersAsync"/>), applied
+    /// ALL-OR-NOTHING: if any selected row is refused, nothing moves.
+    /// Recomputes source + target.
+    /// </summary>
+
+    public async Task<(BulkMoveOutcome Outcome, int Moved)> BulkMoveAccountAsync(
+        Guid ledgerId, SelectionRequest selection, Guid targetAccountId,
+        CancellationToken cancellationToken = default)
+    {
+        var target = await _db.Accounts.AsNoTracking()
+            .Where(a => a.Id == targetAccountId && a.LedgerId == ledgerId)
+            .Select(a => new { a.AccountType, a.IsActive })
+            .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (target is null)
+            return (BulkMoveOutcome.TargetInvalid, 0);
+
+        // A move is a RE-TARGET, and the inactive-account rule refuses those
+        // onto a deactivated account: "new transactions and re-targeting
+        // PATCHes cannot land on accounts that have been deactivated."
+        // Only the picker enforced it, so MCP — or any caller that is not the
+        // SPA — could move rows onto an account the user had retired, which is
+        // the one direction the rule exists to prevent. The SOURCE is not
+        // checked, deliberately: moving rows OFF a deactivated account is how
+        // you clean one up, and refusing that would strand them there.
+        if (!target.IsActive)
+            return (BulkMoveOutcome.TargetInactive, 0);
+        if (selection.AccountId is not { } sourceAccountId)
+            return (BulkMoveOutcome.SourceScopeRequired, 0);
+        if (sourceAccountId == targetAccountId)
+            return (BulkMoveOutcome.TargetSameAsSource, 0);
+
+        // The rule used to be "target must not be a category", which reads as a
+        // rule about targets and is really half of a rule about PAIRS — which
+        // is why the source half was never written. A selection made on a
+        // CATEGORY's register carries the category as its AccountId, so the
+        // move re-pointed the category leg onto a money account and left the
+        // transaction with two money-account legs and no category at all.
+        // Silent, and two clicks from that screen.
+        var sourceType = await _db.Accounts.AsNoTracking()
+            .Where(a => a.Id == sourceAccountId && a.LedgerId == ledgerId)
+            .Select(a => a.AccountType)
+            .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (sourceType is null)
+            return (BulkMoveOutcome.SourceScopeRequired, 0);
+        if (CrossesCategoryBoundary(sourceType, target.AccountType))
+            return (BulkMoveOutcome.AccountDomainCrossed, 0);
+
+        var query = await BuildSelectionQueryAsync(ledgerId, selection, cancellationToken)
+            .ConfigureAwait(false);
+        if (query is null) return (BulkMoveOutcome.Moved, 0);
+
+        var verdict = await CheckHeadersAsync(
+            query, sourceType, target.AccountType, sourceAccountId, targetAccountId,
+            cancellationToken).ConfigureAwait(false);
+        switch (verdict)
+        {
+            case MoveVerdict.InvestmentShape: return (BulkMoveOutcome.InvestmentShape, 0);
+            case MoveVerdict.SplitToInvestment: return (BulkMoveOutcome.SplitToInvestment, 0);
+            case MoveVerdict.SplitFromInvestment: return (BulkMoveOutcome.SplitFromInvestment, 0);
+            case MoveVerdict.Collision: return (BulkMoveOutcome.Collision, 0);
+        }
+
+        await using var transaction = await _db.Database
+            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+        // Both read before the legs move — the selection is source-scoped.
+        var affectedDates = await query
+            .Select(h => h.PostedAt)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var converting = await TransfersToConvertAsync(
+            query, sourceType, target.AccountType, sourceAccountId,
+            cancellationToken).ConfigureAwait(false);
+
+        var moved = await _db.TxnLegs
+            .Where(l => l.AccountId == sourceAccountId
+                && query.Select(h => h.Id).Contains(l.HeaderId))
+            .ExecuteUpdateAsync(s => s.SetProperty(l => l.AccountId, _ => targetAccountId),
+                cancellationToken).ConfigureAwait(false);
+        await ClearInvestmentEventAsync(converting, cancellationToken).ConfigureAwait(false);
+
+        if (affectedDates.Count > 0)
+        {
+            var pairs = affectedDates
+                .SelectMany(d => new[] { (sourceAccountId, d), (targetAccountId, d) });
+            await _balances.RecomputeAsync(pairs, cancellationToken).ConfigureAwait(false);
+        }
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return (BulkMoveOutcome.Moved, moved);
+    }
+}

@@ -1,0 +1,22 @@
+-- =============================================================================
+-- 184 — retire mcp_tool_invocations.is_error (ADR-0086 Track A completion)
+-- =============================================================================
+--
+-- Migration 178 made the MCP write-audit two-phase (pending → ok|error|cancelled)
+-- but RETAINED the older boolean is_error, kept in sync by the recorder, so the
+-- admin viewer (ADR-0081 D5) could stay on the boolean unchanged. That was a
+-- deliberate deferral: is_error is now strictly redundant with status
+-- (is_error ≡ status = 'error') AND strictly less expressive — it cannot tell
+-- a still-pending or cancelled call apart from a successful one, so the viewer
+-- rendered a hung/cancelled write as if it were ok. ADR-0086's whole point on
+-- the read side is that those non-terminal / cancelled outcomes are VISIBLE.
+--
+-- This migration drops the redundant column. The API now projects status
+-- directly (McpAuditEntryDto.Status) and the admin panel renders the four
+-- lifecycle states. No data is lost: status already carries every distinction
+-- is_error did and more (178 backfilled it for all pre-existing rows).
+--
+-- Single autocommitting statement — safe under DbUp NoTransaction.
+-- =============================================================================
+
+ALTER TABLE mcp_tool_invocations DROP COLUMN is_error;

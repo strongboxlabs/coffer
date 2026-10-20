@@ -1,0 +1,41 @@
+namespace Coffer.Api.Db.Entities;
+
+/// <summary>
+/// EF entity for <c>scheduled_jobs</c> (mig 136). One row per (ledger,
+/// job_type): the per-ledger daily schedule + the worker's polling bookkeeping.
+/// A single background worker dispatches each due row by <see cref="JobType"/>
+/// to a registered handler.
+/// </summary>
+internal sealed class ScheduledJobRow
+{
+    public Guid LedgerId { get; init; }
+    public string JobType { get; init; } = string.Empty;
+    public bool Enabled { get; set; }
+    public short HourLocal { get; set; }
+    public short MinuteLocal { get; set; }
+    /// <summary>IANA tz the hour/minute are interpreted in (mig 137); null →
+    /// server-local fallback.</summary>
+    public string? Timezone { get; set; }
+    public Guid ConfiguredByUserId { get; set; }
+    public DateTime? LastRunAt { get; set; }
+    public DateTime? NextRunAt { get; set; }
+    public DateTime CreatedAt { get; init; }
+    public DateTime UpdatedAt { get; set; }
+    /// <summary>Consecutive handler failures (mig 194); 0 on success. Drives the
+    /// backoff and auto-disable in <c>SchedulerRunner</c>.</summary>
+    public int ConsecutiveFailures { get; set; }
+
+    /// <summary>
+    /// Why this job is disabled when a person did not disable it (mig 216); NULL when
+    /// enabled or user-disabled. Values from <c>ScheduleDisableReasons</c>. Current
+    /// state only — cleared on re-enable.
+    /// </summary>
+    public string? DisabledReason { get; set; }
+    /// <summary>Truncated message of the newest failure (mig 194) — never a stack
+    /// trace or payload; this is surfaced in the SPA.</summary>
+    public string? LastError { get; set; }
+    public DateTime? LastFailureAt { get; set; }
+    /// <summary>The last run that did its work, fully or in part (mig 252). Unlike
+    /// <see cref="LastRunAt"/>, which is stamped when a run is claimed.</summary>
+    public DateTime? LastSuccessAt { get; set; }
+}

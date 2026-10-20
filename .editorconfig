@@ -1,0 +1,46 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{ts,tsx,js,jsx,json,yml,yaml,md}]
+indent_size = 2
+
+[*.sql]
+indent_size = 4
+
+[*.cs]
+indent_size = 4
+
+# Globalization analyzers, escalated to warnings (ADR-0089).
+#
+# Api.csproj sets TreatWarningsAsErrors=true, so these fail the build. They
+# default to suggestion/silent, which is why the codebase could carry a
+# culture-dependent comparison unnoticed.
+#
+# The bug they prevent: `ToLower()` and culture-sensitive comparison follow
+# CurrentCulture, so the same string folds differently per machine locale.
+# Under tr-TR, "I".ToLower() is dotless "ı" — an account created on one host
+# becomes unreachable from another. Username identity must never depend on the
+# process culture (folding is Postgres' username_ci collation's job), and the
+# same trap applies to any identifier comparison.
+#
+# CA1304 Specify CultureInfo
+# CA1305 Specify IFormatProvider
+# CA1310 Specify StringComparison for correctness (ordinal vs culture)
+# CA1311 Specify a culture or use an invariant version
+dotnet_diagnostic.CA1304.severity = warning
+dotnet_diagnostic.CA1305.severity = warning
+dotnet_diagnostic.CA1310.severity = warning
+dotnet_diagnostic.CA1311.severity = warning
+
+[Makefile]
+indent_style = tab
+
+[*.{ps1,bat,cmd}]
+end_of_line = crlf

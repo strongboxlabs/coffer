@@ -1,0 +1,193 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>Coffer.Api</RootNamespace>
+    <AssemblyName>coffer-api</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <UserSecretsId>coffer-api-dev</UserSecretsId>
+    <!-- ADR-0044: the API version axis. Semver baseline bumped at
+         releases; the git short SHA + commit count are stamped onto
+         the assembly by the StampGitVersion target below and surfaced
+         via GET /api/meta/version. We compose InformationalVersion
+         ourselves, so suppress the SDK's automatic +<sha> append. -->
+    <Version>0.125.0</Version>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+
+  <!-- FU-089: dev auth (any request with X-Dev-Auth: 1 is the admin) is compiled only into
+       builds that ask for it. Debug builds do, so local runs and `dotnet test` keep it;
+       Release builds do not, so the image, which the Dockerfile publishes in Release, has no
+       dev-auth code at all, whatever its environment and configuration say. It used to be
+       excluded at runtime only, by environment plus config, both settable on a host. The CI
+       and preflight Release builds the tests run against pass -p:CofferDevAuth=true. -->
+  <PropertyGroup>
+    <CofferDevAuth Condition="'$(CofferDevAuth)' == '' And '$(Configuration)' == 'Debug'">true</CofferDevAuth>
+    <DefineConstants Condition="'$(CofferDevAuth)' == 'true'">$(DefineConstants);COFFER_DEV_AUTH</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(CofferDevAuth)' != 'true'">
+    <Compile Remove="Auth/DevAuthHandler.cs" />
+  </ItemGroup>
+
+  <!-- ADR-0044: stamp the build identity (commit count = monotonic
+       build number, short SHA, commit date) onto the assembly so the
+       About panel can show a progression the user can eyeball. Runs
+       before the SDK generates AssemblyInfo. Every git call is
+       ContinueOnError + defaulted, so a .git-less build falls back to
+       build 0 / "nogit" rather than failing the build.
+
+       That fallback IS what a container build hit: .dockerignore excludes
+       .git (rightly — the history has no business in a build context), so
+       every published image reported "0.62.0+nogit" and a build number of
+       0. The degradation was graceful and silent, which made the identity
+       useless exactly where it matters most: a running deployment could
+       name its release but not the commit behind it, and every image of a
+       given release looked identical.
+
+       So each value is now OVERRIDABLE: pass GitShortSha / GitCommitCount /
+       GitCommitDate and the corresponding git call is skipped. The
+       Dockerfile takes them as build args and the release workflow supplies
+       them from the tagged commit, which it knows without needing .git in
+       the context. Local builds are unchanged — nothing is passed, so git
+       is consulted as before. -->
+  <Target Name="StampGitVersion" BeforeTargets="GetAssemblyVersion;CoreGenerateAssemblyInfo;GenerateAssemblyInfo">
+    <Exec Condition="'$(GitCommitCount)' == ''" Command="git rev-list --count HEAD" ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="GitCommitCount" />
+      <Output TaskParameter="ExitCode" PropertyName="GitCountExit" />
+    </Exec>
+    <Exec Condition="'$(GitShortSha)' == ''" Command="git rev-parse --short HEAD" ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="GitShortSha" />
+      <Output TaskParameter="ExitCode" PropertyName="GitShaExit" />
+    </Exec>
+    <!-- The format specifier needs a literal percent to reach git, but
+         it passes through two layers: MSBuild (where %25 means '%') and
+         the temp batch file Exec runs (where '%%' means a literal '%').
+         So %25%25 becomes '%%' for the batch, which git sees as '%cd'. -->
+    <Exec Condition="'$(GitCommitDate)' == ''" Command="git log -1 --format=%25%25cd --date=short" ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="GitCommitDate" />
+      <Output TaskParameter="ExitCode" PropertyName="GitDateExit" />
+    </Exec>
+    <PropertyGroup>
+      <!-- THREE states, not two, and missing the third shipped a git error
+           message as the version string.
+
+           A skipped Exec (value supplied) leaves ExitCode EMPTY, so the
+           fallback cannot key on the exit code alone — '' != '0' would
+           overwrite a supplied sha with "nogit". That is why these tested the
+           VALUE. But an Exec that RAN AND FAILED leaves the value non-empty:
+           ConsoleToMSBuild captures git's own "fatal: not a git repository"
+           into the property, so the value test sees something and the fallback
+           never fires. The build then stamps
+
+               0.87.0+fatal: not a git repository (or any of the parent
+               directories): .git
+
+           as InformationalVersion, which VersionInfo splits on the first '+'
+           and the About panel renders as the commit — twice, since CommitDate
+           is the same text and its "have we got one" guard passes too.
+
+           This only became reachable when the sdk image started shipping git:
+           before that the Exec failed to START (no value captured, empty,
+           fallback fired), which is why the comment above described a
+           degradation that no longer happened. Local builds hit it because
+           .dockerignore excludes .git, so the build stage is not a repo.
+
+           So: clear the value when the Exec ran and failed, THEN apply the
+           empty-value fallback. A skipped Exec still has an empty ExitCode and
+           is untouched by the first condition, so a supplied value survives. -->
+      <GitCommitCount Condition="'$(GitCountExit)' != '' and '$(GitCountExit)' != '0'"></GitCommitCount>
+      <GitShortSha Condition="'$(GitShaExit)' != '' and '$(GitShaExit)' != '0'"></GitShortSha>
+      <GitCommitDate Condition="'$(GitDateExit)' != '' and '$(GitDateExit)' != '0'"></GitCommitDate>
+      <GitCommitCount Condition="'$(GitCommitCount)' == ''">0</GitCommitCount>
+      <GitShortSha Condition="'$(GitShortSha)' == ''">nogit</GitShortSha>
+      <GitCommitDate Condition="'$(GitCommitDate)' == ''"></GitCommitDate>
+      <InformationalVersion>$(Version)+$(GitShortSha.Trim())</InformationalVersion>
+    </PropertyGroup>
+    <ItemGroup>
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>BuildNumber</_Parameter1>
+        <_Parameter2>$(GitCommitCount.Trim())</_Parameter2>
+      </AssemblyAttribute>
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>CommitDate</_Parameter1>
+        <_Parameter2>$(GitCommitDate.Trim())</_Parameter2>
+      </AssemblyAttribute>
+    </ItemGroup>
+  </Target>
+
+  <ItemGroup>
+    <!-- Reads the hand-editable feed_csv_mappings document (mig 222). MIT, so
+         compatible with this project's AGPL-3.0-only. -->
+    <!-- Delimited-file parsing for the generic CSV provider (ADR-0031 Phase 5).
+         Dual MS-PL OR Apache-2.0; taken under Apache-2.0, which is compatible
+         with this project's AGPL-3.0-only. Not hand-rolled: quoted delimiters,
+         doubled quotes and newlines inside quotes are where a splitter silently
+         shifts an amount into the wrong field. -->
+    <PackageReference Include="CsvHelper" Version="33.1.0" />
+    <PackageReference Include="YamlDotNet" Version="18.1.0" />
+    <PackageReference Include="dbup-postgresql" Version="6.1.5" />
+    <PackageReference Include="Fido2.AspNet" Version="4.2.0" />
+    <PackageReference Include="Google.Apis.Drive.v3" Version="1.77.0.4276" />
+    <PackageReference Include="Konscious.Security.Cryptography.Argon2" Version="1.3.1" />
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.12" />
+    <!-- Pin the transitive Microsoft.OpenApi to a patched version. AspNetCore.OpenApi
+         10.0.9 pulls 2.0.0, which has GHSA-v5pm-xwqc-g5wc (high: a circular schema
+         reference can stack-overflow the OpenAPI parser). Fixed in 2.7.5; same major,
+         so the resolver satisfies AspNetCore.OpenApi's floor with it. -->
+    <PackageReference Include="Microsoft.OpenApi" Version="2.12.2" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.12" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0" />
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
+    <PackageReference Include="Npgsql.OpenTelemetry" Version="10.0.3" />
+    <!-- OFX 1.x SGML + 2.x XML parser. MIT; jim-dale/BankingTools; actively
+         maintained (1.8.1 released 2025-11-22, investment statement support
+         landed 2025-11-20). Zero deps on net10.0. Pinned to a specific
+         version; bus-factor mitigation is the IFileProvider adapter
+         (`OfxFileProvider`) — if upstream stalls, MIT lets us vendor
+         `src/OfxNet/` directly into the repo. -->
+    <PackageReference Include="OfxNet" Version="1.8.1" />
+    <PackageReference Include="OpenIddict.AspNetCore" Version="7.7.1" />
+    <PackageReference Include="OpenIddict.EntityFrameworkCore" Version="7.7.1" />
+    <PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.19.1" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.19.1" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.19.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Coffer.Domain.Investment\Coffer.Domain.Investment.csproj" />
+    <ProjectReference Include="..\Coffer.Domain.Reminders\Coffer.Domain.Reminders.csproj" />
+    <!-- ADR-0071 D2: the API drives the Moneydance import pipeline for the
+         in-app "new ledger from export" flow. References the Spectre-free
+         library, not the CLI. -->
+    <ProjectReference Include="..\Importer.Moneydance\Importer.Moneydance.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Api.Tests" />
+  </ItemGroup>
+
+  <!-- ADR-0071 D5: the curated starter category tree seeded into new ledgers.
+       Embedded (not read from disk) so it ships in the assembly.
+       GENERATED from the demo sample's curated core (ADR-0091) — do not
+       hand-edit the .json; edit data/samples/moneydance-export-demo.base.json
+       and re-run data/samples/starter-categories.gen.mjs. -->
+  <ItemGroup>
+    <EmbeddedResource Include="Provisioning\starter-categories.json"
+                      LogicalName="Coffer.Api.Provisioning.starter-categories.json" />
+    <!-- The bundled sample dataset, embedded so ProvisioningService can seed the
+         Demo ledger when setup's one question is answered yes (ADR-0088; it was
+         the retired `provision` subcommand that first needed this). Canonical
+         copy stays in data/samples (the importer tests read it there); the
+         .dockerignore carves data/samples back into the build context.
+         ITSELF GENERATED (FU-009): data/samples/moneydance-export-demo.gen.mjs
+         builds it from the curated .base.json plus a synthetic household
+         history. Hand-edits to the .json are lost on the next regeneration. -->
+    <EmbeddedResource Include="..\..\data\samples\moneydance-export-demo.json"
+                      LogicalName="Coffer.Api.Provisioning.moneydance-export-demo.json" />
+  </ItemGroup>
+
+</Project>

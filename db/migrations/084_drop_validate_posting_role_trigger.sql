@@ -1,0 +1,57 @@
+-- =============================================================================
+-- 084 — drop trg_validate_posting_role (defer-style trigger conflict)
+-- =============================================================================
+--
+-- Migration 057 armed a BEFORE INSERT/UPDATE trigger on txn_legs
+-- enforcing the invariant:
+--     posting_role IS NOT NULL  ⇔  txn_headers.action IS NOT NULL
+--
+-- The invariant is real — but its trigger-based enforcement conflicts
+-- with the multi-statement nature of the editor's upgrade path
+-- (bank-shape feed row → investment-shape). When the user clicks
+-- Accept on a feed-imported brokerage row:
+--
+--   1. EF flushes:    UPDATE txn_headers SET action = 'buyx' WHERE id = ?
+--                     DELETE FROM txn_legs WHERE id = ?  (the old NULL-role legs)
+--                     DELETE FROM txn_legs WHERE id = ?
+--   2. AFTER UPDATE on txn_headers fires trg_headers_balance_after_update
+--   3. That recompute runs UPDATE txn_legs SET balance_after = ... on
+--      every leg of the (still-present) old bank-shape legs
+--   4. BEFORE UPDATE on each touched leg fires trg_validate_posting_role
+--   5. Trigger reads header.action = 'buyx' (just changed), leg.posting_role
+--      = NULL (the old bank-shape value) → RAISE EXCEPTION → rollback
+--
+-- The violation is transient and the DELETE later in the same batch
+-- would have made it go away. But chained AFTER + BEFORE triggers
+-- don't have visibility into "the parent operation is mid-flush";
+-- the inner UPDATE looks like an integrity violation in isolation.
+--
+-- Per the engineering rule "triggers are a last resort — prefer
+-- explicit code at the call site," we move the invariant enforcement
+-- to the API layer, where every leg writer already stamps
+-- posting_role correctly:
+--
+--   * InvestmentTransactionsRepository.CreateAsync — BuildPostings
+--     sets posting_role on every leg of an investment header.
+--   * InvestmentTransactionsRepository.PatchAsync — same call path.
+--   * IngestOrchestrator — bank-shape inserts use action=NULL +
+--     posting_role=NULL (upholds the invariant from the other side).
+--   * Importer.Moneydance.Db.TransactionsRepository — migration
+--     057's one-shot backfill cleaned MD-imported legs; the
+--     repository now stamps role on insert.
+--   * Test fixtures (SyntheticLedger, etc.) — already stamp the
+--     role correctly (they were tested against the trigger and
+--     passed; same expectations apply).
+--
+-- Direct SQL writes (data fixes) are rare and the operator accepts
+-- responsibility; removing the trigger doesn't materially weaken
+-- our protection there.
+--
+-- Follow-ups (separate slices): same exercise on
+-- trg_validate_posting_cardinality_* and trg_validate_posting_completeness.
+-- They have the same shape (validation invariants the API can carry)
+-- but each needs its own audit before pulling.
+-- =============================================================================
+
+DROP TRIGGER IF EXISTS trg_validate_posting_role ON txn_legs;
+DROP FUNCTION IF EXISTS fn_validate_posting_role();

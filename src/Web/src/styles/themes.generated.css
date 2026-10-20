@@ -1,0 +1,393 @@
+/*
+ * GENERATED — do not edit. Run `npm run themes:gen`.
+ *
+ * Four themes x three colour directions. A THEME sets ground lightness and
+ * contrast level; a DIRECTION is one hue that regenerates BOTH the accent
+ * family and the neutral ramp (at hue+74, on slate's own lightness/chroma
+ * curve). Status colours and the category palette never rotate — those carry
+ * meaning, not brand.
+ *
+ * `teal` is the default: the [data-theme] blocks below are already teal, so the
+ * pair blocks only cover indigo and rust.
+ *
+ * Values are solved in OKLCh — constant perceived chroma, so a hue rotation
+ * does not change how coloured the ramp looks — and every pair the register
+ * renders is audited against WCAG AA. themes.generated.test.ts fails if this
+ * file drifts from the model, and refuses a combination that drops below AA.
+ */
+
+[data-theme="light"][data-accent="indigo"] {
+    color-scheme: light;
+    --color-accent: #4468b6;
+    --color-accent-hover: #557aca;
+    --color-accent-soft: #ccdeff;
+    --color-accent-soft-text: #325197;
+    --color-border: #ddcfd8;
+    --color-border-strong: #b19aa9;
+    --color-cat-din-soft: #faf5ff;
+    --color-cat-din-text: #6b21a8;
+    --color-cat-groc-soft: #fff7ed;
+    --color-cat-groc-text: #9a3412;
+    --color-cat-house-soft: #eff6ff;
+    --color-cat-house-text: #1d4ed8;
+    --color-cat-phone-soft: #f0f9ff;
+    --color-cat-phone-text: #075985;
+    --color-cat-rec-soft: #fdf2f8;
+    --color-cat-rec-text: #9d174d;
+    --color-cat-sal-soft: #ecfdf5;
+    --color-cat-sal-text: #047857;
+    --color-cat-sub-soft: #eef2ff;
+    --color-cat-sub-text: #4338ca;
+    --color-cat-tran-soft: #ecfeff;
+    --color-cat-tran-text: #155e75;
+    --color-cat-util-soft: #fffbeb;
+    --color-cat-util-text: #92400e;
+    --color-cat-xfer-soft: #f1f5f9;
+    --color-cat-xfer-text: #475569;
+    --color-chip-neutral: #eee4ea;
+    --color-chip-neutral-text: #624c5b;
+    --color-state-danger: #b91c1c;
+    --color-state-danger-soft: #fee2e2;
+    --color-state-success: #15803d;
+    --color-state-success-soft: #dcfce7;
+    --color-state-warning: #92400e;
+    --color-state-warning-soft: #fef3c7;
+    --color-surface: #ffffff;
+    --color-surface-header: #f8f3f6;
+    --color-surface-hover: #eee4ea;
+    --color-surface-muted: #fbf9fa;
+    --color-surface-sidebar: #ffffff;
+    --color-text: #23101e;
+    --color-text-inverse: #f8fafc;
+    --color-text-muted: #624c5b;
+    --color-text-subtle: #836a7b;
+}
+
+[data-theme="light"][data-accent="rust"] {
+    color-scheme: light;
+    --color-accent: #a74f21;
+    --color-accent-hover: #bb6135;
+    --color-accent-soft: #ffd6c1;
+    --color-accent-soft-text: #8c3d12;
+    --color-border: #d2d6c8;
+    --color-border-strong: #9fa58d;
+    --color-cat-din-soft: #faf5ff;
+    --color-cat-din-text: #6b21a8;
+    --color-cat-groc-soft: #fff7ed;
+    --color-cat-groc-text: #9a3412;
+    --color-cat-house-soft: #eff6ff;
+    --color-cat-house-text: #1d4ed8;
+    --color-cat-phone-soft: #f0f9ff;
+    --color-cat-phone-text: #075985;
+    --color-cat-rec-soft: #fdf2f8;
+    --color-cat-rec-text: #9d174d;
+    --color-cat-sal-soft: #ecfdf5;
+    --color-cat-sal-text: #047857;
+    --color-cat-sub-soft: #eef2ff;
+    --color-cat-sub-text: #4338ca;
+    --color-cat-tran-soft: #ecfeff;
+    --color-cat-tran-text: #155e75;
+    --color-cat-util-soft: #fffbeb;
+    --color-cat-util-text: #92400e;
+    --color-cat-xfer-soft: #f1f5f9;
+    --color-cat-xfer-text: #475569;
+    --color-chip-neutral: #e6e9e0;
+    --color-chip-neutral-text: #525740;
+    --color-state-danger: #b91c1c;
+    --color-state-danger-soft: #fee2e2;
+    --color-state-success: #15803d;
+    --color-state-success-soft: #dcfce7;
+    --color-state-warning: #92400e;
+    --color-state-warning-soft: #fef3c7;
+    --color-surface: #ffffff;
+    --color-surface-header: #f4f5f0;
+    --color-surface-hover: #e6e9e0;
+    --color-surface-muted: #f9faf8;
+    --color-surface-sidebar: #ffffff;
+    --color-text: #161a04;
+    --color-text-inverse: #f8fafc;
+    --color-text-muted: #525740;
+    --color-text-subtle: #70765c;
+}
+
+[data-theme="light-hc"][data-accent="indigo"] {
+    color-scheme: light;
+    --color-accent: #3456a3;
+    --color-accent-hover: #4468b6;
+    --color-accent-soft: #ccdeff;
+    --color-accent-soft-text: #325197;
+    --color-border: #b19aa9;
+    --color-border-strong: #836a7b;
+    --color-cat-din-soft: #e9d5ff;
+    --color-cat-din-text: #581c87;
+    --color-cat-groc-soft: #fed7aa;
+    --color-cat-groc-text: #7c2d12;
+    --color-cat-house-soft: #bfdbfe;
+    --color-cat-house-text: #1e40af;
+    --color-cat-phone-soft: #bae6fd;
+    --color-cat-phone-text: #0c4a6e;
+    --color-cat-rec-soft: #fbcfe8;
+    --color-cat-rec-text: #831843;
+    --color-cat-sal-soft: #a7f3d0;
+    --color-cat-sal-text: #065f46;
+    --color-cat-sub-soft: #c7d2fe;
+    --color-cat-sub-text: #3730a3;
+    --color-cat-tran-soft: #a5f3fc;
+    --color-cat-tran-text: #164e63;
+    --color-cat-util-soft: #fde68a;
+    --color-cat-util-text: #78350f;
+    --color-cat-xfer-soft: #cbd5e1;
+    --color-cat-xfer-text: #334155;
+    --color-chip-neutral: #ddcfd8;
+    --color-chip-neutral-text: #4e3848;
+    --color-state-danger: #991b1b;
+    --color-state-danger-soft: #fecaca;
+    --color-state-success: #166534;
+    --color-state-success-soft: #bbf7d0;
+    --color-state-warning: #7c2d12;
+    --color-state-warning-soft: #fde68a;
+    --color-surface: #ffffff;
+    --color-surface-header: #eee4ea;
+    --color-surface-hover: #ddcfd8;
+    --color-surface-muted: #fbf9fa;
+    --color-surface-sidebar: #ffffff;
+    --color-text: #11020c;
+    --color-text-inverse: #f8fafc;
+    --color-text-muted: #4e3848;
+    --color-text-subtle: #624c5b;
+}
+
+[data-theme="light-hc"][data-accent="rust"] {
+    color-scheme: light;
+    --color-accent: #97400d;
+    --color-accent-hover: #aa5224;
+    --color-accent-soft: #ffd6c1;
+    --color-accent-soft-text: #8c3d12;
+    --color-border: #9fa58d;
+    --color-border-strong: #70765c;
+    --color-cat-din-soft: #e9d5ff;
+    --color-cat-din-text: #581c87;
+    --color-cat-groc-soft: #fed7aa;
+    --color-cat-groc-text: #7c2d12;
+    --color-cat-house-soft: #bfdbfe;
+    --color-cat-house-text: #1e40af;
+    --color-cat-phone-soft: #bae6fd;
+    --color-cat-phone-text: #0c4a6e;
+    --color-cat-rec-soft: #fbcfe8;
+    --color-cat-rec-text: #831843;
+    --color-cat-sal-soft: #a7f3d0;
+    --color-cat-sal-text: #065f46;
+    --color-cat-sub-soft: #c7d2fe;
+    --color-cat-sub-text: #3730a3;
+    --color-cat-tran-soft: #a5f3fc;
+    --color-cat-tran-text: #164e63;
+    --color-cat-util-soft: #fde68a;
+    --color-cat-util-text: #78350f;
+    --color-cat-xfer-soft: #cbd5e1;
+    --color-cat-xfer-text: #334155;
+    --color-chip-neutral: #d2d6c8;
+    --color-chip-neutral-text: #3e432c;
+    --color-state-danger: #991b1b;
+    --color-state-danger-soft: #fecaca;
+    --color-state-success: #166534;
+    --color-state-success-soft: #bbf7d0;
+    --color-state-warning: #7c2d12;
+    --color-state-warning-soft: #fde68a;
+    --color-surface: #ffffff;
+    --color-surface-header: #e6e9e0;
+    --color-surface-hover: #d2d6c8;
+    --color-surface-muted: #f9faf8;
+    --color-surface-sidebar: #ffffff;
+    --color-text: #060900;
+    --color-text-inverse: #f8fafc;
+    --color-text-muted: #3e432c;
+    --color-text-subtle: #525740;
+}
+
+[data-theme="dark"][data-accent="indigo"] {
+    color-scheme: dark;
+    --color-accent: #789ff3;
+    --color-accent-hover: #8eb3ff;
+    --color-accent-soft: #2d3c5d;
+    --color-accent-soft-text: #92b6ff;
+    --color-border: #624c5b;
+    --color-border-strong: #836a7b;
+    --color-cat-din-soft: #3e1c61;
+    --color-cat-din-text: #d8b4fe;
+    --color-cat-groc-soft: #3f2912;
+    --color-cat-groc-text: #fdba74;
+    --color-cat-house-soft: #162f4b;
+    --color-cat-house-text: #93c5fd;
+    --color-cat-phone-soft: #12313f;
+    --color-cat-phone-text: #7dd3fc;
+    --color-cat-rec-soft: #511837;
+    --color-cat-rec-text: #f9a8d4;
+    --color-cat-sal-soft: #0f3526;
+    --color-cat-sal-text: #6ee7b7;
+    --color-cat-sub-soft: #1d2963;
+    --color-cat-sub-text: #a5b4fc;
+    --color-cat-tran-soft: #103337;
+    --color-cat-tran-text: #67e8f9;
+    --color-cat-util-soft: #372e10;
+    --color-cat-util-text: #fcd34d;
+    --color-cat-xfer-soft: #232f3d;
+    --color-cat-xfer-text: #cbd5e1;
+    --color-chip-neutral: #23101e;
+    --color-chip-neutral-text: #e1c9d9;
+    --color-state-danger: #fca5a5;
+    --color-state-danger-soft: #5d1b1b;
+    --color-state-success: #4ade80;
+    --color-state-success-soft: #11391f;
+    --color-state-warning: #fbbf24;
+    --color-state-warning-soft: #3d3112;
+    --color-surface: #35212f;
+    --color-surface-header: #23101e;
+    --color-surface-hover: #4e3848;
+    --color-surface-muted: #23101e;
+    --color-surface-sidebar: #35212f;
+    --color-text: #eee4ea;
+    --color-text-inverse: #020617;
+    --color-text-muted: #b19aa9;
+    --color-text-subtle: #a28c9b;
+}
+
+[data-theme="dark"][data-accent="rust"] {
+    color-scheme: dark;
+    --color-accent: #f59569;
+    --color-accent-hover: #ffac85;
+    --color-accent-soft: #5a3524;
+    --color-accent-soft-text: #fea47c;
+    --color-border: #525740;
+    --color-border-strong: #70765c;
+    --color-cat-din-soft: #3e1c61;
+    --color-cat-din-text: #d8b4fe;
+    --color-cat-groc-soft: #3f2912;
+    --color-cat-groc-text: #fdba74;
+    --color-cat-house-soft: #162f4b;
+    --color-cat-house-text: #93c5fd;
+    --color-cat-phone-soft: #12313f;
+    --color-cat-phone-text: #7dd3fc;
+    --color-cat-rec-soft: #511837;
+    --color-cat-rec-text: #f9a8d4;
+    --color-cat-sal-soft: #0f3526;
+    --color-cat-sal-text: #6ee7b7;
+    --color-cat-sub-soft: #1d2963;
+    --color-cat-sub-text: #a5b4fc;
+    --color-cat-tran-soft: #103337;
+    --color-cat-tran-text: #67e8f9;
+    --color-cat-util-soft: #372e10;
+    --color-cat-util-text: #fcd34d;
+    --color-cat-xfer-soft: #232f3d;
+    --color-cat-xfer-text: #cbd5e1;
+    --color-chip-neutral: #161a04;
+    --color-chip-neutral-text: #ced5bb;
+    --color-state-danger: #fca5a5;
+    --color-state-danger-soft: #5d1b1b;
+    --color-state-success: #4ade80;
+    --color-state-success-soft: #11391f;
+    --color-state-warning: #fbbf24;
+    --color-state-warning-soft: #3d3112;
+    --color-surface: #272b16;
+    --color-surface-header: #161a04;
+    --color-surface-hover: #3e432c;
+    --color-surface-muted: #161a04;
+    --color-surface-sidebar: #272b16;
+    --color-text: #e6e9e0;
+    --color-text-inverse: #020617;
+    --color-text-muted: #9fa58d;
+    --color-text-subtle: #91977f;
+}
+
+[data-theme="dark-hc"][data-accent="indigo"] {
+    color-scheme: dark;
+    --color-accent: #789ff3;
+    --color-accent-hover: #8eb3ff;
+    --color-accent-soft: #212f4f;
+    --color-accent-soft-text: #81a6f3;
+    --color-border: #624c5b;
+    --color-border-strong: #b19aa9;
+    --color-cat-din-soft: #291341;
+    --color-cat-din-text: #d8b4fe;
+    --color-cat-groc-soft: #2a1b0c;
+    --color-cat-groc-text: #fdba74;
+    --color-cat-house-soft: #0e1f31;
+    --color-cat-house-text: #93c5fd;
+    --color-cat-phone-soft: #0c202a;
+    --color-cat-phone-text: #7dd3fc;
+    --color-cat-rec-soft: #371025;
+    --color-cat-rec-text: #f9a8d4;
+    --color-cat-sal-soft: #0a2218;
+    --color-cat-sal-text: #6ee7b7;
+    --color-cat-sub-soft: #131b41;
+    --color-cat-sub-text: #a5b4fc;
+    --color-cat-tran-soft: #0a2124;
+    --color-cat-tran-text: #67e8f9;
+    --color-cat-util-soft: #241e0a;
+    --color-cat-util-text: #fcd34d;
+    --color-cat-xfer-soft: #171f28;
+    --color-cat-xfer-text: #cbd5e1;
+    --color-chip-neutral: #11020c;
+    --color-chip-neutral-text: #e1c9d9;
+    --color-state-danger: #f87171;
+    --color-state-danger-soft: #431414;
+    --color-state-success: #4ade80;
+    --color-state-success-soft: #0b2816;
+    --color-state-warning: #fbbf24;
+    --color-state-warning-soft: #2b230d;
+    --color-surface: #23101e;
+    --color-surface-header: #35212f;
+    --color-surface-hover: #35212f;
+    --color-surface-muted: #11020c;
+    --color-surface-sidebar: #23101e;
+    --color-text: #f8f3f6;
+    --color-text-inverse: #020617;
+    --color-text-muted: #ddcfd8;
+    --color-text-subtle: #b19aa9;
+}
+
+[data-theme="dark-hc"][data-accent="rust"] {
+    color-scheme: dark;
+    --color-accent: #f59569;
+    --color-accent-hover: #ffac85;
+    --color-accent-soft: #4c2817;
+    --color-accent-soft-text: #ed946c;
+    --color-border: #525740;
+    --color-border-strong: #9fa58d;
+    --color-cat-din-soft: #291341;
+    --color-cat-din-text: #d8b4fe;
+    --color-cat-groc-soft: #2a1b0c;
+    --color-cat-groc-text: #fdba74;
+    --color-cat-house-soft: #0e1f31;
+    --color-cat-house-text: #93c5fd;
+    --color-cat-phone-soft: #0c202a;
+    --color-cat-phone-text: #7dd3fc;
+    --color-cat-rec-soft: #371025;
+    --color-cat-rec-text: #f9a8d4;
+    --color-cat-sal-soft: #0a2218;
+    --color-cat-sal-text: #6ee7b7;
+    --color-cat-sub-soft: #131b41;
+    --color-cat-sub-text: #a5b4fc;
+    --color-cat-tran-soft: #0a2124;
+    --color-cat-tran-text: #67e8f9;
+    --color-cat-util-soft: #241e0a;
+    --color-cat-util-text: #fcd34d;
+    --color-cat-xfer-soft: #171f28;
+    --color-cat-xfer-text: #cbd5e1;
+    --color-chip-neutral: #060900;
+    --color-chip-neutral-text: #ced5bb;
+    --color-state-danger: #f87171;
+    --color-state-danger-soft: #431414;
+    --color-state-success: #4ade80;
+    --color-state-success-soft: #0b2816;
+    --color-state-warning: #fbbf24;
+    --color-state-warning-soft: #2b230d;
+    --color-surface: #161a04;
+    --color-surface-header: #272b16;
+    --color-surface-hover: #272b16;
+    --color-surface-muted: #060900;
+    --color-surface-sidebar: #161a04;
+    --color-text: #f4f5f0;
+    --color-text-inverse: #020617;
+    --color-text-muted: #d2d6c8;
+    --color-text-subtle: #9fa58d;
+}

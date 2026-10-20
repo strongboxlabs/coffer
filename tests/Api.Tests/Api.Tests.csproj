@@ -1,0 +1,58 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>Coffer.Api.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="10.1.0" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.12" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.10.1" />
+    <PackageReference Include="NSubstitute" Version="5.3.0" />
+    <PackageReference Include="Testcontainers.PostgreSql" Version="4.15.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.0" />
+    <!-- Pin the transitive System.Security.Cryptography.Xml to a patched version.
+         It arrives via the Api project's OpenIddict closure. Unlike the Web-SDK Api
+         project (which prunes it as a framework package), this plain test SDK project
+         audits the transitive, so it is pinned to the latest patch: 10.0.13, for the
+         .NET October 2026 advisories (GHSA-846f-f764-76mx, GHSA-c399-9853-6jmj and
+         siblings; July's GHSA-23rf-6693-g89p before them). Its Pkcs dependency moves
+         with it. Remove once the toolchain's floor moves past it. -->
+    <PackageReference Include="System.Security.Cryptography.Xml" Version="10.0.13" />
+    <!-- Same treatment for the transitive SSH.NET, and the same reason to keep the
+         audit strict rather than make an exception. It arrives through
+         Testcontainers.PostgreSql 4.13.0 (the latest — upstream has not moved yet) at
+         2025.1.0, which GHSA-q939-rpr3-3284 flags high: ScpClient's recursive download
+         doesn't validate remote-supplied filenames, so a hostile SCP server can write
+         outside the target directory. Nothing here uses ScpClient — Testcontainers
+         pulls SSH.NET in for its port-forwarding path — so the practical exposure is
+         nil, which is exactly the argument that would have us suppress NU1903 and
+         quietly carry a known-vulnerable package. Pinned to the patched 2026.0.0
+         instead. Remove once Testcontainers' own floor moves past it. -->
+    <PackageReference Include="SSH.NET" Version="2026.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Api\Api.csproj" />
+  </ItemGroup>
+
+  <!-- FU-089: dev auth is compiled into the API only on request, and the tests drive it.
+       Say so plainly rather than fail on a missing DevAuthHandler. Debug builds have it by
+       default; a Release build of the tests passes -p:CofferDevAuth=true, which reaches the
+       API project too, since a command-line property is global. -->
+  <Target Name="CofferDevAuthRequired" BeforeTargets="CoreCompile"
+          Condition="'$(CofferDevAuth)' != 'true' And '$(Configuration)' != 'Debug'">
+    <Error Text="Api.Tests needs dev auth compiled into the API: build with -p:CofferDevAuth=true (FU-089)." />
+  </Target>
+
+</Project>

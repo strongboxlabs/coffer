@@ -1,0 +1,890 @@
+import { useEffect, useId, useState, type FormEvent } from 'react';
+import {
+    useMutation,
+    useQuery,
+    useQueryClient,
+} from '@tanstack/react-query';
+import { useNavigate, useParams } from '@tanstack/react-router';
+
+import {
+    fetchSetupInfo,
+    performSetup,
+    restoreFromBackup,
+    waitForRestoreOutcome,
+    rememberPendingRestore,
+    pendingRestoreAttempt,
+    forgetPendingRestore,
+    uploadSetupRestoreParts,
+    type SetupCompleteResponse,
+    type SetupInfoResponse,
+} from '@/lib/auth';
+import {
+    backupPartCount,
+    orderBackupParts,
+    parseBackupPartName,
+    BACKUP_PART_SIZE_FALLBACK,
+} from '@/lib/api/backup';
+import { formatBytes } from '@/lib/format';
+import { errorMessage } from '@/lib/errorMessage';
+import { usernameProblem } from '@/lib/username';
+import { RecoveryCodes } from '@/components/RecoveryCodes';
+import { WelcomePanel } from '@/components/WelcomePanel';
+import { Button } from '@/components/ui/Button';
+import { FieldLabel } from '@/components/ui/FieldLabel';
+import { Input } from '@/components/ui/Input';
+import { Panel, PanelBody } from '@/components/ui/Panel';
+import { BrandHeader } from '@/components/ui/BrandHeader';
+
+// Username rules live in @/lib/username so this form and the invite form can't
+// drift apart the way they had (ADR-0089).
+
+/**
+ * First-run setup page. Three states drive the render:
+ *
+ *   1. Loading /info — the token is being validated.
+ *   2. /info failed — bootstrap token invalid / expired; surface and
+ *      stop.
+ *   3. /info succeeded — show the form.
+ *
+ * After /complete returns, the recovery-codes panel takes over and
+ * (acknowledgement gate) routes onward to the ledger hub.
+ *
+ * Setup does NOT choose a ledger (ADR-0088). It creates the user and passkey,
+ * plus a Demo ledger if the box is ticked; the hub is the post-setup home and
+ * carries both "New ledger" and "Import from Moneydance". Zero ledgers is a
+ * supported landing — the hub renders an empty state with both CTAs.
+ *
+ * Flow (drawn in ADR-0013, expanded by ADR-0022 follow-up, ADR-0088):
+ *   1. Operator finds the bootstrap token in API logs — or in the
+ *      dev-up-docker.sh output — and opens `/setup/{token}`.
+ *   2. Page mounts; GET /info validates the token.
+ *   3. User fills username, display name, passkey label; optionally
+ *      ticks "Include a Demo ledger".
+ *   4. performSetup() runs /begin → WebAuthn ceremony → /complete.
+ *      The page shows "Tap or insert your authenticator…" once /begin
+ *      has returned so the user knows the prompt is imminent (a USB
+ *      security key is inserted then tapped; a platform one just tapped).
+ *   5. /complete sets the cookie + returns recovery codes, and the Demo
+ *      ledger if one was seeded. RecoveryCodes panel gates onward
+ *      navigation behind explicit user acknowledgement.
+ *   6. After acknowledgement, the WelcomePanel shows the master key and points at
+ *      backups (ADR-0095). Setup itself ends at the codes: they are the one secret
+ *      that cannot be recovered, so they are the only one it gates on.
+ *   7. Continue → `/`, the ledger hub.
+ */
+export function SetupPage() {
+    const { token } = useParams({ strict: false }) as { token: string };
+    const infoQuery = useQuery<SetupInfoResponse, Error>({
+        queryKey: ['setup-info', token],
+        queryFn: () => fetchSetupInfo(token),
+        retry: false,
+    });
+
+    if (infoQuery.isLoading) {
+        return (
+            <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center px-6 py-12">
+                <BrandHeader />
+                <Panel>
+                    <PanelBody>
+                        <p className="text-sm text-text-muted">
+                            Verifying setup link…
+                        </p>
+                    </PanelBody>
+                </Panel>
+            </main>
+        );
+    }
+
+    if (infoQuery.error !== null && infoQuery.error !== undefined) {
+        return (
+            <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center px-6 py-12">
+                <BrandHeader />
+                <Panel>
+                    <PanelBody className="space-y-3">
+                        <h1 className="text-lg font-semibold tracking-tight">
+                            Setup link unavailable
+                        </h1>
+                        <p
+                            role="alert"
+                            className="rounded border border-state-danger/40 bg-state-danger-soft px-3 py-2 text-sm text-state-danger"
+                        >
+                            {errorMessage(
+                                infoQuery.error,
+                                'The setup link is invalid, expired, or already consumed.',
+                            )}
+                        </p>
+                        <p className="text-sm text-text-muted">
+                            Ask the operator to mint a fresh bootstrap token
+                            from the API logs.
+                        </p>
+                    </PanelBody>
+                </Panel>
+            </main>
+        );
+    }
+
+    // Awaited so an invalid or expired bootstrap token surfaces before the form
+    // renders. It also carries the restore part size (ADR-0101) — the only
+    // deployment value this pre-auth page needs and cannot read anywhere else.
+    return (
+        <SetupChooser
+            token={token}
+            partSizeBytes={infoQuery.data?.restorePartSizeBytes ?? BACKUP_PART_SIZE_FALLBACK}
+        />
+    );
+}
+
+/**
+ * First decision on a fresh install (ADR-0061): start clean, or restore a
+ * backup. Both are gated by the same one-shot bootstrap token; the choice
+ * only routes to the create ceremony or the restore upload.
+ */
+function SetupChooser({ token, partSizeBytes }: { token: string; partSizeBytes: number }) {
+    const [mode, setMode] = useState<'choose' | 'create' | 'restore'>('choose');
+
+    if (mode === 'create') {
+        return <SetupForm token={token} onBack={() => setMode('choose')} />;
+    }
+    if (mode === 'restore') {
+        return (
+            <RestoreFlow
+                token={token}
+                partSizeBytes={partSizeBytes}
+                onBack={() => setMode('choose')}
+            />
+        );
+    }
+
+    return (
+        <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center px-6 py-12">
+            <BrandHeader />
+            <Panel>
+                <PanelBody className="space-y-5">
+                    <header className="space-y-1">
+                        <h1 className="text-lg font-semibold tracking-tight">
+                            Welcome to Coffer
+                        </h1>
+                        <p className="text-sm text-text-muted">
+                            Set up a new install, or restore from a backup. This
+                            link works once.
+                        </p>
+                    </header>
+
+                    <div className="space-y-3">
+                        <button
+                            type="button"
+                            onClick={() => setMode('create')}
+                            className="w-full rounded border border-border bg-surface px-4 py-3 text-left transition hover:border-accent hover:bg-surface-muted"
+                        >
+                            <span className="block text-sm font-medium text-text">
+                                Set up a new install
+                            </span>
+                            {/* No ledger here: ADR-0088 took ledger creation out of setup
+                                ("zero ledgers is a supported landing"), leaving a Demo
+                                ledger as an opt-in box on the form. The old copy still
+                                promised "the first user + ledger", which is a promise the
+                                flow stopped keeping. */}
+                            <span className="block text-[0.6875rem] text-text-muted">
+                                Create the first user and register a passkey.
+                            </span>
+                        </button>
+
+                        <button
+                            type="button"
+                            onClick={() => setMode('restore')}
+                            className="w-full rounded border border-border bg-surface px-4 py-3 text-left transition hover:border-accent hover:bg-surface-muted"
+                        >
+                            <span className="block text-sm font-medium text-text">
+                                Restore from a backup
+                            </span>
+                            <span className="block text-[0.6875rem] text-text-muted">
+                                Upload an encrypted <code>.cofferbak</code> and its
+                                passphrase. Replaces the database, then restarts.
+                            </span>
+                        </button>
+                    </div>
+                </PanelBody>
+            </Panel>
+        </main>
+    );
+}
+
+interface SetupFormProps {
+    token: string;
+    onBack: () => void;
+}
+
+function SetupForm({ token, onBack }: SetupFormProps) {
+    const navigate = useNavigate();
+    const queryClient = useQueryClient();
+
+    const usernameId = useId();
+    const displayNameId = useId();
+    const credentialNicknameId = useId();
+
+    const [username, setUsername] = useState('');
+    const [displayName, setDisplayName] = useState('');
+    const [credentialNickname, setCredentialNickname] = useState('');
+
+    // Demo opt-in (ADR-0088). Unchecked by default: someone setting up their
+    // own books shouldn't acquire a ledger full of sample data by accident.
+    const [includeDemo, setIncludeDemo] = useState(false);
+
+    const [ceremonyStarted, setCeremonyStarted] = useState(false);
+    const [result, setResult] = useState<SetupCompleteResponse | null>(null);
+    /** Advances the completion panel from the recovery codes to the master key
+     *  (ADR-0092 D2). Two secrets, shown one at a time. */
+    const [savedRecoveryCodes, setSavedRecoveryCodes] = useState(false);
+
+    const setupMutation = useMutation({
+        mutationFn: performSetup,
+        onMutate: () => {
+            setCeremonyStarted(false);
+        },
+        onError: () => {
+            // A WebAuthn cancellation or attestation failure resets the
+            // "ceremony in progress" indicator so the button label
+            // returns to "Create account."
+            setCeremonyStarted(false);
+        },
+        onSuccess: async (response) => {
+            await queryClient.invalidateQueries({ queryKey: ['me'] });
+            setResult(response);
+        },
+    });
+
+    const usernameError = usernameProblem(username);
+    const usernameValid = usernameError === null;
+    const displayNameValid = displayName.trim().length > 0;
+    const credentialNicknameValid = credentialNickname.trim().length > 0;
+
+    // Only complain once there's something to complain about — an empty field on
+    // first paint isn't an error yet.
+    const usernameShowsError = username.length > 0 && !usernameValid;
+
+    function handleSubmit(event: FormEvent<HTMLFormElement>) {
+        event.preventDefault();
+        if (!usernameValid || !displayNameValid || !credentialNicknameValid) {
+            return;
+        }
+
+        setupMutation.mutate({
+            token,
+            username: username.trim(),
+            displayName: displayName.trim(),
+            credentialNickname: credentialNickname.trim(),
+            includeDemo,
+            onCeremonyStart: () => setCeremonyStarted(true),
+        });
+    }
+
+    // Result + acknowledgement path
+    // `!= null`, not `!== null`: an undefined response would slip past a
+    // null-only check and throw on `result.username` while rendering. Now that
+    // ledgerId/ledgerName are legitimately nullable (ADR-0088), the success
+    // screen has to be defensive about the payload rather than assume it.
+    if (result != null) {
+        return (
+            <main className="mx-auto max-w-xl px-6 py-12">
+                <BrandHeader />
+                <Panel>
+                    <PanelBody className="space-y-6">
+                        <header className="space-y-1">
+                            <h1 className="text-lg font-semibold tracking-tight">
+                                Account created
+                            </h1>
+                            <p className="text-sm text-text-muted">
+                                Signed in as{' '}
+                                <span className="font-medium text-text">
+                                    {result.username}
+                                </span>
+                                .{' '}
+                                {result.ledgerName !== null ? (
+                                    <>
+                                        Seeded the{' '}
+                                        <span className="font-medium text-text">
+                                            {result.ledgerName}
+                                        </span>{' '}
+                                        ledger.
+                                    </>
+                                ) : null}
+                            </p>
+                        </header>
+                        {/* Setup gates on ONE secret: the recovery codes, which are
+                            one-time and the only way back in without the
+                            authenticator. The master key follows on the welcome
+                            screen (ADR-0095) — it is re-viewable, costs three
+                            reconnections rather than any data, and can only be
+                            explained next to the backups advice it belongs with. */}
+                        {savedRecoveryCodes ? (
+                            <WelcomePanel
+                                keyBase64={result.masterKeyBase64}
+                                hasLedger={result.ledgerName !== null}
+                                onContinue={() => navigate({ to: '/' })}
+                            />
+                        ) : (
+                            <RecoveryCodes
+                                codes={result.recoveryCodes}
+                                onAcknowledge={() => setSavedRecoveryCodes(true)}
+                            />
+                        )}
+                    </PanelBody>
+                </Panel>
+            </main>
+        );
+    }
+
+    const setupError = setupMutation.error
+        ? errorMessage(setupMutation.error, 'Account setup failed.')
+        : null;
+    const submitDisabled =
+        setupMutation.isPending ||
+        !usernameValid ||
+        !displayNameValid ||
+        !credentialNicknameValid;
+
+    const buttonLabel = setupMutation.isPending
+        ? ceremonyStarted
+            ? 'Tap or insert your authenticator…'
+            : 'Creating account…'
+        : 'Create account';
+
+    return (
+        <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center px-6 py-12">
+            <BrandHeader />
+            <Panel>
+                <PanelBody className="space-y-5">
+                    <header className="space-y-1">
+                        <button
+                            type="button"
+                            onClick={onBack}
+                            disabled={setupMutation.isPending}
+                            className="text-[0.6875rem] text-text-muted hover:text-text disabled:opacity-50"
+                        >
+                            ← Back
+                        </button>
+                        <h1 className="text-lg font-semibold tracking-tight">
+                            Set up your account
+                        </h1>
+                        <p className="text-sm text-text-muted">
+                            Choose your username and register a passkey. This
+                            link works once.
+                        </p>
+                    </header>
+
+                    <form
+                        onSubmit={handleSubmit}
+                        className="space-y-4"
+                        noValidate
+                    >
+                        <div className="space-y-1.5">
+                            <FieldLabel htmlFor={usernameId}>Username</FieldLabel>
+                            <Input
+                                id={usernameId}
+                                type="text"
+                                autoComplete="username"
+                                autoCapitalize="off"
+                                autoCorrect="off"
+                                spellCheck={false}
+                                required
+                                disabled={setupMutation.isPending}
+                                value={username}
+                                onChange={(event) =>
+                                    setUsername(event.target.value)
+                                }
+                                aria-invalid={usernameShowsError ? true : undefined}
+                                aria-describedby={
+                                    usernameShowsError
+                                        ? `${usernameId}-error`
+                                        : `${usernameId}-hint`
+                                }
+                            />
+                            {usernameShowsError ? (
+                                // Say WHY, next to the field. "Create account" is
+                                // disabled until every field is valid, and an
+                                // unexplained disabled button is indistinguishable
+                                // from a broken one.
+                                <p
+                                    id={`${usernameId}-error`}
+                                    role="alert"
+                                    className="text-[0.6875rem] text-state-danger"
+                                >
+                                    {usernameError}
+                                </p>
+                            ) : (
+                                <p
+                                    id={`${usernameId}-hint`}
+                                    className="text-[0.6875rem] text-text-muted"
+                                >
+                                    An email address or a handle — whatever you'd
+                                    rather sign in with. Capitalisation doesn't
+                                    matter.
+                                </p>
+                            )}
+                        </div>
+
+                        <div className="space-y-1.5">
+                            <FieldLabel htmlFor={displayNameId}>Display name</FieldLabel>
+                            <Input
+                                id={displayNameId}
+                                type="text"
+                                autoComplete="name"
+                                required
+                                disabled={setupMutation.isPending}
+                                value={displayName}
+                                onChange={(event) =>
+                                    setDisplayName(event.target.value)
+                                }
+                                aria-describedby={`${displayNameId}-hint`}
+                            />
+                            <p
+                                id={`${displayNameId}-hint`}
+                                className="text-[0.6875rem] text-text-muted"
+                            >
+                                Shown in the app header. Any characters are
+                                fine.
+                            </p>
+                        </div>
+
+                        <div className="space-y-1.5">
+                            <FieldLabel htmlFor={credentialNicknameId}>
+                                Passkey label
+                            </FieldLabel>
+                            <Input
+                                id={credentialNicknameId}
+                                type="text"
+                                autoComplete="off"
+                                placeholder="e.g. MacBook Touch ID"
+                                required
+                                disabled={setupMutation.isPending}
+                                value={credentialNickname}
+                                onChange={(event) =>
+                                    setCredentialNickname(event.target.value)
+                                }
+                                aria-describedby={`${credentialNicknameId}-hint`}
+                            />
+                            <p
+                                id={`${credentialNicknameId}-hint`}
+                                className="text-[0.6875rem] text-text-muted"
+                            >
+                                A nickname for the credential you're enrolling.
+                                Helps if you add more devices later.
+                            </p>
+                        </div>
+
+                        <fieldset
+                            className="space-y-2"
+                            disabled={setupMutation.isPending}
+                        >
+                            <legend className="text-sm font-medium">
+                                Sample data
+                            </legend>
+                            <label className="flex items-start gap-2 text-sm">
+                                <input
+                                    type="checkbox"
+                                    checked={includeDemo}
+                                    onChange={(event) =>
+                                        setIncludeDemo(event.target.checked)
+                                    }
+                                    className="mt-1 size-icon-md accent-accent"
+                                />
+                                <span className="flex-1 space-y-1">
+                                    <span className="block">
+                                        Include a Demo ledger
+                                    </span>
+                                    <span className="block text-[0.6875rem] text-text-muted">
+                                        A worked example with accounts,
+                                        categories and transactions, to explore
+                                        before you commit your own data. You can
+                                        delete it any time.
+                                    </span>
+                                </span>
+                            </label>
+                            <p className="text-[0.6875rem] text-text-muted">
+                                Either way, you'll land on your ledger list next,
+                                where you can create a ledger or import one from
+                                Moneydance.
+                            </p>
+                        </fieldset>
+
+                        {setupError ? (
+                            <p
+                                role="alert"
+                                className="rounded border border-state-danger/40 bg-state-danger-soft px-3 py-2 text-sm text-state-danger"
+                            >
+                                {setupError}
+                            </p>
+                        ) : null}
+
+                        <Button
+                            type="submit"
+                            disabled={submitDisabled}
+                            className="w-full"
+                        >
+                            {buttonLabel}
+                        </Button>
+                    </form>
+                </PanelBody>
+            </Panel>
+        </main>
+    );
+}
+
+/**
+ * Restore branch of the bootstrap UI (ADR-0061). Upload an encrypted
+ * backup + passphrase; on accept, the server stages it and restarts, so
+ * we hand off to the "restoring…" screen which polls until the server is
+ * back and then sends the user to /login (the restored credentials, not
+ * a freshly-created one).
+ */
+function RestoreFlow({
+    token,
+    partSizeBytes,
+    onBack,
+}: {
+    token: string;
+    partSizeBytes: number;
+    onBack: () => void;
+}) {
+    const fileId = useId();
+    const passphraseId = useId();
+    const sourceKeyId = useId();
+    /** One whole backup, or the set of parts it was stored as off-host. */
+    const [source, setSource] = useState<File | { parts: File[] } | null>(null);
+    /** Why a picked set is not a restorable backup — by name, before uploading. */
+    const [pickError, setPickError] = useState<string | null>(null);
+    const [passphrase, setPassphrase] = useState('');
+    /** The master key of the install the backup came from (FU-074). Optional. */
+    const [sourceKey, setSourceKey] = useState('');
+    /** The attempt id of an accepted restore; set from the server's answer, or
+     *  resumed after a reload while the server was still restoring. */
+    const [restartAttempt, setRestartAttempt] = useState<string | null>(() => pendingRestoreAttempt());
+    const [sentBytes, setSentBytes] = useState<number | null>(null);
+
+    function pickFiles(files: FileList | null) {
+        setPickError(null);
+        const picked = files ? [...files] : [];
+        if (picked.length === 0) return setSource(null);
+        if (picked.length === 1 && parseBackupPartName(picked[0].name) === null)
+            return setSource(picked[0]);
+
+        const result = orderBackupParts(picked);
+        if ('error' in result) {
+            setSource(null);
+            setPickError(result.error);
+            return;
+        }
+        setSource(result);
+    }
+
+    const totalBytes =
+        source === null
+            ? 0
+            : source instanceof File
+              ? source.size
+              : source.parts.reduce((n, f) => n + f.size, 0);
+
+    const restoreMutation = useMutation({
+        mutationFn: async () => {
+            // Anything that will not fit in one request goes ahead in pieces,
+            // and the restore call then names them (ADR-0101). On a fresh
+            // install this is not an optimisation: a proxy that caps the body
+            // refuses the whole artifact outright, and there is no CLI left to
+            // fall back to.
+            const needsParts =
+                source !== null &&
+                ('parts' in source || source.size > partSizeBytes);
+
+            if (needsParts) {
+                setSentBytes(0);
+                try {
+                    await uploadSetupRestoreParts(token, source!, partSizeBytes, setSentBytes);
+                } finally {
+                    setSentBytes(null);
+                }
+                return restoreFromBackup(token, { uploadedParts: true }, passphrase, sourceKey);
+            }
+            return restoreFromBackup(token, source as File, passphrase, sourceKey);
+        },
+        onSuccess: (accepted) => {
+            rememberPendingRestore(accepted.attemptId);
+            setRestartAttempt(accepted.attemptId);
+        },
+    });
+
+    if (restartAttempt !== null) {
+        return (
+            <RestoringScreen
+                attemptId={restartAttempt}
+                onBack={() => {
+                    setRestartAttempt(null);
+                    restoreMutation.reset();
+                }}
+            />
+        );
+    }
+
+    const restoreError = restoreMutation.error
+        ? errorMessage(restoreMutation.error, 'Restore failed.')
+        : null;
+    const progress =
+        sentBytes === null
+            ? null
+            : `Uploading — ${formatBytes(sentBytes)} of ${formatBytes(totalBytes)} sent.`;
+    const submitDisabled =
+        restoreMutation.isPending || source === null || passphrase.length === 0;
+
+    return (
+        <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center px-6 py-12">
+            <BrandHeader />
+            <Panel>
+                <PanelBody className="space-y-5">
+                    <header className="space-y-1">
+                        <button
+                            type="button"
+                            onClick={onBack}
+                            disabled={restoreMutation.isPending}
+                            className="text-[0.6875rem] text-text-muted hover:text-text disabled:opacity-50"
+                        >
+                            ← Back
+                        </button>
+                        <h1 className="text-lg font-semibold tracking-tight">
+                            Restore from a backup
+                        </h1>
+                        <p className="text-sm text-text-muted">
+                            Replaces this database with the backup, then restarts.
+                            Sign in afterwards with the credentials from the
+                            backup.
+                        </p>
+                    </header>
+
+                    <form
+                        onSubmit={(event) => {
+                            event.preventDefault();
+                            if (!submitDisabled) restoreMutation.mutate();
+                        }}
+                        className="space-y-4"
+                        noValidate
+                    >
+                        <div className="space-y-1.5">
+                            <FieldLabel htmlFor={fileId}>Backup file</FieldLabel>
+                            {/* No accept filter: a part's extension is
+                                .003-of-005, which cannot be enumerated, and a
+                                filter that hides the files an operator arrived
+                                with is worse than none. */}
+                            <input
+                                id={fileId}
+                                type="file"
+                                multiple
+                                disabled={restoreMutation.isPending}
+                                onChange={(event) => pickFiles(event.target.files)}
+                                className="block w-full text-sm text-text file:mr-3 file:rounded file:border file:border-border file:bg-surface-muted file:px-3 file:py-1.5 file:text-sm"
+                            />
+                            {source !== null && 'parts' in source ? (
+                                <p className="text-[0.6875rem] text-text-muted">
+                                    {source.parts.length} parts · {formatBytes(totalBytes)},
+                                    sent one at a time.
+                                </p>
+                            ) : null}
+                            {source instanceof File && source.size > partSizeBytes ? (
+                                <p className="text-[0.6875rem] text-text-muted">
+                                    {formatBytes(source.size)} — sent in{' '}
+                                    {backupPartCount(source.size, partSizeBytes)} parts,
+                                    so a proxy that caps request size does not refuse it.
+                                </p>
+                            ) : null}
+                            {pickError ? (
+                                <p role="alert" className="text-[0.6875rem] text-state-danger">
+                                    {pickError}
+                                </p>
+                            ) : null}
+                            <p className="text-[0.6875rem] text-text-muted">
+                                A large backup is stored as several
+                                <code className="mx-1">.cofferbak.001-of-003</code>
+                                files. Select all of them together.
+                            </p>
+                        </div>
+
+                        <div className="space-y-1.5">
+                            <FieldLabel htmlFor={passphraseId}>Passphrase</FieldLabel>
+                            <Input
+                                id={passphraseId}
+                                type="password"
+                                autoComplete="off"
+                                required
+                                disabled={restoreMutation.isPending}
+                                value={passphrase}
+                                onChange={(event) => setPassphrase(event.target.value)}
+                            />
+                            <p className="text-[0.6875rem] text-text-muted">
+                                The passphrase the backup was encrypted with. It's
+                                verified before anything is changed.
+                            </p>
+                        </div>
+
+                        {/* FU-074. This screen is the disaster-recovery path: the
+                            install the backup came from is gone, and this one minted a
+                            new key. Without the old key, bank feeds, the stored backup
+                            passphrase, Google Drive and notification targets are cleared
+                            on the first boot. operations.md tells the operator to paste
+                            it here, so here is where it goes. */}
+                        <div className="space-y-1.5">
+                            <FieldLabel htmlFor={sourceKeyId}>
+                                Source install’s master key (optional)
+                            </FieldLabel>
+                            <Input
+                                id={sourceKeyId}
+                                value={sourceKey}
+                                disabled={restoreMutation.isPending}
+                                onChange={(event) => setSourceKey(event.target.value)}
+                                placeholder="44-character base64, ending in ="
+                                autoComplete="off"
+                                spellCheck={false}
+                                className="font-mono text-xs"
+                            />
+                            <p className="text-[0.6875rem] text-text-muted">
+                                The key of the install this backup came from. With it, its
+                                bank feeds, stored backup passphrase, Google Drive and
+                                notification targets carry over. Without it, your data and
+                                sign-ins still restore, and those are cleared for you to
+                                set up again. It's checked against the backup before
+                                anything is changed.
+                            </p>
+                        </div>
+
+                        {progress ? (
+                            <p role="status" className="text-[0.6875rem] text-text-muted">
+                                {progress} Nothing is replaced until every part has
+                                arrived.
+                            </p>
+                        ) : null}
+
+                        {restoreError ? (
+                            <p
+                                role="alert"
+                                className="rounded border border-state-danger/40 bg-state-danger-soft px-3 py-2 text-sm text-state-danger"
+                            >
+                                {restoreError}
+                            </p>
+                        ) : null}
+
+                        <Button type="submit" disabled={submitDisabled} className="w-full">
+                            {restoreMutation.isPending ? 'Uploading…' : 'Restore'}
+                        </Button>
+                    </form>
+                </PanelBody>
+            </Panel>
+        </main>
+    );
+}
+
+/**
+ * Shown after the server accepts a restore: it builds the backup as a new
+ * database, swaps it in and restarts. Reads back what the boot recorded for this
+ * attempt — applied, failed (nothing changed), or unconfirmed — rather than
+ * treating "the server answers again" as success, which it also does after a
+ * restore that failed.
+ */
+function RestoringScreen({ attemptId, onBack }: { attemptId: string; onBack: () => void }) {
+    const navigate = useNavigate();
+    const [state, setState] = useState<
+        | { phase: 'waiting' }
+        | { phase: 'applied' }
+        | { phase: 'failed'; error: string }
+        | { phase: 'unconfirmed'; detail: string | null }
+        | { phase: 'timedOut' }
+    >({ phase: 'waiting' });
+
+    useEffect(() => {
+        let cancelled = false;
+        waitForRestoreOutcome(attemptId)
+            .then((outcome) => {
+                if (cancelled) return;
+                forgetPendingRestore();
+                if (outcome === null || outcome.outcome === 'unknown')
+                    setState({ phase: 'unconfirmed', detail: outcome?.error ?? null });
+                else if (outcome.outcome === 'failed')
+                    setState({ phase: 'failed', error: outcome.error ?? 'The server did not say why.' });
+                else setState({ phase: 'applied' });
+            })
+            .catch(() => {
+                if (!cancelled) setState({ phase: 'timedOut' });
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [attemptId]);
+
+    const title =
+        state.phase === 'applied'
+            ? 'Restore complete'
+            : state.phase === 'failed'
+              ? 'Restore failed — nothing was changed'
+              : state.phase === 'unconfirmed'
+                ? 'Could not confirm the restore'
+                : state.phase === 'timedOut'
+                  ? 'Still restoring…'
+                  : 'Restoring…';
+
+    return (
+        <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center px-6 py-12">
+            <BrandHeader />
+            <Panel>
+                <PanelBody className="space-y-3">
+                    <h1 className="text-lg font-semibold tracking-tight">{title}</h1>
+                    {state.phase === 'waiting' ? (
+                        <p className="text-sm text-text-muted">
+                            Building the backup as a new database and restarting. This page will
+                            say what happened when it is done.
+                        </p>
+                    ) : null}
+                    {state.phase === 'timedOut' ? (
+                        <p className="text-sm text-text-muted">
+                            The restore is taking longer than expected. It may still be running —
+                            reload this page in a moment.
+                        </p>
+                    ) : null}
+                    {state.phase === 'applied' ? (
+                        <>
+                            <p className="text-sm text-text-muted">
+                                Sign in with the credentials from the backup. The restore
+                                signed everyone out: AI connectors have to be connected
+                                again, earlier MCP tokens no longer work, and invites not
+                                yet accepted were cancelled.
+                            </p>
+                            <Button type="button" onClick={() => navigate({ to: '/login' })} className="w-full">
+                                Go to sign in
+                            </Button>
+                        </>
+                    ) : null}
+                    {state.phase === 'failed' ? (
+                        <>
+                            <p className="text-sm text-text-muted">
+                                The install is exactly as it was before. The server said:
+                            </p>
+                            <p className="break-words font-mono text-xs text-text-muted">{state.error}</p>
+                            <Button type="button" variant="secondary" onClick={onBack} className="w-full">
+                                Back
+                            </Button>
+                        </>
+                    ) : null}
+                    {state.phase === 'unconfirmed' ? (
+                        <>
+                            <p className="text-sm text-text-muted">
+                                {state.detail
+                                    ? 'The server could not tell whether this restore was applied. Do not assume either way.'
+                                    : 'The server is back, but it did not record what happened to this restore. Do not assume it worked.'}{' '}
+                                On the server, check{' '}
+                                <code>docker compose logs api | grep -i &quot;bootstrap restore&quot;</code>.
+                            </p>
+                            {state.detail ? (
+                                <p className="break-words font-mono text-xs text-text-muted">{state.detail}</p>
+                            ) : null}
+                        </>
+                    ) : null}
+                </PanelBody>
+            </Panel>
+        </main>
+    );
+}
+

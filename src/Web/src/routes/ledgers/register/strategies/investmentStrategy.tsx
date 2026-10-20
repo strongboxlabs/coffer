@@ -1,0 +1,307 @@
+import type { InvestmentRow } from '@/lib/types';
+import { Chip } from '@/components/ui/Chip';
+import { categoryChipVariant } from '@/lib/categoryChip';
+import { displayAccountPath } from '@/lib/accountPath';
+import { ProvenanceIcon } from '@/components/register/ProvenanceIcon';
+import { TagLine } from '@/components/tags/TagLine';
+import { formatShares, formatPrice, formatCurrency } from '@/lib/money';
+import { taxDateSubLabel } from '../bank/columns';
+
+/**
+ * Investment-register cell renderers (slice A1.c / A1.d). Consumed
+ * directly by <c>InvestmentRow</c> (the investment register renders
+ * its own row component rather than going through a shared dispatch).
+ *
+ * Slot layout (9-column grid — see `../investment/columns.ts`):
+ *   1 status     2 checkbox    3 date + tax date   4 Action chip + check#
+ *   5 Description (payee + memo)
+ *   6 Category | Transfer (line 1)  ·  Fee category (line 2)  ·  Tags (line 3)
+ *   7 Security · Shares @ Price            ← new vs bank
+ *   8 Amount + fee subtitle
+ *   9 Cash balance
+ *
+ * Multi-posting headers (Buy+Fee, DivReinvest, BuyXfr / SellXfr /
+ * DivXfr, Misc with fee) get aggregated to ONE row upstream in the
+ * register's displayRows pipeline — these renderers render the
+ * aggregated facts. Slot 6 splits the line-1 "category" leg from
+ * the line-1 "transfer" leg so DivXfr-style rows can show both
+ * sides side-by-side (income category | transfer destination); the
+ * fee leg always lives on line 2.
+ */
+
+const ACTION_LABEL: Record<string, string> = {
+    buy: 'Buy',
+    buyx: 'BuyXfr',
+    sell: 'Sell',
+    sellx: 'SellXfr',
+    dividend_cash: 'Div',
+    dividend_reinvest: 'DivReinvest',
+    divx: 'DivXfr',
+    transfer: 'Xfr',
+    misc: 'Misc',
+};
+
+function formatAction(action: string): string {
+    return ACTION_LABEL[action] ?? action;
+}
+
+export const investmentStrategy = {
+    renderDateSubLabel(txn: InvestmentRow) {
+        // Tax date, same as the bank register: line 2 of the date cell belongs to
+        // the date. MD's investment-specific check_number markers (Auto / EXfr /
+        // Xfr / numeric) used to live here and now hang off the Action chip, where
+        // they read as what they are — a qualifier on the action, not on the date.
+        const label = taxDateSubLabel(txn);
+        return label ? `tax ${label}` : null;
+    },
+
+    renderActionSubLabel(txn: InvestmentRow) {
+        // MD's investment check_number markers: Auto / EXfr / Xfr, or a plain
+        // cheque number. Displaced from the date cell by the tax date.
+        return txn.checkNumber ?? null;
+    },
+
+    renderSlot4(txn: InvestmentRow) {
+        // Mig 108 / ADR-0036: read `derivedAction`, not
+        // `investmentAction`. For originating-side groups the
+        // aggregator already collapsed legs into one row with
+        // header.action carried through (derivedAction equals
+        // investmentAction in that case). For per-posting TARGET
+        // rows (paycheck splits, manual transfers landing in a
+        // brokerage cash sleeve) `investmentAction` is NULL but
+        // `derivedAction` is `'Xfr'` so the chip renders correctly.
+        const action = txn.derivedAction ?? txn.investmentAction;
+        if (action) {
+            return (
+                <Chip variant="default" className="font-sans">
+                    {formatAction(action)}
+                </Chip>
+            );
+        }
+        // ADR-0031 Phase 3d.2: orchestrator-written classifier hint
+        // on a sync-imported row that the user hasn't upgraded yet.
+        // Render a distinct chip so the row is visibly "review me to
+        // turn this into a real investment transaction." On editor
+        // open the action picker pre-fills from this hint.
+        if (txn.ingestActionHint) {
+            return (
+                <Chip
+                    variant="warn"
+                    className="font-sans"
+                    title={`Detected ${formatAction(txn.ingestActionHint)} from sync · double-click to review + confirm`}
+                >
+                    {'↗ '}{formatAction(txn.ingestActionHint)}
+                </Chip>
+            );
+        }
+        return '';
+    },
+
+    renderSlot5(txn: InvestmentRow) {
+        // Description = payee (bold) + memo (subtitle). Same shape
+        // as bank rows; investment txns rarely populate both
+        // distinctly but when they do (e.g. user-added context on
+        // an imported MD dividend) both lines show.
+        // Mig 107: leading provenance icon (online / file / manual +
+        // merge-winner overlay), matching the bank register.
+        return (
+            <>
+                <span className="flex items-center gap-1.5 truncate font-medium">
+                    <ProvenanceIcon
+                        origin={txn.origin}
+                        providerKey={txn.providerKey}
+                        isMergeWinner={txn.isMergeWinner}
+                    />
+                    <span className="truncate">
+                        {txn.payee ?? <span className="text-text-subtle">—</span>}
+                    </span>
+                </span>
+                {txn.memo ? (
+                    <span className="block truncate text-[0.6875rem] text-text-muted">
+                        {txn.memo}
+                    </span>
+                ) : null}
+            </>
+        );
+    },
+
+    renderSlot6(
+        txn: InvestmentRow,
+        accountPaths?: ReadonlyMap<string, string>,
+    ) {
+        // Slot 6 — up to three chips across two visual lines:
+        //
+        //   Line 1: category chip + transfer chip, side-by-side. Both
+        //           chips render only when populated; DivXfr-style rows
+        //           with income + transfer destination show BOTH, solo
+        //           Div / Xfr / Misc-exp show ONE, solo Buy / Sell show
+        //           nothing (Holdings sibling is stripped upstream).
+        //   Line 2: fee chip — fee posting's counterparty (typically
+        //           "Investment Fees"). Only rendered when present.
+        //
+        // No em-dash placeholders: an empty slot stays visually empty.
+        // The chip variant (color) + the Action column already tell the
+        // user what each chip means, so a positional placeholder adds
+        // noise without information. When the entire cell would be
+        // empty (solo Buy/Sell, Holdings stripped), it stays empty.
+        //
+        // The investment aggregator (slice A1.d) classifies each leg's
+        // role and stamps these onto the synthesized row:
+        //   - postingRole='income' OR ('fee' AND legIndex=0)
+        //         → categoryAccountName
+        //   - postingRole='transfer' → transferAccountName
+        //   - postingRole='fee' AND legIndex>0
+        //         → feeCategoryName + feeAmount
+        const hasCategory = !!txn.categoryAccountName;
+        const hasTransfer = !!txn.transferAccountName;
+        const hasFee = !!txn.feeCategoryName;
+        // Tags are header-level (ADR-0009) and apply to every action, so they
+        // can be the ONLY thing in this cell — a tagged plain buy has no
+        // category, transfer or fee chip. They count toward the early-out.
+        const hasTags = txn.tags.length > 0;
+        if (!hasCategory && !hasTransfer && !hasFee && !hasTags) return null;
+
+        const categoryVariant = hasCategory
+            ? categoryChipVariant(
+                  txn.categoryAccountName!,
+                  txn.categoryAccountType ?? null,
+                  txn.categoryAccountId ?? null,
+              )
+            : 'default';
+        const transferVariant = hasTransfer
+            ? categoryChipVariant(
+                  txn.transferAccountName!,
+                  txn.transferAccountType ?? null,
+                  txn.transferAccountId ?? null,
+              )
+            : 'default';
+        const feeVariant = hasFee
+            ? categoryChipVariant(txn.feeCategoryName!, 'category', null)
+            : 'default';
+
+        return (
+            <>
+                {(hasCategory || hasTransfer) ? (
+                    <span className="flex min-w-0 items-center gap-2">
+                        {hasCategory ? (
+                            <Chip
+                                variant={categoryVariant}
+                                className="min-w-0 max-w-full truncate"
+                                title={displayAccountPath(accountPaths, txn.categoryAccountId, txn.categoryAccountName) ?? undefined}
+                            >
+                                <span className="truncate">
+                                    {displayAccountPath(accountPaths, txn.categoryAccountId, txn.categoryAccountName)}
+                                </span>
+                            </Chip>
+                        ) : null}
+                        {hasTransfer ? (
+                            <Chip
+                                variant={transferVariant}
+                                className="min-w-0 max-w-full truncate"
+                                title={displayAccountPath(accountPaths, txn.transferAccountId, txn.transferAccountName) ?? undefined}
+                            >
+                                <span className="truncate">
+                                    {displayAccountPath(accountPaths, txn.transferAccountId, txn.transferAccountName)}
+                                </span>
+                            </Chip>
+                        ) : null}
+                    </span>
+                ) : null}
+                {hasFee ? (
+                    <Chip
+                        variant={feeVariant}
+                        className="max-w-full truncate"
+                        title={displayAccountPath(accountPaths, txn.feeCategoryId, txn.feeCategoryName) ?? undefined}
+                    >
+                        <span className="truncate">{displayAccountPath(accountPaths, txn.feeCategoryId, txn.feeCategoryName)}</span>
+                    </Chip>
+                ) : null}
+                {/* Tags wrap beneath the account chips, in the same cell and the
+                    same order as the bank register's category · tags column —
+                    one row of chips per header, since the aggregator collapses
+                    an investment event's legs into a single row. */}
+                <TagLine tags={txn.tags} inset />
+            </>
+        );
+    },
+
+    renderSlot7(txn: InvestmentRow) {
+        // Security cell. Line 1: `TICKER · Name` (or just Name when
+        // ticker is null). Line 2: `N sh @ $X.XX` when the row
+        // carries qty + price. Empty cell for actions with no
+        // security (Xfr / Misc).
+        if (!txn.securityTicker && !txn.securityName) return null;
+
+        const label = txn.securityTicker
+            ? `${txn.securityTicker} · ${txn.securityName ?? ''}`.trim()
+            : (txn.securityName ?? '');
+
+        const hasQtyPrice =
+            txn.quantity !== null &&
+            txn.quantity !== 0 &&
+            txn.unitPrice !== null &&
+            txn.unitPrice !== 0;
+
+        return (
+            <>
+                <span className="block truncate font-medium" title={label}>
+                    {label}
+                </span>
+                {hasQtyPrice ? (
+                    <span className="block truncate text-[0.6875rem] text-text-muted">
+                        {formatShares(Math.abs(txn.quantity!))} sh @ {formatPrice(txn.unitPrice!, 'USD')}
+                    </span>
+                ) : null}
+            </>
+        );
+    },
+
+    renderAmountSubtitle(txn: InvestmentRow) {
+        // Two possible subtitles share this one line, and only one can win.
+        //
+        // FEE. The investmentAggregator (slice A1.d) sums the fee-leg amounts
+        // across all postings under one header and stamps the positive total
+        // onto the synthesized row's `feeAmount`.
+        //
+        // SETTLED. `amount` is ADR-0028's net of this account's legs, which is
+        // structurally ZERO for a cash-neutral event — a reinvestment, an
+        // in-kind transfer, a sale a fee consumes. A large share of a real
+        // brokerage register's entries are in that class, and every one of them
+        // rendered a zero amount with nothing to say how big the event was, while the editor behind the
+        // same row showed the trade value (ADR-0073 D1 calls that the Amount;
+        // ADR-0028 calls the net the Amount — the two ADRs disagree, and this
+        // line is where a reader met the consequence).
+        //
+        // Shown only when the Amount cell is uninformative, i.e. exactly zero.
+        // On a row whose net is real, the net IS the answer and a second
+        // figure beneath it is noise.
+        const fee = txn.feeAmount ?? null;
+        const settled = txn.settledAmount ?? null;
+
+        // The fee wins the line when both exist, because it is the one the
+        // Amount does not already imply — and on a fee-consumed sale the two
+        // are the SAME NUMBER by construction (proceeds exactly cancelled by
+        // the fee), so showing both would print it twice under a zero. A real
+        // ledger has that shape across sell, sellx AND buy; keying the suppression on
+        // the VALUES rather than on the action is what catches all three,
+        // instead of the sells someone happened to notice.
+        const settledDuplicatesFee =
+            fee !== null && settled !== null && Math.abs(settled - fee) < 0.005;
+
+        if (fee !== null) {
+            return (
+                <span className="block text-right text-[0.6875rem] text-text-muted">
+                    fee {formatCurrency(fee, 'USD')}
+                </span>
+            );
+        }
+        if (txn.amount === 0 && settled !== null && settled !== 0 && !settledDuplicatesFee) {
+            return (
+                <span className="block text-right text-[0.6875rem] text-text-muted">
+                    settled {formatCurrency(settled, 'USD')}
+                </span>
+            );
+        }
+        return null;
+    },
+};

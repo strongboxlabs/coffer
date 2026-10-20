@@ -1,0 +1,32 @@
+# Build context hygiene — keep the image build fast + reproducible.
+# Host build outputs / deps are rebuilt inside the stages.
+**/bin
+**/obj
+**/node_modules
+src/Web/dist
+.git
+.github
+.vs
+.vscode
+tests
+docs
+scripts
+# Exclude data/ from the build context, EXCEPT the sample dataset, which the API
+# embeds for the setup form's "Include a Demo ledger" box (ADR-0088). `data/*`
+# ignores data's contents while leaving the dir itself, so the negation can
+# re-include samples.
+data/*
+!data/samples
+*.user
+**/.env
+.env
+# Secrets a checkout can hold (FU-094). None reaches the published image today, since
+# its stages copy only what they name; excluded here so no later COPY can carry them,
+# and so they never leave this machine in a build context sent to a remote builder.
+# The role passwords:
+secrets/
+# .env's backups (install.sh's .env.bak and .env.pre-secrets), which hold its values:
+.env.*
+**/.env.*
+# A natively run API's own state: the dev master key, OAuth keys, backups, staging:
+src/Api/data/

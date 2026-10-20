@@ -1,0 +1,54 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>Coffer.Importer.Moneydance.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="10.1.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.10.1" />
+    <PackageReference Include="Testcontainers.PostgreSql" Version="4.15.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.0" />
+    <!-- Pin the transitive SSH.NET to the patched version, same as Api.Tests does and
+         for the same reason: Testcontainers.PostgreSql 4.13.0 (the latest) resolves
+         2025.1.0, which GHSA-q939-rpr3-3284 flags high — ScpClient's recursive download
+         doesn't validate remote-supplied filenames. Nothing here uses ScpClient; it
+         arrives through Testcontainers' port-forwarding path. Audit warnings are errors,
+         so carrying it fails the build.
+
+         This project was missed when Api.Tests was pinned, and a local build did NOT
+         catch it: NuGet audits at RESTORE time, and this project's restore was cached,
+         so no fresh audit ran. Public CI restores clean and failed every shard. If you
+         touch either pin, verify with a forced restore rather than an incremental build.
+         Remove both once Testcontainers' own floor moves past it. -->
+    <PackageReference Include="SSH.NET" Version="2026.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      The boundary magnitudes are ONE source of truth, and the two test assemblies
+      are independent, so the file is linked rather than copied. Duplicating the
+      edge values is how they drift: a case added for the API suites would silently
+      not apply here, and the importer is precisely where a money figure ENTERS the
+      system. Boundary.cs depends only on xunit, so it links cleanly.
+    -->
+    <Compile Include="..\Api.Tests\Integration\Infra\Boundary.cs"
+             Link="Infra\Boundary.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Importer.Moneydance\Importer.Moneydance.csproj" />
+    <ProjectReference Include="..\..\src\Importer.Moneydance.Cli\Importer.Moneydance.Cli.csproj" />
+  </ItemGroup>
+
+</Project>

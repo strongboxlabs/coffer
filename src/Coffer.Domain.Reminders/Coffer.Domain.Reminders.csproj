@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>Coffer.Domain.Reminders</RootNamespace>
+    <AssemblyName>Coffer.Domain.Reminders</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- RFC-5545 RRULE expansion (month-end clamp, nth-weekday, UNTIL/COUNT).
+         Lives here so BOTH the API and the Moneydance importer compute
+         occurrences + the next-due cursor through one implementation. -->
+    <PackageReference Include="Ical.Net" Version="5.2.3" />
+  </ItemGroup>
+
+</Project>

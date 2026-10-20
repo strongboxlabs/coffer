@@ -1,0 +1,335 @@
+services:
+  postgres:
+    image: postgres:16
+    # Prefixed so a second install on the same Docker engine doesn't collide.
+    # Compose already scopes NETWORKS and VOLUMES by project name, but a pinned
+    # container_name is global: a throwaway restore drill, or a dev stack beside a
+    # real install, failed with "container name is already in use" while every other
+    # resource was cleanly separated. Defaults to the old value, so existing installs
+    # and the scripts that default to `coffer-postgres` are unaffected.
+    container_name: ${COFFER_CONTAINER_PREFIX:-coffer}-postgres
+    environment:
+      # Superuser — the docker-entrypoint creates this role on first
+      # container start. The init script under db/init mints the two
+      # application roles (coffer_service, coffer_app).
+      #
+      # All three passwords come from FILES, not environment variables. Same
+      # reasoning as the master key (ADR-0092 D1): an env var is readable via
+      # `docker inspect`, /proc/<pid>/environ, any child process's environment
+      # and crash dumps, and these are the credentials every query authenticates
+      # with. See `secrets:` at the bottom of this file.
+      #
+      # Only the *_FILE form is set. The image's file_env treats POSTGRES_PASSWORD
+      # and POSTGRES_PASSWORD_FILE as mutually exclusive and errors if both are
+      # present, so there is deliberately no env fallback here — a missing secret
+      # file fails the `up` loudly instead.
+      POSTGRES_USER: ${POSTGRES_USER:-coffer}
+      POSTGRES_DB: ${POSTGRES_DB:-coffer}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      COFFER_SERVICE_PASSWORD_FILE: /run/secrets/coffer_service_password
+      COFFER_APP_PASSWORD_FILE: /run/secrets/coffer_app_password
+      # Password auth on EVERY path, including the container's own loopback and
+      # unix socket. initdb's defaults are `trust` for local + 127.0.0.1 + ::1,
+      # which the entrypoint leaves alone (it only appends the `host all all
+      # all` line from POSTGRES_HOST_AUTH_METHOD). Trust there is not reachable
+      # from outside the container, but it means anything running inside it is
+      # superuser with no credential — a standing bypass of the RLS boundary
+      # the whole authorization model rests on (coffer_app NOBYPASSRLS vs
+      # coffer_service BYPASSRLS), and it would silently become a real hole if
+      # this ever moved to network_mode: host or a bare VM.
+      #
+      # This is the image's supported lever, applied by initdb at first boot.
+      # The entrypoint exports PGPASSWORD for the db/init phase precisely so
+      # that auth-required `local` works, so role creation is unaffected.
+      #
+      # APPLIES TO FRESH INSTALLS ONLY: initdb runs once. An install created
+      # before this landed keeps trust in its PGDATA — see
+      # scripts/harden-pg-hba.sh for the one-time fix.
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---auth-local=scram-sha-256 --auth-host=scram-sha-256}
+    # Log every connection and disconnection. With scram everywhere (above) plus
+    # RLS as the authorization boundary, the database is the last line of defence,
+    # and until now a successful login left no trace at all — there was no way to
+    # answer "who connected, as which role, from where?" after the fact. The pair
+    # also makes a credential-stuffing attempt against the published loopback port
+    # visible, and records the session duration a disconnection closes.
+    #
+    # Passed as server flags rather than a mounted postgresql.conf so the image's
+    # own config keeps working; the entrypoint execs whatever `command` supplies.
+    # NOTE: `on` is the boolean form, which is what postgres:16 takes. PG 18 turned
+    # log_connections into a list of aspects but still accepts the boolean as an
+    # alias for all of them, so this survives a major bump.
+    command:
+      - postgres
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+    # No published port, deliberately. The app never needs one — the API reaches
+    # Postgres as `postgres` over the compose network — and an unpublished port is a
+    # listening socket that cannot be misconfigured, plus one less thing for a second
+    # install on the same host to collide with.
+    #
+    # For ad-hoc SQL, exec into it rather than publishing:
+    #   docker compose exec postgres psql -U coffer -d coffer
+    #
+    # A GUI client (pgAdmin, DataGrip) cannot reach into a container and does need a
+    # host port. Add docker-compose.dev.yml to your COMPOSE_FILE (see .env.example) or
+    # write the three-line ports stanza into a docker-compose.override.yml. Bind it to
+    # 127.0.0.1: on 0.0.0.0 this put the database on every interface of the host,
+    # offering all three roles to anything that could route to it.
+    secrets:
+      - postgres_password
+      - coffer_service_password
+      - coffer_app_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Init scripts run once on a fresh data directory and mint the
+      # two application roles. The schema itself is owned by the API's
+      # DbUp runner from PR 3.8 onward (Phase 3 transition flagged in
+      # docs/operations.md) — `db/migrations` is no longer mounted
+      # here.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    # No setuid/setgid binary inside this container can raise its privileges,
+    # for this process or any child. Cheap, and it closes the usual escalation
+    # step after a compromise of the postgres user.
+    security_opt:
+      - no-new-privileges:true
+    # Drop every capability, then add back exactly the five the image's
+    # entrypoint needs. It starts as root to fix ownership on PGDATA and the
+    # socket dir, then re-execs as `postgres` via gosu — so it needs CHOWN,
+    # DAC_OVERRIDE and FOWNER for the former and SETUID/SETGID for the latter.
+    #
+    # MEASURED, not guessed: with a bare `cap_drop: [ALL]` a FRESH install dies
+    # during init with `chmod: changing permissions of '/var/lib/postgresql/data':
+    # Operation not permitted` followed by `error: failed switching to 'postgres':
+    # operation not permitted` — exit 1, no database. With the five added back,
+    # initdb completes, the server answers queries and `ps` confirms the postmaster
+    # is running as `postgres`, so the gosu privilege drop still happens. What's
+    # gone is everything else: NET_ADMIN, SYS_ADMIN, SYS_PTRACE, MKNOD, NET_RAW…
+    #
+    # If you ever need to diagnose inside this container with a tool that wants a
+    # capability (strace/gdb need SYS_PTRACE), add it here temporarily rather than
+    # deleting the stanza.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+    # Bound the database's memory the way the API's is bounded. Read the tradeoff
+    # before lowering it: unlike .NET (which reads the cgroup limit and collects
+    # harder as it approaches), Postgres does not adapt. Hitting this limit means
+    # the kernel OOM-kills a backend, and the postmaster treats a SIGKILLed backend
+    # as a crash — it restarts the whole cluster and runs crash recovery. So this
+    # is a runaway backstop, not a tuning knob: 1g is comfortable for shared_buffers
+    # (128MB) + maintenance_work_mem during a restore + this install's handful of
+    # connections. If you lower it, lower shared_buffers and work_mem to match.
+    mem_limit: ${POSTGRES_MEM_LIMIT:-1g}
+    # Rotated: Docker's default keeps a container's whole log for as long as the
+    # container exists (FU-083). An error here can quote the row it failed on.
+    logging: &rotated-log
+      # Named, not left to the daemon's default: these options are json-file's, and a
+      # host defaulting to another driver would refuse to start the container.
+      driver: json-file
+      options:
+        max-size: ${COFFER_LOG_MAX_SIZE:-10m}
+        max-file: "${COFFER_LOG_MAX_FILE:-5}"
+
+  # Single-container API + SPA (ADR-0059). Builds the image from the repo
+  # Dockerfile; serves /api and the React bundle same-origin on :8080. Runs
+  # DbUp migrations at startup, so it only waits for Postgres to be healthy.
+  api:
+    # Published image (ADR-0060 DR): a recovery host `docker compose pull`s this
+    # from ghcr instead of building (needs `docker login ghcr.io` — private
+    # package). Local `up --build` tags the built image with this same name, so
+    # dev and published stay consistent. Pin a version on a recovery host via
+    # COFFER_IMAGE_TAG (default: latest).
+    # REQUIRED, with no default on purpose. This used to fall back to the public
+    # package, which meant a private install silently pulled from a registry that
+    # wasn't its own unless someone remembered to override it — and the release
+    # workflow publishes to ghcr.io/<the building repo's owner>/coffer, so the
+    # fallback was wrong for every fork. There is no default that is right for
+    # everyone, so there is no default: scripts/install.sh derives this from the
+    # repo it fetched its config from and writes it into .env, so the image and
+    # the config can't come from different places.
+    # Pinned by digest when .env carries the one the release recorded (FU-094): the
+    # tag is then a label, and the digest is what is pulled and run.
+    image: ${COFFER_IMAGE:?COFFER_IMAGE must be set in .env (e.g. ghcr.io/<owner>/coffer) — scripts/install.sh writes it for you}:${COFFER_IMAGE_TAG:-latest}${COFFER_IMAGE_DIGEST:+@${COFFER_IMAGE_DIGEST}}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # .git is dockerignored, so the build stage is not a repo and cannot
+      # work its own commit out. CI passes these from the tagged commit; for a
+      # local build scripts/dev-up-docker.sh exports them from the host. Unset
+      # is fine and means exactly what it says — the image reports "nogit"
+      # rather than pretending to know.
+      args:
+        SOURCE_COMMIT_SHA: ${SOURCE_COMMIT_SHA:-}
+        SOURCE_COMMIT_COUNT: ${SOURCE_COMMIT_COUNT:-}
+        SOURCE_COMMIT_DATE: ${SOURCE_COMMIT_DATE:-}
+    container_name: ${COFFER_CONTAINER_PREFIX:-coffer}-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Production}
+      # coffer_app (NOBYPASSRLS) at request time; coffer_service (BYPASSRLS) for
+      # migrations + pre-auth. Host is the compose service name.
+      # No Password= in either string — it is injected at startup from the
+      # secret file below (DbPasswordResolver). What stays here is the
+      # connection TOPOLOGY, which is what you want to be able to read when
+      # diagnosing a refused connection, and which is not secret.
+      COFFER_API__ConnectionString: "Host=postgres;Port=5432;Database=${POSTGRES_DB:-coffer};Username=coffer_app"
+      COFFER_API__ServiceConnectionString: "Host=postgres;Port=5432;Database=${POSTGRES_DB:-coffer};Username=coffer_service"
+      COFFER_API__AppPasswordFile: /run/secrets/coffer_app_password
+      COFFER_API__ServicePasswordFile: /run/secrets/coffer_service_password
+      # Master KEK. The key lives in a FILE (ADR-0092 D1), on the coffer_keys
+      # volume below — its own, not coffer_data, so a copy of the volume that holds
+      # every backup does not carry the key too (FU-077). An install that kept it at
+      # data/master.key has it moved across on the first start with this file.
+      # COFFER_MASTER_KEY_PATH overrides the location; /run/secrets/coffer_kek or a
+      # projected k8s Secret work too, though a read-only file cannot be rotated
+      # from the UI.
+      #
+      # There is no env var carrying the key any more (ADR-0094 removed
+      # COFFER_MASTER_KEK_BASE64). The API mints its own on first boot when the
+      # database holds no wrapped material and the setup ceremony shows it once; an
+      # install whose key exists elsewhere supplies it by writing the key file, which
+      # is also how a restore carries a source key across.
+      COFFER_API__MasterKey__Path: ${COFFER_MASTER_KEY_PATH:-/app/keys/master.key}
+      # KEK id label stamped on new wraps (ledgers.lek_kek_id) when the key file has
+      # no `id=` line of its own — which only happens for a file an operator wrote by
+      # hand. Minting and rotation both write the id into the file, and that wins.
+      COFFER_MASTER_KEK_ID: ${COFFER_MASTER_KEK_ID:-v1}
+      # WebAuthn relying party. Defaults suit a localhost install on API_PORT;
+      # override for a real domain (RpId = bare host, origin = full URL).
+      COFFER_API__Fido2__RpId: ${COFFER_RP_ID:-localhost}
+      # Allowed passkey origins, one per numbered slot (COFFER_WEB_ORIGIN_0, _1,
+      # …). Slot 0 is the main app. Add a slot for each extra host that runs its
+      # own WebAuthn sign-in — e.g. a separate MCP subdomain (ADR-0063), whose
+      # OAuth login runs on that host and must be an allowed origin or sign-in
+      # fails ("origin ... not equal to ..."); RpId (the parent domain) already
+      # covers a subdomain. install.sh sets both; duplicates dedupe at runtime
+      # (the RP origin set is a HashSet). For a 3rd origin add COFFER_WEB_ORIGIN_2
+      # below as Origins__2.
+      # Named for their role, not their slot. `Origins__1` was the MCP host only by
+      # a convention described in prose — nothing enforced it, and Api:Mcp:PublicUrl
+      # below is a second consumer of that value, which would have made the
+      # convention load-bearing. COFFER_WEB_ORIGIN_0/_1 still work: the nested
+      # default keeps every existing .env valid, so an install upgrades without
+      # touching its config.
+      COFFER_API__Fido2__Origins__0: ${COFFER_WEB_URL:-${COFFER_WEB_ORIGIN_0:-http://localhost:8080}}
+      COFFER_API__Fido2__Origins__1: ${COFFER_MCP_URL:-${COFFER_WEB_ORIGIN_1:-http://localhost:8080}}
+      # The address an operator hands to an MCP client. Deliberately blank unless
+      # set: the UI then falls back to the request's own origin, which is correct
+      # for a single-host install. Set it when MCP answers on its own hostname.
+      COFFER_API__Mcp__PublicUrl: ${COFFER_MCP_URL:-}
+      # MCP read-only report server (ADR-0063), off by default. Set
+      # COFFER_MCP_ENABLED=true in .env to expose /mcp + the Connected-apps
+      # token UI for AI clients (Claude, etc.).
+      COFFER_API__Mcp__Enabled: ${COFFER_MCP_ENABLED:-false}
+      # How large a piece a backup is cut into when it has to cross a boundary
+      # that caps request size — an off-host upload, or a restore coming back in
+      # (ADR-0101). Default 49 MB: under Cloudflare's 100 MB proxied-body cap,
+      # which is NOT raisable on Free or Pro, and under the common 50 MB limits.
+      # Lower it if something in front of Coffer is stricter; lowering it is also
+      # how you exercise the split path on a small ledger.
+      COFFER_API__Backup__PartSizeMb: ${COFFER_BACKUP_PART_SIZE_MB:-49}
+      # Free space a restore upload must leave on the data volume, which also holds the
+      # stored backups (FU-072). An upload that would leave less is refused before it is
+      # written.
+      COFFER_API__Backup__RestoreFreeSpaceReserveMb: ${COFFER_RESTORE_FREE_SPACE_RESERVE_MB:-1024}
+      # The largest Moneydance export the import accepts, in MB (FU-092). Its parse is held
+      # in memory at about 6.5x the file, one export at a time.
+      COFFER_API__Import__MaxUploadMb: ${COFFER_IMPORT_MAX_UPLOAD_MB:-512}
+      # Proxies whose X-Forwarded-For/-Proto/-Host are believed (FU-088): addresses and
+      # CIDR ranges, comma separated. Empty = loopback and the private ranges, which is
+      # where a proxy on this host, a cloudflared container or a LAN proxy connects from.
+      COFFER_API__TrustedProxies: ${COFFER_TRUSTED_PROXIES:-}
+      # Networks a notification target or SimpleFIN URL may reach beyond public https
+      # addresses (FU-082), e.g. a LAN ntfy at 192.168.1.0/24. Empty = none.
+      COFFER_API__Outbound__AllowedNetworks: ${COFFER_OUTBOUND_ALLOWED_NETWORKS:-}
+      # Workstation GC (memory-footprint tuning). Server GC — the ASP.NET Core
+      # default — allocates a heap per logical CPU and is lazy about returning
+      # memory, so on a multi-core host with no pressure the process climbs to
+      # multiple GB and holds. Coffer is low-concurrency, so Workstation GC keeps
+      # the working set small (MS's own benchmark: ~500MB -> ~70MB) at a
+      # negligible throughput cost. Pairs with mem_limit below.
+      DOTNET_gcServer: "0"
+    # Every interface unless API_BIND names one (FU-084): the empty default publishes
+    # "8080:8080" exactly as before, IPv6 included, and API_BIND=127.0.0.1 keeps it to
+    # this machine. Docker's port rules bypass ufw and firewalld, so the host firewall
+    # does not close it.
+    ports:
+      - "${API_BIND:+${API_BIND}:}${API_PORT:-8080}:8080"
+    secrets:
+      - coffer_app_password
+      - coffer_service_password
+    volumes:
+      # First-run bootstrap.url artifact (ADR-0059 / bootstrap-token CLI), the
+      # restore staging (ADR-0061), and the stored backups.
+      - coffer_data:/app/data
+      # The master key and the keys rotation archived (ADR-0092 D1, FU-077). Apart
+      # from postgres_data, so one dump never carries both the wrapped material and
+      # the key that opens it, and apart from coffer_data, so a copy of the backups
+      # never carries it either. Back this volume up on its own, or keep the key
+      # from System → Encryption somewhere safe.
+      - coffer_keys:/app/keys
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    # Nothing added back here, unlike postgres. This container has no privilege
+    # drop to perform (the image runs as an unprivileged user from the start, FU-084,
+    # so no SETUID/SETGID), that user owns /app/data and /app/keys (so no
+    # DAC_OVERRIDE or CHOWN to write the master key, the bootstrap URL or the restore
+    # staging), and it binds 8080 — unprivileged, so no NET_BIND_SERVICE. The backup path shells out to pg_dump,
+    # pg_restore and psql, which are ordinary clients over TCP and need none
+    # either. Verified by a fresh prod-shaped stack that bootstrapped, took a
+    # backup and restored it with this in place.
+    cap_drop:
+      - ALL
+    # Hard memory cap for the API container. .NET's GC is cgroup-aware: with a
+    # limit set it treats this as total physical memory and caps the managed
+    # heap at ~75% of it, collecting aggressively as it nears the cap — so the
+    # process can't creep to multiple GB. Tune per host via COFFER_API_MEM_LIMIT
+    # in .env (survives install.sh, which overwrites this compose file).
+    mem_limit: ${COFFER_API_MEM_LIMIT:-1g}
+    # The same rotation as postgres: one line per request adds up.
+    logging: *rotated-log
+
+volumes:
+  postgres_data:
+  coffer_data:
+  coffer_keys:
+
+# Database role passwords, as files rather than environment variables (see the
+# environment blocks above for why). Compose bind-mounts each one read-only at
+# /run/secrets/<name>.
+#
+# scripts/install.sh generates these, and scripts/migrate-db-secrets.sh moves an
+# existing install's passwords out of .env into them. A missing file is a hard
+# error on `up` — deliberately, because the alternative to a loud failure here is
+# an install that either can't authenticate or, against a Postgres still
+# configured with trust, authenticates without a password.
+#
+# PERMISSIONS: outside swarm, compose ignores `uid`/`gid`/`mode` and the file
+# keeps its host ownership. The Postgres entrypoint re-execs as `postgres`
+# (uid 999) before reading POSTGRES_PASSWORD_FILE, so a 0600 host file owned by
+# the host user is NOT readable in-container. The generator therefore creates
+# `secrets/` as 0700 and the files inside as 0644: other local users are kept out
+# by the directory, and any container uid can still read the file it is given.
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+  coffer_service_password:
+    file: ./secrets/coffer_service_password
+  coffer_app_password:
+    file: ./secrets/coffer_app_password

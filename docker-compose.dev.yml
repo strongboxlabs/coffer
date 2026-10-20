@@ -1,0 +1,20 @@
+# Development overlay — publishes Postgres on the host.
+#
+# The base docker-compose.yml deliberately publishes nothing for Postgres: a
+# production install reaches it over the compose network and never needs a host port.
+# The dev loop does, because the manual fallback runs the API natively on the host
+# (README → Running it) and connects to localhost.
+#
+# Opt in through .env rather than by passing -f on every command, so that a bare
+# `docker compose ...` in this repo does the right thing:
+#
+#   COMPOSE_PATH_SEPARATOR=:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml
+#
+# install.sh does not write those, so an install never publishes the database.
+services:
+  postgres:
+    ports:
+      # Loopback only. On 0.0.0.0 this puts the database on every interface of the
+      # host, offering all three roles to anything that can route to it.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"

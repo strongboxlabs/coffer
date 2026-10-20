@@ -1,0 +1,169 @@
+# 0017 — Categories as a single `account_type` with a `category_kind` discriminator
+
+* Status: Accepted
+* Date: 2026-05-08
+* Refines: [0002-unified-accounts-table.md](0002-unified-accounts-table.md)
+* Refined by: [ADR-0019](0019-symmetric-postings.md) (adds `is_system` + `holdings_account_id` columns; preserves the `parent_id` invariant by keeping the per-brokerage Holdings sibling at the root)
+
+## Context
+
+[ADR-0002](0002-unified-accounts-table.md) established that categories live
+in the `accounts` table — a unified data model matching Moneydance's. The
+initial Phase 1 schema implemented this with `account_type ∈ ('income',
+'expense')` for categories alongside the real-account types (`bank`,
+`credit_card`, `investment`, `asset`, `liability`).
+
+During Phase 2 prep, two problems surfaced with that encoding:
+
+1. **The `account_type` column conflates two orthogonal facts:** *what kind
+   of thing is this row* (real account vs budgeting concept) and *which
+   flow direction* (money coming in vs going out). They are not the same
+   question; mashing them together makes constraints awkward.
+2. **The hierarchy concept is asymmetric:** real accounts (banks, credit
+   cards, investment accounts) shouldn't have hierarchy in our model
+   (per the "no fake accounts as tree branches" concern). Categories
+   genuinely do — a benefits category with one sub-category per kind
+   of coverage is a meaningful tree. The schema can
+   enforce that distinction only if categories are a single discriminated
+   type.
+3. **Categories carry no real-account state.** They have no feed
+   connection, no opening balance, no currency-specific configuration. The
+   schema couldn't enforce that without a single category type.
+
+## Decision
+
+The `accounts` table uses one `category` value in `account_type` for all
+categories (replacing the prior `'income'` and `'expense'` values), with a
+separate `category_kind` column carrying the income/expense distinction.
+
+```
+accounts.account_type ∈ ('bank', 'credit_card', 'investment',
+                          'asset', 'liability', 'loan',
+                          'category')
+
+accounts.category_kind ∈ ('income', 'expense') NULL
+```
+
+Three CHECK constraints (added in [migration
+007](../../db/migrations/007_phase2_schema.sql)) make the model
+self-policing:
+
+```sql
+-- category_kind is set IFF this row is a category
+CHECK ((account_type = 'category') = (category_kind IS NOT NULL))
+
+-- hierarchy via parent_id is only allowed on categories
+CHECK (parent_id IS NULL OR account_type = 'category')
+
+-- categories don't carry real-account state
+CHECK (account_type <> 'category'
+       OR (feed_connection_id IS NULL AND opening_balance = 0))
+```
+
+Additionally, `is_placeholder` is dropped from the schema. "This account is
+just a folder" is derived in the UI as "has children AND no own
+transactions" rather than stored.
+
+## Consequences
+
+**Positive**
+- Each column means one thing. `account_type='category'` says "this is a
+  budgeting concept", `category_kind='expense'` says "money flows out
+  through it". Reports compose these two filters explicitly instead of
+  decoding an overloaded enum.
+- Constraint-enforceable invariants: the database now refuses to create a
+  bank account with a `category_kind`, a category with a feed connection,
+  or a credit-card child of another credit card. None of these were
+  expressible before.
+- Adding new account flavours later (`tax_account`, `pseudo_account`, ...)
+  doesn't fight with the income/expense overload.
+- ADR-0002's core principle — categories live in `accounts` — is
+  preserved; only its implementation tightens.
+
+**Negative**
+- Reports change shape: "expense category total" becomes
+  `WHERE account_type='category' AND category_kind='expense'` instead of
+  `WHERE account_type='expense'`. Slightly more verbose. Acceptable.
+- The MD `acct.type='i'` / `'e'` translation gains one extra column
+  assignment per row. Captured in [ADR-0016](0016-moneydance-account-translation.md).
+- A small behavioural change at the UI layer: code that previously checked
+  `account_type IN ('income','expense')` to identify categories now checks
+  `account_type = 'category'`. There is no such code yet (Phase 1 ships
+  schema only), so the cost is documentary.
+
+## Alternatives considered
+
+- **Keep `account_type IN ('income','expense')`.** The status quo from Phase
+  1. Loses the constraint-enforceability and conflates two concepts.
+  Rejected.
+- **Separate `categories` table from `accounts` (drop the unified model).**
+  Reverts ADR-0002. Forces every report and query to reason about two
+  primitives that mean the same thing. Rejected.
+- **Separate `account_folders` table for organizational groupings.** An
+  earlier draft of this decision proposed it, but a real category tree
+  showed that hierarchy is a *real* concept for categories, not a
+  separate "folder" abstraction layered on top. The
+  parent-with-direct-balance shape (a benefits parent with no balance of
+  its own over several sub-categories carrying their own transactions) is
+  meaningful data, not folder metadata. Rejected.
+
+## Amendment (2026-09-18, mig 224) — a third kind, and kind is DISCLOSED not ENFORCED
+
+### A third value: `adjustment`
+
+`category_kind` now admits `adjustment` alongside `income` and `expense`. A
+VALUATION ADJUSTMENT — marking a house up, reconciling a retirement balance to a
+new statement figure — moves an asset's value with no money changing hands. It is
+neither income nor expense, and until mig 224 the column could not say so, which
+forced such entries into an expense category where they read as NEGATIVE SPENDING.
+
+The cost of not having it, found on a real ledger: one property markup, larger
+than the month's genuine spending, credited to an expense category made that
+month's total spend compute negative — the largest number on the screen, sign
+inverted. The same shape put many months into negative spending and whole
+calendar years into negative income.
+
+Nothing else had to change to make reporting correct, because
+`ReportingRepository.SummarizeAsync` filters by an explicit per-measure allow-list
+(Spending => expense, Income => income, Net => both). A kind in no list falls out
+of all three. That is precisely why a third KIND beat a per-category "exclude from
+reporting" flag, which every call site would have had to respect by hand.
+
+### Kind is DISCLOSED, never ENFORCED
+
+Pickers no longer filter the categories they offer by kind. Any category may be
+chosen anywhere a category is valid; what changes is that the kind is made
+unmissable at the point of selection and of display.
+
+The reasoning, in order of weight:
+
+* **`category_kind` is a REPORTING classification, not a posting constraint.**
+  Double-entry does not care. The investment side is gated by `posting_role`
+  (stamped from the header action), not by kind — `investment_income` filters on
+  `posting_role='income'` — so opening the pickers cannot corrupt investment income
+  or fee netting.
+* **The filters blocked real work.** The investment editor's category field was an
+  income-only allow-list (widened to expense only for `action='misc'`), so an
+  adjustment category could never be selected there at all — meaning one of the two
+  motivating cases for the third kind had no UI path.
+* **They protected almost nothing.** The distortion they nominally guard against —
+  money landing in the wrong measure — arrived overwhelmingly through the IMPORTER,
+  which bypasses every picker. On a real ledger the filters had prevented none of it.
+
+What replaces them is disclosure. `AccountCategoryPicker` already renders a
+per-row `Kind · Parent` qualifier, which survives search because it is per row
+rather than a group header; that gains the third value. Display surfaces outside
+the picker gain a kind glyph.
+
+**Not colour.** ADR-0099 D5 reserves colour for STATE (under the mark / past it)
+and allows the per-category palette only as an identity dot. Chips already use
+per-category colour. Encoding kind in colour would be a third meaning and would
+collapse all three. Not a border either: borders already carry focus and
+validation state and cannot legibly separate three values.
+
+**No warnings on suspect combinations.** The visible kind is the guard. A warning
+on every entry is noise, and there is no evidence it is needed.
+
+Two exclusions are unaffected because they are a different kind of rule:
+`is_system` (plumbing) and `!is_active` (archived) stay filtered out.
+
