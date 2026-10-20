@@ -1,0 +1,182 @@
+# CI: schema + trigger verification, the .NET suite sharded across runners, and the
+# web build.
+#
+# Shard filters live in scripts/ci-dotnet-shards.sh and are selected here by name,
+# never copied, so a namespace move cannot desync a workflow from the suite.
+#
+# Keep runs-on as a GitHub-hosted runner. Workflow code from fork pull requests
+# executes with the job, so pointing this at a machine of your own would run
+# untrusted code on it.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  schema:
+    name: Schema apply + trigger verification
+    runs-on: ubuntu-latest
+
+    env:
+      # 5432 is free on a hosted runner (unlike the private dev host, where the dev
+      # stack owns it and CI has to use a spare port).
+      PGPORT: 5432
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Started here rather than as a `services:` container: a service is published on
+      # every interface of the runner, and its password has to be written into this
+      # file, since nothing a step generates reaches a service's env. Here it listens
+      # on loopback only, under passwords made for this job and masked in its log.
+      - name: Start Postgres
+        run: |
+          set -euo pipefail
+          for var in PGPASSWORD COFFER_SERVICE_PASSWORD COFFER_APP_PASSWORD; do
+            value="$(openssl rand -hex 24)"
+            echo "::add-mask::$value"
+            echo "$var=$value" >> "$GITHUB_ENV"
+            export "$var=$value"
+          done
+          # `-e NAME` with no value: docker reads it from this shell, not its argv.
+          export POSTGRES_PASSWORD="$PGPASSWORD"
+          docker run -d --name ci-postgres -p "127.0.0.1:${PGPORT}:5432" \
+            -e POSTGRES_USER=coffer -e POSTGRES_PASSWORD -e POSTGRES_DB=coffer \
+            postgres:16 >/dev/null
+
+      - name: Wait for Postgres
+        run: |
+          for _ in {1..30}; do
+            if pg_isready -h localhost -U coffer; then echo "postgres ready"; exit 0; fi
+            sleep 2
+          done
+          echo "postgres did not become ready"; exit 1
+
+      # coffer_service needs BYPASSRLS for the RLS bootstrap migration; coffer_app is
+      # the runtime role. Reuses the same script docker-compose does, so CI and a real
+      # install provision identically.
+      - name: Provision coffer_service + coffer_app roles
+        env:
+          POSTGRES_USER: coffer
+          POSTGRES_DB: coffer
+          PGHOST: localhost
+        run: |
+          set -euo pipefail
+          chmod +x db/init/00-init-roles.sh
+          db/init/00-init-roles.sh
+
+      - name: Apply migrations
+        run: |
+          set -euo pipefail
+          for f in db/migrations/*.sql; do
+            echo "==> applying $f"
+            psql -h localhost -U coffer -d coffer -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Run trigger verification scripts
+        run: |
+          set -euo pipefail
+          for f in db/test/*.sql; do
+            echo "==> running $f"
+            psql -h localhost -U coffer -d coffer -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+  audit:
+    name: API no-raw-sql audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Audit src/Api for unsanctioned raw SQL
+        run: |
+          chmod +x scripts/audit-no-raw-sql.sh
+          scripts/audit-no-raw-sql.sh
+
+  dotnet-test:
+    # One shard per runner. Each job rebuilds the solution, which looks wasteful but
+    # is not: the jobs run in PARALLEL on separate machines, so wall-clock is one
+    # build plus the slowest shard. Sharing a build artifact between jobs would trade
+    # that for upload/download of the whole output — not obviously a win, and more
+    # moving parts.
+    name: .NET tests (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Must match SHARD_NAMES in scripts/ci-dotnet-shards.sh. An unknown name
+        # there exits 2 rather than running nothing, so a typo fails loudly instead
+        # of reporting a green build that tested nothing.
+        shard: [trx_a, trx_b, trx_c, feeds, accounts, backup, ingest, rest, importer]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET (pinned via global.json)
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      # Integration tests spin their own Postgres via Testcontainers; Docker is
+      # preinstalled on hosted runners, so nothing else is needed.
+      - name: Build once + run this shard
+        run: |
+          chmod +x scripts/ci-dotnet-shards.sh
+          scripts/ci-dotnet-shards.sh --shard ${{ matrix.shard }}
+
+  web:
+    name: Web build + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/Web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/Web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      # Advisories are gated here as well as in preflight, and high-and-above only:
+      # moderate/low in a dev toolchain would fail CI constantly for things that never
+      # reach a user. `npm ci --no-audit` above is for install speed, so without this
+      # step nothing checks at all — which is how a high-severity nanoid advisory sat
+      # in the lockfile unnoticed.
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test -- --run
+
+      - name: Build
+        run: npm run build

@@ -1,0 +1,157 @@
+# Builds the container image on a version tag and pushes it to ghcr.io, then opens a
+# GitHub Release for the tag and records the image's digest on it as image-digest.txt.
+# install.sh pulls the image by that digest, so a tag moved on the registry later
+# changes nothing an install was given; base-refresh.yml replaces the record when it
+# rebuilds the release on fresh base images.
+#
+# Every action is pinned to a commit, with its release in a comment. A tag can be moved
+# after it was reviewed, in a job that holds packages:write.
+#
+# Keep runs-on as a GitHub-hosted runner. Workflow code from fork pull requests
+# executes with the job, so pointing this at a machine of your own would run
+# untrusted code on it.
+name: Release image
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# Least privilege, stated explicitly rather than inherited: packages:write to push to
+# ghcr, contents:write only because the release step below creates a GitHub Release.
+# Drop contents to `read` if you remove that step.
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Build + push to ghcr.io
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history so `rev-list --count` below is a real number. On this
+          # repo that count is "how many releases have been published", since a
+          # snapshot is one orphan commit per release — coherent as a build
+          # number, and the shallow default would make it the constant 1.
+          fetch-depth: 0
+
+      # WHY THIS EXISTS AT ALL. .git is dockerignored, so the build stage is not
+      # a repo and cannot work its own commit out. Without these three passed in,
+      # Api.csproj consults a .git that is not there — and until the fix in
+      # 0.88.0 it captured git's own "fatal: not a git repository" as the value,
+      # so every public image ever built carried that error text as its version
+      # and rendered it in its own About panel. Post-0.88.0 it degrades honestly
+      # to "X.Y.Z+nogit" instead, which is better but still cannot name a commit.
+      #
+      # THE SHA IS THIS REPO'S, deliberately, not the private one it was
+      # snapshotted from. A public image should name a commit a consumer can
+      # actually check out; the private sha names nothing they can reach, and
+      # the two repos share no history by construction.
+      #
+      # The private release.yml has had this since 43031e3a. That it took until
+      # 0.88.0 to reach here is the drift the publish script warns about: these
+      # two workflows cannot drift in CONTENT, because nothing is copied between
+      # them — they drift in CAPABILITY, silently, and nothing watches.
+      - name: Resolve build identity
+        id: ident
+        run: |
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "count=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(git log -1 --format=%cd --date=short)" >> "$GITHUB_OUTPUT"
+
+      # arm64 emulation for the runtime stage only. The two build stages are pinned
+      # to $BUILDPLATFORM in the Dockerfile and run natively, so QEMU is used just
+      # for the final apt layer — minutes, not the 30-60 a fully emulated build costs.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          platforms: arm64
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tags derive from the git tag, which always equals the <Version> in
+      # src/Api/Api.csproj (ADR-0044) — so the image tag matches the build version
+      # inside it. Don't hand-tag images here; that reintroduces the drift.
+      - name: Image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/coffer
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+          # Set these EXPLICITLY. metadata-action otherwise infers them from GitHub's
+          # repository metadata, and the licenses label came out empty — so the GHCR
+          # package page showed no license for an AGPL project. Don't leave a
+          # user-visible legal field to auto-detection.
+          labels: |
+            org.opencontainers.image.title=Coffer
+            org.opencontainers.image.description=Self-hosted Moneydance replacement: double-entry personal finance in your browser, reachable from anywhere with passkey-only login, plus MCP tools for AI access to your ledger.
+            org.opencontainers.image.licenses=AGPL-3.0-only
+
+      - name: Build + push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # Refresh the base images on every release so the published artifact ships
+          # the current patched .NET runtime rather than a cached stale layer.
+          pull: true
+          # arm64 included because a large share of self-hosters run Raspberry Pi,
+          # Apple Silicon or Ampere VPSes and simply cannot use an amd64-only image.
+          # Verified before enabling: the .NET cross-publish emits linux-arm64 output
+          # natively, and PGDG publishes postgresql-client-16 for arm64 on noble (the
+          # aspnet:10.0 base), which the runtime stage needs.
+          platforms: linux/amd64,linux/arm64
+          # Stamped into the assembly; see "Resolve build identity" above for why
+          # the build cannot derive these itself.
+          build-args: |
+            SOURCE_COMMIT_SHA=${{ steps.ident.outputs.sha }}
+            SOURCE_COMMIT_COUNT=${{ steps.ident.outputs.count }}
+            SOURCE_COMMIT_DATE=${{ steps.ident.outputs.date }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Notes point at the artifact rather than a generated commit list; the tag is
+      # the changelog. The digest is the record install.sh pins to: replaced, never
+      # added beside, and read back before the job counts as done.
+      - name: GitHub Release, with the image's digest
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$' || { echo "no digest: '$DIGEST'"; exit 1; }
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --notes "Container image: \`ghcr.io/${{ github.repository_owner }}/coffer:${VERSION#v}\`, recorded in image-digest.txt.
+
+          See the README for install and upgrade steps." \
+            || echo "release already exists — recording the digest on it"
+          printf '%s\n' "$DIGEST" > image-digest.txt
+          gh release upload "$VERSION" image-digest.txt --clobber
+          gh release download "$VERSION" --pattern image-digest.txt --output - | tr -d '[:space:]' | grep -qx "$DIGEST" \
+            || { echo "the recorded digest does not read back"; exit 1; }
