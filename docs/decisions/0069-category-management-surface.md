@@ -1,6 +1,6 @@
 # 0069 — Category management surface (Settings tab + full paths)
 
-* Status: Accepted (Slice A shipped 0.10.0)
+* Status: Accepted (Slice A shipped 0.10.0; amended 2026-11-03 by [ADR-0111](0111-structure-is-one-page.md): Categories is not a destination of its own but the second tab of Structure, still at `/ledgers/$ledgerId/categories`, and the sidebar entry that reaches it is Structure; a row has a kebab as well as the right-click, and a category can be deactivated and reactivated from its menu; D6 amended 2026-11-14 by [ADR-0114](0114-benchmarks-and-currency-conversion.md): a counterparty chip on a transfer between currencies shares its cell with the other leg's amount)
 * Date: 2026-06-29
 * Related: ADR-0017 (categories ARE accounts — the model this manages), ADR-0068
   (the merge / delete / reparent repo methods this exposes over REST — its D5
@@ -28,8 +28,8 @@ the other per-ledger curation lives — is the right home.
 
 > **Amended 0.13.0 (nav swap) — reversed.** Categories is promoted to a top-level nav
 > destination (`/ledgers/$ledgerId/categories`, after Accounts); Activity (the
-> provider-run timeline, ADR-0055) moves the other way — into a Settings tab. In practice
-> categorization proved a daily-driver surface (curating the hierarchy + opening a
+> provider-run timeline, ADR-0055) moves the other way — into a Settings tab.
+> Categorization is a daily-driver surface (curating the hierarchy + opening a
 > category as a register, Slice B), while the activity log is occasional ops review with
 > more affinity to Settings. The Settings tab is now URL-addressable (`?tab=`, so the
 > Overview's "View activity" link deep-links to it). Slices A/B (`CategoriesPanel` + the
@@ -49,6 +49,10 @@ the delete gate so the UI can pre-disable Delete while the server stays authorit
 Income and Expense render as separate trees, each headed by a kind icon. Row actions
 (Add sub-category / Rename / Move / Merge / Delete) are on **right-click**, matching the
 registers + sidebar (the app-wide `ContextMenu` convention) — not a per-row kebab.
+*(Amended 2026-11-03, [ADR-0111](0111-structure-is-one-page.md) D4: ADR-0021 Rule 10 asks
+for a visible path to a row's menu, so every row a reader can act on now also has a kebab, and
+the kebab and the right-click open one menu: Open register, Add sub-category, Rename…, Move…, Merge…,
+Deactivate or Reactivate, Delete. "Not a per-row kebab" no longer holds.)*
 Parent and merge-target selection reuse `AccountCategoryPicker` (ADR-0043) — the same
 type-ahead the transaction + loan editors use — rather than a parallel picker. Since
 that picker has no null option, "Top level (no parent)" is an explicit checkbox beside
@@ -59,8 +63,11 @@ an always-visible picker.
 (server-enforced; the UI pre-disables via the usage counts). An in-use category can't be
 deleted — the dialog explains and offers Merge instead. Merge repoints every leg +
 reparents the source's children to the target, then **deactivates** (not deletes) the
-source — reversible. Move / Merge exclude the node's own subtree (no cycles; the server
-rejects them too).
+source. Move / Merge exclude the node's own subtree (no cycles; the server rejects them
+too). *(Amended 2026-11-03, [ADR-0111](0111-structure-is-one-page.md) D8: "reversible" held
+only for the row. Reactivating a merged-away category, which the menu now offers, gives
+back an empty category; the transactions, sub-categories and budget targets stay where the
+merge put them, and the merge dialog says so.)*
 
 ### D5 — Per-kind sign normalization for displayed totals
 A category's stored leg-sum is raw double-entry signed (expense nets positive, income
@@ -77,14 +84,16 @@ investment category / transfer / fee). Threaded via a new `accountPaths` field o
 register row context (`RegisterRowBodyCtx`), built once per page from the accounts list
 with the existing `buildAccountPathMap`; a `displayAccountPath` helper does the id→path
 lookup with a leaf-name fallback (so a path-less or not-yet-loaded account still renders).
+*(Amended 2026-11-14, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D14: on a transfer between currencies the
+counterparty chip shares its cell with the other leg's amount; a long account path
+truncates and the amount stays whole.)*
 
 ## Scope
 
 Slice A (this ADR): manage — everything above.
 
 Slice B — the **category register** (open a category like an account to see / edit the
-transactions posted to it, MD parity). The design pass found this needs **no new
-register domain** (correcting this ADR's initial projection): `RegisterRouter` already
+transactions posted to it, MD parity). This needs **no new register domain**: `RegisterRouter` already
 falls through to `BankRegisterPage` for every non-investment account type, categories
 included; the register read (`RegisterRepository.GetPageAsync`) is keyed purely by
 `account_id` with no type guard; `BankRow` already carries everything a category row

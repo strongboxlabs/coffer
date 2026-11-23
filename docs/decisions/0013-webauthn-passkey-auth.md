@@ -10,14 +10,14 @@ Coffer needs an authentication scheme. The constraints, in order:
 1. **Must work when the home internet is down.** The home server is still
    reachable over LAN / VPN, and "I can't see my own books because my ISP is
    out" is an unacceptable failure mode for a personal finance app.
-2. **Single user, but the user has multiple devices** — phone, primary laptop,
-   YubiKeys (one daily, one offline backup). A scheme that supports only one
-   credential leaves the user a single point of failure.
+2. **Single user, but multiple devices** — a phone, a laptop, hardware
+   security keys (e.g. one daily, one offline backup). A scheme that supports
+   only one credential leaves a single point of failure.
 3. **Phishing-resistant.** A finance app exposed over the internet (even if
    gated by a VPN or proxy) shouldn't rely on a typed shared secret as the
    primary credential.
 4. **Minimal maintenance.** No password reset emails, no rate-limiter tuning,
-   no breach-monitoring duties. The user wants to build the app, not run an
+   no breach-monitoring duties. Running the app must not mean running an
    auth service.
 
 The first constraint rules out **OIDC against any public IdP** (Google,
@@ -37,9 +37,9 @@ Local password (single hashed credential) satisfies (1) and (4) but is weak on
 
 **WebAuthn / FIDO2 is the primary authentication mechanism.** Specifically:
 
-- **Credential types accepted:** any WebAuthn authenticator. YubiKey is the
-  user's primary credential; platform passkeys (Windows Hello, Touch ID,
-  Android passkey, iPhone passkey) are first-class equivalents.
+- **Credential types accepted:** any WebAuthn authenticator. Hardware keys
+  (e.g. YubiKey) and platform passkeys (Windows Hello, Touch ID, Android
+  passkey, iPhone passkey) are first-class equivalents.
 - **Multiple credentials per account.** No upper bound enforced. Each
   registered credential records:
   - The FIDO2 credential ID and COSE-encoded public key.
@@ -116,12 +116,12 @@ Local password (single hashed credential) satisfies (1) and (4) but is weak on
 
 ### Update (2026-06-24): recovery + passkey management shipped
 
-Setup and login shipped in Phase 3; the rest of the surface above landed
-now, motivated by [ADR-0061](0061-bootstrap-restore.md): restoring a backup
-onto a host with a different WebAuthn **RP id** (e.g. a new domain) makes
-every stored passkey unusable — a credential is cryptographically bound to
-the RP id it was created under — so an account-recovery path that doesn't
-depend on a passkey became a hard requirement, not a nicety.
+Setup and login shipped in Phase 3; the rest of the surface above ships
+here. Restoring a backup ([ADR-0061](0061-bootstrap-restore.md)) onto a host
+with a different WebAuthn **RP id** (e.g. a new domain) makes every stored
+passkey unusable — a credential is cryptographically bound to the RP id it
+was created under — so an account-recovery path that doesn't depend on a
+passkey is a hard requirement, not a nicety.
 
 - **Recovery sign-in** (`/login/recovery`) verifies the code (constant-time
   Argon2id over the unused hashes), consumes only the matching row, and
@@ -193,9 +193,8 @@ This is a recognized .NET pattern, not a "skip auth" code path.
   without introducing a typed password into the threat model. Rejected.
 - **Cloudflare Access at the edge.** Solid, free for personal use, but it
   adds a third-party dependency on Cloudflare and requires routing the
-  domain through them. The user does not currently use Cloudflare; standing
+  domain through them. For an install not already behind Cloudflare, standing
   it up is a larger change than implementing WebAuthn. Rejected.
-- **No auth, rely on network posture (Teleport / VPN).** The user explicitly
-  asked that network posture and authentication remain independent concerns.
-  Defense in depth says authenticate even on trusted networks. Rejected as a
+- **No auth, rely on network posture (Teleport / VPN).** Network posture and
+  authentication are independent concerns. Defense in depth says authenticate even on trusted networks. Rejected as a
   *substitute*; remains a complementary control.

@@ -11,11 +11,10 @@
 -- resulting unique-violation as a typed `SyncInProgress` failure
 -- the endpoint returns as 422 with code `feed-sync-in-progress`.
 --
--- Per project memory feedback_server_side_concurrency: the API
--- must own race protection at the DB layer, not rely on the
--- SPA's mapBusy / button-disable state — that approach broke
--- when the SPA's busy-flag lifted between rapid mapping clicks
--- while the syncs themselves were still in flight.
+-- The API owns race protection at the DB layer and does not rely on the
+-- SPA's mapBusy / button-disable state — that approach fails
+-- when the SPA's busy-flag lifts between rapid mapping clicks
+-- while the syncs themselves are still in flight.
 --
 -- Crash recovery: a process killed mid-sync leaves a `running`
 -- row stranded forever; no future sync against that connection

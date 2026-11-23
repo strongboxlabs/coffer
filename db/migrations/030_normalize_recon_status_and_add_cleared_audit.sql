@@ -9,15 +9,15 @@
 -- `txn_headers.status` was a raw TEXT passthrough of Moneydance's
 -- per-event `txn.stat` letter codes — `'c'` / `'C'` / `'x'` / `'X'`
 -- for cleared (paper-check and online-banking eras of MD), `'R'`
--- for the rare legacy "reconciled" code, NULL for everything else.
+-- for the legacy "reconciled" code, NULL for everything else.
 -- The web client (`RegisterPage.tsx`) built a `CLEARED_STATUS_CODES`
 -- set to interpret those letters as "cleared." Mutation went
 -- through the override layer (`txn_header_overrides.status`).
 --
 -- Two unused 2-state columns lived alongside this:
 -- `reconciled_at` and `reconciled_by_user_id` — added in migration
--- 022 anticipating a permanent "reconciled" state that, per the
--- user's MD domain definition, doesn't actually exist (MD's
+-- 022 anticipating a permanent "reconciled" state that, in MD's own
+-- model, doesn't actually exist (MD's
 -- "reconciling" is a workflow status, not a permanent terminal
 -- state).
 --

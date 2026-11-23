@@ -10,15 +10,14 @@
 * Action-set update (migration 043): the per-leg directional pair
   `transfer_in` / `transfer_out` has been collapsed to a single
   `transfer` action — leg `amount` sign already encodes direction.
-  `contribution`, `withdrawal`, and `fee` were dropped (zero rows in a
-  large real-world MD export; superseded by `transfer` and `misc_expense`). Final
+  `contribution`, `withdrawal`, and `fee` were dropped (superseded by
+  `transfer` and `misc_expense`, which carry the same postings). Final
   9-action CHECK: `buy`, `sell`, `dividend_cash`, `dividend_reinvest`,
   `interest`, `transfer`, `misc_income`, `misc_expense`, `split`.
 
 ## Context
 
-Phase 2 prep for the investment-transaction mapper surfaced two related
-issues:
+The investment-transaction mapper has to solve two related issues:
 
 1. **Cross-account-transfer balance gap.** Moneydance encodes a transfer
    between two non-category accounts (e.g. checking → savings, brokerage →
@@ -30,9 +29,9 @@ issues:
    is silently wrong. The non-investment transaction mapper (PR 2.5)
    shipped this gap unchanged.
 
-2. **Investment-transaction shape variety.** The thousands of investment txns
-   in a large real-world MD export decompose into nine distinct
-   `(invest.txntype, xfer_type)` shapes, each with a different mix of
+2. **Investment-transaction shape variety.** Moneydance investment txns
+   decompose by `(invest.txntype, xfer_type)` shape — the nine the mapper
+   handles are tabled under Rule 2 — each with a different mix of
    `sec` / `inc` / `fee` / `xfr` splits. A naive "treat them like normal
    txns" approach loses the security side (which lives in `holdings` /
    `inv_txn_securities`, not `splits`) and breaks balances on transfer-
@@ -63,7 +62,7 @@ This applies uniformly:
 - Investment-with-transfer txns (`buyx`, `sellx`, `divx`, `bank` from
   Moneydance) — natively fits the rule.
 
-For txns with multiple non-category split targets (rare but possible:
+For txns with multiple non-category split targets (possible: a
 3-way transfer), one `transactions` row per affected account.
 
 ### Rule 2 — Investment-txn translation is shape-driven
@@ -71,17 +70,17 @@ For txns with multiple non-category split targets (rare but possible:
 The investment mapper handles each `(invest.txntype, xfer_type)` shape
 explicitly. The full table:
 
-| MD shape | Relative frequency | Coffer `transactions` rows | Splits | `inv_txn_securities` | Holdings effect |
-|---|---|---|---|---|---|
-| `(buy,  xfrtp_buysell)` | common | 1 in brokerage, `feed_amount = Σpamt`, `'buy'` | 0 (or 1 to fee EC if a fee split exists) | `qty=samt[sec]`, `unit_price=\|pamt[sec]/samt[sec]\|`, `commission=\|Σpamt[fee]\|` | `qty +=`; `cost_basis +=` total cost incl. fee |
-| `(sell, xfrtp_buysell)` | common | 1 in brokerage, `feed_amount = Σpamt`, `'sell'` | 0 (or 1 fee) | `qty=samt[sec]` (negative), `unit_price`, `commission` | `qty -=` (no lot-closing in Phase 2) |
-| `(div,  xfrtp_dividend)` | common | 1 in brokerage, `feed_amount = pamt[inc]`, `'dividend_cash'` | 1 to income category | `qty=0`, `unit_price=0` (informational link) | unchanged |
-| `(divr, xfrtp_dividend)` | common | 1 in brokerage, `feed_amount = 0`, `'dividend_reinvest'` | 1 to income category (records gross dividend) | `qty=samt[sec]` (new shares), `unit_price` | `qty +=`; `cost_basis +=` gross-dividend |
-| `(buyx, xfrtp_buysellxfr)` | rare | **2 rows**: brokerage `feed_amount=0` `'buy'` + other-account `feed_amount=samt[xfr]` `'transfer'` | 0 on each | 1 attached to brokerage row | as `buy` |
-| `(sellx, xfrtp_buysellxfr)` | rare | **2 rows**: brokerage `feed_amount=0` `'sell'` + other-account `feed_amount=samt[xfr]` `'transfer'` | 0 on each | 1 attached to brokerage row | as `sell` |
-| `(divx, xfrtp_dividendxfr)` | rare | **2 rows**: brokerage `feed_amount=0` `'dividend_cash'` + other-account `feed_amount=samt[xfr]` `'transfer'` | 1 income split on brokerage | 1 attached to brokerage, `qty=0` | unchanged |
-| `(bank, xfrtp_bank)` | occasional | **2 rows**: both `'transfer'`; brokerage `feed_amount=pamt[xfr]`, other-account opposite-sign | 0 on each | none | unchanged |
-| `(inc,  xfrtp_miscincexp)` | rare | 1 in brokerage, `feed_amount=Σpamt`, `'misc_income'` | 1-2 (income + optional fee) | `qty=0` (informational link) | unchanged |
+| MD shape | Coffer `transactions` rows | Splits | `inv_txn_securities` | Holdings effect |
+|---|---|---|---|---|
+| `(buy,  xfrtp_buysell)` | 1 in brokerage, `feed_amount = Σpamt`, `'buy'` | 0 (or 1 to fee EC if a fee split exists) | `qty=samt[sec]`, `unit_price=\|pamt[sec]/samt[sec]\|`, `commission=\|Σpamt[fee]\|` | `qty +=`; `cost_basis +=` total cost incl. fee |
+| `(sell, xfrtp_buysell)` | 1 in brokerage, `feed_amount = Σpamt`, `'sell'` | 0 (or 1 fee) | `qty=samt[sec]` (negative), `unit_price`, `commission` | `qty -=` (no lot-closing in Phase 2) |
+| `(div,  xfrtp_dividend)` | 1 in brokerage, `feed_amount = pamt[inc]`, `'dividend_cash'` | 1 to income category | `qty=0`, `unit_price=0` (informational link) | unchanged |
+| `(divr, xfrtp_dividend)` | 1 in brokerage, `feed_amount = 0`, `'dividend_reinvest'` | 1 to income category (records gross dividend) | `qty=samt[sec]` (new shares), `unit_price` | `qty +=`; `cost_basis +=` gross-dividend |
+| `(buyx, xfrtp_buysellxfr)` | **2 rows**: brokerage `feed_amount=0` `'buy'` + other-account `feed_amount=samt[xfr]` `'transfer'` | 0 on each | 1 attached to brokerage row | as `buy` |
+| `(sellx, xfrtp_buysellxfr)` | **2 rows**: brokerage `feed_amount=0` `'sell'` + other-account `feed_amount=samt[xfr]` `'transfer'` | 0 on each | 1 attached to brokerage row | as `sell` |
+| `(divx, xfrtp_dividendxfr)` | **2 rows**: brokerage `feed_amount=0` `'dividend_cash'` + other-account `feed_amount=samt[xfr]` `'transfer'` | 1 income split on brokerage | 1 attached to brokerage, `qty=0` | unchanged |
+| `(bank, xfrtp_bank)` | **2 rows**: both `'transfer'`; brokerage `feed_amount=pamt[xfr]`, other-account opposite-sign | 0 on each | none | unchanged |
+| `(inc,  xfrtp_miscincexp)` | 1 in brokerage, `feed_amount=Σpamt`, `'misc_income'` | 1-2 (income + optional fee) | `qty=0` (informational link) | unchanged |
 
 ### Rule 3 — Fees recorded twice on purpose
 
@@ -184,11 +183,11 @@ the sells in `inv_txn_securities` using a separate strategy.
 > **Amendment — 2026-05-19 (migration 053).**
 >
 > `holdings.cost_basis` was *previously* the un-decremented sum of every
-> acquisition cost ever (Buy + DivReinvest), with Sells contributing
-> `costBasisDelta = 0` per this rule. After many hundreds of Sell rows scrolled
-> through one of the test datasets, that column read a large multiple of
-> the true market value — the hero card surfaced as a large fake
-> unrealized loss.
+> acquisition cost ever (Buy + Reinvest), with Sells contributing
+> `costBasisDelta = 0` per this rule. Once a holding had seen sells, that
+> column still counted the cost of every share ever sold, so it overstated
+> the basis of what was actually held — and the hero card surfaced it as a
+> large fake unrealized loss.
 >
 > Migration 053 introduces `recompute_holdings_cost_basis(ledger_id)`,
 > a PL/pgSQL function that walks every holdings-side leg in
@@ -265,8 +264,7 @@ is stashed on `ImportContext.SecurityIdByMdSecAcctId`.
 - A single MD transfer becomes two Coffer rows; queries that summarise
   "this transfer" must group/dedupe by `external_id`. Documented; the
   cost is bounded.
-- For the rare 3-way+ transfer (none observed in a large real-world MD
-  export, but possible in principle), the mapper emits N rows — one per
+- For a 3-way+ transfer (possible in principle), the mapper emits N rows — one per
   affected non-category account. Sound, just unusual.
 - `inv_txn_securities` carries `qty=0` rows for dividends and misc-income
   that don't change holdings. They serve as the link from a txn to the
@@ -288,8 +286,8 @@ is stashed on `ImportContext.SecurityIdByMdSecAcctId`.
   works, no schema delta needed, and `transfer_pair_id` would only ever
   carry the same value as `external_id` for these rows.
 - **Decompose `divr` (reinvest) into separate "received dividend" + "buy
-  shares" rows.** Conceptually clean but two-row representation for
-  every reinvest (thousands of them) doubles the txn count. The single-row
+  shares" rows.** Conceptually clean but the two-row representation
+  doubles the row count of every reinvest. The single-row
   representation with `feed_amount=0` and a `dividend_reinvest`
   investment_action carries enough information for both income reports
   and holdings updates. Rejected.

@@ -4,10 +4,10 @@ import type { AttentionSeverity } from '@/lib/useLedgerAttention';
 /**
  * The problem indicator threaded through the navigation (FU-049).
  *
- * A problem used to be visible only if you were already looking at the screen that
+ * Without it a problem is visible only if you are already looking at the screen that
  * shows it — the consistency verdict on Settings → General, notifications on Settings →
- * Notifications, both inside a ledger you had to have chosen first. So "which of my
- * ledgers needs me" had no answer anywhere, and "does this one need me" cost three
+ * Notifications, both inside a ledger you have to have chosen first. So "which of my
+ * ledgers needs me" has no answer anywhere, and "does this one need me" costs three
  * clicks and knowing where to look.
  *
  * Four surfaces show the same dot, so a problem can be followed DOWN rather than
@@ -35,6 +35,12 @@ export interface AttentionDotProps {
     count?: number;
     /** What the dot is about, for the accessible label — a ledger name, or "Coffer". */
     context: string;
+    /**
+     * Replaces the generic "needs attention: N problems outstanding" for a dot whose subject is not a
+     * count of problems — an available release reads "Update available: 0.130.3". Same dot, same
+     * rules; only the words change.
+     */
+    sentence?: string;
     className?: string;
 }
 
@@ -53,10 +59,10 @@ export interface AttentionDotProps {
  * screen-reader-only text for anyone who cannot see it at all. Both name the severity
  * and the count.
  */
-export function AttentionDot({ severity, count, context, className }: AttentionDotProps) {
+export function AttentionDot({ severity, count, context, sentence, className }: AttentionDotProps) {
     if (severity === null) return null;
 
-    const label = describe(severity, count, context);
+    const label = sentence ?? describe(severity, count, context);
 
     return (
         <span className={cn('inline-flex shrink-0 items-center', className)}>

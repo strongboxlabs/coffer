@@ -1,6 +1,6 @@
 # 0077 — Tag management surface (Tags v1)
 
-Status: Accepted
+Status: Accepted (amended 2026-10-27 by [ADR-0108](0108-memo-and-tags-per-side.md): per-side assignment, the name-key index, merge repoints saved reports; amended 2026-11-03 by [ADR-0111](0111-structure-is-one-page.md): D7's placement, Tags is the third tab of Structure, not a destination of its own, and `TagsPage` is gone; a tag can be created from that tab, the list counts distinct transactions, and a tag's name opens the lines it is in play for)
 Date: 2026-07-15
 Relates: [ADR-0009](0009-tags-at-txn-level.md), [ADR-0069](0069-category-management-surface.md), [ADR-0076](0076-register-filter-single-source-of-truth.md)
 
@@ -29,7 +29,33 @@ merge (`POST …/{id}/merge`), delete (`DELETE …/{id}`), and cleanup-unused
 (`DELETE …/tags/unused`). **Assigning** tags to a transaction is
 unchanged — it stays on the transaction `PATCH` (ADR-0009), which already
 does case-insensitive create-on-first-use. This ADR is dictionary admin
-only.
+only. *(Amended 2026-10-27, ADR-0108 D1, D17: assignment is per side. A bank
+write carries tags in its `notes` member, an investment write in its `tags`
+field, and MCP `set_transaction_tags` names the register they are written
+from (`accountId`).)*
+
+*Amended 2026-10-27 (ADR-0108 D12): a merge also repoints saved reports.* A
+saved report stores the tag it filters on by id inside its spec, which no
+foreign key covers. The merge repoints every member's saved reports that
+filter on the source to the target, in its own transaction, through
+`saved_reports_repoint_tag`, a narrow `SECURITY DEFINER` function that checks
+the caller's owner or editor grant on the ledger itself
+([ADR-0083](0083-multi-user-management-invites.md), amendment of this date).
+The response counts only the reports the caller can see, their own and the
+ledger-shared ones, so it never reveals another member's private report.
+The merge locks the source tag first and recomputes every header that
+carried it.
+
+*Amended 2026-11-03 (ADR-0111 D5, D6): two more routes, and a second count.*
+`POST …/tags` makes a tag from the management tab (trimmed, 64 characters, one
+name per ledger ignoring case, an optional `#rrggbb` colour), and
+`GET …/tags/{id}/transactions` lists the lines the tag is in play for, across
+every account, each read from its own side as its register shows it, through the
+reporting query the budget's drill-down already uses. The list read carries
+`transactionCount` (the distinct transactions the tag is in play on a line of,
+which is what that page lists; hidden, merged-away and template rows, and a tag
+the line's own tags hide, are left out) beside `usageCount`; the panel and the
+combobox show the first, and the second still decides whether a tag is unused.
 
 The UI adds: a shared `TagCombobox` autocomplete (colour swatch + usage +
 "Create '<new>'") replacing the free-text inputs in the editor and the
@@ -45,7 +71,12 @@ one statement (the transactions themselves are untouched). The UI shows a
 confirm naming the usage count ("on N transactions; they'll be
 untagged"). A tag is a label, not structure — losing it loses no
 transaction data, so the friction of a mandatory merge-first isn't
-warranted.
+warranted. *(Amended 2026-10-27, ADR-0108 D6, D12: the delete cascades the
+tag's links at both levels (`txn_header_tags`, `txn_leg_tags`) and its stored
+roles (`txn_leg_note_tags`). It locks the tag first (`fn_lock_tags`), so no
+link is added between reading who carries it and deleting it, and recomputes
+every header that carried it in the same transaction: a side whose own set
+empties starts showing the other side's (`TagsRepository.DeleteAsync`).)*
 
 ### D3 — Rename-to-existing offers a merge
 
@@ -57,6 +88,14 @@ case-insensitively everywhere (assignment's resolve and this rename
 check), so **no writer can mint a case-only duplicate** — the DB unique
 index stays `(ledger_id, name)` (case-sensitive) with no migration
 needed, because the application layer is the effective guard.
+*(Amended 2026-10-27, ADR-0108 D12: the database is now the guard too. "The
+same name" is `tag_name_key(name)` (migration 263): lower() of the name with
+leading and trailing white space removed, and every name lookup uses it, the
+rename check and the Moneydance importer's included. Migration 264 merges the
+existing case variants and creates `uq_tags_name_key_per_ledger` on
+`(ledger_id, tag_name_key(name))`; the exact-name index
+`uq_tags_name_per_ledger` stays. A rename refused by either index answers
+`tag-name-exists`.)*
 
 ### D4 — Colours: gray default + fixed palette, set-only
 
@@ -71,14 +110,10 @@ view is unchanged (ADR-0076 keeps one filter definition and no view
 churn), so a `TagColorsProvider` joins tag name → colour from the shared
 `['tags', ledgerId]` query and a `TagChip` tints each chip.
 
-**Amended 2026-09.** This originally ended "Investment register rows
-aggregate per holding and don't render header-level tags, so coloured
-chips are a bank-register concern only." That followed from the
-investment register blanking tags, not from anything about colour. Tags
-now render on investment rows too (ADR-0028's 2026-09 refinement), and
-they are coloured by the same `TagColorsProvider` / `TagChip` pair, from
-the same `['tags', ledgerId]` query — the mechanism needed no change,
-only a second mount point. `InvestmentRegisterPage` wraps its
+**Amended 2026-09.** Tags render on investment rows too (ADR-0028's
+2026-09 refinement), coloured by the same `TagColorsProvider` / `TagChip`
+pair from the same `['tags', ledgerId]` query, so chip colour is not a
+bank-register concern only. `InvestmentRegisterPage` wraps its
 `MainArea` in the provider exactly as `BankRegisterPage` does; without
 it the chips render, and render grey, so one tag would be two colours
 depending on which register you were reading.

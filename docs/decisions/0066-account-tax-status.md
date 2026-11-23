@@ -2,7 +2,7 @@
 
 * Status: Accepted — shipped v0.7.0 (mig 149)
 * Date: 2026-06-26
-* Related: ADR-0063/0064 (MCP reporting + FIFO surfaced the need), ADR-0002/0017
+* Related: ADR-0063/0064 (MCP reporting + FIFO, which need it), ADR-0002/0017
   (account model)
 
 ## Context

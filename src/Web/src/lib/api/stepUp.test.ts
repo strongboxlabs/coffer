@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from './_request';
 import { STEP_UP_HEADER, stepUpHeaders, withStepUpIfRequired } from './stepUp';
 
-// The passkey tap sensitive actions need (2026-10-12 security audit, M2): begin a
+// The passkey tap sensitive actions need (ADR-0105 D1): begin a
 // ceremony for the one action, run it, and send the result in a header.
 
 const assertion = { id: 'cred-1', rawId: 'cred-1', type: 'public-key', response: {} };

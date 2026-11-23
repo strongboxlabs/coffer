@@ -16,22 +16,23 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Auth;
 
 /// <summary>
-/// The fresh passkey tap that sensitive actions need (2026-10-12 security audit, M2).
+/// The fresh passkey tap that sensitive actions need (ADR-0105 D1).
 /// </summary>
 /// <remarks>
-/// Before, a session cookie alone could enrol a passkey of its own and then pass every
-/// step-up with it; and adding passkeys, new recovery codes, MCP tokens, granting admin,
-/// restoring, changing the backup passphrase, deleting backups and turning MCP writes
-/// on needed no tap at all. These pin both halves: every gated endpoint refuses without
+/// Without the gate, a session cookie alone could enrol a passkey of its own and then
+/// pass every step-up with it, and adding passkeys, new recovery codes, MCP tokens,
+/// granting admin, restoring, changing the backup passphrase, deleting backups and
+/// turning MCP writes on would need no tap at all. These pin both halves: every gated endpoint refuses without
 /// a tap, and the gate refuses a tap that is too new, unverified, minted for another
 /// action, or replayed. Fido2's signature check is substituted (StepUpTestHelper).
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class StepUpTests
+public sealed class StepUpTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public StepUpTests(PostgresFixture fixture) => _fixture = fixture;
+    public StepUpTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> CookieClientAsync(
         ApiFactory factory, SyntheticLedger user, string authMethod = SessionAuthMethods.Passkey,
@@ -45,7 +46,7 @@ public sealed class StepUpTests
 
     private async Task MakeAdminAsync(Guid userId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await db.Users.Where(u => u.Id == userId)
             .ExecuteUpdateAsync(s => s.SetProperty(u => u.IsAdmin, _ => true));
     }
@@ -80,12 +81,12 @@ public sealed class StepUpTests
     public async Task Every_gated_action_is_refused_without_a_tap(string action)
     {
         // An admin with a passkey, signed in with it: everything except the tap.
-        var admin = await SyntheticLedger.CreateAsync(_fixture);
+        var admin = await SyntheticLedger.CreateAsync(Db);
         await MakeAdminAsync(admin.UserId);
         var key = await admin.AddCredentialAsync(nickname: "key");
         var other = await admin.AddMemberAsync("viewer");
 
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled().WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithMcpEnabled().WithoutDevAuth()
             .WithService(_ => StepUpTestHelper.AcceptingWebAuthn());
         using var client = await CookieClientAsync(factory, admin);
 
@@ -122,11 +123,11 @@ public sealed class StepUpTests
     [Fact]
     public async Task A_passkey_enrolled_after_the_session_began_cannot_approve_anything()
     {
-        // The audit's bypass: a stolen cookie enrolled its own key, then used it. A key
+        // The bypass this closes: a stolen cookie enrolls its own key, then uses it. A key
         // added during this session is refused even though it IS the caller's.
-        var user = await SyntheticLedger.CreateAsync(_fixture);
+        var user = await SyntheticLedger.CreateAsync(Db);
         await user.AddCredentialAsync(nickname: "before");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService(_ => StepUpTestHelper.AcceptingWebAuthn());
         using var client = await CookieClientAsync(factory, user);
         await Task.Delay(20);                       // timestamps strictly after the session's
@@ -142,9 +143,9 @@ public sealed class StepUpTests
     [Fact]
     public async Task A_tap_without_user_verification_is_refused()
     {
-        var user = await SyntheticLedger.CreateAsync(_fixture);
+        var user = await SyntheticLedger.CreateAsync(Db);
         var key = await user.AddCredentialAsync(nickname: "key");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService(_ => StepUpTestHelper.AcceptingWebAuthn());
         using var client = await CookieClientAsync(factory, user);
 
@@ -160,9 +161,9 @@ public sealed class StepUpTests
     [Fact]
     public async Task A_tap_for_one_action_cannot_approve_another()
     {
-        var user = await SyntheticLedger.CreateAsync(_fixture);
+        var user = await SyntheticLedger.CreateAsync(Db);
         var key = await user.AddCredentialAsync(nickname: "key");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService(_ => StepUpTestHelper.AcceptingWebAuthn());
         using var client = await CookieClientAsync(factory, user);
 
@@ -177,9 +178,9 @@ public sealed class StepUpTests
     [Fact]
     public async Task A_tap_approves_one_request_only()
     {
-        var user = await SyntheticLedger.CreateAsync(_fixture);
+        var user = await SyntheticLedger.CreateAsync(Db);
         var key = await user.AddCredentialAsync(nickname: "key");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService(_ => StepUpTestHelper.AcceptingWebAuthn());
         using var client = await CookieClientAsync(factory, user);
         var header = await StepUpTestHelper.HeaderValueAsync(client, StepUpActions.RecoveryCodes, key.CredentialId);
@@ -196,8 +197,8 @@ public sealed class StepUpTests
     [Fact]
     public async Task Begin_refuses_an_unknown_action()
     {
-        var user = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var user = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await CookieClientAsync(factory, user);
 
         var response = await client.PostAsJsonAsync("/api/auth/step-up/begin", new { action = "reveal-everything" });
@@ -260,8 +261,8 @@ public sealed class StepUpTests
     {
         // It may have no usable passkey at all — that is why it used a recovery code —
         // so without this it could never get one. One, though, not a stream of them.
-        var user = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        var user = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService(_ => RegistrationAndAssertions(
                 () => System.Security.Cryptography.RandomNumberGenerator.GetBytes(64)));
         using var client = await CookieClientAsync(factory, user, SessionAuthMethods.RecoveryCode);
@@ -272,15 +273,15 @@ public sealed class StepUpTests
         Assert.Equal(HttpStatusCode.UnprocessableEntity, second.StatusCode);
         Assert.Equal("step-up-required", await CodeOf(second));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Equal(1, await db.WebAuthnCredentials.CountAsync(c => c.UserId == user.UserId));
     }
 
     [Fact]
     public async Task The_recovery_allowance_ends_fifteen_minutes_after_signing_in()
     {
-        var user = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        var user = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService(_ => RegistrationAndAssertions(
                 () => System.Security.Cryptography.RandomNumberGenerator.GetBytes(64)));
         using var client = await CookieClientAsync(
@@ -297,9 +298,9 @@ public sealed class StepUpTests
     {
         // The allowance is for recovery-code sessions only; a passkey session has a
         // passkey to tap with.
-        var user = await SyntheticLedger.CreateAsync(_fixture);
+        var user = await SyntheticLedger.CreateAsync(Db);
         await user.AddCredentialAsync(nickname: "key");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService(_ => RegistrationAndAssertions(
                 () => System.Security.Cryptography.RandomNumberGenerator.GetBytes(64)));
         using var client = await CookieClientAsync(factory, user);

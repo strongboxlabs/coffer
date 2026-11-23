@@ -28,6 +28,9 @@ public static class ProblemDetailsExtensions
         // A seal refused because the master key is being rotated is a 503 with Retry-After,
         // not a 500: the server restarts onto the new key in seconds (FU-078).
         services.AddExceptionHandler<Coffer.Api.Crypto.MasterKeyRotatingExceptionHandler>();
+        // A write refused because another write to the same ledger held its write lock past
+        // the wait is a 422 business refusal, not a 500 (migration 275).
+        services.AddExceptionHandler<LedgerWriteBusyExceptionHandler>();
         services.AddProblemDetails(options =>
         {
             options.CustomizeProblemDetails = context =>

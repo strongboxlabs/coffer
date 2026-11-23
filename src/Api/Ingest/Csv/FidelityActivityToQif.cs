@@ -27,10 +27,10 @@ public sealed record FidelityQifConversion(
 /// brokerage. This file's entire job is the format: what the columns mean, which rows
 /// are junk, and which QIF verb a row is. The verbs then travel one well-trodden path.</para>
 ///
-/// <para>What that leaves here is knowledge no QIF file needs, learned from real
-/// exports:</para>
+/// <para>What that leaves here is knowledge of Fidelity's format that no QIF file
+/// needs:</para>
 /// <list type="bullet">
-/// <item><b>Columns by NAME.</b> A real export orders them <c>…Type,Price ($),Quantity,…</c>
+/// <item><b>Columns by NAME.</b> Fidelity's export orders them <c>…Type,Price ($),Quantity,…</c>
 /// while the widely-cited reference implementation expects <c>…Quantity,Price ($),…</c> —
 /// the two money columns, swapped. By position, a share count becomes a unit price.</item>
 /// <item><b>The table has to be found, at both ends.</b> Two blank lines precede the
@@ -40,22 +40,22 @@ public sealed record FidelityQifConversion(
 /// says nothing about whether shares moved.</item>
 /// <item><b>The date can be inside the sentence.</b> Run Date is when Fidelity processed
 /// the row; an Action reading "as of 2025-06-30" says when it happened. Settlement Date
-/// is blank on every row of a real export, so the text is the only place the effective
-/// date exists.</item>
+/// can be blank throughout, so the text may be the only place the effective date
+/// exists.</item>
 /// </list>
 ///
 /// <para><b>What is deliberately NOT here: a cash-balance cross-check.</b> The reference
 /// implementation compares consecutive rows' <c>Cash Balance</c> and, where the delta
 /// disagrees with the stated amount, trusts the balance — "it's the change in balance
-/// that's correct, not Fidelity's reported amount". That was implemented here and then
-/// disproved by a real export on first contact.</para>
+/// that's correct, not Fidelity's reported amount". That is wrong for this
+/// format.</para>
 ///
 /// <para>Fidelity does not stamp a per-ROW running balance. Rows arrive in settlement
 /// PAIRS that share one balance — a dividend and the sweep of that same amount into the
 /// core fund both carry the balance after the pair — so the within-pair delta is always
-/// zero. The check fired on every row of a perfectly good file and "corrected" each
-/// amount to zero, which on import would have posted every row as a transaction of nothing.
-/// The stated amounts were right all along.</para>
+/// zero. So the check fires on every row of a perfectly good file and "corrects" each
+/// amount to zero, which on import would post every row as a transaction of nothing.
+/// The stated amounts are the right ones.</para>
 ///
 /// <para>It is not softened to a warning, because a check that cannot distinguish a
 /// mis-parse from normal settlement grouping has nothing to warn about; and not repaired
@@ -63,10 +63,9 @@ public sealed record FidelityQifConversion(
 /// that without guessing a second time.</para>
 ///
 /// <para>Classification mirrors the reference implementation's <c>map_action_type</c>,
-/// including its order and its sign fallbacks — which is not a detail: most of the
-/// distinct actions in a real export are classified by SIGN alone and match no
-/// name rule at all. <c>PURCHASE INTO CORE ACCOUNT</c> contains neither "BUY" nor
-/// "BOUGHT".</para>
+/// including its order and its sign fallbacks — which is not a detail: an action that
+/// matches no name rule is classified by SIGN alone, and plain sentences match none.
+/// <c>PURCHASE INTO CORE ACCOUNT</c> contains neither "BUY" nor "BOUGHT".</para>
 /// </remarks>
 public static class FidelityActivityToQif
 {
@@ -172,9 +171,9 @@ public static class FidelityActivityToQif
             var action = Cell(cells, roles, "action");
             // Fidelity's Run Date is when it PROCESSED the row; when the Action says
             // "as of <date>", that is when the row actually happened, and the two differ.
-            // Many rows in a real export are dated a day late by Run Date alone — which
-            // put them one row above the identical transactions already imported for the
-            // same account from a QIF, where nothing could see they were the same event.
+            // A row dated by Run Date alone can land a day late — one row away from the
+            // identical transaction already imported for the same account from a QIF,
+            // where nothing could see they were the same event.
             if (EffectiveDate(action) is { } effective)
             {
                 date = effective;
@@ -242,8 +241,8 @@ public static class FidelityActivityToQif
     /// load-bearing: <c>DIVIDEND</c> is tested before <c>REINVEST</c>, so a sentence
     /// carrying both is a cash dividend.</para>
     ///
-    /// <para>The sign fallbacks at the end are not a safety net, they are the main path:
-    /// most of the distinct actions in a real export reach them.</para>
+    /// <para>The sign fallbacks at the end are not a safety net, they are a main path:
+    /// every action sentence no name rule matches reaches them.</para>
     ///
     /// <para>Cash arrivals and departures with no shares become <c>XIn</c>/<c>XOut</c>,
     /// which the QIF provider deliberately gives the BANK shape — the right answer for a
@@ -296,9 +295,9 @@ public static class FidelityActivityToQif
     /// </summary>
     /// <remarks>
     /// <para>Written as <c>PURCHASE INTO CORE ACCOUNT as of 2025-06-30 SAMPLE FUND …</c> —
-    /// mid-sentence, so it is neither a prefix nor a column. Both orders appear in the
-    /// wild (ISO and US), and Settlement Date is blank on every row of a real export, so
-    /// this text is the only place the effective date exists.</para>
+    /// mid-sentence, so it is neither a prefix nor a column. Both orders appear (ISO
+    /// and US), and Settlement Date can be blank throughout, so this text may be the
+    /// only place the effective date exists.</para>
     ///
     /// <para>Returned in the Run Date column's own format so one parser handles both.</para>
     /// </remarks>
@@ -359,11 +358,24 @@ public static class FidelityActivityToQif
         roles.TryGetValue(role, out var i) && i < cells.Count ? cells[i].Trim() : string.Empty;
 
     /// <summary>
-    /// Cash amounts, whose destination columns are all 2dp. Four decimals is headroom,
-    /// not precision — a money cell in this export never carries more.
+    /// Cash amounts and fees, emitted exactly as parsed (ADR-0114 D15, ADR-0098).
     /// </summary>
-    private static string Money(decimal value) =>
-        value.ToString("0.####", CultureInfo.InvariantCulture);
+    /// <remarks>
+    /// <para>This projection is transport, as for <see cref="Units"/>. The one rounding of
+    /// an ingested amount is at the ingest write, to the account currency's places, half
+    /// away from zero, and it keeps the cell's figure in the row's originals with the
+    /// rounded mark, so the Review note shows the cell unrounded. Rounding here first
+    /// would round twice and record the shim's figure as the bank's. A fee is carried on
+    /// to <c>ingest_fee</c> as sent, a carrier with no scale limit that the import does
+    /// not fit to the currency; the editor rounds its Fee prefill from it once, at the
+    /// account currency's places.</para>
+    /// <para>The same format as <see cref="Units"/>: nothing is rounded, a whole figure is
+    /// written bare and trailing zeros are dropped, so the emitted document changes only
+    /// for a cell finer than the four places the earlier format kept, and the external id
+    /// QIF hashes from every other cell is unchanged. Invariant, with no grouping, so the
+    /// QIF provider's comma rule never meets a comma here.</para>
+    /// </remarks>
+    private static string Money(decimal value) => Units(value);
 
     /// <summary>
     /// Share counts and unit prices, which are NOT money and must not be rounded here.

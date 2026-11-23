@@ -18,11 +18,12 @@ namespace Coffer.Api.Tests.Integration.Mcp;
 /// only thing that can authenticate /mcp is the bearer scheme itself.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class McpTokensEndpointsTests
+public sealed class McpTokensEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public McpTokensEndpointsTests(PostgresFixture fixture) => _fixture = fixture;
+    public McpTokensEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static HttpRequestMessage McpInitialize(string? bearer)
     {
@@ -51,16 +52,16 @@ public sealed class McpTokensEndpointsTests
     [Fact]
     public async Task Mint_then_authenticate_mcp_then_revoke()
     {
-        var user = await SyntheticLedger.CreateAsync(_fixture);
+        var user = await SyntheticLedger.CreateAsync(Db);
         var key = await user.AddCredentialAsync(nickname: "key");
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled().WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithMcpEnabled().WithoutDevAuth()
             .WithService(_ => StepUpTestHelper.AcceptingWebAuthn());
 
         var cookie = await user.IssueSessionCookieAsync();
         using var session = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
         session.DefaultRequestHeaders.Add("Cookie", $"__Host-coffer.session={cookie}");
 
-        // Mint — plaintext returned once, and only with a passkey tap (audit, M2).
+        // Mint — plaintext returned once, and only with a passkey tap (ADR-0105 D1).
         var createResponse = await StepUpTestHelper.SendWithStepUpAsync(session,
             new HttpRequestMessage(HttpMethod.Post, "/api/account/mcp-tokens")
             {
@@ -95,8 +96,8 @@ public sealed class McpTokensEndpointsTests
     [Fact]
     public async Task Garbage_bearer_is_rejected()
     {
-        await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled().WithoutDevAuth();
+        await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithMcpEnabled().WithoutDevAuth();
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
 
         var response = await client.SendAsync(McpInitialize("coffer_mcp_not-a-real-token"));
@@ -108,8 +109,8 @@ public sealed class McpTokensEndpointsTests
     {
         // The bearer scheme is not in the default policy, so even a valid MCP
         // token cannot reach the token-management surface — only a cookie can.
-        await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled().WithoutDevAuth();
+        await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithMcpEnabled().WithoutDevAuth();
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
 
         var response = await client.GetAsync("/api/account/mcp-tokens");

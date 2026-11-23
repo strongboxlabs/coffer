@@ -1,6 +1,7 @@
 using System.ComponentModel;
 
 using Coffer.Importer.Moneydance.Json;
+using Coffer.Importer.Moneydance.Mappers;
 using Spectre.Console;
 using Spectre.Console.Cli;
 
@@ -14,8 +15,8 @@ namespace Coffer.Importer.Moneydance;
 /// </summary>
 /// <remarks>
 /// Companion to <c>docs/moneydance-import-fidelity.md</c> (the prose
-/// audit). This command runs the same audit against a large real-world
-/// export so the gap-list translates to concrete counts: "yes, N of
+/// audit). This command runs the same audit against a given export so
+/// the gap-list translates to concrete counts for that file: "yes, N of
 /// your transactions have per-leg tags that disagree with the header"
 /// vs. "this is purely theoretical, your data doesn't trigger it."
 ///
@@ -52,7 +53,7 @@ internal sealed class AuditCommand : Command<AuditCommand.Settings>
 
         AnsiConsole.MarkupLine(
             $"Loading [cyan]{Path.GetFileName(path)}[/] …");
-        // Releases the parsed document (hundreds of megabytes for a large export) on exit.
+        // Releases the parsed document, which grows with the export, on exit.
         using var export = MdItemReader.ReadFile(path);
         var txns = export.AllItems.Where(i => i.ObjType == "txn").ToList();
         AnsiConsole.MarkupLine(
@@ -67,7 +68,7 @@ internal sealed class AuditCommand : Command<AuditCommand.Settings>
         AuditSingleLegLegDesc(txns, settings.Examples);
         AuditAttachmentsAcrossAllItems(export.AllItems);
         AuditCustomFields(txns);
-        AuditCurrencyConversion(txns);
+        AuditCurrencyConversion(export);
         AuditUnreadRootKeys(txns);
 
         return 0;
@@ -114,7 +115,7 @@ internal sealed class AuditCommand : Command<AuditCommand.Settings>
     // Attachments — sweep ALL items (not just txns) for fields that
     // look like attachment / receipt / file references. MD stores
     // attachments as a separate item type (rather than inline on txn),
-    // so the previous txn-only sweep would miss them. Counts both
+    // so a txn-only sweep would miss them. Counts both
     // attachment-bearing items and txns that reference them.
     // -----------------------------------------------------------------
     private static void AuditAttachmentsAcrossAllItems(IReadOnlyList<MdItem> all)
@@ -180,10 +181,11 @@ internal sealed class AuditCommand : Command<AuditCommand.Settings>
     }
 
     // -----------------------------------------------------------------
-    // Per-leg tags — MD `split.tags` exists per leg; the importer
-    // unions them up into header-level tags and loses per-leg
-    // attribution. Count the txns where leg-level tag disagreement
-    // means the union was actually lossy.
+    // Per-leg tags — MD `split.tags` exists per leg, and the importer
+    // keeps each on its own line (with the transaction's `tags` merged
+    // into every line of a multi-split, whose other side is read-only).
+    // Count the txns where leg-level tags differ from the transaction's,
+    // which is the attribution that per-line tags preserve.
     // -----------------------------------------------------------------
     private static void AuditPerLegTags(IReadOnlyList<MdItem> txns, int sampleLimit)
     {
@@ -230,7 +232,7 @@ internal sealed class AuditCommand : Command<AuditCommand.Settings>
         AnsiConsole.MarkupLine($"  txns with per-leg tags:     {txnsWithPerLegTags,8:N0}");
         AnsiConsole.MarkupLine(
             $"  txns where leg tags differ: {txnsWithTagDisagreement,8:N0}   " +
-            "[yellow]<- per-leg attribution lost on import[/]");
+            "<- kept per line on import");
         foreach (var ex in examples) AnsiConsole.WriteLine(ex);
         AnsiConsole.WriteLine();
     }
@@ -361,7 +363,9 @@ internal sealed class AuditCommand : Command<AuditCommand.Settings>
 
     private static void AuditSingleLegLegDesc(IReadOnlyList<MdItem> txns, int sampleLimit)
     {
-        // Single-leg iff no `1.acctid`.
+        // Single-leg iff no `1.acctid`. Counted by the importer's own rule
+        // (MoneydanceNotes.CounterpartMemo): a `0.desc` that is neither blank,
+        // the payee copy, nor the memo written is the other side's own memo.
         var count = 0;
         var examples = new List<string>();
 
@@ -370,7 +374,8 @@ internal sealed class AuditCommand : Command<AuditCommand.Settings>
             if (t.Has("1.acctid")) continue;
             var legDesc = (t.GetString("0.desc") ?? "").Trim();
             var txnDesc = (t.GetString("desc") ?? "").Trim();
-            if (legDesc.Length == 0 || string.Equals(legDesc, txnDesc, StringComparison.Ordinal))
+            var written = MoneydanceNotes.WrittenMemo(t.GetString("memo"), t.GetString("ol.orig-memo"));
+            if (MoneydanceNotes.CounterpartMemo(t.GetString("0.desc"), t.GetString("desc"), written) is null)
                 continue;
             count++;
             if (examples.Count < sampleLimit)
@@ -382,7 +387,7 @@ internal sealed class AuditCommand : Command<AuditCommand.Settings>
         }
 
         AnsiConsole.MarkupLine("[bold]Single-leg events with distinct `0.desc`[/]");
-        AnsiConsole.MarkupLine($"  count: {count,8:N0}   [yellow]<- single-leg leg memo dropped[/]");
+        AnsiConsole.MarkupLine($"  count: {count,8:N0}   <- kept as the other side's own memo");
         foreach (var ex in examples) AnsiConsole.WriteLine(ex);
         AnsiConsole.WriteLine();
     }
@@ -416,31 +421,65 @@ internal sealed class AuditCommand : Command<AuditCommand.Settings>
         AnsiConsole.WriteLine();
     }
 
-    private static void AuditCurrencyConversion(IReadOnlyList<MdItem> txns)
+    private static void AuditCurrencyConversion(MdExport export)
     {
-        // Heuristic: a split's pamt != samt indicates currency conversion
-        // (parent-amount in different units than split-amount).
-        var fxTxns = 0;
-        foreach (var t in txns)
-        {
-            for (var i = 0; i < 32; i++)
-            {
-                var samt = t.GetLong($"{i}.samt");
-                var pamt = t.GetLong($"{i}.pamt");
-                if (samt is null || pamt is null) continue;
-                if (samt != pamt)
-                {
-                    fxTxns++;
-                    break;
-                }
-            }
-        }
+        var fxTxns = CountTransfersBetweenCurrencies(export);
 
         AnsiConsole.MarkupLine("[bold]Currency conversion (FX)[/]");
         AnsiConsole.MarkupLine(
             $"  txns with FX-converted splits: {fxTxns,8:N0}   " +
             "[yellow]<- amount preserved, FX rate/history isn't[/]");
         AnsiConsole.WriteLine();
+    }
+
+    /// <summary>
+    /// How many transactions of <paramref name="export"/> carry at least one split
+    /// between two real accounts in different currencies: the two-amount pairs the
+    /// import keeps (ADR-0114 D13). Each side's currency is the account's own, resolved
+    /// through <see cref="MdCurrencies"/>. A split with a category side is skipped, since
+    /// a category leg mirrors the real side, and so is one whose either account or
+    /// currency cannot be read, which the import preview refuses. Comparing a split's
+    /// <c>samt</c> with its <c>pamt</c> is no test: the two differ in sign on every
+    /// split, in one currency or not.
+    /// </summary>
+    internal static int CountTransfersBetweenCurrencies(MdExport export)
+    {
+        ArgumentNullException.ThrowIfNull(export);
+        var currencies = MdCurrencies.From(export);
+        var accounts = new Dictionary<string, Json.Typed.MdAcct>(StringComparer.Ordinal);
+        foreach (var item in export.AllItems)
+        {
+            if (item.ObjType != "acct") continue;
+            var acct = Json.Typed.MdAcct.From(item);
+            accounts.TryAdd(acct.Id, acct);
+        }
+
+        // An account's currency code when it is a real account whose currency reads.
+        string? RealCurrency(string? mdId)
+        {
+            if (mdId is null || !accounts.TryGetValue(mdId, out var acct)) return null;
+            if (AccountMapper.TranslateType(acct.TypeCode) is not { } type || type.AccountType == "category")
+                return null;
+            return currencies.ResolveAccount(acct).Currency?.Code;
+        }
+
+        var count = 0;
+        foreach (var item in export.AllItems)
+        {
+            if (item.ObjType != "txn") continue;
+            var txn = Json.Typed.MdTxn.From(item);
+            if (RealCurrency(txn.AcctId) is not { } primary) continue;
+            foreach (var split in txn.Splits)
+            {
+                if (RealCurrency(split.AcctId) is { } other
+                    && !string.Equals(primary, other, StringComparison.Ordinal))
+                {
+                    count++;
+                    break;
+                }
+            }
+        }
+        return count;
     }
 
     private static void AuditUnreadRootKeys(IReadOnlyList<MdItem> txns)

@@ -4,22 +4,21 @@
 * Date: 2026-06-09
 * Related: ADR-0002 (categories are accounts), ADR-0029 (investment
   transaction editor), the `Typeahead` primitive, the OFX/QIF
-  importers (which produce the transfer-to-category legs that
-  motivated this)
+  importers (which produce transfer-to-category legs)
 
 ## Context
 
 The account/category dropdowns in the transaction editors were
 built ad-hoc on the `Typeahead` primitive, and the inconsistency
-produced real friction:
+causes friction:
 
 1. **Truncation.** `Typeahead` defaults to 8 visible rows. Only
    `SecurityField` overrode it; the Category, Transfer, and Fee
    pickers silently capped at 8 — a ledger with dozens of
    categories couldn't browse past the first few.
-2. **Ambiguity.** Rows showed only the account/category name. Real
-   ledgers have duplicate names (several categories literally
-   named "Fees" is an ordinary case), and the picker gave no way
+2. **Ambiguity.** Rows showed only the account/category name. Names
+   need not be unique (several categories named "Fees" under
+   different parents is legitimate), and the picker gave no way
    to tell them apart.
 3. **A latent correctness bug.** The shared `useIdBackedTypeahead`
    resolved the typed/picked text back to an id by **string
@@ -50,8 +49,7 @@ list plus the caller's `isEligible` predicate.
   Category, Fee — stay chrome-free).
 - **Grouped sections:** a pinned **Frequent** group (see below),
   then **accounts by type** (Bank, Investment, …), then
-  **categories by Income / Expense**. The user asked for this
-  sub-grouping explicitly.
+  **categories by Income / Expense**.
 - **Per-row qualifier:** account type, or category kind + immediate
   parent name (`Expense · Business`) — disambiguates duplicate
   names.
@@ -112,21 +110,17 @@ Fee. `SecurityField` keeps its own picker (it's over securities,
 not accounts, and already shows-all + holdings-prioritize +
 create-new).
 
-**Adopted everywhere as of 2026-09-15.** The bank register's `TxnRowEdit` was
-the last holdout — it used a bespoke `counterpartyText` +
-`resolveCounterpartyId` flow with careful system-account round-trip handling,
-and neither symbol exists anywhere in `src/` any more. Both the single-posting
-branch and every leg of a split now use this picker, and the system-account
-round-trip it worked around is handled by the picker's own rule: the displayed
-name comes from the FULL accounts map, so a system-account counterparty (the
-bank-feed sync stamps incoming rows with Uncategorized) still round-trips even
-though it is not offered for a fresh pick.
+**Adopted everywhere as of 2026-09-15.** The bank register's `TxnRowEdit` uses
+it for the single-posting branch and for every leg of a split. A
+system-account counterparty (the bank-feed sync stamps incoming rows with
+Uncategorized) round-trips through the picker's own rule: the displayed name
+comes from the FULL accounts map, so the counterparty still shows although it
+is not offered for a fresh pick.
 
-Two props were added for the splits grid (2026-09-16), both additive:
-`invalid` marks the control without the message `error` renders below it —
-which would push a leg row past the grid's fixed height budget — and
-`onOpenChange` lets a short container bring the input to the top of its
-scrollport so the panel has somewhere to open into.
+The splits grid (2026-09-16) uses one additive prop, `invalid`, which marks the
+control without the message `error` renders below it — that message would push
+a leg row past the grid's fixed height budget. The panel needs no room inside
+the scroller, because it is fixed to the viewport (ADR-0103 D7).
 
 ## Consequences
 
@@ -146,8 +140,6 @@ scrollport so the panel has somewhere to open into.
 - "Frequent" counts counterparty legs across the account's history;
   a one-off heavy query per editor open (cached 60 s). Bounded —
   it's one account's counterparties, not the whole ledger.
-- The bank editor temporarily keeps the old picker until the
-  follow-up — the "global" goal is reached in two steps, not one.
 
 ## Alternatives considered
 
@@ -157,16 +149,15 @@ scrollport so the panel has somewhere to open into.
 - **A usage-tracking table for frequents.** More infrastructure +
   a write-path on every save, for data already derivable from
   history. Rejected.
-- **Tabbed panel (two tabs) instead of filter buttons.** The user
-  weighed tabs vs. lighter filter-buttons; buttons won — they keep
-  one list visible, add less click-friction, and degrade cleanly
+- **Tabbed panel (two tabs) instead of filter buttons.** Rejected:
+  filter buttons keep one list visible, add less click-friction, and degrade cleanly
   to no-chrome for single-domain fields.
 
 ## Update (2026-07-22) — categories as a tree, path-typing, copy/paste
 
 The v1 picker rendered categories as a FLAT alphabetical leaf list with a
-`kind · parent` tag. Three complaints (against the bank editor's Category field)
-drove an enhancement, all on the same shared component:
+`kind · parent` tag. It had three gaps (visible on the bank editor's Category
+field), all closed on the same shared component:
 
 1. **No copy/paste.** The closed field showed the full path (`Bills/Electricity`)
    but focusing it wiped the value to an empty query — so it couldn't be selected
@@ -185,3 +176,18 @@ and typing/pasting a full path + Enter commits it directly. Real ACCOUNTS keep t
 flat type-grouped list (no tree). Selection stays id-based; the Frequent pin,
 domain tabs, and Alt+1/2/3 are unchanged. The tree + path-match logic lives in a
 pure, unit-tested helper (`categoryPickerRows.ts`).
+
+## Update (2026-11-04) — opening on a value the picker does not offer
+
+A current value can be one the picker never offers for a fresh pick: any value
+the caller's `isEligible` refuses, such as the system Uncategorized category the
+bank feed stamps on new rows, or an inactive category or account. It is shown
+from the full accounts map (above), and opening on it pre-fills its full path and
+selects it as for any value, so the copy round trip still works. That text does
+not narrow the list until the user types: it matches no offered row, so the list
+would read "No matches". The full list shows instead, with no row highlighted:
+the value is in none of the rows, so Enter picks nothing until the user moves to
+a row or types. The first keystroke replaces the selected text and narrows the
+list as usual. A value the picker offers opens as before, narrowed to its own row
+and its ancestors. This holds wherever the picker opens pre-filled: the
+register's editors, the home screen's Review, and every other field built on it.

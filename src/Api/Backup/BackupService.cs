@@ -120,8 +120,8 @@ public sealed class BackupService
     /// touching a database: decrypt it in full (every chunk tag is authenticated),
     /// read its table of contents, and require TABLE DATA for every table in the
     /// live catalog except the declared exclusions. A backup that passes this can
-    /// be decrypted and holds each table's rows; one that does not is the one that
-    /// would have reported success for two months while unrestorable.
+    /// be decrypted and holds each table's rows; one that does not would otherwise
+    /// report success while unrestorable, for as long as nobody tried to restore it.
     /// </summary>
     /// <exception cref="BackupException">The artifact is not a restorable backup.</exception>
     public async Task VerifyAsync(string passphrase, Stream artifact, CancellationToken ct = default)
@@ -312,7 +312,7 @@ public sealed class BackupService
     /// dropping every object the service role owns, from a hand-kept list of object
     /// kinds: migration 200 added an aggregate and 202 two composite types the list
     /// did not know, and from v0.62.0 every restore over an existing install failed
-    /// in production — logged, while the UI said "Restore complete". Building a new
+    /// — logged, while the UI said "Restore complete". Building a new
     /// database needs no list, and needs nothing dropped until there is something
     /// better to swap in.
     /// </remarks>
@@ -368,31 +368,10 @@ public sealed class BackupService
                     ["--no-owner", "--exit-on-error", $"--use-list={listPath}", $"--dbname={incoming}", dumpPath],
                     env, ct).ConfigureAwait(false);
 
-                // A backup from a NEWER build has migrations this one does not know.
-                // DbUp ignores journal rows it has no script for, so it would come
-                // up half-working and be reported restored.
                 var applied = (await RunPsqlAsync(env, incoming,
                         "SELECT scriptname FROM \"__schema_migrations\";", ct).ConfigureAwait(false))
                     .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-                var unknown = UnknownMigrations(applied,
-                    Directory.EnumerateFiles(migrationsDirectory, "*.sql").Select(Path.GetFileName)!);
-                if (unknown.Count > 0)
-                    throw new BackupException(
-                        "This backup was taken by a newer version of Coffer than this one — it carries "
-                        + $"migrations this build does not have ({string.Join(", ", unknown.Take(3))}"
-                        + (unknown.Count > 3 ? ", …" : "") + "). Upgrade, then restore.");
-
-                // An older backup is brought up to this build's schema BEFORE it can
-                // become live, so a migration that cannot apply to it fails the
-                // restore instead of the next boot.
-                try
-                {
-                    MigrationRunner.Run(ConnectionStringFor(incoming), migrationsDirectory, _logger);
-                }
-                catch (Exception ex) when (ex is not BackupException and not OperationCanceledException)
-                {
-                    throw new BackupException($"the backup could not be migrated to this version: {ex.Message}", ex);
-                }
+                BringRestoredDatabaseUpToDate(applied, ConnectionStringFor(incoming), migrationsDirectory, _logger);
 
                 // Every way in granted before the backup, and the Drive identity (FU-076,
                 // ADR-0074), reset in one transaction before the marker below says this
@@ -497,6 +476,43 @@ public sealed class BackupService
         using var tools = OpenPgTools();
         await DropOwnDatabasesAsync(tools.Env, tools.Database, $"{tools.Database}_pre_restore_", keep, ct)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The step of a restore after the dump has been loaded into the incoming database:
+    /// refuse a backup from a newer build, then migrate an older one to this build's
+    /// schema, before it can become live.
+    /// </summary>
+    /// <param name="applied">The incoming database's journal.</param>
+    /// <remarks>
+    /// <para>A backup from a NEWER build has migrations this one does not know. DbUp
+    /// ignores journal rows it has no script for, so it would come up half-working and be
+    /// reported restored. "Known" is every name this build journals, its C# migration
+    /// steps included (<see cref="MigrationRunner.KnownScriptNames"/>): a backup taken
+    /// after an upgrade carries their rows too, and a set of only the SQL files would
+    /// refuse every such backup.</para>
+    /// <para>An older backup is brought up to this build's schema BEFORE it can become
+    /// live, so a migration that cannot apply to it fails the restore instead of the next
+    /// boot.</para>
+    /// </remarks>
+    internal static void BringRestoredDatabaseUpToDate(
+        IReadOnlyCollection<string> applied, string connectionString, string migrationsDirectory, ILogger logger)
+    {
+        var unknown = UnknownMigrations(applied, MigrationRunner.KnownScriptNames(migrationsDirectory));
+        if (unknown.Count > 0)
+            throw new BackupException(
+                "This backup was taken by a newer version of Coffer than this one — it carries "
+                + $"migrations this build does not have ({string.Join(", ", unknown.Take(3))}"
+                + (unknown.Count > 3 ? ", …" : "") + "). Upgrade, then restore.");
+
+        try
+        {
+            MigrationRunner.Run(connectionString, migrationsDirectory, logger);
+        }
+        catch (Exception ex) when (ex is not BackupException and not OperationCanceledException)
+        {
+            throw new BackupException($"the backup could not be migrated to this version: {ex.Message}", ex);
+        }
     }
 
     /// <summary>Migrations a backup has applied that this build does not ship.</summary>
@@ -721,10 +737,9 @@ public sealed class BackupService
     /// <c>WITH (FORCE)</c>: FORCE terminates every other session in the database
     /// first, and a non-superuser may not terminate a superuser's — which is what an
     /// autovacuum worker counts as. A freshly loaded database draws autovacuum within
-    /// a minute, so FORCE failed exactly when a worker happened to be in it
-    /// ("permission denied to terminate process"; 6 of 6 in a probe with a worker
-    /// present) and left the database behind. A plain DROP has Postgres cancel the
-    /// autovacuum worker itself and wait for it (6 of 6). Our own connections are
+    /// a minute, so FORCE fails whenever a worker is in it ("permission denied to
+    /// terminate process") and leaves the database behind. A plain DROP has Postgres
+    /// cancel the autovacuum worker itself and wait for it. Our own connections are
     /// closed before any drop, so there is nothing for FORCE to do — and a session
     /// that is genuinely someone else's should make the drop refuse, not be killed.
     /// </summary>

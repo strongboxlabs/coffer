@@ -11,7 +11,7 @@ describe('safeReturnUrl', () => {
     });
 
     it.each([
-        // The audit's S6: the tab is dropped when the browser parses the URL.
+        // ADR-0105 D8: the tab is dropped when the browser parses the URL.
         '/%09/evil.com',
         '/\t/evil.com',
         '/\n/evil.com',

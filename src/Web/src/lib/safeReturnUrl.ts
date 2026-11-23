@@ -3,10 +3,10 @@
  * — or null when it isn't safe to follow.
  *
  * The server sets `returnUrl` only when /oauth/authorize bounces an anonymous user to
- * sign in, so the only target ever needed is that endpoint on this origin. The check
- * used to be string prefixes ("starts with /, not // or /\"), which `/%09/evil.com`
- * passed: the browser drops the tab when it parses the URL and lands on `//evil.com`
- * (2026-10-12 security audit, S6). Parsing it the way the browser will, then requiring
+ * sign in, so the only target ever needed is that endpoint on this origin. A
+ * string-prefix check ("starts with /, not // or /\") passes `/%09/evil.com`: the
+ * browser drops the tab when it parses the URL and lands on `//evil.com`
+ * (ADR-0105 D8). Parsing it the way the browser will, then requiring
  * this origin and that one path, leaves nothing to drop.
  */
 export function safeReturnUrl(raw: string, origin: string = window.location.origin): string | null {

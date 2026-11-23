@@ -15,8 +15,8 @@
 -- allocation and the returns valuations.
 --
 -- WHY IT MATTERS BEYOND TIDINESS. net_worth_history called BOTH per-instant feeders
--- inside a loop over its period ends — the identical shape that made a whole-ledger
--- TWR cost ~60 s and that migrations 200/201 exist to remove. Its MaxHistoryPoints
+-- inside a loop over its period ends — the identical shape that made whole-ledger
+-- TWR slow and that migrations 200/201 exist to remove. Its MaxHistoryPoints
 -- cap is the same species as the MaxReturnsBoundaries cap deleted in 0.62.0: a limit
 -- that exists because the call underneath is O(instants) round trips. Moving it onto
 -- the batched feeders makes it one query per feeder for the whole series.

@@ -34,7 +34,11 @@ export interface InvestmentTxnDraftHook {
     setPrice:              (next: number | null) => void;
     setAmount:             (next: number | null) => void;
     setCategoryAccountId:  (next: string | null) => void;
+    /** Picks the transfer account. Another account drops the second amount (ADR-0114
+     *  D14): one that comes back is prefilled afresh, as for a new entry. */
     setTransferAccountId:  (next: string | null) => void;
+    /** The second amount's magnitude; `fixed` when typed (the prefill passes false). */
+    setTransferAmount:     (next: number | null, fixed: boolean) => void;
     setFeeAccountId:       (next: string | null) => void;
     setFeeAmount:          (next: number | null) => void;
     setTags:               (next: readonly string[]) => void;
@@ -106,7 +110,14 @@ export function useInvestmentTxnDraft(args: {
         setPrice:              (v) => update('price', v),
         setAmount:             (v) => update('amount', v),
         setCategoryAccountId:  (v) => update('categoryAccountId', v),
-        setTransferAccountId:  (v) => update('transferAccountId', v),
+        setTransferAccountId:  (v) => setDraft((prev) => {
+            if (prev.transferAccountId === v) return prev;
+            const { transferAmount: _a, transferAmountFixed: _f, ...rest } = prev;
+            return { ...rest, transferAccountId: v };
+        }),
+        setTransferAmount:     (v, fixed) => setDraft((prev) => ({
+            ...prev, transferAmount: v, transferAmountFixed: fixed,
+        })),
         setFeeAccountId:       (v) => update('feeAccountId', v),
         setFeeAmount:          (v) => update('feeAmount', v),
         setTags:               (v) => update('tags', v),
@@ -122,9 +133,9 @@ function shallowEqual<T extends object>(a: T, b: T): boolean {
         const av = a[k];
         const bv = b[k];
         // `tags` is the one array-valued field. Identity would make the draft
-        // dirty the moment TagsInput hands back a new array with the same
-        // contents — which it does on every keystroke that resolves to no
-        // change — and the unsaved-changes prompt would fire on cancel from an
+        // dirty the moment TagSelect hands back a new array with the same
+        // contents — which it does when a tag is checked and then unchecked
+        // again — and the unsaved-changes prompt would fire on cancel from an
         // untouched row.
         if (Array.isArray(av) && Array.isArray(bv)) {
             if (av.length !== bv.length) return false;

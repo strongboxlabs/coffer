@@ -28,10 +28,10 @@
 -- positive quantity at the end, drawn from later buys/reinvests
 -- that were added against the clamped-to-zero base.
 --
--- Real-data evidence, found on a real ledger: a fund holding walked
--- to a fractional share count despite a lifetime SUM of exactly 0.
--- That residual arose entirely from clamp-induced order-dependence
--- on a single day whose many mixed events shared one posted_at.
+-- The failure it produces: a holding whose lifetime SUM is exactly 0
+-- walks to a fractional share count when one day's mixed events share
+-- one posted_at. The residual arises entirely from clamp-induced
+-- order-dependence on that day.
 --
 -- THE FIX
 --

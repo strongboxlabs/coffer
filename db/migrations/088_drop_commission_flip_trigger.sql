@@ -9,7 +9,7 @@
 -- documented mechanism for "complex SQL lives in migrations, called
 -- from LINQ" — engineering-standards §4.2.1).
 --
--- AUDIT (corrected from the earlier ADR §3 table):
+-- AUDIT:
 --
 --   * AccountsRepository.SetIsTradeCommissionAsync is the sole writer
 --     that flips accounts.is_trade_commission.

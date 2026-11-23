@@ -10,8 +10,8 @@
 -- but the DB itself does not REJECT a malformed cross-ledger reference.
 -- That's a defense-in-depth gap.
 --
--- Slice A3 (user directive 2026-05-19: "even at the DB structure")
--- closes it for the investment surface by adopting **composite FKs**:
+-- Isolation holds in the DB structure too, not only in the API. Slice A3
+-- closes the gap for the investment surface by adopting **composite FKs**:
 -- every cross-table reference is on (parent_id, ledger_id) → parent
 -- (id, ledger_id), forcing the referencing row and the referenced
 -- row to live in the same ledger. PostgreSQL refuses any INSERT or
@@ -166,7 +166,7 @@ COMMENT ON COLUMN security_prices.ledger_id IS
 -- Triggers on txn_legs maintain `balance_after` (migration 011) and
 -- the swing view (migration 023). The backfill UPDATE doesn't change
 -- amount / account_id / header_id, so per-row trigger work is pure
--- overhead — and on a large real ledger that overhead pushes the
+-- overhead — and on a large ledger that overhead can push the
 -- UPDATE past DbUp's per-statement timeout. Suspend USER triggers
 -- on the table for the duration of the backfill, then re-enable.
 -- Postgres' system triggers (FK / NOT NULL / CHECK enforcement)

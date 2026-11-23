@@ -15,8 +15,8 @@ namespace Coffer.Api.Notifications.Providers;
 /// <para>
 /// <b>It cannot detect absence</b>, and that limitation is the point of
 /// <see cref="SubscriberCapability"/>. This subscriber reaches a phone in seconds
-/// when something goes wrong, and says nothing at all when the deployment is dead —
-/// which is the failure that actually happened. Configure this and nothing else and
+/// when something goes wrong, and says nothing at all when the deployment is dead.
+/// Configure this and nothing else and
 /// the install has no way to notice its own silence, so the settings surface warns
 /// when no heartbeat subscriber is enabled.
 /// </para>

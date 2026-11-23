@@ -2,40 +2,34 @@
 -- 197 — chunk on the primary key, not ctid: the ctid keyset re-scanned per chunk
 -- =============================================================================
 --
--- CORRECTION to migration 193. Its header argued:
+-- Migration 193 chunks on ctid, on the premise:
 --
 --   "ctid ... needs no catalog lookup, and PG14+ serves `ctid > $x ORDER BY ctid`
 --    with a TID range scan."
 --
 -- That is true of a ctid **literal** and false of a bound **parameter**, which is
--- what fn_snapshot_write_part actually passes (EXECUTE ... USING). The planner
--- sees an opaque parameter, cannot judge selectivity, and never considers a TID
--- range scan. The mechanism was asserted from documentation instead of read off a
--- plan, and 193 shipped on that assumption.
+-- what fn_snapshot_write_part passes (EXECUTE ... USING). The planner sees an
+-- opaque parameter, cannot judge selectivity, and never considers a TID range scan.
 --
--- What it really did, measured on a real deployment (tens of thousands of
--- headers carrying a large jsonb payload):
+-- The plan it gets, on a ledger whose headers carry a large jsonb payload:
 --
 --   Limit
 --     -> Sort  (Sort Key: t.ctid)
 --          Sort Method: external merge  Disk: (the table's whole payload)
 --          -> Seq Scan on txn_headers
 --               Filter: ((ctid > $2) AND (ledger_id = $1))
---               Rows Removed by Filter: (a handful)
---     Execution Time: 676.249 ms
+--               Rows Removed by Filter: (other ledgers' rows)
 --
--- Every chunk sequentially scanned the whole table, built to_jsonb for every
--- matching row (to_jsonb sits above the Sort in the target list), spilled a sort
--- the size of the table's whole payload to disk, and then discarded all but
--- p_chunk_rows of it. Dozens of chunks for txn_headers, more for txn_legs, well
--- over a hundred in total: gigabytes of jsonb constructed and gigabytes of temp
--- files written to produce an artifact a small fraction of that size. Capture
--- took tens of seconds.
+-- Every chunk sequentially scans the whole table, builds to_jsonb for every
+-- matching row (to_jsonb sits above the Sort in the target list), spills a sort
+-- the size of the table's whole payload to disk, and then discards all but
+-- p_chunk_rows of it. Every chunk of every table pays that, so capture
+-- constructs jsonb and writes temp files many times over the size of the
+-- artifact it produces, and the cost grows with table size times chunk count.
 --
--- Note what this means about 193's headline result. Peak anon memory really did
--- fall from a multi-GB peak to tens of MiB, but part of that was Postgres paging
--- the per-chunk sort to disk rather than the chunking being frugal. The memory
--- fix stands; it was just also buying disk I/O nobody had measured.
+-- 193's lower peak anonymous memory is partly Postgres paging the per-chunk sort
+-- to disk rather than the chunking being frugal. The memory fix stands; it costs
+-- disk I/O.
 --
 -- The fix: keyset on the primary key, so an index supplies the order and LIMIT
 -- stops early — to_jsonb is then evaluated only for rows actually returned. Same
@@ -44,10 +38,9 @@
 --   Limit
 --     -> Index Scan using uq_txn_headers_id_ledger
 --          Index Cond: ((id > $2) AND (ledger_id = $1))
---     Execution Time: 40.489 ms   (~31 ms excluding a subselect the function
---                                  does not pay — the ledger is a parameter)
 --
--- No Sort, no temp files, ~20x faster per chunk. Both predicates are index
+-- No Sort, no temp files, and per-chunk work bounded by the chunk rather than
+-- the table. Both predicates are index
 -- conditions because txn_headers carries a composite unique index on
 -- (id, ledger_id); tables with only the `id` primary key still get an ordered
 -- index scan with ledger_id as a cheap filter, which is what matters.
@@ -61,26 +54,23 @@
 -- silently reintroducing an unbounded allocation. The `id` test is a catalog
 -- lookup, not a hardcoded name list.
 --
--- VERIFIED IN THE STRESS LANE, which took two harness fixes to make possible —
--- and the first attempt concluded the opposite:
+-- VERIFIED IN THE STRESS LANE, which needs two things to show the difference:
 --
---   * The seeder wrote headers with six thin columns and no provider_raw_payload,
---     so rows were an order of magnitude narrower than a real ledger's, which run
---     to kilobytes per header. The sort never spilled and there was nothing to
---     fix.
---   * Bulk-seeded tables were never ANALYZEd, so the planner worked from defaults
---     (22 estimated rows against 50000 actual) and chose a bitmap scan plus an
---     external-merge sort for BOTH keysets. They measured within noise of each
---     other, which reads exactly like "this migration does nothing".
+--   * Header rows as wide as an imported ledger's, whose headers carry the
+--     provider's raw payload. With thin rows the sort never spills and the two
+--     keysets look alike.
+--   * Statistics. Bulk-seeded tables that are not ANALYZEd leave the planner on
+--     default estimates, where it picks a bitmap scan plus an external-merge
+--     sort for BOTH keysets and they measure within noise of each other.
 --
--- With realistic payload width and statistics present, the per-chunk plan matches
--- what was measured on the real deployment — ctid: 555 ms with a 159 MB external merge; id: 39 ms
--- on an Index Scan, no sort. End to end, capture of a 50000-transaction ledger
--- goes 18289 ms -> 5136 ms (back-to-back runs, only this migration differing).
+-- The stress lane seeds a synthetic 50000-transaction ledger with payload-width
+-- headers and ANALYZEs it. Its per-chunk plans take the two shapes above: ctid,
+-- 555 ms with a 159 MB external merge; id, 39 ms on an Index Scan with no sort.
+-- Capture of that ledger takes 18289 ms on the ctid keyset and 5136 ms on the id
+-- keyset, with only this migration differing.
 --
--- No claim is made here about restore: those figures moved between runs for
--- reasons unrelated to this change (container warm-up), and a number that cannot
--- be attributed is not evidence.
+-- Restore timings on that lane vary between runs with container warm-up, so they
+-- do not measure this change and none are given here.
 --
 -- Still not addressed: octet_length(chunk::text) is a full extra pass over the
 -- payload for a display figure, and after this migration it is the largest
@@ -99,8 +89,9 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     -- Ceiling for the unchunked path only. Two uuid columns per row, so even at
-    -- this many rows the aggregate is tens of MB — far from the multi-GB peak
-    -- that mig 193 set out to eliminate — but it fails rather than degrading quietly.
+    -- this many rows the aggregate is tens of MB — bounded, unlike the
+    -- whole-payload aggregate mig 193 set out to eliminate — but it fails rather
+    -- than degrading quietly.
     c_unchunked_max CONSTANT bigint := 500000;
 
     v_has_id  boolean;
@@ -176,9 +167,8 @@ BEGIN
         EXIT WHEN v_rows < p_chunk_rows;
 
         -- The next keyset bound is the last element of the chunk we just ordered
-        -- by id, so it needs no aggregate. Postgres 16 has no max(uuid) — the
-        -- first cut of this migration called one and every capture failed with
-        -- "function max(uuid) does not exist". Reached only on a full chunk, so
+        -- by id, so it needs no aggregate. Postgres 16 has no max(uuid) — a call
+        -- fails with "function max(uuid) does not exist". Reached only on a full chunk, so
         -- v_chunk is guaranteed non-empty here.
         v_last := (v_chunk -> -1 ->> 'id')::uuid;
     END LOOP;

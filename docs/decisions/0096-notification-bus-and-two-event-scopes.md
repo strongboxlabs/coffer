@@ -6,23 +6,22 @@
 
 ## Context
 
-On 2026-08-13 the snapshot and backup jobs stopped. Snapshots and backups were
-both dead for days, and **nothing said anything**. The only
-trace was `LogError` lines inside a container and an unrelated-looking 500 from
-`/oauth/authorize`. Migration 194 later added `consecutive_failures`,
+When the snapshot and backup jobs stop, **nothing says anything**. The only
+trace is `LogError` lines inside a container, and whatever unrelated-looking
+error a request that needed the database happens to return. Migration 194 later added `consecutive_failures`,
 `last_error` and `last_failure_at`, and `SchedulerRunner` disables a job after
 five consecutive failures — but none of that is surfaced or pushed anywhere, so
 the raw material for an alert exists and no alert does.
 
-On 2026-08-18 a second instance of the same shape surfaced. A one-off data scrub
-had reshaped in-kind transfers on three accounts, correctly recomputed the FIFO
-projections, and never recomputed balances. The register showed wrong figures on
-those accounts for **months**. It came to light because somebody happened to run
-a maintenance action by hand. Migration 206 made that state *checkable* without
+A second failure has the same shape. A data change that recomputes some
+projections and not others — a scrub that recomputes the FIFO projections and
+never the balances — leaves the register showing wrong figures on the affected
+accounts **indefinitely**, until somebody happens to run a maintenance action by
+hand. Migration 206 made that state *checkable* without
 writing to it, which is necessary and not sufficient: a check nobody runs is a
 check nobody runs.
 
-Both incidents are the same defect, and it is not a missing check. It is that
+Both failures are the same defect, and it is not a missing check. It is that
 **Coffer has no way to tell anyone anything.** There is no SMTP path, no webhook,
 no push of any kind. What exists:
 
@@ -57,8 +56,8 @@ wrong:
    `ledger_id` puts both under one policy, and a NULL scope is exactly where
    fail-open and fail-closed bugs live. This codebase's authorization boundary
    *is* RLS (`coffer_app` NOBYPASSRLS vs `coffer_service` BYPASSRLS), and the
-   incident that prompted this ADR was invisible state. A nullable-scope policy
-   on the table meant to make things visible would be a poor joke.
+   problem this ADR solves is invisible state. A nullable-scope policy on the
+   table meant to make things visible would defeat it.
 2. **Lifecycle differs.** A ledger event belongs to its ledger and should die
    with it. "The backup failed" is a fact about the *installation* and must
    outlive deleting a ledger. A shared table with a foreign key means deleting a
@@ -95,6 +94,16 @@ different handling. Subscribers filter on both — the activity feed takes
 everything for a ledger, an in-app badge takes `warning` and `critical`, an
 external monitor takes named topics.
 
+*Amended 2026-11-02 ([ADR-0110](0110-upgrade-from-the-app.md)): a topic for upgrades, and the first
+topic that must be asked for.* `upgrade` joins the topics at deployment scope only
+(`ck_system_events_topic`, migration 272; ledger events keep their list, because an upgrade is a
+fact about the installation). An available release is `upgrade.available` at warning, cleared by
+`upgrade.current` at info. A destination with no topic filter means every topic **except the
+opt-in ones**, of which `upgrade` is the only one: a new warning-level topic would otherwise reach
+every webhook and monitor already configured, unasked. A destination hears it by naming it, and the
+System form's checkbox ("Also send upgrade notices", off by default) sends the full topic list with
+`upgrade` in it. A heartbeat destination never receives it: an upgrade is nobody's liveness signal.
+
 ### D4 — Publishing is not persisting
 
 `ledger_operations` records every four-hourly quote refresh, and it should keep
@@ -112,8 +121,8 @@ design.
 **A system event about the system being broken cannot be written by the broken
 system.** If Postgres is unreachable or the container is dead, nothing writes
 `system_events`, no subscriber fires, and no in-app cue lights up. That is
-precisely what happened for days: the app was not reporting a problem
-because the app was not running the job.
+precisely the silent stop the Context describes: the app does not report a
+problem because the app is not running the job.
 
 So absence-detection has to live **outside** the thing it monitors. A
 dead-man's-switch monitor — healthchecks.io or equivalent — is pinged on success
@@ -161,7 +170,7 @@ So the interface **declares its class**, and the configuration surface **warns w
 no heartbeat-capable subscriber is configured**. Without that warning, provider
 choice becomes a way to opt out of the entire point of this ADR by accident:
 someone wires up a Discord webhook, sees test messages arrive, believes they are
-covered, and has silently kept the days-long failure mode.
+covered, and has silently kept the silent-stop failure mode.
 
 ### D8 — Subscriber credentials are sealed in the database, not docker secrets
 
@@ -170,7 +179,7 @@ the master key via `LedgerKeyService.OpenWithMasterKey` — the pattern Drive sy
 already uses for its outbound OAuth blob.
 
 Not the `secrets/` docker-secret pattern, despite that being where the database
-passwords live, and the distinction is worth stating because it looked like the
+passwords live, and the distinction is worth stating because it looks like the
 obvious answer: **docker secrets are for credentials the application needs BEFORE
 it can read a database.** Postgres passwords qualify. A webhook URL does not — it
 is a user-configurable integration, added and changed at runtime, and one file per
@@ -191,10 +200,10 @@ reports it either, because the job never runs and therefore never pings. The
 result is a check that can only ever read "never", with no surface anywhere
 saying why.
 
-This is not hypothetical: a real deployment's bank-feed check sat at "never" for
-months. The heartbeat URL was configured correctly, the handler was registered,
-the monitor keys matched on both sides — the feed-sync schedule had simply never
-been switched on, and every part of the system was silent about the combination.
+The combination is easy to reach: a bank-feed check with its heartbeat URL
+configured correctly, the handler registered, the monitor keys matching on both
+sides — and the feed-sync schedule never switched on. The check reads "never"
+indefinitely, and every part of the system is silent about why.
 
 So the API returns both halves. `LedgerMonitorStatus` carries the coverage map
 *and* `WatchingNothing` — monitors a switch is bound to whose job is not enabled
@@ -206,7 +215,7 @@ monitor (it runs every tick and cannot be disabled), so testing it for an enable
 `scheduled_jobs` row would find none and flag the one monitor that always runs —
 precisely the false warning D5 exists to prevent.
 
-The general rule this instance teaches: a coverage metric computed over one set
+The general rule: a coverage metric computed over one set
 cannot report the elements that fall outside that set, and those elements are
 often the interesting ones. Asking "what did the denominator exclude?" is worth
 doing every time a system reports coverage.
@@ -245,9 +254,9 @@ Attractive because the table already has `family`/`status`/`details`. Rejected:
 fit without exactly the nullable-scope hole above.
 
 **In-app notifications only, no external monitor.** No new dependency and no
-secret to manage. Rejected on D5: it cannot detect the failure that prompted the
-ADR. It is the design that was already in place, and it produced days of
-silence.
+secret to manage. Rejected on D5: it cannot detect a silent stop, because it
+cannot report its own absence: when the container or the database is down,
+nothing raises the notification and nothing shows that none was raised.
 
 **A single hardcoded provider (healthchecks.io).** Less machinery, and it covers
 the guarantee. Rejected: a self-hoster may already run Uptime Kuma, ntfy or nothing
@@ -265,13 +274,13 @@ It is a good second subscriber once the bus exists.
 A degraded run resets the failure count by design (a flaky provider must not auto-disable
 a daily job), so a run that did NONE of its work — an auto-snapshot skipped because every
 slot holds a manual one, a quote refresh with every provider down, a feed sync where every
-connection needs reconnecting — reported a Warning every day for as long as it lasted, and
-the schedule showed grey "completed with warnings" (FU-071). Those three now return
+connection needs reconnecting — reports a Warning every day for as long as it lasts, and
+the schedule shows grey "completed with warnings" (FU-071). Those three now return
 `JobRunOutcome.DidNothing`, which is still Degraded (no count, no auto-disable) but does not
 move the schedule's new `last_success_at` (migration 252). Once nothing has been done for a
 day the run's signal is Critical and says for how long, and the schedule is red. A partial
 run (some prices, some connections) is unchanged: a standing Warning, never escalated.
 
-Alongside it (FU-070): a run whose handler killed its own connection had its outcome saved on
-that dead context, so `last_error` and `consecutive_failures` stayed unwritten and only the
-log knew. The runner now writes the outcome on a fresh connection when that save fails.
+Alongside it (FU-070): a run whose handler kills its own connection would have its outcome
+saved on that dead context, leaving `last_error` and `consecutive_failures` unwritten and only
+the log knowing. The runner now writes the outcome on a fresh connection when that save fails.

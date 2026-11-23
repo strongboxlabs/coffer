@@ -21,15 +21,18 @@ public sealed class ReminderImportStep
 {
     private readonly TransactionsRepository _transactionsRepo;
     private readonly RecurringTransactionsRepository _repository;
+    private readonly TagsRepository _tagsRepo;
     private readonly string _importSource;
 
     public ReminderImportStep(
         TransactionsRepository transactionsRepo,
         RecurringTransactionsRepository repository,
+        TagsRepository tagsRepo,
         string importSource)
     {
         _transactionsRepo = transactionsRepo;
         _repository = repository;
+        _tagsRepo = tagsRepo;
         _importSource = importSource;
     }
 
@@ -42,6 +45,8 @@ public sealed class ReminderImportStep
         var headers = new List<TxnHeaderRow>();
         var legs = new List<TxnLegRow>();
         var rows = new List<RecurringTransactionRow>();
+        // The templates' tags, in encounter order (the first spelling of a new name is created).
+        var tagSets = new List<ImportTagSet>();
 
         foreach (var item in context.Export.AllItems)
         {
@@ -60,6 +65,10 @@ public sealed class ReminderImportStep
             headers.Add(result.Header);
             legs.AddRange(result.Legs);
             rows.Add(result.Row);
+            if (result.HeaderTags is { Count: > 0 } headerTags)
+                tagSets.Add(new ImportTagSet(result.Header.Id, IsHeader: true, headerTags));
+            foreach (var seed in result.LegTags ?? [])
+                tagSets.Add(new ImportTagSet(seed.LegId, IsHeader: false, seed.Tags));
         }
 
         if (headers.Count == 0)
@@ -70,6 +79,9 @@ public sealed class ReminderImportStep
         var upsert = await _transactionsRepo
             .BulkUpsertAsync(headers, legs, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
+
+        // Seed-once makes every proposed id the persisted one (BulkUpsertAsync).
+        await _tagsRepo.LinkImportedAsync(context.LedgerId, tagSets, cancellationToken).ConfigureAwait(false);
 
         var written = 0;
         foreach (var row in rows)
@@ -94,6 +106,7 @@ public sealed class ReminderImportStep
         var step = new ReminderImportStep(
             new TransactionsRepository(connection),
             new RecurringTransactionsRepository(connection),
+            new TagsRepository(connection),
             importSource);
         return await step.ExecuteAsync(context, cancellationToken).ConfigureAwait(false);
     }

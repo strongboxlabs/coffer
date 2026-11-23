@@ -7,10 +7,10 @@ namespace Coffer.Api.Endpoints;
 /// staged whole-database restore actually did (ADR-0061, amended 2026-10-09).
 /// </summary>
 /// <remarks>
-/// <para>The browser that staged a restore used to wait for <c>/healthz</c> and
-/// then say "Restore complete". <c>/healthz</c> answers whether the restore worked
-/// or not, so a failed restore — logged, database untouched — was reported as a
-/// success. The boot now records its outcome; this reads it back.</para>
+/// <para><c>/healthz</c> answers whether the restore worked or not, so a browser
+/// that waited for it and then said "Restore complete" would report a failed
+/// restore — logged, database untouched — as a success. The boot records its
+/// outcome; this reads it back.</para>
 /// <para>Anonymous, because after an applied restore the caller's session belongs
 /// to a database that no longer exists (and the setup restore has no session at
 /// all). The attempt id is a random GUID handed only to the caller who staged the

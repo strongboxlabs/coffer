@@ -9,14 +9,17 @@ import type {
 
 /** Upload an OFX/QFX file for preview. No DB writes — returns the
  *  set of discovered account blocks so the wizard can ask the user
- *  which one maps to the current Coffer account. */
+ *  which one maps to the current Coffer account. `accountId` is that
+ *  account, so the server reads the file under its currency as the
+ *  import will (ADR-0114 D15). */
 export async function previewOfx(
     ledgerId: string,
     file: Blob,
+    accountId?: string,
 ): Promise<OfxPreviewResponse> {
     return requestMultipart<OfxPreviewResponse>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/ingest/ofx/preview`,
-        buildFormData({ file }, 'upload.ofx'),
+        buildFormData({ file, accountId }, 'upload.ofx'),
     );
 }
 

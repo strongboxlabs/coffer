@@ -10,14 +10,14 @@ namespace Coffer.Api.Tests.Integration.Infra;
 /// <remarks>
 /// <para>
 /// <b>Why the rest of the suite does not cover this.</b> Every scheduler tick runs over
-/// <c>ServiceDbContextFactory</c>, which used to build its options with
-/// <c>UseNpgsql</c> and nothing else — no recompute interceptors — while
-/// <c>Program.cs</c> attaches three to the request-scoped context. So a background
-/// writer saved legs and left <c>txn_header_account_balances</c>, holdings, lots and
-/// trade-sourced prices untouched, and nothing noticed: <c>IngestOrchestrator</c>
-/// states in three places that balance recompute "is automatic via
-/// LegDerivedRecomputeInterceptor", which is true on the request path and was false on
-/// the worker path <c>FeedSyncJobHandler</c> actually uses.
+/// <c>ServiceDbContextFactory</c>, while <c>Program.cs</c> attaches three recompute
+/// interceptors to the request-scoped context. A factory whose options carry
+/// <c>UseNpgsql</c> and nothing else lets a background writer save legs and leave
+/// <c>txn_header_account_balances</c>, holdings, lots and trade-sourced prices
+/// untouched, and request-path tests cannot see it: <c>IngestOrchestrator</c> states in
+/// three places that balance recompute "is automatic via
+/// LegDerivedRecomputeInterceptor", which holds on the worker path
+/// <c>FeedSyncJobHandler</c> uses only because the factory attaches the same three.
 /// </para>
 /// <para>
 /// <b>The context under test must come from the FACTORY.</b>
@@ -35,11 +35,12 @@ namespace Coffer.Api.Tests.Integration.Infra;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ServiceContextRecomputeTests
+public sealed class ServiceContextRecomputeTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ServiceContextRecomputeTests(PostgresFixture fixture) => _fixture = fixture;
+    public ServiceContextRecomputeTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     /// <summary>
     /// Running balances and the denormalised posting count — both derived, both written
@@ -48,25 +49,20 @@ public sealed class ServiceContextRecomputeTests
     [Fact]
     public async Task A_leg_written_through_the_service_factory_gets_its_balance_recomputed()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("Checking");
         var groceries = await ledger.AddBankAccountAsync("Groceries");
 
         var headerId = Guid.NewGuid();
         var postedAt = new DateTime(2026, 4, 1, 12, 0, 0, DateTimeKind.Utc);
 
-        await using (var db = _fixture.NewServiceFactory().Create())
+        await using (var db = Db.NewServiceFactory().Create())
         {
-            db.Add(new TxnHeaderRow
-            {
-                Id = headerId,
-                LedgerId = ledger.LedgerId,
-                Origin = "manual",
-                Payee = "Market",
-                PostedAt = postedAt,
-                TransactedAt = postedAt,
-                CreatedAt = postedAt,
-            });
+            var header = TxnHeaderRow.NewTransaction(headerId, ledger.LedgerId, checking.Id);
+            header.Payee = "Market";
+            header.PostedAt = postedAt;
+            header.TransactedAt = postedAt;
+            db.AddHeader(header, createdAt: postedAt);
             db.Add(new TxnLegRow
             {
                 Id = Guid.NewGuid(),
@@ -87,11 +83,12 @@ public sealed class ServiceContextRecomputeTests
             });
 
             // No explicit recompute call anywhere in this test. That absence IS the
-            // assertion — the interceptor has to do it on save.
-            await db.SaveChangesAsync();
+            // assertion — the interceptor has to do it on save. The save takes the ledger
+            // write lock first (migration 275), as every writer that recomputes does.
+            await db.SaveChangesUnderLedgerLockAsync(ledger.LedgerId);
         }
 
-        await using var read = _fixture.NewServiceDbContext();
+        await using var read = Db.NewServiceDbContext();
 
         var balance = await read.Set<TxnHeaderAccountBalanceRow>()
             .AsNoTracking()
@@ -126,12 +123,12 @@ public sealed class ServiceContextRecomputeTests
     [Fact]
     public async Task An_investment_leg_written_through_the_service_factory_projects_holdings()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdingsAccountId = brokerage.HoldingsAccountId!.Value;
 
         var securityId = Guid.NewGuid();
-        await using (var seed = _fixture.NewServiceDbContext())
+        await using (var seed = Db.NewServiceDbContext())
         {
             seed.Add(new SecurityRow
             {
@@ -146,19 +143,14 @@ public sealed class ServiceContextRecomputeTests
         var headerId = Guid.NewGuid();
         var postedAt = new DateTime(2026, 4, 2, 12, 0, 0, DateTimeKind.Utc);
 
-        await using (var db = _fixture.NewServiceFactory().Create())
+        await using (var db = Db.NewServiceFactory().Create())
         {
-            db.Add(new TxnHeaderRow
-            {
-                Id = headerId,
-                LedgerId = ledger.LedgerId,
-                Origin = "manual",
-                Action = "buy",
-                Payee = "buy",
-                PostedAt = postedAt,
-                TransactedAt = postedAt,
-                CreatedAt = postedAt,
-            });
+            var header = TxnHeaderRow.NewTransaction(headerId, ledger.LedgerId, brokerage.Id);
+            header.Action = "buy";
+            header.Payee = "buy";
+            header.PostedAt = postedAt;
+            header.TransactedAt = postedAt;
+            db.AddHeader(header, createdAt: postedAt);
             db.Add(new TxnLegRow
             {
                 Id = Guid.NewGuid(),
@@ -183,10 +175,10 @@ public sealed class ServiceContextRecomputeTests
                 PostingRole = "security",
             });
 
-            await db.SaveChangesAsync();
+            await db.SaveChangesUnderLedgerLockAsync(ledger.LedgerId);
         }
 
-        await using var read = _fixture.NewServiceDbContext();
+        await using var read = Db.NewServiceDbContext();
 
         var quantity = await read.Set<HoldingRow>()
             .AsNoTracking()

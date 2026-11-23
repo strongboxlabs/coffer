@@ -25,6 +25,8 @@
  * per-leg textarea heights.
  */
 
+import { amountText } from '@/lib/money';
+
 /** A posting as the editor holds it while being edited. */
 export interface PostingDraft {
     /** Stable id within the editor's lifecycle — used as React
@@ -39,11 +41,43 @@ export interface PostingDraft {
     counterpartyId: string | null;
     /** Free-text amount input. Parsed on save. */
     amount: string;
+    /** The text `amount` was seeded with from a stored or copied figure; absent on a
+     *  line that started blank. A save rounds the amount to its currency's places only
+     *  when the text differs from it, so a stored figure finer than its currency is sent
+     *  as it was when the line was left alone (ADR-0114 D15). */
+    seededAmount?: string;
+    /**
+     * The second amount's magnitude, as typed or seeded: the counterparty's own figure on
+     * a posting between real accounts in different currencies (ADR-0114 D13, D14). Its
+     * sign is always opposite Amount's, so the field holds no sign and a save applies one
+     * (lib/secondAmount). Absent or '' while there is none: the field shows only while
+     * the counterparty is a real account in another currency, and changing the
+     * counterparty drops it (see `withCounterparty`).
+     */
+    otherAmount?: string;
+    /** True once the second amount is typed in or seeded from a stored or copied figure:
+     *  it is never refilled from a rate then. Absent: it follows Amount and the date. */
+    otherFixed?: boolean;
+    /** The text `otherAmount` was seeded with, as for `seededAmount`: a save rounds the
+     *  figure at the other currency's places only when the text differs from it. */
+    seededOtherAmount?: string;
+    /** The line's own memo on a split. On a one-posting transaction the Memo
+     *  field is the side's, not this. */
     legMemo: string;
-    /** Tags on THIS posting (ADR-0103). Distinct from the header's, and not a
-     *  subset of them: the header says what the transaction was, this says what
-     *  the posting was. */
+    /** The line's own tags on a split (ADR-0103). Distinct from the
+     *  transaction's, and not a subset of them: the transaction's say what it
+     *  was, these say what the line was. */
     tags: readonly string[];
+    /** How many tags this line held when it was loaded: the size the tag limit
+     *  measures growth from. 0 for a new line. */
+    tagBaseline: number;
+    /** What this line holds in storage, which a save compares against to send
+     *  only what changed; null for a line nothing is stored for (a new line, or
+     *  any line of a create). Carried on the line, not looked up by leg id, so
+     *  a stored line seeded without one is still compared. `tags` is null when
+     *  the source did not say what the line holds, which is not the same as
+     *  none; the reminder template read always says. */
+    stored: { memo: string; tags: readonly string[] | null } | null;
 }
 
 /**
@@ -60,15 +94,22 @@ export interface PostingSeedLike {
     /** Optional so older callers still satisfy this structurally; absent reads
      *  as "no tags", which is what a posting with none returns anyway. */
     legTags?: readonly string[];
+    /** The counterparty leg's own figure on a transfer between currencies (ADR-0114 D13),
+     *  signed; null or absent on a mirrored pair. */
+    counterpartyAmount?: number | null;
 }
 
 /** The minimum a DUPLICATE-prefill posting must carry. Note `legMemo` is
  *  optional here, matching `PostingPrefill` — a prefill may omit it. */
 export interface PostingPrefillLike {
+    /** A stored line's source leg; read only by the stored path below. */
+    legId?: string | null;
     counterpartyAccountId: string | null;
     amount: number;
     legMemo?: string | null;
     legTags?: readonly string[];
+    /** The counterparty leg's own figure, signed, as for {@link PostingSeedLike}. */
+    counterpartyAmount?: number | null;
 }
 
 let postingKeyCounter = 0;
@@ -79,9 +120,41 @@ export function nextKey(): string {
     return `p_${postingKeyCounter}`;
 }
 
-/** Invert an existing leg into a draft (the EDIT path). */
-export function seedToDraft(s: PostingSeedLike): PostingDraft {
+/**
+ * The second amount a stored or copied counterparty figure seeds (ADR-0114 D14): its
+ * magnitude at the other currency's places, fixed, so it is never refilled from a rate.
+ * Nothing for a mirrored pair, whose field, if the editor shows one, follows Amount.
+ */
+function seededOther(
+    counterpartyAmount: number | null | undefined,
+    otherCurrency: string | null,
+): Pick<PostingDraft, 'otherAmount' | 'otherFixed' | 'seededOtherAmount'> {
+    if (counterpartyAmount === null || counterpartyAmount === undefined) return {};
+    const text = amountText(Math.abs(counterpartyAmount), otherCurrency);
+    return { otherAmount: text, otherFixed: true, seededOtherAmount: text };
+}
+
+/**
+ * The fields a counterparty change writes: the new counterparty, and the second amount
+ * dropped (ADR-0114 D14). A field that comes back, for another account in another
+ * currency, is prefilled afresh, as for a new entry. Unchanged when the id is the same.
+ */
+export function withCounterparty(p: PostingDraft, counterpartyId: string | null): PostingDraft {
+    if (p.counterpartyId === counterpartyId) return p;
+    const { otherAmount: _a, otherFixed: _f, seededOtherAmount: _s, ...rest } = p;
+    return { ...rest, counterpartyId };
+}
+
+/**
+ * Invert an existing leg into a draft (the EDIT path). `currency` is the posting's:
+ * the amount is seeded at its places, with every digit a stored figure carries beyond
+ * them (ADR-0114 D15). Null pads nothing. `otherCurrency` is the counterparty's, the
+ * places a stored second amount is seeded at.
+ */
+export function seedToDraft(s: PostingSeedLike, currency: string | null, otherCurrency: string | null = null): PostingDraft {
+    const amount = amountText(s.amount, currency);
     return {
+        ...seededOther(s.counterpartyAmount, otherCurrency),
         key: nextKey(),
         legId: s.legId,
         // Id-based (ADR-0043): the picker resolves the display name
@@ -89,9 +162,12 @@ export function seedToDraft(s: PostingSeedLike): PostingDraft {
         // counterparty (e.g. Uncategorized) still round-trips even
         // though it isn't offered for a fresh pick.
         counterpartyId: s.counterpartyAccountId,
-        amount: s.amount.toFixed(2),
+        amount,
+        seededAmount: amount,
         legMemo: s.legMemo ?? '',
         tags: s.legTags ?? [],
+        tagBaseline: s.legTags?.length ?? 0,
+        stored: { memo: s.legMemo ?? '', tags: s.legTags ?? [] },
     };
 }
 
@@ -104,21 +180,62 @@ export function emptyDraft(): PostingDraft {
         amount: '',
         legMemo: '',
         tags: [],
+        tagBaseline: 0,
+        stored: null,
     };
 }
 
-/** Map one duplicate-prefill posting to a fresh draft (no legId). The
- *  edit path has `seedToDraft`; this is its new-mode twin. */
-export function prefillToDraft(p: PostingPrefillLike): PostingDraft {
+/** Map one duplicate-prefill posting to a fresh draft (no legId unless
+ *  stored, below). The
+ *  edit path has `seedToDraft`; this is its new-mode twin.
+ *
+ *  `isStored`: the prefill is a stored line being edited through the create
+ *  form (a reminder template's), so its values are what a save compares
+ *  against and what the tag limit measures growth from, and its leg id is
+ *  what the server matches the rebuilt line to the stored one by. `currency` is the
+ *  posting's, as for `seedToDraft`: a copied figure is seeded with every digit it has,
+ *  and is rounded only once the user changes it, so a copy of a figure finer than its
+ *  currency is refused by the API rather than silently changed. A copied second amount
+ *  (`otherCurrency` is the counterparty's) is seeded the same way, and never refilled:
+ *  Duplicate and a reminder template carry both amounts (ADR-0114 D14). */
+export function prefillToDraft(
+    p: PostingPrefillLike,
+    currency: string | null,
+    isStored = false,
+    otherCurrency: string | null = null,
+): PostingDraft {
+    const tags = p.legTags ?? [];
+    const amount = amountText(p.amount, currency);
+    const other = seededOther(p.counterpartyAmount, otherCurrency);
+    if (isStored) {
+        return {
+            ...other,
+            key: nextKey(),
+            legId: p.legId ?? null,
+            counterpartyId: p.counterpartyAccountId,
+            amount,
+            seededAmount: amount,
+            legMemo: p.legMemo ?? '',
+            tags,
+            tagBaseline: tags.length,
+            stored: { memo: p.legMemo ?? '', tags: p.legTags ?? null },
+        };
+    }
     return {
+        ...other,
         key: nextKey(),
         legId: null,
         counterpartyId: p.counterpartyAccountId,
-        amount: p.amount.toFixed(2),
+        amount,
+        seededAmount: amount,
         legMemo: p.legMemo ?? '',
         // A duplicate copies the posting's tags along with its memo and amount:
-        // duplicating a rental split and losing which unit each posting was for
+        // duplicating a split and losing which project each posting was for
         // would defeat the point of having recorded it.
-        tags: p.legTags ?? [],
+        tags,
+        // A copy is a new line: nothing is stored yet, so the limit applies
+        // from zero, as the server applies it to a create.
+        tagBaseline: 0,
+        stored: null,
     };
 }

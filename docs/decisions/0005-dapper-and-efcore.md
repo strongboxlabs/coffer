@@ -21,7 +21,7 @@ EF Core can do both, but: tuple-cursor expressions translate awkwardly, raw SQL 
 
 ### Refinement note (PR 3.6.5, 2026-05-10)
 
-The original wording carved out "Dapper for the register query, merge candidate scans, report aggregations." In practice the API drifted further than intended (Dapper used for routine CRUD across PRs 3.1-3.6) and the carve-out for register paging was based on EF Core's then-awkward composite-cursor expressions. PR 3.6.5 realigns:
+The original wording carved out "Dapper for the register query, merge candidate scans, report aggregations." The API had gone further than that (Dapper used for routine CRUD across PRs 3.1-3.6), and the carve-out for register paging was based on EF Core's then-awkward composite-cursor expressions. PR 3.6.5 realigns:
 
 - All API CRUD migrated to EF Core (`UsersRepository`, `LedgersRepository`, `CredentialsRepository`, `SessionsRepository`, `BootstrapTokenService`, `ChallengeStore`, `SetupEndpoints` inline transaction).
 - `IDbConnectionFactory` and `Dapper` package removed from the API project entirely.

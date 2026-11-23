@@ -1,6 +1,12 @@
+using System.Net;
+using System.Net.Http.Json;
+using System.Text.Json;
+
+using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 
+using Coffer.Api.Contracts;
 using Coffer.Api.Db.Entities;
 using Coffer.Api.Notifications;
 using Coffer.Api.Tests.Integration.Infra;
@@ -11,21 +17,17 @@ namespace Coffer.Api.Tests.Integration.Notifications;
 /// The consistency heartbeat: a daily ping while healthy, which doubles as the all-clear.
 /// </summary>
 /// <remarks>
-/// ConsistencyMonitor published when drift appeared and published nothing when it went,
-/// so a warning stayed on a ledger's list looking current until it aged out of retention.
-/// That is not hypothetical: the first real row the in-app list ever displayed was a
-/// days-old drift warning that had already been resolved.
+/// A monitor that publishes when drift appears and nothing when it clears leaves the
+/// warning on a ledger's list looking current until it ages out of retention, long after
+/// the drift is resolved. The heartbeat is the publication that supersedes it.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ConsistencyClearedTests : IAsyncLifetime
+public sealed class ConsistencyClearedTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ConsistencyClearedTests(PostgresFixture fixture) => _fixture = fixture;
-
-    public Task InitializeAsync() => NotificationTargetReset.ClearAsync(_fixture);
-
-    public Task DisposeAsync() => Task.CompletedTask;
+    public ConsistencyClearedTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     /// <summary>A heartbeat provider, so Wants() takes the monitor-matching branch.</summary>
     private sealed class SpySwitch : INotificationSubscriber
@@ -45,7 +47,7 @@ public sealed class ConsistencyClearedTests : IAsyncLifetime
 
     private async Task BindSwitchAsync(Guid ledgerId, string monitor)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         db.LedgerNotificationSubscribers.Add(new LedgerNotificationSubscriberRow
         {
             LedgerId = ledgerId,
@@ -53,7 +55,7 @@ public sealed class ConsistencyClearedTests : IAsyncLifetime
             DisplayName = "switch:" + monitor,
             MinSeverity = NotificationSeverity.Info,
             Monitors = monitor,
-            ConfigCiphertext = _fixture.NewLedgerKeyService().SealWithMasterKey(
+            ConfigCiphertext = Db.NewLedgerKeyService().SealWithMasterKey(
                 System.Text.Encoding.UTF8.GetBytes(
                     System.Text.Json.JsonSerializer.Serialize(
                         new SubscriberConfig("https://hc.invalid/ping")))),
@@ -62,26 +64,26 @@ public sealed class ConsistencyClearedTests : IAsyncLifetime
     }
 
     private ConsistencyMonitor MonitorDeliveringTo(INotificationSubscriber spy) => new(
-        _fixture.NewServiceFactory(),
+        Db.NewServiceFactory(),
         new NotificationPublisher(
-            _fixture.NewServiceFactory(),
-            _fixture.NewLedgerKeyService(),
+            Db.NewServiceFactory(),
+            Db.NewLedgerKeyService(),
             new[] { spy },
             NullLogger<NotificationPublisher>.Instance, TimeProvider.System),
         NullLogger<ConsistencyMonitor>.Instance, TimeProvider.System);
 
     private ConsistencyMonitor NewMonitor() => new(
-        _fixture.NewServiceFactory(),
+        Db.NewServiceFactory(),
         new NotificationPublisher(
-            _fixture.NewServiceFactory(),
-            _fixture.NewLedgerKeyService(),
+            Db.NewServiceFactory(),
+            Db.NewLedgerKeyService(),
             Array.Empty<INotificationSubscriber>(),
             NullLogger<NotificationPublisher>.Instance, TimeProvider.System),
         NullLogger<ConsistencyMonitor>.Instance, TimeProvider.System);
 
     private async Task SeedEventAsync(Guid ledgerId, string severity, string eventKey)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         db.LedgerEvents.Add(new LedgerEventRow
         {
             LedgerId = ledgerId,
@@ -96,7 +98,7 @@ public sealed class ConsistencyClearedTests : IAsyncLifetime
 
     private async Task<List<string>> ConsistencyKeysAsync(Guid ledgerId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.LedgerEvents.AsNoTracking()
             .Where(e => e.LedgerId == ledgerId && e.Topic == NotificationTopics.Consistency)
             .OrderBy(e => e.OccurredAt)
@@ -109,7 +111,7 @@ public sealed class ConsistencyClearedTests : IAsyncLifetime
     {
         // A synthetic ledger has no positions, so the check finds it healthy — which is
         // the state under test. The seeded warning is what makes this a TRANSITION.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedEventAsync(ledger.LedgerId, NotificationSeverity.Warning, "consistency.drift");
 
         await NewMonitor().CheckAllAsync();
@@ -126,7 +128,7 @@ public sealed class ConsistencyClearedTests : IAsyncLifetime
         // is indistinguishable from a check whose app has died. A switch bound to
         // consistency needs the ping on a predictable cadence or healthchecks marks it
         // down from inactivity while everything is fine.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
         await NewMonitor().CheckAllAsync();
 
@@ -138,11 +140,11 @@ public sealed class ConsistencyClearedTests : IAsyncLifetime
     {
         // Without these a heartbeat target could never match it: Wants() routes on
         // monitor name plus signal, so an event with neither reaches no switch at all.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
         await NewMonitor().CheckAllAsync();
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.LedgerEvents.AsNoTracking()
             .SingleAsync(e => e.LedgerId == ledger.LedgerId && e.EventKey == "consistency.ok");
         Assert.Equal(NotificationSeverity.Info, row.Severity);
@@ -155,7 +157,7 @@ public sealed class ConsistencyClearedTests : IAsyncLifetime
         // tick — every fifteen minutes — so an unthrottled ping would write ~96 rows per
         // ledger per day into a table nothing prunes below a year, and would bury the
         // warnings the in-app list exists to show.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedEventAsync(ledger.LedgerId, NotificationSeverity.Warning, "consistency.drift");
 
         var monitor = NewMonitor();
@@ -167,18 +169,91 @@ public sealed class ConsistencyClearedTests : IAsyncLifetime
         Assert.Single(keys, k => k == "consistency.ok");
     }
 
+    /// <summary>
+    /// The drift summary says what each projection's rows are out of step with: the
+    /// transactions, for a figure derived from them ("N of M disagree with the
+    /// transactions"); the brokerage, for a brokerage's holdings, in the Maintenance
+    /// panel's words ("N of M brokerages out of step"). The heartbeat is true of every
+    /// projection.
+    /// </summary>
+    [Fact]
+    public async Task The_drift_summary_says_what_each_projection_disagrees_with()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var securityId = await ledger.AddSecurityAsync(name: "Security M", ticker: "SECM");
+        Guid brokerage;
+        await using (var factory = new ApiFactory(Db).WithoutDevAuth())
+        {
+            using var client = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
+            client.DefaultRequestHeaders.Add("Cookie", $"__Host-coffer.session={await ledger.IssueSessionCookieAsync()}");
+            var made = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/accounts",
+                new CreateAccountRequest { Name = "Brokerage M", AccountType = "investment", CurrencyCode = "USD" });
+            Assert.Equal(HttpStatusCode.Created, made.StatusCode);
+            brokerage = (await made.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetGuid();
+            // A second brokerage, which stays in step: the count is of every brokerage
+            // checked, and more than one reads "brokerages".
+            var other = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/accounts",
+                new CreateAccountRequest { Name = "Brokerage N", AccountType = "investment", CurrencyCode = "USD" });
+            Assert.Equal(HttpStatusCode.Created, other.StatusCode);
+            var bought = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/investment-transactions",
+                new CreateInvestmentTransactionRequest
+                {
+                    BrokerageAccountId = brokerage,
+                    PostedAt = new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
+                    Action = "buy",
+                    SecurityId = securityId,
+                    Shares = 10m,
+                    Price = 10m,
+                    Amount = 100m,
+                });
+            Assert.Equal(HttpStatusCode.Created, bought.StatusCode);
+        }
+
+        // Premise: the ledger is healthy, and the heartbeat says so of every projection.
+        await NewMonitor().CheckAllAsync();
+        await using (var db = Db.NewDbContext())
+        {
+            var ok = await db.LedgerEvents.AsNoTracking()
+                .SingleAsync(e => e.LedgerId == ledger.LedgerId && e.EventKey == "consistency.ok");
+            Assert.Equal("Every projection agrees.", ok.Summary);
+            var state = await db.LedgerConsistencyStates.SingleAsync(r => r.LedgerId == ledger.LedgerId);
+            state.LastCheckedAt = null;
+            state.Healthy = null;
+            await db.SaveChangesAsync();
+        }
+
+        // The write an edit before migration 274 made: the brokerage's row alone. The
+        // trade's dollar price then disagrees with the brokerage's new currency, and the
+        // holdings account with the brokerage.
+        await using (var seed = Db.NewDbContext())
+        {
+            await seed.Accounts.Where(a => a.Id == brokerage)
+                .ExecuteUpdateAsync(s => s.SetProperty(a => a.CurrencyCode, "EUR"));
+        }
+
+        await NewMonitor().CheckAllAsync();
+
+        await using var read = Db.NewDbContext();
+        var drift = await read.LedgerEvents.AsNoTracking()
+            .SingleAsync(e => e.LedgerId == ledger.LedgerId && e.EventKey == "consistency.drift");
+        Assert.Equal(
+            "trade_prices: 1 of 1 disagree with the transactions. "
+            + "holdings_currency: 1 of 2 brokerages out of step.",
+            drift.Summary);
+    }
+
     [Fact]
     public async Task The_all_clear_is_info_so_it_does_not_fill_the_problem_list()
     {
         // Recovery is good news. The row exists so the earlier warning can be MARKED
         // resolved, not so anyone is told twice — and the list is filtered to warnings
         // and above precisely so good news cannot crowd out bad.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedEventAsync(ledger.LedgerId, NotificationSeverity.Warning, "consistency.drift");
 
         await NewMonitor().CheckAllAsync();
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var severity = await db.LedgerEvents.AsNoTracking()
             .Where(e => e.LedgerId == ledger.LedgerId && e.EventKey == "consistency.ok")
             .Select(e => e.Severity)
@@ -192,7 +267,7 @@ public sealed class ConsistencyClearedTests : IAsyncLifetime
         // The point of the whole change, proven end to end rather than inferred from the
         // stored row: a switch can only go green if the event actually REACHES it, and
         // Wants() routes heartbeat targets on monitor name plus signal.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await BindSwitchAsync(ledger.LedgerId, NotificationMonitors.Consistency);
 
         var spy = new SpySwitch();
@@ -209,7 +284,7 @@ public sealed class ConsistencyClearedTests : IAsyncLifetime
         // One URL is one check. A snapshot switch held green by the consistency check
         // would be false coverage of exactly the kind the monitor binding exists to
         // remove.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await BindSwitchAsync(ledger.LedgerId, NotificationMonitors.Snapshot);
 
         var spy = new SpySwitch();

@@ -1,14 +1,12 @@
 -- ---------------------------------------------------------------------------
 -- 239 — report a trade price nothing derives any more, instead of guessing.
 --
--- Migrations 236, 237 and 238 each ended with a DELETE calibrated to one
--- ledger: a narrow price band around the importer's nominal placeholder, plus a
--- floor on what the security normally trades at. Those thresholds came from
--- looking at a few securities in one dataset. Measured against that very
--- dataset they address only a sliver of the orphaned trade prices — and on
--- someone else's install, whose placeholder figures sit elsewhere, they would do
--- nothing at all while 238 simultaneously removes the only thing that was
--- surfacing the problem.
+-- Migrations 236, 237 and 238 each end with a DELETE bounded by fixed figures: a
+-- narrow price band around the importer's nominal placeholder, plus a floor on
+-- what the security normally trades at. A fixed band only reaches figures that
+-- fall inside it: it removes the orphaned trade prices inside the band, and on an
+-- install whose placeholder figures sit elsewhere it does nothing at all, while
+-- 238 removes the only check that reports the problem.
 --
 -- The general statement needs no thresholds: a `trade`-source price on a day
 -- where the rule derives nothing is not backed by anything. It was written by a

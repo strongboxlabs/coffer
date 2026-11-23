@@ -22,15 +22,12 @@ namespace Coffer.Api.Tests.Integration.Scheduling;
 /// real database with a real publisher, and asserts what arrived at the subscriber.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
+public sealed class LedgerJobMonitorDeliveryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public LedgerJobMonitorDeliveryTests(PostgresFixture fixture) => _fixture = fixture;
-
-    public Task InitializeAsync() => NotificationTargetReset.ClearAsync(_fixture);
-
-    public Task DisposeAsync() => Task.CompletedTask;
+    public LedgerJobMonitorDeliveryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     /// <summary>A heartbeat provider, so Wants() takes the monitor-matching branch.</summary>
     private sealed class SpyHeartbeat : INotificationSubscriber
@@ -66,19 +63,19 @@ public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
     }
 
     private NotificationPublisher PublisherFor(params INotificationSubscriber[] subs) =>
-        new(_fixture.NewServiceFactory(),
-            _fixture.NewLedgerKeyService(),
+        new(Db.NewServiceFactory(),
+            Db.NewLedgerKeyService(),
             subs,
             NullLogger<NotificationPublisher>.Instance, TimeProvider.System);
 
     private byte[] SealedConfig() =>
-        _fixture.NewLedgerKeyService().SealWithMasterKey(Encoding.UTF8.GetBytes(
+        Db.NewLedgerKeyService().SealWithMasterKey(Encoding.UTF8.GetBytes(
             JsonSerializer.Serialize(new SubscriberConfig("https://hc.invalid/ping"))));
 
     private async Task AddLedgerSwitchAsync(
         Guid ledgerId, string monitor, string? minSeverity = null)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         db.LedgerNotificationSubscribers.Add(new LedgerNotificationSubscriberRow
         {
             LedgerId = ledgerId,
@@ -116,7 +113,7 @@ public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
             [handler.JobType] = handler,
         };
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await new SchedulerRunner().RunDueAsync(
             db, handlers, DateTime.UtcNow, NullLogger.Instance, default,
             PublisherFor(spy));
@@ -126,7 +123,7 @@ public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
     [Fact]
     public async Task A_clean_run_pings_the_switch_watching_that_job()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await AddLedgerSwitchAsync(ledger.LedgerId, NotificationMonitors.QuoteRefresh);
         await SeedDueJobAsync(ledger, NotificationMonitors.QuoteRefresh);
 
@@ -151,9 +148,9 @@ public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
         // MinSeverity, which is the only reason those switches are green. Apply the floor
         // to heartbeats and every success ping vanishes; the check then goes red from
         // inactivity, reporting the JOB as dead when it was the notification layer that
-        // stopped. The deployment-scope twin of this is pinned as "THE D5 BUG" in
-        // NotificationRoutingTests; ledger scope had no equivalent.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // stopped. The deployment-scope twin of this is pinned under ADR-0096 D5 in
+        // NotificationRoutingTests; this is the ledger-scope equivalent.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await AddLedgerSwitchAsync(
             ledger.LedgerId, NotificationMonitors.QuoteRefresh, NotificationSeverity.Warning);
         await SeedDueJobAsync(ledger, NotificationMonitors.QuoteRefresh);
@@ -173,9 +170,9 @@ public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
     public async Task A_degraded_run_reports_the_switch_DOWN()
     {
         // The end-to-end version of the trap: QuoteOrchestrator swallows provider
-        // exceptions, so this run "succeeded" as far as the old code could tell. The
-        // check must go red anyway.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // exceptions, so this run "succeeds" as far as a did-it-throw check can tell.
+        // The check must go red anyway.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await AddLedgerSwitchAsync(ledger.LedgerId, NotificationMonitors.QuoteRefresh);
         await SeedDueJobAsync(ledger, NotificationMonitors.QuoteRefresh);
 
@@ -190,7 +187,7 @@ public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
     [Fact]
     public async Task A_thrown_run_reports_the_switch_DOWN()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await AddLedgerSwitchAsync(ledger.LedgerId, NotificationMonitors.Snapshot);
         await SeedDueJobAsync(ledger, NotificationMonitors.Snapshot);
 
@@ -213,7 +210,7 @@ public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
         // One URL is one check. A snapshot switch must not be held green by the quote
         // refresh running — that is the false coverage the monitor binding exists to
         // remove, and it is the reason the signal names its job.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await AddLedgerSwitchAsync(ledger.LedgerId, NotificationMonitors.Snapshot);
         await SeedDueJobAsync(ledger, NotificationMonitors.QuoteRefresh);
 
@@ -228,8 +225,8 @@ public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
     {
         // The isolation that makes per-ledger monitors sound. Both ledgers watch the same
         // MONITOR NAME, so nothing but the target query's ledger filter separates them.
-        var mine = await SyntheticLedger.CreateAsync(_fixture);
-        var theirs = await SyntheticLedger.CreateAsync(_fixture);
+        var mine = await SyntheticLedger.CreateAsync(Db);
+        var theirs = await SyntheticLedger.CreateAsync(Db);
         await AddLedgerSwitchAsync(theirs.LedgerId, NotificationMonitors.QuoteRefresh);
         await SeedDueJobAsync(mine, NotificationMonitors.QuoteRefresh);
 
@@ -245,7 +242,7 @@ public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
         // Announcing must never cost a job. The run advanced and was recorded before the
         // notification was attempted; a broken webhook must not undo that or abandon the
         // rest of the tick.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await AddLedgerSwitchAsync(ledger.LedgerId, NotificationMonitors.QuoteRefresh);
         await SeedDueJobAsync(ledger, NotificationMonitors.QuoteRefresh);
 
@@ -256,18 +253,62 @@ public sealed class LedgerJobMonitorDeliveryTests : IAsyncLifetime
                 new OutcomeHandler(NotificationMonitors.QuoteRefresh, JobRunOutcome.Ok()),
         };
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var ran = await new SchedulerRunner().RunDueAsync(
             db, handlers, DateTime.UtcNow, NullLogger.Instance, default,
             PublisherFor(throwing));
 
         Assert.Equal(1, ran);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var job = await read.ScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.LedgerId == ledger.LedgerId);
         Assert.True(job.Enabled);
         Assert.True(job.NextRunAt > DateTime.UtcNow);
+    }
+
+    [Fact]
+    public async Task A_job_that_switches_itself_off_is_announced_under_its_own_subject()
+    {
+        // ADR-0102 D1: the disable is `<job type>.disabled`, so the job's own next
+        // `<job type>.succeeded` clears it once it is re-enabled and runs. Under the old
+        // shared `scheduler.` subject nothing ever cleared it.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using (var seed = ledger.NewDbContext())
+        {
+            seed.ScheduledJobs.Add(new ScheduledJobRow
+            {
+                LedgerId = ledger.LedgerId,
+                JobType = NotificationMonitors.FeedSync,
+                Enabled = true,
+                HourLocal = 3,
+                MinuteLocal = 0,
+                ConfiguredByUserId = ledger.UserId,
+                NextRunAt = DateTime.UtcNow.AddMinutes(-5),
+                ConsecutiveFailures = SchedulerRunner.DisableAfterConsecutiveFailures - 1,
+            });
+            await seed.SaveChangesAsync();
+        }
+
+        await RunAsync(ledger, new OutcomeHandler(
+            NotificationMonitors.FeedSync, JobRunOutcome.Ok(), throwMessage: "bank down"));
+
+        await using var read = Db.NewServiceDbContext();
+        var events = await read.LedgerEvents.AsNoTracking()
+            .Where(e => e.LedgerId == ledger.LedgerId)
+            .Select(e => new { e.EventKey, e.Topic, e.Severity })
+            .ToListAsync();
+
+        var disabled = Assert.Single(events, e => e.EventKey.EndsWith(".disabled", StringComparison.Ordinal));
+        Assert.Equal(NotificationMonitors.FeedSync + ".disabled", disabled.EventKey);
+        Assert.Equal(NotificationTopics.Scheduler, disabled.Topic);
+        Assert.Equal(NotificationSeverity.Critical, disabled.Severity);
+        Assert.DoesNotContain(events, e => e.EventKey == "scheduler.job-disabled");
+
+        // The job really was switched off: the event above is about this tick.
+        await using var jobs = Db.NewDbContext();
+        Assert.False((await jobs.ScheduledJobs.AsNoTracking()
+            .SingleAsync(j => j.LedgerId == ledger.LedgerId)).Enabled);
     }
 
     private sealed class ThrowingSubscriber : INotificationSubscriber

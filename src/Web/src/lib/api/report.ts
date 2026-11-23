@@ -2,10 +2,12 @@ import type {
     PinnedReport,
     ReportResult,
     ReportSpec,
+    ReturnsSeriesResult,
     SavedReport,
     SavedReportVisibility,
 } from '../../types/report';
 import { request } from './_request';
+import { withToday } from './_today';
 
 /**
  * Serialize a spec into the query string the summary endpoint reads.
@@ -17,9 +19,20 @@ import { request } from './_request';
  */
 export function specToQuery(spec: ReportSpec): string {
     const p = new URLSearchParams();
-    p.set('measure', spec.measure);
-    p.set('groupBy', spec.groupBy);
-    if (spec.bucket !== 'None') p.set('bucket', spec.bucket);
+    if (spec.kind === 'returns') {
+        // The returns endpoint's own parameters: an interval (never a day), one
+        // account or the ledger, and whether each account is drawn beside it.
+        p.set('interval', returnsInterval(spec.bucket));
+        if (spec.accountId) p.set('accountId', spec.accountId);
+        p.set('includeAccounts', String(!spec.accountId && spec.includeAccounts !== false));
+        // The benchmark rides with the spec whatever the view: the Gain view hides the
+        // control and keeps the pick (ADR-0114 D1).
+        if (spec.benchmark) p.set('benchmark', spec.benchmark);
+    } else {
+        p.set('measure', spec.measure);
+        p.set('groupBy', spec.groupBy);
+        if (spec.bucket !== 'None') p.set('bucket', spec.bucket);
+    }
 
     if (spec.dateMode === 'Sliding') {
         p.set('dateMode', 'Sliding');
@@ -30,6 +43,7 @@ export function specToQuery(spec: ReportSpec): string {
         if (spec.from) p.set('from', spec.from);
         if (spec.to) p.set('to', spec.to);
     }
+    if (spec.kind === 'returns') return p.toString();
 
     if (spec.tagId) p.set('tagId', spec.tagId);
     if (spec.rollup) p.set('rollup', 'true');
@@ -37,13 +51,38 @@ export function specToQuery(spec: ReportSpec): string {
     return p.toString();
 }
 
-/** Run a report. A GET, so the result is linkable and reloadable. */
+/**
+ * Run a report. A GET, so the result is linkable and reloadable. The user's local
+ * date rides along, never in the spec a save persists: a sliding window then ends
+ * where the register's Scheduled rows begin.
+ */
 export function fetchReportSummary(
     ledgerId: string,
     spec: ReportSpec,
 ): Promise<ReportResult> {
+    const query = withToday(new URLSearchParams(specToQuery(spec)));
     return request<ReportResult>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/reports/summary?${specToQuery(spec)}`,
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/reports/summary?${query.toString()}`,
+    );
+}
+
+/** A returns interval from the spec's bucket. The report has no day and no "none": anything else is a month. */
+function returnsInterval(bucket: ReportSpec['bucket']): 'month' | 'quarter' | 'year' {
+    return bucket === 'Quarter' ? 'quarter' : bucket === 'Year' ? 'year' : 'month';
+}
+
+/**
+ * Run the Returns report: a GET like the summary, with the user's today beside it.
+ * A `benchmark` that is not a symbol's shape is 400; a well-formed symbol the ledger
+ * no longer holds is answered, with `benchmark_not_in_ledger` (ADR-0114 D1).
+ */
+export function fetchReturnsSeries(
+    ledgerId: string,
+    spec: ReportSpec,
+): Promise<ReturnsSeriesResult> {
+    const query = withToday(new URLSearchParams(specToQuery(spec)));
+    return request<ReturnsSeriesResult>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/reports/returns-series?${query.toString()}`,
     );
 }
 
@@ -71,6 +110,9 @@ export function createSavedReport(
  * Patch a saved report. Omitted fields are left alone server-side, which is
  * what lets a rename and a re-share be separate acts without either resending
  * the spec.
+ *
+ * A spec whose `benchmark` is neither absent, null nor a symbol's shape is refused
+ * with 400 on create and patch alike; it is not checked against the ledger's list.
  */
 export function patchSavedReport(
     ledgerId: string,

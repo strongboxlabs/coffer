@@ -1,15 +1,20 @@
 import { useEffect, useMemo, useState, type Dispatch, type SetStateAction } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import {
     createCsvMapping, fetchCsvMappings, updateCsvMapping, validateCsvMapping,
 } from '@/lib/api';
-import type { CsvDelimiterName, CsvMapping, CsvMappingProblem } from '@/lib/types';
+import type {
+    CsvDecimalSeparatorName, CsvDelimiterName, CsvMapping, CsvMappingProblem,
+} from '@/lib/types';
 import { Button } from '@/components/ui/Button';
+import { usePendingChoiceProps } from '@/components/ui/pending';
+import { PendingLabel } from '@/components/ui/PendingLabel';
 import { LayoutNameDialog } from '@/components/imports/LayoutNameDialog';
 import { errorMessage } from '@/lib/errorMessage';
 
-import { csvDraftYaml, type CsvDraft } from './csvDraft';
+import { csvDraftYaml, separatorIsGuess, type CsvDraft } from './csvDraft';
 import {
     DATE_FORMATS,
     SAMPLE_ROWS,
@@ -30,15 +35,28 @@ const DELIMITER_LABELS: Record<CsvDelimiterName, string> = {
     pipe: 'Pipe  |',
 };
 
+/** Each separator followed by an example, like the delimiter labels (ADR-0114 D15). */
+const DECIMAL_SEPARATOR_LABELS: Record<CsvDecimalSeparatorName, string> = {
+    point: 'Point  1,234.56',
+    comma: 'Comma  1.234,56',
+};
+
+/** A draft with its choices guessed from the sample, the decimal separator's guess
+ *  remembered so the step can say it was guessed (ADR-0114 D15). */
+function guessedFrom(draft: CsvDraft, text: string): CsvDraft {
+    const choices = guessChoices(text);
+    return { ...draft, choices, guessedSeparator: choices.decimalSeparator };
+}
+
 /**
  * Describe a delimited file by pointing at its columns.
  *
  * <b>There is always a document on screen, and the dropdown only chooses where it came
- * from.</b> Selecting a saved layout used to hide the grid, the tabs, every control and
- * the document itself — so "reuse" meant picking a name and hoping, and "override" did
- * not exist at all: the only route to a corrected layout was copying YAML out of
- * settings, saving it under a new name, and deleting the old one. A saved layout now
- * opens in the form exactly like a draft, and can be updated in place.
+ * from.</b> If selecting a saved layout hid the grid, the tabs, every control and the
+ * document itself, "reuse" would mean picking a name and hoping, and "override" would not
+ * exist at all: the only route to a corrected layout would be copying YAML out of
+ * settings, saving it under a new name, and deleting the old one. A saved layout opens
+ * in the form exactly like a draft, and can be updated in place.
  *
  * <b>The form is a view of the document, never a second source of truth.</b> A saved
  * document is loaded by asking the SERVER what it says — the browser does not parse
@@ -70,6 +88,9 @@ export function CsvMappingStep({
     onCancel: () => void;
 }) {
     const queryClient = useQueryClient();
+    // Choosing a saved layout reads it in (a request): the choice holds from the
+    // change, so a second choice never races the first (pending.ts).
+    const pendingChoiceProps = usePendingChoiceProps();
     const saved = useQuery({
         queryKey: ['csv-mappings', ledgerId],
         queryFn: () => fetchCsvMappings(ledgerId),
@@ -79,8 +100,8 @@ export function CsvMappingStep({
     const [sample, setSample] = useState<string | null>(null);
     const [readError, setReadError] = useState<string | null>(null);
     const [problems, setProblems] = useState<CsvMappingProblem[] | null>(null);
-    // Naming happens in a dialog. Revealed inline it had no way of going away again:
-    // once shown it sat there through everything else, and the bar changed height
+    // Naming happens in a dialog. Revealed inline it has no way of going away again:
+    // once shown it sits there through everything else, and the bar changes height
     // under the reader.
     const [naming, setNaming] = useState(false);
 
@@ -103,13 +124,11 @@ export function CsvMappingStep({
             }
             // Only when the draft has nothing yet. Coming BACK from the preview must not
             // re-sniff over the answers that produced it.
-            onDraftChange((d) => (d.choices === null
-                ? { ...d, choices: guessChoices(text) }
-                : d));
+            onDraftChange((d) => (d.choices === null ? guessedFrom(d, text) : d));
         }).catch((e: unknown) => {
             if (cancelled) return;
             setSample('');
-            // Previously swallowed, which left an empty grid, option-less dropdowns and
+            // Not swallowed: that would leave an empty grid, option-less dropdowns and
             // no clue why. A file can genuinely become unreadable between being chosen
             // and being read — moved, renamed, overwritten.
             setReadError(errorMessage(e, 'This file could not be read.'));
@@ -178,6 +197,9 @@ export function CsvMappingStep({
                 // it could. The problem list says why, and the YAML tab can fix it.
                 choices: verdict.mapping !== null ? choicesFromShape(verdict.mapping) : d.choices,
                 parsedFrom: verdict.mapping !== null ? row.definitionYaml : d.parsedFrom,
+                // A saved layout keeps the separator it was saved with and is never
+                // guessed again (ADR-0114 D15).
+                guessedSeparator: null,
                 // Cleared, not set to the layout's name: this field is the value of
                 // the name INPUT and nothing else, and Save-as-copy supplies its own
                 // prefill, so a preloaded name was never read. Dead state rather than
@@ -256,10 +278,10 @@ export function CsvMappingStep({
      * Keep every column number inside the file it describes.
      *
      * Changing the separator re-splits the grid, and a file that had four columns as
-     * tab-separated may have one as comma-separated. The dropdowns then had no option
-     * matching the stored number and rendered BLANK, while the document quietly kept
-     * pointing at a column that no longer exists — and Check said nothing, because the
-     * validator sees a document, not a file.
+     * tab-separated may have one as comma-separated. Unclamped, the dropdowns would have
+     * no option matching the stored number and render BLANK, while the document quietly
+     * keeps pointing at a column that no longer exists — and Check says nothing, because
+     * the validator sees a document, not a file.
      */
     function clampColumns(next: WizardChoices, text: string | null): WizardChoices {
         if (text === null || text === '') return next;
@@ -291,13 +313,10 @@ export function CsvMappingStep({
         if (id === '') {
             // Back to describing this file. Re-guessed rather than left holding the
             // saved layout's answers, which would silently describe a different file.
-            onDraftChange((d) => ({
-                ...d,
-                source: { kind: 'new' },
-                override: null,
-                name: '',
-                choices: sample !== null && sample !== '' ? guessChoices(sample) : d.choices,
-            }));
+            onDraftChange((d) => {
+                const next: CsvDraft = { ...d, source: { kind: 'new' }, override: null, name: '' };
+                return sample !== null && sample !== '' ? guessedFrom(next, sample) : next;
+            });
             return;
         }
         const row = (saved.data ?? []).find((m) => m.id === id);
@@ -323,7 +342,7 @@ export function CsvMappingStep({
     const likelyFormats = useMemo(() => plausibleDateFormats(dateSamples), [dateSamples]);
 
     const tabClass = (active: boolean) =>
-        'border-b-2 px-3 py-1.5 text-sm ' + (active
+        'border-b-2 px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent ' + (active
             ? 'border-accent font-medium text-text'
             : 'border-transparent text-text-muted hover:text-text');
 
@@ -337,7 +356,7 @@ export function CsvMappingStep({
 
     return (
         <>
-            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4 text-sm">
+            <div className="relative min-h-0 flex-1 space-y-3 overflow-y-auto p-4 text-sm">
                 {/* ONE PLACE FOR THE LAYOUT. Choosing one, saving one, updating one
                     and reverting one were spread across the top, middle and bottom of
                     the panel — three controls for one idea, read in three places. They
@@ -347,9 +366,11 @@ export function CsvMappingStep({
                     <label className="block">
                         <span className="text-text-muted">Layout</span>
                         <select
-                            className="mt-1 w-full rounded border border-border bg-surface p-2"
+                            className="mt-1 w-full rounded border border-border bg-surface p-2 aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
                             value={sourceId ?? ''}
-                            onChange={(e) => chooseSource(e.target.value)}
+                            {...pendingChoiceProps<HTMLSelectElement>(busy, {
+                                onChange: (e) => chooseSource(e.target.value),
+                            })}
                         >
                             {/* Not "Describe this file…", which named the SCREEN rather
                                 than the choice and read as an instruction in a list of
@@ -370,9 +391,9 @@ export function CsvMappingStep({
                         </p>
                     ) : null}
 
-                    {/* One weight for the whole row. Revert and Save as copy were
-                        ghosts beside a bordered Update, which read as two bits of text
-                        that happened to be clickable next to one real button. */}
+                    {/* One weight for the whole row. Ghost Revert and Save as copy
+                        beside a bordered Update read as two bits of text that happen
+                        to be clickable next to one real button. */}
                     <div className="flex flex-wrap items-center gap-2">
                         <span className="flex-1 text-xs text-text-muted">
                             {source.kind === 'new'
@@ -384,29 +405,30 @@ export function CsvMappingStep({
                         {source.kind === 'saved' && dirty ? (
                             <>
                                 <Button
-                                    type="button" variant="secondary" size="sm" disabled={busy}
+                                    type="button" variant="secondary" size="sm" pending={busy}
                                     onClick={() => update({ override: source.savedYaml })}
                                 >
                                     Revert
                                 </Button>
                                 <Button
-                                    type="button" variant="secondary" size="sm" disabled={busy}
+                                    type="button" variant="secondary" size="sm" pending={busy}
                                     onClick={() => setNaming(true)}
                                 >
                                     Save as copy…
                                 </Button>
                                 <Button
-                                    type="button" variant="secondary" size="sm" disabled={busy}
+                                    type="button" variant="secondary" size="sm" pending={busy}
                                     onClick={() => overwrite.mutate()}
                                 >
-                                    {overwrite.isPending ? 'Updating…' : 'Update'}
+                                    <PendingLabel pending={overwrite.isPending} label="Update" pendingLabel="Updating…" />
                                 </Button>
                             </>
                         ) : null}
                         {source.kind === 'new' ? (
                             <Button
                                 type="button" variant="secondary" size="sm"
-                                disabled={busy || yaml === ''}
+                                disabled={yaml === ''}
+                                pending={busy}
                                 onClick={() => setNaming(true)}
                             >
                                 Save…
@@ -631,6 +653,39 @@ export function CsvMappingStep({
                                                 </label>
                                             </div>
                                         ) : null}
+
+                                        {/* For either amount shape, so at the foot of the
+                                            fieldset rather than inside one shape's block,
+                                            and built like the step's other format choices
+                                            (ADR-0114 D15). The grid above keeps showing
+                                            the cells as written: the server is the only
+                                            reader of a layout, and the amounts as read
+                                            are on the next step. */}
+                                        <div className="grid grid-cols-2 gap-3 border-t border-border pt-2">
+                                            <label className="block">
+                                                <span className="text-text-muted">Decimal separator</span>
+                                                <select
+                                                    className="mt-1 w-full rounded border border-border bg-surface p-2"
+                                                    value={choices.decimalSeparator}
+                                                    onChange={(e) => edit({
+                                                        decimalSeparator: e.target.value as CsvDecimalSeparatorName,
+                                                    })}
+                                                >
+                                                    {(Object.keys(DECIMAL_SEPARATOR_LABELS) as CsvDecimalSeparatorName[]).map((s) => (
+                                                        <option key={s} value={s}>{DECIMAL_SEPARATOR_LABELS[s]}</option>
+                                                    ))}
+                                                </select>
+                                                {/* Only while the select holds the guess on
+                                                    a layout not yet saved: once changed, the
+                                                    value is no longer the guess, and a saved
+                                                    layout is never guessed again. */}
+                                                {separatorIsGuess(draft) ? (
+                                                    <span className="mt-1 block text-xs text-text-muted">
+                                                        Guessed from the sample.
+                                                    </span>
+                                                ) : null}
+                                            </label>
+                                        </div>
                                     </div>
                                 </fieldset>
                             </div>
@@ -734,10 +789,12 @@ export function CsvMappingStep({
                     type="button"
                     variant="secondary"
                     size="sm"
-                    disabled={check.isPending || yaml === ''}
+                    disabled={yaml === ''}
+                    pending={check.isPending}
+                    pendingLabel="Checking…"
                     onClick={() => check.mutate()}
                 >
-                    {check.isPending ? 'Checking…' : 'Check'}
+                    Check
                 </Button>
                 <Button
                     type="button"
@@ -746,11 +803,14 @@ export function CsvMappingStep({
                     // Dead until there IS a document. It was disabled only while
                     // previewing, so during the moment after a file change — before the
                     // new file had been read — Continue was live and ran the NEW file
-                    // against the PREVIOUS file's mapping.
-                    disabled={previewing || yaml === ''}
+                    // against the PREVIOUS file's mapping. While the file is read,
+                    // it is pending rather than disabled, so it keeps focus.
+                    disabled={yaml === ''}
+                    pending={previewing}
+                    pendingLabel="Reading…"
                     onClick={onContinue}
                 >
-                    {previewing ? 'Reading…' : 'Continue →'}
+                    Continue →
                 </Button>
             </footer>
         </>

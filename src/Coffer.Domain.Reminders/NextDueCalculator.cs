@@ -12,10 +12,10 @@ namespace Coffer.Domain.Reminders;
 /// </summary>
 /// <remarks>
 /// The floor is what stops a long pre-import history from stranding the cursor:
-/// an imported reminder running since 2015 with an acknowledged date of "last
-/// month" lands the cursor on next month's occurrence, not 2015 — and the
-/// caller's catch-up cascade likewise skips only occurrences after the floor, so
-/// firing doesn't mark a decade of phantom backlog. The expansion horizon is
+/// an imported reminder running for years with an acknowledged date of "last
+/// month" lands the cursor on next month's occurrence, not its start date — and
+/// the caller's catch-up cascade likewise skips only occurrences after the floor,
+/// so firing doesn't mark years of phantom backlog. The expansion horizon is
 /// anchored to the later of the series start, the floor, and the latest
 /// individually consumed slot, then extended two years so the window can't be
 /// exhausted before the first open slot.

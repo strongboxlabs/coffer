@@ -43,11 +43,11 @@ public sealed record NotificationSubscriberDto(
 /// <param name="MonitorCoverage">
 /// Every known monitor mapped to whether a dead-man's switch is bound to it. A false
 /// entry means that job could stop happening and nothing outside this install would
-/// notice — the failure that once ran for days unnoticed.
+/// notice — a silent stop, the one failure no in-app alert can report.
 /// <para>
-/// A map, not the boolean this used to be. One healthchecks URL is one check, so
-/// "some heartbeat target exists" was rendered as "absence detection is covered" while
-/// a target bound to backups said nothing about any other job. The uncovered entries
+/// A map, not a boolean. One healthchecks URL is one check, so a boolean "some heartbeat
+/// target exists" would read as "absence detection is covered" while a target bound to
+/// backups says nothing about any other job. The uncovered entries
 /// are the ones worth showing.
 /// </para>
 /// </param>
@@ -108,7 +108,7 @@ public sealed record SystemEventDto(
 /// <param name="Count">
 /// How many distinct SUBJECTS are outstanding — not how many rows. A ledger that has
 /// been drifting for six months has hundreds of consistency.drift rows and exactly one
-/// problem, and "312" would be a worse answer than no number at all. Counting subjects
+/// problem, and a row count would be a worse answer than no number at all. Counting subjects
 /// also makes the number stable while a condition stands, which is what lets a reader
 /// notice it CHANGE.
 /// </param>
@@ -116,6 +116,27 @@ public sealed record LedgerAttentionDto(
     Guid LedgerId,
     string Severity,
     int Count);
+
+/// <summary>
+/// One outstanding problem on a ledger: a subject whose latest warning-or-above event
+/// no later info event has cleared. <c>GET …/notifications/outstanding</c>.
+/// </summary>
+/// <param name="SubjectKey">The subject, with its trailing separator (<c>backup.</c>).</param>
+/// <param name="Topic">The latest problem's topic.</param>
+/// <param name="EventKey">The latest problem's key.</param>
+/// <param name="Severity">The latest problem's severity: warning or critical.</param>
+/// <param name="Summary">The latest problem's summary.</param>
+/// <param name="LatestAt">When the latest problem was recorded.</param>
+/// <param name="FirstUnresolvedAt">The earliest problem since the subject's last
+/// all-clear: when it went wrong and stayed wrong.</param>
+public sealed record OutstandingProblemDto(
+    string SubjectKey,
+    string Topic,
+    string EventKey,
+    string Severity,
+    string Summary,
+    DateTime LatestAt,
+    DateTime FirstUnresolvedAt);
 
 /// <summary>
 /// A ledger's notification settings: its own delivery targets.
@@ -140,3 +161,24 @@ public sealed record LedgerNotificationSettingsDto(
     IReadOnlyList<NotificationSubscriberDto> Subscribers,
     IReadOnlyDictionary<string, bool> MonitorCoverage,
     IReadOnlyList<string> MonitorsWatchingNothing);
+
+/// <summary>
+/// One outstanding deployment-scope subject (ADR-0102, amended for ADR-0110): what is wrong or
+/// waiting for the INSTALLATION, as opposed to a ledger.
+/// </summary>
+/// <param name="Subject">The subject without its separator, e.g. <c>backup</c> or <c>upgrade</c>.</param>
+/// <param name="Severity"><c>warning</c> or <c>critical</c>: the latest event's, as for every subject.</param>
+/// <param name="Since">When its latest problem was recorded.</param>
+public sealed record SystemAttentionSubjectDto(string Subject, string Severity, DateTime Since);
+
+/// <summary>
+/// What the System-settings gear and the System tabs draw: the outstanding deployment-scope subjects,
+/// worst first. The same answer for every admin, and absent for everyone else (the route is admin-only).
+/// </summary>
+/// <param name="Worst">The highest severity beneath the gear, or null for none: one dot per surface.</param>
+/// <param name="UpgradeVersion">The release announced as available while the <c>upgrade</c> subject
+/// stands, so the dot's sentence can name it; null otherwise.</param>
+public sealed record SystemAttentionDto(
+    string? Worst,
+    IReadOnlyList<SystemAttentionSubjectDto> Subjects,
+    string? UpgradeVersion);

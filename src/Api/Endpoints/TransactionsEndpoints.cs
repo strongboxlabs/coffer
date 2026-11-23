@@ -35,6 +35,9 @@ public static class TransactionsEndpoints
                           .RequireLedgerAccess();
 
         group.MapGet("/", ListAsync);
+        // The newest register entries across the ledger, each as its own account's
+        // register draws it: the home screen's To review and Recent transactions.
+        group.MapGet("/entries", LedgerEntriesAsync);
         // Date-aware scroll-track (companion to ADR-0024). One bucket
         // per month-with-activity for the account's register —
         // drives the SPA's custom scroll-track replacement.
@@ -67,8 +70,6 @@ public static class TransactionsEndpoints
         group.MapPost("/{headerId:guid}/approve", ApproveAsync);
         group.MapPost("/{headerId:guid}/merge", MergeAsync);
         group.MapDelete("/{headerId:guid}", DeleteAsync);
-        group.MapPost("/{headerId:guid}/unhide", UnhideAsync);
-        group.MapPost("/{headerId:guid}/move-account", MoveAccountAsync);
         // Slice 2c.6c: per-row similar-payees recall (Tier 1 —
         // exact-match on raw bank payee from prior approved bank
         // rows). Returns ≤5 (payee, counterparty) suggestions the
@@ -85,14 +86,18 @@ public static class TransactionsEndpoints
         // Slice 2c.6d: merge candidates — settled rows (accepted,
         // un-merged, un-won, unhidden) whose aggregated source-
         // account amount matches the target's, within ±7 days.
-        // Editor renders these as "Possible matches" chips;
-        // clicking pre-fills the editor and arms
-        // `mergeFromHeaderId` on the next PATCH.
+        // Editor renders these as "Merge candidates" chips;
+        // picking one folds the edited row into that candidate
+        // through POST /{headerId}/merge on save. Nothing is copied
+        // into the editor.
         group.MapGet("/{headerId:guid}/merge-candidates", MergeCandidatesAsync);
         // Bulk endpoints (ADR-0024). POST (not GET) on selection-summary
         // because the SelectionRequest body can be ~360 KB worst case
         // (10K-id exclude list) — that's outside the safe URL length.
-        group.MapPost("/selection-summary", SelectionSummaryAsync);
+        // It is a read over rows any grant can already GET, so it is gated
+        // at read level like the other compute POSTs: a viewer's selection
+        // bar shows the count and Σ. The bulk writes below stay write-gated.
+        group.MapPost("/selection-summary", SelectionSummaryAsync).AsLedgerRead();
         group.MapPost("/bulk-recon-status", BulkReconStatusAsync);
         group.MapPost("/bulk-delete", BulkDeleteAsync);
         group.MapPost("/bulk-unhide", BulkUnhideAsync);
@@ -137,6 +142,14 @@ public static class TransactionsEndpoints
                 BusinessError.Codes.SelectionKindInvalid,
                 "selection.kind must be one of: explicit, all.");
 
+        // A selection is made on one register, and every register is one
+        // account's: there is no ledger-wide selection (the API serves only
+        // the UI). Answered as the register page answers a missing account_id.
+        if (selection.AccountId is null)
+            return BusinessError.Problem(
+                BusinessError.Codes.AccountNotInLedger,
+                "selection.accountId is required: a selection is made on one register.");
+
         if (selection.Kind == "explicit")
         {
             if (selection.HeaderIds.Count == 0)
@@ -164,10 +177,29 @@ public static class TransactionsEndpoints
     }
 
     /// <summary>
+    /// Refuses, whole and before anything is written, an explicit selection that names
+    /// a transaction the register shows read-only: a bulk action changes the
+    /// transaction, and a read-only row's is changed from the register it belongs to.
+    /// Called by the bulk endpoints that change transactions (delete, unhide, move);
+    /// null when the selection may proceed.
+    /// </summary>
+    private static async Task<IResult?> RefuseReadOnlyRowsAsync(
+        BulkTransactionsRepository bulk, Guid ledgerId, SelectionRequest selection,
+        CancellationToken cancellationToken) =>
+        await bulk.HasReadOnlyRowAsync(ledgerId, selection, cancellationToken).ConfigureAwait(false)
+            ? BusinessError.Problem(
+                BusinessError.Codes.SelectionIncludesReadOnly,
+                "The selection includes a row this register shows read-only, so nothing was changed. "
+                + "Act on it from the account it was entered from, or leave it out of the selection.")
+            : null;
+
+    /// <summary>
     /// <c>GET /api/ledgers/{ledgerId}/transactions</c>. Query params:
     /// <list type="bullet">
-    ///   <item><description><c>account_id</c> — optional. When supplied,
-    ///   narrows to one account within the ledger.</description></item>
+    ///   <item><description><c>account_id</c> — required: the register is one
+    ///   account's (with <c>include_subcategories</c>, a category's and its
+    ///   descendants'). Without it, 422 <c>account-not-in-ledger</c>, as the
+    ///   scroll-track buckets and the status counts answer.</description></item>
     ///   <item><description><c>cursor</c> — opaque continuation token
     ///   from a prior page's <c>cursorForOlder</c> /
     ///   <c>cursorForNewer</c>. Omitted on the first page.</description></item>
@@ -192,7 +224,7 @@ public static class TransactionsEndpoints
         Guid? starting_at,
         int? limit,
         bool? hidden,
-        // Filters (mig 164). All optional; omitted ⇒ no-op.
+        // Filters (RegisterQuery.Filtered). All optional; omitted ⇒ no-op.
         string? search,
         DateOnly? date_from,
         DateOnly? date_to,
@@ -207,7 +239,7 @@ public static class TransactionsEndpoints
         // on its children — so its register is empty without this. Ignored for
         // real accounts, which have no tree.
         bool? include_subcategories,
-        // Sort (mig 166). Display-order only; both whitelisted below.
+        // Sort (RegisterQuery). Display-order only; both whitelisted below.
         string? sort,
         string? dir,
         ICurrentUserAccessor currentUser,
@@ -239,20 +271,22 @@ public static class TransactionsEndpoints
                 BusinessError.Codes.RegisterStatusFilterInvalid,
                 "status must be one of cleared / uncleared / reconciling / scheduled / needs_review.");
 
+        if (account_id is not { } scopedAccountId)
+            return BusinessError.Problem(
+                BusinessError.Codes.AccountNotInLedger,
+                "account_id query parameter is required for the register page.");
+
         var visibleLedger = await ledgers.GetVisibleByIdAsync(
             currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
         if (visibleLedger is null)
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
 
-        if (account_id is { } scopedAccountId)
-        {
-            var belongs = await accounts.BelongsToLedgerAsync(
-                ledgerId, scopedAccountId, cancellationToken).ConfigureAwait(false);
-            if (!belongs)
-                return BusinessError.Problem(BusinessError.Codes.AccountNotInLedger,
-                    "Account does not belong to this ledger.");
-        }
+        var belongs = await accounts.BelongsToLedgerAsync(
+            ledgerId, scopedAccountId, cancellationToken).ConfigureAwait(false);
+        if (!belongs)
+            return BusinessError.Problem(BusinessError.Codes.AccountNotInLedger,
+                "Account does not belong to this ledger.");
 
         var filter = BuildFilter(search, date_from, date_to, amount_min, amount_max,
             security_id, tag, category_id, status, today, include_subcategories ?? false);
@@ -261,8 +295,84 @@ public static class TransactionsEndpoints
             : new RegisterSort(sort, Descending: dir is not "asc");
 
         var page = await register.GetPageAsync(
-            ledgerId, account_id, cursor, effectiveDirection, starting_at,
+            ledgerId, scopedAccountId, cursor, effectiveDirection, starting_at,
             effectiveLimit, hidden ?? false, filter, sortSpec, cancellationToken).ConfigureAwait(false);
+        return Results.Ok(page);
+    }
+
+    /// <summary>Page size of <c>GET /transactions/entries</c> when the client omits <c>limit</c>, and its ceiling.</summary>
+    public const int EntriesMaxLimit = 50;
+
+    /// <summary>
+    /// <c>GET /api/ledgers/{ledgerId}/transactions/entries</c>: the newest register
+    /// entries across the ledger, for the home screen's To review and Recent
+    /// transactions lists (<see cref="RegisterRepository.GetLedgerPageAsync"/>).
+    /// </summary>
+    /// <remarks>
+    /// <para>The scope is every account of the ledger that is not a category and not a
+    /// holdings sibling, active and inactive: the accounts <c>GET /accounts?includeInactive=true</c>
+    /// lists, less its categories. Each entry is drawn exactly as its own account's
+    /// register draws it (ADR-0108 D14), with that account's id and currency; a transfer
+    /// between two of the accounts is an entry on each.</para>
+    /// <para>This is not the ledger-wide branch of <c>GET /transactions</c> that ADR-0108
+    /// D14 removed: that route still requires <c>account_id</c> and pages one register by
+    /// cursor. This one answers a single first page and pages no further.</para>
+    /// <para>Query params:</para>
+    /// <list type="bullet">
+    ///   <item><description><c>needs_review</c> — <c>true</c>: only the entries awaiting
+    ///   review, the register's <c>status=needs_review</c>. Omitted or <c>false</c>: every
+    ///   entry.</description></item>
+    ///   <item><description><c>direction</c> — <c>all</c> (default), <c>inflow</c> or
+    ///   <c>outflow</c>: the CASH-FLOW direction, by the sign of the amount the entry's row
+    ///   shows on its account (zero is neither): a split on its own account by its net, each
+    ///   line on another account by its own amount. Not the register's <c>direction</c> on
+    ///   <c>GET /transactions</c>, which is <c>before</c>/<c>after</c> and pages by cursor.
+    ///   Anything else: 422 <c>transaction-entries-direction-invalid</c>.</description></item>
+    ///   <item><description><c>today</c> — the caller's local date. When sent, entries
+    ///   dated after it (the register's Scheduled) are left out.</description></item>
+    ///   <item><description><c>limit</c> — page size, 1 to <see cref="EntriesMaxLimit"/>;
+    ///   defaults to <see cref="EntriesMaxLimit"/>. Outside that: 422
+    ///   <c>register-limit-invalid</c>, as the register page answers.</description></item>
+    /// </list>
+    /// </remarks>
+    private static async Task<IResult> LedgerEntriesAsync(
+        Guid ledgerId,
+        bool? needs_review,
+        string? direction,
+        DateOnly? today,
+        int? limit,
+        ICurrentUserAccessor currentUser,
+        LedgersRepository ledgers,
+        RegisterRepository register,
+        CancellationToken cancellationToken)
+    {
+        var effectiveLimit = limit ?? EntriesMaxLimit;
+        if (effectiveLimit < 1 || effectiveLimit > EntriesMaxLimit)
+            return BusinessError.Problem(
+                BusinessError.Codes.RegisterLimitInvalid,
+                $"limit must be between 1 and {EntriesMaxLimit}.");
+
+        TransactionDirection? flow = direction switch
+        {
+            null or "all" => TransactionDirection.All,
+            "inflow" => TransactionDirection.Inflow,
+            "outflow" => TransactionDirection.Outflow,
+            _ => null,
+        };
+        if (flow is not { } effectiveDirection)
+            return BusinessError.Problem(
+                BusinessError.Codes.TransactionEntriesDirectionInvalid,
+                "direction must be 'all', 'inflow' or 'outflow'.");
+
+        var visibleLedger = await ledgers.GetVisibleByIdAsync(
+            currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
+        if (visibleLedger is null)
+            return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
+                "Ledger not found or not visible to this user.");
+
+        var page = await register.GetLedgerPageAsync(
+            ledgerId, needs_review ?? false, effectiveDirection, today, effectiveLimit, cancellationToken)
+            .ConfigureAwait(false);
         return Results.Ok(page);
     }
 
@@ -272,7 +382,7 @@ public static class TransactionsEndpoints
         string.IsNullOrWhiteSpace(status)
         || status is "cleared" or "uncleared" or "reconciling" or "scheduled" or "needs_review";
 
-    /// <summary>Allowed sort columns (mig 166). Null/blank = the default
+    /// <summary>Allowed sort columns (<c>RegisterQuery</c>). Null/blank = the default
     /// (date, desc). The investment-only columns (security / shares / price /
     /// action) are accepted on any account — on a non-investment register they
     /// collapse to a harmless, deterministic no-op order (the values coalesce
@@ -315,11 +425,12 @@ public static class TransactionsEndpoints
     /// native browser scrollbar — Google Photos pattern).
     /// </summary>
     /// <remarks>
-    /// <para><c>account_id</c> is required: the scroll-track is a
-    /// per-account UX and the ledger-wide aggregate would change the
-    /// "header counted once" semantics non-trivially.</para>
+    /// <para><c>account_id</c> is required, as for the register page itself:
+    /// every register is one account's.</para>
     ///
-    /// <para>Each bucket carries an entry <c>count</c> and a
+    /// <para>Each bucket carries an entry <c>count</c> (entries as the page
+    /// groups them: a header is one entry on the side it belongs to and one
+    /// per line on an opposite side) and a
     /// <c>sampleHeaderId</c> — the most-recent header in that month
     /// by canonical <c>(posted_at, seq)</c>. The SPA uses the sample
     /// id as the seek anchor when the user clicks / drags to that
@@ -330,7 +441,7 @@ public static class TransactionsEndpoints
         Guid ledgerId,
         Guid? account_id,
         bool? hidden,
-        // Filters (mig 164) — the rail must reflect the same set the page shows.
+        // Filters (RegisterQuery.Filtered) — the rail must reflect the same set the page shows.
         string? search,
         DateOnly? date_from,
         DateOnly? date_to,
@@ -526,6 +637,11 @@ public static class TransactionsEndpoints
     ///   - <c>postings.Count &gt;= 1</c>.
     ///   - Per posting: counterparty present + in ledger;
     ///     counterparty != source; amount != 0.
+    ///   - Per posting between real accounts in different currencies (ADR-0114 D13):
+    ///     <c>counterpartyAmount</c> present, nonzero and opposite in sign to
+    ///     <c>amount</c> (<c>transaction-posting-counterparty-amount-required</c>,
+    ///     <c>transaction-posting-two-amounts-nonzero</c>,
+    ///     <c>transaction-posting-two-amounts-sign</c>). On any other posting it is dropped.
     ///   - Ledger visible to the caller.
     /// </summary>
     private static async Task<IResult> CreateAsync(
@@ -535,6 +651,8 @@ public static class TransactionsEndpoints
         LedgersRepository ledgers,
         AccountsRepository accounts,
         TransactionsRepository transactions,
+        Quotes.MarketSeries.MarketSeriesBackfill backfill,
+        Db.AppDbContext db,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -549,11 +667,9 @@ public static class TransactionsEndpoints
             request.Postings, request.SourceAccountId);
         if (postingRejection is not null) return postingRejection;
 
-        if (request.Tags is { } tags)
-        {
-            var tagsRejection = TagValidation.ValidateTags(tags);
-            if (tagsRejection is not null) return tagsRejection;
-        }
+        if (request.Notes is { } notes
+            && TagValidation.ValidateTags(notes.AllTagNames()) is { } tagsRejection)
+            return tagsRejection;
 
         var visible = await ledgers.GetVisibleByIdAsync(
             currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
@@ -581,18 +697,28 @@ public static class TransactionsEndpoints
             cancellationToken).ConfigureAwait(false);
         if (accountsRejection is not null) return accountsRejection;
 
-        var headerId = await transactions.CreateAsync(
+        // ADR-0114 D11, ADR-0114 D14: a transaction dated before the ledger's earliest day moves
+        // every net-worth pair's start to its day, and one on a brokerage before its first
+        // funding moves the benchmarks' start, so the backfill covers that day for later
+        // entries. The starts are read before the write that can move them.
+        var before = await NeededFxPairs.StartsAsync(db, ledgerId, cancellationToken)
+            .ConfigureAwait(false);
+        var created = await transactions.CreateAsync(
             ledgerId,
             request.SourceAccountId,
             request.PostedAt,
             request.Payee,
-            request.Memo,
             request.CheckNumber,
             request.TransactedAt,
             request.Postings,
-            request.Tags,
+            request.Notes?.Intent(),
             cancellationToken: cancellationToken).ConfigureAwait(false);
+        if (created.Refusal is { } refusal) return AnnotationProblem.Of(refusal);
+        if (created.PostingRefusal is { } posting) return PostingProblem(posting);
+        await backfill.StartIfEarlierAsync(db, ledgerId, currentUser.UserId, before, cancellationToken)
+            .ConfigureAwait(false);
 
+        var headerId = created.HeaderId;
         return Results.Created(
             $"/api/ledgers/{ledgerId}/transactions/{headerId}",
             new { headerId });
@@ -601,23 +727,28 @@ public static class TransactionsEndpoints
     /// <summary>
     /// <c>PATCH /api/ledgers/{ledgerId}/transactions/{headerId}</c>.
     /// Apply user edits to a transaction in one atomic Postgres
-    /// transaction: any subset of header fields (payee, memo,
-    /// posted_at, transacted_at) plus any number of leg edits
-    /// (amount, leg memo). Amount edits trigger a paired override
-    /// on the counterparty leg so ADR-0019's sum-to-zero invariant
-    /// holds server-side — the client never gets to violate it.
+    /// transaction: any subset of header fields (payee, check number,
+    /// posted_at, transacted_at), notes, and a postings reshape
+    /// (ADR-0025). The reshape writes each posting's counterparty leg
+    /// itself, from the posting's amount: negated, so ADR-0019's
+    /// sum-to-zero holds server-side and the client never gets to
+    /// violate it, except on a posting between real accounts in
+    /// different currencies, whose counterparty leg is its
+    /// <c>counterpartyAmount</c> in that account's currency
+    /// (ADR-0114 D13). There, a missing second amount is refused, and
+    /// a zero or same-signed pair is refused unless it is resent equal
+    /// to its two stored legs, from either side.
     ///
     /// Validation:
-    ///   - Empty patch (no header fields AND no leg edits) → 422
-    ///     <c>transaction-patch-empty</c>. Forces the SPA to send
-    ///     only real edits and keeps the override tables free of
-    ///     no-op writes.
+    ///   - Empty patch (no header field, postings, notes or approve) → 422
+    ///     <c>transaction-patch-empty</c>, so the SPA sends only real edits.
     ///   - Cross-ledger header probe → 422
     ///     <c>transaction-not-in-ledger</c> instead of leaking via a
     ///     silent RLS-scoped no-op.
-    ///   - Leg id doesn't belong to the header in the URL → 422
-    ///     <c>transaction-leg-not-in-header</c>; the whole patch is
-    ///     rolled back.
+    ///   - A posting's legId that is no source-side leg of the header → 422
+    ///     <c>transaction-posting-leg-not-in-header</c>; nothing is written.
+    ///   - A posting across currencies the reshape refuses → 422 with its
+    ///     code (above); nothing is written.
     /// </summary>
     private static async Task<IResult> PatchAsync(
         Guid ledgerId,
@@ -629,49 +760,13 @@ public static class TransactionsEndpoints
         AccountsRepository accounts,
         RegisterRepository register,
         TransactionsRepository transactions,
+        Quotes.MarketSeries.MarketSeriesBackfill backfill,
+        Db.AppDbContext db,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        // Presence, not nullness (migration 230): `{"payee": null}` is a
-        // request to CLEAR the payee, which is a header edit and must not read
-        // as an empty body.
-        var hasHeaderField =
-            request.HasPayee
-            || request.HasMemo
-            || request.HasCheckNumber
-            || request.HasPostedAt
-            || request.HasTransactedAt;
-        var hasPostings = request.Postings is not null;
-        // Slice 2c.6a: `approve: true` alone is a valid PATCH — it
-        // clears needs_review without other edits (the user accepted
-        // a bank-feed row as-is). Empty-body 422 still fires when
-        // approve is absent / false AND no other field is supplied.
-        var hasApprove = request.Approve == true;
-        // Slice 2c.6b: `tags: []` (clear) and `tags: [...]` (set)
-        // are both valid standalone PATCHes.
-        var hasTags = request.Tags is not null;
-        // No hasMerge: a merge cannot arrive on this route any more. It is a
-        // command with its own POST, and MergeFromHeaderId is [JsonIgnore] so a
-        // body carrying it is simply a body that set nothing.
-        if (!hasHeaderField && !hasPostings && !hasApprove && !hasTags)
-            return BusinessError.Problem(BusinessError.Codes.TransactionPatchEmpty,
-                "Supply at least one header field, a postings reshape, tags, approve=true, or mergeFromHeaderId.");
-
-        if (request.Postings is { } postings)
-        {
-            if (postings.SourceAccountId == Guid.Empty)
-                return BusinessError.Problem(BusinessError.Codes.TransactionAccountRequired,
-                    "postings.sourceAccountId is required.");
-            var rejection = PostingValidation.ValidatePostings(postings.Items, postings.SourceAccountId);
-            if (rejection is not null) return rejection;
-        }
-
-        if (request.Tags is { } tags)
-        {
-            var tagsRejection = TagValidation.ValidateTags(tags);
-            if (tagsRejection is not null) return tagsRejection;
-        }
+        if (ValidatePatchBody(request) is { } bodyRejection) return bodyRejection;
 
         var visible = await ledgers.GetVisibleByIdAsync(
             currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
@@ -690,40 +785,114 @@ public static class TransactionsEndpoints
             var alreadyReferenced = await transactions
                 .LegAccountIdsAsync(ledgerId, headerId, cancellationToken)
                 .ConfigureAwait(false);
+            // What each kept posting stores, so an amount resent as stored passes the
+            // places rule even when it does not fit its currency (ADR-0114 D15).
+            var stored = await transactions
+                .StoredPairsAsync(ledgerId, headerId, postings2.SourceAccountId, cancellationToken)
+                .ConfigureAwait(false);
             var accountsRejection = await PostingValidation.ValidatePostingAccountsAsync(
                 ledgerId, postings2.SourceAccountId, postings2.Items, accounts,
-                cancellationToken, alreadyReferenced).ConfigureAwait(false);
+                cancellationToken, alreadyReferenced, stored, "postings.items").ConfigureAwait(false);
             if (accountsRejection is not null) return accountsRejection;
         }
 
+        // ADR-0114 D11: a new posting date before the ledger's earliest day moves every
+        // net-worth pair's start to it, and a date or a reshape that puts the row on a
+        // brokerage before its first funding moves the benchmarks' start; read before the
+        // write that can move them, as is a merge, whose survivor takes the folded row's
+        // date. A notes or approve edit moves neither.
+        var datedEdit = (request.HasPostedAt && request.PostedAt is not null) || request.Postings is not null
+            || request.MergeFromHeaderId is not null;
+        NeededStarts? before = datedEdit
+            ? await NeededFxPairs.StartsAsync(db, ledgerId, cancellationToken).ConfigureAwait(false)
+            : null;
         var outcome = await transactions.PatchAsync(
             ledgerId, headerId, request, cancellationToken).ConfigureAwait(false);
-        if (outcome != TransactionsRepository.PatchResult.Ok)
+        if (outcome.Refusal is { } refusal) return AnnotationProblem.Of(refusal);
+        if (outcome.Result != TransactionsRepository.PatchResult.Ok)
         {
             return MapPatchFailure(outcome);
         }
+        if (before is { } read)
+            await backfill.StartIfEarlierAsync(db, ledgerId, currentUser.UserId, read, cancellationToken)
+                .ConfigureAwait(false);
 
         // PATCH succeeded. When the caller supplies an account_id
         // (the register view they're currently looking at), return
-        // the freshly-resolved entry so the SPA can patch it into
-        // the window via `mutateEntries` — preserving scroll
-        // position vs. a full window refresh. Falls back to the
-        // postings request's SourceAccountId when present.
+        // every freshly-resolved entry the header has there
+        // (SavedEntriesResponse) so the SPA can replace its rows in
+        // the window — preserving scroll position vs. a full window
+        // refresh. Falls back to the postings request's
+        // SourceAccountId when present.
         //
-        // Inverted-merge direction: when MergeFromHeaderId is set,
-        // the editor row (headerId) is now the LOSER and is
-        // invisible in the register. The survivor is the
-        // candidate (MergeFromHeaderId). Resolve THAT row so the
-        // SPA can refocus onto it after the editor row vanishes.
+        // A PATCH never merges (see the empty-body guard in ValidatePatchBody): a merge
+        // goes through POST /{headerId}/merge, which answers the survivor's
+        // entries itself. The edited row is the one to resolve.
         var resolveAccountId = account_id ?? request.Postings?.SourceAccountId;
-        var survivingHeaderId = request.MergeFromHeaderId ?? headerId;
-        if (resolveAccountId is { } rid)
+        return await SavedEntriesAsync(register, headerId, resolveAccountId, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The PATCH body's own checks, before any read: something to do, a well-formed
+    /// postings reshape, and valid tags. The repository leaves these to its caller, so
+    /// every writer that patches through it makes them first.
+    /// </summary>
+    /// <returns>The refusal, or null when the body passes.</returns>
+    internal static IResult? ValidatePatchBody(PatchTransactionRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        // Presence, not nullness (migration 230): `{"payee": null}` is a
+        // request to CLEAR the payee, which is a header edit and must not read
+        // as an empty body.
+        var hasHeaderField =
+            request.HasPayee
+            || request.HasCheckNumber
+            || request.HasPostedAt
+            || request.HasTransactedAt;
+        var hasPostings = request.Postings is not null;
+        // Slice 2c.6a: `approve: true` alone is a valid PATCH — it
+        // clears needs_review without other edits (the user accepted
+        // a bank-feed row as-is). Empty-body 422 still fires when
+        // approve is absent / false AND no other field is supplied.
+        var hasApprove = request.Approve == true;
+        // A notes body alone is a valid PATCH (a memo or tag edit).
+        var hasNotes = request.Notes is not null;
+        // No hasMerge: a merge cannot arrive on this route any more. It is a
+        // command with its own POST, and MergeFromHeaderId is [JsonIgnore] so a
+        // body carrying it is simply a body that set nothing.
+        if (!hasHeaderField && !hasPostings && !hasApprove && !hasNotes)
+            return BusinessError.Problem(BusinessError.Codes.TransactionPatchEmpty,
+                "Supply at least one header field, a postings reshape, notes, or approve=true.");
+
+        if (request.Postings is { } postings)
         {
-            var entry = await register.GetEntryForHeaderAsync(
-                survivingHeaderId, rid, cancellationToken).ConfigureAwait(false);
-            if (entry is not null) return Results.Ok(entry);
+            if (postings.SourceAccountId == Guid.Empty)
+                return BusinessError.Problem(BusinessError.Codes.TransactionAccountRequired,
+                    "postings.sourceAccountId is required.");
+            var rejection = PostingValidation.ValidatePostings(postings.Items, postings.SourceAccountId);
+            if (rejection is not null) return rejection;
         }
-        return Results.NoContent();
+
+        if (request.Notes is { } notes
+            && TagValidation.ValidateTags(notes.AllTagNames()) is { } tagsRejection)
+            return tagsRejection;
+
+        return null;
+    }
+
+    /// <summary>
+    /// A save's answer: 200 with every entry <paramref name="headerId"/> has in
+    /// <paramref name="accountId"/>'s register (<see cref="SavedEntriesResponse"/>),
+    /// or 204 when no register is named or the header has no entry there.
+    /// </summary>
+    internal static async Task<IResult> SavedEntriesAsync(
+        RegisterRepository register, Guid headerId, Guid? accountId, CancellationToken cancellationToken)
+    {
+        if (accountId is not { } rid) return Results.NoContent();
+        var entries = await register.GetEntriesForHeaderAsync(headerId, rid, cancellationToken).ConfigureAwait(false);
+        return entries.Count > 0 ? Results.Ok(new SavedEntriesResponse(entries)) : Results.NoContent();
     }
 
     /// <summary>
@@ -770,7 +939,7 @@ public static class TransactionsEndpoints
     /// <c>GET /api/ledgers/{ledgerId}/transactions/{headerId}/merge-candidates</c>
     /// — slice 2c.6d. Returns up to 5
     /// <see cref="MergeCandidateDto"/> entries the editor renders
-    /// as "Possible matches" chips. Same probe-safety contract as
+    /// as "Merge candidates" chips. Same probe-safety contract as
     /// similar-payees: cross-ledger or unknown headers come back
     /// empty rather than 404, so the SPA treats absence and miss
     /// identically.
@@ -899,11 +1068,6 @@ public static class TransactionsEndpoints
     }
 
     /// <summary>
-    /// <c>POST /api/ledgers/{ledgerId}/transactions/{headerId}/unhide</c>
-    /// (ADR-0072 D2). Un-hide a soft-hidden transaction so it returns to the
-    /// register. Idempotent — un-hiding a visible row is a no-op (204).
-    /// </summary>
-    /// <summary>
     /// <c>POST /api/ledgers/{ledgerId}/transactions/{headerId}/approve</c> —
     /// accept a bank-feed row as-is, changing no field.
     /// </summary>
@@ -924,9 +1088,10 @@ public static class TransactionsEndpoints
     /// forgotten, and the symptom of forgetting one is a 500 on a case the
     /// repository handles deliberately.
     /// </remarks>
-    private static IResult MapPatchFailure(TransactionsRepository.PatchResult outcome) =>
-        outcome switch
+    private static IResult MapPatchFailure(TransactionsRepository.PatchOutcome outcome) =>
+        outcome.Result switch
         {
+                TransactionsRepository.PatchResult.PostingRefused => PostingProblem(outcome.PostingRefusal!),
                 TransactionsRepository.PatchResult.HeaderNotInLedger =>
                     BusinessError.Problem(BusinessError.Codes.TransactionNotInLedger,
                         "Transaction does not belong to this ledger."),
@@ -951,6 +1116,11 @@ public static class TransactionsEndpoints
                 _ => Results.Problem("Unknown patch result.", statusCode: 500),
             };
 
+    /// <summary>The 422 for a posting the leg-pair builder refused (ADR-0114 D13): its
+    /// code, and a detail naming the posting.</summary>
+    private static IResult PostingProblem(PostingLegPair.Refusal refusal) =>
+        BusinessError.Problem(refusal.Code, refusal.Detail);
+
     private static async Task<IResult> ApproveAsync(
         Guid ledgerId,
         Guid headerId,
@@ -971,19 +1141,13 @@ public static class TransactionsEndpoints
             ledgerId, headerId, new PatchTransactionRequest { Approve = true },
             cancellationToken).ConfigureAwait(false);
 
-        if (outcome != TransactionsRepository.PatchResult.Ok)
+        if (outcome.Result != TransactionsRepository.PatchResult.Ok)
             return MapPatchFailure(outcome);
 
-        // Same courtesy the PATCH route does: hand back the resolved row when the
-        // caller says which register it is looking at, so the SPA can patch it in
+        // Same courtesy the PATCH route does: hand back the resolved entries when the
+        // caller says which register it is looking at, so the SPA can replace them in
         // place instead of refetching a window.
-        if (account_id is { } rid)
-        {
-            var entry = await register.GetEntryForHeaderAsync(
-                headerId, rid, cancellationToken).ConfigureAwait(false);
-            if (entry is not null) return Results.Ok(entry);
-        }
-        return Results.NoContent();
+        return await SavedEntriesAsync(register, headerId, account_id, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1011,6 +1175,8 @@ public static class TransactionsEndpoints
         LedgersRepository ledgers,
         RegisterRepository register,
         TransactionsRepository transactions,
+        Quotes.MarketSeries.MarketSeriesBackfill backfill,
+        Db.AppDbContext db,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -1025,57 +1191,31 @@ public static class TransactionsEndpoints
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
 
+        // ADR-0114 D11: the survivor takes the folded row's date. The folded row was live,
+        // so the ledger's earliest day holds, but the survivor's own lines move to that
+        // date: a survivor that funds a brokerage moves the benchmarks' start earlier.
+        var before = await NeededFxPairs.StartsAsync(db, ledgerId, cancellationToken).ConfigureAwait(false);
         var outcome = await transactions.PatchAsync(
             ledgerId, headerId,
             new PatchTransactionRequest { MergeFromHeaderId = request.FromHeaderId },
             cancellationToken).ConfigureAwait(false);
 
-        if (outcome != TransactionsRepository.PatchResult.Ok)
+        if (outcome.Result != TransactionsRepository.PatchResult.Ok)
             return MapPatchFailure(outcome);
+        await backfill.StartIfEarlierAsync(db, ledgerId, currentUser.UserId, before, cancellationToken)
+            .ConfigureAwait(false);
 
         // The SURVIVOR is what the caller needs back — the edited row is now a
         // tombstone and has left the register.
-        if (account_id is { } rid)
-        {
-            var entry = await register.GetEntryForHeaderAsync(
-                request.FromHeaderId, rid, cancellationToken).ConfigureAwait(false);
-            if (entry is not null) return Results.Ok(entry);
-        }
-        return Results.NoContent();
-    }
-
-    private static async Task<IResult> UnhideAsync(
-        Guid ledgerId,
-        Guid headerId,
-        ICurrentUserAccessor currentUser,
-        LedgersRepository ledgers,
-        TransactionsRepository transactions,
-        CancellationToken cancellationToken)
-    {
-        var visible = await ledgers.GetVisibleByIdAsync(
-            currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
-        if (visible is null)
-            return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
-                "Ledger not found or not visible to this user.");
-
-        var outcome = await transactions.UnhideAsync(ledgerId, headerId, cancellationToken)
-                                         .ConfigureAwait(false);
-        return outcome switch
-        {
-            TransactionsRepository.UnhideOutcome.Unhidden => Results.NoContent(),
-            TransactionsRepository.UnhideOutcome.NotHidden => Results.NoContent(),
-            TransactionsRepository.UnhideOutcome.HeaderNotFound =>
-                BusinessError.Problem(BusinessError.Codes.TransactionNotInLedger,
-                    "Transaction does not belong to this ledger."),
-            _ => Results.Problem("Unknown unhide result.", statusCode: 500),
-        };
+        return await SavedEntriesAsync(register, request.FromHeaderId, account_id, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>
     /// <c>POST /api/ledgers/{ledgerId}/transactions/selection-summary</c>
-    /// (ADR-0024). Returns the count and account-scoped sum for the
+    /// (ADR-0024). Returns the counts and account-scoped sum for the
     /// supplied selection — drives the bulk-action footer's
-    /// "N selected · Σ $X.XX" readout. The SPA debounces this against
+    /// "N selected · M read-only · Σ $X.XX" readout. The SPA debounces this against
     /// rapid checkbox interactions so the footer doesn't lag the
     /// pointer.
     /// </summary>
@@ -1099,7 +1239,7 @@ public static class TransactionsEndpoints
 
         var summary = await bulk.GetSelectionSummaryAsync(
             ledgerId, request, cancellationToken).ConfigureAwait(false);
-        return Results.Ok(summary ?? new SelectionSummary(0, null));
+        return Results.Ok(summary);
     }
 
     /// <summary>
@@ -1119,17 +1259,7 @@ public static class TransactionsEndpoints
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        if (!ValidReconStatuses.Contains(request.Status))
-            return BusinessError.Problem(
-                BusinessError.Codes.TransactionReconStatusInvalid,
-                "status must be one of: uncleared, reconciling, cleared.");
-
-        if (request.AccountId == Guid.Empty)
-            return BusinessError.Problem(
-                BusinessError.Codes.TransactionAccountRequired,
-                "accountId is required — reconciliation status is per-account.");
-
-        var rejection = ValidateSelection(request.Selection);
+        var rejection = ValidateBulkReconStatus(request);
         if (rejection is not null) return rejection;
 
         var visible = await ledgers.GetVisibleByIdAsync(
@@ -1142,6 +1272,29 @@ public static class TransactionsEndpoints
             ledgerId, request.Selection, request.AccountId, request.Status,
             currentUser.UserId, cancellationToken).ConfigureAwait(false);
         return Results.Ok(new BulkReconStatusResponse(updated));
+    }
+
+    /// <summary>
+    /// The bulk status body's own checks, before any read: a known status, the account
+    /// whose legs it sets, and a well-formed selection. The repository leaves these to its
+    /// caller, so every writer that sets a status through it makes them first.
+    /// </summary>
+    /// <returns>The refusal, or null when the body passes.</returns>
+    internal static IResult? ValidateBulkReconStatus(BulkReconStatusRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        if (!ValidReconStatuses.Contains(request.Status))
+            return BusinessError.Problem(
+                BusinessError.Codes.TransactionReconStatusInvalid,
+                "status must be one of: uncleared, reconciling, cleared.");
+
+        if (request.AccountId == Guid.Empty)
+            return BusinessError.Problem(
+                BusinessError.Codes.TransactionAccountRequired,
+                "accountId is required — reconciliation status is per-account.");
+
+        return ValidateSelection(request.Selection);
     }
 
     /// <summary>
@@ -1171,8 +1324,12 @@ public static class TransactionsEndpoints
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
 
-        // Named token: BulkDeleteAsync took a hardDeleteSourcedRows flag (the undo-import
-        // path) in the position this used to pass positionally. The bulk-delete endpoint
+        var readOnly = await RefuseReadOnlyRowsAsync(bulk, ledgerId, request.Selection, cancellationToken)
+            .ConfigureAwait(false);
+        if (readOnly is not null) return readOnly;
+
+        // Named token: BulkDeleteAsync takes a hardDeleteSourcedRows flag (the undo-import
+        // path) before it, so a positional token would land in that flag. The bulk-delete endpoint
         // keeps the DEFAULT — hide a feed-sourced row so a re-sync upserts into it rather
         // than resurrecting it. Only undo wants the other behaviour.
         var (hardDeleted, softHidden) = await bulk.BulkDeleteAsync(
@@ -1183,9 +1340,11 @@ public static class TransactionsEndpoints
 
     /// <summary>
     /// <c>POST /api/ledgers/{ledgerId}/transactions/bulk-unhide</c> (ADR-0072
-    /// D2). Un-hide every (hidden) header in the selection in one transaction,
-    /// recomputing balances + holdings. The selection carries
-    /// <c>statusFilter="hidden"</c> so it scopes to the Hidden view.
+    /// D2). Un-hide every hidden header in the selection in one transaction,
+    /// recomputing balances + holdings. The selection is an explicit list of ids (a
+    /// restore of one row is a selection of one) or a select-all over its view, usually
+    /// the Hidden view. Only the selected rows that are hidden are restored and counted;
+    /// a visible, unknown or merged-away id is left as it is.
     /// </summary>
     private static async Task<IResult> BulkUnhideAsync(
         Guid ledgerId,
@@ -1193,6 +1352,8 @@ public static class TransactionsEndpoints
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         BulkTransactionsRepository bulk,
+        Quotes.MarketSeries.MarketSeriesBackfill backfill,
+        Db.AppDbContext db,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -1206,79 +1367,23 @@ public static class TransactionsEndpoints
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
 
+        var readOnly = await RefuseReadOnlyRowsAsync(bulk, ledgerId, request.Selection, cancellationToken)
+            .ConfigureAwait(false);
+        if (readOnly is not null) return readOnly;
+
+        // ADR-0114 D11: a hidden row counts toward no start, so unhiding one dated before
+        // them moves them earlier; read before the write that can move the starts.
+        var before = await NeededFxPairs.StartsAsync(db, ledgerId, cancellationToken).ConfigureAwait(false);
         var unhidden = await bulk.BulkUnhideAsync(
             ledgerId, request.Selection, cancellationToken).ConfigureAwait(false);
+        if (unhidden > 0)
+            await backfill.StartIfEarlierAsync(db, ledgerId, currentUser.UserId, before, cancellationToken)
+                .ConfigureAwait(false);
         return Results.Ok(new BulkUnhideResponse(unhidden));
     }
 
-    /// <summary>
-    /// <c>POST /api/ledgers/{ledgerId}/transactions/{headerId}/move-account</c>
-    /// (ADR-0072 D3). Move one bank-shape transaction from its source account to
-    /// another real account, recomputing both balances.
-    /// </summary>
-    private static async Task<IResult> MoveAccountAsync(
-        Guid ledgerId,
-        Guid headerId,
-        MoveAccountRequest request,
-        ICurrentUserAccessor currentUser,
-        LedgersRepository ledgers,
-        BulkTransactionsRepository bulk,
-        CancellationToken cancellationToken)
-    {
-        ArgumentNullException.ThrowIfNull(request);
-
-        var visible = await ledgers.GetVisibleByIdAsync(
-            currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
-        if (visible is null)
-            return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
-                "Ledger not found or not visible to this user.");
-
-        var outcome = await bulk.MoveAccountAsync(
-            ledgerId, headerId, request.SourceAccountId, request.TargetAccountId,
-            cancellationToken).ConfigureAwait(false);
-        return MoveOutcomeToResult(outcome);
-    }
-
-    private static IResult MoveOutcomeToResult(
-        BulkTransactionsRepository.MoveAccountOutcome outcome) => outcome switch
-    {
-        BulkTransactionsRepository.MoveAccountOutcome.Moved => Results.NoContent(),
-        BulkTransactionsRepository.MoveAccountOutcome.HeaderNotFound =>
-            BusinessError.Problem(BusinessError.Codes.TransactionNotInLedger,
-                "Transaction does not belong to this ledger."),
-        BulkTransactionsRepository.MoveAccountOutcome.NotBankShape =>
-            BusinessError.Problem(BusinessError.Codes.TransactionHeaderIsInvestment,
-                InvestmentShapeMessage),
-        BulkTransactionsRepository.MoveAccountOutcome.NotOnSourceAccount =>
-            BusinessError.Problem(BusinessError.Codes.TransactionSourceAccountMismatch,
-                "The transaction has no leg on the given source account."),
-        BulkTransactionsRepository.MoveAccountOutcome.TargetInvalid =>
-            BusinessError.Problem(BusinessError.Codes.TransactionMoveTargetInvalid,
-                "Target must be an account or category in this ledger."),
-        BulkTransactionsRepository.MoveAccountOutcome.AccountDomainCrossed =>
-            BusinessError.Problem(BusinessError.Codes.TransactionMoveDomainCrossed,
-                DomainCrossedMessage),
-        BulkTransactionsRepository.MoveAccountOutcome.TargetInactive =>
-            BusinessError.Problem(BusinessError.Codes.AccountInactive,
-                "Target account is inactive; reactivate it before moving transactions to it."),
-        BulkTransactionsRepository.MoveAccountOutcome.TargetSameAsSource =>
-            BusinessError.Problem(BusinessError.Codes.TransactionMoveTargetSameAsSource,
-                "Source and target accounts are the same."),
-        BulkTransactionsRepository.MoveAccountOutcome.SplitToInvestment =>
-            BusinessError.Problem(BusinessError.Codes.TransactionMoveSplitToInvestment,
-                "A split transaction cannot be moved to an investment account."),
-        BulkTransactionsRepository.MoveAccountOutcome.SplitFromInvestment =>
-            BusinessError.Problem(BusinessError.Codes.TransactionMoveSplitFromInvestment,
-                "A split transaction cannot be moved from an investment account to a bank account."),
-        BulkTransactionsRepository.MoveAccountOutcome.Collision =>
-            BusinessError.Problem(BusinessError.Codes.TransactionMoveCollision,
-                "The target account is already part of this transaction (would collide with an existing leg)."),
-        _ => Results.Problem("Unknown move result.", statusCode: 500),
-    };
-
-    // ONE wording per rule, shared by the single-row and bulk responses. The
-    // two paths ask one implementation of the rule now, and a user moving one
-    // row and then forty should not be told two different rules.
+    // The bulk move's wording for the two rules a move of any size asks (ADR-0072 D3). A
+    // move of one row is a bulk move of a selection of one.
     private const string DomainCrossedMessage =
         "A category and an account are not interchangeable: move a category's "
         + "transactions to another category, and an account's to another account.";
@@ -1299,6 +1404,8 @@ public static class TransactionsEndpoints
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         BulkTransactionsRepository bulk,
+        Quotes.MarketSeries.MarketSeriesBackfill backfill,
+        Db.AppDbContext db,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -1312,13 +1419,25 @@ public static class TransactionsEndpoints
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
 
-        var (outcome, moved) = await bulk.BulkMoveAccountAsync(
+        var readOnly = await RefuseReadOnlyRowsAsync(bulk, ledgerId, request.Selection, cancellationToken)
+            .ConfigureAwait(false);
+        if (readOnly is not null) return readOnly;
+
+        // ADR-0114 D11: a move onto a brokerage of a row dated before its first funding moves
+        // the benchmarks' start earlier; read before the write that can move it.
+        var before = await NeededFxPairs.StartsAsync(db, ledgerId, cancellationToken).ConfigureAwait(false);
+        var result = await bulk.BulkMoveAccountAsync(
             ledgerId, request.Selection, request.TargetAccountId,
             cancellationToken).ConfigureAwait(false);
-        return outcome switch
+        if (result.Outcome == BulkTransactionsRepository.BulkMoveOutcome.Moved)
+            await backfill.StartIfEarlierAsync(db, ledgerId, currentUser.UserId, before, cancellationToken)
+                .ConfigureAwait(false);
+        return result.Outcome switch
         {
             BulkTransactionsRepository.BulkMoveOutcome.Moved =>
-                Results.Ok(new BulkMoveAccountResponse(moved)),
+                Results.Ok(new BulkMoveAccountResponse(result.Moved, result.BecameTwoAmount)),
+            BulkTransactionsRepository.BulkMoveOutcome.RelabelRefused =>
+                RelabelCheck.Refusal(result.Relabel!)!,
             BulkTransactionsRepository.BulkMoveOutcome.TargetInvalid =>
                 BusinessError.Problem(BusinessError.Codes.TransactionMoveTargetInvalid,
                     "Target must be an account or category in this ledger."),

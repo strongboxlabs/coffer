@@ -5,36 +5,36 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Reporting;
 
 /// <summary>
-/// A posting of exactly zero (dimension 11 of the fixture audit).
+/// A posting of exactly zero (dimension 11).
 /// </summary>
 /// <remarks>
 /// <para>Ordinary in a real ledger — a waived fee entered so the waiver is on
 /// the record, a fully-discounted order, a correction zeroed out rather than
-/// deleted. The demo did carry zero-amount legs, but every one was an investment
-/// security leg, where zero cash is structural rather than a figure the user
-/// typed; the ordinary case existed nowhere.</para>
+/// deleted. A zero-amount investment security leg does not count: zero cash is
+/// structural there rather than a figure the user typed.</para>
 ///
 /// <para>The point worth pinning is not that the summary tolerates a zero — it
 /// is that <see cref="TransactionDirection"/> has THREE values and a zero
 /// belongs to only one of them. Inflow is <c>&gt; 0</c> and Outflow is
 /// <c>&lt; 0</c>, so a zero-amount line is returned by neither: a user who
 /// reaches for either filter cannot see it at all. That is defensible — it
-/// moved no money in either direction — but it is a decision, and nothing said
-/// so, which is how it gets "fixed" into one side by someone who reads the two
-/// predicates as a partition.</para>
+/// moved no money in either direction — but it is a decision, and unstated it
+/// gets "fixed" into one side by someone who reads the two predicates as a
+/// partition.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ZeroAmountPostingTests
+public sealed class ZeroAmountPostingTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ZeroAmountPostingTests(PostgresFixture fixture) => _fixture = fixture;
+    public ZeroAmountPostingTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static readonly DateTime May = new(2026, 5, 15, 12, 0, 0, DateTimeKind.Utc);
 
     private async Task<(Guid LedgerId, Guid BankId, Guid FeeId)> SeedAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var fees = await ledger.AddCategoryAsync("Service Charges", "expense");
 
@@ -50,7 +50,7 @@ public sealed class ZeroAmountPostingTests
     {
         var (ledgerId, _, _) = await SeedAsync();
 
-        var result = await new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System).SummarizeAsync(
+        var result = await new ReportingRepository(Db.NewDbContext(), TimeProvider.System).SummarizeAsync(
             new ReportSpec
             {
                 LedgerId = ledgerId,
@@ -75,7 +75,7 @@ public sealed class ZeroAmountPostingTests
     public async Task Neither_direction_filter_returns_a_zero_line()
     {
         var (ledgerId, bankId, _) = await SeedAsync();
-        var repo = new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System);
+        var repo = new ReportingRepository(Db.NewDbContext(), TimeProvider.System);
 
         async Task<int> CountAsync(TransactionDirection direction)
         {

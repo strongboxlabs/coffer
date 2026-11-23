@@ -1,8 +1,6 @@
 // QIF file-upload endpoints (ADR-0042). Multipart, mirroring
-// `ofx.ts`. The third surface landed (the Fidelity CSV, ADR-0031 Phase 6),
-// so the form builder moved to `upload.ts` as this note asked —
-// and the local `uploadMultipart` went with it, having been a
-// reinvention of `_request.ts`'s `requestMultipart` all along.
+// `ofx.ts`; the form builder is shared in `upload.ts` and sending is
+// `_request.ts`'s `requestMultipart`.
 
 import { requestMultipart } from './_request';
 import { buildFormData } from './upload';
@@ -13,14 +11,18 @@ import type {
 
 /** Upload a QIF file for preview. No DB writes — returns the single
  *  discovered account block (QIF is single-account-implicit) so the
- *  wizard can show the transaction count before import. */
+ *  wizard can show the transaction count before import. `accountId` is
+ *  the account the file will go into: the server reads its currency, so
+ *  an amount the import would refuse for that currency's places is
+ *  reported in the preview too (ADR-0114 D15). */
 export async function previewQif(
     ledgerId: string,
     file: Blob,
+    accountId?: string,
 ): Promise<QifPreviewResponse> {
     return requestMultipart<QifPreviewResponse>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/ingest/qif/preview`,
-        buildFormData({ file }, 'upload.qif'),
+        buildFormData({ file, accountId }, 'upload.qif'),
     );
 }
 

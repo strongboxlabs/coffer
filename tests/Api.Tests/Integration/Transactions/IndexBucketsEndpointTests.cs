@@ -17,11 +17,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// (Google Photos pattern, ADR-0024 follow-up).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class IndexBucketsEndpointTests
+public sealed class IndexBucketsEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public IndexBucketsEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public IndexBucketsEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -44,7 +45,7 @@ public sealed class IndexBucketsEndpointTests
     [Fact]
     public async Task Returns_one_bucket_per_active_month_most_recent_first()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
 
@@ -66,7 +67,7 @@ public sealed class IndexBucketsEndpointTests
                 amount: -(10m + i), postedAt: pa, payee: $"m-{i}");
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync(
@@ -89,7 +90,7 @@ public sealed class IndexBucketsEndpointTests
         // Sample header for May 2026 is the May 30 transaction — the
         // most-recent in that month by (posted_at, seq). Verify by
         // looking the header up via posted_at.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var may30HeaderId = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId
                      && h.PostedAt == new DateTime(2026, 5, 30, 12, 0, 0, DateTimeKind.Utc))
@@ -107,7 +108,7 @@ public sealed class IndexBucketsEndpointTests
     [Fact]
     public async Task Excludes_hidden_and_merged_entries()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
 
@@ -124,7 +125,7 @@ public sealed class IndexBucketsEndpointTests
         // entry. Both should drop out of the March count; the May
         // count stays at 1 (the merge survivor doesn't gain
         // accidentally).
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var marchHide = await db.TxnHeaders
                 .SingleAsync(h => h.LedgerId == ledger.LedgerId && h.Payee == "to-hide-mar");
@@ -139,7 +140,7 @@ public sealed class IndexBucketsEndpointTests
             await db.SaveChangesAsync();
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync(
@@ -162,7 +163,7 @@ public sealed class IndexBucketsEndpointTests
     [Fact]
     public async Task Filters_to_the_requested_account()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bankA = await ledger.AddBankAccountAsync("checking-A");
         var bankB = await ledger.AddBankAccountAsync("checking-B");
         var groceries = await ledger.AddCategoryAsync("groceries");
@@ -172,7 +173,7 @@ public sealed class IndexBucketsEndpointTests
         await ledger.AddTransactionPairAsync(bankB.Id, groceries.Id, -20m,
             new DateTime(2026, 5, 5, 12, 0, 0, DateTimeKind.Utc));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // A's track sees only the March bucket.
@@ -200,8 +201,8 @@ public sealed class IndexBucketsEndpointTests
     [Fact]
     public async Task Returns_422_when_account_id_is_missing()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync(
@@ -216,11 +217,11 @@ public sealed class IndexBucketsEndpointTests
     [Fact]
     public async Task Returns_422_when_account_is_in_another_ledger()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var otherLedger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var otherLedger = await SyntheticLedger.CreateAsync(Db);
         var otherBank = await otherLedger.AddBankAccountAsync("checking");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync(
@@ -235,10 +236,10 @@ public sealed class IndexBucketsEndpointTests
     [Fact]
     public async Task Returns_empty_array_for_account_with_no_visible_entries()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync(

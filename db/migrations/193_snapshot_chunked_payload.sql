@@ -6,16 +6,15 @@
 -- process. It fixed that OOM and created a smaller one in Postgres: the whole
 -- payload is still built as a single value, just on the other side of the wire.
 --
--- Measured on a real deployment: capturing a large snapshot peaked at roughly 14x
--- the artifact's size in *anonymous* backend memory (sampled at 1s from the
--- cgroup's memory.stat). That was several times the container's mem_limit, so
--- the kernel OOM-killed the backend (signal 9, CONSTRAINT_MEMCG); the
--- postmaster then terminated every other backend and entered crash recovery. The
--- scheduler could not persist next_run_at over the killed connection, so the job
--- stayed due and retried on the next tick — a daily job became a 15-minute crash
--- loop that ran ~2 days, taking the nightly whole-DB backup down with it.
+-- Capture holds several full copies of the payload in *anonymous* backend memory
+-- at once (enumerated below), so a large enough ledger exceeds the container's
+-- mem_limit and the kernel OOM-kills the backend (signal 9, CONSTRAINT_MEMCG);
+-- the postmaster then terminates every other backend and enters crash recovery.
+-- The scheduler cannot persist next_run_at over the killed connection, so the
+-- job stays due and retries on the next tick — a daily job becomes a 15-minute
+-- crash loop, taking the nightly whole-DB backup down with it.
 --
--- Where the 14x comes from, all live simultaneously:
+-- Where the copies come from, all live simultaneously:
 --   1. fn_ledger_snapshot_payload builds ONE jsonb_build_object over 21 jsonb_agg
 --      subqueries — every table's full contents materialised at once, then a
 --      second copy for the combined object.

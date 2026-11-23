@@ -95,6 +95,8 @@ public static class CsvIngestEndpoints
         AccountsRepository accounts,
         CsvMappingsRepository mappings,
         IngestOrchestrator orchestrator,
+        Quotes.MarketSeries.MarketSeriesBackfill backfill,
+        Db.AppDbContext db,
         CancellationToken cancellationToken)
     {
         var (mapping, failure) = await ResolveAsync(
@@ -103,7 +105,7 @@ public static class CsvIngestEndpoints
 
         return await FileIngestEndpoints.ImportAsync(
             ledgerId, file, accountId, providerAccountId, currentUser, ledgers, accounts,
-            orchestrator, CsvGenericFileProvider.Key, "csv", cancellationToken, mapping)
+            orchestrator, backfill, db, CsvGenericFileProvider.Key, "csv", cancellationToken, mapping)
             .ConfigureAwait(false);
     }
 
@@ -253,7 +255,8 @@ public static class CsvIngestEndpoints
             mapping.AmountColumn,
             mapping.AmountInvert,
             mapping.DebitColumn,
-            mapping.CreditColumn);
+            mapping.CreditColumn,
+            CsvMappingValidator.NameOf(mapping.DecimalSeparator));
 
     private static IReadOnlyList<CsvMappingErrorDto> Describe(IReadOnlyList<CsvMappingError> errors) =>
         errors.Select(e => new CsvMappingErrorDto(e.Path, e.Line, e.Message)).ToList();

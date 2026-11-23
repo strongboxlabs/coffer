@@ -55,16 +55,21 @@ export interface RegisterRowBodyCtx<R = unknown> {
     variant: RegisterRowVariant;
     currency: string;
     today: Date;
-    /** True when this row is the read-only TARGET side of a multi-posting
-     *  header (ADR-0036). Drives the "↗ Split" / "↗ Investment" chip
-     *  treatment inside the strategy's description slot. */
-    isTargetSplit: boolean;
+    /** True when this register shows the row read-only (the row's
+     *  `isReadOnly`): a split line seen from its other side, or an investment
+     *  event's counterpart. Drives the "↗ Split" / "↗ Investment" badge in
+     *  the strategy's slot after the date, never in the payee cell. */
+    isReadOnly: boolean;
     /** Ledger account-id → full slash path (`Food/Groceries`), built once
      *  per page from the accounts list. Strategies use it to render a
      *  category's full chain instead of its bare leaf name. Optional /
      *  may be absent while accounts load — strategies fall back to the
      *  leaf name via {@link displayAccountPath}. */
     accountPaths?: ReadonlyMap<string, string>;
+    /** The ledger's system category ids (its Uncategorized), whose chip is
+     *  always neutral (lib/categoryChip.ts). Empty while accounts load.
+     *  Required, so no host can leave it out and colour Uncategorized. */
+    systemCategoryIds: ReadonlySet<string>;
     /**
      * The CATEGORY this register is a subtree rollup of, or null/absent when
      * it isn't one.
@@ -115,7 +120,7 @@ export interface RegisterRowContainerCtx {
     today: Date;
     focused: boolean;
     rowIndex?: number;
-    isTargetSplit: boolean;
+    isReadOnly: boolean;
 }
 
 /** Per-register rendering strategy. The objects live in non-component
@@ -150,9 +155,9 @@ export interface RegisterRowStrategy<R extends RegisterRowUnion> {
 interface RegisterRowProps<R extends RegisterRowUnion> {
     strategy: RegisterRowStrategy<R>;
     variant: RegisterRowVariant;
-    /** The row to render. For split-parent the page synthesizes a
-     *  representative row (bank: canonical + group amount/balance;
-     *  investment: the aggregated cluster row). */
+    /** The row to render. For split-parent the bank page synthesizes a
+     *  representative row (canonical + group amount/balance); the
+     *  investment register renders no split-parent. */
     row: R;
     currency: string;
     today: Date;
@@ -177,8 +182,9 @@ interface RegisterRowProps<R extends RegisterRowUnion> {
     cycleStatus: ReconStatus;
     onCycleReconStatus: (headerId: string, current: ReconStatus) => void;
     /** Header id the status cycle operates on (canonical leg's header for
-     *  split-parent rows). */
-    statusHeaderId?: string;
+     *  split-parent rows). Required: the cycle writes to a URL built from it,
+     *  and a host that left it out would send that write with an empty id. */
+    statusHeaderId: string;
     /** When true the status node renders a STATIC badge (no cycle button)
      *  — bank's scheduled / pending rows. Defaults false. */
     statusStatic?: boolean;
@@ -190,7 +196,8 @@ interface RegisterRowProps<R extends RegisterRowUnion> {
      *  every investment row). Bank split-parent does NOT toggle on
      *  cmd-click — it leaves this false. */
     cmdClickToggles?: boolean;
-    /** Suppress double-click-to-edit (read-only target-split rows). */
+    /** Suppress double-click-to-edit: the row's `isReadOnly` (a split line
+     *  seen from its other side, an investment event's counterpart). */
     readOnly?: boolean;
 
     // -- Chrome --
@@ -218,6 +225,8 @@ interface RegisterRowProps<R extends RegisterRowUnion> {
      *  strategy's `renderBody` via `ctx.accountPaths` so category chips
      *  render their full parent→child chain. */
     accountPaths?: ReadonlyMap<string, string>;
+    /** The ledger's system category ids, forwarded as `ctx.systemCategoryIds`. */
+    systemCategoryIds: ReadonlySet<string>;
     /** Split-parent rows only — the group's legs, forwarded as `ctx.legs`.
      *  See that member for why the `row` prop cannot stand in for them. */
     legs?: readonly R[];
@@ -260,6 +269,7 @@ export function RegisterRow<R extends RegisterRowUnion>(
         title,
         expand,
         accountPaths,
+        systemCategoryIds,
         legs,
         filterCategoryId,
         rollupRootId,
@@ -306,13 +316,13 @@ export function RegisterRow<R extends RegisterRowUnion>(
         today,
         focused,
         rowIndex,
-        isTargetSplit: readOnly,
+        isReadOnly: readOnly,
     }) ?? {};
 
     // Shared row-STATE treatment so the needs-review ("to be accepted"),
     // scheduled, and hidden looks are IDENTICAL across bank + investment.
-    // This used to live in the bank strategy only (investment's differed);
-    // computed here from the row's own flags so both registers can't drift.
+    // Computed here from the row's own flags, not per strategy, so both
+    // registers can't drift.
     const scheduled = status === 'scheduled';
     const isParentOrTxn = variant === 'txn' || variant === 'split-parent';
     const stateClassName = isLeg
@@ -338,8 +348,9 @@ export function RegisterRow<R extends RegisterRowUnion>(
         variant,
         currency,
         today,
-        isTargetSplit: readOnly,
+        isReadOnly: readOnly,
         accountPaths,
+        systemCategoryIds,
         expand,
         legs,
         filterCategoryId,
@@ -385,7 +396,7 @@ export function RegisterRow<R extends RegisterRowUnion>(
                                 onClick={(e) => {
                                     e.stopPropagation();
                                     onCycleReconStatus(
-                                        statusHeaderId ?? '',
+                                        statusHeaderId,
                                         cycleStatus,
                                     );
                                 }}

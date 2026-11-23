@@ -2,7 +2,9 @@ using Microsoft.EntityFrameworkCore;
 
 using Coffer.Api.Contracts;
 using Coffer.Api.Db.Entities;
+using Coffer.Domain.Annotations;
 using Coffer.Domain.Investment;
+using Coffer.Domain.Money;
 
 namespace Coffer.Api.Db.Repositories;
 
@@ -34,24 +36,43 @@ namespace Coffer.Api.Db.Repositories;
 ///   (mig 104) re-derives <c>holdings</c> + <c>lots</c> for every
 ///   (account, security) pair whose investment-shape legs changed
 ///   in this save — including the BOTH-ends case where a leg moves
-///   between holdings.</item>
+///   between holdings — and for every investment leg of a header
+///   whose date, action, hidden or merged flag changed.</item>
 /// </list>
 /// Every mutation method here inserts legs as EF-tracked rows and
 /// reaches <c>SaveChangesAsync</c>, so both interceptors see the leg
-/// changes from the ChangeTracker and the recomputes are implicit. No
-/// explicit recompute call is needed (the legs were once inserted via
-/// the <c>insert_investment_legs</c> TVF, which bypassed the
-/// ChangeTracker and forced hand-driven recomputes; that TVF was
-/// retired once the txn_legs trigger family went away — ADR-0032
-/// lineage).</para>
+/// and header changes from the ChangeTracker and the recomputes are
+/// implicit (the legs were once inserted via the
+/// <c>insert_investment_legs</c> TVF, which bypassed the ChangeTracker
+/// and forced hand-driven recomputes; that TVF was retired once the
+/// txn_legs trigger family went away — ADR-0032 lineage). The explicit
+/// holdings recomputes left here cover what no save the interceptor
+/// sees carries: lots added in a save of their own, after the legs, and
+/// a fee leg's amount (see <see cref="PatchAsync"/>).</para>
+///
+/// <para><b>The ledger write lock</b> (<see cref="LedgerWriteLock"/>, migration 275).
+/// Every mutation method that recomputes (create, patch, delete, the in-kind
+/// conversion) opens its transaction with <c>BeginLedgerWriteAsync</c> as its first
+/// statement, before the reads that decide what it writes: the database refuses a
+/// recompute in a transaction that wrote or row-locked without the lock, and two
+/// writers of one ledger take turns. Approving writes only <c>needs_review</c>, which
+/// no recompute reads, and takes no lock.</para>
 /// </remarks>
 public sealed class InvestmentTransactionsRepository
 {
     private readonly AppDbContext _db;
+    private readonly TimeProvider _clock;
 
-    public InvestmentTransactionsRepository(AppDbContext db)
+    /// <param name="db">The request's context.</param>
+    /// <param name="clock">The injected server clock, which decides the day the lot-basis
+    /// move between currencies reads a rate for (ADR-0114 D13, the one rate rule).
+    /// Required: a caller that left it out would read the wall clock instead of the
+    /// injected one.</param>
+    public InvestmentTransactionsRepository(AppDbContext db, TimeProvider clock)
     {
+        ArgumentNullException.ThrowIfNull(clock);
         _db = db;
+        _clock = clock;
     }
 
     /// <summary>
@@ -87,7 +108,7 @@ public sealed class InvestmentTransactionsRepository
         TransferSharesDestNotInvestment,
         TransferSharesDestMissingHoldingsSibling,
         TransferSharesInsufficientShares,
-        // Inactive-account gate (PR #132 follow-up). Per-role so the
+        // Inactive-account gate. Per-role so the
         // SPA's editor can place the error message next to the right
         // field (the existing per-role "*NotInLedger" pattern).
         BrokerageInactive,
@@ -99,20 +120,59 @@ public sealed class InvestmentTransactionsRepository
         // Checked against the FIFO walk itself, so it holds for a sale in 2014 as
         // much as for one today, and for a BUY edited down under a later sale.
         InsufficientShares,
+        // A transfer-shape action between the brokerage and a real account in another
+        // currency (ADR-0114 D13, ADR-0029): transferAmount, the other account's own
+        // leg, is required, nonzero and opposite in sign to the brokerage's leg of the
+        // transfer pair.
+        TransferAmountRequired,
+        TransferAmountsNonzero,
+        TransferAmountsSign,
+        // A typed amount or fee with more places than the brokerage's currency allows
+        // (ADR-0114 D15). Its FailureDetail names the currency and the request field.
+        AmountPlacesExceedCurrency,
+        // A share move between brokerages in different currencies with a lot whose
+        // acquisition day has no derived rate (ADR-0114 D13). Its FailureDetail names
+        // each missing stored leg and its day.
+        RateUnavailable,
+    }
+
+    /// <summary>
+    /// What a refusal names beyond its <see cref="CreateFailure"/> code, for the two
+    /// refusals whose reason is data: the currency and request field of
+    /// <see cref="CreateFailure.AmountPlacesExceedCurrency"/> (ADR-0114 D15), and each
+    /// missing stored leg of <see cref="CreateFailure.RateUnavailable"/> (ADR-0114 D13).
+    /// </summary>
+    /// <param name="CurrencyCode">The currency the refused figure lands in.</param>
+    /// <param name="Field">The request field's wire name.</param>
+    /// <param name="MissingRates">Each missing stored leg, in the direction it is stored
+    /// (account currency into the reporting currency), with its day.</param>
+    public sealed record FailureDetail(
+        string? CurrencyCode = null,
+        string? Field = null,
+        IReadOnlyList<RateUnavailable>? MissingRates = null)
+    {
+        /// <summary>The places refusal of a figure in <paramref name="currencyCode"/> sent
+        /// as <paramref name="field"/>.</summary>
+        public static FailureDetail Places(string currencyCode, string field) => new(currencyCode, field);
     }
 
     /// <summary>
     /// Result of <see cref="CreateAsync"/>. On <see cref="Ok"/>,
     /// <see cref="HeaderId"/> is the new header's id. On any
     /// other value, <see cref="HeaderId"/> is unset and the
-    /// failure maps to a 422 error code at the endpoint.
+    /// failure maps to a 422 error code at the endpoint, with
+    /// <see cref="Detail"/> when the refusal names data.
     /// </summary>
     public readonly record struct CreateResult(
         CreateFailure? Failure,
-        Guid HeaderId)
+        Guid HeaderId,
+        AnnotationViolation? Refusal = null,
+        FailureDetail? Detail = null)
     {
         public static CreateResult Ok(Guid id) => new(null, id);
-        public static CreateResult Fail(CreateFailure f) => new(f, Guid.Empty);
+        public static CreateResult Fail(CreateFailure f, FailureDetail? detail = null) => new(f, Guid.Empty, null, detail);
+        /// <summary>The write primitive refused the event's notes; nothing is written.</summary>
+        public static CreateResult Refused(AnnotationViolation v) => new(null, Guid.Empty, v);
     }
 
     /// <summary>
@@ -124,10 +184,12 @@ public sealed class InvestmentTransactionsRepository
     /// </summary>
     internal readonly record struct TemplateLegsResult(
         CreateFailure? Failure,
-        IReadOnlyList<TxnLegRow> Legs)
+        IReadOnlyList<TxnLegRow> Legs,
+        FailureDetail? Detail = null)
     {
         public static TemplateLegsResult Ok(IReadOnlyList<TxnLegRow> legs) => new(null, legs);
-        public static TemplateLegsResult Fail(CreateFailure f) => new(f, Array.Empty<TxnLegRow>());
+        public static TemplateLegsResult Fail(CreateFailure f, FailureDetail? detail = null) =>
+            new(f, Array.Empty<TxnLegRow>(), detail);
     }
 
     /// <summary>
@@ -150,6 +212,10 @@ public sealed class InvestmentTransactionsRepository
         Guid ledgerId,
         Guid templateHeaderId,
         CreateInvestmentTransactionRequest request,
+        // The accounts the template's legs already sit on, when this rebuilds an
+        // existing template: those may stay inactive, and the template's stored
+        // figures exempt an unchanged one from the checks. Null on a create.
+        IReadOnlySet<Guid>? alreadyPresent,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -158,9 +224,22 @@ public sealed class InvestmentTransactionsRepository
         if (request.Action == LedgerActions.TransferShares)
             return TemplateLegsResult.Fail(CreateFailure.ActionInvalid);
 
-        var (failure, _, postings, _) =
-            await ValidateAndResolveAsync(ledgerId, request, allowInactiveAccounts: false, cancellationToken).ConfigureAwait(false);
-        if (failure is { } f) return TemplateLegsResult.Fail(f);
+        // A rebuild of an existing template checks only the figures it changes, as a
+        // PATCH does (ADR-0114 D13, ADR-0114 D15): an edit of the memo or the schedule
+        // resends the stored amounts, and one that no longer fits is refused at fire,
+        // not here. The stored legs are read before the caller replaces them.
+        StoredFigures? stored = null;
+        if (alreadyPresent is not null)
+            stored = StoredFigures.Of(
+                await _db.TxnLegs.AsNoTracking()
+                    .Where(l => l.HeaderId == templateHeaderId)
+                    .ToListAsync(cancellationToken).ConfigureAwait(false),
+                request.BrokerageAccountId);
+
+        var resolved = await ValidateAndResolveAsync(
+            ledgerId, request, allowInactiveAccounts: false, alreadyPresent, stored, cancellationToken).ConfigureAwait(false);
+        if (resolved.Failure is { } f) return TemplateLegsResult.Fail(f, resolved.Detail);
+        var postings = resolved.Postings;
 
         var legs = new List<TxnLegRow>(postings.Count * 2);
         for (var i = 0; i < postings.Count; i++)
@@ -178,16 +257,19 @@ public sealed class InvestmentTransactionsRepository
     /// resolves all referenced accounts + security in this
     /// ledger, builds posting legs via
     /// <see cref="InvestmentPostings"/>, and saves header + legs
-    /// + holdings + lot in one Postgres transaction. Triggers
-    /// the holdings cost-basis recompute function after commit so
-    /// basis math stays consistent with the brokerage's policy flag.
+    /// + holdings + lot in one Postgres transaction. Calls
+    /// the holdings cost-basis recompute function after the save's
+    /// statements, inside its transaction, so basis math stays
+    /// consistent with the brokerage's policy flag.
     /// </summary>
     /// <remarks>Balances, holdings/lots, and posting counts all
     /// recompute automatically via
     /// <see cref="LegDerivedRecomputeInterceptor"/> +
     /// <see cref="HoldingsRecomputeInterceptor"/> on the
     /// <c>SaveChangesAsync</c> that persists the EF-tracked legs — no
-    /// explicit recompute call here.</remarks>
+    /// explicit recompute call here, but for an in-kind transfer's two positions.
+    /// The ledger write lock (<see cref="LedgerWriteLock"/>, migration 275) is the
+    /// first statement, before the validation reads.</remarks>
     public async Task<CreateResult> CreateAsync(
         Guid ledgerId,
         CreateInvestmentTransactionRequest request,
@@ -195,20 +277,35 @@ public sealed class InvestmentTransactionsRepository
         // stamped to its series + slot. Null = a normal live investment create.
         Guid? recurringTransactionId = null,
         DateOnly? occurrenceDate = null,
-        // Bypass the PR #132 inactive-account gate. Only convert_in_kind_transfer
+        // Bypass the inactive-account gate. Only convert_in_kind_transfer
         // sets this (a historical correction on since-closed accounts); every live
         // create keeps the guard. See ValidateAndResolveAsync.
         bool allowInactiveAccounts = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        // The event's notes when they come from somewhere other than the body: the
+        // in-kind transfer that replaces a sell and a buy joins theirs. Given the
+        // event's shape; null plans the body's memo and tags.
+        Func<TxnShape, AnnotationPlan<Guid>>? notesFor = null)
     {
         ArgumentNullException.ThrowIfNull(request);
+
+        // The ledger write lock (migration 275), first. The saves below recompute
+        // balances and holdings, which the database refuses in a transaction that wrote
+        // without it, and every read from here on (the validation, the in-kind FIFO
+        // plan, the shortfall baseline) decides what is written, so they read under it
+        // too. Inside a caller's transaction (a reminder fire, an in-kind conversion),
+        // which took it first, this does nothing and the caller commits; a refusal
+        // returns without committing, so in both cases nothing is kept.
+        await using var write = await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken).ConfigureAwait(false);
 
         // Validate the action × field matrix + resolve accounts/security +
         // build the posting pairs. Shared verbatim with PATCH and the
         // recurring-template path (ADR-0047) — see ValidateAndResolveAsync.
-        var (failure, holdingsAccountId, postings, destHoldingsAccountId) =
-            await ValidateAndResolveAsync(ledgerId, request, allowInactiveAccounts, cancellationToken).ConfigureAwait(false);
-        if (failure is { } f) return CreateResult.Fail(f);
+        var resolved = await ValidateAndResolveAsync(
+            ledgerId, request, allowInactiveAccounts, alreadyPresent: null, stored: null, cancellationToken).ConfigureAwait(false);
+        if (resolved.Failure is { } f) return CreateResult.Fail(f, resolved.Detail);
+        var (holdingsAccountId, postings, destHoldingsAccountId) =
+            (resolved.HoldingsAccountId, resolved.Postings, resolved.DestHoldingsAccountId);
 
         // Resolved values for the header + lot side of the write.
         var headerId = Guid.NewGuid();
@@ -219,7 +316,9 @@ public sealed class InvestmentTransactionsRepository
         // transfer_shares (in-kind, ADR-0065): compute the source FIFO lots to
         // move + build the per-lot postings. On a fresh create the source lots
         // already reflect the correct pre-transfer state (this transfer doesn't
-        // exist yet), so the plan can be read before the write.
+        // exist yet), so the plan can be read before the write. Each lot's basis is
+        // priced for the destination before anything is written, so a lot with no
+        // rate refuses the whole move (ADR-0114 D13).
         var transferPlan = (IReadOnlyList<MovedLot>)Array.Empty<MovedLot>();
         if (action == LedgerActions.TransferShares)
         {
@@ -227,20 +326,37 @@ public sealed class InvestmentTransactionsRepository
                 ledgerId, holdingsAccountId, request.SecurityId!.Value,
                 request.Shares!.Value, cancellationToken).ConfigureAwait(false);
             if (planFail is { } pf) return CreateResult.Fail(pf);
-            transferPlan = plan;
+            var (missing, priced) = await PriceMovedLotsAsync(
+                ledgerId, plan, resolved.BrokerageCurrency, resolved.DestCurrency!, cancellationToken).ConfigureAwait(false);
+            if (missing is not null) return CreateResult.Fail(CreateFailure.RateUnavailable, missing);
+            transferPlan = priced;
             postings = BuildTransferSharesPostings(
                 request.BrokerageAccountId, holdingsAccountId,
                 request.TransferAccountId!.Value, destHoldingsAccountId!.Value,
                 request.SecurityId!.Value, transferPlan);
         }
 
-        // Reuse-from-fire (ADR-0049): when the reminder fire path has already
-        // opened a transaction (to make the committed occurrence + catch-up
-        // atomic), JOIN it instead of nesting — and let that caller commit.
-        var ownsTransaction = _db.Database.CurrentTransaction is null;
-        await using var transaction = ownsTransaction
-            ? await _db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false)
-            : null;
+        // The event's one memo and tag set, planned from its brokerage before any
+        // write, so a refusal stores nothing: on the brokerage leg of a one-posting
+        // event, on the header of a multi-posting one. The brokerage owns it (for
+        // transfer_shares, the source; TransferAccountId is the destination).
+        var shape = AnnotationWriter.Shape(request.BrokerageAccountId, action, PlannedLegs(postings),
+            await AnnotationWriter.AccountFactsAsync(
+                    _db, postings.SelectMany(p => new[] { p.Cash.AccountId, p.Counterparty.AccountId }), cancellationToken)
+                .ConfigureAwait(false));
+        AnnotationPlan<Guid> notesPlan;
+        if (notesFor is not null)
+        {
+            notesPlan = notesFor(shape);
+        }
+        else
+        {
+            var notes = await AnnotationWriter.ResolveAsync(
+                    _db, ledgerId, NotesIntent(request.BrokerageAccountId, request), cancellationToken)
+                .ConfigureAwait(false);
+            notesPlan = AnnotationPlanner.Seed(shape, notes);
+        }
+        if (!notesPlan.IsValid) return CreateResult.Refused(notesPlan.Violations[0]);
 
         // Inside the transaction and before the first flush, so this is the
         // position the save starts from. See ShortfallWorsenedAsync.
@@ -248,23 +364,21 @@ public sealed class InvestmentTransactionsRepository
             ShortfallPairs([], holdingsAccountId, destHoldingsAccountId, request.SecurityId),
             cancellationToken).ConfigureAwait(false);
 
-        _db.TxnHeaders.Add(new TxnHeaderRow
-        {
-            Id = headerId,
-            LedgerId = ledgerId,
-            Origin = "manual",
-            Payee = HeaderText.Normalize(request.Payee),
-            Memo = HeaderText.Normalize(request.Memo),
-            CheckNumber = HeaderText.Normalize(request.CheckNumber),
-            PostedAt = postedAt,
-            // NOT NULL since mig 189 — see TransactionsRepository.
-            TransactedAt = request.TransactedAt ?? postedAt,
-            Action = action,
-            // Adjust-at-post fire stamps the occurrence to its series + slot
-            // (null for a normal live create).
-            RecurringTransactionId = recurringTransactionId,
-            OccurrenceDate = occurrenceDate,
-        });
+        // Owned by the request's brokerage (mig 263): the one on every posting, and
+        // for transfer_shares the SOURCE brokerage (TransferAccountId is the
+        // destination).
+        var header = TxnHeaderRow.NewTransaction(headerId, ledgerId, request.BrokerageAccountId);
+        header.Payee = HeaderText.Normalize(request.Payee);
+        header.CheckNumber = HeaderText.Normalize(request.CheckNumber);
+        header.PostedAt = postedAt;
+        // NOT NULL since mig 189 — see TransactionsRepository.
+        header.TransactedAt = request.TransactedAt ?? postedAt;
+        header.Action = action;
+        // Adjust-at-post fire stamps the occurrence to its series + slot
+        // (null for a normal live create).
+        header.RecurringTransactionId = recurringTransactionId;
+        header.OccurrenceDate = occurrenceDate;
+        _db.TxnHeaders.Add(header);
 
         // Multi-posting headers share an implicit group via header_id;
         // the resolved_transactions view exposes that as `txn_group_id`
@@ -305,16 +419,6 @@ public sealed class InvestmentTransactionsRepository
             }
         }
 
-        // Tags on create (ADR-0009: a tag is a property of the EVENT). Same
-        // helper, dictionary and create-on-first-use semantics as the bank
-        // create path — an investment txn is an event like any other, and the
-        // legs it happens to have do not enter into it.
-        if (request.Tags is { Count: > 0 } tags)
-        {
-            await HeaderTags.ApplyAsync(_db, ledgerId, headerId, tags, cancellationToken)
-                .ConfigureAwait(false);
-        }
-
         // Flush the header alone so its row exists when the leg
         // INSERT (next step) takes its FK reference: legs need the
         // header in the DB to satisfy txn_legs.header_id -> txn_headers(id).
@@ -327,8 +431,10 @@ public sealed class InvestmentTransactionsRepository
         // the holding row is created (HoldingsRecomputeService's
         // auto-create) by the time GetHoldingIdAsync runs below, and
         // the multi-posting counts are corrected from DEFAULT 1. No
-        // explicit recompute call needed.
-        _db.TxnLegs.AddRange(legs.Select(ToTxnLegRow));
+        // explicit recompute call needed. The planned notes land in the same save.
+        var legRows = legs.Select(ToTxnLegRow).ToList();
+        _db.TxnLegs.AddRange(legRows);
+        await AnnotationWriter.ApplyAsync(_db, header, legRows, notesPlan, cancellationToken).ConfigureAwait(false);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 
         if (action == LedgerActions.TransferShares)
@@ -357,16 +463,17 @@ public sealed class InvestmentTransactionsRepository
         }
         else if (LedgerActions.TouchesHoldings(action) && request.SecurityId is { } securityId)
         {
-            // Acquisition actions (Buy / BuyXfr / DivReinvest) need a
+            // Acquisition actions (Buy / BuyXfr / Reinvest) need a
             // matching lot row. The lot binds to the holding via
             // holding_id; query the (now-existing) holding for its id
             // and add the lot. Sell-side actions don't add lots — the
             // recompute's FIFO walk closes existing lots in place.
             var quantity = request.Shares ?? 0m;
-            // Lot cost basis uses the authoritative amount (2dp), not a
-            // re-derivation from the rounded price — same money the sec leg
-            // carries, so basis == cash paid.
-            var (sharePrice, _) = ResolveTradeMoney(request.Amount, request.Price ?? 0m, quantity);
+            // Lot cost basis uses the authoritative amount, at the brokerage's
+            // places (ADR-0114 D15), not a re-derivation from the rounded price —
+            // same money the sec leg carries, so basis == cash paid.
+            var (sharePrice, _) = ResolveTradeMoney(
+                request.Amount, request.Price ?? 0m, quantity, resolved.BrokerageCurrency);
             var impact = InvestmentPostings.BuildHoldingsImpact(
                 action: action,
                 holdingsAccountId: holdingsAccountId,
@@ -397,14 +504,13 @@ public sealed class InvestmentTransactionsRepository
             }
         }
 
-        // Refuse BEFORE committing. When this method owns the transaction,
-        // returning disposes it and rolls everything back; when it joined the
-        // reminder fire's, that caller returns without committing, same effect.
+        // Refuse BEFORE committing. When the lock opened the transaction, returning
+        // disposes it and rolls everything back; inside a caller's (a reminder fire,
+        // an in-kind conversion), that caller returns without committing, same effect.
         if (await ShortfallWorsenedAsync(shortfallBefore, cancellationToken).ConfigureAwait(false))
             return CreateResult.Fail(CreateFailure.InsufficientShares);
 
-        if (ownsTransaction)
-            await transaction!.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
 
         return CreateResult.Ok(headerId);
     }
@@ -434,20 +540,25 @@ public sealed class InvestmentTransactionsRepository
 
     public readonly record struct PatchResult(
         PatchFailure? PatchFail,
-        CreateFailure? CreateFail)
+        CreateFailure? CreateFail,
+        AnnotationViolation? Refusal = null,
+        FailureDetail? Detail = null)
     {
         public static PatchResult Ok() => new(null, null);
         public static PatchResult Fail(PatchFailure f) => new(f, null);
-        public static PatchResult Fail(CreateFailure f) => new(null, f);
+        public static PatchResult Fail(CreateFailure f, FailureDetail? detail = null) => new(null, f, null, detail);
+        /// <summary>The write primitive refused the event's notes; nothing is written.</summary>
+        public static PatchResult Refused(AnnotationViolation v) => new(null, null, v);
     }
 
     /// <summary>
     /// PATCH an existing investment txn. Per ADR-0025, postings
     /// replace wholesale — the supplied <paramref name="request"/>
-    /// IS the new state of the world. Existing legs + lots are
-    /// dropped; the new shape is built via the same per-action
-    /// posting builders as <see cref="CreateAsync"/>. Recompute
-    /// fires after commit.
+    /// IS the new state of the world. The new shape is built via the
+    /// same per-action posting builders as <see cref="CreateAsync"/>,
+    /// and existing legs keep their identity where it has room for
+    /// them. Recompute runs after the save's statements, inside its
+    /// transaction.
     /// </summary>
     /// <remarks>
     /// <para>PATCH body fields are nullable at the wire
@@ -460,16 +571,18 @@ public sealed class InvestmentTransactionsRepository
     /// <para>Legs KEEP their ids across an edit wherever the new shape still
     /// has a leg with the same (account, posting_role, security) — see the
     /// block that does the matching. Only what the new shape has no room for
-    /// is deleted. This exists because anything keyed on leg_id used to die
-    /// with the row, <c>txn_leg_recon</c> most damagingly.</para>
+    /// is deleted, because anything keyed on leg_id dies with the row,
+    /// <c>txn_leg_recon</c> most damagingly.</para>
     ///
     /// <para>Balances and posting counts recompute via
     /// <see cref="LegDerivedRecomputeInterceptor"/>, whose Modified branch
-    /// supplies both the OLD and the NEW pair from OriginalValues — so the
-    /// two-flush split that used to carry that is no longer what makes it
-    /// correct. Holdings and lots are reconciled EXPLICITLY at the end:
-    /// <see cref="HoldingsRecomputeInterceptor"/> watches legs only, so a
-    /// shape-identical edit produces nothing for it to see.</para>
+    /// supplies both the OLD and the NEW pair from OriginalValues — so no
+    /// two-flush split is needed to make it correct. Holdings and lots
+    /// recompute via <see cref="HoldingsRecomputeInterceptor"/> for every
+    /// investment leg the edit writes and for a changed date or action, and
+    /// are reconciled once more EXPLICITLY at the end, for what that
+    /// interceptor does not see: the acquisition lot added after the leg
+    /// save, and a fee leg's amount, which the walk folds into basis.</para>
     /// </remarks>
     public async Task<PatchResult> PatchAsync(
         Guid ledgerId,
@@ -485,24 +598,32 @@ public sealed class InvestmentTransactionsRepository
         // transaction that later writes, or there is a TOCTOU window between
         // the endpoint's cross-ledger check and these writes.
         //
-        // This used to open two transactions further down — one inside the
-        // merge branch, one after validation — so every read above them,
-        // including the membership guard and the whole action x field matrix
-        // validation, ran unprotected. `await using` rolls back on any early
+        // Opened here, not further down (one inside the merge branch, one after
+        // validation), where every read above them — including the membership
+        // guard and the whole action x field matrix validation — would run
+        // unprotected. `await using` rolls back on any early
         // return, so the failure paths below need no commit.
-        await using var transaction = await _db.Database
-            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        //
+        // Opened by the ledger write lock (migration 275), its first statement: the
+        // saves below recompute balances and holdings, in several steps, and the
+        // database refuses a recompute in a transaction that wrote without the lock.
+        // Held from here to the commit, it keeps every other writer of the ledger out
+        // between the steps.
+        await using var write = await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken).ConfigureAwait(false);
 
-        var existing = await _db.TxnHeaders
+        // A merged-away header is not found by an edit (MergedAway). The merge reads it as
+        // it is: its own gate below refuses a tombstone at either end.
+        var headers = request.MergeFromHeaderId is null ? _db.TxnHeaders.NotMergedAway() : _db.TxnHeaders;
+        var existing = await headers
             .FirstOrDefaultAsync(
                 h => h.Id == headerId && h.LedgerId == ledgerId,
                 cancellationToken).ConfigureAwait(false);
         if (existing is null) return PatchResult.Fail(PatchFailure.HeaderNotFound);
 
         // Investment-side merge (mirrors bank PatchAsync, slice
-        // "investment-merge"). A merge-only PATCH carries just
-        // MergeFromHeaderId: the editor row (existing) folds into the chosen
-        // candidate. Validate both ends, stamp loser→winner + the winner's
+        // "investment-merge"). Only the merge route sets MergeFromHeaderId,
+        // on a request carrying nothing else: the editor row (existing)
+        // folds into the chosen candidate, which keeps its own fields. Validate both ends, stamp loser→winner + the winner's
         // adopted date, and return early — no leg reshape (the loser is
         // tombstoned, not rebuilt). The server re-enforces the same gates the
         // candidates query used, independently of the UI filter
@@ -524,31 +645,23 @@ public sealed class InvestmentTransactionsRepository
                     cancellationToken).ConfigureAwait(false);
             // Candidate must be settled + visible + not itself a loser.
             // Winners ARE allowed (multi-source collapse keeps a one-hop graph).
+            // A reminder's template is no transaction (ADR-0047), as on the bank
+            // merge: the candidates never offer it, and a merge into it would fold
+            // a real row away into one no register shows.
             if (winner is null
                 || winner.NeedsReview
                 || winner.IsMergedInto is not null
-                || winner.IsHidden)
+                || winner.IsHidden
+                || winner.IsRecurringTemplate)
                 return PatchResult.Fail(PatchFailure.MergeSourceInvalid);
-
-            // The loser's holdings-side (account, security) pairs — its shares
-            // must stop counting once it's merged. Collected before the stamp
-            // (the legs don't move).
-            var loserPairs = await _db.TxnLegs.AsNoTracking()
-                .Where(l => l.HeaderId == headerId
-                    && l.SecurityId != null
-                    && l.Quantity != null)
-                .Select(l => new { l.AccountId, SecurityId = l.SecurityId!.Value })
-                .ToListAsync(cancellationToken).ConfigureAwait(false);
 
             existing.IsMergedInto = winner.Id;   // editor row → loser
             winner.IsMergeWinner = true;          // candidate → winner (idempotent)
-            // ...and the loser is no longer awaiting review. The bank editor has
-            // always sent `approve: true` alongside its merge stamp — "to keep
-            // state coherent if the row is ever surfaced again" — and the
-            // investment branch, which takes a merge-ONLY patch and returns before
-            // any approve handling, never did. So investment losers alone stayed
-            // flagged, and the sidebar's review dot stayed lit on an account whose
-            // register had nothing left to review.
+            // ...and the loser is no longer awaiting review. This branch takes a
+            // merge-ONLY patch and returns before any approve handling, so without
+            // this an investment loser would stay flagged, and the sidebar's review
+            // dot would stay lit on an account whose register has nothing left to
+            // review.
             //
             // Done HERE rather than by teaching the SPA to send the flag: the
             // server owns the end state, and a merge-only PATCH should not depend
@@ -557,39 +670,20 @@ public sealed class InvestmentTransactionsRepository
             // Winner adopts the imported (loser) row's date — the fresh feed
             // row's date is authoritative for the merged event. Written onto the
             // winner's canonical row since mig 230, with its feed date captured
-            // to txn_header_originals first. Balance-relevant, so the balance
-            // recompute interceptor rewalks the winner's account on save.
+            // to txn_header_originals first.
             var importedPostedAt = request.PostedAt ?? existing.PostedAt;
             await SetPostedAtAsync(winner, importedPostedAt, cancellationToken)
                 .ConfigureAwait(false);
+            // Both stamps are header changes the walks read, so this save
+            // recomputes them, in this transaction, with no leg written: the
+            // loser's is_merged_into takes its shares out of its positions, its
+            // amounts out of its accounts' balances (mig 163) and its trades off the
+            // day they priced (mig 273), and the winner's moved date re-sorts its
+            // lots, basis and realized gains against the rest of each position it
+            // holds, re-walks its accounts, and re-derives the trade price of the day
+            // it now sits on (LegDerivedRecomputeInterceptor,
+            // HoldingsRecomputeInterceptor, TradePriceFromLegInterceptor).
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            // Stamping is_merged_into on the header doesn't mutate txn_legs, so
-            // the HoldingsRecomputeInterceptor never fires — trigger the holdings
-            // recompute explicitly. Mig 163 makes the recompute exclude merged
-            // legs, so the loser's shares drop out. Same transaction, so it's
-            // atomic with the stamp.
-            //
-            // The WINNER's pairs go in too, and that became load-bearing with mig
-            // 229. The walk orders by the date the line above just moved — so the
-            // winner's lots, basis and realized gains can re-sort against
-            // everything else in that holding, and recomputing only the loser
-            // would leave the winner's figures derived from its pre-merge
-            // position. (229 moved the walk onto the effective date; 230 made
-            // that the only date there is.)
-            var winnerPairs = await _db.TxnLegs.AsNoTracking()
-                .Where(l => l.HeaderId == winner.Id
-                    && l.SecurityId != null
-                    && l.Quantity != null)
-                .Select(l => new { l.AccountId, SecurityId = l.SecurityId!.Value })
-                .ToListAsync(cancellationToken).ConfigureAwait(false);
-
-            await new HoldingsRecomputeService(_db)
-                .RecomputeAsync(
-                    loserPairs.Select(p => (p.AccountId, p.SecurityId))
-                        .Concat(winnerPairs.Select(p => (p.AccountId, p.SecurityId)))
-                        .Distinct(),
-                    cancellationToken)
-                .ConfigureAwait(false);
 
             // ADR-0082 merge → reconciling, as the bank branch has always done.
             // A feed match is the INSTITUTION acknowledging the transaction, and
@@ -641,7 +735,7 @@ public sealed class InvestmentTransactionsRepository
                 }
             }
 
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await write.CommitAsync(cancellationToken).ConfigureAwait(false);
             return PatchResult.Ok();
         }
 
@@ -651,8 +745,8 @@ public sealed class InvestmentTransactionsRepository
         //     pattern at sync time — the canonical hinted upgrade),
         //     OR
         //   * The header came from a feed source other than manual
-        //     entry (origin != 'manual'). Real-world data shows the
-        //     classifier doesn't match every institution's wire
+        //     entry (origin != 'manual'). The classifier cannot
+        //     match every institution's wire
         //     format (different brokerages use different description
         //     conventions), but the user still needs a path to
         //     upgrade these rows manually. Origin-gating keeps
@@ -670,21 +764,31 @@ public sealed class InvestmentTransactionsRepository
         // contract, then reuse the same validation + posting-build
         // pipeline. Wholesale-replace semantics: every field on the
         // PATCH body becomes the new state of the world.
+        // The memo and tags are not part of the shape and are planned from the PATCH
+        // body itself (presence-tracked), so they are not carried over here.
+        // A date on the stored day keeps the stored timestamp (HeaderDates): the
+        // editor sends midnight UTC of the picked day, and the FIFO walk orders by
+        // posted_at, so overwriting the time of day on an untouched date would
+        // re-sort the event among its same-day neighbours.
         var asCreate = new CreateInvestmentTransactionRequest
         {
             BrokerageAccountId = request.BrokerageAccountId ?? Guid.Empty,
-            PostedAt           = request.PostedAt           ?? existing.PostedAt,
+            PostedAt           = request.PostedAt is { } requestedPostedAt
+                                     ? HeaderDates.Resolve(existing.PostedAt, requestedPostedAt)
+                                     : existing.PostedAt,
             Action             = request.Action             ?? existing.Action ?? string.Empty,
             Payee              = request.Payee,
-            Memo               = request.Memo,
             CheckNumber        = request.CheckNumber,
-            TransactedAt       = request.TransactedAt,
+            TransactedAt       = request.TransactedAt is { } requestedTransactedAt
+                                     ? HeaderDates.Resolve(existing.TransactedAt, requestedTransactedAt)
+                                     : null,
             SecurityId         = request.SecurityId,
             Shares             = request.Shares,
             Price              = request.Price,
             Amount             = request.Amount,
             CategoryAccountId  = request.CategoryAccountId,
             TransferAccountId  = request.TransferAccountId,
+            TransferAmount     = request.TransferAmount,
             FeeAccountId       = request.FeeAccountId,
             FeeAmount          = request.FeeAmount,
         };
@@ -694,13 +798,50 @@ public sealed class InvestmentTransactionsRepository
         if (asCreate.BrokerageAccountId == Guid.Empty)
             return PatchResult.Fail(CreateFailure.AccountNotInLedger);
 
+        // The figures the edit would replace, so the validation checks only what it
+        // changes (ADR-0114 D13, D15): read before the leg rebuild below changes them.
+        var storedFigures = StoredFigures.Of(
+            await _db.TxnLegs.AsNoTracking()
+                .Where(l => l.HeaderId == headerId)
+                .ToListAsync(cancellationToken).ConfigureAwait(false),
+            asCreate.BrokerageAccountId);
+
         // Same validation + resolution + posting build as CreateAsync (the
         // PATCH body IS the new state of the world per ADR-0025). For
         // transfer_shares, postings are empty here and built after the leg-drop
-        // flush below (the FIFO plan must read the RESTORED source lots).
-        var (failure, holdingsAccountId, postings, destHoldingsAccountId) =
-            await ValidateAndResolveAsync(ledgerId, asCreate, allowInactiveAccounts: false, cancellationToken).ConfigureAwait(false);
-        if (failure is { } f) return PatchResult.Fail(f);
+        // flush below (the FIFO plan must read the RESTORED source lots). The
+        // accounts the event already sits on may stay inactive; read inside this
+        // transaction, before the leg rebuild below changes them.
+        var alreadyPresent = await TransactionsRepository
+            .LegAccountIdsAsync(_db, ledgerId, headerId, cancellationToken).ConfigureAwait(false);
+        var resolved = await ValidateAndResolveAsync(
+            ledgerId, asCreate, allowInactiveAccounts: false, alreadyPresent, storedFigures, cancellationToken).ConfigureAwait(false);
+        if (resolved.Failure is { } f) return PatchResult.Fail(f, resolved.Detail);
+        var (holdingsAccountId, postings, destHoldingsAccountId) =
+            (resolved.HoldingsAccountId, resolved.Postings, resolved.DestHoldingsAccountId);
+
+        // The event's notes and owner, planned before the first write so a refusal
+        // stores nothing. The request's brokerage writes and owns the rebuilt event
+        // (the SOURCE brokerage for transfer_shares): the hand-over when a feed or
+        // Moneydance bank-shape row becomes an event, and when an event moves to
+        // another brokerage. The event's value survives the rebuild (the planner moves
+        // it between the brokerage leg and the header when the posting count changes);
+        // a counterpart's own value follows its (account, role). An in-kind transfer's
+        // postings exist only after the drop flush below, so it is planned there.
+        var stored = await AnnotationWriter.LoadAsync(_db, existing, cancellationToken,
+                postings.SelectMany(p => new[] { p.Cash.AccountId, p.Counterparty.AccountId })
+                    .Append(asCreate.BrokerageAccountId)
+                    .Concat(asCreate.TransferAccountId is { } dest ? [dest] : []))
+            .ConfigureAwait(false);
+        var notesIntent = await AnnotationWriter.ResolveAsync(
+                _db, ledgerId, NotesIntent(asCreate.BrokerageAccountId, request), cancellationToken)
+            .ConfigureAwait(false);
+        AnnotationPlan<Guid>? notesPlan = null;
+        if (asCreate.Action != LedgerActions.TransferShares)
+        {
+            notesPlan = PlanEventNotes(stored, asCreate, postings, notesIntent);
+            if (!notesPlan.IsValid) return PatchResult.Refused(notesPlan.Violations[0]);
+        }
 
         // Read before the first write (the leg-drop flush below): wherever this
         // header held shares, and wherever the edit puts them — a changed
@@ -744,10 +885,9 @@ public sealed class InvestmentTransactionsRepository
         // canonical and, until 230, captured nothing at all, so an investment
         // edit destroyed the imported values outright. Rows edited before 230
         // are past recovering; from here on both paths keep the original.
-        await HeaderOriginals.CaptureAsync(_db, existing, cancellationToken)
+        await AnnotationWriter.CaptureOriginalsAsync(_db, existing, cancellationToken)
             .ConfigureAwait(false);
         existing.Payee        = HeaderText.Normalize(asCreate.Payee);
-        existing.Memo         = HeaderText.Normalize(asCreate.Memo);
         existing.CheckNumber  = HeaderText.Normalize(asCreate.CheckNumber);
         existing.PostedAt     = asCreate.PostedAt;
         // NOT NULL since mig 189: a null request value means "no distinct tax
@@ -757,24 +897,13 @@ public sealed class InvestmentTransactionsRepository
         existing.Action       = asCreate.Action;
         // Approve only when ASKED to, matching the bank PATCH.
         //
-        // This used to clear the flag unconditionally, justified by "the
-        // investment editor's only Save-pressed exit IS Accept". That was a
-        // claim about one client, applied to the endpoint: every other caller —
-        // MCP, a direct PATCH, a script correcting a typo across a ledger —
-        // accepted every row it touched, and nobody could fix an imported row
-        // and leave it queued. The editor still sends approve: true on a
-        // needs-review row, so its behaviour is unchanged.
+        // Not unconditionally: "the investment editor's only Save-pressed exit IS
+        // Accept" is a claim about one client, not the endpoint. Clearing it on
+        // every PATCH would make every other caller — MCP, a direct PATCH, a
+        // script correcting a typo across a ledger — accept every row it touches,
+        // and nobody could fix an imported row and leave it queued. The editor
+        // sends approve: true on a needs-review row.
         if (request.Approve == true) existing.NeedsReview = false;
-
-        // Tags, on the same presence contract as the bank PATCH: null leaves
-        // them alone, [] clears them. The pairing is to the HEADER and the
-        // header id is stable across the wholesale leg reshape below, so an
-        // edit to a buy's fee never disturbs its tags.
-        if (request.Tags is { } tags)
-        {
-            await HeaderTags.ApplyAsync(_db, ledgerId, headerId, tags, cancellationToken)
-                .ConfigureAwait(false);
-        }
 
         // Multi-posting grouping is implicit via shared header_id —
         // see CreateAsync's note. Build leg specs first; insert as
@@ -805,13 +934,13 @@ public sealed class InvestmentTransactionsRepository
         // ----------------------------------------------------------------
         // Keep leg IDENTITY across the edit.
         //
-        // This used to delete every leg and rebuild with fresh ids. Anything
-        // keyed on leg_id therefore died with the row — and txn_leg_recon.leg_id
-        // cascades on delete (mig 171), so editing a CLEARED brokerage row, even
-        // just its memo, silently reverted it to uncleared and destroyed
-        // cleared_at / cleared_by_user_id. A reconciled brokerage account drifted
-        // with nothing on screen to say why. The bank path never had this: it
-        // keeps the legs a request names by legId and mutates them in place.
+        // Deleting every leg and rebuilding with fresh ids would kill anything
+        // keyed on leg_id with the row — and txn_leg_recon.leg_id cascades on
+        // delete (mig 171), so editing a CLEARED brokerage row, even just its
+        // memo, would silently revert it to uncleared and destroy cleared_at /
+        // cleared_by_user_id, and a reconciled brokerage account would drift with
+        // nothing on screen to say why. The bank path keeps the legs a request
+        // names by legId and mutates them in place.
         //
         // The investment editor cannot name legs — they are DERIVED from the
         // action x field matrix, so the client never sees them — so identity is
@@ -860,9 +989,9 @@ public sealed class InvestmentTransactionsRepository
                 pool.Remove(match);
                 // Mutate in place. PostingIndex is deliberately NOT set here — the
                 // renumber happens after a shift flush below, so a kept leg cannot
-                // collide with a doomed one on uq_txn_legs_posting.
+                // collide with a doomed one on uq_txn_legs_posting. Its memo and tags
+                // are the plan's, applied once every leg is in place.
                 match.Amount      = spec.Leg.Amount;
-                match.LegMemo     = spec.Leg.LegMemo;
                 match.Quantity    = spec.Leg.Quantity;
                 match.UnitPrice   = spec.Leg.UnitPrice;
                 reusedLegIds.Add(match.Id);
@@ -893,14 +1022,10 @@ public sealed class InvestmentTransactionsRepository
         }
 
         // A surviving leg keeps its txn_leg_recon row, and that is the POINT of
-        // reusing the identity — the reconciled state is what an edit used to
+        // reusing the identity — the reconciled state is what a rebuild would
         // destroy. It is deliberately not dropped here; nor does the bank path
-        // drop it.
-        //
-        // This block also used to delete the leg's txn_leg_overrides row, on the
-        // reasoning that a stale override would mask the amount just saved. That
-        // table went away in migration 230 (zero rows in every database, never
-        // written by the API), so only the index dance is left.
+        // drop it. (There is no txn_leg_overrides row to clear: migration 230
+        // drops that table.) Only the index dance is left.
         if (reusedLegIds.Count > 0)
         {
             // Park kept legs at indices nothing else can claim, and flush, so the
@@ -910,10 +1035,9 @@ public sealed class InvestmentTransactionsRepository
             // update that wants the vacated index.
             //
             // Only when something actually MOVES. Shifting unconditionally would
-            // also make every reused leg Modified on every edit, which would mask
-            // the holdings-recompute gap below behind an accident: the interceptor
-            // watches legs, so it would fire for the wrong reason and stop firing
-            // the day someone tightened this.
+            // also make every reused leg Modified on every edit, and every
+            // interceptor that watches legs would recompute for a change that is
+            // not one.
             var finalIndexById = legs.ToDictionary(x => x.Id, x => x.PostingIndex);
             var anyIndexMoves = oldLegs.Any(l =>
                 finalIndexById.TryGetValue(l.Id, out var target) && target != l.PostingIndex);
@@ -947,12 +1071,20 @@ public sealed class InvestmentTransactionsRepository
                 ledgerId, holdingsAccountId, asCreate.SecurityId!.Value,
                 asCreate.Shares!.Value, cancellationToken).ConfigureAwait(false);
             if (planFail is { } pf) return PatchResult.Fail(pf);  // await using rolls back
+            // Priced as the create prices them, so a PATCH of the move and the create
+            // store the same figures (ADR-0114 D13).
+            var (missing, priced) = await PriceMovedLotsAsync(
+                ledgerId, plan, resolved.BrokerageCurrency, resolved.DestCurrency!, cancellationToken).ConfigureAwait(false);
+            if (missing is not null) return PatchResult.Fail(CreateFailure.RateUnavailable, missing);  // await using rolls back
 
-            transferPlan = plan;
+            transferPlan = priced;
             postings = BuildTransferSharesPostings(
                 asCreate.BrokerageAccountId, holdingsAccountId,
                 asCreate.TransferAccountId!.Value, destHoldingsAccountId!.Value,
                 asCreate.SecurityId!.Value, transferPlan);
+
+            notesPlan = PlanEventNotes(stored, asCreate, postings, notesIntent);
+            if (!notesPlan.IsValid) return PatchResult.Refused(notesPlan.Violations[0]);  // await using rolls back
 
             transferDestLegIds = new List<Guid>(transferPlan.Count);
             for (var i = 0; i < postings.Count; i++)
@@ -991,6 +1123,12 @@ public sealed class InvestmentTransactionsRepository
             }
         }
         _db.TxnLegs.AddRange(legsToInsert.Select(ToTxnLegRow));
+        // Every leg is in place at its final posting: store the planned notes and
+        // owner with them.
+        await AnnotationWriter.ApplyAsync(
+                _db, existing, _db.TxnLegs.Local.Where(l => l.HeaderId == headerId).ToList(),
+                notesPlan!, cancellationToken)
+            .ConfigureAwait(false);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 
         if (asCreate.Action == LedgerActions.TransferShares)
@@ -1018,10 +1156,11 @@ public sealed class InvestmentTransactionsRepository
         else if (LedgerActions.TouchesHoldings(asCreate.Action) && asCreate.SecurityId is { } securityId)
         {
             var quantity = asCreate.Shares ?? 0m;
-            // Lot cost basis uses the authoritative amount (2dp), not a
-            // re-derivation from the rounded price — same money the sec leg
-            // carries, so basis == cash paid.
-            var (sharePrice, _) = ResolveTradeMoney(asCreate.Amount, asCreate.Price ?? 0m, quantity);
+            // Lot cost basis uses the authoritative amount, at the brokerage's
+            // places (ADR-0114 D15), not a re-derivation from the rounded price —
+            // same money the sec leg carries, so basis == cash paid.
+            var (sharePrice, _) = ResolveTradeMoney(
+                asCreate.Amount, asCreate.Price ?? 0m, quantity, resolved.BrokerageCurrency);
             var impact = InvestmentPostings.BuildHoldingsImpact(
                 action: asCreate.Action,
                 holdingsAccountId: holdingsAccountId,
@@ -1052,14 +1191,17 @@ public sealed class InvestmentTransactionsRepository
             }
         }
 
-        // HoldingsRecomputeInterceptor watches txn_legs and nothing else, so it
-        // used to fire on every PATCH only because every PATCH deleted every leg.
-        // Now a shape-identical edit — a memo fix, or a DATE change, which reorders
-        // the FIFO walk — can produce no leg diff at all and recompute nothing,
-        // leaving lots, realized_gains and cost basis derived from the old order.
-        // So the pairs this header touches, before and after, are reconciled
-        // explicitly. Recompute is a full re-derivation, so doing it when the
-        // interceptor already did is a no-op, not a double-count.
+        // HoldingsRecomputeInterceptor recomputes the positions of the investment
+        // legs a save writes, and of every investment leg of a header whose date or
+        // action changed, so a date-only edit that keeps every leg as it was still
+        // re-sorts the walk. Two inputs reach it in no save it sees: the
+        // acquisition lot added above, saved after the legs (a lots-only save
+        // recomputes nothing), which the walk has to bring to its derived state;
+        // and a fee leg's amount, which the walk folds into basis when the
+        // brokerage treats commissions as basis, on a leg that is not
+        // investment-shaped. So the pairs this header touches, before and after,
+        // are reconciled explicitly. Recompute is a full re-derivation, so doing it
+        // when the interceptor already did is a no-op, not a double-count.
         var touchedPairs = oldLegs
             .Where(l => l.SecurityId is not null && l.Quantity is not null)
             .Select(l => (l.AccountId, SecurityId: l.SecurityId!.Value))
@@ -1078,7 +1220,7 @@ public sealed class InvestmentTransactionsRepository
         if (await ShortfallWorsenedAsync(shortfallBefore, cancellationToken).ConfigureAwait(false))
             return PatchResult.Fail(CreateFailure.InsufficientShares);
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
 
         return PatchResult.Ok();
     }
@@ -1181,20 +1323,38 @@ public sealed class InvestmentTransactionsRepository
     /// next sync resurrect it; soft-hide preserves the user's
     /// delete intent across re-sync.</para>
     ///
-    /// <para>Balance recompute on
-    /// <c>txn_header_account_balances</c> is automatic via
-    /// <see cref="LegDerivedRecomputeInterceptor"/> after this method's
-    /// <c>SaveChangesAsync</c>. The hard-delete branch tracks the
-    /// header DELETE via EF; the interceptor's pre-save snapshot
-    /// reads the doomed header's legs from the DB so the
-    /// affected-accounts set survives the cascade.</para>
+    /// <para>Balances (<see cref="LegDerivedRecomputeInterceptor"/>) and
+    /// holdings, lots and realized gains
+    /// (<see cref="HoldingsRecomputeInterceptor"/>) recompute on this
+    /// method's <c>SaveChangesAsync</c>, in both branches. The hard-delete
+    /// branch tracks the header DELETE via EF, and each interceptor reads the
+    /// doomed header's legs from the DB before the save, so the affected
+    /// accounts and positions survive the cascade; the rows merged into the
+    /// header, which the delete un-merges, are tracked first so the save
+    /// recomputes them too (<see cref="MergeLosers"/>). The soft-hide branch flips
+    /// <c>is_hidden</c>, which both walks read, so each interceptor treats the
+    /// change as one to every leg of the header, and a hidden buy's shares
+    /// leave its position (ADR-0032, 2026-11-03 amendment).</para>
+    ///
+    /// <para>The save runs in a transaction this method opens with the ledger write
+    /// lock (<see cref="LedgerWriteLock"/>, migration 275) as its first statement, so the
+    /// header read, the interceptors' reads of its legs and the cascade all come after
+    /// it.</para>
     /// </remarks>
     public async Task<DeleteOutcome> DeleteAsync(
         Guid ledgerId,
         Guid headerId,
         CancellationToken cancellationToken = default)
     {
-        var header = await _db.TxnHeaders
+        // The ledger write lock (migration 275), first. Without a transaction of its own
+        // the save would run in the one the stored-notes interceptor opens, after the
+        // recompute interceptors' reads and with the cascade's row locks taken before any
+        // recompute asked for the lock, which the database refuses.
+        await using var write = await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken).ConfigureAwait(false);
+
+        // A merged-away header is not found (MergedAway). Deleting a winner still
+        // un-merges its losers below.
+        var header = await _db.TxnHeaders.NotMergedAway()
             .FirstOrDefaultAsync(
                 h => h.Id == headerId && h.LedgerId == ledgerId,
                 cancellationToken).ConfigureAwait(false);
@@ -1207,30 +1367,29 @@ public sealed class InvestmentTransactionsRepository
         // the agenda as un-acted and re-fireable — while the identical delete of a
         // BANK occurrence leaves it consumed. Soft-hiding keeps the stamp, takes the
         // row out of the register the same way a deleted feed row goes, and
-        // UnhideAsync is already the undo.
-        var isReminderOccurrence =
-            header.RecurringTransactionId is not null
-            && header.OccurrenceDate is not null
-            && !header.IsRecurringTemplate;
-
+        // the bulk unhide is the undo. The rule is TxnHeaderRow.IsDeletedOutright,
+        // shared with the bank delete.
         DeleteOutcome outcome;
-        if (header.ExternalId is null && !isReminderOccurrence)
+        if (header.DeletesOutright())
         {
             // Hard delete cascades through txn_legs. Both interceptors
             // (mig 102 balance + mig 104 holdings) read the doomed
             // legs from the live DB in SavingChangesAsync — before
             // the cascade — so the affected accounts + holdings set
-            // survives the DB-side delete.
+            // survives the DB-side delete. A manual row can be a merge
+            // winner, and deleting it un-merges its losers; tracked first,
+            // the save recomputes them (MergeLosers).
+            await MergeLosers.TrackAsync(_db, [header.Id], cancellationToken).ConfigureAwait(false);
             _db.TxnHeaders.Remove(header);
             outcome = DeleteOutcome.HardDeleted;
         }
         else
         {
-            // Soft-hide leaves the legs in place. Holdings state is
-            // unchanged (no DML on txn_legs → no holdings recompute).
-            // Balance state DOES change: mig 103 made is_hidden a
-            // recompute filter, and LegDerivedRecomputeInterceptor picks
-            // up the IsHidden flip on this SaveChanges.
+            // Soft-hide leaves the legs in place, but both walks leave a
+            // hidden header out (balances since mig 103, holdings since mig
+            // 117, ADR-0040), so the IsHidden flip on this SaveChanges
+            // recomputes the header's accounts and positions through
+            // LegDerivedRecomputeInterceptor and HoldingsRecomputeInterceptor.
             // Soft-delete also clears needs_review (ADR-0052 D3): a deleted row
             // is resolved, not awaiting acceptance — otherwise it strands as
             // is_hidden + needs_review (invisible but still queued).
@@ -1240,54 +1399,58 @@ public sealed class InvestmentTransactionsRepository
         }
 
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
 
         return outcome;
     }
 
     /// <summary>
-    /// Investment merge candidates for the editor's "possible matches" panel
+    /// Investment merge candidates for the editor's "Merge candidates" strip
     /// (mirrors <see cref="TransactionsRepository.GetMergeCandidatesAsync"/> for
     /// the bank shape): settled investment rows the edited, still-unreviewed row
     /// could fold into.
     /// </summary>
     /// <remarks>
-    /// <para><b>The anchor reads the ingest HINTS, not a security leg.</b> It used
-    /// to require the edited row to carry <c>posting_role='security'</c> with a
-    /// security_id, a quantity, and a non-null <c>action</c> — while also requiring
-    /// <c>needs_review</c>. Those two demands are mutually exclusive in this
-    /// product, so the panel could never return a single row: ingest writes a
+    /// <para><b>The anchor reads the ingest HINTS, not a security leg.</b> Requiring
+    /// the edited row to carry <c>posting_role='security'</c> with a security_id, a
+    /// quantity, and a non-null <c>action</c> — while also requiring
+    /// <c>needs_review</c> — asks for two things that are mutually exclusive in this
+    /// product, so the panel would never return a single row: ingest writes a
     /// BANK-shaped two-leg posting (account + Uncategorized) and carries the
     /// investment detail in the <c>ingest_*</c> columns, and the investment shape
     /// only appears at Accept, which clears <c>needs_review</c> in the same
-    /// transaction. The original predicate came from ADR-0031's sync-time write
-    /// path, which specified action-bearing needs_review rows; migration 076
-    /// records that the shipped Phase 3c deliberately did NOT do that, because
-    /// <c>trg_validate_posting_role</c> (migration 057) makes posting_role and
-    /// header.action inseparable and the invariant could not be relaxed for
-    /// unreviewed rows. The anchor was written against the superseded design and
-    /// was never reachable — the only writer of that state is a raw UPDATE in the
-    /// old test fixtures, which is exactly why the gate stayed green.</para>
+    /// transaction. The invariant <c>posting_role IS NOT NULL ⇔ txn_headers.action
+    /// IS NOT NULL</c> holds for every row, unreviewed ones included: no trigger
+    /// enforces it (migration 084 dropped <c>trg_validate_posting_role</c>), so
+    /// every leg writer upholds it — <c>CreateAsync</c> / <c>PatchAsync</c> stamp
+    /// a role on every investment leg, and ingest writes <c>action = NULL</c> with
+    /// <c>posting_role = NULL</c> (ADR-0031's action-bearing needs_review rows are
+    /// not what ingest writes).</para>
     ///
-    /// <para>So the anchor is now defined over what an unreviewed row ACTUALLY
-    /// has, the way the bank anchor always has been: its source leg (the
-    /// non-category one) for the account and the effective date, and the
-    /// <c>ingest_*</c> carriers for the money, the share count and the security.
-    /// Reshaping ingest to suit the old predicate is not an option and never
-    /// was — the trigger forbids it.</para>
+    /// <para>So the anchor is defined over what an unreviewed row ACTUALLY has,
+    /// the way the bank anchor is: its source leg (the non-category one) for the
+    /// account and the effective date, and the <c>ingest_*</c> carriers for the
+    /// money, the share count and the security. Reshaping ingest to suit a
+    /// security-leg predicate is not an option — a role-bearing leg on an
+    /// action-less header breaks the invariant above.</para>
     ///
     /// <para><b>Matching.</b> Candidates are settled, un-merged, effectively
     /// visible investment rows whose holdings leg sits on the source account's
     /// Holdings sibling (so: same brokerage, same ledger), within ±7 effective
     /// days, matched on MAGNITUDE:</para>
     /// <list type="number">
-    ///   <item><description><c>ingest_amount</c> — the wire's own cash total. The
+    ///   <item><description><c>ingest_amount</c> — the wire's own cash total, kept
+    ///   as sent and read at the brokerage currency's places (ADR-0114 D15). The
     ///   only usable number for a reinvest, whose net on the account is zero by
-    ///   construction (mig 228; before that column existed there was nothing to
-    ///   match a reinvest on at all).</description></item>
+    ///   construction, so no leg amount identifies it (column added by
+    ///   mig 228).</description></item>
     ///   <item><description>else the summed source-account amount — a plain buy or
     ///   sell moves real cash, so its own leg carries the principal.</description></item>
     ///   <item><description>else <c>ingest_shares</c> against the candidate's
     ///   quantity, for a basis-only move where no amount is informative.</description></item>
+    ///   <item><description>and the same principal on a candidate's holdings leg,
+    ///   which is the only place a dividend reinvest carries it: its brokerage
+    ///   cash nets to zero.</description></item>
     /// </list>
     /// <para>Magnitude, not signed value: <c>ingest_amount</c> is stored as the
     /// wire's absolute total while a holdings leg is signed by direction, so a
@@ -1305,12 +1468,16 @@ public sealed class InvestmentTransactionsRepository
     /// agrees with what the register shows. Merge winners ARE eligible (folding
     /// into a prior winner keeps the merge graph one-hop).</para>
     /// </remarks>
+    /// <param name="register">Reads each candidate's row in the brokerage's
+    /// register, which is what the chip's figures are.</param>
     public async Task<IReadOnlyList<InvestmentMergeCandidateDto>> GetMergeCandidatesAsync(
         Guid ledgerId,
         Guid headerId,
         int limit,
+        RegisterRepository register,
         CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(register);
         // The edited row must be fresh, undecided and effectively visible. Anchored
         // through resolved_transactions for the override-aware date + hidden, and on
         // the NON-CATEGORY leg — the same negative test the bank anchor uses, which
@@ -1340,9 +1507,12 @@ public sealed class InvestmentTransactionsRepository
                 // (ADR-0019). NULL on a non-brokerage account, which then matches
                 // nothing — correct, as there are no investment rows to fold into.
                 account.HoldingsAccountId,
+                account.CurrencyCode,
                 rv.IngestAmount,
                 rv.IngestShares,
                 rv.IngestSecurityId,
+                rv.IngestActionHint,
+                rv.InvestmentAction,
             })
             .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -1356,9 +1526,19 @@ public sealed class InvestmentTransactionsRepository
             .SumAsync(rv => rv.Amount, cancellationToken)
             .ConfigureAwait(false);
 
-        var principal = Math.Abs(anchor.IngestAmount ?? 0m);
+        // ingest_amount keeps the wire's total as sent, so it is read once at the
+        // brokerage currency's places, half away from zero, as the ingest write fits a
+        // leg and the editor's prefill reads it (ADR-0114 D14, D15): the candidates'
+        // legs are at those places. A total under half a minor unit is none.
+        var principal = anchor.IngestAmount is { } total
+            ? CurrencyMinorUnits.RoundAwayFromZero(Math.Abs(total), anchor.CurrencyCode)
+            : 0m;
         if (principal == 0m) principal = Math.Abs(sourceAmount);
         var shares = Math.Abs(anchor.IngestShares ?? 0m);
+        // Whether the anchor's own cash direction is a classification's, not just
+        // a feed's sign: it carries an action or an ingest action hint.
+        var directionKnown = anchor.IngestActionHint is not null
+            || anchor.InvestmentAction is not null;
         // Nothing to match on: no cash figure and no share count. Offering every
         // row in the window would be worse than offering none.
         if (principal == 0m && shares == 0m)
@@ -1391,15 +1571,15 @@ public sealed class InvestmentTransactionsRepository
             select rv;
 
         // (A) Bank's rule, applied to the brokerage: the same effective cash on
-        // the same account. This used to be a match on the SECURITY leg's amount
-        // instead, which silently added a SHAPE constraint to a rule that is
-        // supposed to constrain settledness only — a candidate had to already be
+        // the same account. Matching on the SECURITY leg's amount instead would
+        // silently add a SHAPE constraint to a rule that is supposed to constrain
+        // settledness only — a candidate would have to already be
         // investment-shaped, with a security leg on the Holdings sibling.
         //
         // The commonest duplicate on a brokerage has no such leg. A dividend
         // recorded as cash is (brokerage cash, income category); a feed-delivered
         // INVBANKTRAN row is (brokerage cash, category) with no action at all.
-        // Neither could ever be offered, so the merge panel came up empty on
+        // Neither could be offered, so the merge panel would come up empty on
         // exactly the rows it exists for.
         var byAmount = principal == 0m
             ? new List<Guid>()
@@ -1435,12 +1615,28 @@ public sealed class InvestmentTransactionsRepository
                 .ToListAsync(cancellationToken)
                 .ConfigureAwait(false);
 
-        var matched = byAmount.Union(byShares).ToList();
+        // (C) A reinvest moves no net cash on the brokerage either: its income leg
+        // and its purchase leg cancel, so (A) reads it as zero and never offers it
+        // for a cash row of its principal. The principal sits on the holdings leg,
+        // so match the figure there, in magnitude as a holdings leg is signed by
+        // direction. Only the amount is compared: the direction check below still
+        // separates the two sides of a trade, and it passes a zero-cash reinvest.
+        var byHoldingsAmount = principal == 0m
+            ? new List<Guid>()
+            : await settledInWindow
+                .Where(rv => rv.AccountId == holdingsAccountId
+                    && rv.PostingRole == PostingRoles.Security
+                    && (rv.Amount == principal || rv.Amount == -principal))
+                .Select(rv => rv.HeaderId)
+                .Distinct()
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+        var matched = byAmount.Union(byShares).Union(byHoldingsAmount).ToList();
         if (matched.Count == 0) return Array.Empty<InvestmentMergeCandidateDto>();
 
-        // The security leg, for the candidates that have one. It carries what the
-        // chip shows — ticker, shares, price — and the trade's PRINCIPAL, which
-        // the cash leg cannot supply on a reinvest (that nets to zero).
+        // The security leg, for the candidates that have one: the security the
+        // narrowing below compares, and the ticker and price the chip shows.
         var securityLegs = await _db.ResolvedTransactions.AsNoTracking()
             .Where(rv => matched.Contains(rv.HeaderId)
                 && rv.AccountId == holdingsAccountId
@@ -1452,9 +1648,7 @@ public sealed class InvestmentTransactionsRepository
                 rv.PostedAt,
                 rv.SecurityId,
                 rv.SecurityTicker,
-                rv.Quantity,
                 rv.UnitPrice,
-                rv.Amount,
                 rv.InvestmentAction,
             })
             .ToListAsync(cancellationToken)
@@ -1466,7 +1660,7 @@ public sealed class InvestmentTransactionsRepository
             .ToDictionary(g => g.Key, g => g.First());
 
         // The brokerage leg, for every candidate: date and payee come from here,
-        // and so does the money on a candidate with no security leg.
+        // and the cash direction the filter below compares.
         var cashLegs = await _db.ResolvedTransactions.AsNoTracking()
             .Where(rv => matched.Contains(rv.HeaderId)
                 && rv.AccountId == anchor.SourceAccountId)
@@ -1485,7 +1679,7 @@ public sealed class InvestmentTransactionsRepository
             .GroupBy(l => l.HeaderId)
             .ToDictionary(g => g.Key, g => g.First());
 
-        return matched
+        var chosen = matched
             // A candidate whose cash moved the OPPOSITE way is not a duplicate
             // — it is the other side of the trade. A sell that brought in some
             // amount and a buy that spent that same amount on the same security,
@@ -1493,18 +1687,26 @@ public sealed class InvestmentTransactionsRepository
             // offering one as the other's twin invites a merge that tombstones
             // a real transaction.
             //
-            // This was never right: before the widening, the amount match ran
-            // on the security leg with Math.Abs, so the pair matched there too.
-            // The widening was supposed to bring this to the bank rule, which
-            // compares the SIGNED sum (`g.Sum(...) == targetSourceAmount`) —
-            // getting that wrong left the defect in place under a comment
-            // claiming parity.
+            // An unsigned amount match (Math.Abs on the security leg) accepts
+            // that pair. The bank rule compares the SIGNED sum
+            // (`g.Sum(...) == targetSourceAmount`); this direction check is what
+            // gives the investment side the same parity.
             //
             // Skipped when the anchor moved no cash: a reinvest nets to zero on
             // the brokerage, so it has no direction for a candidate to
             // contradict, and matching there is by share count or by the feed's
             // stated total instead.
-            .Where(id => sourceAmount == 0m
+            //
+            // Also skipped when the anchor has no classification (no action and
+            // no ingest action hint). Its sign is then only the feed's claim: an
+            // aggregator that cannot tell a fund purchase from a sale reports the
+            // cash with its own convention, so a buy can arrive as money IN. The
+            // guard would then hide the row's true twin, which is exactly the row
+            // the panel exists for. Nothing is lost by offering it: the chip
+            // shows the twin's own direction, the merge is the person's pick, and
+            // same-direction twins are listed first (see the ordering below).
+            .Where(id => !directionKnown
+                || sourceAmount == 0m
                 || !cashByHeader.TryGetValue(id, out var cash)
                 || cash.Amount == 0m
                 || Math.Sign(cash.Amount) == Math.Sign(sourceAmount))
@@ -1529,25 +1731,58 @@ public sealed class InvestmentTransactionsRepository
                     PostedAt = postedAt,
                     Action = sec?.InvestmentAction ?? cash?.InvestmentAction,
                     Ticker = sec?.SecurityTicker,
-                    sec?.Quantity,
                     sec?.UnitPrice,
-                    Amount = sec?.Amount ?? cash?.Amount ?? 0m,
                     Payee = cash?.Payee,
+                    // Only an unclassified anchor can reach here with a twin that
+                    // moved cash the other way; those sort after the rest.
+                    Opposes = cash is not null
+                        && sourceAmount != 0m
+                        && cash.Amount != 0m
+                        && Math.Sign(cash.Amount) != Math.Sign(sourceAmount),
                 };
             })
-            .OrderBy(r => Math.Abs((r.PostedAt - anchor.PostedAt).TotalDays))
+            .OrderBy(r => r.Opposes)
+            .ThenBy(r => Math.Abs((r.PostedAt - anchor.PostedAt).TotalDays))
             .ThenByDescending(r => r.PostedAt)
+            .ThenBy(r => r.HeaderId)
             .Take(limit)
-            .Select(r => new InvestmentMergeCandidateDto(
-                r.HeaderId,
-                r.PostedAt,
-                (int)Math.Round((r.PostedAt - anchor.PostedAt).TotalDays),
-                r.Action,
-                r.Ticker,
-                r.Quantity,
-                r.UnitPrice,
-                r.Amount,
-                r.Payee))
+            .ToList();
+        if (chosen.Count == 0) return Array.Empty<InvestmentMergeCandidateDto>();
+
+        // The chip reads like the candidate's row in this brokerage's register, so
+        // its amount, shares, action and other account are that row's, as the
+        // register reads and projects it. The legs above say something else: the
+        // holdings leg of a sell is negative where its row is cash coming in, the
+        // principal leaves out a fee the row includes, and a cash transfer's Xfr
+        // exists only on the row.
+        var rows = await register.GetRowsForHeadersAsync(
+                chosen.Select(c => c.HeaderId).ToList(), anchor.SourceAccountId, cancellationToken)
+            .ConfigureAwait(false);
+
+        // Every candidate has a visible leg on the brokerage (a cash match is made
+        // on one, and a security posting pairs one with its holdings leg), so each
+        // has a row; one without would have nothing to read like and is not
+        // offered.
+        return chosen
+            .Where(c => rows.TryGetValue(c.HeaderId, out var r) && r is InvestmentRowDto)
+            .Select(c =>
+            {
+                var row = (InvestmentRowDto)rows[c.HeaderId];
+                return new InvestmentMergeCandidateDto(
+                    c.HeaderId,
+                    c.PostedAt,
+                    (int)Math.Round((c.PostedAt - anchor.PostedAt).TotalDays),
+                    c.Action,
+                    c.Ticker,
+                    row.Quantity,
+                    c.UnitPrice,
+                    row.Amount,
+                    c.Payee,
+                    row.DerivedAction,
+                    row.CounterpartyAccountId,
+                    row.CounterpartyAccountName,
+                    row.Origin);
+            })
             .ToList();
     }
 
@@ -1566,7 +1801,7 @@ public sealed class InvestmentTransactionsRepository
         DateTime postedAt,
         CancellationToken cancellationToken)
     {
-        await HeaderOriginals.CaptureAsync(_db, header, cancellationToken)
+        await AnnotationWriter.CaptureOriginalsAsync(_db, header, cancellationToken)
             .ConfigureAwait(false);
         header.PostedAt = postedAt;
     }
@@ -1591,7 +1826,8 @@ public sealed class InvestmentTransactionsRepository
         Guid headerId,
         CancellationToken cancellationToken = default)
     {
-        var header = await _db.TxnHeaders
+        // A merged-away header is not found (MergedAway).
+        var header = await _db.TxnHeaders.NotMergedAway()
             .FirstOrDefaultAsync(h => h.Id == headerId && h.LedgerId == ledgerId,
                 cancellationToken)
             .ConfigureAwait(false);
@@ -1620,11 +1856,13 @@ public sealed class InvestmentTransactionsRepository
     public readonly record struct ConvertInKindOutcome(
         ConvertInKindResult Result,
         CreateFailure? CreateFail,
-        Guid HeaderId)
+        Guid HeaderId,
+        FailureDetail? Detail = null)
     {
         public static ConvertInKindOutcome Ok(Guid id) => new(ConvertInKindResult.Ok, null, id);
         public static ConvertInKindOutcome Fail(ConvertInKindResult r) => new(r, null, Guid.Empty);
-        public static ConvertInKindOutcome Fail(CreateFailure f) => new(ConvertInKindResult.NotAValidPair, f, Guid.Empty);
+        public static ConvertInKindOutcome Fail(CreateFailure f, FailureDetail? detail = null) =>
+            new(ConvertInKindResult.NotAValidPair, f, Guid.Empty, detail);
     }
 
     private sealed record HoldingsLeg(Guid SecurityId, decimal Quantity, Guid SiblingAccountId, DateTime PostedAt);
@@ -1638,7 +1876,9 @@ public sealed class InvestmentTransactionsRepository
     /// <see cref="CreateAsync"/>'s FIFO plan reads the correct pre-transfer state;
     /// CreateAsync joins this open transaction (does not commit) since it sees a
     /// current transaction. Any fee/cash legs on the original pair are dropped (an
-    /// in-kind transfer moves no cash) — the candidate review surfaces that.
+    /// in-kind transfer moves no cash) — the candidate review surfaces that. The
+    /// transaction is opened by the ledger write lock (<see cref="LedgerWriteLock"/>,
+    /// migration 275), before the pair is read and validated.
     /// </summary>
     public async Task<ConvertInKindOutcome> ConvertInKindTransferAsync(
         Guid ledgerId,
@@ -1646,6 +1886,13 @@ public sealed class InvestmentTransactionsRepository
         Guid buyHeaderId,
         CancellationToken cancellationToken = default)
     {
+        // The ledger write lock (migration 275), first: the delete save and the
+        // transfer's saves recompute balances and holdings, which the database refuses
+        // in a transaction that wrote without it, and the pair read here is the pair
+        // deleted below. CreateAsync takes it again inside this transaction, which does
+        // nothing.
+        await using var write = await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken).ConfigureAwait(false);
+
         var sell = await LoadDisposalOrAcquisitionLegAsync(
             ledgerId, sellHeaderId, disposal: true, cancellationToken).ConfigureAwait(false);
         if (sell is null) return ConvertInKindOutcome.Fail(ConvertInKindResult.SellNotFound);
@@ -1666,9 +1913,6 @@ public sealed class InvestmentTransactionsRepository
         if (sourceBrokerage is not { } sourceId || destBrokerage is not { } destId || sourceId == destId)
             return ConvertInKindOutcome.Fail(ConvertInKindResult.NotAValidPair);
 
-        await using var transaction = await _db.Database
-            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-
         // Hard-delete both headers. The DB cascades header → legs → lots
         // (mig 123), and HoldingsRecomputeInterceptor snapshots the doomed
         // legs' (account, security) pairs before the cascade, so both holdings
@@ -1676,6 +1920,14 @@ public sealed class InvestmentTransactionsRepository
         var headers = await _db.TxnHeaders
             .Where(h => h.LedgerId == ledgerId && (h.Id == sellHeaderId || h.Id == buyHeaderId))
             .ToListAsync(cancellationToken).ConfigureAwait(false);
+        // Read both events' notes before they go: the transfer joins them.
+        var sellNotes = await AnnotationWriter.LoadAsync(_db, headers.Single(h => h.Id == sellHeaderId), cancellationToken)
+            .ConfigureAwait(false);
+        var buyNotes = await AnnotationWriter.LoadAsync(_db, headers.Single(h => h.Id == buyHeaderId), cancellationToken)
+            .ConfigureAwait(false);
+        // Either can be a merge winner, and deleting it un-merges its losers; tracked
+        // first, the save recomputes them (MergeLosers).
+        await MergeLosers.TrackAsync(_db, [.. headers.Select(h => h.Id)], cancellationToken).ConfigureAwait(false);
         _db.TxnHeaders.RemoveRange(headers);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 
@@ -1696,11 +1948,17 @@ public sealed class InvestmentTransactionsRepository
             // sell+buy — the source/destination brokerage is often since-closed
             // (e.g. a rolled-over 401k). Bypass the inactive-account write gate.
             allowInactiveAccounts: true,
-            cancellationToken: cancellationToken).ConfigureAwait(false);
+            cancellationToken: cancellationToken,
+            // The transfer's notes: what each event's register showed, the sell's
+            // first, joined, and their tags unioned. A system merge: never capped.
+            notesFor: transfer => AnnotationPlanner.ConvertInKind(
+                sellNotes.Shape, sellNotes.Notes, buyNotes.Shape, buyNotes.Notes, transfer)).ConfigureAwait(false);
         if (createResult.Failure is { } f)
-            return ConvertInKindOutcome.Fail(f);   // await using rolls back
+            return ConvertInKindOutcome.Fail(f, createResult.Detail);   // await using rolls back
+        if (createResult.Refusal is not null)
+            throw new InvalidOperationException("An in-kind transfer's joined notes were refused.");
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
         return ConvertInKindOutcome.Ok(createResult.HeaderId);
     }
 
@@ -1717,15 +1975,14 @@ public sealed class InvestmentTransactionsRepository
             ? new[] { LedgerActions.Sell, LedgerActions.SellXfr }
             : new[] { LedgerActions.Buy, LedgerActions.BuyXfr };
 
-        // Date and visibility come from the OVERRIDE LAYER, not the raw header.
-        // This read decides whether a pair is convertible, and the caller compares
-        // the two sides' dates — but the detector that OFFERS the pair
-        // (FindInKindCandidates) reads resolved_transactions. This side used to
-        // read the raw posted_at while that view resolved the override, so the two
-        // disagreed about the same pair in both directions: a pair whose displayed
-        // dates matched was offered and then rejected as NotAValidPair, and a pair
-        // a user had deliberately dated apart could still convert. Since mig 230
-        // there is one date and they cannot drift again.
+        // Date and visibility must be the ones the detector that OFFERS the pair
+        // (FindInKindCandidates, over resolved_transactions) sees. This read decides
+        // whether a pair is convertible, and the caller compares the two sides'
+        // dates; if the two read different dates they disagree about the same pair
+        // in both directions — a pair whose displayed dates match is offered and
+        // then rejected as NotAValidPair, and a pair a user deliberately dated apart
+        // can still convert. Since mig 230 the header holds the one date, so they
+        // cannot drift.
         //
         // The leg columns come off txn_legs on purpose: resolved_transactions
         // COALESCEs security_id and quantity across a posting's sibling legs, so
@@ -1733,14 +1990,14 @@ public sealed class InvestmentTransactionsRepository
         // from the holdings leg this must find.
         var row = await (
             from l in _db.TxnLegs.AsNoTracking()
-            join h in _db.TxnHeaders.AsNoTracking() on l.HeaderId equals h.Id
+            // A merged-away header is not found (MergedAway).
+            join h in _db.TxnHeaders.AsNoTracking().NotMergedAway() on l.HeaderId equals h.Id
             where l.HeaderId == headerId
                   && l.LedgerId == ledgerId
                   && l.PostingRole == PostingRoles.Security
                   && l.SecurityId != null
                   && l.Quantity != null
                   && h.Action != null && actions.Contains(h.Action)
-                  && h.IsMergedInto == null
             select new
             {
                 SecurityId = l.SecurityId!.Value,
@@ -1778,20 +2035,33 @@ public sealed class InvestmentTransactionsRepository
     /// failure (the caller maps it to a 422) OR the resolved holdings-sibling
     /// account id + the posting list. Performs NO writes.
     /// </summary>
-    private async Task<(CreateFailure? Failure, Guid HoldingsAccountId, IReadOnlyList<InvestmentPosting> Postings, Guid? DestHoldingsAccountId)>
-        ValidateAndResolveAsync(
+    /// <remarks>
+    /// <para><b>Places</b> (ADR-0114 D15). The amount and the fee are typed figures in
+    /// the brokerage's currency, so each is checked at its places once the brokerage is
+    /// loaded, and one with more places is refused, never rounded. An edit passes the
+    /// figures it replaces as <paramref name="stored"/>: a figure resent equal to one of
+    /// them passes, because a stored figure that does not fit is kept.</para>
+    /// <para><b>The transfer pair</b> (ADR-0114 D13, ADR-0029). A transfer-shape action
+    /// whose transfer account is a real account in another currency carries
+    /// <c>transferAmount</c> as that account's leg, checked by the one second-amount
+    /// rule (<see cref="PostingLegPair.CheckSecondAmount"/>) against the brokerage's leg
+    /// of the transfer pair. Every other transfer mirrors, and a
+    /// <c>transferAmount</c> sent on it is dropped.</para>
+    /// </remarks>
+    private async Task<Resolution> ValidateAndResolveAsync(
             Guid ledgerId,
             CreateInvestmentTransactionRequest request,
             bool allowInactiveAccounts,
+            IReadOnlySet<Guid>? alreadyPresent,
+            StoredFigures? stored,
             CancellationToken cancellationToken)
     {
-        var empty = Array.Empty<InvestmentPosting>();
         var action = request.Action;
         if (!IsCatalogAction(action))
-            return (CreateFailure.ActionInvalid, Guid.Empty, empty, null);
+            return Resolution.Fail(CreateFailure.ActionInvalid);
 
         var (shapeFailure, _) = ValidateActionShape(request, action);
-        if (shapeFailure is { } sf) return (sf, Guid.Empty, empty, null);
+        if (shapeFailure is { } sf) return Resolution.Fail(sf);
 
         // Account lookups (single round-trip; one query covers brokerage +
         // every referenced counterparty).
@@ -1803,33 +2073,41 @@ public sealed class InvestmentTransactionsRepository
         var byId = accounts.ToDictionary(a => a.Id);
 
         if (!byId.TryGetValue(request.BrokerageAccountId, out var brokerage))
-            return (CreateFailure.AccountNotInLedger, Guid.Empty, empty, null);
+            return Resolution.Fail(CreateFailure.AccountNotInLedger);
         if (brokerage.AccountType != "investment")
-            return (CreateFailure.AccountNotInvestment, Guid.Empty, empty, null);
+            return Resolution.Fail(CreateFailure.AccountNotInvestment);
         if (brokerage.HoldingsAccountId is not { } holdingsAccountId)
-            return (CreateFailure.AccountMissingHoldingsSibling, Guid.Empty, empty, null);
+            return Resolution.Fail(CreateFailure.AccountMissingHoldingsSibling);
 
         foreach (var (id, code) in EnumerateCounterpartyIds(request))
             if (!byId.ContainsKey(id))
-                return (code, Guid.Empty, empty, null);
+                return Resolution.Fail(code);
 
-        // PR #132 inactive-account gate: a brokerage / counterparty must be active
+        // Inactive-account gate: a brokerage / counterparty must be active
         // to receive a write. It blocks NEW activity being posted to a closed
         // account. allowInactiveAccounts bypasses it for convert_in_kind_transfer,
         // which re-represents transactions that ALREADY exist on those (often since-
         // closed) accounts — a historical data-hygiene correction, not new activity
         // (the ADR-0085 presentation-vs-correctness distinction: is_active gates the
         // UI, not a legitimate historical write).
+        //
+        // alreadyPresent is what an edit's legs already sit on, as the bank edits
+        // pass theirs: an inactive account left in place is not new activity, one
+        // newly chosen is. An edit resends the whole shape, so without it an
+        // unchanged account looks exactly like one moved onto, and an event on a
+        // deactivated account could not be edited at all. Null (creates and fires)
+        // gates every account.
+        bool IsNew(Guid id) => alreadyPresent is null || !alreadyPresent.Contains(id);
         if (!allowInactiveAccounts)
         {
-            if (!brokerage.IsActive)
-                return (CreateFailure.BrokerageInactive, Guid.Empty, empty, null);
+            if (!brokerage.IsActive && IsNew(brokerage.Id))
+                return Resolution.Fail(CreateFailure.BrokerageInactive);
 
             // Runs after the "not-in-ledger" pass, so the more specific error wins
             // when both apply.
             foreach (var (id, code) in EnumerateCounterpartyIdsForInactiveCheck(request))
-                if (byId.TryGetValue(id, out var account) && !account.IsActive)
-                    return (code, Guid.Empty, empty, null);
+                if (byId.TryGetValue(id, out var account) && !account.IsActive && IsNew(id))
+                    return Resolution.Fail(code);
         }
 
         // Security lookup (per-ledger).
@@ -1838,7 +2116,7 @@ public sealed class InvestmentTransactionsRepository
             var secExists = await _db.Securities.AsNoTracking()
                 .AnyAsync(s => s.Id == secId && s.LedgerId == ledgerId, cancellationToken)
                 .ConfigureAwait(false);
-            if (!secExists) return (CreateFailure.SecurityNotInLedger, Guid.Empty, empty, null);
+            if (!secExists) return Resolution.Fail(CreateFailure.SecurityNotInLedger);
         }
 
         // transfer_shares (in-kind, ADR-0065): the destination is another
@@ -1852,18 +2130,132 @@ public sealed class InvestmentTransactionsRepository
             // counterparty passes above.
             var dest = byId[request.TransferAccountId!.Value];
             if (dest.AccountType != "investment")
-                return (CreateFailure.TransferSharesDestNotInvestment, Guid.Empty, empty, null);
+                return Resolution.Fail(CreateFailure.TransferSharesDestNotInvestment);
             if (dest.HoldingsAccountId is not { } destHoldings)
-                return (CreateFailure.TransferSharesDestMissingHoldingsSibling, Guid.Empty, empty, null);
+                return Resolution.Fail(CreateFailure.TransferSharesDestMissingHoldingsSibling);
             if (destHoldings == holdingsAccountId)
-                return (CreateFailure.TransferSharesToSelf, Guid.Empty, empty, null);
-            return (null, holdingsAccountId, empty, destHoldings);
+                return Resolution.Fail(CreateFailure.TransferSharesToSelf);
+            return new Resolution(null, null, holdingsAccountId, [], destHoldings,
+                brokerage.CurrencyCode, dest.CurrencyCode);
+        }
+
+        // The typed figures, at the brokerage's places (ADR-0114 D15). A figure equal
+        // to one the edit replaces passes: stored amounts that do not fit are kept.
+        var currency = brokerage.CurrencyCode;
+        if (request.Amount is { } typedAmount
+            && !CurrencyMinorUnits.Fits(typedAmount, currency)
+            && !(stored?.HoldsAmount(request.BrokerageAccountId, typedAmount) ?? false))
+            return Resolution.Fail(CreateFailure.AmountPlacesExceedCurrency, FailureDetail.Places(currency, "amount"));
+        if (request.FeeAmount is { } typedFee
+            && !CurrencyMinorUnits.Fits(typedFee, currency)
+            && !(stored?.HoldsFee(request.BrokerageAccountId, typedFee) ?? false))
+            return Resolution.Fail(CreateFailure.AmountPlacesExceedCurrency, FailureDetail.Places(currency, "feeAmount"));
+
+        // The transfer account's own leg (ADR-0114 D13, ADR-0029): required only across
+        // currencies between real accounts; everywhere else the leg mirrors and a sent
+        // transferAmount is dropped.
+        decimal? transferLeg = null;
+        if (TakesTransferAmount(action)
+            && byId[request.TransferAccountId!.Value] is var transferAccount
+            && new PostingLegPair.AccountSide(transferAccount.AccountType, transferAccount.CurrencyCode).IsReal
+            && !string.Equals(transferAccount.CurrencyCode, currency, StringComparison.Ordinal))
+        {
+            if (request.TransferAmount is not { } sent)
+                return Resolution.Fail(CreateFailure.TransferAmountRequired);
+            transferLeg = sent;
+
+            // At the transfer account's own places (ADR-0114 D15), like every typed figure;
+            // one resent equal to the stored leg on the same account is unchanged and passes.
+            if (!CurrencyMinorUnits.Fits(sent, transferAccount.CurrencyCode)
+                && !(stored?.TransferPair is { } storedPair
+                     && storedPair.Second.AccountId == transferAccount.Id
+                     && storedPair.Second.Amount == sent))
+                return Resolution.Fail(CreateFailure.AmountPlacesExceedCurrency,
+                    FailureDetail.Places(transferAccount.CurrencyCode, "transferAmount"));
         }
 
         var totalCommission = request.FeeAmount ?? 0m;
-        var postings = BuildPostings(request, action, holdingsAccountId, totalCommission);
-        return (null, holdingsAccountId, postings, null);
+        var postings = BuildPostings(request, action, holdingsAccountId, totalCommission, currency, transferLeg);
+
+        if (transferLeg is not null)
+        {
+            var pair = postings.Single(p => p.Cash.PostingRole == PostingRoles.Transfer);
+            var fault = PostingLegPair.CheckSecondAmount(
+                new PostingLegPair.Leg(pair.Cash.AccountId, pair.Cash.Amount),
+                new PostingLegPair.Leg(pair.Counterparty.AccountId, pair.Counterparty.Amount),
+                stored?.TransferPair);
+            if (fault != PostingLegPair.SecondAmountFault.None)
+                return Resolution.Fail(fault == PostingLegPair.SecondAmountFault.Zero
+                    ? CreateFailure.TransferAmountsNonzero
+                    : CreateFailure.TransferAmountsSign);
+        }
+
+        return new Resolution(null, null, holdingsAccountId, postings, null, currency, null);
     }
+
+    /// <summary>
+    /// What <see cref="ValidateAndResolveAsync"/> resolved: the first failure and what
+    /// it names, or the brokerage's holdings sibling, the postings, the destination's
+    /// holdings sibling for an in-kind move, and the two brokerages' currencies.
+    /// </summary>
+    private readonly record struct Resolution(
+        CreateFailure? Failure,
+        FailureDetail? Detail,
+        Guid HoldingsAccountId,
+        IReadOnlyList<InvestmentPosting> Postings,
+        Guid? DestHoldingsAccountId,
+        string BrokerageCurrency,
+        string? DestCurrency)
+    {
+        public static Resolution Fail(CreateFailure failure, FailureDetail? detail = null) =>
+            new(failure, detail, Guid.Empty, [], null, string.Empty, null);
+    }
+
+    /// <summary>
+    /// The figures a PATCH would replace, read from the stored legs before the rebuild:
+    /// the amounts and fees on the edited brokerage, compared by magnitude since each
+    /// action signs them its own way, and the stored transfer pair. A figure resent
+    /// equal to one of them is unchanged, so it passes the places rule (ADR-0114 D15),
+    /// and a transfer pair resent equal to its two stored legs passes the nonzero and
+    /// sign rules (ADR-0114 D13).
+    /// </summary>
+    /// <remarks>Only legs on the request's brokerage count: an edit that moves the event
+    /// to another brokerage changes every figure's currency, so each is checked as
+    /// typed.</remarks>
+    private sealed record StoredFigures(
+        Guid BrokerageAccountId,
+        IReadOnlySet<decimal> Amounts,
+        IReadOnlySet<decimal> Fees,
+        PostingLegPair.StoredPair? TransferPair)
+    {
+        public static StoredFigures Of(IReadOnlyList<TxnLegRow> legs, Guid brokerageAccountId)
+        {
+            var onBrokerage = legs.Where(l => l.AccountId == brokerageAccountId).ToList();
+            var transferLeg = onBrokerage.FirstOrDefault(l => l.PostingRole == PostingRoles.Transfer);
+            var transferPair = transferLeg is not null
+                               && PostingLegPair.StoredPairs(legs, brokerageAccountId)
+                                   .TryGetValue(transferLeg.Id, out var pair)
+                ? pair
+                : (PostingLegPair.StoredPair?)null;
+            return new StoredFigures(
+                brokerageAccountId,
+                onBrokerage.Where(l => l.PostingRole != PostingRoles.Fee).Select(l => Math.Abs(l.Amount)).ToHashSet(),
+                onBrokerage.Where(l => l.PostingRole == PostingRoles.Fee).Select(l => Math.Abs(l.Amount)).ToHashSet(),
+                transferPair);
+        }
+
+        public bool HoldsAmount(Guid brokerageAccountId, decimal value) =>
+            brokerageAccountId == BrokerageAccountId && Amounts.Contains(Math.Abs(value));
+
+        public bool HoldsFee(Guid brokerageAccountId, decimal value) =>
+            brokerageAccountId == BrokerageAccountId && Fees.Contains(Math.Abs(value));
+    }
+
+    /// <summary>The transfer-shape actions, whose transfer pair carries
+    /// <c>transferAmount</c> across currencies (ADR-0114 D13, ADR-0029): on buyx, sellx
+    /// and divx it pairs with the trade amount, never the fee.</summary>
+    private static bool TakesTransferAmount(string action) => action is
+        LedgerActions.Transfer or LedgerActions.BuyXfr or LedgerActions.SellXfr or LedgerActions.DivXfr;
 
     private static bool IsCatalogAction(string action) => action is
         LedgerActions.Buy or LedgerActions.BuyXfr or
@@ -1967,7 +2359,7 @@ public sealed class InvestmentTransactionsRepository
     }
 
     /// <summary>
-    /// PR #132 inactive-account gate per role. Same shape as
+    /// Inactive-account gate per role. Same shape as
     /// <see cref="EnumerateCounterpartyIds"/>; emits the role-specific
     /// "inactive" failure when the referenced account exists in the
     /// ledger but has <c>is_active=false</c>.
@@ -1990,11 +2382,17 @@ public sealed class InvestmentTransactionsRepository
     /// (account-pair) on the brokerage. The list's order determines
     /// the legs' posting_index sequence.
     /// </summary>
+    /// <param name="currencyCode">The brokerage's currency, whose places the
+    /// price-times-shares fallback rounds at (ADR-0114 D15).</param>
+    /// <param name="transferLeg">The transfer account's own leg when the transfer pair
+    /// is between currencies (ADR-0114 D13); null mirrors the brokerage's leg.</param>
     private static IReadOnlyList<InvestmentPosting> BuildPostings(
         CreateInvestmentTransactionRequest r,
         string action,
         Guid holdingsAccountId,
-        decimal totalCommission)
+        decimal totalCommission,
+        string currencyCode,
+        decimal? transferLeg)
     {
         var list = new List<InvestmentPosting>();
         var brokerageId = r.BrokerageAccountId;
@@ -2006,7 +2404,7 @@ public sealed class InvestmentTransactionsRepository
             {
                 // Cash side -X (cash leaving for shares), holdings +Y.
                 var qty = r.Shares!.Value;
-                var (principal, unitPrice) = ResolveTradeMoney(r.Amount, r.Price!.Value, qty);
+                var (principal, unitPrice) = ResolveTradeMoney(r.Amount, r.Price!.Value, qty, currencyCode);
                 list.Add(InvestmentPostings.BuildSecPair(
                     brokerageId, holdingsAccountId, securityId!.Value,
                     cashAmount: -principal, holdingsAmount: principal,
@@ -2017,7 +2415,7 @@ public sealed class InvestmentTransactionsRepository
             case LedgerActions.Sell:
             {
                 var qty = r.Shares!.Value;             // negative input → expected
-                var (principal, unitPrice) = ResolveTradeMoney(r.Amount, r.Price!.Value, qty);
+                var (principal, unitPrice) = ResolveTradeMoney(r.Amount, r.Price!.Value, qty, currencyCode);
                 list.Add(InvestmentPostings.BuildSecPair(
                     brokerageId, holdingsAccountId, securityId!.Value,
                     cashAmount: principal, holdingsAmount: -principal,
@@ -2029,18 +2427,20 @@ public sealed class InvestmentTransactionsRepository
             case LedgerActions.SellXfr:
             {
                 var qty = r.Shares!.Value;
-                var (principal, unitPrice) = ResolveTradeMoney(r.Amount, r.Price!.Value, qty);
+                var (principal, unitPrice) = ResolveTradeMoney(r.Amount, r.Price!.Value, qty, currencyCode);
                 var sign = action == LedgerActions.BuyXfr ? -1m : 1m;
                 list.Add(InvestmentPostings.BuildSecPair(
                     brokerageId, holdingsAccountId, securityId!.Value,
                     cashAmount: sign * principal, holdingsAmount: -sign * principal,
                     quantity: qty, unitPrice: unitPrice));
                 // Xfr pair offsets brokerage cash (cash nets to zero on the brokerage).
+                // Across currencies the other leg is its own figure, which pairs with
+                // the trade amount, not the fee (ADR-0114 D13).
                 list.Add(InvestmentPostings.BuildXferPair(
                     brokerageAccountId: brokerageId,
                     otherAccountId: r.TransferAccountId!.Value,
                     brokerageAmount: -sign * principal,
-                    otherAmount: sign * principal));
+                    otherAmount: transferLeg ?? sign * principal));
                 AddOptionalFee(list, r, brokerageId, securityId, action);
                 break;
             }
@@ -2060,7 +2460,7 @@ public sealed class InvestmentTransactionsRepository
             case LedgerActions.DividendReinvest:
             {
                 var qty = r.Shares!.Value;
-                var (principal, unitPrice) = ResolveTradeMoney(r.Amount, r.Price!.Value, qty);
+                var (principal, unitPrice) = ResolveTradeMoney(r.Amount, r.Price!.Value, qty, currencyCode);
                 // Inc pair: cash IN from category.
                 list.Add(InvestmentPostings.BuildCategoryPair(
                     brokerageAccountId: brokerageId,
@@ -2091,7 +2491,7 @@ public sealed class InvestmentTransactionsRepository
                     brokerageAccountId: brokerageId,
                     otherAccountId: r.TransferAccountId!.Value,
                     brokerageAmount: -amount,
-                    otherAmount: amount));
+                    otherAmount: transferLeg ?? amount));
                 AddOptionalFee(list, r, brokerageId, securityId, action);
                 break;
             }
@@ -2102,7 +2502,7 @@ public sealed class InvestmentTransactionsRepository
                     brokerageAccountId: brokerageId,
                     otherAccountId: r.TransferAccountId!.Value,
                     brokerageAmount: amount,
-                    otherAmount: -amount));
+                    otherAmount: transferLeg ?? -amount));
                 // Transfer never carries a fee (ADR-0027); validation
                 // already rejected the combination.
                 break;
@@ -2147,28 +2547,30 @@ public sealed class InvestmentTransactionsRepository
     /// <summary>
     /// Money + derived unit price for a share-trade leg (buy / sell /
     /// buyx / sellx / dividend_reinvest). The AMOUNT paid/received is
-    /// authoritative and carries exactly 2 decimals — it is the actual
-    /// settled cash, which for an imported trade is the wire total, not a
-    /// re-derivation from a rounded per-share price (ADR-0073). The
+    /// authoritative — it is the actual settled cash, which for an imported
+    /// trade is the wire total, not a re-derivation from a rounded per-share
+    /// price (ADR-0073). A typed amount is used as sent: the validation has
+    /// already refused one finer than the brokerage's currency (ADR-0114
+    /// D15), and one resent equal to a stored figure is kept as stored. The
     /// per-share <c>unit_price</c> is DERIVED metadata (<c>amount ÷
     /// |shares|</c>) rounded to 6 decimals — the register's max display
     /// precision (<c>formatPrice</c>) — so what is stored is exactly what
     /// is shown (never more digits in the DB than on screen), and no
-    /// sub-cent money ever lands on a leg (which is what produced
-    /// fractional amounts + negative-zero balances).
+    /// money finer than the currency ever lands on a leg (which is what
+    /// produced fractional amounts + negative-zero balances).
     ///
-    /// Falls back to <c>round(price × |shares|, 2)</c> only when the request
-    /// omits an amount — a defensive path for callers predating the
+    /// Falls back to price × |shares| only when the request omits an
+    /// amount — a defensive path for callers predating the
     /// amount-authoritative model (e.g. a fixture that sets shares+price
-    /// but no amount). Rounds half away from zero to match Postgres
-    /// <c>round(numeric, n)</c> so the scrub migration and this code agree.
+    /// but no amount). That figure is computed, so it is rounded once at
+    /// the brokerage's places, half away from zero (ADR-0114 D15).
     /// </summary>
     private static (decimal Principal, decimal UnitPrice) ResolveTradeMoney(
-        decimal? requestAmount, decimal price, decimal quantity)
+        decimal? requestAmount, decimal price, decimal quantity, string currencyCode)
     {
         var absQty = Math.Abs(quantity);
-        var principal = Math.Round(
-            requestAmount ?? price * absQty, 2, MidpointRounding.AwayFromZero);
+        var principal = requestAmount
+                        ?? CurrencyMinorUnits.RoundAwayFromZero(price * absQty, currencyCode);
         var unitPrice = absQty != 0m
             ? Math.Round(principal / absQty, 6, MidpointRounding.AwayFromZero)
             : price;
@@ -2183,10 +2585,26 @@ public sealed class InvestmentTransactionsRepository
     /// One source FIFO lot (slice) being moved by a transfer_shares: the
     /// quantity taken from it, its inherited per-share <see cref="UnitCost"/>,
     /// and its original <see cref="AcquiredAt"/> (UTC). The destination
-    /// re-creates a lot with exactly these values so holding period + basis
-    /// carry across the move (ADR-0065 D2).
+    /// re-creates a lot with its quantity and acquisition date so holding period
+    /// + basis carry across the move (ADR-0065 D2), at the basis
+    /// <see cref="PriceMovedLotsAsync"/> sets.
     /// </summary>
-    private readonly record struct MovedLot(decimal Quantity, decimal UnitCost, DateTime AcquiredAt);
+    private readonly record struct MovedLot(decimal Quantity, decimal UnitCost, DateTime AcquiredAt)
+    {
+        /// <summary>The lot's basis leaving the source, at the source brokerage's
+        /// places.</summary>
+        public decimal SourceCost { get; init; }
+
+        /// <summary>The lot's basis arriving at the destination, in the destination
+        /// brokerage's currency, at its places: the source basis itself between two
+        /// brokerages in one currency, converted otherwise (ADR-0114 D13).</summary>
+        public decimal DestCost { get; init; }
+
+        /// <summary>The destination lot's per-share cost: the inherited
+        /// <see cref="UnitCost"/> in one currency, <see cref="DestCost"/> over the
+        /// quantity across currencies.</summary>
+        public decimal DestUnitCost { get; init; }
+    }
 
     /// <summary>
     /// Compute the FIFO consumption plan on the SOURCE holding for an in-kind
@@ -2234,6 +2652,72 @@ public sealed class InvestmentTransactionsRepository
     }
 
     /// <summary>
+    /// Price each moved lot's basis on both sides of an in-kind move. The source
+    /// basis is the lot's quantity times its unit cost, rounded once at the source
+    /// brokerage's places (ADR-0114 D15). Between two brokerages in one currency the
+    /// destination carries that basis and the lot's unit cost unchanged, and no rate
+    /// is read. Across currencies each lot converts at the derived rate for its own
+    /// acquisition day (ADR-0114 D13), which an earlier move keeps: computed at full
+    /// precision from the unrounded basis and rounded once at the destination's
+    /// places, with the destination unit cost that figure over the quantity.
+    /// </summary>
+    /// <returns>Every lot priced, or, when any lot's day has no derived rate, the
+    /// missing stored legs (account currency into the reporting currency) and days,
+    /// each once, and no lot: the whole move is refused.</returns>
+    private async Task<(FailureDetail? Missing, IReadOnlyList<MovedLot> Priced)> PriceMovedLotsAsync(
+        Guid ledgerId,
+        IReadOnlyList<MovedLot> plan,
+        string sourceCurrency,
+        string destCurrency,
+        CancellationToken cancellationToken)
+    {
+        if (string.Equals(sourceCurrency, destCurrency, StringComparison.Ordinal))
+        {
+            return (null, [.. plan.Select(lot =>
+            {
+                var cost = CurrencyMinorUnits.RoundAwayFromZero(lot.Quantity * lot.UnitCost, sourceCurrency);
+                return lot with { SourceCost = cost, DestCost = cost, DestUnitCost = lot.UnitCost };
+            })]);
+        }
+
+        var reporting = await _db.Ledgers.AsNoTracking()
+            .Where(l => l.Id == ledgerId)
+            .Select(l => l.CurrencyCode)
+            .SingleAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var lookup = new ExchangeRateLookup(_db, _clock);
+        var needs = lookup.NewNeeds();
+        foreach (var lot in plan)
+            needs.AddDerived(sourceCurrency, destCurrency, reporting, AcquiredDay(lot));
+        var rates = await lookup.LoadAsync(ledgerId, needs, cancellationToken).ConfigureAwait(false);
+
+        var priced = new List<MovedLot>(plan.Count);
+        var missing = new List<RateUnavailable>();
+        foreach (var lot in plan)
+        {
+            var basis = lot.Quantity * lot.UnitCost;
+            var rate = rates.Derived(sourceCurrency, destCurrency, reporting, AcquiredDay(lot));
+            if (rate.Convert(basis) is not { } converted)
+            {
+                foreach (var leg in rate.Unavailable)
+                    if (!missing.Contains(leg)) missing.Add(leg);
+                continue;
+            }
+            priced.Add(lot with
+            {
+                SourceCost = CurrencyMinorUnits.RoundAwayFromZero(basis, sourceCurrency),
+                DestCost = converted,
+                DestUnitCost = converted / lot.Quantity,
+            });
+        }
+        return missing.Count > 0
+            ? (new FailureDetail(MissingRates: missing), [])
+            : (null, priced);
+
+        static DateOnly AcquiredDay(MovedLot lot) => DateOnly.FromDateTime(lot.AcquiredAt);
+    }
+
+    /// <summary>
     /// Build the in-kind transfer postings: per moved lot, TWO sec postings —
     /// a source one (zero brokerage cash ↔ source holdings −lot) and a destination
     /// one (zero brokerage cash ↔ destination holdings +lot). The zero-cash sec
@@ -2258,26 +2742,27 @@ public sealed class InvestmentTransactionsRepository
         var list = new List<InvestmentPosting>(plan.Count * 2);
         foreach (var lot in plan)
         {
-            // Leg money is authoritative at 2dp (ADR-0073, ck_txn_legs_amount_scale_2):
-            // producers round before insert. quantity × unit_cost (unit_cost stored at
-            // NUMERIC(25,12), mig 180) is generally NOT 2dp when the lot's basis didn't
-            // divide evenly by its quantity (e.g. a whole-unit basis over three shares
-            // gives a repeating per-share cost, and that cost times three falls just
-            // short of the basis), so round here — same convention as the buy/sell
-            // principal (see PrincipalAndUnitPrice). At 12dp the rounded basis is
-            // penny-exact vs the source lot; the pre-mig-180 (19,4) unit_cost drifted
-            // by several whole units of currency on a large in-kind move.
-            var cost = Math.Round(lot.Quantity * lot.UnitCost, 2, MidpointRounding.AwayFromZero);
+            // Leg money is a computed figure, rounded once at its brokerage's places
+            // (ADR-0114 D15) by PriceMovedLotsAsync. quantity × unit_cost (unit_cost
+            // stored at NUMERIC(25,12), mig 180) generally does not fit the currency
+            // when the lot's basis didn't divide evenly by its quantity (e.g. a
+            // whole-unit basis over three shares gives a repeating per-share cost, and
+            // that cost times three falls just short of the basis), so it is rounded
+            // there, as the price-times-shares fallback is (see ResolveTradeMoney). At
+            // 12dp the rounded basis is exact to the minor unit vs the source lot; the
+            // pre-mig-180 (19,4) unit_cost drifted by several whole units of currency
+            // on a large in-kind move.
             // Source: zero brokerage cash (in-kind) ↔ source holdings −lot.
             list.Add(InvestmentPostings.BuildSecPair(
                 sourceBrokerageId, sourceHoldingsAccountId, securityId,
-                cashAmount: 0m, holdingsAmount: -cost,
+                cashAmount: 0m, holdingsAmount: -lot.SourceCost,
                 quantity: -lot.Quantity, unitPrice: lot.UnitCost));
-            // Destination: zero brokerage cash (in-kind) ↔ dest holdings +lot.
+            // Destination: zero brokerage cash (in-kind) ↔ dest holdings +lot, in the
+            // destination's currency, its unit price the destination lot's unit cost.
             list.Add(InvestmentPostings.BuildSecPair(
                 destBrokerageId, destHoldingsAccountId, securityId,
-                cashAmount: 0m, holdingsAmount: cost,
-                quantity: lot.Quantity, unitPrice: lot.UnitCost));
+                cashAmount: 0m, holdingsAmount: lot.DestCost,
+                quantity: lot.Quantity, unitPrice: lot.DestUnitCost));
         }
         return list;
     }
@@ -2285,7 +2770,7 @@ public sealed class InvestmentTransactionsRepository
     /// <summary>
     /// Create the destination lot rows for an in-kind transfer — one per moved
     /// lot, each bound to its destination leg, carrying the inherited
-    /// <see cref="MovedLot.AcquiredAt"/> + <see cref="MovedLot.UnitCost"/> so the
+    /// <see cref="MovedLot.AcquiredAt"/> + its <see cref="MovedLot.DestUnitCost"/> so the
     /// holding period + basis carry (ADR-0065 D2). The source lots are NOT
     /// touched here; the recompute consumes them FIFO from the source −qty legs.
     /// </summary>
@@ -2312,7 +2797,7 @@ public sealed class InvestmentTransactionsRepository
                 LegId = destLegIds[i],
                 LedgerId = ledgerId,
                 Quantity = plan[i].Quantity,
-                UnitCost = plan[i].UnitCost,
+                UnitCost = plan[i].DestUnitCost,
                 AcquiredAt = plan[i].AcquiredAt,
                 IsClosed = false,
             });
@@ -2387,9 +2872,36 @@ public sealed class InvestmentTransactionsRepository
         SecurityId = spec.Leg.SecurityId,
         Quantity = spec.Leg.Quantity,
         UnitPrice = spec.Leg.UnitPrice,
-        LegMemo = spec.Leg.LegMemo,
+        // No memo: the write primitive places the event's one memo.
         PostingRole = spec.Leg.PostingRole,
     };
+
+    /// <summary>
+    /// Plan an edited event's notes against its stored ones: the rebuilt event,
+    /// owned by the request's brokerage, its legs matched to the stored ones by
+    /// (account, role).
+    /// </summary>
+    private static AnnotationPlan<Guid> PlanEventNotes(
+        AnnotationWriter.Stored stored, CreateInvestmentTransactionRequest asCreate,
+        IReadOnlyList<InvestmentPosting> postings, AnnotationIntent<Guid> intent)
+    {
+        var after = AnnotationWriter.Shape(asCreate.BrokerageAccountId, asCreate.Action, PlannedLegs(postings), stored.Facts);
+        var change = new ShapeChange<Guid>(stored.Shape, stored.Notes, after,
+            ShapeChange<Guid>.ByAccountAndRole(stored.Shape, after));
+        return AnnotationPlanner.Plan(change, intent);
+    }
+
+    /// <summary>The planner's legs of an event built from <paramref name="postings"/>.</summary>
+    private static IEnumerable<AnnotationWriter.PlannedLeg> PlannedLegs(IReadOnlyList<InvestmentPosting> postings) =>
+        postings.SelectMany((p, i) => new[]
+        {
+            new AnnotationWriter.PlannedLeg(i, p.Cash.AccountId, null, p.Cash.PostingRole),
+            new AnnotationWriter.PlannedLeg(i, p.Counterparty.AccountId, null, p.Counterparty.PostingRole),
+        });
+
+    /// <summary>An investment body's notes as the planner reads them, written from its brokerage.</summary>
+    internal static AnnotationIntent<string> NotesIntent(Guid brokerageAccountId, IInvestmentWriteNotes notes) =>
+        new(brokerageAccountId, InvestmentNotesEdits.Memo(notes.HasMemo, notes.Memo), InvestmentNotesEdits.Tags(notes.Tags));
 
     // ----------------------------------------------------------------
     // Reads — lots for FIFO preview (ADR-0029)

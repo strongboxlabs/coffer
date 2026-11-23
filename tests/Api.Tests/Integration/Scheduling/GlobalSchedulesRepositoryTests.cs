@@ -15,26 +15,25 @@ namespace Coffer.Api.Tests.Integration.Scheduling;
 /// independently (each preserves the other).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class GlobalSchedulesRepositoryTests
+public sealed class GlobalSchedulesRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
+    public GlobalSchedulesRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
-    public GlobalSchedulesRepositoryTests(PostgresFixture fixture) => _fixture = fixture;
-
-    private GlobalSchedulesRepository NewRepo() => new(_fixture.NewServiceFactory());
+    private GlobalSchedulesRepository NewRepo() => new(Db.NewServiceFactory());
 
     [Fact]
     public async Task Get_returns_null_when_never_configured()
     {
-        await ResetBackupRowAsync();
         Assert.Null(await NewRepo().GetAsync(GlobalJobTypes.Backup));
     }
 
     [Fact]
     public async Task UpsertSchedule_creates_then_reflects_the_row()
     {
-        await ResetBackupRowAsync();
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var repo = NewRepo();
         var now = DateTime.UtcNow;
 
@@ -59,8 +58,7 @@ public sealed class GlobalSchedulesRepositoryTests
     [Fact]
     public async Task UpsertSchedule_disabled_clears_next_run_at()
     {
-        await ResetBackupRowAsync();
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var repo = NewRepo();
 
         await repo.UpsertScheduleAsync(
@@ -75,8 +73,7 @@ public sealed class GlobalSchedulesRepositoryTests
     [Fact]
     public async Task SetPassphrase_stores_bytes_and_flags_configured()
     {
-        await ResetBackupRowAsync();
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var repo = NewRepo();
         var sealed_ = new byte[] { 1, 2, 3, 4, 5 };
 
@@ -95,8 +92,7 @@ public sealed class GlobalSchedulesRepositoryTests
     [Fact]
     public async Task Schedule_and_passphrase_are_written_independently()
     {
-        await ResetBackupRowAsync();
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var repo = NewRepo();
         var now = DateTime.UtcNow;
 
@@ -120,12 +116,5 @@ public sealed class GlobalSchedulesRepositoryTests
         Assert.True(after!.Schedule.Enabled);
         Assert.Equal(4, after.Schedule.HourLocal);
         Assert.Equal(new byte[] { 7, 7 }, await repo.GetPassphraseCiphertextAsync(GlobalJobTypes.Backup));
-    }
-
-    /// <summary>Wipe the singleton backup row so each test owns its state.</summary>
-    private async Task ResetBackupRowAsync()
-    {
-        await using var db = _fixture.NewDbContext();   // service role
-        await db.Database.ExecuteSqlRawAsync("DELETE FROM global_scheduled_jobs;");
     }
 }

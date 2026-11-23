@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 
 using Coffer.Api.Db;
 using Coffer.Api.Db.Entities;
+using Coffer.Api.Db.Repositories;
 
 namespace Coffer.Api.Quotes;
 
@@ -19,7 +20,8 @@ namespace Coffer.Api.Quotes;
 /// <para>Persistence: UPSERT into <c>security_prices</c> keyed by
 /// <c>(security_id, price_date)</c>. EF-side load-then-decide
 /// pattern (not raw SQL) — N+1 queries are acceptable at quote-
-/// refresh scale (typically &lt;50 securities per ledger).</para>
+/// refresh scale, which the design assumes is tens of securities
+/// per ledger, not thousands.</para>
 ///
 /// <para>Every run is recorded to <c>ledger_operations</c> (family
 /// <c>quote</c>) by <c>WriteRunAsync</c> — ADR-0055; failures also
@@ -38,20 +40,35 @@ public sealed class QuoteOrchestrator
     /// </summary>
     private const int PriceScale = 4;
 
+    /// <summary>Error code for a quote a provider handed over with a currency code no
+    /// stored price may carry; the quote is not written.</summary>
+    public const string CurrencyInvalidCode = CurrencyCodes.InvalidErrorCode;
+
+    /// <summary>A stored price's currency is already in <see cref="CurrencyCodes"/>' normal
+    /// form: a code that normalizes to something else (<c>GBp</c>, <c> usd</c>) is refused,
+    /// not silently rewritten.</summary>
+    private static bool IsStoredCurrencyShape(string? code) =>
+        CurrencyCodes.TryNormalize(code, out var normal) && string.Equals(normal, code, StringComparison.Ordinal);
+
     private readonly AppDbContext _db;
     private readonly IReadOnlyDictionary<string, IQuotePullProvider> _pullProviders;
     private readonly IReadOnlyDictionary<string, IQuotePushProvider> _pushProviders;
     private readonly Db.Repositories.UserPreferencesRepository _prefs;
     private readonly ILogger<QuoteOrchestrator> _logger;
     private readonly TimeProvider _clock;
+    private readonly MarketSeries.MarketSeriesFetcher? _marketSeries;
 
+    /// <param name="marketSeries">The benchmark and exchange-rate fetch that rides
+    /// <see cref="RunAllPullsAsync"/> (ADR-0114 D11). Null runs prices only, which is what
+    /// the post-sync pull (<see cref="RunPullAsync"/>) does whether or not it is set.</param>
     public QuoteOrchestrator(
         AppDbContext db,
         IEnumerable<IQuotePullProvider> pullProviders,
         IEnumerable<IQuotePushProvider> pushProviders,
         Db.Repositories.UserPreferencesRepository prefs,
         ILogger<QuoteOrchestrator> logger,
-        TimeProvider clock)
+        TimeProvider clock,
+        MarketSeries.MarketSeriesFetcher? marketSeries = null)
     {
         _db = db;
         _pullProviders = pullProviders.ToDictionary(p => p.ProviderKey, StringComparer.Ordinal);
@@ -59,7 +76,31 @@ public sealed class QuoteOrchestrator
         _prefs = prefs;
         _logger = logger;
         _clock = clock;
+        _marketSeries = marketSeries;
     }
+
+    /// <summary>Error code for a market-series step that threw: folded into the run, as a
+    /// provider exception is, so the refresh is still audited.</summary>
+    public const string MarketSeriesExceptionCode = "market-series-exception";
+
+    /// <summary>The source key stamped on the benchmark and exchange-rate fetch's errors
+    /// (<see cref="QuoteError.ProviderKey"/>): that fetch is not a quote provider, so it
+    /// has no provider key of its own.</summary>
+    public const string MarketSeriesProviderKey = "market-series";
+
+    /// <summary>
+    /// Stamp <paramref name="key"/> on every error that does not name its source yet. The
+    /// orchestrator calls this on everything a source returns, so a provider never has to
+    /// name itself and an error can never reach the run without a source.
+    /// </summary>
+    internal static IReadOnlyList<QuoteError> FromSource(IEnumerable<QuoteError> errors, string key) =>
+        errors.Select(e => e.ProviderKey is null ? e with { ProviderKey = key } : e).ToList();
+
+    /// <summary>A provider's result with its key stamped on each quote and each error.</summary>
+    private static QuoteResult FromSource(QuoteResult result, string key) =>
+        new(
+            result.Quotes.Select(q => q.ProviderKey is null ? q with { ProviderKey = key } : q).ToList(),
+            FromSource(result.Errors, key));
 
     /// <summary>
     /// Invoke ONE pull-capable provider for one ledger, recording the run
@@ -123,7 +164,7 @@ public sealed class QuoteOrchestrator
                     });
             }
 
-            outcome = await PersistAsync(ledgerId, new[] { providerKey }, result, cancellationToken)
+            outcome = await PersistAsync(ledgerId, new[] { providerKey }, FromSource(result, providerKey), cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -153,7 +194,7 @@ public sealed class QuoteOrchestrator
         }
         var result = await provider.PushAsync(payload, cancellationToken)
             .ConfigureAwait(false);
-        return await PersistAsync(payload.LedgerId, new[] { payload.ProviderKey }, result, cancellationToken)
+        return await PersistAsync(payload.LedgerId, new[] { payload.ProviderKey }, FromSource(result, payload.ProviderKey), cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -212,8 +253,9 @@ public sealed class QuoteOrchestrator
                     : context;
                 try
                 {
-                    var result = await provider.PullAsync(providerContext, cancellationToken)
-                        .ConfigureAwait(false);
+                    var result = FromSource(
+                        await provider.PullAsync(providerContext, cancellationToken).ConfigureAwait(false),
+                        key);
                     allQuotes.AddRange(result.Quotes);
                     allErrors.AddRange(result.Errors);
                 }
@@ -230,13 +272,46 @@ public sealed class QuoteOrchestrator
                         // string literal in both places is one rename away from a
                         // dead-man's switch that silently goes back to lying.
                         Code: Scheduling.QuoteRefreshJobHandler.ProviderExceptionCode,
-                        Message: $"{key}: {ex.Message}"));
+                        Message: $"{key}: {ex.Message}",
+                        ProviderKey: key));
                 }
             }
 
             var merged = new QuoteResult(allQuotes, allErrors);
             outcome = await PersistAsync(ledgerId, keys, merged, cancellationToken)
                 .ConfigureAwait(false);
+        }
+
+        // ADR-0114 D5 (amendment): the one-time currency pass, whatever was held. Outside
+        // the branch above, so a ledger with nothing held still has its unheld securities'
+        // fetched prices confirmed.
+        outcome = await ConfirmUnconfirmedCurrenciesAsync(ledgerId, triggeredByUserId, outcome, cancellationToken)
+            .ConfigureAwait(false);
+
+        // ADR-0114 D11: benchmarks and exchange rates ride this refresh, each under the
+        // run user's consent for its own destination (ADR-0114 D8). They run whether or not any
+        // security is held: a ledger of bank accounts in two currencies needs rates too.
+        if (_marketSeries is not null)
+        {
+            MarketSeries.MarketSeriesOutcome series;
+            try
+            {
+                series = await _marketSeries.FetchAsync(ledgerId, triggeredByUserId, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogError(ex, "Market-series fetch failed during a quote refresh: ledger={LedgerId}", ledgerId);
+                series = new MarketSeries.MarketSeriesOutcome(0, 0,
+                    [new QuoteError(null, string.Empty, MarketSeriesExceptionCode,
+                        "The benchmark and exchange-rate fetch failed. Detail is in the server log.")]);
+            }
+            outcome = outcome with
+            {
+                Errors = [.. outcome.Errors, .. FromSource(series.Errors, MarketSeriesProviderKey)],
+                RatesInserted = series.RatesInserted,
+                BenchmarkDaysInserted = series.BenchmarkDaysInserted,
+            };
         }
 
         // ADR-0055: record the run — even when nothing was eligible — so a
@@ -265,26 +340,43 @@ public sealed class QuoteOrchestrator
     /// both the pull and the unresolved tally. <c>auto_price</c> stays a pure
     /// user-intent flag; "held" is derived live here (no flag mutation), so a
     /// buy/sell takes effect immediately without backfilling a column.
+    /// <para>
+    /// Held today (<c>holdings_as_of_now</c>, migration 259), the holding every
+    /// current value is computed from. Not the <c>holdings</c> projection, which
+    /// counts trades the register calls Scheduled: a position sold by a future-dated
+    /// sale has no projection quantity, so refreshing from the projection would stop
+    /// pricing it while the portfolio card still values it today. A security held only through a
+    /// future-dated buy is picked up by the first run on or after that date. A refresh
+    /// has no caller's date, so it takes the register's fallback (the server clock's
+    /// UTC date, <see cref="ScheduledBoundary"/>).
+    /// </para>
     /// </summary>
-    private IQueryable<SecurityRow> HeldAutoPriceable(Guid ledgerId) =>
-        _db.Securities.AsNoTracking()
+    private async Task<IQueryable<SecurityRow>> HeldAutoPriceableAsync(
+        Guid ledgerId, CancellationToken cancellationToken)
+    {
+        var heldNow = await _db.HoldingsAsOfNow(
+                ledgerId, ScheduledBoundary.ScheduledFrom(null, _clock), null)
+            .AsNoTracking()
+            .Select(h => h.SecurityId)
+            .Distinct()
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return _db.Securities.AsNoTracking()
             .Where(s => s.LedgerId == ledgerId)
             .Where(AutoPriceable)
-            .Where(s => _db.Holdings.Any(
-                h => h.SecurityId == s.Id
-                     && h.LedgerId == ledgerId
-                     && h.Quantity != 0m));
+            .Where(s => heldNow.Contains(s.Id));
+    }
 
     private async Task<QuotePullContext> BuildContextAsync(
         Guid ledgerId, CancellationToken cancellationToken)
     {
         // The working set for quote pulls (ADR-0054): held + auto-priceable
         // securities, resolving to quote_symbol when set, else the ticker.
-        var securities = await HeldAutoPriceable(ledgerId)
+        var securities = await (await HeldAutoPriceableAsync(ledgerId, cancellationToken)
+                .ConfigureAwait(false))
             .Select(s => new QuoteSecurityRef(
                 s.Id,
                 s.QuoteSymbol ?? s.Ticker!,
-                "USD",
                 s.QuoteSymbolPublic))
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -315,6 +407,23 @@ public sealed class QuoteOrchestrator
         // Attribute each WRITTEN price to its winning source (ADR-0070) so the
         // run can report which provider actually moved prices, not just a count.
         var bySource = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        // Every stored price names a major currency code (ADR-0114 D5). Each
+        // provider resolves its own, and this is the single write path they all
+        // converge on, so a provider that hands over a blank, minor-unit or
+        // otherwise malformed code has that quote dropped here with an error rather
+        // than stored as-is — the same reason the scale is normalized below.
+        var badCurrency = result.Quotes.Where(q => !IsStoredCurrencyShape(q.CurrencyCode)).ToList();
+        if (badCurrency.Count > 0)
+        {
+            result = new QuoteResult(
+                result.Quotes.Where(q => IsStoredCurrencyShape(q.CurrencyCode)).ToList(),
+                result.Errors.Concat(badCurrency.Select(q => new QuoteError(
+                    q.SecurityId, string.Empty, CurrencyInvalidCode,
+                    $"A {q.Source} quote named currency '{q.CurrencyCode}', which is not a stored currency code.",
+                    ProviderKey: q.ProviderKey)))
+                    .ToList());
+        }
 
         if (result.Quotes.Count > 0)
         {
@@ -412,12 +521,25 @@ public sealed class QuoteOrchestrator
         // "couldn't refresh" pills per-position. Computed even
         // when no quotes came back (the empty-quotes case is when
         // unresolved matters MOST — every ticker is unresolved).
-        var requested = await HeldAutoPriceable(ledgerId)
+        var requested = await (await HeldAutoPriceableAsync(ledgerId, cancellationToken)
+                .ConfigureAwait(false))
             .Select(s => s.Id)
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
         var quoted = result.Quotes.Select(q => q.SecurityId).ToHashSet();
         var unresolved = requested.Where(id => !quoted.Contains(id)).ToList();
+
+        // ADR-0114 D5 (amendment): a fetch quote names its security's currency, which
+        // confirms it and re-stamps that security's older fetch rows in another currency.
+        // Every fetch quote counts, stored or not: one the source ladder dropped for a day
+        // a manual price owns still says what Yahoo quotes the symbol in.
+        var confirmed = await QuoteCurrencyConfirmation.ConfirmAsync(
+                _db, ledgerId,
+                result.Quotes
+                    .Where(q => q.Source == PriceSource.Fetch)
+                    .Select(q => new QuoteCurrency(q.SecurityId, q.CurrencyCode, q.QuotedMinorUnitFactor)),
+                _clock.GetUtcNow().UtcDateTime, cancellationToken)
+            .ConfigureAwait(false);
 
         return new QuoteRunOutcome(
             ProviderKeys: providerKeys,
@@ -425,7 +547,52 @@ public sealed class QuoteOrchestrator
             PricesUpdated: updated,
             PricesWrittenBySource: bySource,
             SecuritiesUnresolved: unresolved,
-            Errors: result.Errors);
+            Errors: result.Errors,
+            CurrenciesConfirmed: confirmed.CurrenciesConfirmed,
+            RowsRestamped: confirmed.RowsRestamped);
+    }
+
+    /// <summary>
+    /// The one-time currency pass (ADR-0114 D5, amendment): every security with fetched
+    /// prices whose currency no Yahoo read has confirmed, held or not, gets one
+    /// currency-only lookup, which stores no price and re-stamps its fetch rows. The one
+    /// exception to quoting held securities only (ADR-0054). "Once" because a confirmed
+    /// security drops out; no flag of its own.
+    /// </summary>
+    /// <remarks>
+    /// Egress, so only under the run's user's opt-in for a provider that can look a
+    /// currency up; a run with no user, or with that provider off, skips it. A security
+    /// that already has an error this run was just asked and is not asked again.
+    /// </remarks>
+    private async Task<QuoteRunOutcome> ConfirmUnconfirmedCurrenciesAsync(
+        Guid ledgerId, Guid? triggeredByUserId, QuoteRunOutcome outcome, CancellationToken cancellationToken)
+    {
+        if (triggeredByUserId is not { } uid) return outcome;
+        var enabled = (await _prefs.GetQuotesAsync(uid, ledgerId, cancellationToken).ConfigureAwait(false))
+            .EnabledProviders;
+        var lookup = _pullProviders.Values
+            .Where(p => p.RequiresOptIn && enabled.Contains(p.ProviderKey, StringComparer.Ordinal))
+            .OfType<IQuoteCurrencyLookup>()
+            .FirstOrDefault();
+        if (lookup is null) return outcome;
+
+        var asked = outcome.Errors.Where(e => e.SecurityId is not null).Select(e => e.SecurityId!.Value).ToHashSet();
+        var candidates = await QuoteCurrencyConfirmation.PassCandidatesAsync(_db, ledgerId, asked, cancellationToken)
+            .ConfigureAwait(false);
+        if (candidates.Count == 0) return outcome;
+
+        var (confirmed, errors) = await QuoteCurrencyConfirmation.LookupAndConfirmAsync(
+                _db, ledgerId, lookup, candidates, _clock, cancellationToken)
+            .ConfigureAwait(false);
+        return outcome with
+        {
+            ProviderKeys = outcome.ProviderKeys.Contains(lookup.ProviderKey, StringComparer.Ordinal)
+                ? outcome.ProviderKeys
+                : [.. outcome.ProviderKeys, lookup.ProviderKey],
+            Errors = [.. outcome.Errors, .. FromSource(errors, lookup.ProviderKey)],
+            CurrenciesConfirmed = outcome.CurrenciesConfirmed + confirmed.CurrenciesConfirmed,
+            RowsRestamped = outcome.RowsRestamped + confirmed.RowsRestamped,
+        };
     }
 
     /// <summary>
@@ -434,12 +601,47 @@ public sealed class QuoteOrchestrator
     /// the real user, or the system user for scheduled runs; counts live in
     /// the <c>details</c> jsonb.
     /// </summary>
-    private async Task WriteRunAsync(
+    private Task WriteRunAsync(
         Guid ledgerId,
         string triggeredVia,
         Guid? triggeredByUserId,
         DateTime startedAt,
         QuoteRunOutcome outcome,
+        CancellationToken cancellationToken) =>
+        WriteRunAsync(
+            _db, _clock, ledgerId, QuoteRefreshProviderKey, triggeredVia, triggeredByUserId, startedAt,
+            new QuoteRunDetails
+            {
+                PricesInserted = outcome.PricesInserted,
+                PricesUpdated = outcome.PricesUpdated,
+                SecuritiesUnresolved = outcome.SecuritiesUnresolved.Count,
+                PricesFromFetch = outcome.PricesWrittenBySource.GetValueOrDefault(PriceSource.Fetch),
+                PricesFromSimplefin = outcome.PricesWrittenBySource.GetValueOrDefault(PriceSource.Simplefin),
+                CurrenciesConfirmed = outcome.CurrenciesConfirmed,
+                RowsRestamped = outcome.RowsRestamped,
+                RatesInserted = outcome.RatesInserted,
+                BenchmarkDaysInserted = outcome.BenchmarkDaysInserted,
+            },
+            outcome.Errors, cancellationToken);
+
+    /// <summary>The <c>provider_key</c> of a quote refresh's <c>ledger_operations</c> row.</summary>
+    public const string QuoteRefreshProviderKey = "quote-refresh";
+
+    /// <summary>
+    /// Write one family-<c>quote</c> <c>ledger_operations</c> row and an error row per
+    /// <paramref name="errors"/> entry: a quote refresh's, and a standalone market-series
+    /// backfill's (ADR-0114 D11), which share the shape.
+    /// </summary>
+    internal static async Task WriteRunAsync(
+        AppDbContext db,
+        TimeProvider clock,
+        Guid ledgerId,
+        string providerKey,
+        string triggeredVia,
+        Guid? triggeredByUserId,
+        DateTime startedAt,
+        QuoteRunDetails details,
+        IReadOnlyList<QuoteError> errors,
         CancellationToken cancellationToken)
     {
         var run = new LedgerOperationRow
@@ -447,34 +649,31 @@ public sealed class QuoteOrchestrator
             Id = Guid.NewGuid(),
             LedgerId = ledgerId,
             Family = "quote",
-            ProviderKey = "quote-refresh",
+            ProviderKey = providerKey,
             TriggeredVia = triggeredVia,
             TriggeredByUserId = triggeredByUserId,
-            Status = outcome.Errors.Count > 0 ? "partial" : "completed",
-            DetailsJson = LedgerOperationDetails.Serialize(new QuoteRunDetails
-            {
-                PricesInserted = outcome.PricesInserted,
-                PricesUpdated = outcome.PricesUpdated,
-                SecuritiesUnresolved = outcome.SecuritiesUnresolved.Count,
-                PricesFromFetch = outcome.PricesWrittenBySource.GetValueOrDefault(PriceSource.Fetch),
-                PricesFromSimplefin = outcome.PricesWrittenBySource.GetValueOrDefault(PriceSource.Simplefin),
-            }),
+            Status = errors.Count > 0 ? "partial" : "completed",
+            DetailsJson = LedgerOperationDetails.Serialize(details),
             StartedAt = startedAt,
-            CompletedAt = _clock.GetUtcNow().UtcDateTime,
+            CompletedAt = clock.GetUtcNow().UtcDateTime,
         };
-        _db.LedgerOperations.Add(run);
-        foreach (var e in outcome.Errors)
+        db.LedgerOperations.Add(run);
+        foreach (var e in errors)
         {
-            _db.LedgerOperationErrors.Add(new LedgerOperationErrorRow
+            db.LedgerOperationErrors.Add(new LedgerOperationErrorRow
             {
                 Id = Guid.NewGuid(),
                 LedgerOperationId = run.Id,
                 LedgerId = ledgerId,
                 Code = e.Code,
                 Message = e.Message,
+                ProviderKey = e.ProviderKey,
+                // The feed's account id, in the column a sync's errors already use for
+                // it, so the Activity log names the account the same way for both.
+                SimpleFinAccountId = e.FeedAccountId,
             });
         }
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static QuoteRunOutcome EmptyOutcome(string? providerKey = null) =>

@@ -5,39 +5,53 @@
  * ../README.md.
  */
 
+import { usePendingButtonProps } from '@/components/ui/pending';
+import { cn } from '@/lib/cn';
 import type { MergeCandidateDto } from '@/lib/types';
+
+import { DIALOG_NARROW_HINT_CHIP, DIALOG_NARROW_HINT_STRIP } from './hintChips';
+import { mergeChipTitle } from './mergeChipTitle';
 
 // --------------------------------------------------------------------
 // MergeCandidatesPanel (slice 2c.6d)
 // --------------------------------------------------------------------
-// "Possible matches" chip row beneath the payee field. Each chip
-// represents a manual row whose source-account aggregate equals
-// this row's, within ±7 days. Clicking pre-fills the editor with
-// the candidate's payee / memo / tags / postings AND arms
-// `mergeFromHeaderId` for the next save (the saving handler sends
-// it in the PATCH body so the server stamps `is_merged_into` on
-// the manual row in the same transaction).
+// "Merge candidates" chip row beneath the payee field. Each chip
+// represents a settled row (manual, or a feed or imported row already
+// accepted) whose source-account aggregate equals this row's, within
+// ±7 days. Clicking one arms `mergeFromHeaderId`
+// for the next save, which then folds the row being edited into the
+// candidate (bank-edit/save.ts): the candidate survives as it was
+// entered and the edited row is marked merged. Nothing is copied into
+// the form; its fields are moot once a candidate is armed.
 //
 // Selection is a toggle: re-clicking the active chip clears the
-// merge arm (keeping the form state) — provides a "cancel merge,
-// keep my edits" path without restoring original state.
+// merge arm, and the form is as the user left it.
 
 export function MergeCandidatesPanel({
     candidates,
     accountPaths,
     selectedHeaderId,
-    disabled,
+    pending,
+    dialog,
     onSelect,
 }: {
     candidates: readonly MergeCandidateDto[];
     accountPaths: Map<string, string>;
     selectedHeaderId: string | null;
-    disabled: boolean;
+    /** The editor's save is in flight: the chips keep focus and refuse a pick (pending.ts). */
+    pending: boolean;
+    /** The editor is in its dialog layout: on a narrow dialog the chips
+     *  take the touch size (hintChips.ts). False in the register. */
+    dialog: boolean;
     onSelect: (candidate: MergeCandidateDto) => void;
 }) {
+    const pendingProps = usePendingButtonProps();
     if (candidates.length === 0) return null;
     return (
-        <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1 pt-0.5 text-[0.625rem]">
+        <div className={cn(
+            'flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1 pt-0.5 text-[0.625rem]',
+            dialog && DIALOG_NARROW_HINT_STRIP,
+        )}>
             <span className="text-text-subtle">Merge candidates:</span>
             {candidates.map((c) => {
                 const isSelected = selectedHeaderId === c.headerId;
@@ -55,20 +69,16 @@ export function MergeCandidatesPanel({
                     <button
                         key={c.headerId}
                         type="button"
-                        disabled={disabled}
-                        onClick={() => onSelect(c)}
                         aria-pressed={isSelected}
-                        title={
+                        title={mergeChipTitle(dateLabel, c.origin)}
+                        {...pendingProps(pending, () => onSelect(c))}
+                        className={cn(
+                            'inline-flex items-baseline gap-1 rounded border px-1.5 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50',
                             isSelected
-                                ? 'Click to cancel the merge (form edits stay).'
-                                : `Merge with ${c.payee ?? '(no payee)'} (${dateLabel}). The bank row keeps its identity; the manual row is marked as merged.`
-                        }
-                        className={
-                            'inline-flex items-baseline gap-1 rounded border px-1.5 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50 ' +
-                            (isSelected
                                 ? 'border-accent bg-accent-soft text-accent'
-                                : 'border-border bg-surface text-text hover:border-accent hover:bg-surface-muted')
-                        }
+                                : 'border-border bg-surface text-text hover:border-accent hover:bg-surface-muted',
+                            dialog && DIALOG_NARROW_HINT_CHIP,
+                        )}
                     >
                         <span className="text-text-subtle">{dateLabel}</span>
                         <span className="font-medium">

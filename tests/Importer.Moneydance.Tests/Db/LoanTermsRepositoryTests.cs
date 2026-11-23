@@ -9,20 +9,17 @@ namespace Coffer.Importer.Moneydance.Tests.Db;
 /// loan account's amortization parameters is a plain INSERT.
 /// </summary>
 [Collection(DbCollection.Name)]
-public sealed class LoanTermsRepositoryTests
+public sealed class LoanTermsRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public LoanTermsRepositoryTests(PostgresFixture fixture)
+    public LoanTermsRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     [Fact]
     public async Task Seeds_loan_terms()
     {
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
         var accounts = new AccountsRepository(conn);
         var repo = new LoanTermsRepository(conn);
 
@@ -77,13 +74,4 @@ public sealed class LoanTermsRepositoryTests
             InstitutionName:   null,
             RoutingNumber:     null,
             AccountUrl:        null);
-
-    private static async Task ResetAsync(Npgsql.NpgsqlConnection conn)
-    {
-        await conn.ExecuteAsync(@"
-            TRUNCATE loan_terms, security_splits, lots, holdings, txn_legs, txn_headers,
-                     security_prices, securities,
-                     account_external_ids, accounts
-                     RESTART IDENTITY CASCADE;");
-    }
 }

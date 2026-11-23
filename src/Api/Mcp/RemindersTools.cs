@@ -17,10 +17,15 @@ public static class RemindersTools
     [McpServerTool(Name = "list_upcoming_reminders"), Description(
         "Upcoming scheduled transactions — bills and recurring reminders (ADR-0047) — " +
         "for a ledger over the next N days: date, kind, payee, memo, amount (negative = " +
-        "outflow, positive = inflow), and reminderId. 'kind' is 'reminder' (due, not " +
+        "outflow, positive = inflow), and reminderId. 'memo' is as the register of the " +
+        "account the transaction belongs to shows it: a posted occurrence's own, else the " +
+        "reminder template's (a template with no lines shows its own memo). 'kind' is 'reminder' (due, not " +
         "yet posted — what's coming up), 'scheduled' (already posted for that date), or " +
         "'skipped' (a skipped slot); filter to 'reminder' for the true agenda of what's " +
-        "still owed. Ordered by date. Amounts in the ledger's currency (USD). " +
+        "still owed. Ordered by date. Each amount is in the occurrence's currencyCode, its " +
+        "source account's; currencyCode, sourceAccountId and sourceAccountName are null for a series with no " +
+        "single source. autoPost is present when the series has auto-post days; its " +
+        "excludedReason, when set, says why the job does not post it. " +
         "IMPORTANT: when 'estimate' is present and its 'amount' is non-null, the " +
         "occurrence's amount is an ESTIMATE — the average of the last N committed " +
         "occurrences of that series, with 'availableSampleCount' saying how many it " +

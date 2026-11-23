@@ -32,8 +32,8 @@ namespace Coffer.Api.Endpoints;
 /// </remarks>
 public static class FileIngestEndpoints
 {
-    /// <summary>Upper bound on accepted upload size. Real-world QFX
-    /// statements run a few hundred KB; a 5 MB cap leaves plenty of
+    /// <summary>Upper bound on accepted upload size. A QFX statement
+    /// is compact text, one short record per transaction; a 5 MB cap leaves
     /// headroom for multi-year exports while bounding memory + parse
     /// cost. Larger files are almost certainly mis-uploads.</summary>
     public const long MaxUploadBytes = 5L * 1024 * 1024;
@@ -69,12 +69,15 @@ public static class FileIngestEndpoints
         group.MapPost("/preview",
                 (Guid ledgerId,
                  IFormFile? file,
+                 [FromForm] Guid? accountId,
                  ICurrentUserAccessor currentUser,
                  LedgersRepository ledgers,
+                 AccountsRepository accounts,
                  IngestOrchestrator orchestrator,
                  CancellationToken cancellationToken) =>
                     PreviewAsync(ledgerId, file, currentUser, ledgers, orchestrator,
-                                 providerKey, errorPrefix, cancellationToken))
+                                 providerKey, errorPrefix, cancellationToken,
+                                 accountId: accountId, accounts: accounts))
              .WithMetadata(new RequestSizeLimitAttribute(MaxUploadBytes));
 
         group.MapPost("/import",
@@ -86,9 +89,11 @@ public static class FileIngestEndpoints
                  LedgersRepository ledgers,
                  AccountsRepository accounts,
                  IngestOrchestrator orchestrator,
+                 Quotes.MarketSeries.MarketSeriesBackfill backfill,
+                 Db.AppDbContext db,
                  CancellationToken cancellationToken) =>
                     ImportAsync(ledgerId, file, accountId, providerAccountId, currentUser,
-                                ledgers, accounts, orchestrator,
+                                ledgers, accounts, orchestrator, backfill, db,
                                 providerKey, errorPrefix, cancellationToken))
              .WithMetadata(new RequestSizeLimitAttribute(MaxUploadBytes));
 
@@ -106,6 +111,14 @@ public static class FileIngestEndpoints
     /// implicit. Resolved by the CALLER so providers stay pure and a draft can be
     /// previewed without being saved first.
     /// </param>
+    /// <param name="accountId">
+    /// The account the file will go into, when the dialog has already chosen it, as the
+    /// register's import dialog has. Optional. When given it must be in the ledger, and
+    /// its currency reaches the provider as it does at import, so a QIF amount the
+    /// import would refuse in a three-place currency is reported here too
+    /// (ADR-0114 D15). Without it the preview parses with no currency.
+    /// </param>
+    /// <param name="accounts">Required with <paramref name="accountId"/>.</param>
     internal static async Task<IResult> PreviewAsync(
         Guid ledgerId,
         IFormFile? file,
@@ -115,7 +128,9 @@ public static class FileIngestEndpoints
         string providerKey,
         string errorPrefix,
         CancellationToken cancellationToken,
-        Ingest.Csv.CsvMapping? csvMapping = null)
+        Ingest.Csv.CsvMapping? csvMapping = null,
+        Guid? accountId = null,
+        AccountsRepository? accounts = null)
     {
         var visible = await ledgers.GetVisibleByIdAsync(
             currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
@@ -126,15 +141,27 @@ public static class FileIngestEndpoints
             return BusinessError.Problem($"{errorPrefix}_file_required",
                 $"Upload a non-empty {errorPrefix.ToUpperInvariant()} file in the `file` form field.");
 
+        var target = accountId is { } id && id != Guid.Empty ? id : Guid.Empty;
+        if (target != Guid.Empty)
+        {
+            ArgumentNullException.ThrowIfNull(accounts);
+            var belongs = await accounts.BelongsToLedgerAsync(
+                ledgerId, target, cancellationToken).ConfigureAwait(false);
+            if (!belongs)
+                return BusinessError.Problem(BusinessError.Codes.AccountNotInLedger,
+                    "Account does not belong to this ledger.");
+        }
+
         await using var stream = file.OpenReadStream();
         Coffer.Api.Ingest.FileResult parsed;
         try
         {
-            // Preview takes a placeholder context — preview never
-            // writes, so AccountId / TriggeredByUserId aren't read.
+            // Preview never writes, so TriggeredByUserId isn't read. AccountId is
+            // Guid.Empty unless the caller named the account; the orchestrator then
+            // fills its currency.
             var context = new FileIngestContext(
                 LedgerId: ledgerId,
-                AccountId: Guid.Empty,
+                AccountId: target,
                 TriggeredByUserId: currentUser.UserId,
                 CsvMapping: csvMapping);
             parsed = await orchestrator.PreviewFileAsync(
@@ -174,6 +201,8 @@ public static class FileIngestEndpoints
         LedgersRepository ledgers,
         AccountsRepository accounts,
         IngestOrchestrator orchestrator,
+        Quotes.MarketSeries.MarketSeriesBackfill backfill,
+        Db.AppDbContext db,
         string providerKey,
         string errorPrefix,
         CancellationToken cancellationToken,
@@ -200,6 +229,12 @@ public static class FileIngestEndpoints
             return BusinessError.Problem(BusinessError.Codes.AccountNotInLedger,
                 "Account does not belong to this ledger.");
 
+        // ADR-0114 D11: an imported row dated before the ledger's earliest day, or on a
+        // brokerage before its first funding, moves the starts earlier. A file import is the
+        // user's upload, not a feed sync (ADR-0054 D1), so it starts the backfill; read
+        // before the write that can move them.
+        var before = await NeededFxPairs.StartsAsync(db, ledgerId, cancellationToken).ConfigureAwait(false);
+
         await using var stream = file.OpenReadStream();
         IngestRunOutcome outcome;
         try
@@ -214,10 +249,17 @@ public static class FileIngestEndpoints
                 providerKey, stream, context, cancellationToken)
                 .ConfigureAwait(false);
         }
+        catch (StatementCurrencyMismatchException ex)
+        {
+            // Refused before the run opened (ADR-0114 D13): nothing was written.
+            return BusinessError.Problem(BusinessError.Codes.OfxStatementCurrencyMismatch, ex.Message);
+        }
         catch (InvalidOperationException ex)
         {
             return BusinessError.Problem($"{errorPrefix}_parse_failed", ex.Message);
         }
+        await backfill.StartIfEarlierAsync(db, ledgerId, currentUser.UserId, before, cancellationToken)
+            .ConfigureAwait(false);
 
         // Remember the brokerage so the picker can preselect it next time. After the
         // import, deliberately: a file that failed to parse says nothing about where the

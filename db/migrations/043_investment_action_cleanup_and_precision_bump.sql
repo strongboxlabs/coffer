@@ -1,10 +1,11 @@
 -- 043_investment_action_cleanup_and_precision_bump.sql
 --
 -- Pre-A1 cleanup: align the investment-action CHECK constraint with the
--- agreed user-facing action set, and bump share-quantity / per-unit-price
--- precision to support MD-fidelity fractional shares (MD exports carry
--- 11-decimal share counts on reinvested-dividend lots; today's (19,6)
--- silently rounds).
+-- user-facing action set (ADR-0027), and bump share-quantity / per-unit-price
+-- precision to support MD-fidelity fractional shares (a reinvested
+-- dividend buys cash ÷ price shares, a quotient that rarely ends at six
+-- places; today's (19,6) silently rounds whatever finer count the source
+-- carries).
 --
 -- =============================================================================
 -- 1) investment_action: 12 -> 9 actions
@@ -18,11 +19,10 @@
 --   buy, sell, dividend_cash, dividend_reinvest, interest,
 --   transfer, misc_income, misc_expense, split
 --
--- An audit of an imported MD export (found on a real ledger) showed only
---   dividend_reinvest, buy, sell, transfer_in, transfer_out,
---   dividend_cash and misc_income in use, most common first,
--- and no rows of interest / contribution / withdrawal / fee.
--- So the only backfill needed is transfer_in/_out -> transfer.
+-- The only retired labels with a successor are transfer_in/_out, so the
+-- only backfill is transfer_in/_out -> transfer. The others have no
+-- mapping: a row still carrying one fails the re-added CHECK below, and
+-- the migration aborts rather than relabelling it by guess.
 --
 -- Order matters: drop the CHECK first so the backfill UPDATE isn't
 -- rejected by the still-active old constraint, THEN re-add the CHECK
@@ -54,9 +54,11 @@ ALTER TABLE txn_legs
 -- and the running-balance trigger / cost-basis math assume 4-scale).
 --
 -- Share-quantity columns and per-unit-price columns move to NUMERIC(25, 12):
---   - 25-digit precision: ample headroom over real-world holdings sizes.
---   - 12-decimal scale: matches MD's 11-decimal display with one digit of
---     buffer; covers cash ÷ price reinvest math without rounding loss.
+--   - 25-digit precision: 13 integer digits, ample headroom for any
+--     holding size.
+--   - 12-decimal scale: holds a share count or per-unit price to twelve
+--     places, so cash ÷ price reinvest math is stored without the
+--     rounding a six-place column applies.
 --
 -- Affected columns:
 --   txn_legs.quantity        (19,8) -> (25,12)

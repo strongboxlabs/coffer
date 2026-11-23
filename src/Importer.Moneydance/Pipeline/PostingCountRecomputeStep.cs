@@ -51,14 +51,13 @@ internal sealed class PostingCountRecomputeStep
                     SELECT header_id, COUNT(DISTINCT posting_index) AS total
                       FROM txn_legs WHERE ledger_id = @ledgerId GROUP BY header_id
                 )
-                -- per_header is joined to per_pair DIRECTLY. It used to be
-                -- `FROM htp, aph` with both tied only to `l` — no predicate between
-                -- the two aggregates — which left "materialize the cross product"
-                -- as a legal plan. On a large real import that product runs to
-                -- billions of rows, and the planner picked it: the statement ran past the 600s
-                -- command timeout, every time, at 100% CPU on one core. Joining
-                -- them on header_id makes that plan unrepresentable rather than
-                -- merely unlikely.
+                -- per_header is joined to per_pair DIRECTLY. Two aggregates tied
+                -- only to `l`, with no predicate between them, leave "materialize
+                -- the cross product" as a legal plan. That product grows with (pairs x headers), so
+                -- on a large import it is quadratic in ledger size, and if the
+                -- planner picks it the statement runs past the command timeout.
+                -- Joining them on header_id makes that plan unrepresentable
+                -- rather than merely unlikely.
                 UPDATE txn_legs l
                    SET header_total_postings      = per_header.total,
                        account_postings_on_header = per_pair.cnt

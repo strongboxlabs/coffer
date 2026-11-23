@@ -24,18 +24,19 @@ namespace Coffer.Api.Tests.Integration.MultiUser;
 /// PRE-SCOPED grant + the invite consumed.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class InvitesTests
+public sealed class InvitesTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
+    public InvitesTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
-    public InvitesTests(PostgresFixture fixture) => _fixture = fixture;
-
-    private InvitesRepository Repo() => new(_fixture.NewServiceFactory(), TimeProvider.System);
+    private InvitesRepository Repo() => new(Db.NewServiceFactory(), TimeProvider.System);
 
     [Fact]
     public async Task Create_then_valid_scope_returns_ledger_role_and_admin_flag()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var repo = Repo();
         var token = await repo.CreateAsync(ledger.UserId, ledger.LedgerId, "editor", grantsAdmin: false);
 
@@ -52,11 +53,11 @@ public sealed class InvitesTests
     [Fact]
     public async Task Expired_and_consumed_invites_are_not_valid()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var (expiredToken, expiredHash) = BootstrapTokenService.GenerateToken();
         var (usedToken, usedHash) = BootstrapTokenService.GenerateToken();
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             db.Invites.Add(new InviteRow
             {
@@ -80,7 +81,7 @@ public sealed class InvitesTests
     [Fact]
     public async Task List_and_revoke_are_scoped_to_the_ledger_and_by_id_for_admin()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var repo = Repo();
         await repo.CreateAsync(ledger.UserId, ledger.LedgerId, "viewer", false);
         await repo.CreateAsync(ledger.UserId, ledger.LedgerId, "editor", false);
@@ -101,11 +102,11 @@ public sealed class InvitesTests
     [Fact]
     public async Task Redeem_creates_a_user_with_the_pre_scoped_grant_and_consumes_the_invite()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var token = await Repo().CreateAsync(ledger.UserId, ledger.LedgerId, "editor", grantsAdmin: false);
 
         var credentialId = RandomBytes(64);
-        await using var factory = new ApiFactory(_fixture).WithService(_ => NewWebAuthnSubstitute(credentialId));
+        await using var factory = new ApiFactory(Db).WithService(_ => NewWebAuthnSubstitute(credentialId));
         using var client = factory.CreateClient();
 
         var username = $"invitee-{Guid.NewGuid():N}";
@@ -136,7 +137,7 @@ public sealed class InvitesTests
         Assert.True(Guid.TryParse(doc.RootElement.GetProperty("userId").GetString(), out var newUserId));
         Assert.Equal(10, doc.RootElement.GetProperty("recoveryCodes").EnumerateArray().Count());
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         // The pre-scoped grant landed at the invite's role...
         var grant = await db.UserLedgerGrants.AsNoTracking()
             .FirstOrDefaultAsync(g => g.LedgerId == ledger.LedgerId && g.UserId == newUserId);

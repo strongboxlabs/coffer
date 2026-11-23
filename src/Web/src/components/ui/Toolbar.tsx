@@ -1,6 +1,5 @@
 import {
     forwardRef,
-    type ButtonHTMLAttributes,
     type HTMLAttributes,
 } from 'react';
 
@@ -45,36 +44,3 @@ export const ToolbarGroup = forwardRef<HTMLDivElement, ToolbarGroupProps>(
 export function ToolbarDivider() {
     return <span className="text-text-subtle">|</span>;
 }
-
-export interface ToolbarFilterButtonProps
-    extends ButtonHTMLAttributes<HTMLButtonElement> {
-    active?: boolean;
-}
-
-/**
- * Filter pill in the toolbar. Active variant uses the accent-soft
- * background to signal "this filter is on" without competing with
- * the primary button accent.
- */
-export const ToolbarFilterButton = forwardRef<
-    HTMLButtonElement,
-    ToolbarFilterButtonProps
->(function ToolbarFilterButton(
-    { className, active, type, ...props },
-    ref,
-) {
-    return (
-        <button
-            ref={ref}
-            type={type ?? 'button'}
-            aria-pressed={active}
-            className={cn(
-                'rounded px-2 py-1 text-xs text-text-muted hover:bg-surface-hover',
-                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1',
-                active && 'bg-accent-soft font-semibold text-accent-soft-text',
-                className,
-            )}
-            {...props}
-        />
-    );
-});

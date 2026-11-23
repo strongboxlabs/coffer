@@ -25,16 +25,19 @@ namespace Coffer.Api.Tests.Integration.Schema;
 /// discrepancy (lots.unit_cost).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class SchemaDriftGuardTests
+public sealed class SchemaDriftGuardTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SchemaDriftGuardTests(PostgresFixture fixture) => _fixture = fixture;
+    public SchemaDriftGuardTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Utc(int y, int m, int d) => new(y, m, d, 12, 0, 0, DateTimeKind.Utc);
 
     // Derived: NOT captured; the restore rebuilds it (fn_recompute_balances_for_ledger).
-    // realized_gains sat here until it was found to be captured since mig 188.
+    // realized_gains is captured (since mig 188), so it is not listed here.
+    // The stored memo-and-tags presentation (mig 264) is NOT here: its tag rows and the
+    // txn_legs.notes_* columns are captured, and a restore copies them back verbatim.
     private static readonly HashSet<string> DerivedRebuiltOnRestore = new()
     {
         "txn_header_account_balances",
@@ -100,13 +103,22 @@ public sealed class SchemaDriftGuardTests
     //
     // Reconciled: the restore applies the FK's own ON DELETE action to a restored
     // row whose parent is gone (fn_ledger_snapshot_reconcile_external_refs, mig
-    // 247), so it must be deferrable to let the row land before the fix-up runs.
+    // 247, extended by 302), so it must be DEFERRABLE INITIALLY DEFERRED to let
+    // the row land before the fix-up runs. The restores defer nothing by name, so
+    // a key that is merely DEFERRABLE (initially immediate) is checked at the
+    // INSERT and fails it.
     // Each entry needs a test in SnapshotsTests that deletes the parent and
     // restores — this list proves the classification, not the behaviour.
     private static readonly HashSet<string> OutwardReconciledOnRestore = new()
     {
         // Deleting a bank connection unlinks its accounts (SET NULL).
         "accounts_feed_connection_id_ledger_fkey",
+        // AuditRetentionService prunes ledger_operations past the retention window
+        // (mig 302). It unstamps the rows a run wrote (SET NULL) and deletes the
+        // run's promotions (CASCADE, on both the run FK and the composite one).
+        "txn_headers_ledger_operation_id_fkey",
+        "ledger_operation_promotions_ledger_operation_id_fkey",
+        "ledger_operation_promotions_run_ledger_fkey",
     };
 
     // No app path deletes the parent, so a restored reference cannot dangle. That
@@ -114,19 +126,15 @@ public sealed class SchemaDriftGuardTests
     // delete, move its FKs to the reconciled set and extend the fix-up.
     private static readonly HashSet<string> OutwardParentNeverDeleted = new()
     {
-        // ledger_operations go only with their ledger (fn_ledger_delete). A purge
-        // of old runs would make every snapshot holding one of their promotions
-        // unrestorable — reconcile these (CASCADE: drop the row) before adding one.
-        "txn_headers_ledger_operation_id_fkey",
-        "ledger_operation_promotions_ledger_operation_id_fkey",
-        "ledger_operation_promotions_run_ledger_fkey",
         // users: no endpoint deletes a user.
-        "user_account_groups_user_id_fkey",
         "fk_provider_security_mappings_user",
         "fk_recurring_occurrence_exceptions_user",
         "txn_leg_recon_cleared_by_user_id_fkey",
         "saved_reports_owner_user_id_fkey",
         "report_pins_user_id_fkey",
+        // The author of a hand-entered rate (mig 280). ON DELETE SET NULL, so the day a
+        // user delete exists this is a reconcile (set it NULL), not a dangling reference.
+        "fk_fx_rates_entered_by_user",
     };
 
     private static readonly Regex SafeIdent = new("^[a-z_][a-z0-9_]*$", RegexOptions.Compiled);
@@ -186,14 +194,17 @@ public sealed class SchemaDriftGuardTests
         return doc.RootElement.EnumerateObject().Select(o => o.Name).ToHashSet();
     }
 
-    private sealed record ForeignKey(string Name, string Child, string Parent, bool Deferrable);
+    // InitiallyDeferred, not merely deferrable: no restore body defers a constraint
+    // by name or runs SET CONSTRAINTS ALL DEFERRED, so a DEFERRABLE INITIALLY
+    // IMMEDIATE key is checked at each restore INSERT like any other.
+    private sealed record ForeignKey(string Name, string Child, string Parent, bool InitiallyDeferred);
 
     private static async Task<List<ForeignKey>> ForeignKeysAsync(DbConnection conn)
     {
         var list = new List<ForeignKey>();
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"
-            SELECT c.conname, cl.relname, pl.relname, c.condeferrable
+            SELECT c.conname, cl.relname, pl.relname, c.condeferrable AND c.condeferred
             FROM pg_constraint c
             JOIN pg_class cl ON cl.oid = c.conrelid
             JOIN pg_class pl ON pl.oid = c.confrelid
@@ -232,8 +243,8 @@ public sealed class SchemaDriftGuardTests
     [Fact]
     public async Task Snapshot_payload_classifies_every_ledger_scoped_table()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
         var conn = db.Database.GetDbConnection();
         await conn.OpenAsync();
 
@@ -277,6 +288,50 @@ public sealed class SchemaDriftGuardTests
     }
 
     // -----------------------------------------------------------------
+    // Guard 1a — every captured table has a primary key to chunk on.
+    // -----------------------------------------------------------------
+
+    [Fact]
+    public async Task Every_captured_table_has_a_primary_key_and_the_writer_refuses_one_without()
+    {
+        // The snapshot writer keyset-chunks each table on its primary key (mig 264); a
+        // table written in one aggregate holds its whole ledger in one value, in the
+        // backend that already runs closest to its memory limit. That the writer does
+        // chunk every table is proven by the round trip below, at one row per chunk.
+        await using var db = Db.NewDbContext();
+        var conn = db.Database.GetDbConnection();
+        await conn.OpenAsync();
+
+        var keyed = new HashSet<string>(StringComparer.Ordinal);
+        await using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = @"
+                SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid
+                 WHERE i.indisprimary AND c.relnamespace = 'public'::regnamespace";
+            await using var r = await cmd.ExecuteReaderAsync();
+            while (await r.ReadAsync()) keyed.Add(r.GetString(0));
+        }
+        var captured = await CapturedTablesAsync(conn);
+        var unkeyed = captured.Where(t => !keyed.Contains(t)).Order().ToList();
+        Assert.True(unkeyed.Count == 0,
+            "Captured table(s) without a primary key, which the snapshot writer cannot chunk: "
+            + string.Join(", ", unkeyed) + ". Give each one a primary key.");
+
+        // And the writer refuses a table without one rather than writing it whole.
+        await using var tx = await conn.BeginTransactionAsync(System.Data.IsolationLevel.RepeatableRead);
+        await using (var cmd = conn.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = @"
+                CREATE TEMP TABLE snapshot_probe_unkeyed (ledger_id uuid) ON COMMIT DROP;
+                SELECT fn_snapshot_write_part(gen_random_uuid(), gen_random_uuid(), 'snapshot_probe_unkeyed', 10);";
+            var refused = await Assert.ThrowsAsync<Npgsql.PostgresException>(() => cmd.ExecuteNonQueryAsync());
+            Assert.Contains("no primary key", refused.MessageText, StringComparison.Ordinal);
+        }
+        await tx.RollbackAsync();
+    }
+
+    // -----------------------------------------------------------------
     // Guard 1b — "excluded" has to be true: the restore cannot reach in.
     // -----------------------------------------------------------------
 
@@ -289,7 +344,7 @@ public sealed class SchemaDriftGuardTests
         // NO ACTION) — whatever the allow-list says about it surviving a rollback.
         // ledger_operation_promotions was "excluded" while every restore cascaded
         // through it from txn_headers; mig 247 captures it.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var conn = db.Database.GetDbConnection();
         await conn.OpenAsync();
 
@@ -315,13 +370,14 @@ public sealed class SchemaDriftGuardTests
     public async Task Restore_insert_order_satisfies_every_reference_between_captured_tables()
     {
         // Each captured table is inserted after the ones it references — or the FK
-        // is deferrable. A SELF-reference is never satisfied by table order: the v3
+        // is INITIALLY DEFERRED. A SELF-reference is never satisfied by table order: the v3
         // restore inserts a table in chunks keyset-ordered on id, so a row can
-        // reference one in a later chunk of its own table. That failed a production
-        // restore on txn_headers.is_merged_into (mig 247); no test saw it because a
-        // test ledger fits in one chunk. Checked here against the catalog, so it
-        // does not depend on a fixture happening to seed a crossing.
-        await using var db = _fixture.NewDbContext();
+        // reference one in a later chunk of its own table. txn_headers.is_merged_into
+        // does exactly that for any ledger past one chunk with a forward merge (mig
+        // 247), and a test ledger fits in one chunk, so a fixture never crosses the
+        // boundary. Checked here against the catalog, so it does not depend on a
+        // fixture happening to seed a crossing.
+        await using var db = Db.NewDbContext();
         var conn = db.Database.GetDbConnection();
         await conn.OpenAsync();
 
@@ -330,7 +386,7 @@ public sealed class SchemaDriftGuardTests
 
         var outOfOrder = (await ForeignKeysAsync(conn))
             .Where(f => position.ContainsKey(f.Child) && position.ContainsKey(f.Parent))
-            .Where(f => !f.Deferrable && position[f.Parent] >= position[f.Child])
+            .Where(f => !f.InitiallyDeferred && position[f.Parent] >= position[f.Child])
             .Select(f => f.Child == f.Parent
                 ? $"{f.Name} ({f.Child} references itself)"
                 : $"{f.Name} ({f.Child} is inserted before {f.Parent})")
@@ -350,7 +406,7 @@ public sealed class SchemaDriftGuardTests
     [Fact]
     public async Task Every_reference_out_of_the_snapshot_is_classified()
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var conn = db.Database.GetDbConnection();
         await conn.OpenAsync();
 
@@ -380,12 +436,12 @@ public sealed class SchemaDriftGuardTests
             + "restore: handle it in fn_ledger_snapshot_reconcile_external_refs and list it in "
             + "OutwardReconciledOnRestore. Otherwise list it in OutwardParentNeverDeleted.");
 
-        var notDeferrable = outward
-            .Where(f => OutwardReconciledOnRestore.Contains(f.Name) && !f.Deferrable)
+        var notDeferred = outward
+            .Where(f => OutwardReconciledOnRestore.Contains(f.Name) && !f.InitiallyDeferred)
             .Select(f => f.Name).Order().ToList();
-        Assert.True(notDeferrable.Count == 0,
-            "Reconciled FK(s) must be deferrable so the restored row lands before the fix-up: "
-            + string.Join(", ", notDeferrable));
+        Assert.True(notDeferred.Count == 0,
+            "Reconciled FK(s) must be DEFERRABLE INITIALLY DEFERRED so the restored row lands before "
+            + "the fix-up: " + string.Join(", ", notDeferred));
     }
 
     // -----------------------------------------------------------------
@@ -395,20 +451,19 @@ public sealed class SchemaDriftGuardTests
     [Fact]
     public async Task Snapshot_restore_round_trips_every_captured_table()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
         // EVERY captured table is seeded, and the sanity check below fails on any
         // that is not. A table with no rows passes a before/after comparison at
-        // 0 == 0 — green on exactly the omission this test exists to catch. The
-        // previous version checked a hand-kept list of seeded tables, and
-        // saved_reports and report_pins (migs 244/245) shipped without ever being
-        // added to it.
+        // 0 == 0 — green on exactly the omission this test exists to catch. A
+        // hand-kept list of seeded tables would miss any new table nobody added
+        // to it, so the check covers every captured table instead.
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         await ledger.AddTransactionPairAsync(
             bank.Id, dining.Id, -30m, Utc(2026, 1, 2), payee: "seed");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var cookie = await ledger.IssueSessionCookieAsync();
         using var client = factory.CreateClient(
             new WebApplicationFactoryClientOptions { HandleCookies = false });
@@ -430,8 +485,9 @@ public sealed class SchemaDriftGuardTests
 
         // Self-references that CROSS A CHUNK BOUNDARY. The restore below replays a
         // capture taken at one row per chunk, keyset-ordered on id, so a row whose
-        // id sorts before the row it references lands in an earlier chunk — the
-        // production failure of mig 247. Ids are chosen to force that for each
+        // id sorts before the row it references lands in an earlier chunk, which
+        // fails any ledger past one chunk unless the restore defers the reference
+        // (mig 247). Ids are chosen to force that for each
         // self-reference, rather than left to the 50/50 of random uuids. Postgres
         // orders uuids bytewise, which is the ordinal order of their text form.
         static (Guid Low, Guid High) OrderedPair()
@@ -441,6 +497,7 @@ public sealed class SchemaDriftGuardTests
         }
         var (childCategory, parentCategory) = OrderedPair();
         var (brokerageId, holdingsSiblingId) = OrderedPair();
+        var (childFolder, parentFolder) = OrderedPair();
 
         var (mergedLeg, _) = await ledger.AddTransactionPairAsync(
             bank.Id, dining.Id, -12m, Utc(2026, 1, 4), payee: "duplicate");
@@ -453,15 +510,15 @@ public sealed class SchemaDriftGuardTests
         await ledger.MarkTransactionMergedAsync(loser, winner);
 
         // A second member, whose PRIVATE rows the owner's RLS cannot see. A manual
-        // snapshot used to run under that RLS, so these were neither captured nor
-        // restored (mig 247). Mutated after the snapshot below; the restore must
+        // snapshot that ran under that RLS would neither capture nor restore them
+        // (mig 247). Mutated after the snapshot below; the restore must
         // bring them back.
         var memberId = await ledger.AddMemberAsync("editor");
 
         Guid bankLegId;
         Guid promotionRunId;
         Guid memberReportId;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             db.Accounts.Add(new AccountRow
             {
@@ -506,6 +563,7 @@ public sealed class SchemaDriftGuardTests
                 CategoryId = dining.Id,
                 TargetMonth = new DateOnly(2026, 1, 1),
                 Amount = 250m,
+                CurrencyCode = "USD",
                 CreatedAt = Utc(2026, 1, 1),
                 UpdatedAt = Utc(2026, 1, 1),
             });
@@ -515,7 +573,7 @@ public sealed class SchemaDriftGuardTests
             {
                 Id = tagId,
                 LedgerId = ledger.LedgerId,
-                Name = "Property B",
+                Name = "Project B",
                 CreatedAt = Utc(2026, 1, 1),
             });
             db.TxnHeaderTags.Add(new TxnHeaderTagRow
@@ -531,18 +589,48 @@ public sealed class SchemaDriftGuardTests
                 TagId = tagId,
                 LedgerId = ledger.LedgerId,
             });
-
-
-            var groupId = Guid.NewGuid();
-            db.UserAccountGroups.Add(new UserAccountGroupRow
+            // A second tag on the same header and leg: the tag tables' primary keys are
+            // (parent, tag), so at one row per chunk a keyset must resume inside one
+            // parent's rows, which it would skip on a bound over the parent alone.
+            var secondTagId = Guid.NewGuid();
+            db.Tags.Add(new TagRow
             {
-                Id = groupId, UserId = ledger.UserId, LedgerId = ledger.LedgerId,
-                Name = "Everyday", SortOrder = 0, CreatedAt = Utc(2026, 1, 1),
+                Id = secondTagId,
+                LedgerId = ledger.LedgerId,
+                Name = "Project C",
+                CreatedAt = Utc(2026, 1, 1),
             });
-            db.UserAccountGroupMembers.Add(new UserAccountGroupMemberRow
+            db.TxnHeaderTags.Add(new TxnHeaderTagRow
             {
-                GroupId = groupId, AccountId = bank.Id, LedgerId = ledger.LedgerId,
-                AddedAt = Utc(2026, 1, 1),
+                HeaderId = await db.TxnLegs.AsNoTracking()
+                    .Where(l => l.Id == bankLegId).Select(l => l.HeaderId).SingleAsync(),
+                TagId = secondTagId,
+                LedgerId = ledger.LedgerId,
+            });
+            db.TxnLegTags.Add(new TxnLegTagRow
+            {
+                LegId = bankLegId,
+                TagId = secondTagId,
+                LedgerId = ledger.LedgerId,
+            });
+
+
+            // A sub-folder whose id sorts before its parent's: at one row per chunk
+            // it is restored first, so the deferred parent reference is exercised.
+            db.AccountFolders.Add(new AccountFolderRow
+            {
+                Id = parentFolder, LedgerId = ledger.LedgerId, AccountType = "bank",
+                Name = "Everyday", CreatedAt = Utc(2026, 1, 1),
+            });
+            db.AccountFolders.Add(new AccountFolderRow
+            {
+                Id = childFolder, LedgerId = ledger.LedgerId, AccountType = "bank",
+                Name = "Nested", ParentId = parentFolder, CreatedAt = Utc(2026, 1, 1),
+            });
+            db.AccountFolderMembers.Add(new AccountFolderMemberRow
+            {
+                AccountId = bank.Id, LedgerId = ledger.LedgerId, FolderId = childFolder,
+                AccountType = "bank",
             });
 
             db.ProviderSecurityMappings.Add(new ProviderSecurityMappingRow
@@ -553,12 +641,24 @@ public sealed class SchemaDriftGuardTests
 
             var templateId = Guid.NewGuid();
             var seriesId = Guid.NewGuid();
-            db.TxnHeaders.Add(new TxnHeaderRow
-            {
-                Id = templateId, LedgerId = ledger.LedgerId, Origin = "manual",
-                Payee = "Rent", PostedAt = Utc(2026, 1, 1), TransactedAt = Utc(2026, 1, 1),
-                IsRecurringTemplate = true,
-            });
+            // A template with legs, so the round trip carries a non-NULL
+            // originating account (mig 263): owned by the bank, the source side.
+            var template = TxnHeaderRow.NewTemplate(templateId, ledger.LedgerId, bank.Id);
+            template.Payee = "Rent";
+            template.PostedAt = Utc(2026, 1, 1);
+            template.TransactedAt = Utc(2026, 1, 1);
+            db.TxnHeaders.Add(template);
+            db.TxnLegs.AddRange(
+                new TxnLegRow
+                {
+                    Id = Guid.NewGuid(), HeaderId = templateId, LedgerId = ledger.LedgerId,
+                    AccountId = bank.Id, PostingIndex = 0, Amount = -900m,
+                },
+                new TxnLegRow
+                {
+                    Id = Guid.NewGuid(), HeaderId = templateId, LedgerId = ledger.LedgerId,
+                    AccountId = dining.Id, PostingIndex = 0, Amount = 900m,
+                });
             db.RecurringTransactions.Add(new RecurringTransactionRow
             {
                 Id = seriesId, LedgerId = ledger.LedgerId, ExternalId = $"rem-{ledger.LedgerId}",
@@ -620,7 +720,7 @@ public sealed class SchemaDriftGuardTests
                 CatalogKey = "net-worth", SortOrder = 1, CreatedAt = Utc(2026, 1, 1),
             });
 
-            // The member's own: a private report, its pin, an account group.
+            // The member's own: a private report and its pin.
             memberReportId = Guid.NewGuid();
             db.SavedReports.Add(new SavedReportRow
             {
@@ -633,11 +733,60 @@ public sealed class SchemaDriftGuardTests
                 Id = Guid.NewGuid(), UserId = memberId, LedgerId = ledger.LedgerId,
                 SavedReportId = memberReportId, SortOrder = 0, CreatedAt = Utc(2026, 1, 1),
             });
-            db.UserAccountGroups.Add(new UserAccountGroupRow
+
+            // The outside market series (mig 280). Two days of one symbol, and two pairs
+            // from one currency, so a keyset at one row per chunk must resume inside a
+            // composite key's leading columns. A hand-entered rate names its author, the
+            // reference out of the snapshot to users.
+            db.LedgerBenchmarks.Add(new LedgerBenchmarkRow
             {
-                Id = Guid.NewGuid(), UserId = memberId, LedgerId = ledger.LedgerId,
-                Name = "Member's group", SortOrder = 0, CreatedAt = Utc(2026, 1, 1),
+                Id = Guid.NewGuid(), LedgerId = ledger.LedgerId, Symbol = "FNDA", Name = "Fund A",
+                CurrencyCode = "USD", Position = 1, CreatedAt = Utc(2026, 1, 1),
             });
+            db.LedgerBenchmarks.Add(new LedgerBenchmarkRow
+            {
+                Id = Guid.NewGuid(), LedgerId = ledger.LedgerId, Symbol = "FNDB", Name = "Fund B",
+                CurrencyCode = "EUR", Position = 2, CreatedAt = Utc(2026, 1, 1),
+            });
+            foreach (var day in new[] { new DateOnly(2026, 1, 5), new DateOnly(2026, 1, 6) })
+            {
+                db.BenchmarkGrowth.Add(new BenchmarkGrowthRow
+                {
+                    LedgerId = ledger.LedgerId, Symbol = "FNDA", GrowthDate = day, Growth = 1.000123456789m,
+                    Source = BenchmarkGrowthSource.Fetch, CreatedAt = Utc(2026, 1, 7),
+                });
+            }
+            db.FxRates.Add(new FxRateRow
+            {
+                Id = Guid.NewGuid(), LedgerId = ledger.LedgerId, FromCurrency = "EUR", ToCurrency = "USD",
+                RateDate = new DateOnly(2026, 1, 5), Rate = 1.234567890123m, Source = FxRateSource.Frankfurter,
+                Upstream = "Source A", CreatedAt = Utc(2026, 1, 7),
+            });
+            db.FxRates.Add(new FxRateRow
+            {
+                Id = Guid.NewGuid(), LedgerId = ledger.LedgerId, FromCurrency = "EUR", ToCurrency = "USD",
+                RateDate = new DateOnly(2026, 1, 6), Rate = 1.25m, Source = FxRateSource.Manual,
+                EnteredByUserId = ledger.UserId, CreatedAt = Utc(2026, 1, 7),
+            });
+            db.FxPairCoverage.Add(new FxPairCoverageRow
+            {
+                LedgerId = ledger.LedgerId, FromCurrency = "EUR", ToCurrency = "USD",
+                FetchedFromDate = new DateOnly(2025, 12, 29), FetchedThroughDate = new DateOnly(2026, 1, 5),
+            });
+            db.FxPairCoverage.Add(new FxPairCoverageRow
+            {
+                LedgerId = ledger.LedgerId, FromCurrency = "EUR", ToCurrency = "GBP",
+                FetchedFromDate = new DateOnly(2025, 12, 29), FetchedThroughDate = new DateOnly(2026, 1, 5),
+            });
+            // One range per symbol, kept after its benchmark is removed (FNDC has none).
+            foreach (var symbol in new[] { "FNDA", "FNDC" })
+            {
+                db.BenchmarkCoverage.Add(new BenchmarkCoverageRow
+                {
+                    LedgerId = ledger.LedgerId, Symbol = symbol,
+                    FetchedFromDate = new DateOnly(2025, 12, 29), FetchedThroughDate = new DateOnly(2026, 1, 6),
+                });
+            }
             await db.SaveChangesAsync();
 
             // account_external_ids has no API writer and no EF entity: the Moneydance
@@ -646,8 +795,8 @@ public sealed class SchemaDriftGuardTests
                 INSERT INTO account_external_ids (account_id, ledger_id, source, external_id)
                 VALUES ({bank.Id}, {ledger.LedgerId}, 'moneydance', 'md-checking')");
 
-            // A row whose id IS the all-zero uuid — what the chunk keyset used to
-            // start strictly after, and so skip. The Moneydance importer writes
+            // A row whose id IS the all-zero uuid — what a chunk keyset that starts
+            // strictly after it would skip. The Moneydance importer writes
             // explicit ids in raw SQL, and so does this: EF reads Guid.Empty as
             // "no key yet" and would generate one, leaving the case untested.
             await db.Database.ExecuteSqlInterpolatedAsync($@"
@@ -656,8 +805,20 @@ public sealed class SchemaDriftGuardTests
         }
         await ledger.EditHeaderAsync(bankLegId, memo: "reconciled at bank");
 
+        // Originals as an import that rounded seeds them (migration 301, ADR-0114 D15): the
+        // bank's figure finer than its account's currency allows, and the rounded mark set,
+        // so the fingerprint proves capture and restore carry both columns.
+        var (roundedLeg, _) = await ledger.AddTransactionPairAsync(
+            bank.Id, dining.Id, -41.25m, Utc(2026, 1, 5), payee: "rounded at import");
+        await ledger.SeedRoundedImportOriginalsAsync(roundedLeg, -41.2468m);
+
+        // The seeding context writes past the recompute, so the stored memo-and-tags
+        // presentation (txn_legs.notes_* and txn_leg_note_tags, both captured) is brought
+        // to what every writer leaves, as the upgrade's backfill does.
+        await ledger.RecomputeAllNotesAsync();
+
         // Fingerprint every captured table.
-        await using var db2 = _fixture.NewDbContext();
+        await using var db2 = Db.NewDbContext();
         var conn = db2.Database.GetDbConnection();
         await conn.OpenAsync();
         var captured = await CapturedTablesAsync(conn);
@@ -677,8 +838,8 @@ public sealed class SchemaDriftGuardTests
 
         // Re-capture the same state at ONE row per chunk: same snapshot, same rows,
         // only the chunking differs. The endpoint's 2000-row chunks put a test ledger
-        // in a single chunk per table, which is how the cross-chunk failure reached
-        // production unseen. Service role, so RLS does not narrow the capture — for
+        // in a single chunk per table, where no cross-chunk failure can occur. Service
+        // role, so RLS does not narrow the capture — for
         // a single-owner ledger it sees exactly what the request did.
         // REPEATABLE READ, which capture requires (mig 247).
         await using (var capture = await db2.Database.BeginTransactionAsync(System.Data.IsolationLevel.RepeatableRead))
@@ -687,27 +848,65 @@ public sealed class SchemaDriftGuardTests
                 $"SELECT ledger_snapshot_write({snap.Id}, {ledger.LedgerId}, 1)");
             await capture.CommitAsync();
         }
-        var headerChunks = await db2.Database.SqlQuery<int>(
-            $"SELECT count(*)::int AS \"Value\" FROM ledger_snapshot_parts WHERE snapshot_id = {snap.Id} AND part_name = 'txn_headers'")
-            .SingleAsync();
-        Assert.Equal(before["txn_headers"].Rows, headerChunks);
+        // One chunk per row for EVERY captured table, whatever its primary key's shape:
+        // no table is written in one piece, and each table's keyset (composite ones
+        // included) has resumed after every row, which a wrong bound would skip or repeat.
+        var chunks = new Dictionary<string, int>(StringComparer.Ordinal);
+        await using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT part_name, count(*)::int FROM ledger_snapshot_parts WHERE snapshot_id = @s GROUP BY part_name";
+            var p = cmd.CreateParameter();
+            p.ParameterName = "s";
+            p.Value = snap.Id;
+            cmd.Parameters.Add(p);
+            await using var r = await cmd.ExecuteReaderAsync();
+            while (await r.ReadAsync()) chunks[r.GetString(0)] = r.GetInt32(1);
+        }
+        var onePiece = captured
+            .Where(t => chunks.GetValueOrDefault(t) != before[t].Rows)
+            .Select(t => $"{t}: {before[t].Rows} rows in {chunks.GetValueOrDefault(t)} chunk(s)")
+            .Order().ToList();
+        Assert.True(onePiece.Count == 0,
+            "At one row per chunk, these captured tables did not get one chunk per row: " + string.Join("; ", onePiece));
 
         // Mutate after the snapshot: a stray transaction, a dropped recon mark, the
-        // fund's look-through, the saved report (its pin cascades with it), and a
-        // later promotion — which the restore rolls back with everything else.
+        // fund's look-through, the saved report (its pin cascades with it), the
+        // folders (their members cascade with them), and a later promotion — which
+        // the restore rolls back with everything else.
         await ledger.AddTransactionPairAsync(
             bank.Id, dining.Id, -99m, Utc(2026, 2, 2), payee: "post-snapshot");
-        await using (var db3 = _fixture.NewDbContext())
+        await using (var db3 = Db.NewDbContext())
         {
             await db3.TxnLegRecon.Where(r => r.LegId == bankLegId).ExecuteDeleteAsync();
             await db3.SecurityComponents.Where(c => c.SecurityId == security).ExecuteDeleteAsync();
             await db3.SavedReports.Where(r => r.LedgerId == ledger.LedgerId).ExecuteDeleteAsync();
-            await db3.UserAccountGroups.Where(g => g.UserId == memberId).ExecuteDeleteAsync();
+            await db3.AccountFolders.Where(f => f.LedgerId == ledger.LedgerId).ExecuteDeleteAsync();
             db3.LedgerOperationPromotions.Add(new LedgerOperationPromotionRow
             {
                 Id = Guid.NewGuid(), LedgerOperationId = promotionRunId, LedgerId = ledger.LedgerId,
                 HeaderId = loser, WasAmount = -10m, BecameAmount = -12m, PromotedAt = Utc(2026, 2, 3),
             });
+            // The market series move on after the snapshot: a benchmark is removed, a day
+            // of growth and a rate are fetched, coverage advances. A restore drops the days
+            // after the snapshot and puts the removed benchmark back (ADR-0114 D6).
+            await db3.LedgerBenchmarks.Where(b => b.LedgerId == ledger.LedgerId && b.Symbol == "FNDB")
+                .ExecuteDeleteAsync();
+            db3.BenchmarkGrowth.Add(new BenchmarkGrowthRow
+            {
+                LedgerId = ledger.LedgerId, Symbol = "FNDA", GrowthDate = new DateOnly(2026, 2, 2),
+                Growth = 0.999876543210m, Source = BenchmarkGrowthSource.Fetch,
+            });
+            db3.FxRates.Add(new FxRateRow
+            {
+                Id = Guid.NewGuid(), LedgerId = ledger.LedgerId, FromCurrency = "EUR", ToCurrency = "USD",
+                RateDate = new DateOnly(2026, 2, 2), Rate = 1.2m, Source = FxRateSource.Frankfurter,
+            });
+            await db3.FxPairCoverage.Where(c => c.LedgerId == ledger.LedgerId)
+                .ExecuteUpdateAsync(s => s.SetProperty(c => c.FetchedThroughDate, new DateOnly(2026, 2, 2)));
+            await db3.BenchmarkCoverage.Where(c => c.LedgerId == ledger.LedgerId)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(c => c.FetchedFromDate, new DateOnly(2025, 11, 3))
+                    .SetProperty(c => c.FetchedThroughDate, new DateOnly(2026, 2, 2)));
             await db3.SaveChangesAsync();
         }
 
@@ -740,7 +939,8 @@ public sealed class SchemaDriftGuardTests
         // lossy (19,4)/(19,6) to NUMERIC(25,12) but missed lots.unit_cost (fixed
         // mig 180). Pin the whole family so the next precision bump can't miss a
         // column again. Deliberately EXCLUDED:
-        //   * money AMOUNT columns (txn_legs.amount) — 2dp by ADR-0073.
+        //   * money AMOUNT columns (txn_legs.amount) — each currency's own minor
+        //     units, at most 3 places (ADR-0073 as amended by ADR-0114 D15).
         //   * security_prices.price — a market-valuation snapshot, constrained to
         //     NUMERIC(19,4) on purpose by mig 155 (ADR-0070 D8) to match its
         //     high/low columns and reject FLOAT noise. NOT an execution price.
@@ -753,7 +953,7 @@ public sealed class SchemaDriftGuardTests
             ("lots", "unit_cost"),
         };
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var conn = db.Database.GetDbConnection();
         await conn.OpenAsync();
 
@@ -792,9 +992,15 @@ public sealed class SchemaDriftGuardTests
         // and overflows .NET decimal on read. Any unbounded numeric in an aggregated
         // financial table is the same footgun — pin that every one carries an explicit
         // scale, so a computed value can't grow past decimal's ceiling and blow up the
-        // read. (The specific scale is a per-column choice — money 2dp, shares 12dp —
+        // read. (The specific scale is a per-column choice — money at the 3-place
+        // ceiling every currency's minor units fit under (ADR-0114 D15), shares 12dp —
         // this only forbids the no-scale case.)
-        await using var db = _fixture.NewDbContext();
+        //
+        // txn_header_originals is deliberately not listed: its amount is the bank's
+        // figure exactly as sent, unbounded on purpose (ADR-0114 D15), and it is a
+        // record of one value per header, never summed or computed, so no derived
+        // value can grow its scale.
+        await using var db = Db.NewDbContext();
         var conn = db.Database.GetDbConnection();
         await conn.OpenAsync();
 
@@ -830,7 +1036,7 @@ public sealed class SchemaDriftGuardTests
         // recurring_transactions FK (it also nulled the NOT NULL ledger_id) broke
         // snapshot restore for any ledger with a recurring-linked transaction. The
         // fix is the PG15+ column-specific form: ON DELETE SET NULL (nullable_col).
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var conn = db.Database.GetDbConnection();
         await conn.OpenAsync();
 
@@ -896,7 +1102,7 @@ public sealed class SchemaDriftGuardTests
     {
         // WHY: migration headers are load-bearing documentation here. 205 and 209
         // each rounded money at a scale a stale header asserted, and 209 left
-        // disposals off in their last decimal place on a real ledger. The column-side guard above pins
+        // disposals off in their last decimal place. The column-side guard above pins
         // the columns; this is its comment-side twin.
         //
         // A claim is one fragment (comma/semicolon-delimited) of a comment line
@@ -906,7 +1112,7 @@ public sealed class SchemaDriftGuardTests
         // claim that lots.unit_cost is (19,4), which is a parser artifact, not drift.
         var dir = MigrationsDirectoryLocator.Locate(AppContext.BaseDirectory);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var conn = db.Database.GetDbConnection();
         await conn.OpenAsync();
 

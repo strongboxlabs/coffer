@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
-    useMutation,
     useQuery,
     useQueryClient,
     useInfiniteQuery,
 } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 import { Link, useNavigate, useParams } from '@tanstack/react-router';
 
 import {
@@ -33,7 +33,12 @@ import { Breadcrumb } from '@/components/ui/Breadcrumb';
 import { Button } from '@/components/ui/Button';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { EmptyStateInline } from '@/components/ui/EmptyState';
+import { useLedgerRole } from '@/lib/useLedgerRole';
 import { Modal } from '@/components/ui/Modal';
+import { MoneyInput } from '@/components/ui/MoneyInput';
+import { usePendingButtonProps } from '@/components/ui/pending';
+import { PendingLabel } from '@/components/ui/PendingLabel';
+import { useRowRemovalFocus } from '@/components/ui/rowRemovalFocus';
 import { SecurityFormFields, useSecurityForm } from './components/SecurityForm';
 import { LedgerHubSection } from '@/components/LedgerHubSection';
 import { Panel, PanelBody } from '@/components/ui/Panel';
@@ -42,9 +47,12 @@ import {
     MainPane,
     TopBar,
 } from '@/components/ui/SidebarLayout';
-import { formatLedgerDate as formatDate } from '@/lib/dates';
+import { formatLedgerDate as formatDate, todayInputValue } from '@/lib/dates';
 import { errorMessage } from '@/lib/errorMessage';
-import { formatPrice, formatQuantity } from '@/lib/money';
+import { invalidateHomeReads } from '@/lib/registerInvalidation';
+import { atDisplayPrecision, formatCurrency, formatPrice, formatQuantity } from '@/lib/money';
+import { NoRate } from './home/Money';
+import { formatInvestmentAction } from './register/strategies/investmentStrategy';
 
 /**
  * `/ledgers/:lid/securities/:sid` — Securities Detail.
@@ -69,6 +77,9 @@ export function SecurityDetailPage() {
         queryKey: ['ledgers'],
         queryFn: fetchVisibleLedgers,
     });
+    // A viewer reads the security, its trades and its prices, and edits none of
+    // them (the API refuses a viewer every one).
+    const { canEdit } = useLedgerRole(ledgerId);
     const detailQuery = useQuery({
         queryKey: ['security', ledgerId, securityId],
         queryFn: () => fetchSecurity(ledgerId, securityId),
@@ -116,6 +127,11 @@ export function SecurityDetailPage() {
         () => (pricesQuery.data?.pages.flatMap((p) => p.items) ?? []),
         [pricesQuery.data],
     );
+    // A price deleted from its Edit price dialog takes its row's edit button
+    // with it: focus goes to the next row's, the previous row's, or + Add price
+    // (ADR-0023 §L).
+    const addPriceRef = useRef<HTMLButtonElement | null>(null);
+    const editPriceControl = useRowRemovalFocus(useMemo(() => priceRows.map((p) => p.id), [priceRows]), addPriceRef);
 
     return (
         <MainArea>
@@ -172,7 +188,7 @@ export function SecurityDetailPage() {
                         <>
                             <Hero
                                 detail={detail}
-                                onEdit={() => setEditOpen(true)}
+                                onEdit={canEdit ? () => setEditOpen(true) : undefined}
                             />
                             <LedgerHubSection
                                 sectionKey="transactions"
@@ -206,15 +222,16 @@ export function SecurityDetailPage() {
                                 totalCount={
                                     pricesQuery.data?.pages[0]?.totalCount
                                 }
-                                headerAction={
+                                headerAction={canEdit ? (
                                     <button
+                                        ref={addPriceRef}
                                         type="button"
                                         onClick={() => setPriceEditor({ kind: 'add' })}
                                         className="font-medium text-accent hover:underline"
                                     >
                                         + Add price
                                     </button>
-                                }
+                                ) : undefined}
                             >
                                 <PricesTable
                                     rows={priceRows}
@@ -224,7 +241,8 @@ export function SecurityDetailPage() {
                                     hasNext={pricesQuery.hasNextPage}
                                     fetchingNext={pricesQuery.isFetchingNextPage}
                                     onLoadMore={() => void pricesQuery.fetchNextPage()}
-                                    onEdit={(row) => setPriceEditor({ kind: 'edit', row })}
+                                    onEdit={canEdit ? (row) => setPriceEditor({ kind: 'edit', row }) : undefined}
+                                    editControl={editPriceControl}
                                 />
                             </LedgerHubSection>
                         </>
@@ -246,6 +264,7 @@ export function SecurityDetailPage() {
                     ledgerId={ledgerId}
                     securityId={securityId}
                     mode={priceEditor}
+                    defaultCurrencyCode={pricesQuery.data ? (pricesQuery.data.pages[0]?.defaultCurrencyCode ?? null) : undefined}
                     onClose={() => setPriceEditor(null)}
                 />
             ) : null}
@@ -253,23 +272,41 @@ export function SecurityDetailPage() {
     );
 }
 
+/**
+ * The hero: the security's figures, each in the currency the detail read says
+ * it is in. The price is in its own currency. The market value, the cost basis
+ * and the unrealized gain sum the holdings across accounts, so they are combined
+ * figures in the reporting currency, converted by the server (ADR-0114 D7); the
+ * page derives none of them. One that needs a missing rate says "no rate", naming
+ * it (ADR-0114 D9); a market value or gain with no current price is a dash. The
+ * prices (the latest one, the average cost per share) print through formatPrice,
+ * and the money (cost basis, market value, gain) through formatCurrency at its
+ * currency's places (ADR-0114 D15). A gain that is printed takes its sign and its
+ * red from the figure as it prints, so a residue below one minor unit is a zero,
+ * never a red negative zero.
+ */
 function Hero({
     detail,
     onEdit,
 }: {
     detail: SecurityDetail;
-    onEdit: () => void;
+    /** Absent for a viewer, who edits nothing. */
+    onEdit?: () => void;
 }) {
-    const marketValue =
-        detail.latestPrice !== null
-            ? detail.latestPrice * detail.totalQuantity
-            : null;
-    const unrealized =
-        marketValue !== null ? marketValue - detail.totalCostBasis : null;
+    // The totals are the server's, in the reporting currency; each is null when a rate
+    // it needs is missing, naming it (ADR-0114 D7, D9).
+    const basis = detail.totalCostBasis;
+    const marketValue = detail.marketValue;
+    const unrealized = detail.unrealizedGain;
     const costPerShare =
-        detail.totalQuantity !== 0
-            ? detail.totalCostBasis / detail.totalQuantity
+        detail.totalQuantity !== 0 && basis !== null
+            ? basis / detail.totalQuantity
             : null;
+    const price = detail.priceCurrencyCode;
+    const cost = detail.costBasisCurrencyCode;
+    const valueCurrency = detail.marketValueCurrencyCode;
+    const gainCurrency = detail.unrealizedGainCurrencyCode;
+    const shownGain = unrealized === null ? null : atDisplayPrecision(unrealized, gainCurrency);
 
     return (
         <Panel>
@@ -287,16 +324,18 @@ function Hero({
                             {!detail.isActive ? ' · deactivated' : ''}
                         </p>
                     </div>
-                    <Button variant="secondary" size="sm" onClick={onEdit}>
-                        Edit
-                    </Button>
+                    {onEdit ? (
+                        <Button variant="secondary" size="sm" onClick={onEdit}>
+                            Edit
+                        </Button>
+                    ) : null}
                 </div>
                 <div className="mt-4 grid grid-cols-2 gap-4 md:grid-cols-3">
                     <Stat
                         label="Latest price"
                         value={
                             detail.latestPrice !== null
-                                ? formatPrice(detail.latestPrice)
+                                ? formatPrice(detail.latestPrice, price)
                                 : '—'
                         }
                         sublabel={
@@ -315,27 +354,29 @@ function Hero({
                     />
                     <Stat
                         label="Cost basis"
-                        value={formatPrice(detail.totalCostBasis)}
+                        value={basis === null ? <NoRate missing={detail.costBasisRateUnavailable} /> : formatCurrency(basis, cost)}
                         sublabel={
                             costPerShare !== null
-                                ? `avg ${formatPrice(costPerShare)}/sh`
+                                ? `avg ${formatPrice(costPerShare, cost)}/sh`
                                 : undefined
                         }
                     />
                     <Stat
                         label="Market value"
-                        value={marketValue !== null ? formatPrice(marketValue) : '—'}
+                        value={
+                            marketValue !== null ? formatCurrency(marketValue, valueCurrency)
+                                : detail.marketValueRateUnavailable.length > 0 ? <NoRate missing={detail.marketValueRateUnavailable} />
+                                : '—'
+                        }
                     />
                     <Stat
                         label="Unrealized"
-                        value={unrealized !== null ? formatPrice(unrealized) : '—'}
-                        tone={
-                            unrealized === null
-                                ? undefined
-                                : unrealized >= 0
-                                  ? 'positive'
-                                  : 'negative'
+                        value={
+                            shownGain !== null ? formatCurrency(shownGain, gainCurrency)
+                                : detail.unrealizedGainRateUnavailable.length > 0 ? <NoRate missing={detail.unrealizedGainRateUnavailable} />
+                                : '—'
                         }
+                        tone={shownGain !== null && shownGain < 0 ? 'negative' : undefined}
                     />
                 </div>
             </PanelBody>
@@ -350,9 +391,10 @@ function Stat({
     tone,
 }: {
     label: string;
-    value: string;
+    value: ReactNode;
     sublabel?: string;
-    tone?: 'positive' | 'negative';
+    /** A loss is red; a gain stays default text, never green (ADR-0023 §H). */
+    tone?: 'negative';
 }) {
     return (
         <div>
@@ -362,11 +404,7 @@ function Stat({
             <p
                 className={
                     'mt-0.5 font-mono text-base tabular-nums ' +
-                    (tone === 'positive'
-                        ? 'text-state-success'
-                        : tone === 'negative'
-                          ? 'text-state-danger'
-                          : '')
+                    (tone === 'negative' ? 'text-state-danger' : '')
                 }
             >
                 {value}
@@ -377,6 +415,10 @@ function Stat({
         </div>
     );
 }
+
+/** A look-through sleeve row's own key, for its row only; never sent. */
+let sleeveKeys = 0;
+const newSleeveKey = () => ++sleeveKeys;
 
 const LT_CLASSES = ['equity', 'fixed_income', 'cash', 'real_assets', 'alternative'];
 const LT_REGIONS = ['us', 'developed_ex_us', 'emerging', 'global', 'na'];
@@ -400,13 +442,32 @@ function SleeveEditor({
     const update = (i: number, patch: Partial<SecurityComponent>) =>
         setRows(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
 
+    // Each sleeve's own key, kept beside the rows and never sent: a row keyed
+    // by its place would hand its DOM to the row after it on a removal, and
+    // the focused Remove of the last row would leave the page. A Remove takes
+    // its row away, and focus goes to the next row's Remove, the previous
+    // row's, or Add sleeve (ADR-0023 §L). Rows loaded afresh get fresh keys.
+    const [keys, setKeys] = useState<number[]>(() => rows.map(newSleeveKey));
+    if (keys.length !== rows.length) setKeys(rows.map(newSleeveKey));
+    const addRef = useRef<HTMLButtonElement | null>(null);
+    const removeControl = useRowRemovalFocus(keys, addRef);
+    const remove = (i: number) => {
+        setKeys(keys.filter((_, j) => j !== i));
+        setRows(rows.filter((_, j) => j !== i));
+    };
+    const add = () => {
+        setKeys([...keys, newSleeveKey()]);
+        setRows([...rows, { assetClass: 'equity', region: null, weight: 0 }]);
+    };
+
     return (
         <div className="flex flex-col gap-2 rounded border border-border/60 bg-surface-muted/20 p-2">
             <div className="flex items-center justify-between">
                 <span className="text-[0.625rem] font-semibold uppercase leading-[1.5] tracking-wider text-text-muted">
                     Look-through sleeves
                 </span>
-                <span className={'font-mono text-xs tabular-nums ' + (Math.abs(total - 100) < 0.05 ? 'text-state-success' : 'text-state-warning')}>
+                {/* The warning is the state; a total of 100% is default text, never green (ADR-0023 §H). */}
+                <span className={'font-mono text-xs tabular-nums ' + (Math.abs(total - 100) < 0.05 ? 'text-text' : 'text-state-warning')}>
                     {total.toFixed(1)}%
                 </span>
             </div>
@@ -414,7 +475,7 @@ function SleeveEditor({
                 Weights (should total 100%) used to decompose this multi-asset fund in allocation reports.
             </p>
             {rows.map((r, i) => (
-                <div key={i} className="flex items-center gap-2">
+                <div key={keys[i]} className="flex items-center gap-2">
                     <select className={sel} value={r.assetClass} onChange={(e) => update(i, { assetClass: e.target.value })}>
                         {LT_CLASSES.map((c) => <option key={c} value={c}>{c.replace(/_/g, ' ')}</option>)}
                     </select>
@@ -424,15 +485,14 @@ function SleeveEditor({
                     </select>
                     <input type="number" min="0" step="0.1" className={sel + ' w-fixed-80px text-right'} value={r.weight}
                         onChange={(e) => update(i, { weight: Number(e.target.value) })} />
-                    <button type="button" className="text-xs text-state-danger" onClick={() => setRows(rows.filter((_, j) => j !== i))}>
+                    <button ref={removeControl(keys[i]!)} type="button" className="text-xs text-state-danger" onClick={() => remove(i)}>
                         Remove
                     </button>
                 </div>
             ))}
             {rows.length === 0 ? <p className="text-xs text-text-subtle">No sleeves yet.</p> : null}
             <div>
-                <Button type="button" variant="secondary" size="sm"
-                    onClick={() => setRows([...rows, { assetClass: 'equity', region: null, weight: 0 }])}>
+                <Button ref={addRef} type="button" variant="secondary" size="sm" onClick={add}>
                     Add sleeve
                 </Button>
             </div>
@@ -451,6 +511,7 @@ function TransactionsTable({
     onLoadMore,
 }: {
     ledgerId: string;
+    /** Each carries its account's currency, which its price and amount are in. */
     items: readonly SecurityTransaction[];
     isPending: boolean;
     isError: boolean;
@@ -459,6 +520,7 @@ function TransactionsTable({
     fetchingNext: boolean;
     onLoadMore: () => void;
 }) {
+    const pendingProps = usePendingButtonProps();
     if (isPending) {
         return (
             <PanelBody>
@@ -514,8 +576,13 @@ function TransactionsTable({
                                     {t.accountName}
                                 </Link>
                             </td>
-                            <td className="px-4 py-2 text-[0.6875rem] uppercase tracking-wider text-text-muted">
-                                {t.action ?? '—'}
+                            {/* Not uppercased or letter-spaced, unlike the column heads: the
+                                word reads as the register's chip prints it (Reinvest, not
+                                REINVEST), in the column's small muted type. */}
+                            <td className="px-4 py-2 text-[0.6875rem] text-text-muted">
+                                {/* The stored action is a catalog value; the page names it
+                                    with the word every other surface uses. */}
+                                {t.action ? formatInvestmentAction(t.action) : '—'}
                             </td>
                             <td
                                 className={
@@ -528,7 +595,7 @@ function TransactionsTable({
                                 {t.quantity !== null ? formatQuantity(t.quantity) : '—'}
                             </td>
                             <td className="px-4 py-2 text-right font-mono tabular-nums">
-                                {t.unitPrice !== null ? formatPrice(t.unitPrice) : '—'}
+                                {t.unitPrice !== null ? formatPrice(t.unitPrice, t.currencyCode) : '—'}
                             </td>
                             <td
                                 className={
@@ -536,7 +603,7 @@ function TransactionsTable({
                                     (t.amount < 0 ? 'text-state-danger' : '')
                                 }
                             >
-                                {formatPrice(t.amount)}
+                                {formatCurrency(t.amount, t.currencyCode)}
                             </td>
                         </tr>
                     ))}
@@ -546,11 +613,10 @@ function TransactionsTable({
                 <div className="border-t border-border/60 px-4 py-2 text-center">
                     <button
                         type="button"
-                        onClick={onLoadMore}
-                        disabled={fetchingNext}
-                        className="text-xs font-medium text-accent hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+                        {...pendingProps(fetchingNext, onLoadMore)}
+                        className="text-xs font-medium text-accent hover:underline disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
                     >
-                        {fetchingNext ? 'Loading…' : 'Load more'}
+                        <PendingLabel pending={fetchingNext} label="Load more" pendingLabel="Loading…" />
                     </button>
                 </div>
             ) : null}
@@ -579,6 +645,7 @@ function PricesTable({
     fetchingNext,
     onLoadMore,
     onEdit,
+    editControl,
 }: {
     rows: readonly SecurityPriceRow[];
     isPending: boolean;
@@ -587,8 +654,12 @@ function PricesTable({
     hasNext: boolean;
     fetchingNext: boolean;
     onLoadMore: () => void;
-    onEdit: (row: SecurityPriceRow) => void;
+    /** Absent for a viewer: a row reads, and opens nothing. */
+    onEdit?: (row: SecurityPriceRow) => void;
+    /** The ref for a row's edit button, for when its row goes (useRowRemovalFocus). */
+    editControl: (id: string) => (el: HTMLElement | null) => void;
 }) {
+    const pendingProps = usePendingButtonProps();
     if (isPending) {
         return (
             <PanelBody>
@@ -628,20 +699,28 @@ function PricesTable({
                     {rows.map((p) => (
                         <tr
                             key={p.id}
-                            onClick={() => onEdit(p)}
-                            className="cursor-pointer hover:bg-surface-hover"
+                            // A click anywhere on the row opens it through its
+                            // edit button, which takes focus first: the dialog
+                            // then gives focus back to it (or, once the row has
+                            // gone, to the next row's) when it closes.
+                            onClick={onEdit ? (e) => {
+                                e.currentTarget.querySelector<HTMLElement>('[data-edit-price]')?.focus();
+                                onEdit(p);
+                            } : undefined}
+                            className={onEdit ? 'cursor-pointer hover:bg-surface-hover' : undefined}
                         >
                             <td className="px-4 py-2 font-mono text-[0.75rem] tabular-nums">
                                 {formatDate(p.asOf)}
                             </td>
+                            {/* A price row carries its own currency. */}
                             <td className="px-4 py-2 text-right font-mono tabular-nums">
-                                {formatPrice(p.price)}
+                                {formatPrice(p.price, p.currencyCode)}
                             </td>
                             <td className="px-4 py-2 text-right font-mono tabular-nums text-text-muted">
-                                {p.high !== null ? formatPrice(p.high) : '—'}
+                                {p.high !== null ? formatPrice(p.high, p.currencyCode) : '—'}
                             </td>
                             <td className="px-4 py-2 text-right font-mono tabular-nums text-text-muted">
-                                {p.low !== null ? formatPrice(p.low) : '—'}
+                                {p.low !== null ? formatPrice(p.low, p.currencyCode) : '—'}
                             </td>
                             <td className="px-4 py-2 text-right font-mono tabular-nums text-text-muted">
                                 {p.volume !== null ? formatInteger(p.volume) : '—'}
@@ -659,8 +738,8 @@ function PricesTable({
                                         title={
                                             'No transaction currently produces this price — '
                                             + 'the trade behind it was deleted or edited. '
-                                            + 'It may still be correct. Edit it to keep it '
-                                            + 'as a price you set, or delete it.'
+                                            + 'It may still be correct.'
+                                            + (onEdit ? ' Edit it to keep it as a price you set, or delete it.' : '')
                                         }
                                     >
                                         {priceSourceLabel(p.source)}
@@ -670,7 +749,23 @@ function PricesTable({
                                 )}
                             </td>
                             <td className="px-4 py-2 text-right text-[0.6875rem] text-text-subtle">
-                                edit →
+                                {/* A real button, so the keyboard reaches Edit
+                                    price and Delete price as the pointer does. */}
+                                {onEdit ? (
+                                    <button
+                                        ref={editControl(p.id)}
+                                        type="button"
+                                        data-edit-price
+                                        aria-label={`Edit price for ${formatDate(p.asOf)}`}
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            onEdit(p);
+                                        }}
+                                        className="rounded hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                                    >
+                                        edit →
+                                    </button>
+                                ) : null}
                             </td>
                         </tr>
                     ))}
@@ -680,11 +775,10 @@ function PricesTable({
                 <div className="border-t border-border/60 px-4 py-2 text-center">
                     <button
                         type="button"
-                        onClick={onLoadMore}
-                        disabled={fetchingNext}
-                        className="text-xs font-medium text-accent hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+                        {...pendingProps(fetchingNext, onLoadMore)}
+                        className="text-xs font-medium text-accent hover:underline disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
                     >
-                        {fetchingNext ? 'Loading…' : 'Load more'}
+                        <PendingLabel pending={fetchingNext} label="Load more" pendingLabel="Loading…" />
                     </button>
                 </div>
             ) : null}
@@ -741,6 +835,11 @@ function EditSecurityDialog({
             queryClient.invalidateQueries({ queryKey: ['security', ledgerId, securityId] });
             queryClient.invalidateQueries({ queryKey: ['securities', ledgerId] });
             queryClient.invalidateQueries({ queryKey: ['security-components', ledgerId, securityId] });
+            // An edited security can value its holdings differently, and the
+            // sidebar's figures include their market value (FU-052), and so do
+            // the home screen's.
+            queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+            invalidateHomeReads(queryClient, ledgerId);
             onClose();
         },
     });
@@ -879,7 +978,7 @@ function EditSecurityDialog({
                             variant="secondary"
                             size="sm"
                             onClick={onClose}
-                            disabled={patchMutation.isPending}
+                            pending={patchMutation.isPending}
                         >
                             Cancel
                         </Button>
@@ -887,9 +986,11 @@ function EditSecurityDialog({
                             type="submit"
                             variant="primary"
                             size="sm"
-                            disabled={patchMutation.isPending || !form.isValid}
+                            disabled={!form.isValid}
+                            pending={patchMutation.isPending}
+                            pendingLabel="Saving…"
                         >
-                            {patchMutation.isPending ? 'Saving…' : 'Save'}
+                            Save
                         </Button>
                     </div>
                 </footer>
@@ -903,16 +1004,25 @@ function EditSecurityDialog({
  * or edit (existing row pre-fills the inputs). Save dispatches
  * to addSecurityPrice / patchSecurityPrice; delete is only
  * available in edit mode and confirms before firing.
+ *
+ * A price names its currency (ADR-0114 D5): an added one starts on the security's
+ * default (its latest price's currency, else the one its holding accounts agree on),
+ * an edited one on its own. With no default the field starts empty and must be
+ * filled; nothing defaults to USD.
  */
 function PriceDialog({
     ledgerId,
     securityId,
     mode,
+    defaultCurrencyCode,
     onClose,
 }: {
     ledgerId: string;
     securityId: string;
     mode: { kind: 'add' } | { kind: 'edit'; row: SecurityPriceRow };
+    /** `SecurityPricesPage.defaultCurrencyCode`; null when nothing settles one, and
+     *  undefined while the prices page has not arrived. */
+    defaultCurrencyCode: string | null | undefined;
     onClose: () => void;
 }) {
     const queryClient = useQueryClient();
@@ -921,7 +1031,8 @@ function PriceDialog({
     const [priceDate, setPriceDate] = useState(() =>
         initial !== null
             ? initial.asOf.slice(0, 10)
-            : new Date().toISOString().slice(0, 10),
+            // The reader's own day: the UTC one is tomorrow in an evening west of UTC.
+            : todayInputValue(),
     );
     const [priceStr, setPriceStr] = useState(() =>
         initial !== null ? String(initial.price) : '',
@@ -941,6 +1052,18 @@ function PriceDialog({
             ? String(initial.volume)
             : '',
     );
+    const currencyId = useId();
+    const currencyHintId = useId();
+    const priceId = useId();
+    const highId = useId();
+    const lowId = useId();
+    // What the reader typed, or null while they have typed nothing: until then the field
+    // shows the prefill, which can arrive after the dialog opens (the prices page may
+    // still be loading when + Add price is pressed).
+    const [typedCurrency, setCurrencyStr] = useState<string | null>(() =>
+        initial !== null ? initial.currencyCode : null,
+    );
+    const currencyStr = typedCurrency ?? defaultCurrencyCode ?? '';
 
     const invalidate = () => {
         queryClient.invalidateQueries({
@@ -952,6 +1075,13 @@ function PriceDialog({
         queryClient.invalidateQueries({
             queryKey: ['securities', ledgerId],
         });
+        // A price moves the market value of every account holding the
+        // security, which the sidebar's figures include (FU-052), and the
+        // home screen's balances (ADR-0079).
+        queryClient.invalidateQueries({
+            queryKey: ['accounts', ledgerId],
+        });
+        invalidateHomeReads(queryClient, ledgerId);
     };
 
     const addMutation = useMutation({
@@ -993,16 +1123,22 @@ function PriceDialog({
     const errorMessage = errorMessageForCode(errorCode);
 
     const priceNum = Number(priceStr);
+    const currency = currencyStr.trim().toUpperCase();
+    // The symbol Price, High and Low show: the Currency field's, live as it is typed.
+    // While the code is partial or not three characters, which the server refuses, the
+    // formatter cannot take it and the fields show none (lib/money currencyAffix;
+    // ADR-0114 D5, D14). A price is not money, so nothing here is rounded (ADR-0114 D15).
+    const priceCurrency = currency.length > 0 ? currency : null;
     const saveDisabled =
-        busy ||
         priceStr.trim().length === 0 ||
         Number.isNaN(priceNum) ||
         priceNum <= 0 ||
-        priceDate.length === 0;
+        priceDate.length === 0 ||
+        currency.length === 0;
 
     function handleSubmit(e: React.FormEvent) {
         e.preventDefault();
-        if (saveDisabled) return;
+        if (busy || saveDisabled) return;
         const high = highStr.trim().length === 0 ? null : Number(highStr);
         const low = lowStr.trim().length === 0 ? null : Number(lowStr);
         const volume = volumeStr.trim().length === 0 ? null : Number(volumeStr);
@@ -1013,6 +1149,7 @@ function PriceDialog({
             addMutation.mutate({
                 price: priceNum,
                 priceDate,
+                currencyCode: currency,
                 high: high === null || Number.isNaN(high) ? null : high,
                 low: low === null || Number.isNaN(low) ? null : low,
                 volume: volume === null || Number.isNaN(volume) ? null : volume,
@@ -1021,6 +1158,8 @@ function PriceDialog({
             patchMutation.mutate({
                 price: priceNum,
                 priceDate,
+                // Sent only when changed: a PATCH leaves an absent field as it is.
+                ...(currency !== initial?.currencyCode ? { currencyCode: currency } : {}),
                 high: high === null || Number.isNaN(high) ? null : high,
                 low: low === null || Number.isNaN(low) ? null : low,
                 volume: volume === null || Number.isNaN(volume) ? null : volume,
@@ -1064,39 +1203,67 @@ function PriceDialog({
                             className="w-full rounded border border-border bg-surface px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                         />
                     </label>
-                    <label className="flex flex-col gap-1">
-                        <span className="text-[0.625rem] font-semibold uppercase leading-[1.5] tracking-wider text-text-muted">Price *</span>
-                        <input
-                            type="number"
-                            step="any"
+                    {/* Price, High and Low name their field with `htmlFor`, not by
+                        wrapping it: the symbol inside the field is not part of its
+                        label. */}
+                    <div className="flex flex-col gap-1">
+                        <label htmlFor={priceId} className="text-[0.625rem] font-semibold uppercase leading-[1.5] tracking-wider text-text-muted">Price *</label>
+                        <MoneyInput
+                            id={priceId}
+                            price
+                            currency={priceCurrency}
                             value={priceStr}
-                            onChange={(e) => setPriceStr(e.target.value)}
+                            onValueChange={setPriceStr}
                             required
                             autoFocus={mode.kind === 'add'}
                             className="w-full rounded border border-border bg-surface px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                         />
-                    </label>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                        <label htmlFor={currencyId} className="text-[0.625rem] font-semibold uppercase leading-[1.5] tracking-wider text-text-muted">Currency *</label>
+                        <input
+                            id={currencyId}
+                            aria-describedby={currencyHintId}
+                            type="text"
+                            value={currencyStr}
+                            onChange={(e) => setCurrencyStr(e.target.value)}
+                            required
+                            maxLength={3}
+                            autoComplete="off"
+                            spellCheck={false}
+                            placeholder="e.g. USD"
+                            aria-invalid={errorCode === 'security-price-currency-invalid' || errorCode === 'security-price-currency-required' ? true : undefined}
+                            className="w-full rounded border border-border bg-surface px-3 py-1.5 font-mono text-sm uppercase focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent aria-invalid:border-state-danger"
+                        />
+                        <span id={currencyHintId} className="text-xs text-text-subtle">
+                            {initial === null && defaultCurrencyCode === null
+                                ? 'Nothing settles this security\'s currency yet: it has no price, and the accounts holding it do not share one. Name the currency the price is quoted in.'
+                                : 'The currency the price is quoted in, as a 3-letter code.'}
+                        </span>
+                    </div>
                     <div className="grid grid-cols-2 gap-3">
-                        <label className="flex flex-col gap-1">
-                            <span className="text-[0.625rem] font-semibold uppercase leading-[1.5] tracking-wider text-text-muted">High</span>
-                            <input
-                                type="number"
-                                step="any"
+                        <div className="flex flex-col gap-1">
+                            <label htmlFor={highId} className="text-[0.625rem] font-semibold uppercase leading-[1.5] tracking-wider text-text-muted">High</label>
+                            <MoneyInput
+                                id={highId}
+                                price
+                                currency={priceCurrency}
                                 value={highStr}
-                                onChange={(e) => setHighStr(e.target.value)}
+                                onValueChange={setHighStr}
                                 className="w-full rounded border border-border bg-surface px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                             />
-                        </label>
-                        <label className="flex flex-col gap-1">
-                            <span className="text-[0.625rem] font-semibold uppercase leading-[1.5] tracking-wider text-text-muted">Low</span>
-                            <input
-                                type="number"
-                                step="any"
+                        </div>
+                        <div className="flex flex-col gap-1">
+                            <label htmlFor={lowId} className="text-[0.625rem] font-semibold uppercase leading-[1.5] tracking-wider text-text-muted">Low</label>
+                            <MoneyInput
+                                id={lowId}
+                                price
+                                currency={priceCurrency}
                                 value={lowStr}
-                                onChange={(e) => setLowStr(e.target.value)}
+                                onValueChange={setLowStr}
                                 className="w-full rounded border border-border bg-surface px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                             />
-                        </label>
+                        </div>
                     </div>
                     <label className="flex flex-col gap-1">
                         <span className="text-[0.625rem] font-semibold uppercase leading-[1.5] tracking-wider text-text-muted">Volume</span>
@@ -1121,9 +1288,9 @@ function PriceDialog({
                             variant="danger"
                             size="sm"
                             onClick={handleDelete}
-                            disabled={busy}
+                            pending={busy}
                         >
-                            {deleteMutation.isPending ? 'Deleting…' : 'Delete price'}
+                            <PendingLabel pending={deleteMutation.isPending} label="Delete price" pendingLabel="Deleting…" />
                         </Button>
                     ) : (
                         <span />
@@ -1134,7 +1301,7 @@ function PriceDialog({
                             variant="secondary"
                             size="sm"
                             onClick={onClose}
-                            disabled={busy}
+                            pending={busy}
                         >
                             Cancel
                         </Button>
@@ -1143,8 +1310,10 @@ function PriceDialog({
                             variant="primary"
                             size="sm"
                             disabled={saveDisabled}
+                            pending={busy}
+                            pendingLabel="Saving…"
                         >
-                            {busy ? 'Saving…' : 'Save'}
+                            Save
                         </Button>
                     </div>
                 </footer>
@@ -1190,6 +1359,10 @@ function errorMessageForCode(code: string | undefined): string | null {
             return 'High must be greater than or equal to Low.';
         case 'security-price-not-in-security':
             return 'This price no longer exists. Close the dialog and refresh.';
+        case 'security-price-currency-required':
+            return 'Name the currency this price is quoted in: the security has no price yet, and the accounts holding it do not share a currency to take.';
+        case 'security-price-currency-invalid':
+            return 'The currency must be a 3-letter code, such as USD or EUR.';
         case undefined:
         case null:
             return null;

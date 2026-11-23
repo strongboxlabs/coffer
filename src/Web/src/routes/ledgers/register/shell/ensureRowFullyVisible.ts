@@ -10,8 +10,7 @@
  *
  * Correcting afterwards rather than choosing a different `align` is deliberate.
  * `align: 'start'` fixes the clipping and yanks the row to the top of the list
- * after EVERY save, which is disruptive mid-list and was removed for that
- * reason. This leaves a row that is already comfortably visible exactly where
+ * after EVERY save, which is disruptive mid-list. This leaves a row that is already comfortably visible exactly where
  * it is, and only moves one that is cut off.
  *
  * Measured rather than computed: whatever virtuoso did, and whatever the

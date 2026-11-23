@@ -1,15 +1,14 @@
 /**
  * Strings both registers must say identically.
  *
- * `selectAllLabel` is the accessible name of the header checkbox, and the two
- * registers disagreed about what it promises: bank said "...matching the
- * current filter", investment said "Select all transactions in this account".
- * Investment's overstated its scope — that register has the same filter bar,
- * so the checkbox selects the FILTERED set there too, and a screen-reader user
- * was told they were about to act on every transaction in the account.
+ * `selectAllLabel` is the accessible name of the header checkbox. Both
+ * registers have the same filter bar, so the checkbox selects the FILTERED set
+ * in both; a label of "Select all transactions in this account" overstates its
+ * scope and tells a screen-reader user they are about to act on every
+ * transaction in the account.
  *
- * Here rather than in each page so the two cannot drift again: the previous
- * arrangement was two literals that merely happened to be near each other.
+ * Here rather than in each page so the two cannot drift: two literals that
+ * merely sit near each other are free to disagree.
  */
 export const REGISTER_SELECT_ALL_LABEL =
     'Select all transactions in this account matching the current filter';

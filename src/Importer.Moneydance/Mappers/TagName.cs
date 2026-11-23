@@ -18,8 +18,8 @@ namespace Coffer.Importer.Moneydance.Mappers;
 /// management would refuse to create, and every later rename of one would be
 /// judged against a limit the existing value already broke.</para>
 ///
-/// <para><b>Truncate, not reject</b> — a maintainer decision, taken over the
-/// alternative of failing the import. An import that refuses a file over a tag
+/// <para><b>Truncate, not reject</b> — chosen over the alternative of failing
+/// the import. An import that refuses a file over a tag
 /// name is a worse outcome than a shortened label, and the name is a label: no
 /// identity, no reference, nothing downstream keys on it.</para>
 ///
@@ -44,12 +44,20 @@ public static class TagName
     /// lands mid-word as often as not, and a name ending in a space would be
     /// stored with it — making two names that differ only by where the cut
     /// fell look identical in every UI while remaining distinct rows.
+    /// <para>The cap counts UTF-16 units, like every length check on a tag name. A
+    /// cut that would fall between the two halves of a surrogate pair drops the
+    /// whole character instead: half a character is not text, and the database
+    /// driver's UTF-8 encoder refuses it, which stopped the import.</para>
     /// </remarks>
     public static string? Normalize(string? raw)
     {
         if (string.IsNullOrWhiteSpace(raw)) return null;
         var trimmed = raw.Trim();
-        if (trimmed.Length > MaxLength) trimmed = trimmed[..MaxLength].TrimEnd();
+        if (trimmed.Length > MaxLength)
+        {
+            var cut = char.IsHighSurrogate(trimmed[MaxLength - 1]) ? MaxLength - 1 : MaxLength;
+            trimmed = trimmed[..cut].TrimEnd();
+        }
         return trimmed.Length == 0 ? null : trimmed;
     }
 }

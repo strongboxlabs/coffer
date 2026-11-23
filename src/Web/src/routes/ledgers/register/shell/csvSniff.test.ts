@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
+import type { CsvMappingShape } from '@/lib/types';
+
 import {
+    choicesFromShape,
     guessChoices,
+    guessDecimalSeparator,
     plausibleDateFormats,
     sampleGrid,
     sniffDelimiter,
@@ -11,8 +15,8 @@ import {
     type WizardChoices,
 } from './csvSniff';
 
-/** The real target's shape: tab-separated, despite arriving as a .csv. */
-const STORE_CARD = [
+/** A card-issuer export shape: tab-separated, despite arriving as a .csv. */
+const CARD_ISSUER = [
     '09/02/2026\t$40.25\tSAMPLE.COM              ANYTOWN      ST\tpurchase',
     '09/03/2026\t$6.50\tSAMPLE STORE            ANYTOWN      ST\tpurchase',
     '09/04/2026\t-$23.50\tSAMPLE STORE            ANYTOWN      ST\tpurchase',
@@ -20,9 +24,9 @@ const STORE_CARD = [
 
 describe('sniffDelimiter', () => {
     it('finds the tab in a file that merely calls itself a csv', () => {
-        // The case that motivated the wizard: the extension says comma, the file says
-        // tab, and a person should not have to notice that themselves.
-        expect(sniffDelimiter(STORE_CARD)).toBe('tab');
+        // The extension says comma, the file says tab, and a person should not have
+        // to notice that themselves.
+        expect(sniffDelimiter(CARD_ISSUER)).toBe('tab');
     });
 
     it('is not fooled by a comma inside a payee', () => {
@@ -41,8 +45,8 @@ describe('sniffDelimiter', () => {
 
     it('prefers the delimiter that splits EVERY line the same way, not the most fields', () => {
         // The case the test above does not actually reach. There, tab wins on field
-        // count alone, so it passes even with the consistency rule removed — a mutation
-        // proved exactly that. Here a description full of commas gives comma MORE
+        // count alone, so it passes even with the consistency rule removed. Here a
+        // description full of commas gives comma MORE
         // fields than tab on the first line, and only consistency picks correctly:
         //   comma -> 5, then 1  (inconsistent)
         //   tab   -> 4, then 4  (consistent)
@@ -82,7 +86,7 @@ describe('splitLine', () => {
 
 describe('sampleGrid', () => {
     it('splits the sample into rows of fields', () => {
-        const grid = sampleGrid(STORE_CARD, 'tab');
+        const grid = sampleGrid(CARD_ISSUER, 'tab');
         expect(grid).toHaveLength(3);
         expect(grid[0]).toHaveLength(4);
         expect(grid[0]![1]).toBe('$40.25');
@@ -118,11 +122,11 @@ describe('plausibleDateFormats', () => {
 
 describe('guessChoices', () => {
     it('reads an ISO file as ISO, which is the whole reason it exists', () => {
-        // The defect this replaces: the separator was sniffed and the date format was
-        // hard-coded to MM/dd/yyyy, so an ordinary ISO export opened with the one
-        // setting that cannot read it and previewed as "0 transactions" with a warning
-        // per row. Guessing one field and hard-coding the two most likely to be wrong
-        // is worse than not guessing, because it looks answered.
+        // Sniffing the separator while hard-coding the date format to MM/dd/yyyy
+        // would open an ordinary ISO export with the one setting that cannot read it,
+        // previewing "0 transactions" with a warning per row. Guessing one field and
+        // hard-coding the two most likely to be wrong is worse than not guessing,
+        // because it looks answered.
         const guess = guessChoices([
             'Date,Description,Amount',
             '2026-09-02,SHOP,-23.50',
@@ -155,10 +159,10 @@ describe('guessChoices', () => {
         expect(without.headerRows).toBe(0);
     });
 
-    it('finds date, amount and payee in the real target file', () => {
-        // The store-card shape: tab-separated despite a .csv name, no header, a currency
+    it('finds date, amount and payee in a card-issuer export', () => {
+        // The card-issuer shape: tab-separated despite a .csv name, no header, a currency
         // symbol on the amount, description in the widest column.
-        const guess = guessChoices(STORE_CARD);
+        const guess = guessChoices(CARD_ISSUER);
 
         expect(guess.delimiter).toBe('tab');
         expect(guess.headerRows).toBe(0);
@@ -175,9 +179,9 @@ describe('guessChoices', () => {
         // sitting there.
         //
         // The reference sits to the RIGHT of the amount on purpose. With it on the
-        // left, the rightmost-wins tie-break passed this test on its own and the
-        // weighting went untested — a mutation flattening moneyScore to a constant
-        // stayed green.
+        // left, the rightmost-wins tie-break would pass this test on its own and the
+        // weighting would go untested: flattening moneyScore to a constant would stay
+        // green.
         const guess = guessChoices([
             '09/02/2026,SHOP,-23.50,100234',
             '09/03/2026,CAFE,-4.20,100235',
@@ -202,7 +206,7 @@ describe('guessChoices', () => {
 
     it('is not fooled by a small integer column either', () => {
         // The size tie-break rescues a LARGE stray integer (a reference number) on its
-        // own, so it hid the fact that the cents weighting was doing anything. A line
+        // own, so that case cannot show whether the cents weighting does anything. A line
         // number is the case that needs it: tiny, so "smaller wins" picks it, and only
         // the weighting knows that the line numbers are not money while a signed
         // figure with cents is.
@@ -230,9 +234,9 @@ describe('guessChoices', () => {
     });
 
     it('takes the money column when the file has no dates at all', () => {
-        // With no date anywhere, dateColumn falls back to 1. An earlier version skipped
-        // that column when hunting for money, so a file whose only numbers were in
-        // column 1 had the amount pushed onto a column with nothing in it.
+        // With no date anywhere, dateColumn falls back to 1. Skipping that column when
+        // hunting for money would push the amount of a file whose only numbers are in
+        // column 1 onto a column with nothing in it.
         const guess = guessChoices('-23.50,SHOP\n-4.20,CAFE');
 
         expect(guess.amountColumn).toBe(1);
@@ -242,7 +246,7 @@ describe('guessChoices', () => {
         // Whether a positive number means money in or money out is a fact about the
         // ISSUER, not about the text. Guessing it would be guessing about someone's
         // money; the form asks it as a question about the statement instead.
-        expect(guessChoices(STORE_CARD).amountInvert).toBe(false);
+        expect(guessChoices(CARD_ISSUER).amountInvert).toBe(false);
     });
 
     it('still produces a usable answer for a file it cannot read at all', () => {
@@ -254,6 +258,108 @@ describe('guessChoices', () => {
         expect(guess.amountColumn).toBeGreaterThanOrEqual(1);
         expect(guess.payeeColumn).toBeGreaterThanOrEqual(1);
         expect(guess.headerRows).toBe(0);
+    });
+});
+
+/**
+ * The decimal separator, guessed from the sample when a layout is first made
+ * (ADR-0114 D15). Cell shapes from the approved boards CS-1 and CS-2.
+ */
+describe('guessDecimalSeparator', () => {
+    it('reads a comma when the cells group thousands with a point and write a decimal comma', () => {
+        // A cell that groups thousands with a point and ends in a decimal comma can only
+        // be read with a comma as the decimal separator, and a bare decimal comma says
+        // the same.
+        expect(guessDecimalSeparator(['-47,05', '-8,90', '2.500,00', '-12,34', '-1.234,56', '-3,20']))
+            .toBe('comma');
+        // A bare decimal comma decides on its own: a point reading would take its comma
+        // for a grouping mark and read a whole number a hundred times too large.
+        expect(guessDecimalSeparator(['-12,34'])).toBe('comma');
+    });
+
+    it('reads a point when the cells group thousands with a comma and write a decimal point', () => {
+        expect(guessDecimalSeparator(['-47.05', '-8.90', '2,500.00', '-12.34', '-1,234.56', '-3.20']))
+            .toBe('point');
+    });
+
+    it('guesses a point when every cell is a comma followed by three digits, which both readings allow', () => {
+        // A thousands grouping under a point, three decimals under a comma. Nothing in
+        // the sample decides, and a tie is a point, the only reading a file ever had.
+        expect(guessDecimalSeparator(['1,234', '-2,500', '12,345'])).toBe('point');
+        expect(guessDecimalSeparator([])).toBe('point');
+    });
+
+    it('lets no date or payee vote', () => {
+        // A dotted date is a number under neither reading, so a comma-decimal file whose
+        // dates are written with points is not outvoted by its own dates.
+        expect(guessDecimalSeparator(['03.11.2026', 'Sample Grocer', '04.11.2026', '-8,90']))
+            .toBe('comma');
+    });
+});
+
+describe('guessChoices and the decimal separator', () => {
+    it('finds the amount column of a comma-decimal file, past a column of small integers', () => {
+        // Read always with a point, a decimal-comma cell lost its comma as a grouping mark and
+        // scored as a plain integer, tying with the line numbers beside it, and the
+        // smaller-size tie-break then handed the line numbers the amount column.
+        const guess = guessChoices([
+            'Date;No;Payee;Amount',
+            '03.11.2026;1;Sample Grocer;-47,05',
+            '04.11.2026;2;Sample Bakery;-8,90',
+            '05.11.2026;3;Sample Payroll;2.500,00',
+        ].join('\n'));
+
+        expect(guess.delimiter).toBe('semicolon');
+        expect(guess.decimalSeparator).toBe('comma');
+        expect(guess.amountColumn).toBe(4);
+        expect(guess.payeeColumn).toBe(3);
+    });
+
+    it('reads a three-place amount as money with cents', () => {
+        // A currency with three places writes three decimals (ADR-0114 D15). Refused as
+        // money, the amount ties with the line numbers and loses to them on size.
+        const guess = guessChoices([
+            '2026-11-03,1,Sample Grocer,-47.050',
+            '2026-11-04,2,Sample Bakery,-8.905',
+        ].join('\n'));
+
+        expect(guess.amountColumn).toBe(4);
+    });
+
+    it('guesses a point for a point-decimal file', () => {
+        expect(guessChoices(CARD_ISSUER).decimalSeparator).toBe('point');
+    });
+});
+
+describe('choicesFromShape and the decimal separator', () => {
+    const shape = {
+        version: 2,
+        delimiter: 'semicolon',
+        headerRows: 1,
+        footerRows: 0,
+        dateColumn: 1,
+        dateFormat: 'dd.MM.yyyy',
+        payeeColumn: 2,
+        memoColumn: null,
+        amountShape: 'signed',
+        amountColumn: 4,
+        amountInvert: false,
+        debitColumn: null,
+        creditColumn: null,
+        decimalSeparator: 'comma',
+    } as const satisfies CsvMappingShape;
+
+    it('keeps the separator the layout was saved with', () => {
+        expect(choicesFromShape(shape).decimalSeparator).toBe('comma');
+    });
+
+    it('reads a version-1 layout, which names no separator, with a point', () => {
+        // The negative case: a version-1 document is not guessed. It reads as it
+        // always did (ADR-0114 D15).
+        const v1: Partial<CsvMappingShape> = { ...shape, version: 1 };
+        delete v1.decimalSeparator;
+
+        expect(choicesFromShape(v1 as CsvMappingShape).decimalSeparator).toBe('point');
     });
 });
 
@@ -271,6 +377,7 @@ describe('toYaml', () => {
         amountInvert: true,
         debitColumn: 3,
         creditColumn: 4,
+        decimalSeparator: 'point',
     };
 
     it('writes the document a person would have written by hand', () => {
@@ -279,7 +386,7 @@ describe('toYaml', () => {
         // with its comments stripped, so the guidance can be reworded without anyone
         // having to re-approve the mapping it describes.
         expect(withoutComments(toYaml(base))).toBe(
-            'version: 1\n'
+            'version: 2\n'
             + 'delimiter: tab\n'
             + 'header_rows: 0\n'
             + 'date:\n'
@@ -288,6 +395,7 @@ describe('toYaml', () => {
             + 'payee:\n'
             + '  column: 3\n'
             + 'amount:\n'
+            + '  decimal_separator: point\n'
             + '  shape: signed\n'
             + '  column: 2\n'
             + '  invert: true');
@@ -337,6 +445,20 @@ describe('toYaml', () => {
         expect(pair).toContain('#   shape: signed');
         expect(pair).toContain('#   column: 2');
         expect(pair).toContain('#   invert: true');
+    });
+
+    it('writes version 2 with the decimal separator, which the parser keeps', () => {
+        // Version 2 requires the key (ADR-0114 D15), so a document the wizard writes
+        // without it would be refused. Past the comments, so the key is real.
+        const yaml = toYaml({ ...base, decimalSeparator: 'comma' });
+        const bare = withoutComments(yaml);
+
+        expect(bare).toMatch(/^version: 2$/m);
+        expect(bare).toContain('amount:\n  decimal_separator: comma');
+        // The accepted values next to the key, derived from the vocabulary.
+        expect(yaml).toContain('  # point | comma\n  decimal_separator: comma');
+        expect(withoutComments(toYaml({ ...base, amountShape: 'debit_credit' })))
+            .toContain('amount:\n  decimal_separator: point');
     });
 
     it('leaves out memo and footer_rows when they say nothing', () => {

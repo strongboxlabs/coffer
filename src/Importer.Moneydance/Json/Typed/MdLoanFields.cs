@@ -42,9 +42,9 @@ public sealed record MdLoanFields(
             MonthlyPayment:      item.GetDecimal("monthly_pmt"),
             // Same two-source read as accounts.opened_on, and for the same
             // reason: MD writes the account's creation stamp as either a
-            // yyyyMMdd int or epoch millis, inconsistently. On a real export only
-            // a minority of loans carry `date_created`, so reading it alone left
-            // the rest with no first-payment date at all.
+            // yyyyMMdd int or epoch millis, inconsistently. A loan need not carry
+            // `date_created`, so reading it alone left those with no first-payment
+            // date at all.
             FirstPaymentDate:    item.GetMdDate("date_created")
                                  ?? item.GetMdEpochDate("creation_date"));
     }

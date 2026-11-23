@@ -39,17 +39,16 @@
 -- RLS boundary — without it the view runs as its owner and a caller reads every
 -- ledger. Recreating from an extracted definition therefore OPENS A SECURITY
 -- HOLE unless the option is set again, which is why migrations 171 and 210 both
--- end with an explicit ALTER VIEW. The first draft of this migration omitted it
--- and the RLS suite failed with 82 visible rows where 2 were expected.
+-- end with an explicit ALTER VIEW. Without it the RLS suite fails: a caller sees
+-- other ledgers' rows.
 --
 -- TWO VIEWS, IN ORDER. resolved_transactions reads the header through
 -- live_txn_headers, so the column has to surface there first or the outer view
--- cannot see it -- which is exactly how the first draft of this migration
--- failed ("column h.ingest_amount does not exist"). Both are extracted from the
--- LIVE catalogue with pg_get_viewdef rather than copied from an older
--- migration: the discipline mig 226/227 used, and the reason mig 205 silently
--- reverted a fix that 209 had to undo. The new column is appended at the END of
--- each select list, which is what CREATE OR REPLACE VIEW permits.
+-- cannot see it ("column h.ingest_amount does not exist"). Both are extracted
+-- from the LIVE catalogue with pg_get_viewdef rather than copied from an older
+-- migration: the discipline mig 226/227 used, because a definition copied
+-- forward silently reverts every fix made since. The new column is appended at
+-- the END of each select list, which is what CREATE OR REPLACE VIEW permits.
 -- =============================================================================
 
 BEGIN;
@@ -103,11 +102,10 @@ SELECT id,
 
 
 -- CREATE OR REPLACE VIEW does NOT carry reloptions, and pg_get_viewdef does not
--- emit them — so the recreate above silently dropped security_invoker and the
--- view reverted to running as its OWNER. That is the RLS boundary: without it a
--- caller reads every ledger's rows through this view. The RLS suite caught it
--- (82 rows where 2 were expected), which is the only reason it is not in this
--- migration. Re-assert it exactly as migrations 171 and 210 do.
+-- emit them — so the recreate above silently drops security_invoker and the
+-- view runs as its OWNER. That is the RLS boundary: without it a caller reads
+-- every ledger's rows through this view, which the RLS suite fails on.
+-- Re-assert it exactly as migrations 171 and 210 do.
 ALTER VIEW live_txn_headers SET (security_invoker = true);
 
 -- 2 of 2: the register/editor projection.

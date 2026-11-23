@@ -10,8 +10,8 @@
 -- stayed NULL. So DELETE on a SimpleFIN row went down the
 -- hard-delete branch, physically removing the row. The very next
 -- sync didn't recognise the FITID (no row to match against),
--- treated it as new, re-inserted it. A deleted row reappearing after
--- the next sync is exactly this path.
+-- treated it as new, re-inserted it: the deleted row reappears after
+-- the next sync.
 --
 -- Root cause is category confusion. `online_match_fitid` +
 -- `online_match_fi_id` were introduced (mig 034) as OFX-protocol

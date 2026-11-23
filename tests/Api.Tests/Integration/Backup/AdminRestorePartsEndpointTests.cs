@@ -15,7 +15,7 @@ namespace Coffer.Api.Tests.Integration.Backup;
 /// <c>POST /api/admin/backups/restore/parts</c>, then a restore that names those
 /// parts with <c>useUploadedParts=true</c>.
 /// <para>It exists because the one cap an operator cannot raise — Cloudflare's
-/// 100 MB proxied body on Free and Pro — is smaller than a real
+/// 100 MB proxied body on Free and Pro — can be smaller than a
 /// <c>.cofferbak</c>. What these tests are really protecting is the ASSEMBLY:
 /// a set of parts stitched together wrong produces an archive that fails to
 /// decrypt, which is indistinguishable from a wrong passphrase, on the one day
@@ -24,11 +24,12 @@ namespace Coffer.Api.Tests.Integration.Backup;
 /// collection runs sequentially).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class AdminRestorePartsEndpointTests
+public sealed class AdminRestorePartsEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AdminRestorePartsEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public AdminRestorePartsEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private sealed class FakeRestarter : IApplicationRestarter
     {
@@ -105,11 +106,11 @@ public sealed class AdminRestorePartsEndpointTests
     [Fact]
     public async Task A_part_that_would_fill_the_data_volume_is_refused_before_it_is_written()
     {
-        // FU-072: the parts protocol had no total cap, so an upload could fill the volume
-        // that holds the stored backups. A reserve no real disk can meet
+        // FU-072: without a total cap on the parts protocol, an upload could fill the
+        // volume that holds the stored backups. A reserve no real disk can meet
         // makes every part "too big" without writing gigabytes to prove it.
         BootstrapRestoreStaging.Clear();
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithService<IApplicationRestarter>(_ => new FakeRestarter())
             .WithConfig("Api:Backup:RestoreFreeSpaceReserveMb", int.MaxValue.ToString(System.Globalization.CultureInfo.InvariantCulture));
         using var client = factory.CreateClient();
@@ -129,7 +130,7 @@ public sealed class AdminRestorePartsEndpointTests
         // The other side of the rule: the default 1 GB reserve does not get in the way of an
         // ordinary upload on a machine with ordinary free space.
         BootstrapRestoreStaging.Clear();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => new FakeRestarter());
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => new FakeRestarter());
         using var client = factory.CreateClient();
 
         var resp = await client.PostAsync("/api/admin/backups/restore/parts", PartForm(MakeArtifact("pw"), 1, 1));
@@ -143,7 +144,7 @@ public sealed class AdminRestorePartsEndpointTests
     {
         BootstrapRestoreStaging.Clear();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         var artifact = MakeArtifact("pw");
@@ -170,7 +171,7 @@ public sealed class AdminRestorePartsEndpointTests
     public async Task Parts_are_refused_out_of_order()
     {
         BootstrapRestoreStaging.Clear();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         // Part 2 with nothing received: the server expects part 1, and knows so
@@ -187,7 +188,7 @@ public sealed class AdminRestorePartsEndpointTests
     public async Task A_short_non_final_part_is_refused()
     {
         BootstrapRestoreStaging.Clear();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         // Every part but the last must be exactly PartSizeBytes — that invariant
@@ -206,7 +207,7 @@ public sealed class AdminRestorePartsEndpointTests
     {
         BootstrapRestoreStaging.Clear();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         using var restore = RestoreFromParts("pw");
@@ -222,7 +223,7 @@ public sealed class AdminRestorePartsEndpointTests
     public async Task Naming_uploaded_parts_and_an_upload_together_is_refused()
     {
         BootstrapRestoreStaging.Clear();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         using var content = new MultipartFormDataContent
@@ -243,7 +244,7 @@ public sealed class AdminRestorePartsEndpointTests
     {
         BootstrapRestoreStaging.Clear();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         // A first attempt that went nowhere — the browser was closed, the laptop
@@ -271,7 +272,7 @@ public sealed class AdminRestorePartsEndpointTests
     {
         BootstrapRestoreStaging.Clear();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         // A real two-part artifact: the first part is exactly PartSizeBytes (the

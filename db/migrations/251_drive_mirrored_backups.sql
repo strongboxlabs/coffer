@@ -1,9 +1,9 @@
 -- 251 — drive_mirrored_backups: which backups THIS install has put on Google Drive.
 --
--- The Drive mirror (ADR-0074) deleted every remote file that was not in the local
--- set, with one guard: not when the local set was empty. It always runs straight after
+-- The Drive mirror (ADR-0074) deletes every remote file that is not in the local
+-- set, with one guard: not when the local set is empty. It always runs straight after
 -- a backup, so the set is never empty — point the backup directory at a new volume, or
--- mount an empty one, and the next backup left one local file and deleted every older
+-- mount an empty one, and the next backup leaves one local file and deletes every older
 -- Drive copy (FU-064).
 --
 -- The mirror may now delete a remote backup only if THIS install recorded putting it

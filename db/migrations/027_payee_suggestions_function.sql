@@ -11,7 +11,7 @@
 -- header level so a multi-leg posting is counted once.
 --
 -- Lives in SQL rather than EF Core LINQ because the COALESCE-on-an-
--- outer-join pattern doesn't translate (tried; EF rejects the
+-- outer-join pattern doesn't translate (EF rejects the
 -- conditional on the right side of a LEFT JOIN). Per ADR-0005 + the
 -- engineering-standards memo, complex query shapes live in Postgres
 -- and the API binds them via HasDbFunction.

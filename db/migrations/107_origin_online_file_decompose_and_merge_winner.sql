@@ -39,19 +39,18 @@
 -- hot resolved view. Backfilled from existing is_merged_into data;
 -- the merge code path flips it atomically going forward.
 --
--- MD-row decomposition rules (verified against a real MD export,
--- spot-checked across every source shape below — bank history mixing
--- online and manual rows, investment history fed mostly by MD+, a
--- CSV-import era on a card, and legacy MD+ date-prefix FITIDs):
+-- MD-row decomposition rules (one per source shape an MD row can carry —
+-- online and manual rows, MD+ downloads, MD's own CSV import, and
+-- legacy MD+ date-prefix FITIDs):
 --
 --   qif fields set                          → file_import, qif
 --   ol_fi_id = 'md:txtimport'               → file_import, csv
 --   ol_fitid_1 LIKE 'md%import:%'           → file_import, csv
 --   ol_fitid_1 ~ '^\d{8}:' or '^\d{4}-…'    → online_import, mdplus  (legacy MD+ format —
---                                                                     MD+ ingested these online
---                                                                     and stopped supporting
---                                                                     the date-prefix shape at
---                                                                     some point. Common in older exports.)
+--                                                                     online downloads in a
+--                                                                     date-prefix shape that
+--                                                                     later MD+ versions no
+--                                                                     longer write.)
 --   ol_fi_id LIKE 'mdplus:%'                → online_import, mdplus
 --   ol_fi_id LIKE 'ofx:%'                   → online_import, ofx
 --   ol_fitid_1 set, none of above           → online_import, ofx   (assume real OFX FITID)
@@ -161,11 +160,11 @@ UPDATE txn_headers
 --     QIF metadata isn't useful at runtime), so the backfill has
 --     no DB-level QIF signal to read.
 --
---     An earlier draft tried `online_match_orig_id IS NOT NULL`
---     as a QIF proxy, but that column is set on EVERY OL-matched
---     row (not just QIF — MD's `ol.orig-txn` projection always
---     carries the bank-original JSON blob on online-matched rows),
---     so it grabbed everything and shadowed every rule below.
+--     `online_match_orig_id IS NOT NULL` is not a QIF proxy: that
+--     column is set on EVERY OL-matched row (not just QIF — MD's
+--     `ol.orig-txn` projection always carries the bank-original JSON
+--     blob on online-matched rows), so it would grab everything and
+--     shadow every rule below.
 --
 --     Net effect on backfill: QIF-only rows (no ol_fitid,
 --     only qif_* in MD JSON) classify as `origin='manual'`. They
@@ -197,10 +196,8 @@ UPDATE txn_headers
 --     MD+ used this format for online-fetched rows during an
 --     earlier era and stopped supporting it later; the rows
 --     stayed in MD's database with their legacy shape. They are
---     online_import / mdplus despite the absent ol_fi_id prefix.
---     Per review feedback during ADR-0035 — an earlier draft had
---     these as file_import/csv, which mis-classified every row of
---     this shape.
+--     online_import / mdplus despite the absent ol_fi_id prefix,
+--     not file_import / csv.
 UPDATE txn_headers
    SET origin = 'online_import',
        provider_key = 'mdplus'

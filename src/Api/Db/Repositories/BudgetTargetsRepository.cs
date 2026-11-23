@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 
 using Coffer.Api.Db.Entities;
+using Coffer.Domain.Money;
 
 namespace Coffer.Api.Db.Repositories;
 
@@ -38,6 +39,17 @@ public sealed class BudgetTargetsRepository
         _clock = clock;
     }
 
+    /// <summary>
+    /// The currency a target typed now is in: the ledger's reporting currency
+    /// (ADR-0114 D12). Stamped on an insert and on a retype alike, so retyping a target
+    /// stores it in the current reporting currency; nothing else rewrites it.
+    /// </summary>
+    private Task<string> ReportingCurrencyAsync(Guid ledgerId, CancellationToken cancellationToken) =>
+        _db.Ledgers.AsNoTracking()
+            .Where(l => l.Id == ledgerId)
+            .Select(l => l.CurrencyCode)
+            .SingleAsync(cancellationToken);
+
     /// <summary>Depth guard on every tree walk. A cycle in <c>parent_id</c> should be
     /// impossible, but an infinite loop inside a request is a worse way to find out.
     /// Matches <see cref="ReportingRepository"/>'s rollup.</summary>
@@ -54,12 +66,29 @@ public sealed class BudgetTargetsRepository
         AncestorHasTarget,
         /// <summary>A descendant already holds a target for this month (ADR-0099 D1a).</summary>
         DescendantHasTarget,
+        /// <summary>The typed amount carries more places than the currency it would be
+        /// stamped with allows (ADR-0114 D15); the outcome names that currency. Nothing is
+        /// written.</summary>
+        AmountPlacesExceedCurrency,
     }
 
     /// <summary>The outcome, plus the NAME of whichever category caused a refusal.
     /// Naming it is the whole point: "you cannot set this" is not actionable, and the
     /// conflicting category may be several levels away and not on screen.</summary>
-    public readonly record struct SetOutcome(SetResult Result, string? ConflictingCategoryName);
+    /// <param name="CurrencyCode">For <see cref="SetResult.AmountPlacesExceedCurrency"/>, the
+    /// currency the amount does not fit.</param>
+    public readonly record struct SetOutcome(SetResult Result, string? ConflictingCategoryName, string? CurrencyCode = null);
+
+    /// <summary>
+    /// True when a typed <paramref name="amount"/>, stamped with <paramref name="currency"/>,
+    /// may be written over <paramref name="stored"/> (ADR-0114 D15): it fits the currency's
+    /// places, or it and the currency equal the stored row's, because a stored target that
+    /// does not fit is kept and an unchanged retype is not refused for it.
+    /// </summary>
+    private static bool TypedAmountFits(decimal amount, string currency, BudgetTargetRow? stored) =>
+        CurrencyMinorUnits.Fits(amount, currency)
+        || (stored is not null && stored.Amount == amount
+            && string.Equals(stored.CurrencyCode, currency, StringComparison.Ordinal));
 
     /// <summary>One category's typed target for one month, inserted or updated.</summary>
     /// <param name="month">Any date inside the month; normalised to its first day.</param>
@@ -71,6 +100,15 @@ public sealed class BudgetTargetsRepository
         CancellationToken cancellationToken = default)
     {
         var first = FirstOfMonth(month);
+
+        // The ledger write lock (migration 275) first, before the reporting currency is read
+        // and stamped (ADR-0114 D12). A reporting-currency change holds it while it writes
+        // the new code (LedgersRepository.SetReportingCurrencyAsync), so this target either
+        // commits before that change, in the code then current, or waits for it and is
+        // stamped with the new one.
+        await using var write = await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken)
+            .ConfigureAwait(false);
+
         var tree = await LoadTreeAsync(ledgerId, cancellationToken).ConfigureAwait(false);
 
         if (!tree.IsCategory.TryGetValue(categoryId, out var isCategory))
@@ -86,6 +124,10 @@ public sealed class BudgetTargetsRepository
         if (conflict is { } c) return c;
 
         var row = existing.FirstOrDefault(t => t.CategoryId == categoryId);
+        var currency = await ReportingCurrencyAsync(ledgerId, cancellationToken).ConfigureAwait(false);
+        // Checked at the currency read under the lock, which is the one stamped below.
+        if (!TypedAmountFits(amount, currency, row))
+            return new SetOutcome(SetResult.AmountPlacesExceedCurrency, null, currency);
         var now = _clock.GetUtcNow().UtcDateTime;
         if (row is null)
         {
@@ -95,6 +137,7 @@ public sealed class BudgetTargetsRepository
                 CategoryId = categoryId,
                 TargetMonth = first,
                 Amount = amount,
+                CurrencyCode = currency,
                 CreatedAt = now,
                 UpdatedAt = now,
             });
@@ -102,10 +145,12 @@ public sealed class BudgetTargetsRepository
         else
         {
             row.Amount = amount;
+            row.CurrencyCode = currency;
             row.UpdatedAt = now;
         }
 
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
         return new SetOutcome(SetResult.Ok, null);
     }
 
@@ -139,8 +184,10 @@ public sealed class BudgetTargetsRepository
     }
 
     /// <summary>What one entry of a bulk fill did.</summary>
+    /// <param name="CurrencyCode">For <see cref="SetResult.AmountPlacesExceedCurrency"/>, the
+    /// currency the entry's amount does not fit.</param>
     public readonly record struct BulkEntryOutcome(
-        Guid CategoryId, SetResult Result, string? ConflictingCategoryName);
+        Guid CategoryId, SetResult Result, string? ConflictingCategoryName, string? CurrencyCode = null);
 
     /// <summary>
     /// Applies many targets for one month in a single transaction — the "copy last
@@ -160,13 +207,85 @@ public sealed class BudgetTargetsRepository
     /// speaks for the whole subtree — and it makes the outcome independent of the order
     /// the caller happened to send.</para>
     /// </remarks>
-    public async Task<IReadOnlyList<BulkEntryOutcome>> SetManyAsync(
+    /// <remarks>
+    /// Every entry is stamped with the ledger's reporting currency (ADR-0114 D12): the
+    /// fill-from-average amounts are figures in it. A copy keeps the currency each source
+    /// target was typed in, and goes through <see cref="CopyMonthAsync"/>.
+    /// <para>Each amount is a typed figure, held to the reporting currency's places
+    /// (ADR-0114 D15). Unlike a conflict, an amount that does not fit refuses the whole
+    /// fill: nothing is written, and the outcomes list only the entries that do not fit,
+    /// each as <see cref="SetResult.AmountPlacesExceedCurrency"/>. An amount equal to the
+    /// stored target, in the same currency, passes.</para>
+    /// </remarks>
+    public Task<IReadOnlyList<BulkEntryOutcome>> SetManyAsync(
         Guid ledgerId,
         DateOnly month,
         IReadOnlyCollection<(Guid CategoryId, decimal Amount)> entries,
         CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(entries);
+        return ApplyManyAsync(
+            ledgerId, month,
+            _ => Task.FromResult<IReadOnlyCollection<(Guid CategoryId, decimal Amount, string? CurrencyCode)>>(
+                entries.Select(e => (e.CategoryId, e.Amount, (string?)null)).ToList()),
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// "Copy last month": every target stored for <paramref name="sourceMonth"/> written to
+    /// <paramref name="month"/>, each with the amount AND the currency it was typed in
+    /// (ADR-0114 D12), under the same D1a rules and outcome list as
+    /// <see cref="SetManyAsync"/>. A source month with no targets applies nothing.
+    /// </summary>
+    /// <remarks>
+    /// The server reads the source rows itself, under the write lock, rather than taking
+    /// the amounts from the client: the client's copy of last month is a progress read,
+    /// whose figures may be converted into the reporting currency, and a converted amount
+    /// stamped with the source's currency would be a number nobody typed.
+    /// <para>The copied figures are not checked against their currency's places
+    /// (ADR-0114 D15): copying is not typing, and a stored target that does not fit is
+    /// kept, in its copy as in itself.</para>
+    /// </remarks>
+    public Task<IReadOnlyList<BulkEntryOutcome>> CopyMonthAsync(
+        Guid ledgerId,
+        DateOnly sourceMonth,
+        DateOnly month,
+        CancellationToken cancellationToken = default)
+    {
+        var source = FirstOfMonth(sourceMonth);
+        return ApplyManyAsync(ledgerId, month, async ct =>
+            (await _db.BudgetTargets.AsNoTracking()
+                .Where(t => t.LedgerId == ledgerId && t.TargetMonth == source)
+                .OrderBy(t => t.CategoryId)
+                .Select(t => new { t.CategoryId, t.Amount, t.CurrencyCode })
+                .ToListAsync(ct).ConfigureAwait(false))
+            .Select(t => (t.CategoryId, t.Amount, (string?)t.CurrencyCode))
+            .ToList(),
+            cancellationToken);
+    }
+
+    /// <summary>The bulk write both fills share. <paramref name="loadEntries"/> runs under
+    /// the lock; an entry with no currency takes the reporting currency.</summary>
+    private async Task<IReadOnlyList<BulkEntryOutcome>> ApplyManyAsync(
+        Guid ledgerId,
+        DateOnly month,
+        Func<CancellationToken, Task<IReadOnlyCollection<(Guid CategoryId, decimal Amount, string? CurrencyCode)>>> loadEntries,
+        CancellationToken cancellationToken)
+    {
         var first = FirstOfMonth(month);
+
+        // The ledger write lock (migration 275) first, before the reads the batch is
+        // validated against. A category merge holds it while it locks its source and moves
+        // the source's targets onto the destination's; a fill that updated the destination's
+        // target and then inserted one naming the source would wait for the merge's lock on
+        // the source while the merge waited for that target. Taken first, the two take turns,
+        // and the fill reads the tree and the targets the merge committed. A reporting-
+        // currency change takes it too, so the code stamped below is the one current at
+        // commit (ADR-0114 D12).
+        await using var write = await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken)
+            .ConfigureAwait(false);
+
+        var entries = await loadEntries(cancellationToken).ConfigureAwait(false);
         var tree = await LoadTreeAsync(ledgerId, cancellationToken).ConfigureAwait(false);
 
         var existing = await _db.BudgetTargets
@@ -175,7 +294,19 @@ public sealed class BudgetTargetsRepository
 
         var accepted = existing.Select(t => t.CategoryId).ToHashSet();
         var outcomes = new List<BulkEntryOutcome>(entries.Count);
+        var reporting = await ReportingCurrencyAsync(ledgerId, cancellationToken).ConfigureAwait(false);
         var now = _clock.GetUtcNow().UtcDateTime;
+
+        // A typed entry (one with no currency of its own) is held to the reporting
+        // currency's places, read under the lock (ADR-0114 D15). One that does not fit
+        // refuses the whole fill before anything is written. A copied entry carries its
+        // source's currency and is not typed, so it is not checked.
+        var unfit = entries
+            .Where(e => e.CurrencyCode is null
+                        && !TypedAmountFits(e.Amount, reporting, existing.FirstOrDefault(t => t.CategoryId == e.CategoryId)))
+            .Select(e => new BulkEntryOutcome(e.CategoryId, SetResult.AmountPlacesExceedCurrency, null, reporting))
+            .ToList();
+        if (unfit.Count > 0) return unfit;
 
         foreach (var entry in entries.OrderBy(e => DepthOf(tree, e.CategoryId)))
         {
@@ -199,6 +330,7 @@ public sealed class BudgetTargetsRepository
                 continue;
             }
 
+            var currency = entry.CurrencyCode ?? reporting;
             var row = existing.FirstOrDefault(t => t.CategoryId == entry.CategoryId);
             if (row is null)
             {
@@ -208,6 +340,7 @@ public sealed class BudgetTargetsRepository
                     CategoryId = entry.CategoryId,
                     TargetMonth = first,
                     Amount = entry.Amount,
+                    CurrencyCode = currency,
                     CreatedAt = now,
                     UpdatedAt = now,
                 });
@@ -215,6 +348,7 @@ public sealed class BudgetTargetsRepository
             else
             {
                 row.Amount = entry.Amount;
+                row.CurrencyCode = currency;
                 row.UpdatedAt = now;
             }
 
@@ -223,6 +357,7 @@ public sealed class BudgetTargetsRepository
         }
 
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
         return outcomes;
     }
 

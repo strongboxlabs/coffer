@@ -1,0 +1,12 @@
+{
+    "buy": "Buy",
+    "buyx": "BuyXfr",
+    "sell": "Sell",
+    "sellx": "SellXfr",
+    "dividend_cash": "Dividend",
+    "dividend_reinvest": "Reinvest",
+    "divx": "DividendXfr",
+    "transfer": "Xfr",
+    "misc": "Misc",
+    "transfer_shares": "Transfer shares"
+}

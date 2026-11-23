@@ -1,9 +1,8 @@
 import { Button } from '@/components/ui/Button';
 
 // Shared register primary toolbar (ADR-0030 reuse). The "+ New
-// transaction" button + the keyboard-hint chip. Bank shipped the hint
-// (`N new · Enter edit selected`); investment had only the button.
-// Both registers support N-to-create and Enter-to-edit via
+// transaction" button + the keyboard-hint chip
+// (`N new · Enter edit selected`). Both registers support N-to-create and Enter-to-edit via
 // `useRegisterKeyboardNav`, so the hint is accurate for both — one
 // definition keeps them identical.
 //
@@ -46,6 +45,9 @@ export function RegisterToolbarContent({
                 onClick={onNew}
                 disabled={disabled}
                 title={newButtonTitle}
+                // Where focus goes while the row list is not on the page
+                // (useRegisterFocusHome).
+                data-register-home="add"
             >
                 + New transaction
             </Button>

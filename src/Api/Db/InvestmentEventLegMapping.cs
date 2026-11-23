@@ -17,7 +17,6 @@ internal static class InvestmentEventLegMapping
         LegIndex: r.LegIndex,
         Amount: r.Amount,
         BalanceAfter: r.BalanceAfter,
-        HasOverrides: r.HasOverrides,
         PostingRole: r.PostingRole,
         DerivedAction: r.DerivedAction,
         CounterpartyId: r.CounterpartyId,
@@ -28,5 +27,7 @@ internal static class InvestmentEventLegMapping
         UnitPrice: r.UnitPrice,
         CounterpartyAccountId: r.CounterpartyAccountId,
         CounterpartyAccountName: r.CounterpartyAccountName,
-        CounterpartyAccountType: r.CounterpartyAccountType);
+        CounterpartyAccountType: r.CounterpartyAccountType,
+        CounterpartyAmount: r.CounterpartyAmount,
+        CounterpartyCurrencyCode: r.CounterpartyCurrencyCode);
 }

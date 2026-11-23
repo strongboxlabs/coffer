@@ -19,13 +19,11 @@ namespace Coffer.Api.Tests.Integration.Quotes;
 /// raw payload.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class QuotesEndpointsTests
+public sealed class QuotesEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public QuotesEndpointsTests(PostgresFixture fixture)
+    public QuotesEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -48,7 +46,7 @@ public sealed class QuotesEndpointsTests
         // to the SimpleFinHoldingsQuoteProvider, which parses the
         // payload, computes price = market_value / shares, and
         // upserts into security_prices.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var securityId = await ledger.AddSecurityAsync("Index ETF A", ticker: "ETFA");
         await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, securityId, 10m, 1000m);
@@ -63,7 +61,7 @@ public sealed class QuotesEndpointsTests
                 },
                 balanceDateUnix: 1779537600));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -77,7 +75,7 @@ public sealed class QuotesEndpointsTests
         Assert.Contains("simplefin-holdings", outcome.ProviderKeys);
 
         // Verify the persisted price: market_value / shares.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var price = await db.SecurityPrices.AsNoTracking()
             .Where(p => p.SecurityId == securityId)
             .SingleAsync();
@@ -94,7 +92,7 @@ public sealed class QuotesEndpointsTests
         // First refresh inserts; second refresh with the same
         // (security, date) UPSERTs in place (no new row). Tests
         // the orchestrator's load-then-decide persistence path.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var securityId = await ledger.AddSecurityAsync("Index ETF A", ticker: "ETFA");
         await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, securityId, 10m, 1000m);
@@ -105,7 +103,7 @@ public sealed class QuotesEndpointsTests
                 new[] { (Symbol: "ETFA", Shares: 10m, MarketValue: 6750m) },
                 balanceDate));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // First refresh — inserts.
@@ -129,7 +127,7 @@ public sealed class QuotesEndpointsTests
         Assert.Equal(0, outcome2.PricesInserted);
         Assert.Equal(1, outcome2.PricesUpdated);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var rows = await db.SecurityPrices.AsNoTracking()
             .Where(p => p.SecurityId == securityId)
             .ToListAsync();
@@ -144,7 +142,7 @@ public sealed class QuotesEndpointsTests
         // clobber a hand-entered 'manual' price (rank 2) for the same
         // (security, day). The provider would compute market_value / shares; the
         // manual price survives untouched.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var securityId = await ledger.AddSecurityAsync("Index ETF A", ticker: "ETFA");
         await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, securityId, 10m, 1000m);
@@ -159,7 +157,7 @@ public sealed class QuotesEndpointsTests
                 new[] { (Symbol: "ETFA", Shares: 10m, MarketValue: 6750m) },
                 balanceDate));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var resp = await client.PostAsync(
             $"/api/ledgers/{ledger.LedgerId}/quotes/refresh", content: null);
@@ -169,7 +167,7 @@ public sealed class QuotesEndpointsTests
         Assert.Equal(0, outcome.PricesInserted);
         Assert.Equal(0, outcome.PricesUpdated);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.SecurityPrices.AsNoTracking()
             .Where(p => p.SecurityId == securityId)
             .SingleAsync();
@@ -183,7 +181,7 @@ public sealed class QuotesEndpointsTests
         // Source ladder (ADR-0070 D2/D3): 'import' is the floor and 'simplefin'
         // outranks it, so a SimpleFIN holdings price REPLACES an importer-seeded
         // price for the same (security, day) — the MD seed is provisional.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var securityId = await ledger.AddSecurityAsync("Index ETF A", ticker: "ETFA");
         await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, securityId, 10m, 1000m);
@@ -198,7 +196,7 @@ public sealed class QuotesEndpointsTests
                 new[] { (Symbol: "ETFA", Shares: 10m, MarketValue: 6750m) },
                 balanceDate));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var resp = await client.PostAsync(
             $"/api/ledgers/{ledger.LedgerId}/quotes/refresh", content: null);
@@ -208,7 +206,7 @@ public sealed class QuotesEndpointsTests
         Assert.Equal(0, outcome.PricesInserted);
         Assert.Equal(1, outcome.PricesUpdated);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.SecurityPrices.AsNoTracking()
             .Where(p => p.SecurityId == securityId)
             .SingleAsync();
@@ -222,8 +220,8 @@ public sealed class QuotesEndpointsTests
         // SimpleFIN reports market_value + a share count (not a per-share price),
         // so market_value / shares can leave sub-cent noise. The provider rounds
         // to 4dp (ADR-0070): a whole value over three shares repeats forever and
-        // lands at four decimals, not the 12dp crud the prices table used to show.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // lands at four decimals, not 12dp of division noise.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var securityId = await ledger.AddSecurityAsync("Index ETF A", ticker: "ETFA");
         await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, securityId, 3m, 100m);
@@ -233,13 +231,13 @@ public sealed class QuotesEndpointsTests
                 new[] { (Symbol: "ETFA", Shares: 3m, MarketValue: 100m) },
                 balanceDateUnix: 1779537600));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var resp = await client.PostAsync(
             $"/api/ledgers/{ledger.LedgerId}/quotes/refresh", content: null);
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var price = await db.SecurityPrices.AsNoTracking()
             .Where(p => p.SecurityId == securityId)
             .SingleAsync();
@@ -253,7 +251,7 @@ public sealed class QuotesEndpointsTests
         // holding in the payload. The other appears in
         // outcome.SecuritiesUnresolved so the SPA can flag a
         // "couldn't refresh" pill.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var resolvedId = await ledger.AddSecurityAsync("Index ETF A", ticker: "ETFA");
         var unresolvedId = await ledger.AddSecurityAsync("Stock B Inc", ticker: "STKB");
@@ -265,7 +263,7 @@ public sealed class QuotesEndpointsTests
                 new[] { (Symbol: "ETFA", Shares: 10m, MarketValue: 6750m) },
                 balanceDateUnix: 1779537600));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -284,7 +282,7 @@ public sealed class QuotesEndpointsTests
         // ticker) to the provider. The security's ticker is "XYZ" but its
         // quote_symbol is "ETFA"; the payload holds "ETFA", so it resolves
         // ONLY because quote_symbol — not the ticker — was used.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var securityId = await ledger.AddSecurityAsync(
             "Index ETF A", ticker: "XYZ", quoteSymbol: "ETFA");
@@ -295,7 +293,7 @@ public sealed class QuotesEndpointsTests
                 new[] { (Symbol: "ETFA", Shares: 10m, MarketValue: 6750m) },
                 balanceDateUnix: 1779537600));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var resp = await client.PostAsync(
             $"/api/ledgers/{ledger.LedgerId}/quotes/refresh", content: null);
@@ -304,7 +302,7 @@ public sealed class QuotesEndpointsTests
         Assert.Equal(1, outcome.PricesInserted);
         Assert.DoesNotContain(securityId, outcome.SecuritiesUnresolved);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var price = await db.SecurityPrices.AsNoTracking()
             .Where(p => p.SecurityId == securityId)
             .SingleAsync();
@@ -317,7 +315,7 @@ public sealed class QuotesEndpointsTests
         // ADR-0054 D2: auto_price=false makes the security manual-only — not
         // in the pull working set, so it is neither priced nor reported as
         // unresolved even though a matching holding exists in the payload.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var securityId = await ledger.AddSecurityAsync(
             "Index ETF A", ticker: "ETFA", autoPrice: false);
@@ -329,7 +327,7 @@ public sealed class QuotesEndpointsTests
                 new[] { (Symbol: "ETFA", Shares: 10m, MarketValue: 6750m) },
                 balanceDateUnix: 1779537600));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var resp = await client.PostAsync(
             $"/api/ledgers/{ledger.LedgerId}/quotes/refresh", content: null);
@@ -338,7 +336,7 @@ public sealed class QuotesEndpointsTests
         Assert.Equal(0, outcome.PricesInserted);
         Assert.DoesNotContain(securityId, outcome.SecuritiesUnresolved);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var any = await db.SecurityPrices.AsNoTracking()
             .AnyAsync(p => p.SecurityId == securityId);
         Assert.False(any);
@@ -351,7 +349,7 @@ public sealed class QuotesEndpointsTests
         // payload reports shares=0, market_value=0 (a stale/sold snapshot). The
         // provider abstains (division-by-zero protection); no price recorded,
         // and the security surfaces as unresolved.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var securityId = await ledger.AddSecurityAsync("Index ETF A", ticker: "ETFA");
         await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, securityId, 10m, 1000m);
@@ -361,7 +359,7 @@ public sealed class QuotesEndpointsTests
                 new[] { (Symbol: "ETFA", Shares: 0m, MarketValue: 0m) },
                 balanceDateUnix: 1779537600));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -370,7 +368,7 @@ public sealed class QuotesEndpointsTests
         Assert.Equal(0, outcome.PricesInserted);
         Assert.Contains(securityId, outcome.SecuritiesUnresolved);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var any = await db.SecurityPrices.AsNoTracking()
             .AnyAsync(p => p.SecurityId == securityId);
         Assert.False(any);
@@ -383,7 +381,7 @@ public sealed class QuotesEndpointsTests
         // + auto_price=true but NO live position is excluded from the working
         // set (wasted egress otherwise). Neither priced nor reported as
         // unresolved, even though the payload holds a matching symbol.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var securityId = await ledger.AddSecurityAsync("Index ETF A", ticker: "ETFA");
         // No AddHoldingAsync → not held.
@@ -394,7 +392,7 @@ public sealed class QuotesEndpointsTests
                 new[] { (Symbol: "ETFA", Shares: 10m, MarketValue: 6750m) },
                 balanceDateUnix: 1779537600));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var resp = await client.PostAsync(
             $"/api/ledgers/{ledger.LedgerId}/quotes/refresh", content: null);
@@ -403,7 +401,7 @@ public sealed class QuotesEndpointsTests
         Assert.Equal(0, outcome.PricesInserted);
         Assert.DoesNotContain(securityId, outcome.SecuritiesUnresolved);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var any = await db.SecurityPrices.AsNoTracking()
             .AnyAsync(p => p.SecurityId == securityId);
         Assert.False(any);
@@ -412,8 +410,8 @@ public sealed class QuotesEndpointsTests
     [Fact]
     public async Task Refresh_returns_422_on_unknown_ledger()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var foreignLedgerId = Guid.NewGuid();
@@ -428,7 +426,7 @@ public sealed class QuotesEndpointsTests
         // ADR-0055: every refresh records a ledger_operations row (family=quote)
         // with counts + who/when, so a refresh is auditable even when it
         // changed nothing.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var securityId = await ledger.AddSecurityAsync("Index ETF A", ticker: "ETFA");
         await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, securityId, 10m, 1000m);
@@ -438,13 +436,13 @@ public sealed class QuotesEndpointsTests
                 new[] { (Symbol: "ETFA", Shares: 10m, MarketValue: 6750m) },
                 balanceDateUnix: 1779537600));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var resp = await client.PostAsync(
             $"/api/ledgers/{ledger.LedgerId}/quotes/refresh", content: null);
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var run = await db.LedgerOperations.AsNoTracking()
             .Where(r => r.LedgerId == ledger.LedgerId && r.Family == "quote")
             .SingleAsync();

@@ -36,8 +36,46 @@ public static class AdminNotificationsEndpoints
         group.MapPost("/subscribers", CreateSubscriberAsync);
         group.MapDelete("/subscribers/{id:guid}", DeleteSubscriberAsync);
         group.MapGet("/events", ListEventsAsync);
+        group.MapGet("/attention", AttentionAsync);
 
         return routes;
+    }
+
+    /// <summary>
+    /// <c>GET /api/admin/notifications/attention</c>: the deployment-scope subjects still outstanding,
+    /// behind the System-settings gear and the System tabs (ADR-0102, amended for ADR-0110).
+    /// </summary>
+    /// <remarks>
+    /// Two things happen before the read, and both belong here because this is the one read every admin
+    /// page load makes. The lazy release check runs, which goes to GitHub only with the automatic check
+    /// on and the last result stale, and announces a newer release when it finds one. Then what was
+    /// announced is cleared if the install has caught up, which needs no network, so an install that
+    /// upgraded with the automatic check off does not keep a dot for a release it already runs.
+    /// </remarks>
+    private static async Task<IResult> AttentionAsync(
+        AppDbContext db, Upgrades.ReleaseCheckService check, Upgrades.UpgradeNotices notices,
+        CancellationToken cancellationToken)
+    {
+        await check.CurrentAsync(cancellationToken).ConfigureAwait(false);
+        await notices.ClearIfInstalledAsync(Meta.VersionInfo.Semver, cancellationToken).ConfigureAwait(false);
+
+        var outstanding = await SystemOutstandingSubjects.ListAsync(db, cancellationToken).ConfigureAwait(false);
+        var subjects = outstanding
+            .OrderByDescending(s => OutstandingSubjects.Rank(s.Severity))
+            .ThenByDescending(s => s.LatestAt)
+            // The separator is the grouping device (EventSubjects); nothing outside it wants it.
+            .Select(s => new SystemAttentionSubjectDto(s.Subject.TrimEnd('.'), s.Severity, s.LatestAt))
+            .ToList();
+
+        var worst = subjects.Count == 0
+            ? null
+            : subjects[0].Severity;
+        var upgradeStands = subjects.Any(s => s.Subject == "upgrade");
+        var version = upgradeStands
+            ? await notices.AnnouncedAsync(cancellationToken).ConfigureAwait(false)
+            : null;
+
+        return Results.Ok(new SystemAttentionDto(worst, subjects, version));
     }
 
     /// <summary>What this build can deliver to, and what each can promise.</summary>
@@ -59,7 +97,7 @@ public static class AdminNotificationsEndpoints
     /// <remarks>
     /// <c>hasHeartbeatSubscriber</c> is the honest part. Message-only providers
     /// reach a phone in seconds when something breaks and say nothing when the
-    /// deployment is dead — the failure that actually went unnoticed for days. Surfacing the
+    /// deployment is dead — the failure that otherwise goes unnoticed. Surfacing the
     /// answer means configuring only a chat webhook is a visible trade rather than
     /// a silent one.
     /// </remarks>

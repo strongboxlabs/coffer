@@ -18,7 +18,7 @@
 -- WHY A COLLATION AND NOT lower(username):
 --   `lower()` depends on the database's ctype, which is baked in at initdb from
 --   the host/container locale — so folding would differ between installs. On
---   this DB (en_US.utf8):
+--   a database initialised as en_US.utf8:
 --       lower('İSTANBUL')               -> istanbul
 --       lower('İSTANBUL' COLLATE "C")   -> İstanbul
 --   Same expression, different answers. `COLLATE "C"` is deterministic but folds
@@ -35,9 +35,8 @@
 -- Setting the collation on the COLUMN — rather than adding a functional index —
 -- makes `=` case-insensitive everywhere at once, so no application query
 -- changes, and ALTER COLUMN TYPE rebuilds uq_users_username under the new
--- collation. Verified on a live DB: `WHERE username = 'SYSTEM'` matches
--- `system`, and inserting `SysTem` alongside `system` is rejected by the
--- existing unique index.
+-- collation: `WHERE username = 'SYSTEM'` matches `system`, and inserting
+-- `SysTem` alongside `system` is rejected by the existing unique index.
 --
 -- Non-deterministic collations do not support LIKE / pattern operators on the
 -- column. Audited: nothing pattern-matches, orders, or searches on `username`

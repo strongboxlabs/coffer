@@ -88,8 +88,7 @@ Where `sort_class` is a `CASE` in the SELECT projection, set to
   patterns (tax-loss harvest with same-day repurchase, security
   swaps), our heuristic processes the buy first; the broker's
   true order was sell→buy. Quantity is unaffected. Avg-cost basis
-  can differ by a small amount (few cents to a few dollars per
-  disposition, typically). For tax-advantaged accounts
+  can differ by a small amount per disposition. For tax-advantaged accounts
   (401(k), IRA) this doesn't matter (basis isn't tracked at the
   participant level for tax purposes). For taxable accounts it
   produces a different — but defensible and deterministic —
@@ -102,8 +101,7 @@ Where `sort_class` is a `CASE` in the SELECT projection, set to
 ## Alternatives considered
 
 * **Add `entered_at` from MD's `dtentered` to txn_headers and
-  use it as the within-date sort.** Investigated in this session
-  and rejected: `dtentered` is "when the user/sync entered the
+  use it as the within-date sort.** Rejected: `dtentered` is "when the user/sync entered the
   txn in MD," which for sync-fed events reflects MD's ingest
   order, not the broker's true intra-day order. Adds dependency
   on a per-provider field most providers don't carry, for no

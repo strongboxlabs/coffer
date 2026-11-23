@@ -8,7 +8,7 @@
 -- `cost_basis`, `market_value`, `purchase_price`) that isn't carried
 -- on the per-transaction payload.
 --
--- Real-world data from a major brokerage surfaced the gap: the orchestrator's
+-- The gap: the orchestrator's
 -- typed projection (SimpleFinAccount) keeps a handful of display
 -- fields but discards the holdings array, so we can't see what
 -- positions the broker reports without re-fetching SimpleFIN.

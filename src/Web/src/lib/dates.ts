@@ -45,13 +45,14 @@ const LEDGER_DATE_FORMAT = new Intl.DateTimeFormat(undefined, {
 });
 
 /**
- * Compact variant — `May 18` (no year). Used in dense rows where the
- * year is implied by surrounding context (the scroll-track's year
- * labels, day-stamped split rows). Same UTC-anchored semantic.
+ * Compact variant — `May 18`, `May 5` (no year). Used in the Overview's
+ * dense rows and notes, where the year is implied by context. Same
+ * UTC-anchored semantic, and the day prints as `LEDGER_DATE_FORMAT`
+ * prints it, with no leading zero.
  */
 const LEDGER_DATE_COMPACT_FORMAT = new Intl.DateTimeFormat(undefined, {
     month: 'short',
-    day: '2-digit',
+    day: 'numeric',
     timeZone: 'UTC',
 });
 
@@ -62,7 +63,7 @@ const LEDGER_DATE_COMPACT_FORMAT = new Intl.DateTimeFormat(undefined, {
  */
 const LEDGER_DATE_LONG_FORMAT = new Intl.DateTimeFormat(undefined, {
     month: 'short',
-    day: '2-digit',
+    day: 'numeric',
     year: 'numeric',
     timeZone: 'UTC',
 });
@@ -94,7 +95,7 @@ export function formatLedgerDate(iso: string): string {
 }
 
 /**
- * Compact `May 18` — no year. Same UTC-anchored semantic.
+ * Compact `May 18`, `May 5` — no year. Same UTC-anchored semantic.
  */
 export function formatLedgerDateCompact(iso: string): string {
     const d = new Date(iso);
@@ -110,6 +111,20 @@ export function formatLedgerDateLong(iso: string): string {
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return iso;
     return LEDGER_DATE_LONG_FORMAT.format(d);
+}
+
+/**
+ * The local day of a wall-clock instant, compact (`May 18`). Use for a
+ * `…At` field shown by its day, never `formatLedgerDateCompact`, which reads
+ * the UTC day of a calendar date.
+ */
+export function formatInstantDateCompact(iso: string): string {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    // In the reader's zone, read when printed: a moment late in the evening west of
+    // UTC is still that evening's day, where the calendar formatter prints the UTC
+    // day after it.
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
 /**

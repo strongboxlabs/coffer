@@ -18,11 +18,12 @@ namespace Coffer.Api.Tests.Integration.Reminders;
 /// permanent and the message sent people looking for a control nobody had built.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ReminderUnskipTests
+public sealed class ReminderUnskipTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ReminderUnskipTests(PostgresFixture fixture) => _fixture = fixture;
+    public ReminderUnskipTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static readonly DateOnly Slot = new(2026, 4, 1);
 
@@ -51,11 +52,22 @@ public sealed class ReminderUnskipTests
         return (await resp.Content.ReadFromJsonAsync<ReminderDetail>())!.Id;
     }
 
-    private sealed record Fixture(SyntheticLedger Ledger, HttpClient Client, Guid SeriesId, string BaseUrl);
+    private sealed record Fixture(
+        SyntheticLedger Ledger, HttpClient Client, Guid SeriesId, string BaseUrl, Guid BankId, Guid CatId)
+    {
+        /// <summary>Post the slot by hand, as the occurrence dialog does.</summary>
+        public Task<HttpResponseMessage> FireAsync() => Client.PostAsJsonAsync(
+            $"{BaseUrl}/fire/bank",
+            new FireBankReminderRequest
+            {
+                OccurrenceDate = Slot, SourceAccountId = BankId,
+                Postings = [new TransactionPosting { CounterpartyAccountId = CatId, Amount = -1500m }],
+            });
+    }
 
     private async Task<Fixture> SeriesWithSkippedSlotAsync(ApiFactory factory)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
         var client = await AuthedClientAsync(factory, ledger);
@@ -66,12 +78,12 @@ public sealed class ReminderUnskipTests
             $"{baseUrl}/skip", new SkipReminderRequest { OccurrenceDate = Slot });
         Assert.Equal(HttpStatusCode.OK, skip.StatusCode);
 
-        return new Fixture(ledger, client, seriesId, baseUrl);
+        return new Fixture(ledger, client, seriesId, baseUrl, bank.Id, cat.Id);
     }
 
     private async Task<int> ExceptionCountAsync(Guid seriesId, DateOnly? slot = null)
     {
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         var q = db.RecurringOccurrenceExceptions.AsNoTracking()
             .Where(e => e.RecurringTransactionId == seriesId);
         if (slot is { } d) q = q.Where(e => e.OccurrenceDate == d);
@@ -90,21 +102,19 @@ public sealed class ReminderUnskipTests
     [Fact]
     public async Task An_unskipped_occurrence_can_then_be_fired()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var f = await SeriesWithSkippedSlotAsync(factory);
         using var client = f.Client;
 
         // Precondition: firing is refused while it is skipped. Without this the test
         // could pass against a build where firing never checked skips at all.
-        var refused = await client.PostAsJsonAsync(
-            $"{f.BaseUrl}/fire", new FireReminderRequest { OccurrenceDate = Slot });
+        var refused = await f.FireAsync();
         Assert.Equal(HttpStatusCode.UnprocessableEntity, refused.StatusCode);
 
         var unskip = await client.DeleteAsync($"{f.BaseUrl}/skip?occurrenceDate={Slot:yyyy-MM-dd}");
         Assert.Equal(HttpStatusCode.OK, unskip.StatusCode);
 
-        var fired = await client.PostAsJsonAsync(
-            $"{f.BaseUrl}/fire", new FireReminderRequest { OccurrenceDate = Slot });
+        var fired = await f.FireAsync();
         Assert.Equal(HttpStatusCode.OK, fired.StatusCode);
     }
 
@@ -120,7 +130,7 @@ public sealed class ReminderUnskipTests
     [Fact]
     public async Task Unskip_touches_only_the_occurrence_asked_for()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var f = await SeriesWithSkippedSlotAsync(factory);
         using var client = f.Client;
 
@@ -149,7 +159,7 @@ public sealed class ReminderUnskipTests
     [Fact]
     public async Task Unskipping_the_earliest_slot_moves_the_cursor_back_to_it()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var f = await SeriesWithSkippedSlotAsync(factory);
         using var client = f.Client;
 
@@ -168,7 +178,7 @@ public sealed class ReminderUnskipTests
         Assert.Equal(new DateOnly(2026, 1, 1), body!.NextDueDate);
 
         // And the stored cursor agrees with what the response claimed.
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         var stored = await db.RecurringTransactions.AsNoTracking()
             .Where(r => r.Id == f.SeriesId)
             .Select(r => r.NextDueDate)
@@ -186,7 +196,7 @@ public sealed class ReminderUnskipTests
     [Fact]
     public async Task Unskipping_a_slot_that_is_not_skipped_is_a_no_op()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var f = await SeriesWithSkippedSlotAsync(factory);
         using var client = f.Client;
 
@@ -205,11 +215,11 @@ public sealed class ReminderUnskipTests
     [Fact]
     public async Task Unskip_is_refused_across_ledgers()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var mine = await SeriesWithSkippedSlotAsync(factory);
         using var myClient = mine.Client;
 
-        var other = await SyntheticLedger.CreateAsync(_fixture);
+        var other = await SyntheticLedger.CreateAsync(Db);
         using var otherClient = await AuthedClientAsync(factory, other);
 
         // Ledger B's holder, asking about ledger A's reminder id under their OWN ledger.

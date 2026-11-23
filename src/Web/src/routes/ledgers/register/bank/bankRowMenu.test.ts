@@ -1,23 +1,24 @@
 import { describe, it, expect } from 'vitest';
 import type { BankRow } from '@/lib/types';
+import { NO_NOTES } from '@/lib/annotations/rowNotesFixture';
 import { buildBankRowMenuItems } from './bankRowMenu';
 
 // Minimal BankRow factory (no coercion — every field set).
 function makeRow(overrides: Partial<BankRow> & { id: string }): BankRow {
     const defaults: BankRow = {
+        ...NO_NOTES,
         kind: 'bank',
-    legTags: [],
         id: '',
         accountId: '00000000-0000-0000-0000-0000000000a1',
         payee: 'Paycheck',
-        memo: null,
         amount: 1000.00,
         postedAt: '2026-04-07T12:00:00Z',
         transactedAt: null,
         status: 'cleared',
         isHidden: false,
-        hasOverrides: false,
         balanceAfter: 1000.00,
+        currencyCode: 'USD',
+        balanceCurrencyCode: 'USD',
         origin: 'manual',
         isPending: false,
         externalId: null,
@@ -28,13 +29,10 @@ function makeRow(overrides: Partial<BankRow> & { id: string }): BankRow {
         counterpartyAccountId: null,
         counterpartyAccountName: null,
         counterpartyAccountType: null,
-        tags: [],
         headerId: '00000000-0000-0000-0000-0000000000bb',
         clearedAt: null,
         clearedByUserId: null,
         createdAt: '2026-04-07T12:00:00Z',
-        legMemo: null,
-        headerMemo: null,
         onlineMatchFitid: null,
         onlineMatchFiId: null,
         needsReview: false,
@@ -88,8 +86,8 @@ describe('buildBankRowMenuItems — originating split-parent', () => {
             'accept',
             // Edit sits after Accept and before Duplicate: Accept is the
             // one-click resolution a flagged row is asking for, so it stays
-            // first. Until Edit existed a split parent had no menu route to
-            // its own legs at all.
+            // first. Edit is a split parent's only menu route to its own
+            // legs.
             'edit',
             'duplicate',
             'create-reminder',
@@ -97,11 +95,7 @@ describe('buildBankRowMenuItems — originating split-parent', () => {
         ]);
     });
 
-    it('without the flag, a split counter-side offers nothing that MUTATES it', () => {
-        // Contrast: same txnGroupId-bearing row, but NOT flagged as an
-        // originating parent → the existing ADR-0036 counter-side guard
-        // makes it read-only. Locks that this change is opt-in.
-        //
+    it('a split line seen from its other side offers nothing that MUTATES it', () => {
         // "Read-only" is about mutation, not about the item COUNT: the two
         // items here navigate and inspect, and "Show raw data" is offered on
         // every row precisely because "why did this import like this?" is
@@ -111,12 +105,49 @@ describe('buildBankRowMenuItems — originating split-parent', () => {
             id: 'counter',
             txnGroupId: '00000000-0000-0000-0000-0000000000bb',
             counterpartyAccountId: '00000000-0000-0000-0000-0000000000c1',
+            notesKind: 'splitOpposite',
+            isReadOnly: true,
         });
         expect(ids(row)).toEqual(['show-other-side', 'raw']);
         // The assertion that carries the meaning: nothing here changes the row.
         for (const mutating of ['edit', 'accept', 'duplicate', 'create-reminder', 'delete']) {
             expect(ids(row)).not.toContain(mutating);
         }
+    });
+});
+
+describe('buildBankRowMenuItems — the server says which rows are read-only', () => {
+    // The menu reads `isReadOnly`; it never re-derives read-only-ness from
+    // posting counts or a group id.
+    it.each([
+        ['a one-posting investment counterpart (an Xfr seen from the bank)', 'eventCounterpartOne'],
+        ['a multi-posting investment counterpart', 'eventOpposite'],
+        ['a split line seen from its other side', 'splitOpposite'],
+    ] as const)('offers neither Edit nor Duplicate on %s', (_name, notesKind) => {
+        const row = makeRow({
+            id: `ro-${notesKind}`,
+            counterpartyAccountId: '00000000-0000-0000-0000-0000000000c1',
+            notesKind,
+            isReadOnly: true,
+        });
+        const items = ids(row);
+        expect(items).toContain('show-other-side');
+        expect(items).not.toContain('edit');
+        expect(items).not.toContain('duplicate');
+    });
+
+    it('a row with a group id that the server shows as editable keeps Edit', () => {
+        // The old guard treated any txnGroupId as a counter-side; the symmetric
+        // shape on its owning account carries one and is editable.
+        const row = makeRow({
+            id: 'owned',
+            txnGroupId: '00000000-0000-0000-0000-0000000000bb',
+            counterpartyAccountId: '00000000-0000-0000-0000-0000000000c1',
+            notesKind: 'onePosting',
+            isReadOnly: false,
+        });
+        expect(ids(row)).toContain('edit');
+        expect(ids(row)).toContain('duplicate');
     });
 });
 

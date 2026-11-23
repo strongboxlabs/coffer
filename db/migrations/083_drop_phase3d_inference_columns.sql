@@ -5,16 +5,15 @@
 -- Reverts the columns added by migrations 081 + 082. The holdings
 -- description matcher (SimpleFinHoldingsMatcher / Idea 1) and the
 -- snapshot-delta classifier (SimpleFinHoldingsDelta / Idea 2)
--- proved unreliable in practice:
+-- are unreliable:
 --
 --   * Idea 1 recovered tickers from holdings[] descriptions but
---     left action null on the very institutions that motivated it
---     (a brokerage money-market fund / a 529 plan don't carry an action
---     keyword in the transaction description).
+--     could not supply the action: a transaction description with no
+--     action keyword leaves it null whichever ticker is found.
 --   * Idea 2's shares-from-delta inference required two snapshots
---     separated by an actual position change, never fired
---     reliably on real data, and "(guess)" provisional values
---     added more cognitive load than they removed.
+--     separated by an actual position change — a condition no sync
+--     controls, so it could not be relied on to fire — and "(guess)"
+--     provisional values added more cognitive load than they removed.
 --
 -- The reality is payee + memo (post-migration heuristic that
 -- splits SimpleFIN's payee from description) give the user enough

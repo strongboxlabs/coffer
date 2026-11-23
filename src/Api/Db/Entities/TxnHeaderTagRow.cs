@@ -1,10 +1,11 @@
 namespace Coffer.Api.Db.Entities;
 
 /// <summary>
-/// EF entity for <c>txn_header_tags</c> (ADR-0022 Rule 6). Tags
-/// describe the event, not individual legs; a "vacation" tag on a
-/// multi-split paycheck applies to all legs by virtue of being on the
-/// header.
+/// EF entity for <c>txn_header_tags</c> (ADR-0022 Rule 6): the
+/// transaction-level tags of a multi-posting transaction only (a split or
+/// a multi-posting investment event). A one-posting transaction's tags sit
+/// on its legs (<see cref="TxnLegTagRow"/>). A raw input of the stored
+/// presentation; readers read <c>txn_leg_note_tags</c>.
 /// </summary>
 internal sealed class TxnHeaderTagRow
 {

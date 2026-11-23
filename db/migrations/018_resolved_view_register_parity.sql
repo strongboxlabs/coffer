@@ -89,6 +89,6 @@ LEFT JOIN transaction_overrides o ON o.transaction_id = t.id;
 -- 017) for the underlying RLS policies on transactions / accounts /
 -- tags to be evaluated against the *caller's* role rather than the
 -- view owner's. Without this line, alice's query would see bob's
--- data through this view — an RLS regression caught by
--- RowLevelSecurityTests.Transactions_inherit_account_policy_via_FK_chain.
+-- data through this view — an RLS regression, which
+-- RowLevelSecurityTests.Transactions_inherit_account_policy_via_FK_chain pins.
 ALTER VIEW resolved_transactions SET (security_invoker = true);

@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using Coffer.Domain.Money;
 using Coffer.Importer.Moneydance.Db;
 using Coffer.Importer.Moneydance.Json;
 using Coffer.Importer.Moneydance.Pipeline;
@@ -105,8 +106,8 @@ internal sealed class ReconcileCommand : AsyncCommand<ReconcileCommand.Settings>
         }
 
         var steps = result.Steps;
-        ImportCommand.PrintStepSummary(steps);
-        ImportCommand.PrintSkips(steps);
+        PrintStepSummary(steps);
+        PrintSkips(steps);
         PrintHoldings(result.Holdings, settings.OnlyTickers);
         PrintDiffs(result.Diffs);
 
@@ -114,6 +115,59 @@ internal sealed class ReconcileCommand : AsyncCommand<ReconcileCommand.Settings>
         AnsiConsole.MarkupLine(
             $"[grey]Reconcile (rolled back, nothing persisted) in {stopwatch.Elapsed.TotalSeconds:F2}s.[/]");
         return dropped > 0 ? 1 : 0;
+    }
+
+    private static void PrintStepSummary(IReadOnlyList<ImportStepResult> results)
+    {
+        var table = new Table()
+            .AddColumn("step")
+            .AddColumn(new TableColumn("read").RightAligned())
+            .AddColumn(new TableColumn("written").RightAligned())
+            .AddColumn(new TableColumn("skipped").RightAligned());
+        foreach (var result in results)
+            table.AddRow(
+                Markup.Escape(result.StepName),
+                result.Read.ToString("N0"),
+                result.Written.ToString("N0"),
+                result.Skipped.ToString("N0"));
+        AnsiConsole.Write(table);
+    }
+
+    /// <summary>
+    /// Itemise every transaction the import would drop — silent drops are data
+    /// loss and must be visible. Prints a per-(step, reason, ticker) aggregate
+    /// with total shares lost.
+    /// </summary>
+    private static void PrintSkips(IReadOnlyList<ImportStepResult> results)
+    {
+        var skips = results
+            .Where(r => r.Skips is { Count: > 0 })
+            .SelectMany(r => r.Skips!.Select(s => (Step: r.StepName, Skip: s)))
+            .ToList();
+        if (skips.Count == 0)
+            return;
+
+        AnsiConsole.MarkupLine(
+            $"[red]⚠ {skips.Count:N0} transaction(s) would be DROPPED (not imported):[/]");
+
+        var agg = new Table()
+            .AddColumn("step")
+            .AddColumn("reason")
+            .AddColumn("ticker / security")
+            .AddColumn(new TableColumn("count").RightAligned())
+            .AddColumn(new TableColumn("shares lost").RightAligned());
+        foreach (var g in skips
+            .GroupBy(x => (x.Step, x.Skip.Reason, Sec: x.Skip.Ticker ?? x.Skip.Security ?? "(none)"))
+            .OrderByDescending(g => g.Count()))
+        {
+            agg.AddRow(
+                Markup.Escape(g.Key.Step),
+                Markup.Escape(g.Key.Reason),
+                Markup.Escape(g.Key.Sec),
+                g.Count().ToString("N0"),
+                g.Sum(x => x.Skip.Shares ?? 0m).ToString("N4"));
+        }
+        AnsiConsole.Write(agg);
     }
 
     /// <summary>
@@ -141,7 +195,8 @@ internal sealed class ReconcileCommand : AsyncCommand<ReconcileCommand.Settings>
                 Markup.Escape(h.Ticker ?? "(none)"),
                 Markup.Escape(h.Name),
                 h.Quantity.ToString("N4"),
-                h.CostBasis.ToString("N2"));
+                // Money at its holding's currency's places (ADR-0114 D15).
+                $"{h.CostBasis.ToString("N" + CurrencyMinorUnits.PlacesOf(h.CurrencyCode))} {h.CurrencyCode}");
         AnsiConsole.Write(table);
     }
 

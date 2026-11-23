@@ -1,6 +1,8 @@
 import { useId } from 'react';
 import { cn } from '@/lib/cn';
 import { FieldLabel } from '@/components/ui/FieldLabel';
+import { useFieldSizeClass } from '@/components/ui/fieldSize';
+import { pendingTextProps } from '@/components/ui/pending';
 import { SHARES_SIGN_RULE } from '../actionLayout';
 import type { LedgerInvestmentAction } from '@/lib/types';
 
@@ -12,7 +14,8 @@ interface SharesFieldProps {
      * and the input's `min` / `max` clamps. */
     action: LedgerInvestmentAction;
     error?: string | null;
-    disabled?: boolean;
+    /** The save is in flight: the field keeps focus and is read-only (pending.ts). */
+    pending?: boolean;
 }
 
 /**
@@ -23,9 +26,10 @@ interface SharesFieldProps {
  * Validation (../validation.ts) enforces the sign rule at save time.
  */
 export function SharesField({
-    value, onChange, action, error, disabled,
+    value, onChange, action, error, pending,
 }: SharesFieldProps) {
     const inputId = useId();
+    const sizeClass = useFieldSizeClass();
     const signRule = SHARES_SIGN_RULE[action];
     const signHint = signRule === 'positive'
         ? 'positive (shares acquired)'
@@ -43,7 +47,7 @@ export function SharesField({
                 inputMode="decimal"
                 value={value ?? ''}
                 placeholder="0"
-                disabled={disabled}
+                {...pendingTextProps<HTMLInputElement>(pending)}
                 onChange={(e) => {
                     const v = e.target.value;
                     if (v.length === 0) {
@@ -55,7 +59,9 @@ export function SharesField({
                 }}
                 className={cn(
                     'h-control-28px w-full rounded border bg-surface px-2 text-right font-mono text-xs tabular-nums',
+                    sizeClass,
                     'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+                    'aria-disabled:cursor-not-allowed aria-disabled:opacity-50',
                     error ? 'border-state-danger' : 'border-border',
                 )}
                 aria-invalid={!!error}

@@ -10,21 +10,19 @@
 -- override-aware posted_at, both accumulate SUM(...) OVER (ORDER BY posted_at, seq).
 -- Two independent statements of one rule.
 --
--- WHY THAT IS THE DEFECT AND NOT JUST UNTIDY. Migration 206 rewrote the per-account
--- side and did not touch the ledger-wide twin. They still agreed — verified at the
--- time on every row of a real ledger — but nothing made them agree, and the guard was a test
--- comparing one against the other. That test is the wrong shape: it makes the
--- duplication permanent and merely alarms when the copies drift, and it names the
--- per-account function "the reference implementation" while 206 was busy changing it.
--- The failure it was watching for is nasty precisely because both answers look right:
+-- WHY THAT IS THE DEFECT AND NOT JUST UNTIDY. Nothing makes the two agree except a
+-- test comparing one against the other. That test is the wrong shape: it makes the
+-- duplication permanent and merely alarms when the copies drift, and either copy
+-- can change without the other (206 rewrote the per-account side alone).
+-- The failure it watches for is nasty precisely because both answers look right:
 -- a restored ledger would disagree with the same ledger after one edit, and the
 -- consistency checker would report drift that is really a function mismatch.
 --
--- WHICH ONE SURVIVES, and this is measured rather than chosen. Delegating the
+-- WHICH ONE SURVIVES is decided by cost. Delegating the
 -- ledger-wide path to the per-account walk (CROSS JOIN LATERAL over accounts) puts
--- back exactly the per-account overhead mig 188 was written to remove: ~12ms per
--- account, so several seconds for a real ledger of hundreds of accounts against
--- ~325ms for the set-based pass. Only the set-based form can serve both shapes, so it is the survivor, and the
+-- back exactly the per-account overhead mig 188 was written to remove: a fixed cost
+-- paid once per account, categories included, where the set-based pass pays it once
+-- per ledger. Only the set-based form can serve both shapes, so it is the survivor, and the
 -- per-account case becomes that same query restricted to one account.
 --
 -- WHAT EACH CALLER NOW IS:
@@ -49,9 +47,9 @@
 --     does exactly that before calling), because changing that would change behaviour
 --     for a path this migration has no business touching.
 --
--- Equivalence is proven against real data before this ships, not asserted: the new
--- functions must reproduce, row for row, what the old ones stored for a real
--- ledger — in both directions.
+-- Equivalence is proven before this ships, not asserted: the new functions must
+-- reproduce, row for row, what the old ones stored for a populated ledger — in
+-- both directions.
 -- ---------------------------------------------------------------------------
 
 BEGIN;

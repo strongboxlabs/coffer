@@ -24,13 +24,14 @@
 --   | sync_runs.feed_connection_id           | feed_connections | SET NULL  |
 --   | sync_run_promotions.header_id          | txn_headers      | CASCADE   |
 --
--- VERIFIED PREREQUISITES (against the live dev DB — do NOT re-add):
+-- PREREQUISITES (already in place — do NOT re-add):
 --   * All 7 child tables already carry a NOT NULL `ledger_id`.
 --   * All 3 parents (accounts, feed_connections, txn_headers) already
 --     have UNIQUE (id, ledger_id) — accounts/txn_headers from mig 049,
 --     feed_connections from its own anchor migration.
---   * All 7 references are currently LEAK-FREE (0 rows cross ledgers),
---     so the composite FKs add and validate cleanly with no data fix.
+--   * No data fix runs first: the composite FKs are added without NOT
+--     VALID, so they validate on ADD, and a reference that crosses
+--     ledgers fails this migration loudly instead of being carried on.
 --
 -- ON DELETE semantics are preserved exactly:
 --   * The 6 nullable FKs keep SET-NULL. Because the FK is now composite,

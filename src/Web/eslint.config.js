@@ -6,8 +6,11 @@ import tseslint from 'typescript-eslint';
 
 // Local rule: a test whose every assertion is satisfied by an empty render
 // cannot fail. See eslint-rules/no-unanchored-negative-assertion.js for the
-// three real instances that motivated it, one of which shipped.
+// defect and what counts as an anchor.
 import noUnanchoredNegativeAssertion from './eslint-rules/no-unanchored-negative-assertion.js';
+// Local rule: a row's transaction-level memo and tags are read only by the
+// split-parent builder. See the rule for why.
+import headerNotesReader from './eslint-rules/header-notes-reader.js';
 
 export default tseslint.config(
   { ignores: ['dist', 'src/routeTree.gen.ts'] },
@@ -21,7 +24,12 @@ export default tseslint.config(
     plugins: {
       'react-hooks': reactHooks,
       'react-refresh': reactRefresh,
-      local: { rules: { 'no-unanchored-negative-assertion': noUnanchoredNegativeAssertion } },
+      local: {
+        rules: {
+          'no-unanchored-negative-assertion': noUnanchoredNegativeAssertion,
+          'header-notes-reader': headerNotesReader,
+        },
+      },
     },
     rules: {
       ...reactHooks.configs.recommended.rules,
@@ -43,6 +51,7 @@ export default tseslint.config(
       // all satisfied by an empty DOM genuinely cannot fail — so there is no
       // false positive to live with and nothing to triage.
       'local/no-unanchored-negative-assertion': 'error',
+      'local/header-notes-reader': 'error',
       // Honour the `_`-prefix convention for intentionally unused
       // identifiers — most commonly mock parameters whose types match a
       // production signature but whose values the test never reads.

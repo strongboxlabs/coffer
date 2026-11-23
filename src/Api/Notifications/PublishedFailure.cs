@@ -13,7 +13,7 @@ namespace Coffer.Api.Notifications;
 /// summary is an egress path for infrastructure detail that no gate checks.
 /// </para>
 /// <para>
-/// Capping the length bounded how much escaped; it did not stop it escaping. This
+/// Capping the length bounds how much escapes; it does not stop it escaping. This
 /// type is the thing that stops it: callers get a KIND, never the text.
 /// </para>
 /// <para>
@@ -35,12 +35,12 @@ public static class PublishedFailure
     /// against. Anything unrecognised says so plainly rather than guessing,
     /// because a wrong category is worse than none.
     ///
-    /// <para>Lifted out of <c>JobMonitorSignal</c>, where it was private, when the
-    /// backup handler turned out to need the same treatment. Backup is a
+    /// <para>Shared rather than private to <c>JobMonitorSignal</c> because the
+    /// backup handler needs the same treatment. Backup is a
     /// DEPLOYMENT-scope monitor, so it cannot go through <c>JobMonitorSignal.For</c>
     /// to reach this: that method answers null for anything not registered as a
-    /// per-ledger job type, and routing backup through it would have silenced the
-    /// alert rather than redacted it.</para>
+    /// per-ledger job type, and routing backup through it would silence the
+    /// alert rather than redact it.</para>
     /// </remarks>
     public static string Describe(Exception ex)
     {

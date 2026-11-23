@@ -162,9 +162,8 @@ public static class LoginEndpoints
         // strictly greater than the stored one. Fido2NetLib validates it; we
         // trust that and persist the new value.
         //
-        // The parenthetical that used to sit here — "unless the authenticator
-        // returns 0, which means it doesn't track a counter" — described 4.0.1
-        // and stopped being true at 4.1.0. A zero is now only tolerated when the
+        // Since Fido2NetLib 4.1.0 a returned 0 does not simply mean "this
+        // authenticator doesn't track a counter". A zero is only tolerated when the
         // STORED counter is also zero; a credential that has been counting and
         // then reports 0 is rejected as a suspected clone.
         //

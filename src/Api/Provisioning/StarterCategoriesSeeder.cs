@@ -12,11 +12,15 @@ namespace Coffer.Api.Provisioning;
 ///
 /// The embedded catalogue is GENERATED from the demo sample by
 /// <c>data/samples/starter-categories.gen.mjs</c> (ADR-0091) — so a new ledger
-/// and the Demo ledger get the SAME categories. It used to be a separate
-/// hand-written tree, which is how the two drifted into unrelated taxonomies
-/// (61 entries vs 108, only ~6 of ~22 top-level names in common). Applied on the
-/// empty-new-ledger paths; the import paths still bring their own categories,
-/// but for the Demo import those are now these same ones.
+/// and the Demo ledger get the SAME categories; a separate hand-written tree
+/// drifts into an unrelated taxonomy. Applied on the empty-new-ledger paths; the
+/// import paths bring their own categories, but for the Demo import those are
+/// these same ones.
+///
+/// The catalogue is a tree of nodes, each with its own kind (income, expense or
+/// adjustment), nested to any depth the generator allows (three levels). A
+/// child's kind must be its parent's: a branch that mixes kinds is refused
+/// before anything is written.
 ///
 /// Singleton + stateless: the catalogue is parsed once from the embedded
 /// resource. Callers pass a service-role <see cref="AppDbContext"/> (the ledger
@@ -32,46 +36,69 @@ public sealed class StarterCategoriesSeeder
 
     public StarterCategoriesSeeder(TimeProvider clock) => _clock = clock;
 
-    /// <summary>Total categories (parents + children) the seed will create.</summary>
-    public int CategoryCount => Catalogue.Value.Sum(c => 1 + c.Children.Count);
+    /// <summary>Total categories, at every level, the seed will create.</summary>
+    public int CategoryCount => Count(Catalogue.Value);
+
+    private static int Count(IReadOnlyList<StarterCategory> nodes) =>
+        nodes.Sum(c => 1 + Count(c.ChildNodes));
 
     /// <summary>
     /// Insert the starter categories into <paramref name="ledgerId"/>. Parent
-    /// ids are minted client-side so parents + children commit in one
+    /// ids are minted client-side so the whole tree commits in one
     /// <c>SaveChanges</c>. Returns the number of categories created.
     /// </summary>
+    /// <exception cref="InvalidOperationException">The catalogue is invalid (a
+    /// child's kind differs from its parent's, see <see cref="Parse"/>);
+    /// nothing is added.</exception>
     public async Task<int> SeedAsync(AppDbContext db, Guid ledgerId, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(db);
+        var catalogue = Catalogue.Value;
         var now = _clock.GetUtcNow().UtcDateTime;
         var created = 0;
+        // A category has no currency of its own (ADR-0109 D9): its row carries the
+        // ledger's reporting currency, so it never reads as foreign.
+        var currency = await Db.Repositories.DisplayCurrency.ForLedgerAsync(db, ledgerId, cancellationToken)
+            .ConfigureAwait(false);
 
-        foreach (var top in Catalogue.Value)
+        void Add(StarterCategory node, Guid? parentId)
         {
-            var parentId = Guid.NewGuid();
-            db.Accounts.Add(NewCategory(parentId, ledgerId, parent: null, top.Name, top.Kind, now));
+            var id = Guid.NewGuid();
+            db.Accounts.Add(NewCategory(id, ledgerId, parentId, node.Name, node.Kind, currency, now));
             created++;
-
-            foreach (var childName in top.Children)
-            {
-                db.Accounts.Add(NewCategory(Guid.NewGuid(), ledgerId, parentId, childName, top.Kind, now));
-                created++;
-            }
+            foreach (var child in node.ChildNodes)
+                Add(child, id);
         }
+
+        foreach (var top in catalogue)
+            Add(top, parentId: null);
 
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return created;
     }
 
+    private static void CheckKinds(StarterCategory node, string path)
+    {
+        foreach (var child in node.ChildNodes)
+        {
+            var childPath = $"{path} > {child.Name}";
+            if (child.Kind != node.Kind)
+                throw new InvalidOperationException(
+                    $"Starter category '{childPath}' is {child.Kind} under a {node.Kind} parent; a child must have its parent's kind.");
+            CheckKinds(child, childPath);
+        }
+    }
+
     private static AccountRow NewCategory(
-        Guid id, Guid ledgerId, Guid? parent, string name, string kind, DateTime now) => new()
+        Guid id, Guid ledgerId, Guid? parent, string name, string kind, string currency, DateTime now) => new()
     {
         Id = id,
         LedgerId = ledgerId,
         ParentId = parent,
         Name = name,
         AccountType = "category",
-        CategoryKind = kind,        // 'income' | 'expense' (ADR-0017 invariant)
-        CurrencyCode = "USD",
+        CategoryKind = kind,        // 'income' | 'expense' | 'adjustment' (ADR-0017 invariant, mig 224)
+        CurrencyCode = currency,
         OpeningBalance = 0m,        // DB CHECK forces 0 on categories
         IsActive = true,
         CreatedAt = now,
@@ -81,6 +108,15 @@ public sealed class StarterCategoriesSeeder
     {
         using var stream = typeof(StarterCategoriesSeeder).Assembly.GetManifestResourceStream(ResourceName)
             ?? throw new InvalidOperationException($"Embedded resource '{ResourceName}' not found.");
+        return Parse(stream);
+    }
+
+    /// <summary>
+    /// Read a catalogue and refuse a branch whose child has a different kind
+    /// from its parent: a category tree never mixes kinds within a branch.
+    /// </summary>
+    internal static IReadOnlyList<StarterCategory> Parse(Stream stream)
+    {
         var options = new JsonSerializerOptions
         {
             PropertyNameCaseInsensitive = true,
@@ -88,18 +124,20 @@ public sealed class StarterCategoriesSeeder
         };
         var catalogue = JsonSerializer.Deserialize<StarterCatalogue>(stream, options)
             ?? throw new InvalidOperationException("Starter-categories resource deserialized to null.");
+        foreach (var top in catalogue.Categories)
+            CheckKinds(top, top.Name);
         return catalogue.Categories;
     }
 
     private sealed record StarterCatalogue(
         [property: JsonPropertyName("categories")] IReadOnlyList<StarterCategory> Categories);
 
-    private sealed record StarterCategory(
+    internal sealed record StarterCategory(
         [property: JsonPropertyName("name")] string Name,
         [property: JsonPropertyName("kind")] string Kind,
-        [property: JsonPropertyName("children")] IReadOnlyList<string>? ChildrenRaw = null)
+        [property: JsonPropertyName("children")] IReadOnlyList<StarterCategory>? Children = null)
     {
         [JsonIgnore]
-        public IReadOnlyList<string> Children => ChildrenRaw ?? [];
+        public IReadOnlyList<StarterCategory> ChildNodes => Children ?? [];
     }
 }

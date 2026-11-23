@@ -22,7 +22,8 @@ export interface Brokerage {
     label: string;
     /** Which export of theirs, in the brokerage's own words, so it can be found. */
     exportName: string;
-    preview: (ledgerId: string, file: Blob) => Promise<OfxPreviewResponse>;
+    /** `accountId` is the account the file will go into, read for its currency. */
+    preview: (ledgerId: string, file: Blob, accountId: string) => Promise<OfxPreviewResponse>;
     import: (
         ledgerId: string,
         file: Blob,
@@ -40,7 +41,7 @@ export const BROKERAGES: readonly Brokerage[] = [
         // the module held at load time, which makes the client unmockable and quietly
         // decides that this list owns the reference. An arrow resolves the live binding
         // at call time instead.
-        preview: (ledgerId, file) => previewFidelity(ledgerId, file),
+        preview: (ledgerId, file, accountId) => previewFidelity(ledgerId, file, accountId),
         import: (ledgerId, file, accountId, providerAccountId) =>
             importFidelity(ledgerId, file, accountId, providerAccountId),
     },

@@ -19,6 +19,17 @@ public sealed class CreateFeedConnectionRequest
 }
 
 /// <summary>
+/// Request body for
+/// <c>PATCH /api/ledgers/{ledgerId}/feed-connections/{connectionId}</c>:
+/// the connection's new name. Trimmed, then 1 to 80 characters; two
+/// connections may share a name.
+/// </summary>
+public sealed class RenameFeedConnectionRequest
+{
+    public string? Name { get; init; }
+}
+
+/// <summary>
 /// Public projection of a feed-connection row. Carries the audit-
 /// safe fields only — the sealed access URL stays server-side.
 /// </summary>
@@ -26,9 +37,10 @@ public sealed record FeedConnectionSummary(
     Guid Id,
     Guid LedgerId,
     string Provider,
-    /// <summary>Display name for the FI. Null until the first
-    /// sync (or the connect-time probe) populates it; the SPA
-    /// renders "SimpleFIN" as the fallback.</summary>
+    /// <summary>The connection's name. The connect step sets it from
+    /// SimpleFIN's connection list when that names one institution,
+    /// and null otherwise; an owner can rename it, and syncs never
+    /// change it. The SPA renders "SimpleFIN" for null.</summary>
     string? InstitutionName,
     /// <summary>One of <c>active</c>, <c>needs_reauth</c>,
     /// <c>error</c>, <c>disconnected</c> (CHECK enforced at the
@@ -75,17 +87,24 @@ public sealed record SyncResultDto(
     IReadOnlyList<SyncErrorDto> Errors);
 
 /// <summary>
-/// One SimpleFIN v2 <c>errlist[]</c> entry. <see cref="Code"/> is
-/// the structured <c>prefix.subcode</c> the SPA can switch on
-/// (e.g. <c>auth.revoked</c>); <see cref="Message"/> is the human
-/// message. Optional scope ids when SimpleFIN attributed the error
-/// to one connection or account on the feed.
+/// One error a run recorded: a SimpleFIN v2 <c>errlist[]</c> entry, or a quote
+/// source's failure. <see cref="Code"/> is the structured code the SPA can switch on
+/// (e.g. <c>auth.revoked</c>); <see cref="Message"/> is the human message. Optional
+/// scope ids when the error is about one connection or account on the feed.
 /// </summary>
+/// <param name="ProviderKey">The source that raised it, on a quote run's errors
+/// (migration 303); null on a sync's and on older rows.</param>
+/// <param name="AccountLabel">What to call the feed account
+/// <paramref name="SimpleFinAccountId"/> names: its mapped Coffer account's name, else
+/// "name · institution" from the feed. Null when there is no account id, or the id is
+/// no longer known; the SPA then shows the id.</param>
 public sealed record SyncErrorDto(
     string Code,
     string Message,
     string? SimpleFinConnectionId,
-    string? SimpleFinAccountId);
+    string? SimpleFinAccountId,
+    string? ProviderKey = null,
+    string? AccountLabel = null);
 
 /// <summary>
 /// Response body for <c>POST /api/ledgers/{ledgerId}/sync-all</c>

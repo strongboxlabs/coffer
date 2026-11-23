@@ -1,5 +1,6 @@
-import { useId, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useId, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 import { useSearch } from '@tanstack/react-router';
 
 import {
@@ -18,6 +19,8 @@ import {
     createMcpToken,
     fetchMcpTokens,
     fetchOAuthGrants,
+    renameMcpToken,
+    renameOAuthGrant,
     revokeMcpToken,
     revokeOAuthGrant,
     type IssuedMcpToken,
@@ -25,14 +28,19 @@ import {
     type OAuthGrantSummary,
 } from '@/lib/api';
 import { errorMessage } from '@/lib/errorMessage';
+import { lastUsedText } from '@/lib/mcpConnection';
 import { describeUserAgent } from '@/lib/userAgent';
 import { RecoveryCodes } from '@/components/RecoveryCodes';
+import { RenameConnectionForm } from '@/components/RenameConnectionForm';
+import { useRenameFocus } from '@/components/renameFocus';
 import { Breadcrumb } from '@/components/ui/Breadcrumb';
 import { Button } from '@/components/ui/Button';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { FieldLabel } from '@/components/ui/FieldLabel';
 import { Input } from '@/components/ui/Input';
 import { Modal } from '@/components/ui/Modal';
+import { PendingLabel } from '@/components/ui/PendingLabel';
+import { useRowRemovalFocus } from '@/components/ui/rowRemovalFocus';
 import { MainArea, MainPane, TopBar } from '@/components/ui/SidebarLayout';
 
 /**
@@ -94,6 +102,9 @@ function PasskeysSection() {
     const queryClient = useQueryClient();
     const nicknameId = useId();
     const [nickname, setNickname] = useState('');
+    // An added passkey clears the nickname, which leaves Add disabled with
+    // focus on it; focus goes to the nickname field it waits on (ADR-0023 §L).
+    const nicknameRef = useRef<HTMLInputElement>(null);
     const [ceremonyStarted, setCeremonyStarted] = useState(false);
     const [pendingDelete, setPendingDelete] = useState<CredentialSummary | null>(null);
 
@@ -112,9 +123,13 @@ function PasskeysSection() {
     const addMutation = useMutation({
         mutationFn: () => addPasskey(nickname.trim(), () => setCeremonyStarted(true)),
         onSettled: () => setCeremonyStarted(false),
-        onSuccess: async () => {
+        // The list is read again without waiting on it, as for a made token:
+        // awaiting it would keep the add pending through the read, with the
+        // nickname cleared, Add disabled and the nickname field disabled too,
+        // so focus would have nowhere to go until the read answered.
+        onSuccess: () => {
             setNickname('');
-            await queryClient.invalidateQueries({ queryKey: ['credentials'] });
+            void queryClient.invalidateQueries({ queryKey: ['credentials'] });
         },
     });
 
@@ -135,6 +150,10 @@ function PasskeysSection() {
     // out; with no recovery codes it stays disabled.
     const hasRecoveryFallback = (recoveryStatusQuery.data?.remaining ?? 0) > 0;
     const blockLastDelete = credentials.length <= 1 && !hasRecoveryFallback;
+    // A removed passkey takes its row's Remove with it: focus goes to the next
+    // row's Remove, the previous row's, or the nickname field that adds one, as
+    // Add is disabled until a nickname is typed (ADR-0023 §L).
+    const removeControl = useRowRemovalFocus(credentials.map((c) => c.id), nicknameRef);
 
     const addError = addMutation.error ? errorMessage(addMutation.error, 'Could not add the passkey.') : null;
     const deleteError = deleteMutation.error
@@ -169,10 +188,12 @@ function PasskeysSection() {
                                     : ' · never used'}
                             </span>
                             <Button
+                                ref={removeControl(c.id)}
                                 type="button"
                                 variant="secondary"
                                 size="sm"
-                                disabled={blockLastDelete || deleteMutation.isPending}
+                                disabled={blockLastDelete}
+                                pending={deleteMutation.isPending}
                                 title={blockLastDelete ? "Add another passkey or generate recovery codes first — otherwise you'd be locked out." : undefined}
                                 onClick={() => setPendingDelete(c)}
                             >
@@ -191,24 +212,28 @@ function PasskeysSection() {
                 <FieldLabel htmlFor={nicknameId}>Add a passkey</FieldLabel>
                 <div className="flex gap-2">
                     <Input
+                        ref={nicknameRef}
                         id={nicknameId}
                         type="text"
                         placeholder="e.g. YubiKey 5, MacBook Touch ID"
                         value={nickname}
-                        disabled={addMutation.isPending}
+                        pending={addMutation.isPending}
                         onChange={(event) => setNickname(event.target.value)}
                         className="flex-1"
                     />
                     <Button
                         type="button"
-                        disabled={addMutation.isPending || nickname.trim().length === 0}
+                        disabled={nickname.trim().length === 0}
+                        pending={addMutation.isPending}
+                        fallbackFocusRef={nicknameRef}
                         onClick={() => addMutation.mutate()}
+                        // Two stages, both laid out from the first render so Add
+                        // never changes size between them (PendingLabel).
+                        pendingLabel={(
+                            <PendingLabel pending={ceremonyStarted} label="Starting…" pendingLabel="Tap your authenticator…" />
+                        )}
                     >
-                        {addMutation.isPending
-                            ? ceremonyStarted
-                                ? 'Tap your authenticator…'
-                                : 'Starting…'
-                            : 'Add'}
+                        Add
                     </Button>
                 </div>
                 {addError ? (
@@ -248,7 +273,7 @@ function PasskeysSection() {
 
 /**
  * The browsers and devices signed in to this account (ADR-0013's session list, FU-087),
- * and signing out one or all of the others (2026-10-12 security audit, S1): the way to
+ * and signing out one or all of the others (ADR-0105 D3): the way to
  * end a session you don't recognise or left signed in somewhere. Protective, so no
  * passkey tap — the worst a stolen session can do with it is sign the owner out.
  */
@@ -275,11 +300,18 @@ function SessionsSection() {
           ? errorMessage(signOutOneMutation.error, 'Could not sign out that session.')
           : null;
     const sessions = sessionsQuery.data ?? [];
+    // A session signed out leaves the list, and its Sign out with it: focus
+    // goes to the next row's Sign out, else the previous row's, else the list
+    // itself, which has no add control (ADR-0023 §L). This device's row has
+    // none, so it is passed over, and keeps the list on the page.
+    const listRef = useRef<HTMLUListElement | null>(null);
+    const headingId = useId();
+    const signOutControl = useRowRemovalFocus(sessions.map((s) => s.id), listRef);
 
     return (
         <section className="space-y-3 rounded border border-border bg-surface p-4">
             <header className="space-y-0.5">
-                <h2 className="text-base font-semibold">Sessions</h2>
+                <h2 id={headingId} className="text-base font-semibold">Sessions</h2>
                 <p className="text-sm text-text-muted">
                     The browsers and devices signed in to your account. Sign out any you
                     don't recognise.
@@ -293,7 +325,12 @@ function SessionsSection() {
                     {errorMessage(sessionsQuery.error, 'Could not load your sessions.')}
                 </p>
             ) : (
-                <ul className="divide-y divide-border rounded border border-border">
+                <ul
+                    ref={listRef}
+                    aria-labelledby={headingId}
+                    tabIndex={-1}
+                    className="divide-y divide-border rounded border border-border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                >
                     {sessions.map((s) => (
                         <li key={s.id} className="flex items-center gap-3 px-3 py-2 text-sm">
                             <span className="flex-1 truncate font-medium text-text" title={s.userAgent ?? undefined}>
@@ -307,10 +344,11 @@ function SessionsSection() {
                                 <span className="text-[0.6875rem] font-medium text-accent">This device</span>
                             ) : (
                                 <Button
+                                    ref={signOutControl(s.id)}
                                     type="button"
                                     variant="secondary"
                                     size="sm"
-                                    disabled={signOutOneMutation.isPending}
+                                    pending={signOutOneMutation.isPending}
                                     onClick={() => signOutOneMutation.mutate(s.id)}
                                 >
                                     Sign out
@@ -325,9 +363,10 @@ function SessionsSection() {
                 type="button"
                 variant="secondary"
                 onClick={() => signOutMutation.mutate()}
-                disabled={signOutMutation.isPending}
+                pending={signOutMutation.isPending}
+                pendingLabel="Signing out…"
             >
-                {signOutMutation.isPending ? 'Signing out…' : 'Sign out other sessions'}
+                Sign out other sessions
             </Button>
 
             {ended !== null ? (
@@ -355,12 +394,17 @@ function RecoveryCodesSection() {
 
     const regenerateMutation = useMutation({
         mutationFn: regenerateRecoveryCodes,
-        onSuccess: async (codes) => {
+        // The confirm hands over to the fresh codes while the mutation is still
+        // pending. Regenerate codes is pending then, not disabled, so the
+        // confirm gives focus back to it and the codes give it back on close
+        // (ADR-0023 §L). The reads are not awaited: the codes are shown as soon
+        // as the server has made them.
+        onSuccess: (codes) => {
             setConfirming(false);
             setFreshCodes(codes);
-            await queryClient.invalidateQueries({ queryKey: ['recovery-codes-status'] });
+            void queryClient.invalidateQueries({ queryKey: ['recovery-codes-status'] });
             // The server ended every other session with them (FU-087).
-            await queryClient.invalidateQueries({ queryKey: ['sessions'] });
+            void queryClient.invalidateQueries({ queryKey: ['sessions'] });
         },
     });
 
@@ -391,7 +435,7 @@ function RecoveryCodesSection() {
                 type="button"
                 variant="secondary"
                 onClick={() => setConfirming(true)}
-                disabled={regenerateMutation.isPending}
+                pending={regenerateMutation.isPending}
             >
                 Regenerate codes
             </Button>
@@ -411,11 +455,12 @@ function RecoveryCodesSection() {
             />
 
             {/* New codes shown once, in a modal with the same save affordances
-                as first-run setup. */}
+                as first-run setup. The dialog is named by the codes' own
+                heading, which RecoveryCodes renders with this id. */}
             <Modal
                 open={freshCodes !== null}
                 onClose={() => setFreshCodes(null)}
-                titleId="fresh-recovery-codes-title"
+                titleId="recovery-codes-heading"
                 dismissOnBackdrop={false}
                 className="max-w-xl"
             >
@@ -441,6 +486,11 @@ function ConnectedAppsSection() {
     const nameId = useId();
     const urlId = useId();
     const [name, setName] = useState('');
+    // Where focus goes when the token dialog closes. Generate opened it, but a
+    // made token clears the name, which leaves Generate disabled until a new
+    // one is typed, so it cannot take focus back; the name field it waits on
+    // takes it instead (ADR-0023 §L).
+    const nameRef = useRef<HTMLInputElement>(null);
     const [issued, setIssued] = useState<IssuedMcpToken | null>(null);
     const [pendingRevoke, setPendingRevoke] = useState<McpTokenSummary | null>(null);
     const [copied, setCopied] = useState<'url' | 'token' | null>(null);
@@ -458,10 +508,15 @@ function ConnectedAppsSection() {
 
     const createMutation = useMutation({
         mutationFn: () => createMcpToken(name.trim()),
-        onSuccess: async (token) => {
+        // The list is read again without waiting on it: the create settles once
+        // the token is issued. Awaiting it would keep the create pending through
+        // the read, and the name field disabled with it while "Copy your token
+        // now" is open, so a dialog closed before the read answered would have
+        // no field to give focus to.
+        onSuccess: (token) => {
             setName('');
             setIssued(token);
-            await queryClient.invalidateQueries({ queryKey: ['mcp-tokens'] });
+            void queryClient.invalidateQueries({ queryKey: ['mcp-tokens'] });
         },
     });
 
@@ -481,21 +536,51 @@ function ConnectedAppsSection() {
         retry: (count, error) =>
             !(error instanceof ApiError && error.status === 404) && count < 3,
     });
-    const [pendingDisconnect, setPendingDisconnect] = useState<OAuthGrantSummary | null>(null);
-    const disconnectMutation = useMutation({
+    const [pendingRevokeGrant, setPendingRevokeGrant] = useState<OAuthGrantSummary | null>(null);
+    const revokeGrantMutation = useMutation({
         mutationFn: (id: string) => revokeOAuthGrant(id),
         onSuccess: async () => {
-            setPendingDisconnect(null);
+            setPendingRevokeGrant(null);
             await queryClient.invalidateQueries({ queryKey: ['oauth-grants'] });
         },
     });
     const grants = grantsQuery.data ?? [];
-    const disconnectError = disconnectMutation.error
-        ? errorMessage(disconnectMutation.error, 'Could not disconnect the app.')
+    const revokeGrantError = revokeGrantMutation.error
+        ? errorMessage(revokeGrantMutation.error, 'Could not revoke the app.')
         : null;
+
+    // Naming a connection: one row at a time, a token or a sign-in, so one state says which.
+    const [renaming, setRenaming] = useState<{ kind: 'token' | 'oauth'; id: string } | null>(null);
+    const renameMutation = useMutation({
+        mutationFn: (v: { kind: 'token' | 'oauth'; id: string; name: string }) =>
+            v.kind === 'token' ? renameMcpToken(v.id, v.name) : renameOAuthGrant(v.id, v.name),
+        onSuccess: async (_, v) => {
+            setRenaming(null);
+            await queryClient.invalidateQueries({
+                queryKey: [v.kind === 'token' ? 'mcp-tokens' : 'oauth-grants'],
+            });
+        },
+    });
+    const renameError = renameMutation.error
+        ? errorMessage(renameMutation.error, 'Could not rename it.')
+        : null;
+    // The rename form goes on a save that lands, Cancel or Escape: focus goes to
+    // the row's Rename, drawn in its place, in either list (ADR-0023 §L).
+    const renameFocus = useRenameFocus<string>();
+    const renameKey = (kind: 'token' | 'oauth', id: string) => `${kind}:${id}`;
+    function startRenaming(kind: 'token' | 'oauth', id: string) {
+        renameMutation.reset();
+        renameFocus.opened(renameKey(kind, id));
+        setRenaming({ kind, id });
+    }
 
     const tokens = tokensQuery.data ?? [];
     const serverUrl = `${window.location.origin}/mcp`;
+    // A revoked token or app takes its row's Revoke with it: focus goes to the
+    // next row's Revoke, the previous row's, or the panel's add control, the
+    // token name field, as Generate is disabled until a name is typed (ADR-0023 §L).
+    const revokeTokenControl = useRowRemovalFocus(tokens.map((t) => t.id), nameRef);
+    const revokeGrantControl = useRowRemovalFocus(grants.map((g) => g.id), nameRef);
 
     const createError = createMutation.error
         ? errorMessage(createMutation.error, 'Could not create the token.')
@@ -564,25 +649,51 @@ function ConnectedAppsSection() {
                         <ul className="divide-y divide-border rounded border border-border">
                             {tokens.map((t) => (
                                 <li key={t.id} className="flex items-center gap-3 px-3 py-2 text-sm">
-                                    <span className="flex-1 truncate font-medium text-text">{t.name}</span>
-                                    <span className="text-[0.6875rem] text-text-muted">
-                                        added {new Date(t.createdAt).toLocaleDateString()}
-                                        {t.lastUsedAt
-                                            ? ` · last used ${new Date(t.lastUsedAt).toLocaleDateString()}`
-                                            : ' · never used'}
-                                        {t.expiresAt
-                                            ? ` · expires ${new Date(t.expiresAt).toLocaleDateString()}`
-                                            : ''}
-                                    </span>
-                                    <Button
-                                        type="button"
-                                        variant="secondary"
-                                        size="sm"
-                                        disabled={revokeMutation.isPending}
-                                        onClick={() => setPendingRevoke(t)}
-                                    >
-                                        Revoke
-                                    </Button>
+                                    {renaming?.kind === 'token' && renaming.id === t.id ? (
+                                        <div className="flex-1">
+                                            <RenameConnectionForm
+                                                initial={t.name}
+                                                label={`Name for ${t.name}`}
+                                                placeholder={t.name}
+                                                allowBlank={false}
+                                                pending={renameMutation.isPending}
+                                                error={renameError}
+                                                onSave={(next) => renameMutation.mutate({ kind: 'token', id: t.id, name: next })}
+                                                onCancel={() => setRenaming(null)}
+                                                {...renameFocus.formRefs}
+                                            />
+                                        </div>
+                                    ) : (
+                                        <>
+                                            <span className="flex-1 truncate font-medium text-text">{t.name}</span>
+                                            <span className="text-[0.6875rem] text-text-muted">
+                                                added {new Date(t.createdAt).toLocaleDateString()}
+                                                {` · ${lastUsedText('token', t.lastUsedAt)}`}
+                                                {t.expiresAt
+                                                    ? ` · expires ${new Date(t.expiresAt).toLocaleDateString()}`
+                                                    : ''}
+                                            </span>
+                                            <Button
+                                                ref={renameFocus.renameRef(renameKey('token', t.id))}
+                                                type="button"
+                                                variant="secondary"
+                                                size="sm"
+                                                onClick={() => startRenaming('token', t.id)}
+                                            >
+                                                Rename
+                                            </Button>
+                                            <Button
+                                                ref={revokeTokenControl(t.id)}
+                                                type="button"
+                                                variant="secondary"
+                                                size="sm"
+                                                pending={revokeMutation.isPending}
+                                                onClick={() => setPendingRevoke(t)}
+                                            >
+                                                Revoke
+                                            </Button>
+                                        </>
+                                    )}
                                 </li>
                             ))}
                         </ul>
@@ -604,28 +715,67 @@ function ConnectedAppsSection() {
                             <ul className="divide-y divide-border rounded border border-border">
                                 {grants.map((g) => (
                                     <li key={g.id} className="flex items-center gap-3 px-3 py-2 text-sm">
-                                        <span className="flex-1 truncate font-medium text-text">{g.appName}</span>
-                                        <span className="text-[0.6875rem] text-text-muted">
-                                            {g.canWrite ? 'can make changes · ' : 'read-only · '}
-                                            connected {new Date(g.connectedAt).toLocaleDateString()}
-                                            {' · until '}
-                                            {new Date(g.expiresAt).toLocaleDateString()}
-                                        </span>
-                                        <Button
-                                            type="button"
-                                            variant="secondary"
-                                            size="sm"
-                                            disabled={disconnectMutation.isPending}
-                                            onClick={() => setPendingDisconnect(g)}
-                                        >
-                                            Disconnect
-                                        </Button>
+                                        {renaming?.kind === 'oauth' && renaming.id === g.id ? (
+                                            <div className="flex-1">
+                                                <RenameConnectionForm
+                                                    initial={g.label ?? ''}
+                                                    label={`Name for ${g.label ?? g.appName}`}
+                                                    placeholder={g.appName}
+                                                    allowBlank
+                                                    pending={renameMutation.isPending}
+                                                    error={renameError}
+                                                    onSave={(next) => renameMutation.mutate({ kind: 'oauth', id: g.id, name: next })}
+                                                    onCancel={() => setRenaming(null)}
+                                                    {...renameFocus.formRefs}
+                                                />
+                                            </div>
+                                        ) : (
+                                            <>
+                                                <span className="flex-1 truncate font-medium text-text">
+                                                    {g.label ?? g.appName}
+                                                    {/* The app's own name stays visible once renamed: the
+                                                        name is the person's word for it, but the app's is
+                                                        what says which software this is. */}
+                                                    {g.label ? (
+                                                        <span className="ml-2 font-normal text-text-muted">
+                                                            ({g.appName})
+                                                        </span>
+                                                    ) : null}
+                                                </span>
+                                                <span className="text-[0.6875rem] text-text-muted">
+                                                    {g.canWrite ? 'can make changes · ' : 'read-only · '}
+                                                    connected {new Date(g.connectedAt).toLocaleDateString()}
+                                                    {` · ${lastUsedText('oauth', g.lastUsedAt)}`}
+                                                    {' · until '}
+                                                    {new Date(g.expiresAt).toLocaleDateString()}
+                                                </span>
+                                                <Button
+                                                    ref={renameFocus.renameRef(renameKey('oauth', g.id))}
+                                                    type="button"
+                                                    variant="secondary"
+                                                    size="sm"
+                                                    onClick={() => startRenaming('oauth', g.id)}
+                                                >
+                                                    Rename
+                                                </Button>
+                                                <Button
+                                                    ref={revokeGrantControl(g.id)}
+                                                    type="button"
+                                                    variant="secondary"
+                                                    size="sm"
+                                                    pending={revokeGrantMutation.isPending}
+                                                    onClick={() => setPendingRevokeGrant(g)}
+                                                >
+                                                    Revoke
+                                                </Button>
+                                            </>
+                                        )}
                                     </li>
                                 ))}
                             </ul>
                         )}
-                        {disconnectError ? (
-                            <p role="alert" className="text-sm text-state-danger">{disconnectError}</p>
+                        {revokeGrantError ? (
+                            <p role="alert" className="text-sm text-state-danger">{revokeGrantError}</p>
                         ) : null}
                     </div>
 
@@ -633,20 +783,23 @@ function ConnectedAppsSection() {
                         <FieldLabel htmlFor={nameId}>Generate a token</FieldLabel>
                         <div className="flex gap-2">
                             <Input
+                                ref={nameRef}
                                 id={nameId}
                                 type="text"
                                 placeholder="e.g. Claude Desktop"
                                 value={name}
-                                disabled={createMutation.isPending}
+                                pending={createMutation.isPending}
                                 onChange={(event) => setName(event.target.value)}
                                 className="flex-1"
                             />
                             <Button
                                 type="button"
-                                disabled={createMutation.isPending || name.trim().length === 0}
+                                disabled={name.trim().length === 0}
+                                pending={createMutation.isPending}
+                                pendingLabel="Generating…"
                                 onClick={() => createMutation.mutate()}
                             >
-                                {createMutation.isPending ? 'Generating…' : 'Generate'}
+                                Generate
                             </Button>
                         </div>
                         {createError ? (
@@ -678,29 +831,32 @@ function ConnectedAppsSection() {
             />
 
             <ConfirmDialog
-                open={pendingDisconnect !== null}
-                title="Disconnect this app?"
+                open={pendingRevokeGrant !== null}
+                title="Revoke this app?"
                 body={
-                    pendingDisconnect ? (
+                    pendingRevokeGrant ? (
                         <>
-                            <span className="font-medium text-text">{pendingDisconnect.appName}</span>{' '}
+                            <span className="font-medium text-text">
+                                {pendingRevokeGrant.label ?? pendingRevokeGrant.appName}
+                            </span>{' '}
                             loses access immediately. To use it again, connect it again from the app.
                         </>
                     ) : null
                 }
                 variant="danger"
-                confirmLabel="Disconnect"
-                isConfirming={disconnectMutation.isPending}
+                confirmLabel="Revoke"
+                isConfirming={revokeGrantMutation.isPending}
                 onConfirm={() => {
-                    if (pendingDisconnect) disconnectMutation.mutate(pendingDisconnect.id);
+                    if (pendingRevokeGrant) revokeGrantMutation.mutate(pendingRevokeGrant.id);
                 }}
-                onCancel={() => setPendingDisconnect(null)}
+                onCancel={() => setPendingRevokeGrant(null)}
             />
 
             {/* The plaintext token, shown exactly once. */}
             <Modal
                 open={issued !== null}
                 onClose={() => setIssued(null)}
+                fallbackFocusRef={nameRef}
                 titleId="mcp-token-issued-title"
                 dismissOnBackdrop={false}
                 className="max-w-xl"

@@ -26,6 +26,7 @@ public sealed class PriceSnapshotImportStep
         var read = 0;
         var skipped = 0;
         var rows = new List<SecurityPriceRow>();
+        var currencyBySecurity = new Dictionary<string, string>(StringComparer.Ordinal);
 
         foreach (var item in context.Export.AllItems)
         {
@@ -33,7 +34,26 @@ public sealed class PriceSnapshotImportStep
             read++;
 
             var csnap = MdCsnap.From(item);
-            var result = PriceSnapshotMapper.Map(csnap, context.SecurityByMdId, context.LedgerId);
+
+            // ADR-0114: a snapshot's rate is relative to its security's relative
+            // currency (`rel_curr_id`) when MD records one, else to the file's base
+            // currency, and the price is in that currency. A snapshot of a plain
+            // currency (an exchange rate) is not a price and is skipped by the
+            // mapper. A file whose price currency cannot be read never gets here:
+            // the preview and ImportAsync refuse it (MdCurrencies.Problems). Throw
+            // rather than stamp a currency the file does not name.
+            if (!context.SecurityByMdId.ContainsKey(csnap.CurrId))
+            {
+                skipped++;
+                continue;
+            }
+            if (!currencyBySecurity.TryGetValue(csnap.CurrId, out var priceCurrency))
+            {
+                priceCurrency = context.Currencies.RequirePriceCurrency(csnap.CurrId);
+                currencyBySecurity[csnap.CurrId] = priceCurrency;
+            }
+
+            var result = PriceSnapshotMapper.Map(csnap, context.SecurityByMdId, priceCurrency, context.LedgerId);
             if (result.Row is null)
             {
                 skipped++;

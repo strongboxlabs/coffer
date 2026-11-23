@@ -15,11 +15,12 @@ namespace Coffer.Api.Tests.Integration.Accounts;
 /// tax_status is rejected with the stable 422 code.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class TaxStatusAndClassificationTests
+public sealed class TaxStatusAndClassificationTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public TaxStatusAndClassificationTests(PostgresFixture fixture) => _fixture = fixture;
+    public TaxStatusAndClassificationTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -32,10 +33,10 @@ public sealed class TaxStatusAndClassificationTests
     [Fact]
     public async Task Account_update_sets_and_returns_tax_status()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Retirement");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var patch = await client.PatchAsJsonAsync(
@@ -47,7 +48,7 @@ public sealed class TaxStatusAndClassificationTests
                 IsActive = true,
                 TaxStatus = "tax_deferred",
             });
-        Assert.Equal(HttpStatusCode.NoContent, patch.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, patch.StatusCode);
 
         var get = await client.GetAsync(
             $"/api/ledgers/{ledger.LedgerId}/accounts/{brokerage.Id}");
@@ -59,10 +60,10 @@ public sealed class TaxStatusAndClassificationTests
     [Fact]
     public async Task Account_update_rejects_invalid_tax_status()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Retirement");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var patch = await client.PatchAsJsonAsync(
@@ -83,10 +84,10 @@ public sealed class TaxStatusAndClassificationTests
     [Fact]
     public async Task Security_patch_sets_and_returns_classification_dimensions()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var sec = await ledger.AddSecurityAsync(name: "Large Cap Index", ticker: "LCI");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var patch = await client.PatchAsJsonAsync(

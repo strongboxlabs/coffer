@@ -8,7 +8,7 @@ namespace Coffer.Api.Tests.Integration.Infra;
 /// These are fixture invariants rather than product behaviour, but they are load
 /// bearing: a matrix whose cases disagree about the price move makes cross-magnitude
 /// invariance false, and a test written against that property then fails in a way
-/// that looks like a bug in the code under test. That happened once already.
+/// that looks like a bug in the code under test.
 /// </remarks>
 public sealed class BoundaryFixtureTests
 {

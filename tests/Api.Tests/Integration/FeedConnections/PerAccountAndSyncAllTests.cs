@@ -28,13 +28,11 @@ namespace Coffer.Api.Tests.Integration.FeedConnections;
 /// </list>
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class PerAccountAndSyncAllTests
+public sealed class PerAccountAndSyncAllTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public PerAccountAndSyncAllTests(PostgresFixture fixture)
+    public PerAccountAndSyncAllTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -84,9 +82,9 @@ public sealed class PerAccountAndSyncAllTests
     {
         // SimpleFIN feed has two accounts; per-account sync should
         // pass `?account=sf-A` and land only sf-A's transactions.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var keys = _fixture.NewLedgerKeyService();
-        await using (var seed = _fixture.NewDbContext())
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var keys = Db.NewLedgerKeyService();
+        await using (var seed = Db.NewDbContext())
         {
             var row = await seed.Ledgers.SingleAsync(l => l.Id == ledger.LedgerId);
             row.WrappedLek = keys.CreateWrappedLek();
@@ -110,7 +108,7 @@ public sealed class PerAccountAndSyncAllTests
                       ]}
                     ]}
                     """) });
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => new SimpleFinClient(new HttpClient(recording), TimeProvider.System));
         using var client = await AuthedClientAsync(factory, ledger);
 
@@ -144,7 +142,7 @@ public sealed class PerAccountAndSyncAllTests
         var query = Assert.Single(recording.CapturedQueries);
         Assert.Contains("account=sf-A", query, StringComparison.Ordinal);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var headers = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId)
             .ToListAsync();
@@ -155,10 +153,10 @@ public sealed class PerAccountAndSyncAllTests
     [Fact]
     public async Task Per_account_sync_422s_with_account_not_bound_to_feed_when_account_has_no_mapping()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("unbound");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -177,9 +175,9 @@ public sealed class PerAccountAndSyncAllTests
         // a clean account, second returns 403 (needs_reauth). The
         // aggregate response carries both outcomes; hadAnyFailure
         // is true because of the needs_reauth.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var keys = _fixture.NewLedgerKeyService();
-        await using (var seed = _fixture.NewDbContext())
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var keys = Db.NewLedgerKeyService();
+        await using (var seed = Db.NewDbContext())
         {
             var row = await seed.Ledgers.SingleAsync(l => l.Id == ledger.LedgerId);
             row.WrappedLek = keys.CreateWrappedLek();
@@ -192,7 +190,7 @@ public sealed class PerAccountAndSyncAllTests
         // → success body; second GET → 403. We track GET count
         // to disambiguate which connection is being synced.
         var getCount = 0;
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(req =>
             {
                 if (req.Method == HttpMethod.Post)

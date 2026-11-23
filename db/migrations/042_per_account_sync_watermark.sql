@@ -4,7 +4,7 @@
 -- feed_connections.last_synced_at: subsequent syncs ask for
 -- (last_synced_at - 7d) to now, instead of the full 90 days every
 -- time. The watermark is per-CONNECTION, which produces a
--- correctness gap found on a real run:
+-- correctness gap:
 --
 --   1. User wipes the DB and reconnects SimpleFIN.
 --   2. First sync runs BEFORE any account is mapped on the Coffer

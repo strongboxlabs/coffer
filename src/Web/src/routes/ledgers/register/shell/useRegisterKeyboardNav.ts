@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { happenedInside } from '@/components/ui/popoverDismissal';
+
 /**
- * Shared register keyboard-navigation controller (review #18).
- * Extracted verbatim from the duplicated focus + keyboard wiring
- * BankRegisterPage and InvestmentRegisterPage each reimplemented:
+ * Shared register keyboard-navigation controller: the focus +
+ * keyboard wiring BankRegisterPage and InvestmentRegisterPage would
+ * otherwise each reimplement:
  *
  *   * `focusedRowId` state + its synchronous ref-mirror (so OS
  *     auto-repeat on a held arrow key, and click-then-immediate-
@@ -11,13 +13,21 @@ import { useCallback, useEffect, useRef, useState } from 'react';
  *     last-commit value),
  *   * `moveFocus(delta)` — edge-paginate + clamp + scrollIntoView,
  *   * the document-level ArrowUp / ArrowDown / Enter (+ optional `N`)
- *     keydown handler with the typing-target guard.
+ *     keydown handler with the typing-target guard, which leaves every
+ *     key pressed in a dialog, a menu or a list to that popup.
  *
  * The two pages differ only in the row collection, the per-row id
  * extractor, how the scroll index maps (logical vs local), whether
  * `N` opens a new row, and what Enter does on the focused row — all
  * parameterized below. The control flow is byte-for-byte the same.
  */
+
+/**
+ * A popup layered over the register, whose keys are its own. The register's
+ * shortcuts (these keys, and the date jump's Ctrl/⌘+J) leave a key pressed
+ * inside one to it.
+ */
+export const POPUP = '[role="dialog"], [role="menu"], [role="listbox"]';
 
 export interface UseRegisterKeyboardNavArgs<Row> {
     /** The visible row collection in display order. */
@@ -33,16 +43,16 @@ export interface UseRegisterKeyboardNavArgs<Row> {
     onLoadOlder: () => void;
     /** When true (a client-side status filter is active), do NOT paginate at
      *  the window edges — the sparse filtered subset would auto-load itself
-     *  into eviction (the flash-then-blank bug, #322). Mirrors the virtuoso
+     *  into eviction (rows flash and then blank). Mirrors the virtuoso
      *  edge-load suppression; both read the single `isClientFiltered` rule so
      *  the policy can't drift between mouse and keyboard, or between pages. */
     suppressEdgeLoad?: boolean;
     /** Scroll a freshly-focused row into view. `localIndex` is the row's
      *  position inside `rows`, and that is what virtuoso's `scrollIntoView` /
      *  `scrollToIndex` want — they are never given `firstItemIndex` and so
-     *  cannot compensate for one. This used to tell callers to ADD their
-     *  `firstItemIndex` offset, which made bank scroll to the wrong row
-     *  whenever the window had shifted. Pass the local index unmodified. */
+     *  cannot compensate for one. Adding a `firstItemIndex` offset scrolls
+     *  to the wrong row whenever the window has shifted. Pass the local
+     *  index unmodified. */
     scrollRowIntoView: (localIndex: number) => void;
     /** False while an edit row / new-row form is open — suppresses
      *  the document handler so the editor owns the keyboard. */
@@ -157,6 +167,15 @@ export function useRegisterKeyboardNav<Row>({
 
     useEffect(() => {
         function onDocKeyDown(e: globalThis.KeyboardEvent) {
+            // A key pressed in a dialog (a Modal, the date-jump popover), a
+            // menu (a row's actions) or a list (the Show and Sort options) is
+            // that popup's. The register is behind it: N would open a new row
+            // under the popup, and an arrow, which a menu uses to move between
+            // its items, would also move the row focus where nobody is looking.
+            // Read from the key's path (ADR-0023 §L): a control in the popup can
+            // take itself away as the key goes down, before this listener runs,
+            // and the popup is no longer among its ancestors then.
+            if (happenedInside(e, POPUP)) return;
             const target = e.target as HTMLElement | null;
             const tag = target?.tagName;
             // Text-like inputs (text/number/date/search/email) and
@@ -166,14 +185,14 @@ export function useRegisterKeyboardNav<Row>({
             // one is focused (this is what makes
             // Enter-after-checkbox-click reliably open edit).
             //
-            // BUTTONS are a different story, and this comment used to
-            // lump them in with checkboxes. A row carries two of them —
+            // BUTTONS are a different story from checkboxes. A row carries
+            // two of them —
             // the status-cycle control and the split-parent's expand
             // toggle — and Enter is their NATIVE activation key, so
             // letting the row handler fire as well means one keypress
             // does two things: cycle the status AND open the editor, or
             // toggle the split AND open the editor. See the Enter
-            // branch below, which now returns early for them.
+            // branch below, which returns early for them.
             const isTextLikeInput =
                 tag === 'INPUT'
                 && (() => {
@@ -216,7 +235,7 @@ export function useRegisterKeyboardNav<Row>({
                 // actually opens edit — preserving the per-page
                 // originals, which left the default intact on
                 // non-editable focused rows (split legs, read-only
-                // target clusters).
+                // rows: opposite-side lines, event counterparts).
                 onEnterRow(currentId, e);
             } else if (e.key === 'ArrowDown') {
                 if (isTypingTarget) return;
@@ -234,8 +253,8 @@ export function useRegisterKeyboardNav<Row>({
             ) {
                 if (isTypingTarget) return;
                 if (!enabled) return;
-                // Both guards are the ones the Enter branch learned the hard
-                // way, and they matter here for the same reason: a row carries
+                // Both guards are the Enter branch's, and they matter here for
+                // the same reason: a row carries
                 // buttons, and arrows are how a focused control moves between
                 // its own options. Acting as well would make one keypress do
                 // two things.

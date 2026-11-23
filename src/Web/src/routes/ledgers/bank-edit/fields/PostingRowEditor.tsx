@@ -2,12 +2,12 @@
  * One leg row of a split transaction, on the splits grid's own five columns:
  * `# · Category · Tags · Memo · Amount · actions`.
  *
- * WHY ITS OWN GRID AND NOT THE REGISTER'S EIGHT TRACKS. Leg rows used to ride
- * the register template so each field sat under its root counterpart. That
- * bought vertical alignment with the rows above and paid for it three times
- * over: columns 1-3 were always empty (three tracks of dead width on every leg
- * of every split), the category and memo had to stack inside ONE track to fit,
- * and a leg row was therefore ~62px tall. Twenty-five of those is 1550px of
+ * WHY ITS OWN GRID AND NOT THE REGISTER'S EIGHT TRACKS. Leg rows on the
+ * register template, each field under its root counterpart, buy vertical
+ * alignment with the rows above and pay for it three times over: columns 1-3
+ * are always empty (three tracks of dead width on every leg of every split),
+ * the category and memo have to stack inside ONE track to fit, and a leg row
+ * is therefore ~62px tall. Twenty-five of those is 1550px of
  * editor — a form whose Save button you cannot see from the row you are
  * editing. On its own grid a leg row is 30px and the fields sit side by side.
  * The root row still rides the register template, so the transaction's own
@@ -41,7 +41,9 @@ import { useEffect, useRef, useState } from 'react';
 
 import { AccountCategoryPicker } from '@/components/register/AccountCategoryPicker';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
+import { MoneyInput } from '@/components/ui/MoneyInput';
 import { RowActionsButton } from '@/components/ui/RowActionsButton';
+import { pendingTextProps } from '@/components/ui/pending';
 import { cn } from '@/lib/cn';
 import { counterpartyWords, type CounterpartyKind } from '@/lib/counterparty';
 import type { AccountSummary, FrequentCounterpartiesResponse } from '@/lib/types';
@@ -50,6 +52,10 @@ import type { PostingDraft } from '../postingDraft';
 import type { PostingIssue, PostingIssueKind } from '../validation';
 import type { TagDto } from '@/lib/types';
 import { TagSelect } from '@/components/tags/TagSelect';
+import { tagCountCeiling } from '@/lib/annotations/notes';
+import { GripIcon } from '@/components/ui/GripIcon';
+import type { SecondAmountSide } from '@/lib/secondAmount';
+import { SplitSecondAmount } from './SecondAmountField';
 
 interface PostingRowEditorProps {
     posting: PostingDraft;
@@ -73,10 +79,25 @@ interface PostingRowEditorProps {
      *  (ADR-0103). Passed down rather than fetched — this file is
      *  presentational, per the boundary rule in ../README.md. */
     allTags: readonly TagDto[];
+    /** The currency this line's Amount is typed in: its symbol, step and rounding
+     *  (ADR-0114 D14, D15). */
+    currency: string;
+    /** This line's second amount, the other account's own figure, while its
+     *  counterparty is a real account in another currency (ADR-0114 D14); null otherwise. */
+    side: SecondAmountSide | null;
+    /** The grid has the second amount's column, because some line has one: a line with
+     *  none leaves it empty. */
+    secondColumn: boolean;
+    /** For the second amount's derived-rate prefill. */
+    ledgerId: string;
+    /** The entry's date, `yyyy-MM-dd`. */
+    date: string;
     /** The splits grid's column template — shared with the header and
      *  footer strips so all three line up. */
     cols: string;
-    disabled: boolean;
+    /** The editor's save is in flight: the fields are disabled, and the row
+     *  menu's button keeps focus and refuses to open (pending.ts). */
+    pending: boolean;
     /** True for the most-recently-added posting; the amount input
      *  focuses itself on mount so the user can start typing
      *  immediately after clicking Add split. */
@@ -92,6 +113,9 @@ interface PostingRowEditorProps {
      *  row to the top of its scrollport and give the panel room. */
     onChange: (fields: Partial<PostingDraft>) => void;
     onRemove: () => void;
+    /** The ref for the row's actions button, for when Remove split takes the
+     *  row away (useRowRemovalFocus). */
+    actionsRef?: (el: HTMLElement | null) => void;
     /** Nudge this row one slot. The parent bounds-checks too. */
     onMove: (delta: -1 | 1) => void;
     onDragStart: () => void;
@@ -111,14 +135,20 @@ export function PostingRowEditor({
     counterpartyKind,
     frequent,
     allTags,
+    currency,
+    side,
+    secondColumn,
+    ledgerId,
+    date,
     cols,
-    disabled,
+    pending,
     autoFocusAmount,
     onAutoFocused,
     fieldId,
     dragging,
     onChange,
     onRemove,
+    actionsRef,
     onMove,
     onDragStart,
     onDragEnd,
@@ -138,6 +168,7 @@ export function PostingRowEditor({
     const canRemove = count > 1;
     const badAmount = issues.some((i) => i.kind === 'amount');
     const badCounterparty = issues.some((i) => i.kind === 'counterparty');
+    const badSecond = issues.some((i) => i.kind === 'second');
     const bad = issues.length > 0;
 
     const amount = Number(posting.amount);
@@ -147,13 +178,13 @@ export function PostingRowEditor({
      * agree). The investment register uses the opposite pairing, plain for
      * debits and green for credits, and each register is internally consistent.
      *
-     * This editor first followed the INVESTMENT convention, on the reasoning
-     * that red is also the error colour in this grid so a split of ordinary
-     * expenses would read as twenty-five errors. That was wrong twice over: it
-     * is the BANK editor, so it sits inside and visually replaces bank register
-     * rows — every leg of a paycheck was red in the register and plain the
-     * instant you opened it, which is the same number contradicting itself. And
-     * the collision it was avoiding does not really exist: a defect here is
+     * Not the INVESTMENT convention, though red is also the error colour in
+     * this grid and a split of ordinary expenses might seem to read as
+     * twenty-five errors. This is the BANK editor, so it sits inside and
+     * visually replaces bank register rows — under the other convention every
+     * leg of a paycheck would be red in the register and plain the instant you
+     * opened it, the same number contradicting itself. And the collision does
+     * not really exist: a defect here is
      * signalled by a tinted row, an inset bar, a red field BORDER, a red row
      * number and a marker icon, none of which is a figure's text colour.
      */
@@ -233,10 +264,8 @@ export function PostingRowEditor({
                 {n}
             </span>
 
-            {/* col2 — category picker + this posting's tags, side by side.
-                The slot was reserved at a fixed width while tags were header-only
-                (ADR-0009) precisely so landing them here would not reshuffle the
-                form; ADR-0103 filled it. */}
+            {/* col2 — category picker + this posting's tags (ADR-0103), side by
+                side, in one slot so the tags do not reshuffle the form. */}
             <div className="flex min-w-0 items-center gap-1">
                 <div className="min-w-0 flex-1">
                     <AccountCategoryPicker
@@ -248,23 +277,23 @@ export function PostingRowEditor({
                         onChangeId={(id) => onChange({ counterpartyId: id })}
                         placeholder="Category or account…"
                         ariaLabel={`Posting ${n} ${counterpartyWords(counterpartyKind).lower}`}
-                        disabled={disabled}
+                        pending={pending}
                         invalid={badCounterparty}
-                        // `compact` is now only a preference for a shorter
-                        // list — the panel is fixed to the viewport and sized to
-                        // the room below, so it no longer needs the grid to
-                        // scroll this row to the top to make space. That scroll
-                        // was what moved the list out from under the row you had
-                        // just clicked.
+                        // `compact` is only a preference for a shorter list —
+                        // the panel is fixed to the viewport and sized to the
+                        // room below, so the grid need not scroll this row to
+                        // the top to make space. Such a scroll would move the
+                        // list out from under the row you just clicked.
                         compact
                     />
                 </div>
                 <TagSelect
                     compact
                     tags={posting.tags}
+                    maxCount={tagCountCeiling(posting.tagBaseline)}
                     allTags={allTags}
                     onChange={(tags) => onChange({ tags })}
-                    disabled={disabled}
+                    pending={pending}
                     aria-label={`Posting ${n} tags`}
                 />
             </div>
@@ -279,43 +308,53 @@ export function PostingRowEditor({
             <textarea
                 rows={1}
                 value={posting.legMemo}
-                disabled={disabled}
                 placeholder="Memo (optional)"
                 aria-label={`Posting ${n} memo`}
                 onChange={(e) => onChange({ legMemo: e.target.value })}
                 onKeyDown={(e) => {
                     if (e.key === 'Enter' && e.shiftKey) e.stopPropagation();
                 }}
-                className="h-control-28px w-full resize-none overflow-y-auto rounded border border-border bg-surface px-2 py-1 text-xs leading-tight focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
+                className="h-control-28px w-full resize-none overflow-y-auto rounded border border-border bg-surface px-2 py-1 text-xs leading-tight focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
+                {...pendingTextProps<HTMLTextAreaElement>(pending)}
             />
 
             {/* col4 — leg amount. */}
-            <input
+            <MoneyInput
                 id={fieldId('amount')}
                 ref={amountRef}
-                type="number"
-                step="0.01"
-                inputMode="decimal"
+                currency={currency}
                 value={posting.amount}
-                placeholder="0.00"
-                disabled={disabled}
+                pending={pending}
                 aria-label={`Posting ${n} amount`}
                 aria-invalid={badAmount || undefined}
-                onChange={(e) => onChange({ amount: e.target.value })}
-                onBlur={(e) => {
-                    const text = e.target.value.trim();
-                    if (text.length === 0) return;
-                    const v = Number(text);
-                    if (!Number.isNaN(v)) onChange({ amount: v.toFixed(2) });
-                }}
+                onValueChange={(amount) => onChange({ amount })}
                 className={cn(
                     'h-control-28px w-full rounded border bg-surface px-2 text-right font-mono text-xs tabular-nums focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+                    'aria-disabled:cursor-not-allowed aria-disabled:opacity-50',
                     badAmount ? 'border-state-danger' : 'border-border',
                     amountTone,
                 )}
             />
 
-            {/* col5 — drag handle, defect marker, row menu. Quiet at rest and
+            {/* col5 while the grid has it — the second amount (ADR-0114 D14), its rate
+                line on a second row of the leg, ending under the field. */}
+            {side !== null ? (
+                <SplitSecondAmount
+                    ledgerId={ledgerId}
+                    posting={posting}
+                    side={side}
+                    currency={currency}
+                    date={date}
+                    pending={pending}
+                    onPatch={onChange}
+                    n={n}
+                    id={fieldId('second')}
+                    invalid={badSecond}
+                />
+            ) : secondColumn ? <span aria-hidden /> : null}
+
+
+            {/* Last column — drag handle, defect marker, row menu. Quiet at rest and
                 emphasised on the row you are working in: twenty-five loud
                 kebabs is noise, but hiding them entirely is the affordance
                 failure ADR-0021 Rule 10 exists to prevent, so they stay
@@ -337,25 +376,30 @@ export function PostingRowEditor({
                     role="button"
                     aria-label={`Reorder posting ${n}`}
                     title="Drag to reorder, or Alt+↑ / Alt+↓"
-                    draggable={!disabled && canRemove}
+                    draggable={!pending && canRemove}
                     onDragStart={(e) => {
                         e.dataTransfer.setData('text/posting-key', posting.key);
                         e.dataTransfer.effectAllowed = 'move';
                         onDragStart();
                     }}
                     onDragEnd={onDragEnd}
-                    className="flex size-control-20px cursor-grab select-none items-center justify-center text-text-subtle opacity-50 transition-opacity group-hover/leg:opacity-100 group-focus-within/leg:opacity-100"
+                    // A grip that cannot be dragged (the row saves, or it is the
+                    // only leg) offers no drag; while the row saves it also
+                    // keeps its resting dim and shows no hover, as a pending
+                    // control does.
+                    className={cn(
+                        'flex size-control-20px select-none items-center justify-center text-text-subtle opacity-50 transition-opacity',
+                        !pending && canRemove ? 'cursor-grab' : 'cursor-default',
+                        !pending && 'group-hover/leg:opacity-100 group-focus-within/leg:opacity-100',
+                    )}
                 >
-                    <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                        <circle cx="6" cy="3" r="1.3" /><circle cx="10" cy="3" r="1.3" />
-                        <circle cx="6" cy="8" r="1.3" /><circle cx="10" cy="8" r="1.3" />
-                        <circle cx="6" cy="13" r="1.3" /><circle cx="10" cy="13" r="1.3" />
-                    </svg>
+                    <GripIcon />
                 </span>
                 <RowActionsButton
+                    ref={actionsRef}
                     size="sm"
                     label={`Actions for posting ${n}`}
-                    disabled={disabled}
+                    pending={pending}
                     className="opacity-50 transition-opacity group-hover/leg:opacity-100 group-focus-within/leg:opacity-100"
                     onOpen={({ x, y }) => setMenu({ x, y })}
                 />

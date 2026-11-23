@@ -19,7 +19,6 @@ using Coffer.Api.Db;
 using Coffer.Api.Db.Entities;
 using Coffer.Api.Db.Repositories;
 using Coffer.Api.Db.Services;
-using Coffer.Api.Provisioning;
 using Coffer.Api.Errors;
 
 namespace Coffer.Api.Endpoints;
@@ -208,7 +207,7 @@ public static class SetupEndpoints
         // gone — and its own key is a new one, so without this every secret sealed under
         // the old key (bank feeds, the stored passphrase, Drive, notification targets) is
         // cleared on the first boot. operations.md and install.sh tell the operator to paste
-        // it here; until now there was nowhere to paste it.
+        // it here.
         var (keyFailure, _) = await RestoreSourceKey
             .StageIfSuppliedAsync(form[RestoreSourceKey.FormField].ToString(), cancellationToken)
             .ConfigureAwait(false);
@@ -257,11 +256,10 @@ public static class SetupEndpoints
             return Results.Problem("Invalid or expired bootstrap token.",
                 statusCode: StatusCodes.Status401Unauthorized);
 
-        // No ledger list any more (ADR-0088). This used to return every ledger on
-        // the install so the form could offer "join an existing one" — but on a
-        // fresh install the only rows were empty placeholders from migration 055,
-        // which made the choice actively misleading. Migration 186 drops them, and
-        // ledgers are now created after setup from the hub. Token validation above
+        // No ledger list (ADR-0088). A fresh install has no ledgers to join —
+        // migration 186 drops migration 055's empty placeholders — so offering
+        // "join an existing one" would be actively misleading; ledgers are
+        // created after setup from the hub. Token validation above
         // is what this endpoint is actually for.
         // The part size travels with the token check because the setup page has
         // no other authenticated read, and hardcoding it in the SPA would make
@@ -359,7 +357,6 @@ public static class SetupEndpoints
         CredentialsRepository credentials,
         SessionService sessions,
         ServiceDbContextFactory serviceFactory,
-        ProvisioningService provisioning,
         ILoggerFactory loggerFactory,
         IOptions<ApiOptions> apiOptions,
         // ADR-0092 D2: setup is where the operator is first shown the master key.
@@ -380,11 +377,11 @@ public static class SetupEndpoints
             return BusinessError.Problem(BusinessError.Codes.SetupAttestationRequired,
                 "attestationResponse is required.");
 
-        // No ledger-choice gate any more (ADR-0088). Setup creates the user and
-        // passkey; the ledger hub is the post-setup home and offers "New ledger"
-        // and "Import from Moneydance". Zero ledgers is a supported landing —
-        // the hub renders an empty state with both CTAs, so the dead end the old
-        // mandatory choice guarded against no longer exists.
+        // No ledger question at all (ADR-0088, amended by ADR-0115 D2). Setup creates
+        // the user and passkey; the ledger hub is the post-setup home and offers
+        // "Import from Moneydance", "Demo ledger" and "New ledger". Zero ledgers is a
+        // supported landing — the hub renders an empty state with those choices, so
+        // the dead end the old mandatory choice guarded against no longer exists.
 
         var challenge = await challenges.ConsumeAsync(
             request.ChallengeId, ChallengeStore.SetupFlow, cancellationToken).ConfigureAwait(false);
@@ -478,14 +475,11 @@ public static class SetupEndpoints
         }
 
         // No ledger is created here (ADR-0088), and therefore no grant — so
-        // nothing in this transaction can trip the deferred ≥1-owner trigger. The
-        // Demo ledger, if requested, is created post-commit by the import
-        // pipeline, which owns ledger creation for imports (new-ledger-only,
-        // ADR-0052) and grants ownership as part of that.
+        // nothing in this transaction can trip the deferred ≥1-owner trigger.
 
-        // Setup has happened, for good. First-run setup used to re-arm whenever no
-        // passkey existed, so a populated install whose user deleted their last
-        // passkey offered pre-auth setup and restore again (2026-10-12 audit, S3).
+        // Setup has happened, for good. Setup that re-arms whenever no passkey exists
+        // would offer pre-auth setup and restore again on a populated install whose
+        // user deleted their last passkey (ADR-0105 D7).
         // Same transaction as the user, so neither exists without the other.
         if (!await db.SystemSettings.AnyAsync(
                 s => s.Key == SystemSettingsRepository.SetupCompletedKey, cancellationToken)
@@ -533,36 +527,6 @@ public static class SetupEndpoints
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
-        // Optional Demo ledger (ADR-0088). Best-effort, post-commit — setup has
-        // already succeeded, so a slow or failing import costs the sample data,
-        // never the passkey registration. The user simply lands on the hub with
-        // no ledgers and can create or import one there.
-        //
-        // The seeder is deliberately NOT run here: the sample dataset carries its
-        // own category tree, so layering the starter catalogue on top would
-        // duplicate every row. Since ADR-0091 that tree and the starter catalogue
-        // are the same set — the catalogue is generated from this very export —
-        // so Demo and a hub-created ledger (which does run the seeder, via
-        // LedgersEndpoints) end up with identical categories by different routes.
-        Guid? ledgerId = null;
-        string? ledgerName = null;
-        if (request.IncludeDemo)
-        {
-            try
-            {
-                var demo = await provisioning
-                    .ProvisionDemoAsync(metadata.UserId, cancellationToken)
-                    .ConfigureAwait(false);
-                ledgerId   = demo.LedgerId;
-                ledgerName = demo.Name;
-            }
-            catch (Exception ex)
-            {
-                loggerFactory.CreateLogger("Coffer.Api.Provisioning")
-                    .LogWarning(ex, "Demo ledger seed failed during setup for user {UserId}.", metadata.UserId);
-            }
-        }
-
         // Issue a cookie session so the browser ends up logged in as the
         // newly created user without an extra round-trip.
         var session = await sessions.IssueAsync(
@@ -594,7 +558,7 @@ public static class SetupEndpoints
         }
 
         // The body carries the master key and the recovery codes: no cache may keep it
-        // (2026-10-12 audit, N4) — the same header the reveal endpoints send.
+        // (ADR-0105 D8) — the same header the reveal endpoints send.
         http.Response.Headers.CacheControl = "no-store, no-cache, must-revalidate";
         return Results.Ok(new SetupCompleteResponse(
             UserId: metadata.UserId,
@@ -602,8 +566,6 @@ public static class SetupEndpoints
             SessionId: session.SessionId,
             SessionExpiresAt: session.ExpiresAt,
             RecoveryCodes: recoveryPlaintext,
-            LedgerId: ledgerId,
-            LedgerName: ledgerName,
             MasterKeyBase64: Convert.ToBase64String(masterKey.KeyBytes)));
     }
 

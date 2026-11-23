@@ -8,7 +8,7 @@
 -- another, captured as a pair of legs.
 --
 -- Pre-065 the invariant was an unenforced convention. The importer's
--- pre-A4 leg-upsert logic could (and did) produce 3+-leg postings when
+-- pre-A4 leg-upsert logic could produce 3+-leg postings when
 -- the same logical purchase ended up under TWO Ledger account_ids
 -- (SimpleFIN + MD dual-source bug). Migration 064 / Slice 1 fixed the
 -- producer; this migration locks the invariant at the DB level so no
@@ -17,9 +17,9 @@
 -- BALANCE-TO-ZERO NOTE
 -- --------------------
 -- The original P3 spec called for "legs sum to zero" enforcement on
--- top of the 2-leg rule. Real MD data carries legitimate one-sided
--- events (SHARE CLASS EXCHANGE, DIST TO OWNER BASIS) where one leg
--- has amount=0 by design — the share-side effect is real, the cash
+-- top of the 2-leg rule. MD admits legitimate one-sided events
+-- (e.g. a share-class exchange, or a distribution that returns basis)
+-- where one leg has amount=0 by design — the share-side effect is real, the cash
 -- side is intentionally zero. The current implementation enforces
 -- the 2-leg cardinality only; balance enforcement is deferred until
 -- a richer posting model can accommodate one-sided corporate actions.

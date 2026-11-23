@@ -2,9 +2,8 @@ namespace Coffer.Api.Migrations;
 
 /// <summary>
 /// Walks up from the running assembly's directory to find <c>db/migrations</c>.
-/// Mirrors the helper in the importer's test fixture so dev runs, tests, and
-/// container deployments (where migrations are copied alongside the binary)
-/// all land on the same lookup rule.
+/// Dev runs, both test projects, and container deployments (where migrations are
+/// copied alongside the binary) all use this one lookup rule.
 /// </summary>
 public static class MigrationsDirectoryLocator
 {

@@ -4,15 +4,9 @@
 -- Migration 240 gave `fn_price_is_unbacked(ledger, security, date, source)`, a
 -- per-ROW predicate. Correct, and the wrong shape: each call runs
 -- fn_trade_price_for_day, which scans that security's legs for that one day. A
--- price list therefore rescans the same legs once per row.
---
--- Measured on a real security with a long price history, a substantial share
--- of it trade-source:
---
---   per-row predicate   728 ms
---   one pass             14 ms
---
--- 54x, for the same answer. The per-row form is kept — the paginated UI list
+-- price list therefore rescans the same legs once per row, a cost that grows with
+-- the length of the price history; one pass scans them once, for the same
+-- answer. The per-row form is kept — the paginated UI list
 -- can still use it for a page of 50, and it reads clearly — but anything
 -- covering a whole price history has to use this instead.
 --
@@ -48,7 +42,8 @@ $$;
 COMMENT ON FUNCTION fn_unbacked_price_dates(uuid, uuid) IS
     'Dates on which this security has a trade-source price that no trade '
     'currently derives. One pass over the security''s legs — the per-row '
-    'fn_price_is_unbacked costs 54x as much across a full price history. '
+    'fn_price_is_unbacked rescans them once per price row, a cost that grows '
+    'with the length of the price history. '
     'Advisory: such a price may still be correct (ADR-0084 D4).';
 
 GRANT EXECUTE ON FUNCTION fn_unbacked_price_dates(uuid, uuid)

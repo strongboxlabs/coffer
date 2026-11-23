@@ -1,9 +1,9 @@
 # 0091 — One category taxonomy for Demo and new ledgers
 
-* Status: Accepted
+* Status: Accepted (amended 2026-11-18: 108 categories, nested to three levels, with a third kind, `adjustment`, carried by a fail-closed `coffer_category_kind` key)
 * Date: 2026-08-03
 * Narrows: [ADR-0071](0071-install-provisioning-ui-import-authed-restore.md) D5 (starter categories)
-* Relates: [ADR-0017](0017-account-discriminator.md) (categories are accounts), [ADR-0088](0088-setup-asks-one-question.md) (Demo is an opt-in at setup)
+* Relates: [ADR-0017](0017-account-discriminator.md) (categories are accounts), [ADR-0088](0088-setup-asks-one-question.md) (the Demo brings its own categories; added from the hub since 2026-11-18, [ADR-0115](0115-the-demo-is-generated-imported-and-seeded-from-the-hub.md))
 
 ## Context
 
@@ -22,8 +22,7 @@ nothing was truncated. The sets were simply **unrelated taxonomies**: only about
 `Healthcare`, `Tax`, `Loan`, `Childcare`, `Pet Care`. A user who explored Demo
 and then made their own ledger found the vocabulary changed underneath them.
 
-Two claims made while diagnosing this were **wrong**, and are recorded so they
-are not "fixed" later:
+Two things that look like defects are **not**, and must not be "fixed":
 
 - **`Investment` appearing twice is not a duplicate.** One is `expense` (child:
   `Trading Commission`), the other `income` (children: `Dividends`,
@@ -32,7 +31,7 @@ are not "fixed" later:
 - **`Bank Charge` is not a transaction type.** Bank fees are a legitimate expense
   category, with sensible children (`Interest Paid`, `Service Charges`).
 
-Inspected in full, the Moneydance-derived tree is the better of the two: properly
+The Moneydance-derived tree is the better of the two: properly
 hierarchical, 108 entries, and it covers ground the starter set missed entirely
 (tax breakdown, loan interest vs principal, childcare, pet care).
 
@@ -71,9 +70,8 @@ generated from it.**
 **A generator is not enough, so there is a test.** Nothing stops someone editing
 the export and forgetting to regenerate, or hand-editing the JSON.
 `StarterCategoryParityTests` compares the two *files* and fails with the exact
-difference plus the regeneration command. It was verified by injecting a bogus
-category and confirming the failure, then regenerating — a parity test that
-cannot fail is worse than none.
+difference plus the regeneration command. An injected bogus category fails it —
+a parity test that cannot fail is worse than none.
 
 The same test pins the two corrections above: it asserts `Investment` exists
 under **both** kinds, so a future "dedupe by name" cannot quietly collapse it.
@@ -87,3 +85,57 @@ Installs created before this will still show the old 61/108 split.
 **Demo is now exemplary, not merely realistic.** It is what a new ledger looks
 like, populated — which is the only way "explore Demo, then start your own books"
 is an honest onboarding path.
+
+## Amendment, 2026-11-18 — the tree grows, nests to three levels, and has a third kind
+
+The taxonomy lacked shapes an ordinary household ledger needs: a utility line for
+broadband beside cable, somewhere for baby supplies under childcare, a home for a
+valuation adjustment, and any branch deeper than parent → child. Five rows are
+added to `data/samples/moneydance-export-demo.base.json`; none moves or is
+renamed, and every correction above stands. **103 → 108.**
+
+| Added | Kind | Note |
+|---|---|---|
+| `Bills > Internet` | expense | A leaf beside `Cable`, which is not renamed. |
+| `Childcare > Baby Supplies` | expense | `Childcare` becomes a parent and still takes postings directly. |
+| `Valuation Adjustment` | adjustment | Top level. The third kind (ADR-0017, mig 224): a markup moves an asset's value and is neither income nor spending. |
+| `Vacation > Travel > Airfare` | expense | The first third level. `Travel` keeps direct postings. |
+| `Vacation > Travel > Car Rental` | expense | Third level. |
+
+**The override key.** Moneydance has no third category kind, so the adjustment
+row stays a type `e` category and carries `"coffer_category_kind": "adjustment"`.
+The importer reads it (`MdAcct.CofferCategoryKind`) and `AccountMapper` turns that
+row's kind from `expense` into `adjustment`. A new type code was rejected: an
+unknown code is dropped as `UnknownTypeCode` and its postings are skipped, which
+fails open, while a type `e` row is still skipped by the import's balance check as
+every category is.
+
+**It fails closed.** The key is allowed only with the value `"adjustment"`, only on
+a type `e` row, and only at the top level (no parent, or MD's root). Any other
+value, the key on any other row type (checked before a root, a security or an
+unknown code is skipped), or the key on a child category throws
+`InvalidDataException` and fails the import, so nothing of it is committed.
+`starter-categories.gen.mjs` refuses the same cases.
+
+**Nested starter JSON.** `starter-categories.json` was a list of roots with string
+children that inherited the root's kind. It is now a tree of nodes, each carrying
+its own kind (`income`, `expense` or `adjustment`). The generator emits it
+recursively in a fixed kind order (income, expense, adjustment), alphabetically
+within a kind at every level; it dies on a tree deeper than three levels, on a
+child whose kind differs from its parent's, and on a repeated name within a kind
+and parent at any level. `StarterCategoriesSeeder` seeds the tree recursively and
+refuses a branch that mixes kinds before writing anything.
+
+**Parity at every depth.** `StarterCategoryParityTests` keys each entry by its full
+segment path and its kind, and applies the override on the export side as the
+importer does. It also asserts that an `adjustment` entry and
+`Vacation > Travel > Airfare` exist: without those, losing the override on both
+sides, or flattening both trees, would still compare equal. Parity compares the
+generator's output, the export the C# Demo generator writes from the embedded base
+(`DemoExportGenerator`, read through the tests' fixed-date short span), with the
+starter JSON (`starter-categories.gen.mjs`, projected from the same base). The
+Demo side is generated on every run, so it can never be stale: a base edit fails
+parity until the starter JSON is regenerated.
+
+Existing ledgers are untouched, as above: no migration adds these rows to a tree a
+user already has.

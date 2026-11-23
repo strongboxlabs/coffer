@@ -26,16 +26,17 @@ namespace Coffer.Api.Tests.Integration.Overview;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class CurrentBalanceEffectiveOrderTests
+public sealed class CurrentBalanceEffectiveOrderTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public CurrentBalanceEffectiveOrderTests(PostgresFixture fixture) => _fixture = fixture;
+    public CurrentBalanceEffectiveOrderTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     [Fact]
     public async Task An_override_that_moves_a_header_last_makes_its_balance_the_current_one()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("Checking", openingBalance: 1000m);
         var expense = await ledger.AddCategoryAsync("Groceries", "expense");
 
@@ -69,7 +70,7 @@ public sealed class CurrentBalanceEffectiveOrderTests
 
     private async Task<decimal> CurrentBalanceAsync(Guid accountId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.AccountCurrentBalances.AsNoTracking()
             .Where(b => b.AccountId == accountId)
             .Select(b => b.Balance)
@@ -78,7 +79,7 @@ public sealed class CurrentBalanceEffectiveOrderTests
 
     private async Task RecomputeAsync(Guid accountId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         _ = await db.RecomputeBalancesForAccount(
                 accountId, new DateTime(1, 1, 1, 0, 0, 0, DateTimeKind.Utc))
             .Select(r => r.AccountId)

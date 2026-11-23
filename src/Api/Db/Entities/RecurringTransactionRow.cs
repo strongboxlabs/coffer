@@ -67,8 +67,9 @@ internal sealed class RecurringTransactionRow
     /// "estimating from an unset N".
     /// <para>
     /// Only meaningful for a single-posting, non-loan, bank-shape series. A split has no
-    /// single amount to estimate, and a loan payment is computed from its terms and
-    /// current balance — real information an average would only degrade.
+    /// single amount to estimate, and a loan payment is computed from its terms, its
+    /// split from the loan's balance as of the payment's own date — real information an
+    /// average would only degrade.
     /// </para>
     /// </remarks>
     public int? EstimateSampleCount { get; set; }
@@ -84,7 +85,7 @@ internal sealed class RecurringTransactionRow
 
     /// <summary>Passive parity flag carried from import (ADR-0047). Set true
     /// for a managed loan-payment reminder — its split is computed from
-    /// loan_terms + the loan balance at fire/display time.</summary>
+    /// loan_terms + the loan's balance as of the payment's own date (ADR-0078).</summary>
     public bool IsLoanReminder { get; set; }
 
     /// <summary>The loan account this series is the managed payment reminder for

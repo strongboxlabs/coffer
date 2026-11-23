@@ -41,8 +41,8 @@ ALTER TABLE sync_runs
     ADD COLUMN txns_still_pending   INTEGER NOT NULL DEFAULT 0;
 
 -- Backfill ledger_id from feed_connections for any rows that may
--- already exist (no production writer today, but local dev DBs may
--- carry experimental rows). Orphan rows whose feed_connection_id
+-- already exist (no shipped code writes them yet, but a development
+-- database can carry experimental rows). Orphan rows whose feed_connection_id
 -- doesn't resolve get dropped — they're un-attributable and the
 -- column is about to become NOT NULL.
 UPDATE sync_runs r

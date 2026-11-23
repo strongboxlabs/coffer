@@ -21,11 +21,12 @@ namespace Coffer.Api.Tests.Integration.Tags;
 /// per-test ledger; shared-table reads are scoped by the test's ledger id.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class TagsEndpointsTests
+public sealed class TagsEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public TagsEndpointsTests(PostgresFixture fixture) => _fixture = fixture;
+    public TagsEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -42,6 +43,20 @@ public sealed class TagsEndpointsTests
     }
 
     private static DateTime Utc(int day) => new(2026, 1, day, 0, 0, 0, DateTimeKind.Utc);
+
+    /// <summary>
+    /// Tag a one-split as <paramref name="side"/>'s register writes it (the side's own
+    /// set, on its leg), returning the ledger's tag ids by name.
+    /// </summary>
+    private async Task<Dictionary<string, Guid>> TagSideAsync(
+        SyntheticLedger ledger, Guid legId, Guid side, params string[] names)
+    {
+        await ledger.SetSideTagsAsync(legId, side, names, side);
+        await using var db = Db.NewDbContext();
+        return await db.Tags.AsNoTracking()
+            .Where(t => t.LedgerId == ledger.LedgerId && names.Contains(t.Name))
+            .ToDictionaryAsync(t => t.Name, t => t.Id);
+    }
 
     /// <summary>
     /// Create a transaction whose single posting carries <paramref name="legTag"/>,
@@ -69,15 +84,16 @@ public sealed class TagsEndpointsTests
                     {
                         CounterpartyAccountId = catId,
                         Amount = -75m,
-                        Tags = new[] { legTag },
                     },
                 },
+                // A one-split's tags are the writing side's own, on its leg.
+                Notes = new TransactionNotesRequest { Side = bankId, Tags = [legTag] },
             });
         Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
         using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
         var headerId = doc.RootElement.GetProperty("headerId").GetGuid();
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId && l.AccountId == bankId)
             .Select(l => l.Id).SingleAsync();
@@ -88,20 +104,20 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Usage_counts_a_tag_used_only_on_a_posting()
     {
-        // Counting header pairings alone reported 0 here — and 0 is the number the
+        // Counting header pairings alone would report 0 here — and 0 is the number the
         // management table shows next to a delete button.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
-        var cat = await ledger.AddCategoryAsync("Rent", "expense");
+        var cat = await ledger.AddCategoryAsync("Supplies", "expense");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
-        await TagAPostingAsync(client, ledger, bank.Id, cat.Id, "Property B");
+        await TagAPostingAsync(client, ledger, bank.Id, cat.Id, "Project B");
 
         var list = await client.GetFromJsonAsync<List<TagDto>>(
             $"/api/ledgers/{ledger.LedgerId}/tags");
 
-        Assert.Equal(1, Assert.Single(list!, t => t.Name == "Property B").UsageCount);
+        Assert.Equal(1, Assert.Single(list!, t => t.Name == "Project B").UsageCount);
     }
 
     [Fact]
@@ -111,13 +127,13 @@ public sealed class TagsEndpointsTests
         // HEADER pairing, so a posting-only tag read as an orphan and deleting it
         // cascaded its leg pairings away — data loss from the one action whose
         // whole promise is that it removes only what nothing points at.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
-        var cat = await ledger.AddCategoryAsync("Rent", "expense");
+        var cat = await ledger.AddCategoryAsync("Supplies", "expense");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
-        var legId = await TagAPostingAsync(client, ledger, bank.Id, cat.Id, "Property B");
+        var legId = await TagAPostingAsync(client, ledger, bank.Id, cat.Id, "Project B");
         // A genuine orphan, so the sweep is shown to still do its job.
         await ledger.AddBareTagAsync("archived");
 
@@ -126,11 +142,11 @@ public sealed class TagsEndpointsTests
 
         var list = await client.GetFromJsonAsync<List<TagDto>>(
             $"/api/ledgers/{ledger.LedgerId}/tags");
-        Assert.Contains(list!, t => t.Name == "Property B");
+        Assert.Contains(list!, t => t.Name == "Project B");
         Assert.DoesNotContain(list!, t => t.Name == "archived");
 
         // And the pairing itself survived, not merely the dictionary row.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.True(await db.TxnLegTags.AsNoTracking().AnyAsync(x => x.LegId == legId));
     }
 
@@ -140,28 +156,28 @@ public sealed class TagsEndpointsTests
         // Merge deletes the source tag at the end, and tags.id cascades to
         // txn_leg_tags — so without repointing the leg side first, a merge silently
         // deletes every posting's attribution instead of moving it.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
-        var cat = await ledger.AddCategoryAsync("Rent", "expense");
+        var cat = await ledger.AddCategoryAsync("Supplies", "expense");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
-        var legId = await TagAPostingAsync(client, ledger, bank.Id, cat.Id, "Flat B");
+        var legId = await TagAPostingAsync(client, ledger, bank.Id, cat.Id, "Proj B");
 
         var list = await client.GetFromJsonAsync<List<TagDto>>(
             $"/api/ledgers/{ledger.LedgerId}/tags");
-        var source = Assert.Single(list!, t => t.Name == "Flat B").Id;
-        await ledger.AddBareTagAsync("Property B");
+        var source = Assert.Single(list!, t => t.Name == "Proj B").Id;
+        await ledger.AddBareTagAsync("Project B");
         list = await client.GetFromJsonAsync<List<TagDto>>(
             $"/api/ledgers/{ledger.LedgerId}/tags");
-        var target = Assert.Single(list!, t => t.Name == "Property B").Id;
+        var target = Assert.Single(list!, t => t.Name == "Project B").Id;
 
         var resp = await client.PostAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/tags/{source}/merge",
             new MergeTagRequest(target));
         Assert.True(resp.IsSuccessStatusCode, $"merge failed: {resp.StatusCode}");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var remaining = await db.TxnLegTags.AsNoTracking()
             .Where(x => x.LegId == legId).ToListAsync();
         var kept = Assert.Single(remaining);
@@ -173,19 +189,18 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task List_returns_tags_with_usage_counts_sorted_by_name()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("Dining", "expense");
         var (h1, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -10m, Utc(2));
         var (h2, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -20m, Utc(3));
-        // "work" on two headers (usage 2), "home" on one (usage 1).
-        await ledger.AddTagAsync(h1, "work");
-        await ledger.AddTagAsync(h2, "work");
-        await ledger.AddTagAsync(h1, "home");
+        // "work" on two transactions (usage 2), "home" on one (usage 1).
+        await TagSideAsync(ledger, h1, bank.Id, "work", "home");
+        await TagSideAsync(ledger, h2, bank.Id, "work");
         // An orphan tag (never assigned) reports usage 0.
         await ledger.AddBareTagAsync("archived");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var list = await client.GetFromJsonAsync<List<TagDto>>(
@@ -202,10 +217,10 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task List_rejects_when_ledger_not_visible_to_caller()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var resp = await bobClient.GetAsync($"/api/ledgers/{alice.LedgerId}/tags");
@@ -218,10 +233,10 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Patch_renames_a_tag()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tagId = await ledger.AddBareTagAsync("groceries");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PatchAsJsonAsync(
@@ -236,10 +251,10 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Patch_recolors_a_tag_and_lowercases_the_hex()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tagId = await ledger.AddBareTagAsync("travel");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PatchAsJsonAsync(
@@ -254,10 +269,10 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Patch_renames_and_recolors_in_one_call()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tagId = await ledger.AddBareTagAsync("misc");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PatchAsJsonAsync(
@@ -275,11 +290,11 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Patch_rejects_rename_to_an_existing_name_case_insensitive()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await ledger.AddBareTagAsync("Work");
         var home = await ledger.AddBareTagAsync("Home");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Rename "Home" → "work" collides with "Work" (case-insensitive).
@@ -293,10 +308,10 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Patch_allows_a_case_only_self_rename()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tagId = await ledger.AddBareTagAsync("work");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PatchAsJsonAsync(
@@ -311,10 +326,10 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Patch_rejects_an_invalid_colour()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tagId = await ledger.AddBareTagAsync("bills");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PatchAsJsonAsync(
@@ -327,10 +342,10 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Patch_rejects_an_empty_name()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tagId = await ledger.AddBareTagAsync("bills");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PatchAsJsonAsync(
@@ -343,10 +358,10 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Patch_rejects_a_name_over_the_length_cap()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tagId = await ledger.AddBareTagAsync("bills");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PatchAsJsonAsync(
@@ -359,9 +374,9 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Patch_rejects_an_unknown_tag()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PatchAsJsonAsync(
@@ -374,11 +389,11 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Patch_rejects_when_ledger_not_visible_to_caller()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var aliceTag = await alice.AddBareTagAsync("alice-only");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var resp = await bobClient.PatchAsJsonAsync(
@@ -393,18 +408,17 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Merge_repoints_assignments_dedups_and_deletes_source()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("Dining", "expense");
         var (h1, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -10m, Utc(2));
         var (h2, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -20m, Utc(3));
 
         // h1: source only. h2: BOTH source and target (dedup case).
-        var source = await ledger.AddTagAsync(h1, "groceries-old");
-        await ledger.AddTagAsync(h2, "groceries-old");
-        var target = await ledger.AddTagAsync(h2, "groceries");
+        var source = (await TagSideAsync(ledger, h1, bank.Id, "groceries-old"))["groceries-old"];
+        var target = (await TagSideAsync(ledger, h2, bank.Id, "groceries-old", "groceries"))["groceries"];
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -417,22 +431,22 @@ public sealed class TagsEndpointsTests
         var body = (await resp.Content.ReadFromJsonAsync<MergeTagResponse>())!;
         Assert.Equal(1, body.TransactionsRepointed);
 
-        await using var read = _fixture.NewDbContext();
-        // Source tag gone; target now on both headers exactly once each.
+        await using var read = Db.NewDbContext();
+        // Source tag gone; target now on both transactions exactly once each.
         Assert.False(await read.Tags.AnyAsync(t => t.Id == source));
-        Assert.Equal(2, await read.TxnHeaderTags.CountAsync(
+        Assert.Equal(2, await read.TxnLegTags.CountAsync(
             x => x.LedgerId == ledger.LedgerId && x.TagId == target));
-        Assert.Equal(0, await read.TxnHeaderTags.CountAsync(
+        Assert.Equal(0, await read.TxnLegTags.CountAsync(
             x => x.LedgerId == ledger.LedgerId && x.TagId == source));
     }
 
     [Fact]
     public async Task Merge_rejects_merging_into_itself()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tagId = await ledger.AddBareTagAsync("solo");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -445,10 +459,10 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Merge_rejects_an_unknown_target()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddBareTagAsync("source");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -461,12 +475,12 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Merge_rejects_when_ledger_not_visible_to_caller()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var src = await alice.AddBareTagAsync("a-src");
         var dst = await alice.AddBareTagAsync("a-dst");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var resp = await bobClient.PostAsJsonAsync(
@@ -476,7 +490,7 @@ public sealed class TagsEndpointsTests
         Assert.Equal(BusinessError.Codes.LedgerNotVisible, await ErrorCodeAsync(resp));
 
         // Alice's tags are untouched.
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         Assert.True(await read.Tags.AnyAsync(t => t.Id == src));
     }
 
@@ -485,31 +499,31 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Delete_removes_a_tag_and_untags_its_transactions()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("Dining", "expense");
         var (h1, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -10m, Utc(2));
-        var tagId = await ledger.AddTagAsync(h1, "in-use");
+        var tagId = (await TagSideAsync(ledger, h1, bank.Id, "in-use"))["in-use"];
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.DeleteAsync($"/api/ledgers/{ledger.LedgerId}/tags/{tagId}");
         Assert.Equal(HttpStatusCode.NoContent, resp.StatusCode);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         Assert.False(await read.Tags.AnyAsync(t => t.Id == tagId));
         // FK cascade removed the assignment too.
-        Assert.Equal(0, await read.TxnHeaderTags.CountAsync(
+        Assert.Equal(0, await read.TxnLegTags.CountAsync(
             x => x.LedgerId == ledger.LedgerId && x.TagId == tagId));
     }
 
     [Fact]
     public async Task Delete_rejects_an_unknown_tag()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.DeleteAsync($"/api/ledgers/{ledger.LedgerId}/tags/{Guid.NewGuid()}");
@@ -520,18 +534,18 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task Delete_rejects_when_ledger_not_visible_to_caller()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var aliceTag = await alice.AddBareTagAsync("alice-only");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var resp = await bobClient.DeleteAsync($"/api/ledgers/{alice.LedgerId}/tags/{aliceTag}");
         Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
         Assert.Equal(BusinessError.Codes.LedgerNotVisible, await ErrorCodeAsync(resp));
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         Assert.True(await read.Tags.AnyAsync(t => t.Id == aliceTag));
     }
 
@@ -540,15 +554,15 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task CleanupUnused_removes_only_orphan_tags()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("Dining", "expense");
         var (h1, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -10m, Utc(2));
-        var used = await ledger.AddTagAsync(h1, "kept");
+        var used = (await TagSideAsync(ledger, h1, bank.Id, "kept"))["kept"];
         var orphanA = await ledger.AddBareTagAsync("orphan-a");
         var orphanB = await ledger.AddBareTagAsync("orphan-b");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.DeleteAsync($"/api/ledgers/{ledger.LedgerId}/tags/unused");
@@ -556,7 +570,7 @@ public sealed class TagsEndpointsTests
         var body = (await resp.Content.ReadFromJsonAsync<CleanupTagsResponse>())!;
         Assert.Equal(2, body.TagsRemoved);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         Assert.True(await read.Tags.AnyAsync(t => t.Id == used));
         Assert.False(await read.Tags.AnyAsync(t => t.Id == orphanA));
         Assert.False(await read.Tags.AnyAsync(t => t.Id == orphanB));
@@ -565,11 +579,11 @@ public sealed class TagsEndpointsTests
     [Fact]
     public async Task CleanupUnused_rejects_when_ledger_not_visible_to_caller()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         await alice.AddBareTagAsync("alice-orphan");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var resp = await bobClient.DeleteAsync($"/api/ledgers/{alice.LedgerId}/tags/unused");

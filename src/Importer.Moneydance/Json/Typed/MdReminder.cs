@@ -69,7 +69,9 @@ public sealed record MdReminder(
             TransactedDate: item.GetInt("txn.td"),
             DateEnteredMillis: item.GetLong("txn.dtentered"),
             CheckNumber: item.GetString("txn.chk"),
-            Splits: splits);
+            Splits: splits,
+            InvestTxnType: item.GetString("txn.invest.txntype"),
+            XferType: item.GetString("txn.xfer_type"));
     }
 }
 
@@ -86,4 +88,13 @@ public sealed record MdReminderTxn(
     int? TransactedDate,
     long? DateEnteredMillis,
     string? CheckNumber,
-    IReadOnlyList<MdSplit> Splits);
+    IReadOnlyList<MdSplit> Splits,
+    string? InvestTxnType = null,
+    string? XferType = null)
+{
+    /// <summary>
+    /// <see cref="MdTxn.IsInvestmentShape"/> for the template: true when a live
+    /// txn of this shape would take the investment route, not the bank route.
+    /// </summary>
+    public bool IsInvestmentShape => MdTxn.IsInvestmentShapeOf(InvestTxnType, XferType);
+}

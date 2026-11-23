@@ -18,13 +18,11 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// realistic input.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class TransactionsEndpointsTests
+public sealed class TransactionsEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public TransactionsEndpointsTests(PostgresFixture fixture)
+    public TransactionsEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -45,9 +43,9 @@ public sealed class TransactionsEndpointsTests
     /// scope to it.
     /// </summary>
     private static async Task<(SyntheticLedger Ledger, AccountTuple Accounts, DateTime FirstPostedAt)>
-        SeedRegisterAsync(PostgresFixture fixture, int pairCount)
+        SeedRegisterAsync(TestDatabase database, int pairCount)
     {
-        var ledger = await SyntheticLedger.CreateAsync(fixture);
+        var ledger = await SyntheticLedger.CreateAsync(database);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
 
@@ -88,29 +86,48 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Get_returns_page_sorted_by_posted_at_descending()
     {
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 3);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 3);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
-        // No account filter: both legs of each pair appear, so 3 pairs
-        // → 6 transactions, each its own entry (none of them are
-        // grouped), sorted by posted_at DESC.
-        var response = await client.GetAsync(
-            $"/api/ledgers/{ledger.LedgerId}/transactions?limit=100");
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        // 3 pairs → 3 transactions on each side, each its own entry (none of
+        // them are grouped), sorted by posted_at DESC.
+        foreach (var account in new[] { accounts.BankId, accounts.CategoryId })
+        {
+            var response = await client.GetAsync(
+                $"/api/ledgers/{ledger.LedgerId}/transactions?account_id={account}&limit=100");
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-        var page = (await response.Content.ReadFromJsonAsync<RegisterPage>())!;
-        Assert.Equal(6, page.Entries.Count);
-        Assert.All(page.Entries, e => Assert.Equal(RegisterEntryDto.KindTxn, e.Kind));
-        Assert.Null(page.CursorForOlder);
+            var page = (await response.Content.ReadFromJsonAsync<RegisterPage>())!;
+            Assert.Equal(3, page.Entries.Count);
+            Assert.All(page.Entries, e => Assert.Equal(RegisterEntryDto.KindTxn, e.Kind));
+            Assert.Null(page.CursorForOlder);
 
-        var rows = Flatten(page);
-        var postedAts = rows.Select(i => i.PostedAt).ToArray();
-        Assert.Equal(postedAts.OrderByDescending(p => p).ToArray(), postedAts);
+            var rows = Flatten(page);
+            var postedAts = rows.Select(i => i.PostedAt).ToArray();
+            Assert.Equal(postedAts.OrderByDescending(p => p).ToArray(), postedAts);
+            Assert.All(rows, item => Assert.Equal(account, item.AccountId));
+        }
+    }
 
-        Assert.All(rows, item =>
-            Assert.True(item.AccountId == accounts.BankId || item.AccountId == accounts.CategoryId,
-                $"row's account_id {item.AccountId} should be either bank or category"));
+    [Fact]
+    public async Task Get_without_account_id_returns_422_like_the_rail_and_the_counts()
+    {
+        // The register is always one account's (or one category's with its
+        // descendants); there is no ledger-wide page.
+        var (ledger, _, _) = await SeedRegisterAsync(Db, pairCount: 1);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        foreach (var path in new[] { "transactions?limit=100", "transactions/index-buckets", "transactions/status-counts" })
+        {
+            var response = await client.GetAsync($"/api/ledgers/{ledger.LedgerId}/{path}");
+            Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
+            using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            Assert.Equal("account-not-in-ledger", doc.RootElement.GetProperty("code").GetString());
+            Assert.StartsWith("account_id query parameter is required", doc.RootElement.GetProperty("detail").GetString(),
+                StringComparison.Ordinal);
+        }
     }
 
     private static async Task<string?> ReadCodeAsync(HttpResponseMessage resp)
@@ -120,19 +137,37 @@ public sealed class TransactionsEndpointsTests
         return doc.RootElement.TryGetProperty("code", out var c) ? c.GetString() : null;
     }
 
+    /// <summary>One transaction moved: the bulk move of an explicit selection of one, the
+    /// only move route (ADR-0072 D3).</summary>
+    private static Task<HttpResponseMessage> MoveOneAsync(
+        HttpClient client, Guid ledgerId, Guid headerId, Guid sourceAccountId, Guid targetAccountId) =>
+        client.PostAsJsonAsync(
+            $"/api/ledgers/{ledgerId}/transactions/bulk-move-account",
+            new
+            {
+                selection = new { kind = "explicit", accountId = sourceAccountId, headerIds = new[] { headerId } },
+                targetAccountId,
+            });
+
+    private static async Task<(int Moved, int BecameTwoAmount)> MovedAndTwoAmountAsync(HttpResponseMessage resp)
+    {
+        var body = (await resp.Content.ReadFromJsonAsync<BulkMoveAccountResponse>())!;
+        return (body.Moved, body.BecameTwoAmount);
+    }
+
     [Fact]
     public async Task Move_account_relocates_a_transaction_to_another_real_account()
     {
         // ADR-0072 D3: a mis-filed row moves from its source account to another
         // real account — it leaves the source register and appears in the target.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var savings = await ledger.AddBankAccountAsync("savings");
         var groceries = await ledger.AddCategoryAsync("groceries");
         await ledger.AddTransactionPairAsync(bank.Id, groceries.Id, -25m,
             new DateTime(2026, 2, 1, 12, 0, 0, DateTimeKind.Utc), "merchant");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var before = (await (await client.GetAsync(
@@ -140,10 +175,11 @@ public sealed class TransactionsEndpointsTests
             .Content.ReadFromJsonAsync<RegisterPage>())!;
         var row = Assert.Single(Flatten(before));
 
-        var resp = await client.PostAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/transactions/{row.HeaderId}/move-account",
-            new { sourceAccountId = bank.Id, targetAccountId = savings.Id });
-        Assert.Equal(HttpStatusCode.NoContent, resp.StatusCode);
+        var resp = await MoveOneAsync(client, ledger.LedgerId, row.HeaderId, bank.Id, savings.Id);
+        // A move relabels (ADR-0114 D13): the answer counts the pairs it left across
+        // currencies, none within one.
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.Equal((1, 0), await MovedAndTwoAmountAsync(resp));
 
         var bankAfter = (await (await client.GetAsync(
             $"/api/ledgers/{ledger.LedgerId}/transactions?account_id={bank.Id}&limit=100"))
@@ -160,13 +196,13 @@ public sealed class TransactionsEndpointsTests
     {
         // Moving the source leg of a transfer onto the account that is already
         // the other side would collide with UNIQUE(header, posting, account).
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var savings = await ledger.AddBankAccountAsync("savings");
         await ledger.AddTransactionPairAsync(bank.Id, savings.Id, -50m,
             new DateTime(2026, 2, 1, 12, 0, 0, DateTimeKind.Utc), "transfer");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var page = (await (await client.GetAsync(
@@ -174,9 +210,7 @@ public sealed class TransactionsEndpointsTests
             .Content.ReadFromJsonAsync<RegisterPage>())!;
         var row = Assert.Single(Flatten(page));
 
-        var resp = await client.PostAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/transactions/{row.HeaderId}/move-account",
-            new { sourceAccountId = bank.Id, targetAccountId = savings.Id });
+        var resp = await MoveOneAsync(client, ledger.LedgerId, row.HeaderId, bank.Id, savings.Id);
         Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
         Assert.Equal("transaction-move-collision", await ReadCodeAsync(resp));
     }
@@ -187,10 +221,10 @@ public sealed class TransactionsEndpointsTests
         // The half of the pair rule that still forbids crossing, and the one
         // worth a test: a move is `UPDATE txn_legs SET account_id = target`,
         // so re-pointing a money leg at a category leaves the transaction with
-        // two category legs and no account. The guard used to read "target
-        // must not be a category", which also blocked a legitimate category →
-        // category recategorise; stated as a pair it blocks only the crossing.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // two category legs and no account. A guard of "target must not be a
+        // category" would also block a legitimate category → category
+        // recategorise; stated as a pair it blocks only the crossing.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
         var utilities = await ledger.AddCategoryAsync("utilities");
@@ -198,12 +232,10 @@ public sealed class TransactionsEndpointsTests
             new DateTime(2026, 2, 1, 12, 0, 0, DateTimeKind.Utc), "deposit");
         var headerId = await ledger.ResolveHeaderIdAsync(pair.FromTxnId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
-        var resp = await client.PostAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/transactions/{headerId}/move-account",
-            new { sourceAccountId = bank.Id, targetAccountId = utilities.Id });
+        var resp = await MoveOneAsync(client, ledger.LedgerId, headerId, bank.Id, utilities.Id);
 
         Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
         Assert.Equal("transaction-move-domain-crossed", await ReadCodeAsync(resp));
@@ -214,7 +246,7 @@ public sealed class TransactionsEndpointsTests
     {
         // ADR-0072 D3 guard: a split (multi-posting) transaction cannot be
         // moved to an investment account.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
         var utilities = await ledger.AddCategoryAsync("utilities");
@@ -224,12 +256,10 @@ public sealed class TransactionsEndpointsTests
             new (Guid, decimal)[] { (groceries.Id, -10m), (utilities.Id, -20m) },
             new DateTime(2026, 2, 1, 12, 0, 0, DateTimeKind.Utc), "split");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
-        var resp = await client.PostAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/transactions/{headerId}/move-account",
-            new { sourceAccountId = bank.Id, targetAccountId = brokerage.Id });
+        var resp = await MoveOneAsync(client, ledger.LedgerId, headerId, bank.Id, brokerage.Id);
         Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
         Assert.Equal("transaction-move-split-to-investment", await ReadCodeAsync(resp));
     }
@@ -240,14 +270,14 @@ public sealed class TransactionsEndpointsTests
         // ADR-0072 D3: a NON-split cash row may legitimately move to an
         // investment account (a mis-filed brokerage deposit). Only a SPLIT
         // headed to an investment account is rejected.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         await ledger.AddTransactionPairAsync(bank.Id, groceries.Id, -25m,
             new DateTime(2026, 2, 1, 12, 0, 0, DateTimeKind.Utc), "deposit");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var page = (await (await client.GetAsync(
@@ -255,10 +285,8 @@ public sealed class TransactionsEndpointsTests
             .Content.ReadFromJsonAsync<RegisterPage>())!;
         var row = Assert.Single(Flatten(page));
 
-        var resp = await client.PostAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/transactions/{row.HeaderId}/move-account",
-            new { sourceAccountId = bank.Id, targetAccountId = brokerage.Id });
-        Assert.Equal(HttpStatusCode.NoContent, resp.StatusCode);
+        var resp = await MoveOneAsync(client, ledger.LedgerId, row.HeaderId, bank.Id, brokerage.Id);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
         var bankAfter = (await (await client.GetAsync(
             $"/api/ledgers/{ledger.LedgerId}/transactions?account_id={bank.Id}&limit=100"))
@@ -291,9 +319,9 @@ public sealed class TransactionsEndpointsTests
         // The target was validated and the source never was, so the category
         // leg became a second money-account leg and the transaction was left
         // with no category at all. Nothing said so.
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 2);
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 2);
         var savings = await ledger.AddBankAccountAsync("savings");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -317,11 +345,10 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Bulk_move_refuses_an_account_selection_headed_for_a_category()
     {
-        // The other direction, which the old rule did cover. Kept as a pair so
-        // a future edit cannot satisfy the new boundary rule by deleting the
-        // half that was already working.
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 2);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        // The other direction. Kept as a pair so a future edit cannot satisfy
+        // the boundary rule by deleting one half of it.
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 2);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -334,13 +361,13 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Bulk_move_from_a_bank_account_to_a_credit_card_is_allowed()
     {
-        // The banking domain is WIDE on purpose. "Same account_type" was the
-        // rule FU-054 proposed, and it would have blocked this — but
+        // The banking domain is WIDE on purpose. A "same account_type" rule
+        // would block this — but
         // recording a purchase on the wrong side of the wallet is a correction
         // people really make, and re-pointing the leg is exactly the fix.
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 2);
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 2);
         var card = await ledger.AddAccountAsync("card", "credit_card");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -353,17 +380,14 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Bulk_move_between_a_bank_and_an_investment_account_works_both_ways()
     {
-        // This test used to assert the OPPOSITE — that the bulk path refuses a
-        // bank → investment move — while the single-row path allowed it under
-        // ADR-0072 D3. Two paths, two rules. Decided 2026-10-09: banking and
-        // investment accounts are interchangeable for a cash row, in BOTH
-        // directions — a brokerage deposit filed against checking, or the
-        // reverse — and both paths now ask one implementation of the rule.
+        // Banking and investment accounts are interchangeable for a cash row,
+        // in BOTH directions — a brokerage deposit filed against checking, or
+        // the reverse (ADR-0072 D3).
         // There and back again, so neither direction can be lost alone.
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 2);
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 2);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var savings = await ledger.AddBankAccountAsync("savings");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var into = await client.PostAsJsonAsync(
@@ -385,15 +409,14 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task An_investment_transactions_CATEGORY_leg_can_be_recategorised()
     {
-        // The guard used to refuse any move touching an investment-shape
-        // header, on the grounds that such a header is "tied to holdings and
-        // lots, which this leg-repoint doesn't carry". True of the SECURITY
-        // leg, false of every other leg on the same header: holdings derive
-        // only from legs carrying a security_id (migration 068), and a
-        // security leg lives on the holdings SIBLING. So investment income sat
-        // stuck in whatever category it imported under, with no way to correct
-        // it.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // An investment-shape header is "tied to holdings and lots, which this
+        // leg-repoint doesn't carry" — true of the SECURITY leg, false of every
+        // other leg on the same header: holdings derive only from legs carrying
+        // a security_id (migration 068), and a security leg lives on the
+        // holdings SIBLING. A guard refusing any move touching such a header
+        // would leave investment income stuck in whatever category it imported
+        // under, with no way to correct it.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var security = await ledger.AddSecurityAsync("IDXC", "IDXC", assetClass: "equity");
@@ -404,7 +427,7 @@ public sealed class TransactionsEndpointsTests
             brokerage.Id, holdings, security, dividends.Id, 120m,
             new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -417,11 +440,11 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task An_investment_transactions_BROKERAGE_leg_still_cannot_be_moved()
     {
-        // The half that stays refused, and the reason the old guard existed:
+        // The half that stays refused:
         // moving the brokerage's own leg would leave its holdings on the
         // account the cash just left. Paired with the test above so a future
         // edit cannot satisfy one by deleting the other.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var other = await ledger.AddInvestmentAccountAsync("Rollover");
         var holdings = brokerage.HoldingsAccountId!.Value;
@@ -432,7 +455,7 @@ public sealed class TransactionsEndpointsTests
             brokerage.Id, holdings, security, dividends.Id, 120m,
             new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -476,7 +499,7 @@ public sealed class TransactionsEndpointsTests
     /// in the database enforces it since migration 084.</summary>
     private async Task AssertIsPlainTransferAsync(Guid headerId, params Guid[] accountIds)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == headerId);
         Assert.Null(header.Action);
 
@@ -489,23 +512,21 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task A_cash_only_transfer_leaves_the_brokerage_as_a_plain_bank_transfer()
     {
-        // THE EXCEPTION, on the single-row path. An MD-imported contribution
+        // THE EXCEPTION, on one row named explicitly. An MD-imported contribution
         // from checking is an investment `transfer` with no security leg.
         // Moved off the brokerage onto a bank it touches no investment account,
         // so it is converted: action and every posting_role cleared together.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var checking = await ledger.AddBankAccountAsync("checking");
         var savings = await ledger.AddBankAccountAsync("savings");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var headerId = await PostTransferAsync(client, ledger.LedgerId, brokerage.Id, checking.Id);
 
-        var resp = await client.PostAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/transactions/{headerId}/move-account",
-            new { sourceAccountId = brokerage.Id, targetAccountId = savings.Id });
-        Assert.Equal(HttpStatusCode.NoContent, resp.StatusCode);
+        var resp = await MoveOneAsync(client, ledger.LedgerId, headerId, brokerage.Id, savings.Id);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
         await AssertIsPlainTransferAsync(headerId, checking.Id, savings.Id);
     }
@@ -513,18 +534,18 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Bulk_move_converts_the_cash_only_transfers_it_moves_off_a_brokerage()
     {
-        // The same exception on the bulk path, which has a hazard the single
+        // The same exception over a select-all, which has a hazard a named
         // row does not: the selection is SCOPED TO THE SOURCE ACCOUNT, so asked
         // which headers to convert AFTER the legs have moved, it matches none
         // and the conversion silently does not happen — leaving a 'transfer'
         // action on a bank-to-bank transaction. Two transfers, so a fix that
         // converted only the first could not pass.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var checking = await ledger.AddBankAccountAsync("checking");
         var card = await ledger.AddAccountAsync("card", "credit_card");
         var savings = await ledger.AddBankAccountAsync("savings");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var fromChecking = await PostTransferAsync(client, ledger.LedgerId, brokerage.Id, checking.Id);
@@ -545,23 +566,21 @@ public sealed class TransactionsEndpointsTests
         // "Only a single BANKING leg." Moved to a bank, a brokerage-to-brokerage
         // transfer would still touch an investment account, so it cannot stop
         // being an investment event and does not qualify for conversion.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var rollover = await ledger.AddInvestmentAccountAsync("Rollover");
         var savings = await ledger.AddBankAccountAsync("savings");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var headerId = await PostTransferAsync(client, ledger.LedgerId, brokerage.Id, rollover.Id);
 
-        var resp = await client.PostAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/transactions/{headerId}/move-account",
-            new { sourceAccountId = brokerage.Id, targetAccountId = savings.Id });
+        var resp = await MoveOneAsync(client, ledger.LedgerId, headerId, brokerage.Id, savings.Id);
         Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
         Assert.Equal("transaction-header-is-investment", await ReadCodeAsync(resp));
 
         // Refused means untouched — the investment event survived intact.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Equal("transfer",
             (await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == headerId)).Action);
     }
@@ -572,7 +591,7 @@ public sealed class TransactionsEndpointsTests
         // The exception is `transfer` and nothing else. Opening investment →
         // bank must not quietly widen to every investment event that happens
         // to be heading that way — a dividend's holdings would stay behind.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var security = await ledger.AddSecurityAsync("IDXC", "IDXC", assetClass: "equity");
@@ -582,7 +601,7 @@ public sealed class TransactionsEndpointsTests
             brokerage.Id, holdings, security, dividends.Id, 120m,
             new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -597,9 +616,9 @@ public sealed class TransactionsEndpointsTests
     {
         // The other half of "a single banking leg", and the mirror of
         // SplitToInvestment. A plain split sitting on a brokerage is what the
-        // MD importer produces for a non-investment split held there. Both
-        // paths, because each maps the verdict onto its own outcome enum.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // MD importer produces for a non-investment split held there. Named
+        // explicitly and selected by a select-all.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var groceries = await ledger.AddCategoryAsync("groceries");
         var utilities = await ledger.AddCategoryAsync("utilities");
@@ -609,12 +628,10 @@ public sealed class TransactionsEndpointsTests
             new (Guid, decimal)[] { (groceries.Id, -10m), (utilities.Id, -20m) },
             new DateTime(2026, 2, 1, 12, 0, 0, DateTimeKind.Utc));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
-        var single = await client.PostAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/transactions/{headerId}/move-account",
-            new { sourceAccountId = brokerage.Id, targetAccountId = savings.Id });
+        var single = await MoveOneAsync(client, ledger.LedgerId, headerId, brokerage.Id, savings.Id);
         Assert.Equal(HttpStatusCode.UnprocessableEntity, single.StatusCode);
         Assert.Equal("transaction-move-split-from-investment", await ReadCodeAsync(single));
 
@@ -628,12 +645,12 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Bulk_move_between_two_categories_IS_a_recategorise()
     {
-        // The boundary rule legalises what the old target-only rule forbade.
+        // The boundary rule allows what a target-only rule would forbid.
         // Category to category is the same UPDATE, and it is the operation the
-        // category register should have been offering all along.
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 2);
+        // category register needs to offer.
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 2);
         var dining = await ledger.AddCategoryAsync("dining");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -655,9 +672,9 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Bulk_move_account_relocates_the_whole_selection()
     {
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 2);
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 2);
         var savings = await ledger.AddBankAccountAsync("savings");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var body = new
@@ -693,10 +710,10 @@ public sealed class TransactionsEndpointsTests
         // ADR-0072 D3 + layer independence: the endpoint refuses to move an
         // investment-shape header (action != null — holdings-tied) regardless
         // of caller, all-or-nothing.
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 2);
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 2);
         var savings = await ledger.AddBankAccountAsync("savings");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var oneHeader = await db.TxnHeaders
                 .Where(h => h.LedgerId == ledger.LedgerId)
@@ -704,9 +721,11 @@ public sealed class TransactionsEndpointsTests
                 .FirstAsync();
             await db.TxnHeaders.Where(h => h.Id == oneHeader)
                 .ExecuteUpdateAsync(s => s.SetProperty(h => h.Action, "buy"));
+            // Written past every writer: store the presentation as the upgrade's backfill does.
+            await ledger.RecomputeNotesAsync(oneHeader);
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var body = new
@@ -743,11 +762,11 @@ public sealed class TransactionsEndpointsTests
     {
         // ADR-0072 D2: an all-mode "hidden" selection un-hides the rows, which
         // then re-appear in the normal (visible) register.
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 2);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 2);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnHeaders.Where(h => h.LedgerId == ledger.LedgerId)
                 .ExecuteUpdateAsync(s => s.SetProperty(h => h.IsHidden, true));
@@ -788,9 +807,9 @@ public sealed class TransactionsEndpointsTests
         // specific hidden row — carries no statusFilter, so it must NOT be
         // visibility-scoped. Otherwise the summary counts 0 (the bulk bar
         // flashes then vanishes) and an explicit unhide/move silently no-ops.
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 2);
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 2);
         Guid hiddenId;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnHeaders.Where(h => h.LedgerId == ledger.LedgerId)
                 .ExecuteUpdateAsync(s => s.SetProperty(h => h.IsHidden, true));
@@ -800,13 +819,13 @@ public sealed class TransactionsEndpointsTests
                 .FirstAsync();
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // The footer summary counts the explicitly-selected hidden row.
         var summaryResp = await client.PostAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/transactions/selection-summary",
-            new { kind = "explicit", headerIds = new[] { hiddenId } });
+            new { kind = "explicit", accountId = accounts.BankId, headerIds = new[] { hiddenId } });
         Assert.Equal(HttpStatusCode.OK, summaryResp.StatusCode);
         using (var doc = JsonDocument.Parse(
             await summaryResp.Content.ReadAsStringAsync()))
@@ -817,7 +836,7 @@ public sealed class TransactionsEndpointsTests
         // Explicit bulk-unhide restores exactly that row to the register.
         var unhideResp = await client.PostAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/transactions/bulk-unhide",
-            new { selection = new { kind = "explicit", headerIds = new[] { hiddenId } } });
+            new { selection = new { kind = "explicit", accountId = accounts.BankId, headerIds = new[] { hiddenId } } });
         Assert.Equal(HttpStatusCode.OK, unhideResp.StatusCode);
 
         var visible = (await (await client.GetAsync(
@@ -826,17 +845,82 @@ public sealed class TransactionsEndpointsTests
         Assert.Contains(Flatten(visible), r => r.HeaderId == hiddenId);
     }
 
+    // ADR-0072 D2: the unhide flips only rows that are hidden, and counts only those. A
+    // visible row in an explicit selection, or an all-mode selection over a visible view, is
+    // left as it is and not counted.
+    [Fact]
+    public async Task A_bulk_unhide_counts_only_the_hidden_rows_it_restores()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("Account A");
+        var category = await ledger.AddCategoryAsync("Category A");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+        var url = $"/api/ledgers/{ledger.LedgerId}/transactions";
+
+        // A reminder occurrence is soft-hidden by a delete, as its slot's stamp is kept.
+        var series = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders", new CreateReminderRequest
+        {
+            Rrule = "FREQ=MONTHLY;BYMONTHDAY=1",
+            StartDate = new DateOnly(2026, 1, 1),
+            Payee = "Payee A",
+            SourceAccountId = bank.Id,
+            Postings = [new TransactionPosting { CounterpartyAccountId = category.Id, Amount = -12m }],
+        });
+        Assert.Equal(HttpStatusCode.Created, series.StatusCode);
+        var seriesId = (await series.Content.ReadFromJsonAsync<ReminderDetail>())!.Id;
+        var fired = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders/{seriesId}/fire/bank",
+            new FireBankReminderRequest
+            {
+                OccurrenceDate = new DateOnly(2026, 1, 1),
+                SourceAccountId = bank.Id,
+                Payee = "Payee A",
+                Postings = [new TransactionPosting { CounterpartyAccountId = category.Id, Amount = -12m }],
+            });
+        Assert.Equal(HttpStatusCode.OK, fired.StatusCode);
+        var hidden = (await fired.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("headerId").GetGuid();
+        var deleted = await client.DeleteAsync($"{url}/{hidden}");
+        Assert.Equal("soft-hidden", (await deleted.Content.ReadFromJsonAsync<DeleteTransactionResponse>())!.Kind);
+
+        var created = await client.PostAsJsonAsync(url, new CreateTransactionRequest
+        {
+            PostedAt = new DateTime(2026, 1, 2, 12, 0, 0, DateTimeKind.Utc),
+            Payee = "Payee B",
+            SourceAccountId = bank.Id,
+            Postings = [new TransactionPosting { CounterpartyAccountId = category.Id, Amount = -5m }],
+        });
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        var visible = (await created.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("headerId").GetGuid();
+
+        async Task<int> UnhiddenAsync(object selection)
+        {
+            var response = await client.PostAsJsonAsync($"{url}/bulk-unhide", new { selection });
+            Assert.True(response.StatusCode == HttpStatusCode.OK, await response.Content.ReadAsStringAsync());
+            return (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("unhidden").GetInt32();
+        }
+
+        // A select-all over the visible view restores nothing.
+        Assert.Equal(0, await UnhiddenAsync(new
+        {
+            kind = "all", accountId = bank.Id, statusFilter = "all", selectedAt = DateTime.UtcNow.AddMinutes(1),
+        }));
+        Assert.Equal(1, await UnhiddenAsync(new { kind = "explicit", accountId = bank.Id, headerIds = new[] { hidden, visible } }));
+
+        await using var db = Db.NewDbContext();
+        Assert.False((await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == hidden)).IsHidden);
+    }
+
     [Fact]
     public async Task Hidden_filter_shows_only_soft_hidden_rows()
     {
         // ADR-0072 D1: ?hidden=true pages the soft-hidden "recovery" view; the
         // default (visible) register still excludes hidden rows.
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 3);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 3);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         Guid hiddenHeaderId;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             hiddenHeaderId = await db.TxnHeaders
                 .Where(h => h.LedgerId == ledger.LedgerId)
@@ -863,8 +947,8 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Get_paginates_through_cursor_until_next_cursor_is_null()
     {
-        var (ledger, _, _) = await SeedRegisterAsync(_fixture, pairCount: 5); // 10 entries total (no groups)
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 10); // 10 bank entries (no groups)
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // limit=4 means: page 1 = 4 entries + cursor, page 2 = 4 + cursor,
@@ -873,7 +957,7 @@ public sealed class TransactionsEndpointsTests
         string? cursor = null;
         for (var page = 0; page < 10; page++)   // 10 = safety stop
         {
-            var url = $"/api/ledgers/{ledger.LedgerId}/transactions?limit=4"
+            var url = $"/api/ledgers/{ledger.LedgerId}/transactions?account_id={accounts.BankId}&limit=4"
                     + (cursor is null ? "" : $"&cursor={Uri.EscapeDataString(cursor)}");
             var response = await client.GetAsync(url);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -892,8 +976,8 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Get_with_account_id_filter_returns_only_that_accounts_rows()
     {
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 3);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 3);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Bank-only view: should be 3 single-txn entries, all referencing
@@ -915,11 +999,11 @@ public sealed class TransactionsEndpointsTests
         // ledgerA + accountA, ledgerB exists but caller is authed for B
         // and supplies accountA in the query — the API must reject with
         // 422 account-not-in-ledger (distinct from ledger-not-visible).
-        var ledgerA = await SyntheticLedger.CreateAsync(_fixture);
+        var ledgerA = await SyntheticLedger.CreateAsync(Db);
         var accountA = await ledgerA.AddBankAccountAsync("a-bank");
 
-        var ledgerB = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledgerB = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledgerB);
 
         var response = await client.GetAsync(
@@ -934,14 +1018,14 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Get_returns_422_ledger_not_visible_when_user_has_no_grant()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        await alice.AddBankAccountAsync("alices-bank");
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var alicesBank = await alice.AddBankAccountAsync("alices-bank");
 
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var bob = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
-        var response = await bobClient.GetAsync($"/api/ledgers/{alice.LedgerId}/transactions");
+        var response = await bobClient.GetAsync($"/api/ledgers/{alice.LedgerId}/transactions?account_id={alicesBank.Id}");
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
 
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
@@ -955,8 +1039,8 @@ public sealed class TransactionsEndpointsTests
     [InlineData(501)]
     public async Task Get_returns_422_register_limit_invalid_when_limit_out_of_range(int limit)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.GetAsync(
@@ -971,8 +1055,8 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Get_excludes_user_hidden_rows()
     {
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 2); // 4 rows
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 2); // 4 rows
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Snapshot the pre-hide page so we know which ids exist, then
@@ -996,8 +1080,8 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Get_excludes_rows_that_were_merged_away()
     {
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 2);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 2);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Pick two rows; mark one as merged-into the other so it should
@@ -1026,7 +1110,7 @@ public sealed class TransactionsEndpointsTests
         // leg_index, and tags. The counterparty values are the "other
         // side" of the symmetric posting per ADR-0019 — the MD register
         // surfaces this as the Category column.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
 
@@ -1037,10 +1121,11 @@ public sealed class TransactionsEndpointsTests
             postedAt: new DateTime(2026, 5, 11, 12, 0, 0, DateTimeKind.Utc),
             payee: "Payee A");
         await ledger.SetCheckNumberAsync(fromId, "1284");
-        await ledger.AddTagAsync(fromId, "weekly");
-        await ledger.AddTagAsync(fromId, "essentials");
+        // A one-split's tags live on a leg, never on its header: the bank's own.
+        await ledger.AddLegTagAsync(fromId, "weekly");
+        await ledger.AddLegTagAsync(fromId, "essentials");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.GetAsync(
@@ -1069,6 +1154,7 @@ public sealed class TransactionsEndpointsTests
 
         // Single-split pairs get NULL txn_group_id; leg_index defaults to 0.
         Assert.Null(row.TxnGroupId);
+        Assert.Equal(NotesKinds.OnePosting, row.NotesKind);
         Assert.Equal(0, row.LegIndex);
     }
 
@@ -1080,7 +1166,7 @@ public sealed class TransactionsEndpointsTests
         // the leaf-only account name. Categories like "Base" or "Health"
         // are ambiguous in isolation; the path makes the register chip
         // meaningful ("Wages & Salary/Base", "Taxes/Federal Income Tax").
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var taxes = await ledger.AddCategoryAsync("Taxes");
         var federal = await ledger.AddCategoryAsync("Federal Income Tax", parentId: taxes.Id);
@@ -1092,7 +1178,7 @@ public sealed class TransactionsEndpointsTests
             postedAt: new DateTime(2026, 5, 11, 12, 0, 0, DateTimeKind.Utc),
             payee: "Tax Agency");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.GetAsync(
@@ -1111,7 +1197,7 @@ public sealed class TransactionsEndpointsTests
         // Three-leg paycheck: the gross, split across federal tax,
         // state tax, and net deposit. The bank-side view should see
         // ONE group entry with three legs (sorted by leg_index ASC).
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var federal = await ledger.AddCategoryAsync("federal-tax");
         var state = await ledger.AddCategoryAsync("state-tax");
@@ -1128,7 +1214,7 @@ public sealed class TransactionsEndpointsTests
             postedAt: new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
             payee: "Acme Payroll");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.GetAsync(
@@ -1147,8 +1233,10 @@ public sealed class TransactionsEndpointsTests
         Assert.Equal(new[] { 0, 1, 2 }, legs.Select(l => l.LegIndex).ToArray());
         // Each leg references the originally-seeded origin-side id.
         Assert.Equal(originIds.ToArray(), legs.Select(l => l.Id).ToArray());
-        // All legs share the same txn_group_id and account.
+        // All legs share the same txn_group_id and account, on the split side.
         Assert.All(legs, l => Assert.Equal(groupId, l.TxnGroupId));
+        Assert.All(legs, l => Assert.Equal(groupId, l.HeaderId));
+        Assert.All(legs, l => Assert.Equal(NotesKinds.SplitSide, l.NotesKind));
         Assert.All(legs, l => Assert.Equal(bank.Id, l.AccountId));
         // Leg amounts preserved verbatim — the API surfaces raw legs,
         // SPA aggregates for display.
@@ -1162,7 +1250,7 @@ public sealed class TransactionsEndpointsTests
         // One 3-leg group + 5 single transactions, all on distinct dates
         // so the order is deterministic. limit=2 → page 1 = 2 entries
         // (whatever they are), and the group stays whole inside its page.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
         var federal = await ledger.AddCategoryAsync("federal-tax");
@@ -1192,7 +1280,7 @@ public sealed class TransactionsEndpointsTests
                 payee: $"merchant-{i:D2}");
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // 6 entries total (1 group + 5 singles). limit=2 → 3 pages.
@@ -1236,8 +1324,8 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Get_with_direction_after_returns_entries_newer_than_cursor()
     {
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 6);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 6);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Load the most-recent 3 entries (oldest-half remains unseen).
@@ -1282,11 +1370,51 @@ public sealed class TransactionsEndpointsTests
         Assert.Equal(postedAts.OrderByDescending(p => p).ToArray(), postedAts);
     }
 
+    /// <summary>
+    /// With more newer entries than the page holds, a <c>direction=after</c> page is the
+    /// entries next to its cursor, so walking up from the oldest entry a page at a time
+    /// returns every newer entry once, in display order, with nothing skipped at a page's
+    /// edge.
+    /// </summary>
+    [Fact]
+    public async Task Get_with_direction_after_keeps_the_entries_next_to_the_cursor_when_more_are_newer()
+    {
+        const int Pairs = 7, Limit = 2;
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: Pairs);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+        var register = $"/api/ledgers/{ledger.LedgerId}/transactions?account_id={accounts.BankId}";
+
+        var whole = Flatten((await client.GetFromJsonAsync<RegisterPage>($"{register}&limit=100"))!)
+            .Select(r => r.Id).ToList();
+        Assert.Equal(Pairs, whole.Count);
+
+        // The oldest entry alone, then upward from it.
+        var allButOldest = (await client.GetFromJsonAsync<RegisterPage>($"{register}&limit={Pairs - 1}"))!;
+        var oldest = (await client.GetFromJsonAsync<RegisterPage>(
+            $"{register}&limit=1&cursor={Uri.EscapeDataString(allButOldest.CursorForOlder!)}"))!;
+        Assert.Equal(new[] { whole[^1] }, Flatten(oldest).Select(r => r.Id));
+
+        var up = new List<Guid>();
+        var newer = oldest.CursorForNewer;
+        for (var guard = 0; newer is not null && guard < Pairs; guard++)
+        {
+            var page = (await client.GetFromJsonAsync<RegisterPage>(
+                $"{register}&limit={Limit}&direction=after&cursor={Uri.EscapeDataString(newer)}"))!;
+            if (page.Entries.Count == 0) break;
+            Assert.True(page.Entries.Count <= Limit);
+            up.InsertRange(0, Flatten(page).Select(r => r.Id));
+            newer = page.CursorForNewer;
+        }
+
+        Assert.Equal(whole.SkipLast(1), up);
+    }
+
     [Fact]
     public async Task Get_with_starting_at_anchors_focused_header_at_index_zero()
     {
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 5);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 5);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Capture all entries first, then pick a middle one to anchor on.
@@ -1328,8 +1456,8 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Get_with_invalid_direction_returns_422()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.GetAsync(
@@ -1343,8 +1471,8 @@ public sealed class TransactionsEndpointsTests
     [Fact]
     public async Task Get_with_starting_at_for_nonexistent_header_returns_empty_page()
     {
-        var (ledger, accounts, _) = await SeedRegisterAsync(_fixture, pairCount: 2);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var (ledger, accounts, _) = await SeedRegisterAsync(Db, pairCount: 2);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // A header id that doesn't exist (random Guid) resolves to no

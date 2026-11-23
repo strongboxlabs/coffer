@@ -77,7 +77,7 @@ function renderDialog(account: AccountSummary | null) {
 beforeEach(() => {
     vi.clearAllMocks();
     createAccount.mockResolvedValue(bank);
-    updateAccount.mockResolvedValue(undefined);
+    updateAccount.mockResolvedValue({ becameTwoAmount: 0 });
     fetchAccount.mockResolvedValue(bankDetail);
     fetchAccounts.mockResolvedValue([]);
     loanPaymentPreview.mockResolvedValue({ periodicPayment: 2387.1, escrowAmount: 500.00, totalPayment: 2887.1 });
@@ -119,6 +119,32 @@ describe('AccountEditorDialog', () => {
         expect(createAccount).not.toHaveBeenCalled();
     });
 
+    it('edit: has no Active box, and saving never sends the flag, so it cannot deactivate without the question', async () => {
+        // Deactivating asks first, from the row menu and the sidebar. A box here deactivated on Save
+        // with no question, and an account that was already inactive would have been re-sent as it was.
+        renderDialog({ ...bank, isActive: false });
+        await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled());
+        expect(screen.getByLabelText('Name')).toHaveValue('Checking');
+        expect(screen.queryByRole('checkbox', { name: /active/i })).not.toBeInTheDocument();
+
+        await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+        await waitFor(() => expect(updateAccount).toHaveBeenCalledTimes(1));
+        expect(updateAccount.mock.calls[0]![2]).not.toHaveProperty('isActive');
+    });
+
+    it('create: has no Active box, and the server makes the account active', async () => {
+        renderDialog(null);
+        expect(screen.getByLabelText('Name')).toBeInTheDocument();
+        expect(screen.queryByRole('checkbox', { name: /active/i })).not.toBeInTheDocument();
+
+        await userEvent.type(screen.getByLabelText('Name'), 'Savings');
+        await userEvent.click(screen.getByRole('button', { name: 'Create' }));
+
+        await waitFor(() => expect(createAccount).toHaveBeenCalledTimes(1));
+        expect(createAccount.mock.calls[0]![1]).not.toHaveProperty('isActive');
+    });
+
     it('edit: Save invalidates the singular account-detail key so a reopen re-seeds fresh', async () => {
         const { qc } = renderDialog(bank);
         await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled());
@@ -134,6 +160,59 @@ describe('AccountEditorDialog', () => {
         // re-seeds stale metadata / loan terms.
         const keys = spy.mock.calls.map((c) => c[0]?.queryKey);
         expect(keys).toContainEqual(['account', LEDGER, 'a1']);
+    });
+
+    it.each([
+        ['edit: changing the currency', bank],
+        ['create: an account in a new currency', null],
+    ] as const)('%s refreshes the reads whose currency comes from the accounts', async (_label, account) => {
+        const { qc } = renderDialog(account);
+        const submit = account ? 'Save' : 'Create';
+        if (account) await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled());
+        else await userEvent.type(screen.getByLabelText('Name'), 'Savings');
+        await userEvent.selectOptions(screen.getByLabelText('Currency'), 'EUR');
+        // Spy after the form is filled, so only the save's invalidations are captured.
+        const spy = vi.spyOn(qc, 'invalidateQueries');
+
+        await userEvent.click(screen.getByRole('button', { name: submit }));
+        const saved = account ? updateAccount : createAccount;
+        await waitFor(() => expect(saved).toHaveBeenCalled());
+        expect(saved.mock.calls[0]!.at(-1)).toEqual(expect.objectContaining({ currencyCode: 'EUR' }));
+
+        // Structure's Categories tab takes the ledger's currency, and whether the
+        // accounts span currencies, from its own read; a security's trades and hero
+        // carry their brokerage's. Each must refetch, or it keeps the old currency.
+        await waitFor(() => {
+            const keys = spy.mock.calls.map((c) => c[0]?.queryKey);
+            expect(keys).toContainEqual(['categories', LEDGER]);
+            expect(keys).toContainEqual(['security-transactions', LEDGER]);
+            expect(keys).toContainEqual(['security', LEDGER]);
+            expect(keys).toContainEqual(['securities', LEDGER]);
+            // A brokerage's currency edit re-prices its trade days in the new
+            // currency, which a security's price list prints; a tag's and a budget
+            // category's lines are each in their account's currency.
+            expect(keys).toContainEqual(['security-prices', LEDGER]);
+            expect(keys).toContainEqual(['tag-transactions', LEDGER]);
+            expect(keys).toContainEqual(['budget-transactions', LEDGER]);
+        });
+    });
+
+    it('edit: a failed read of the details blocks Save, so the blank fields cannot overwrite the saved ones', async () => {
+        // A save sends every text field in full and an empty one clears it. With the read failed the
+        // account number, routing number and notes are still the blanks the dialog opened with, so a
+        // save would erase what was never shown. Save waits for the details; "Try again" fetches them.
+        fetchAccount.mockRejectedValueOnce(new Error('offline'));
+        renderDialog(bank);
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(/Could not load this account’s details/);
+        expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+        await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+        expect(updateAccount).not.toHaveBeenCalled();
+
+        await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
+        await waitFor(() => expect(screen.getByLabelText('Account number')).toHaveValue('1234'));
+        expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+        expect(screen.queryByText(/Could not load this account’s details/)).not.toBeInTheDocument();
     });
 
     it('blocks save with a blank name and surfaces the error', async () => {

@@ -73,7 +73,7 @@ describe('MasterKeyPanel', () => {
 
     it('offers no new-key-id field — the server increments', async () => {
         // An advisory label nothing depends on isn't a decision worth putting in front
-        // of an operator mid-rotation, and the placeholder used to reimplement
+        // of an operator mid-rotation, and a placeholder would reimplement
         // NextKekId client-side where it could drift.
         stubStatus();
         renderPanel();
@@ -174,6 +174,25 @@ describe('MasterKeyPanel', () => {
         expect(rotate).not.toHaveBeenCalled();
     });
 
+    // ADR-0023 §L: the confirm field is pending while the rotation is in flight,
+    // since the rotation's success clears it.
+    it('refuses typing in the confirm field while the rotation is in flight', async () => {
+        stubStatus();
+        vi.spyOn(masterKeyApi, 'rotateMasterKey').mockImplementation(() => new Promise(() => {}));
+        const user = userEvent.setup();
+        renderPanel();
+
+        await screen.findByText('v1');
+        const field = screen.getByLabelText(/to confirm/i);
+        await user.type(field, 'rotate');
+        await user.click(screen.getByRole('button', { name: /rotate master key/i }));
+        await screen.findByRole('button', { name: /rotating/i });
+
+        await user.type(field, ' more');
+        expect(field).toHaveValue('rotate');
+        expect(field).toHaveAttribute('aria-disabled', 'true');
+    });
+
     it('offers no separate check step — rotation checks itself', async () => {
         // The server runs the dry run as rotation's first step and refuses before
         // touching anything, so a "Check first" button only previewed a list that
@@ -190,10 +209,10 @@ describe('MasterKeyPanel', () => {
 
     it('does not claim nothing was stored when only delivery URLs were', async () => {
         // The install with no bank-feed connection, no backup passphrase and no Drive,
-        // but two notification targets. Before the count reached this component,
-        // rotatedItems() came back empty and the panel said "Nothing was stored under
-        // the old key, so only the key changed" — immediately after re-wrapping both
-        // URLs. A false statement produced by the rotation itself.
+        // but two notification targets. Without the targets' count, rotatedItems()
+        // would come back empty and the panel would say "Nothing was stored under the
+        // old key, so only the key changed" — immediately after re-wrapping both URLs.
+        // A false statement produced by the rotation itself.
         stubStatus();
         vi.spyOn(masterKeyApi, 'rotateMasterKey').mockResolvedValue({
             keyBase64: 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=',
@@ -203,6 +222,7 @@ describe('MasterKeyPanel', () => {
             driveTokenRotated: false,
             notificationTargetsRotated: 2,
             oauthKeysRotated: false,
+            upgradeTokenRotated: false,
             previousKeyArchivedAt: '/app/data/master.key.20260806T120000Z.bak',
             restartPending: true,
         });
@@ -230,6 +250,7 @@ describe('MasterKeyPanel', () => {
             driveTokenRotated: false,
             notificationTargetsRotated: 0,
             oauthKeysRotated: true,
+            upgradeTokenRotated: false,
             previousKeyArchivedAt: '/app/data/master.key.20261017T120000Z.bak',
             restartPending: true,
         });
@@ -245,6 +266,35 @@ describe('MasterKeyPanel', () => {
         expect(screen.queryByText(/nothing was stored under the old key/i)).toBeNull();
     });
 
+    it('names the upgrade token when it was the only thing re-wrapped (ADR-0110)', async () => {
+        // A private fork's repository token is sealed under the master key. On an install with
+        // nothing else sealed it is all the rotation moved, and saying "only the key changed"
+        // right after re-wrapping it would be false.
+        stubStatus();
+        vi.spyOn(masterKeyApi, 'rotateMasterKey').mockResolvedValue({
+            keyBase64: 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=',
+            kekId: 'v2',
+            ledgersRotated: 0,
+            backupPassphraseRotated: false,
+            driveTokenRotated: false,
+            notificationTargetsRotated: 0,
+            oauthKeysRotated: false,
+            upgradeTokenRotated: true,
+            previousKeyArchivedAt: '/app/data/master.key.20261031T120000Z.bak',
+            restartPending: true,
+        });
+
+        const user = userEvent.setup();
+        renderPanel();
+
+        await screen.findByText('v1');
+        await user.type(screen.getByLabelText(/to confirm/i), 'rotate');
+        await user.click(screen.getByRole('button', { name: /rotate master key/i }));
+
+        expect(await screen.findByText(/your upgrade repository token/i)).toBeTruthy();
+        expect(screen.queryByText(/nothing was stored under the old key/i)).toBeNull();
+    });
+
     it('names what moved in operator terms, not API counters', async () => {
         // Was "Re-wrapped 3 ledger keys, the backup passphrase" — jargon, and a bare
         // count of something an operator has no concept of.
@@ -257,6 +307,7 @@ describe('MasterKeyPanel', () => {
             driveTokenRotated: false,
             notificationTargetsRotated: 0,
             oauthKeysRotated: false,
+            upgradeTokenRotated: false,
             previousKeyArchivedAt: '/app/data/master.key.20260807T120000Z.bak',
             restartPending: true,
         });
@@ -278,8 +329,8 @@ describe('MasterKeyPanel', () => {
     });
 
     it('explains how to remediate a blocked rotation', async () => {
-        // The one rotation failure an operator can act on. Previously it surfaced only
-        // the server's diagnostic, which says what is wrong but not what to do.
+        // The one rotation failure an operator can act on. The server's diagnostic
+        // alone says what is wrong but not what to do.
         stubStatus();
         vi.spyOn(masterKeyApi, 'rotateMasterKey').mockRejectedValue(
             new ApiError(
@@ -326,6 +377,7 @@ describe('MasterKeyPanel', () => {
             driveTokenRotated: false,
             notificationTargetsRotated: 0,
             oauthKeysRotated: false,
+            upgradeTokenRotated: false,
             previousKeyArchivedAt: '/app/data/master.key.20260806T120000Z.bak',
             restartPending: true,
         });
@@ -347,9 +399,9 @@ describe('MasterKeyPanel', () => {
         expect(screen.queryByText('v1')).not.toBeInTheDocument();
         expect(screen.getByText(/reconnecting to the server/i)).toBeInTheDocument();
         // (3) Progress, not a warning about the page breaking.
-        // Short, and explicitly coloured rather than inheriting — it was reported
-        // unreadable (dark on dark), and in practice it's on screen for about half a
-        // second, so it's a status flicker, not information anyone must catch.
+        // Short, and explicitly coloured rather than inheriting — inherited, it
+        // renders dark on dark. It is on screen only briefly, so it's a status
+        // flicker, not information anyone must catch.
         const restarting = screen.getByText(/^Restarting…$/);
         expect(restarting).toBeInTheDocument();
         expect(restarting).toHaveClass('text-state-warning');

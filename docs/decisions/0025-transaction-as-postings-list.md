@@ -1,6 +1,6 @@
 # 0025 — Transaction editing as a unified postings list
 
-* Status: Accepted
+* Status: Accepted (amended 2026-10-27 by [ADR-0108](0108-memo-and-tags-per-side.md): memo and tags travel in `notes`, postings carry shape only; amended 2026-11-03: the editor in a dialog has its own layout; amended 2026-11-14 by [ADR-0114](0114-benchmarks-and-currency-conversion.md): a posting between real accounts in different currencies carries a required second amount and does not sum to zero, and the editors show it in one extra column or track)
 * Date: 2026-05-15
 * Companion to: [ADR-0019](0019-symmetric-postings.md), [ADR-0022](0022-txn-headers-and-legs.md), [ADR-0023](0023-ui-ux-interaction-conventions.md)
 
@@ -11,6 +11,8 @@ postings × 2 `txn_legs` rows. A "single-row" transaction is just
 `N=1`; a "multi-split" is `N>1`. The schema treats them
 identically — `posting_index` numbers the postings, and the
 sum-to-zero CHECK applies per posting, not across the transaction.
+*(Amended 2026-11-14, see the amendment of that date: no CHECK enforces the sum, and a
+posting between real accounts in different currencies does not sum to zero.)*
 
 The pre-ADR-0025 SPA and API surface didn't model that uniformity:
 
@@ -21,9 +23,8 @@ The pre-ADR-0025 SPA and API surface didn't model that uniformity:
   tweaks on existing legs) but no add/remove postings, no reorder.
 - No endpoint converted single ↔ split.
 
-The roadmap had a "Convert to split UI" slice queued as a *separate
-flow* — right-click menu item, separate modal, separate API
-endpoint. Working through the design surfaced that:
+A "Convert to split" UI as a *separate flow* — right-click menu
+item, separate modal, separate API endpoint — duplicates work:
 
 - "Convert to split" and "edit split" share ~90% of their UI.
 - "New transaction with N>1 postings" needs the same editor.
@@ -77,7 +78,9 @@ legs to match the requested list:
 
 - `legId` present + matches an existing source-side leg → that
   posting is preserved (counterparty / amount / memo updated as
-  requested).
+  requested). *(2026-10-27: counterparty and amount only; a line's
+  memo and tags are addressed by index in `notes.lines`, see the
+  amendment of that date.)*
 - `legId` missing or null → new posting.
 - Existing source-side legs whose `legId` is not referenced by
   any request item → that posting is deleted (both legs).
@@ -92,7 +95,9 @@ costs one PATCH with no postings overhead.
 ### Validation (one set, both endpoints)
 
 - `postings.length >= 1`.
-- No `amount === 0` (silently meaningless posting).
+- No `amount === 0` (silently meaningless posting). *(Superseded: zero amounts are
+  legal, as the 2026-09-16 amendment states, except on a posting between real accounts
+  in different currencies, where both amounts must be nonzero (2026-11-14 amendment).)*
 - `counterpartyAccountId !== sourceAccountId` per posting
   (`transaction-posting-self`).
 - Every `counterpartyAccountId` lives in the same ledger
@@ -108,6 +113,8 @@ transaction's total = sum of source-side amounts, free-form.
 Splitting a row into postings whose sum differs from the row's
 original total is allowed — the user might be correcting both the
 breakdown and the total in one edit. The SPA shows `Total: -$X.XX` as informational only.
+*(Amended 2026-11-14, see the amendment of that date: per-posting sum-to-zero does not
+hold between real accounts in different currencies, and no CHECK enforces it.)*
 
 ### Frontend
 
@@ -193,8 +200,116 @@ a swap, which is.
 
 **Still true, and load-bearing:** no balance rule. The running total in the
 footer is informational, zero amounts are legal, and an "unbalanced" split is
-not an invalid one. Two test files pin the absence so a later change cannot
+not an invalid one. *(Amended 2026-11-14, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D13: except on a posting
+between real accounts in different currencies, where both amounts must be nonzero.)* Two test files pin the absence so a later change cannot
 quietly introduce one.
+
+## Amendment, 2026-10-27 — memo and tags travel in `notes` (ADR-0108 D14)
+
+**The API shape above is out of date in its memo fields.** Memo and tags are per side of
+a transaction (ADR-0108 D1), so they left the header and the postings. The top-level
+`"memo"` and each posting's `"legMemo"` are gone, with no compatibility shim. A posting
+carries shape only (`legId`, `counterpartyAccountId`, `amount`), and the memo and tags
+travel in a `notes` member of the `POST` and `PATCH` bodies (`TransactionNotesRequest`):
+
+```
+"notes": {
+  "side": "<uuid>",
+  "memo": "...", "tags": ["..."],
+  "lines": [ { "index": 0, "memo": "...", "tags": ["..."] } ]
+}
+```
+
+- `side` is the register the write is made from. It must equal the postings'
+  `sourceAccountId` (`side-not-on-transaction`), and on a split it becomes the
+  transaction's originating account.
+- `memo` and `tags` are that side's own on a one-posting result and the whole
+  transaction's on a multi-posting one. **Presence decides**, as for the header fields:
+  an omitted key leaves the value, and `null`, `""` or `[]` clears it, which on a
+  one-split means "show the other side's".
+- `lines` addresses a line by its position in the postings sent. A posting kept by
+  `legId` keeps its counterparty and amount as requested; its memo and tags are
+  changed only through its entry in `notes.lines`, so a client echoing back the
+  postings it read cannot strip them by omission.
+
+**Validation gains:**
+
+- `lines` on a one-posting result is refused (`line-notes-on-one-posting`), and so is a
+  line that names no line of the originating account, names one twice, or addresses an
+  investment event (`line-notes-invalid`).
+- A tag set is refused only when the write GROWS it past the per-set limit; an
+  unchanged or shrinking set saves even when a system merge left it over the limit
+  (ADR-0108 D12).
+- On an edit, an account already on the transaction is kept even if it has since been
+  deactivated, and a newly added inactive account is refused (`account-inactive`); a
+  create stays strict.
+- A requested date on the stored calendar day keeps the stored posted timestamp, time
+  of day included; only a different day changes it (`HeaderDates`).
+
+**A change of shape moves the notes** (ADR-0108 D4). The postings list still has no convert-to-split
+operation, but the write primitive (`AnnotationPlanner.Plan`) applies the shape's
+transition before the request's notes: splitting a one-split copies what the writing
+side showed onto the header and onto line 1; collapsing to one line joins the header's
+memo with the line's (" · ", when they differ), unions their tags, and clears the
+header. The request's values are then laid over that result, so the editor sends the
+joined memo and merged tags it showed before Save.
+
+## Amendment, 2026-11-03 — the editor in a dialog has its own layout
+
+The 2026-09-16 amendment says the root row rides the register template. That holds in
+the register. The editor is also hosted in dialogs: the reminder occurrence's Post or
+skip, the reminder series editor and the home screen's Review. There is no register
+behind a dialog to align with, so the register's own tracks (selection, status,
+balance) were dead width there. In a dialog the editor takes `layout="dialog"`:
+
+- **Wide:** five columns of its own, Date · Check # · Payee · Category · Amount, with
+  Tax date, Memo and Tags beneath Date, Payee and Category, and the Similar and Merge
+  strips under Payee, as in the register.
+- **Narrow:** below `@3xl/dialog`, a container query on the dialog card
+  (`@container/dialog`, `components/ui/EditorDialog.tsx`), one field per row: Date
+  beside Check #, then Payee, the strips, Category, Amount, Tax date, Memo and Tags.
+  The fields grow to 40px and the footer's Cancel and primary become 44px buttons that
+  share the width. The fields learn their size from `FieldSizeContext`
+  (`components/ui/fieldSize.ts`), which only the dialog layout sets.
+- **The legs keep the splits grid** in both, at its own sizes. Where the dialog is
+  narrower than its columns, its scrollport scrolls sideways and the dialog does not.
+
+The investment editor follows the same principle: its form rows fill the dialog, and
+below `@3xl/dialog` each field takes its own row at touch size, with the same footer.
+The model and the save path are unchanged; only the drawing differs.
+
+## Amendment, 2026-11-14 — a posting between currencies carries both amounts ([ADR-0114](0114-benchmarks-and-currency-conversion.md) D13, D14)
+
+**The sum-to-zero invariant has one exception, and no CHECK, trigger or constraint
+enforces a posting's sum** (ADR-0032). A posting between two real accounts in different
+currencies records both amounts, each in its own account's currency, with opposite,
+nonzero signs, and does not sum to zero ([ADR-0022](0022-txn-headers-and-legs.md) Rule 2, 2026-11-14 amendment).
+Every other posting, a category leg's included, still sums to zero. The transaction's
+total is still the sum of the source-side amounts.
+
+**The posting shape gains the second amount**, the counterparty side's own figure, as a
+new field `counterpartyAmount` beside `counterpartyAccountId`. It is present only while
+the counterparty is a real account in another currency than the source; switching the
+counterparty to a category or to a same-currency account drops it.
+
+**Validation gains one rule:** on a posting between real accounts in different
+currencies, the second amount is required. A missing, zero or same-signed second amount
+is refused. Zero amounts stay legal on every other posting (2026-09-16 amendment).
+
+**The editors show it in one extra place**, right of Amount, only while it applies:
+
+- **The splits grid** gains one column right of Amount, with a header caption, for a line
+  whose counterparty is a real account in another currency. The five columns of the
+  2026-09-16 amendment become six while it shows. Its caption is Received, Sent, or
+  Other amount while the lines go both ways (ADR-0114 D14). The footer total sums the
+  Amount column only, in the register account's currency, never the second amount's
+  column, as it does today.
+- **The dialog layout** gains one track while it shows, in every host of it: Post or
+  skip…, the reminder series editor and the home screen's Review…. That track is a sixth
+  column right of Amount on a wide card, and a row after Amount below `@3xl/dialog`.
+- **The investment editor** places it right of Amount, in a row of its own below
+  `@3xl/dialog`. BuyXfr, SellXfr and DividendXfr pair it with the trade amount, not the
+  fee.
 
 ## Consequences
 
@@ -203,14 +318,16 @@ quietly introduce one.
 - Schema, API, and UI all model the same shape: a transaction is
   a postings list.
 - No "convert-to-split" code path. No "convert-to-single" code
-  path. Both fall out of the same edit operation.
+  path. Both fall out of the same edit operation. *(2026-10-27: still
+  true of the postings; the memo and tags do have a transition on a
+  change of shape, applied by the write primitive, see the amendment
+  of that date.)*
 - The SPA's `TxnRowEdit` is one state shape and one save handler —
   used by `+ New transaction`, double-click-row edit, Enter on a
   focused row, and the splits editor. *(2026-09-16: no longer one
-  COMPONENT. It is a 983-line shell over `bank-edit/` — the pure
-  tier, the draft hook and six field components. The state shape and
-  the single save handler, which are what this bullet was actually
-  claiming, both survived the decomposition intact.)*
+  COMPONENT. It is a shell over `bank-edit/` — the pure tier, the
+  draft hook and the field components. It still has one state shape
+  and one save handler.)*
 - Reorder (drag) is structurally trivial: the order of `items[]`
   in the request maps to `posting_index`, no separate "move
   posting" endpoint.
@@ -262,5 +379,4 @@ quietly introduce one.
 
 None. Auto-balance / sum-constraint warnings were the only open
 UX question; the design call (no auto-balance, no warnings) is
-captured above and matches user feedback during the 2026-05-15
-design discussion.
+captured above.

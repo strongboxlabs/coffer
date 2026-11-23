@@ -3,6 +3,8 @@
 // resource (feed-mapping, sync-from-date); the related feed-connection
 // summary lives in [./feed.ts].
 
+import type { RateUnavailable } from './conversion';
+
 /**
  * Mirror of API `Coffer.Api.Contracts.AccountSummary`. Unified account
  * shape: real accounts (`bank` / `credit_card` / `investment` /
@@ -105,6 +107,18 @@ export interface CreateAccountRequest {
  *  clears (→ null). `accountType` is immutable, so it is intentionally absent. */
 export interface UpdateAccountRequest {
     name?: string;
+    /** A new currency relabels (ADR-0114 D13): every stored figure is kept and reads in
+     *  it. Refused when a two-amount pair would land in one currency with magnitudes that
+     *  differ (`relabel-pair-not-representable`: `count` pairs, and `mergedInto`, each a
+     *  {@link RelabelMergedInto}, when any of them is on a transaction merged into
+     *  another, which `ApiError.mergedInto` carries) or stored figures carry more places than
+     *  it allows (`relabel-places-exceed-currency`: `count`, how many transactions have a
+     *  leg on the account or its Holdings sibling that does not fit, a category's mirror
+     *  not counted again and a transaction merged into another left out (ADR-0114 D15);
+     *  `accountFigures`, the account-level figures that do not fit,
+     *  each `'opening_balance'` or `'loan_terms'` ({@link UnfitAmountKind} values), empty
+     *  when none does; `currencyCode` and `places`). The response says how many mirrored
+     *  pairs now carry two amounts ({@link UpdateAccountResponse}). */
     currencyCode?: string;
     institutionName?: string;
     accountNumber?: string;
@@ -124,6 +138,35 @@ export interface UpdateAccountRequest {
     /** Tax treatment (ADR-0066): 'taxable' | 'tax_deferred' | 'tax_free' |
      *  'other'. Omit = unchanged; '' clears (→ null). */
     taxStatus?: string;
+}
+
+/** Response of `PATCH /api/ledgers/{ledgerId}/accounts/{accountId}`. Mirror of API
+ *  `UpdateAccountResponse`. */
+export interface UpdateAccountResponse {
+    /** How many mirrored pairs a currency change left across currencies, so each now
+     *  carries two amounts, equal in magnitude and opposite in sign. Zero when the
+     *  currency did not change. */
+    becameTwoAmount: number;
+}
+
+/** One entry of a `relabel-pair-not-representable` refusal's `mergedInto` (ADR-0114 D13,
+ *  decided by the owner, 2026-11-18): a transaction that a refused pair's transaction was
+ *  merged into. The merged row is in no register; this one is, so the refusal links to
+ *  it. Followed to the end of a chain: a transaction since merged into another names the
+ *  row a register shows (settled by Claude, 2026-11-18). Mirror of API
+ *  `RelabelMergedInto`. */
+export interface RelabelMergedInto {
+    /** The transaction to open. */
+    headerId: string;
+    /** The account whose register opens at it: the one it was entered from. */
+    accountId: string;
+    /** That account's name. */
+    account: string;
+    /** Its posted date (ISO date). */
+    date: string;
+    payee: string | null;
+    /** Hidden: its register shows it only in the Hidden view (ADR-0072 D1). */
+    hidden: boolean;
 }
 
 /** Full editable shape of one account — `GET /api/ledgers/{lid}/accounts/{aid}`
@@ -177,6 +220,12 @@ export interface SetupPaymentReminderRequest {
 /** Body of `POST /api/ledgers/{ledgerId}/accounts/loan-payment-preview`
  *  (ADR-0050 slice 3) — stateless amortization preview for the editor. */
 export interface LoanPaymentPreviewRequest {
+    /** The loan's currency, as the editor's Currency field holds it (ADR-0114 D15): the
+     *  payment rounds up to one of its minor units. The server refuses a preview whose
+     *  code is missing or not three characters once trimmed (`account-currency-invalid`)
+     *  and never defaults one. Any other three-character code previews at its places, 2 for a code an
+     *  account kept from before the rule. */
+    currencyCode?: string | null;
     originalPrincipal: number;
     annualInterestRate: number;
     paymentCount: number;
@@ -195,26 +244,151 @@ export interface LoanPaymentPreviewResponse {
 }
 
 /**
- * Mirror of API `Coffer.Api.Contracts.AccountGroupSummary` (migration
- * 033). One user-curated sidebar tab; the implicit "All" tab is
- * rendered client-side and is never returned from the API.
+ * Mirror of API `Coffer.Api.Contracts.AccountFolderDto` (migration 258,
+ * FU-006). One sidebar folder: ledger-wide, one account type, nested under
+ * `parentId` (null = the top level of its type's section). The list is flat;
+ * the sidebar builds the tree. `accountIds` are the accounts directly in this
+ * folder, not those in its sub-folders.
  */
-export interface AccountGroupSummary {
+export interface AccountFolder {
     id: string;
+    accountType: string;
+    parentId: string | null;
     name: string;
-    sortOrder: number;
-    memberAccountIds: readonly string[];
+    accountIds: readonly string[];
 }
 
-/** Body of `POST /api/ledgers/{ledgerId}/account-groups`. */
-export interface CreateAccountGroupRequest {
+/** Body of `POST /api/ledgers/{ledgerId}/account-folders`. */
+export interface CreateAccountFolderRequest {
+    accountType: string;
+    name: string;
+    parentId?: string | null;
+}
+
+/** Body of `PATCH /api/ledgers/{ledgerId}/account-folders/{folderId}`: rename. */
+export interface RenameAccountFolderRequest {
     name: string;
 }
 
-/** Body of `PATCH /api/ledgers/{ledgerId}/account-groups/{groupId}`.
- *  Rename only at v1 — `sort_order` reorder is a deferred follow-up. */
-export interface PatchAccountGroupRequest {
-    name?: string;
+/**
+ * Mirror of API `Coffer.Api.Contracts.AccountBalanceDto` (FU-052). One real
+ * account's current balance, the figure the dashboard shows: cash, plus
+ * holdings market value for an investment account. Liabilities are negative.
+ * Inactive accounts are included.
+ */
+export interface AccountBalance {
+    accountId: string;
+    balance: number;
+    currencyCode: string;
+}
+
+/**
+ * Mirror of API `Coffer.Api.Contracts.AccountSubtotalsDto`:
+ * `GET /api/ledgers/{ledgerId}/accounts/subtotals?today`. The sidebar's section and
+ * folder totals. Each combines accounts, so it is in the ledger's reporting currency,
+ * every account's current balance converted at the latest rate and summed on the
+ * server (ADR-0114 D7); null, with `rateUnavailable` naming each missing pair and day,
+ * when a rate is missing (ADR-0114 D9). Inactive accounts count (ADR-0085).
+ */
+export interface AccountSubtotals {
+    /** The ledger's reporting currency, which every total here is in. */
+    currencyCode: string;
+    /** One per account type the ledger has an account of. */
+    types: AccountTypeSubtotal[];
+    /** One per folder, empty ones included. */
+    folders: AccountFolderSubtotal[];
+}
+
+export interface AccountTypeSubtotal {
+    accountType: string;
+    amount: number | null;
+    rateUnavailable: RateUnavailable[];
+}
+
+export interface AccountFolderSubtotal {
+    folderId: string;
+    /** Every account beneath the folder at any depth that the total is over. */
+    accountIds: string[];
+    /** Zero for a folder with nothing beneath it. */
+    amount: number | null;
+    rateUnavailable: RateUnavailable[];
+}
+
+/**
+ * Mirror of API `Coffer.Api.Contracts.BalanceForecastDto`:
+ * `GET /api/ledgers/{ledgerId}/accounts/balance-forecast?today&days`.
+ * Each account's balance from the caller's today through `days` ahead, from the
+ * register's committed rows and the reminders not yet posted. A projection, never a
+ * fact: nothing in it is counted anywhere else.
+ */
+export interface BalanceForecast {
+    /** One row per account in scope, by name: every account a reminder is paid from. */
+    accounts: BalanceForecastAccount[];
+    /** The accounts summed in the ledger's reporting currency, each converted at the
+     *  latest rate on every day (ADR-0114 D7); null when there are none, or when a
+     *  rate is missing, which `rateUnavailable` then names (ADR-0114 D9). */
+    combined: BalanceForecastCombined | null;
+    /** An estimated amount was placed on an account in scope. */
+    includesEstimates: boolean;
+    /** The un-posted occurrences dated before today that were placed, all on day 1:
+     *  the reminders Bills calls overdue. */
+    overdueOnDay1: number;
+    /** The reminders that would move an account in scope but could not be placed. */
+    excluded: BalanceForecastExclusion[];
+    /** Every missing rate the combined line needed. */
+    rateUnavailable: RateUnavailable[];
+}
+
+/** One account's projection. */
+export interface BalanceForecastAccount {
+    accountId: string;
+    name: string;
+    currencyCode: string;
+    /** Day 0: the register's own current balance for the caller's today. */
+    today: number;
+    /** The lowest balance over `points`, day 0 included, and the first date reached. */
+    lowest: BalanceForecastLowest;
+    /** One point per day, day 0 through the window's last day: the balance at the
+     *  end of that day. */
+    points: BalanceForecastPoint[];
+}
+
+/** The accounts in scope summed, in the ledger's reporting currency. */
+export interface BalanceForecastCombined {
+    currencyCode: string;
+    today: number;
+    lowest: BalanceForecastLowest;
+    points: BalanceForecastPoint[];
+}
+
+export interface BalanceForecastLowest {
+    amount: number;
+    /** `YYYY-MM-DD`. */
+    date: string;
+    /** An estimated amount went into this figure, so it is approximate. */
+    estimated: boolean;
+}
+
+export interface BalanceForecastPoint {
+    /** `YYYY-MM-DD`. */
+    date: string;
+    balance: number;
+}
+
+/**
+ * A reminder left out of the projection. `no-lines`: its template names no account;
+ * `override-not-placeable`: a computed amount cannot be placed on the accounts in
+ * scope; `cross-currency`: a managed loan payment across currencies, which can never
+ * post (ADR-0114 D13); `rate-unavailable`: an estimating reminder between currencies
+ * whose other side needs the latest derived rate, and a stored leg of it is missing,
+ * named in `rateUnavailable`.
+ */
+export interface BalanceForecastExclusion {
+    reminderId: string;
+    reason: string;
+    /** On a `rate-unavailable` row, each missing stored leg (account currency into the
+     *  reporting currency) and its day; absent on every other row. */
+    rateUnavailable?: RateUnavailable[];
 }
 
 /** Body of

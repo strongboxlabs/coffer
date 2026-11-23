@@ -2,9 +2,9 @@
 -- lets through is the writer's own row or theirs by role (FU-086)
 --
 -- Migration 017 set DEFAULT PRIVILEGES so that every table created later handed
--- coffer_app SELECT, INSERT, UPDATE and DELETE on its own. A table that then shipped
--- without row-level security was open to every request, and that happened at least four
--- times (072, 175/231, 207, 243). The API's own authorization hid each one. Below:
+-- coffer_app SELECT, INSERT, UPDATE and DELETE on its own. A table created without
+-- row-level security is therefore open to every request, behind nothing but the API's
+-- own authorization (072, 175/231, 207 and 243 each created one). Below:
 --
 --   1. The default grant goes. A new table is now closed to coffer_app until its
 --      migration grants exactly what its policies serve; RlsCatalogTests fails until

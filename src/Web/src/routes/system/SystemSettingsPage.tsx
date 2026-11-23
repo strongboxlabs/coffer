@@ -2,6 +2,9 @@ import { useQuery } from '@tanstack/react-query';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 
 import { fetchCurrentUser } from '@/lib/api';
+import { AttentionDot } from '@/components/AttentionDot';
+import type { AttentionSeverity } from '@/lib/useLedgerAttention';
+import { sentenceFor, useSystemAttention } from '@/lib/useSystemAttention';
 import { Breadcrumb } from '@/components/ui/Breadcrumb';
 import { MainArea, MainPane, TopBar } from '@/components/ui/SidebarLayout';
 
@@ -10,9 +13,10 @@ import { AppearancePanel } from './AppearancePanel';
 import { BackupsPanel } from './BackupsPanel';
 import { MasterKeyPanel } from './MasterKeyPanel';
 import { McpSettingsPanel } from './McpSettingsPanel';
-import { McpClientsPanel } from './McpClientsPanel';
+import { McpConnectedAppsPanel } from './McpConnectedAppsPanel';
 import { McpAuditPanel } from './McpAuditPanel';
 import { NotificationsPanel } from './NotificationsPanel';
+import { UpgradePanel } from './UpgradePanel';
 import { UsersPanel } from './UsersPanel';
 
 export type SystemTab =
@@ -22,6 +26,7 @@ export type SystemTab =
     | 'encryption'
     | 'mcp'
     | 'notifications'
+    | 'upgrade'
     | 'users';
 
 /**
@@ -31,7 +36,7 @@ export type SystemTab =
  */
 export function coerceSystemTab(value: unknown): SystemTab {
     return value === 'appearance' || value === 'backups' || value === 'encryption'
-        || value === 'mcp' || value === 'notifications' || value === 'users'
+        || value === 'mcp' || value === 'notifications' || value === 'upgrade' || value === 'users'
         ? value
         : 'about';
 }
@@ -51,6 +56,21 @@ export function SystemSettingsPage() {
     const userQuery = useQuery({ queryKey: ['me'], queryFn: fetchCurrentUser });
     const isAdmin = userQuery.data?.isAdmin ?? false;
 
+    // The trail the gear starts, followed down to the tab that holds the thing (ADR-0102, amended
+    // for ADR-0110). Upgrade carries the upgrade alone and Notifications everything else, so one
+    // subject never lights two tabs.
+    const attention = useSystemAttention();
+    const dots: Partial<Record<SystemTab, { severity: AttentionSeverity | null; sentence: string }>> = {
+        upgrade: {
+            severity: attention.upgrade,
+            sentence: sentenceFor(0, true, attention.upgradeVersion) ?? '',
+        },
+        notifications: {
+            severity: attention.problems,
+            sentence: sentenceFor(attention.problemCount, false, null) ?? '',
+        },
+    };
+
     const tabs: ReadonlyArray<{ id: SystemTab; label: string }> = isAdmin
         ? [
               { id: 'about', label: 'About' },
@@ -60,13 +80,16 @@ export function SystemSettingsPage() {
               // sealed secrets portable, so it's the more fundamental of the two —
               // and its own tab, not a card under Backups (ADR-0092). The key wraps
               // bank-feed tokens, the backup passphrase AND the Drive connection, so
-              // filing it under one of the three made "where is my master key?" a
-              // hunt. It also has a lifecycle of its own now (view, rotate).
+              // filing it under one of the three would make "where is my master
+              // key?" a hunt. It also has a lifecycle of its own (view, rotate).
               { id: 'encryption', label: 'Encryption' },
               { id: 'backups', label: 'Backups' },
+              // Next to Backups on purpose: an upgrade starts with a backup and the
+              // two are read together (ADR-0110).
+              { id: 'upgrade', label: 'Upgrade' },
               { id: 'mcp', label: 'MCP' },
-              // Next to Backups on purpose: the first thing it reports on is whether
-              // a backup actually happened, and the two are read together.
+              // Notifications reports on whether a backup actually happened, as
+              // Upgrade does on the backup it takes.
               { id: 'notifications', label: 'Notifications' },
               { id: 'users', label: 'Users' },
           ]
@@ -79,10 +102,10 @@ export function SystemSettingsPage() {
     // reached with the back button — and so the sidebar's System section can
     // point at individual tabs.
     //
-    // This used to be component state seeded ONLY from `?tab=backups` (for the
-    // Google Drive OAuth callback). Every other value fell through to About, so
-    // `?tab=mcp` silently showed the wrong tab, and switching tabs left the URL
-    // stale — a reload or a shared link never landed where you were.
+    // Not component state seeded only from `?tab=backups` (the Google Drive
+    // OAuth callback): then every other value falls through to About, so
+    // `?tab=mcp` silently shows the wrong tab, and switching tabs leaves the URL
+    // stale — a reload or a shared link never lands where you were.
     const navigate = useNavigate();
     const search = useSearch({ strict: false }) as { tab?: string };
     const tab = coerceSystemTab(search.tab);
@@ -103,13 +126,11 @@ export function SystemSettingsPage() {
     return (
         <MainArea>
             <TopBar>
-                {/* Just "System" (ADR-0090). This used to render
-                    "All ledgers / System", asserting a hierarchy that does not
-                    exist: /system is a SIBLING of / in the router, and its scope
-                    is the whole install — the ledger list does not contain it.
-                    The "All ledgers" crumb was also the only way back to the
-                    ledger list, which made a breadcrumb load-bearing for
-                    navigation; the sidebar now owns that. */}
+                {/* Just "System" (ADR-0090). "All ledgers / System" would
+                    assert a hierarchy that does not exist: /system is a SIBLING
+                    of / in the router, and its scope is the whole install — the
+                    ledger list does not contain it. Nor is a breadcrumb the way
+                    back to the ledger list; the sidebar owns that. */}
                 <Breadcrumb items={[{ label: 'System' }]} />
             </TopBar>
             <MainPane>
@@ -134,12 +155,26 @@ export function SystemSettingsPage() {
                                 aria-selected={activeTab === t.id}
                                 onClick={() => setTab(t.id)}
                                 className={
-                                    activeTab === t.id
-                                        ? '-mb-px border-b-2 border-accent px-3 py-1.5 font-semibold text-text'
-                                        : '-mb-px border-b-2 border-transparent px-3 py-1.5 text-text-muted hover:text-text'
+                                    '-mb-px border-b-2 px-3 py-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent '
+                                    + (activeTab === t.id
+                                        ? 'border-accent font-semibold text-text'
+                                        : 'border-transparent text-text-muted hover:text-text')
                                 }
                             >
                                 {t.label}
+                                {dots[t.id]?.severity ? (
+                                    <>
+                                        {/* A real space: the tab's accessible name is label then
+                                            sentence, and inline children join without one. */}
+                                        {' '}
+                                        <AttentionDot
+                                            severity={dots[t.id]!.severity}
+                                            context={t.label}
+                                            sentence={dots[t.id]!.sentence}
+                                            className="ml-0.5 align-middle"
+                                        />
+                                    </>
+                                ) : null}
                             </button>
                         ))}
                     </nav>
@@ -148,13 +183,16 @@ export function SystemSettingsPage() {
                     {activeTab === 'appearance' ? <AppearancePanel /> : null}
                     {activeTab === 'backups' && isAdmin ? <BackupsPanel /> : null}
                     {activeTab === 'encryption' && isAdmin ? <MasterKeyPanel /> : null}
+                    {activeTab === 'upgrade' && isAdmin ? (
+                        <UpgradePanel onOpenBackups={() => setTab('backups')} />
+                    ) : null}
                     {activeTab === 'notifications' && isAdmin ? (
                         <NotificationsPanel />
                     ) : null}
                     {activeTab === 'mcp' && isAdmin ? (
                         <div className="space-y-4">
                             <McpSettingsPanel />
-                            <McpClientsPanel />
+                            <McpConnectedAppsPanel />
                             <McpAuditPanel />
                         </div>
                     ) : null}

@@ -1,6 +1,6 @@
 # 0068 — MCP write surface (AI-assisted data cleanup)
 
-* Status: Accepted (slices A + B shipped 0.8.0 / 0.9.0)
+* Status: Accepted (slices A + B shipped 0.8.0 / 0.9.0; amended 2026-11-03 by [ADR-0111](0111-structure-is-one-page.md) D8: a category merge may cross kinds, refuses a target beneath the source, and Reactivate does not undo it; amended 2026-11-03: `merge_securities` prices the target's days from the trades it moves; amended 2026-11-04: `merge_securities` locks the source before it reads its lines; amended 2026-11-06: `merge_securities` recomputes only the accounts that hold the source or carry its shares on a transaction, and counts only those; E amended 2026-11-14 by [ADR-0114](0114-benchmarks-and-currency-conversion.md): `set_split_posting_category` carries each untouched posting's far-leg amount, so a transfer line between currencies keeps both amounts; D5 and E amended 2026-11-16 by ADR-0114: a typed money figure finer than its currency is refused with ADR-0114 D15's named error code, a stored figure a write leaves unchanged passes, and the CSV mapping tools name a layout's decimal separator, which a layout written through them must name)
 * Date: 2026-06-27
 * Related: ADR-0063 (MCP server — this reverses its "read-only first" stance, behind
   a gate), ADR-0067 (classification — the schema these writes populate), ADR-0065
@@ -16,8 +16,8 @@ tools (populate classifications, collapse duplicate/mis-tagged securities, merge
 redundant categories left by stacked imports, fix mis-recorded rollovers) dead-ends
 in manual work. The gap is almost entirely writes.
 
-The product owner wants to drive cleanup with an AI assistant: the assistant reasons
-over names/tickers/usage and produces the values; a human reviews; the change persists.
+The target workflow is cleanup driven by an AI assistant: the assistant reasons over
+names/tickers/usage and produces the values; a human reviews; the change persists.
 
 ## Decisions
 
@@ -61,7 +61,7 @@ friction** (no per-call confirm, no per-call snapshot) — the safety boundary i
 single enablement warning (D2), not a prompt per call. Each call supports
 **`dryRun`** (preview that one op's before/after) and setters take an **`overwrite`**
 flag (default false = fill nulls only; `overwrite=true` makes a deliberate
-correction, e.g. re-classing a commodity fund from equity to real_assets). Each call
+correction, e.g. replacing an asset class that was set wrong). Each call
 **echoes the resulting state**
 (or `{before, after}` under dryRun) and reports a clear error on a bad input.
 Rationale: simple composable primitives the model invokes per item are cleaner than
@@ -88,16 +88,38 @@ future SPA category-management surface can share them — is a **fast-follow bui
 UI lands** (no SPA consumer today; not built speculatively). The repo method is written so
 the endpoint is a thin pass-through when needed.
 
+*(Amended 2026-11-16, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D15: money is kept at its currency's own
+minor units, 0, 2 or 3 places. No write tool here takes a typed money figure today:
+`add_price` and `update_price` take prices, which are not money. A tool that takes one
+writes through the same repository as the SPA, so a figure finer than its currency is
+refused as the SPA's save is, with the new named error code that ADR-0114 D15 gives (a
+422 over REST), naming the currency and its places (settled by Claude). A stored figure
+that a write leaves unchanged passes, even when it does not fit its currency. The CSV
+mapping tools (`validate_csv_mapping`, `save_csv_mapping`) describe a layout's decimal
+separator, point or comma, as a key of its YAML ([ADR-0031](0031-ingest-provider-pattern.md) §4).
+The key is required in mapping schema version 2, so a layout written through these
+tools, which has no sample, must name the separator; a version-1 document is still
+accepted and reads with a point (settled by Claude, 2026-11-16).)*
+
 **Merge semantics (`merge_category`):** repoint every leg referencing the source —
 committed transactions *and* recurring-template legs (a reminder's category postings live
 on its template `txn_legs`, so the one repoint covers both) — to the target; reparent the
 source's child categories to the target; then **deactivate** the emptied source
-(`is_active=false`, reversible — the row + history are preserved, *not* deleted). Guards:
+(`is_active=false` — the row is preserved, *not* deleted). Guards:
 both are categories of the same `category_kind` in the ledger, source ≠ target, source not
-system-managed. Maintained balances for both categories are rebuilt; the whole thing is one
+system-managed. *(Amended 2026-11-03, [ADR-0111](0111-structure-is-one-page.md) D8: the
+kinds may differ, because a merge across kinds is the one way to reclassify a category whose
+kind cannot be edited; the target must not be the source (`category-merge-self`) or beneath it
+(`category-cycle` over REST, `TargetIsDescendant` over MCP); and reactivating the source gives back an empty
+category, since nothing records what moved. A merge also sums or drops budget targets
+(ADR-0099), and says how many.)* Maintained balances for both categories are rebuilt; the whole thing is one
 transaction. (`txn_leg_overrides` carry no category, and `transaction_rules` isn't yet
 EF-modelled — and a deactivate, unlike a delete, leaves any dangling reference intact — so
-neither needs touching here.) **Delete semantics (`delete_category`):** hard-delete only a
+neither needs touching here.) *(Amended 2026-10-27, [ADR-0108](0108-memo-and-tags-per-side.md) D3, D6: a transaction the source
+category owned, which after the repoint has no leg on it, hands its ownership to the target
+(`AnnotationWriter.FollowRepointAsync`); no memo or tag is rewritten, since they sit on
+legs and the legs keep their ids. The stored memo-and-tags presentation of every moved
+header is recomputed in the same transaction.)* **Delete semantics (`delete_category`):** hard-delete only a
 category with zero referencing legs, zero child categories, and not system-managed; else a
 `category-in-use` error pointing at `merge_category`.
 
@@ -105,7 +127,23 @@ category with zero referencing legs, zero child categories, and not system-manag
 `txn_legs`, `realized_gains`, and `provider_security_mappings` — to the target, rebuild
 holdings + lots (ADR-0064 FIFO) for every affected `(account, security)` pair via
 `HoldingsRecomputeService`, then **deactivate** the source (`is_active=false`, reversible —
-mirrors `merge_category`). Guards: both securities in the ledger, source ≠ target. (A
+mirrors `merge_category`). Since 2026-11-03 it also re-derives the target's trade price on
+each day a moved execution prices, which the repoint bypassing the change tracker had left
+unpriced ([ADR-0084](0084-trade-derived-security-prices.md) D4, 2026-11-03 amendment).
+Since 2026-11-04 (migration 274) it locks the source `FOR UPDATE` (`fn_lock_securities`)
+before it reads which lines, holdings and days are the source's, as `merge_category` locks
+its source: a line another request adds to the source takes `KEY SHARE` on it, so one in
+flight is waited for and moved with the rest, and one that starts later waits for the merge.
+Without the lock such a line moved with the others while its day and its holdings with the
+target were never derived.
+Since 2026-11-06 the affected accounts are those holding the source and those with a line
+that carries its shares on a transaction: a line with a quantity, on a header that is not a
+reminder's template, the predicate the holdings interceptor applies to a save. A line that
+names the source with no shares (the cash line of a dividend, a fee or a miscellaneous
+event) and a template's line still move to the target, but their account is not
+recomputed, since the recompute stores a holding for any pair it is given. The answer's
+account count counts only the accounts recomputed, in a dry run too.
+Guards: both securities in the ledger, source ≠ target. (A
 provider mapping can't collide on the target: `provider_security_mappings` is unique on
 `(ledger, provider_key, provider_security_id)`, so source and target never share a
 provider-ticker — the repoint is always a clean move.) **Reparent guard
@@ -126,7 +164,7 @@ of write tools (the deferred ADR-0063 §D7) is a fast-follow once writes ship.
 ## Slices
 
 - **A (0.8.0, shipped):** the gate (`mcp.writes_enabled` + startup registration + bold
-  warning UI) + `set_account_taxstatus` + the cleanups the owner asked for —
+  warning UI) + `set_account_taxstatus` + the first cleanup primitives —
   `set_security_classification` (bulk classification backfill, `overwrite` flag),
   `merge_category` + `delete_category` (the category revamp), and
   `set_transaction_category` (single-transaction recategorize — single-posting bank-shape
@@ -143,7 +181,9 @@ of write tools (the deferred ADR-0063 §D7) is a fast-follow once writes ship.
 - **C+:** Tier-2 reads + the per-call write audit (audit shipped in ADR-0081 / 0.30.0).
 - **D (0.31.0):** tag-dictionary lifecycle on MCP — `rename_tag` / `merge_tags` /
   `delete_tag` / `cleanup_unused_tags`, wrapping the Tags-v1 `TagsRepository` that already
-  backs the SPA (the direct parallel to the `merge_category` / `rename_category` /
+  backs the SPA, so `merge_tags` also repoints every saved report that filters on the
+  merged-away tag (2026-10-27, [ADR-0077](0077-tag-management-surface.md) amendment of that
+  date) (the direct parallel to the `merge_category` / `rename_category` /
   `delete_category` tools on the category side). Manual prices — `add_price` /
   `update_price` / `delete_price`, the write side of the `price_history` read tool, wrapping
   the ADR-0070 `SecuritiesRepository` price methods (a hand-entered price is manual-owned).
@@ -172,6 +212,13 @@ of write tools (the deferred ADR-0063 §D7) is a fast-follow once writes ship.
   deliberate exception to D4's one-entity rule (after `set_transaction_tags` + bulk
   `set_transaction_category`). `dryRun` previews the tally; write-gated. Full split create/edit
   (add/remove postings, re-amount) remains a larger follow-on. (Version stamped at release.)
+  *(Amended 2026-11-14, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D13: a posting between real accounts in
+  different currencies carries a required second amount, so the rebuilt posting set
+  carries each untouched posting's stored far-leg amount as its second amount. A transfer
+  line between currencies keeps both amounts, and every other posting is still left
+  untouched. Amended 2026-11-16, ADR-0114 D15: the rebuilt set re-sends stored amounts
+  unchanged, so a posting whose stored figure does not fit its currency's places still
+  passes, since only values a write changes are checked.)*
 
 ## Consequences
 

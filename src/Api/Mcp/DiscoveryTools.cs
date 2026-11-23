@@ -18,7 +18,8 @@ namespace Coffer.Api.Mcp;
 public static class DiscoveryTools
 {
     [McpServerTool(Name = "list_ledgers"), Description(
-        "List the ledgers the authenticated user can access (id, name, role). Call this " +
+        "List the ledgers the authenticated user can access (id, name, role, and the " +
+        "ledger's reporting currency as currencyCode). Call this " +
         "first to resolve a ledger name to the ledgerId that reporting/investment tools take.")]
     public static async Task<IReadOnlyList<LedgerSummary>> ListLedgers(
         ICurrentUserAccessor currentUser,

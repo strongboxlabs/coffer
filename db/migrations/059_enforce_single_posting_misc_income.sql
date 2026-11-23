@@ -2,9 +2,9 @@
 -- 059 — enforce single-posting MiscInc as a structural invariant
 -- =============================================================================
 --
--- Migration 058 split the multi-posting MiscInc events found on a real
--- ledger (MD's automated brokerage-statement import path bundles multiple
--- inc/fee splits into one txn). The importer (this PR) is rewired to
+-- Migration 058 split multi-posting MiscInc events into single-posting
+-- ones (an MD txn can bundle multiple inc/fee splits into one; migration
+-- 061 reverses 058 and this one). The importer is rewired to
 -- fan out at import time so future re-imports produce single-posting
 -- MiscInc headers natively.
 --

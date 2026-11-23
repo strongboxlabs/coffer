@@ -18,8 +18,8 @@ namespace Coffer.Api.Endpoints;
 /// </summary>
 public static class InvestmentTransactionsEndpoints
 {
-    /// <summary>Max "possible matches" returned for the merge panel — same
-    /// cap as the bank side.</summary>
+    /// <summary>Max merge candidates returned for the editor's "Merge
+    /// candidates" strip — same cap as the bank side.</summary>
     private const int MergeCandidatesLimit = 5;
 
     public static IEndpointRouteBuilder MapInvestmentTransactionsEndpoints(
@@ -39,13 +39,15 @@ public static class InvestmentTransactionsEndpoints
         // /transactions/{id}/merge route exactly, including the inverted
         // direction.
         group.MapPost("/{headerId:guid}/merge", MergeAsync);
-        // Accept-as-is, the investment twin of the bank route. Until this
-        // existed there was no way to accept an investment row without opening
-        // the editor and re-saving every field through a wholesale PATCH — the
-        // bank register has offered it from the row menu since slice 2c.
+        // Accept-as-is, the investment twin of the bank route. Without it,
+        // accepting an investment row means opening the editor and re-saving
+        // every field through a wholesale PATCH; the bank register offers
+        // Accept from the row menu.
         group.MapPost("/{headerId:guid}/approve", ApproveAsync);
-        // "Possible matches" for the editor's merge panel (mirrors the bank
-        // /transactions/{id}/merge-candidates route).
+        // The editor's "Merge candidates" strip (mirrors the bank
+        // /transactions/{id}/merge-candidates route). Picking one folds the
+        // edited row into it through the merge route above; the candidate
+        // survives with its own fields.
         group.MapGet("/{headerId:guid}/merge-candidates", MergeCandidatesAsync);
 
         // In-kind transfer scrub (ADR-0065 D4): convert a detected sell+buy pair
@@ -73,8 +75,9 @@ public static class InvestmentTransactionsEndpoints
     /// Validates the action × field matrix in ADR-0029, builds the
     /// multi-posting shape via <c>Coffer.Domain.Investment</c>'s
     /// builders, and inserts header + legs + holdings + lot in one
-    /// Postgres transaction. Triggers
-    /// <c>recompute_holdings_cost_basis</c> after commit.
+    /// Postgres transaction, and calls
+    /// <c>recompute_holdings_cost_basis</c> inside it, after the save's
+    /// statements.
     /// </summary>
     private static async Task<IResult> CreateAsync(
         Guid ledgerId,
@@ -83,6 +86,8 @@ public static class InvestmentTransactionsEndpoints
         LedgersRepository ledgers,
         InvestmentTransactionsRepository investmentTxns,
         ProviderSecurityMappingsRepository providerSecurityMappings,
+        Quotes.MarketSeries.MarketSeriesBackfill backfill,
+        Db.AppDbContext db,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -99,14 +104,17 @@ public static class InvestmentTransactionsEndpoints
             return tagsRejection;
         }
 
+        // ADR-0114 D11: a trade dated before the ledger's earliest day or the brokerage's first
+        // funding moves the net-worth pairs' or the benchmarks' start earlier; read before the
+        // write that can move them.
+        var before = await NeededFxPairs.StartsAsync(db, ledgerId, cancellationToken).ConfigureAwait(false);
         var result = await investmentTxns.CreateAsync(
             ledgerId, request, cancellationToken: cancellationToken).ConfigureAwait(false);
 
-        if (result.Failure is { } failure)
-        {
-            var (code, message) = MapFailure(failure);
-            return BusinessError.Problem(code, message);
-        }
+        if (result.Failure is { } failure) return MapFailureProblem(failure, result.Detail);
+        if (result.Refusal is { } refusal) return AnnotationProblem.Of(refusal);
+        await backfill.StartIfEarlierAsync(db, ledgerId, currentUser.UserId, before, cancellationToken)
+            .ConfigureAwait(false);
 
         // ADR-0031 Phase 3d.1: if the request carried a provider hint
         // alongside the resolved SecurityId, persist the mapping so
@@ -143,6 +151,8 @@ public static class InvestmentTransactionsEndpoints
         InvestmentTransactionsRepository investmentTxns,
         RegisterRepository register,
         ProviderSecurityMappingsRepository providerSecurityMappings,
+        Quotes.MarketSeries.MarketSeriesBackfill backfill,
+        Db.AppDbContext db,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -159,6 +169,9 @@ public static class InvestmentTransactionsEndpoints
             return tagsRejection;
         }
 
+        // ADR-0114 D11: the body is the row's new state, its date included, so read the
+        // starts before the write that can move them.
+        var before = await NeededFxPairs.StartsAsync(db, ledgerId, cancellationToken).ConfigureAwait(false);
         var result = await investmentTxns.PatchAsync(
             ledgerId, headerId, request, cancellationToken).ConfigureAwait(false);
 
@@ -167,6 +180,7 @@ public static class InvestmentTransactionsEndpoints
             var (code, message) = MapPatchFailure(pf);
             return BusinessError.Problem(code, message);
         }
+        if (result.Refusal is { } refusal) return AnnotationProblem.Of(refusal);
 
         // ADR-0031 Phase 3d.1: same provider-mapping upsert as on POST.
         // Recorded after a successful PATCH so a failed reshape (422)
@@ -179,31 +193,23 @@ public static class InvestmentTransactionsEndpoints
                 sid, currentUser.UserId, cancellationToken)
                 .ConfigureAwait(false);
         }
-        if (result.CreateFail is { } cf)
-        {
-            var (code, message) = MapFailure(cf);
-            return BusinessError.Problem(code, message);
-        }
+        if (result.CreateFail is { } cf) return MapFailureProblem(cf, result.Detail);
+        await backfill.StartIfEarlierAsync(db, ledgerId, currentUser.UserId, before, cancellationToken)
+            .ConfigureAwait(false);
 
         // PATCH succeeded. When the caller supplies an account_id
         // query param (the brokerage register the user is editing
-        // in), return the freshly-resolved entry so the SPA can
-        // patch it into the window via `mutateEntries` —
+        // in), return every freshly-resolved entry the header has
+        // there (SavedEntriesResponse) so the SPA can replace them in
+        // the window —
         // preserving scroll position + chronological row order vs.
         // a window refresh. Without the query param, default to
         // 204 No Content (the existing contract).
-        if (account_id is { } rid)
-        {
-            // On a merge the SURVIVING row is the winner (MergeFromHeaderId);
-            // the edited row (headerId) has folded into it. Re-resolve the
-            // survivor so the SPA refocuses onto the row that's still there
-            // (mirrors the bank endpoint).
-            var survivingHeaderId = request.MergeFromHeaderId ?? headerId;
-            var entry = await register.GetEntryForHeaderAsync(
-                survivingHeaderId, rid, cancellationToken).ConfigureAwait(false);
-            if (entry is not null) return Results.Ok(entry);
-        }
-        return Results.NoContent();
+        // A PATCH never merges: MergeFromHeaderId is [JsonIgnore], and a
+        // merge goes through POST /{headerId}/merge, which answers the
+        // survivor's entries itself. The edited row is the one to resolve.
+        return await TransactionsEndpoints.SavedEntriesAsync(register, headerId, account_id, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>
@@ -219,6 +225,7 @@ public static class InvestmentTransactionsEndpoints
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         InvestmentTransactionsRepository investmentTxns,
+        RegisterRepository register,
         CancellationToken cancellationToken)
     {
         var visible = await ledgers.GetVisibleByIdAsync(
@@ -228,7 +235,7 @@ public static class InvestmentTransactionsEndpoints
                 "Ledger not found or not visible to this user.");
 
         var candidates = await investmentTxns.GetMergeCandidatesAsync(
-            ledgerId, headerId, MergeCandidatesLimit, cancellationToken).ConfigureAwait(false);
+            ledgerId, headerId, MergeCandidatesLimit, register, cancellationToken).ConfigureAwait(false);
         return Results.Ok(candidates);
     }
 
@@ -253,8 +260,8 @@ public static class InvestmentTransactionsEndpoints
     /// <para>Clearing <c>needs_review</c> on the loser is the repository's job,
     /// not this route's. A folded-away row is resolved by definition, and an
     /// invariant that depends on a caller remembering to pair two fields is not
-    /// an invariant — that is exactly how investment losers stayed queued and
-    /// kept the sidebar's review dot lit in 0.94.0.</para>
+    /// an invariant — a caller that forgets leaves the loser queued and the
+    /// sidebar's review dot lit.</para>
     /// </remarks>
     /// <summary>
     /// <c>POST /api/ledgers/{ledgerId}/investment-transactions/{headerId}/approve</c>
@@ -288,13 +295,8 @@ public static class InvestmentTransactionsEndpoints
             return BusinessError.Problem(BusinessError.Codes.TransactionNotInLedger,
                 "Transaction does not belong to this ledger.");
 
-        if (account_id is { } rid)
-        {
-            var entry = await register.GetEntryForHeaderAsync(
-                headerId, rid, cancellationToken).ConfigureAwait(false);
-            if (entry is not null) return Results.Ok(entry);
-        }
-        return Results.NoContent();
+        return await TransactionsEndpoints.SavedEntriesAsync(register, headerId, account_id, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     private static async Task<IResult> MergeAsync(
@@ -306,6 +308,8 @@ public static class InvestmentTransactionsEndpoints
         LedgersRepository ledgers,
         InvestmentTransactionsRepository investmentTxns,
         RegisterRepository register,
+        Quotes.MarketSeries.MarketSeriesBackfill backfill,
+        Db.AppDbContext db,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -320,6 +324,9 @@ public static class InvestmentTransactionsEndpoints
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
 
+        // ADR-0114 D11: the survivor takes the folded row's date, which can move the
+        // benchmarks' start, or a pair's, earlier though the earliest day holds.
+        var before = await NeededFxPairs.StartsAsync(db, ledgerId, cancellationToken).ConfigureAwait(false);
         var result = await investmentTxns.PatchAsync(
             ledgerId, headerId,
             new PatchInvestmentTransactionRequest { MergeFromHeaderId = request.FromHeaderId },
@@ -330,21 +337,14 @@ public static class InvestmentTransactionsEndpoints
             var (code, message) = MapPatchFailure(pf);
             return BusinessError.Problem(code, message);
         }
-        if (result.CreateFail is { } cf)
-        {
-            var (code, message) = MapFailure(cf);
-            return BusinessError.Problem(code, message);
-        }
+        if (result.CreateFail is { } cf) return MapFailureProblem(cf, result.Detail);
+        await backfill.StartIfEarlierAsync(db, ledgerId, currentUser.UserId, before, cancellationToken)
+            .ConfigureAwait(false);
 
         // The SURVIVOR is what the caller needs back: the row named in the URL
         // is now a tombstone and has left the register.
-        if (account_id is { } rid)
-        {
-            var entry = await register.GetEntryForHeaderAsync(
-                request.FromHeaderId, rid, cancellationToken).ConfigureAwait(false);
-            if (entry is not null) return Results.Ok(entry);
-        }
-        return Results.NoContent();
+        return await TransactionsEndpoints.SavedEntriesAsync(register, request.FromHeaderId, account_id, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     private static async Task<IResult> DeleteAsync(
@@ -407,11 +407,7 @@ public static class InvestmentTransactionsEndpoints
         var outcome = await investmentTxns.ConvertInKindTransferAsync(
             ledgerId, request.SellHeaderId, request.BuyHeaderId, cancellationToken).ConfigureAwait(false);
 
-        if (outcome.CreateFail is { } cf)
-        {
-            var (code, message) = MapFailure(cf);
-            return BusinessError.Problem(code, message);
-        }
+        if (outcome.CreateFail is { } cf) return MapFailureProblem(cf, outcome.Detail);
         return outcome.Result switch
         {
             InvestmentTransactionsRepository.ConvertInKindResult.Ok =>
@@ -579,7 +575,7 @@ public static class InvestmentTransactionsEndpoints
         InvestmentTransactionsRepository.CreateFailure.FeeAccountNotInLedger =>
             (BusinessError.Codes.AccountNotInLedger,
              "feeAccountId does not belong to this ledger."),
-        // PR #132 inactive-account gate (per role).
+        // Inactive-account gate (per role).
         InvestmentTransactionsRepository.CreateFailure.BrokerageInactive =>
             (BusinessError.Codes.InvestmentTxnBrokerageInactive,
              "brokerageAccountId is inactive; reactivate the brokerage before posting new transactions to it."),
@@ -614,7 +610,63 @@ public static class InvestmentTransactionsEndpoints
             (BusinessError.Codes.InvestmentTxnInsufficientShares,
              "Not enough shares: this would leave a sale taking more shares than the account "
              + "held at that point. Reduce the shares, or check the purchases before it."),
+        // A transfer between currencies records both amounts (ADR-0114 D13, ADR-0029).
+        InvestmentTransactionsRepository.CreateFailure.TransferAmountRequired =>
+            (BusinessError.Codes.InvestmentTxnTransferAmountRequired,
+             "transferAccountId is in another currency than the brokerage: send transferAmount, "
+             + "the amount in that account's currency."),
+        InvestmentTransactionsRepository.CreateFailure.TransferAmountsNonzero =>
+            (BusinessError.Codes.InvestmentTxnTransferAmountsNonzero,
+             "Money that leaves one account arrives in the other, so neither the brokerage's "
+             + "amount nor transferAmount can be zero."),
+        InvestmentTransactionsRepository.CreateFailure.TransferAmountsSign =>
+            (BusinessError.Codes.InvestmentTxnTransferAmountsSign,
+             "What leaves one account arrives in the other, so transferAmount has the opposite "
+             + "sign to the brokerage's side of the transfer."),
+        // Without its FailureDetail (MapFailureProblem names the currency and field).
+        InvestmentTransactionsRepository.CreateFailure.AmountPlacesExceedCurrency =>
+            (BusinessError.Codes.AmountPlacesExceedCurrency,
+             "An amount carries more decimal places than the brokerage's currency allows."),
+        InvestmentTransactionsRepository.CreateFailure.RateUnavailable =>
+            (BusinessError.Codes.RateUnavailable,
+             "A lot being moved has no exchange rate for the day it was acquired, so its cost "
+             + "cannot be converted. Nothing was moved."),
         _ => (BusinessError.Codes.InvestmentTxnActionInvalid,
               "Invalid investment transaction request."),
     };
+
+    /// <summary>
+    /// The 422 for a repository <c>CreateFailure</c>, carrying what the refusal names
+    /// beyond its code when <paramref name="detail"/> gives it: the currency, its places
+    /// and the request field of <c>amount-places-exceed-currency</c> (ADR-0114 D15,
+    /// <see cref="MoneyPlaces.Refusal"/>), and the <c>rateUnavailable</c> list of a share
+    /// move between currencies (ADR-0114 D13). Every other failure, or one with no
+    /// detail, is <see cref="MapFailure"/>'s code and message. Shared with every caller
+    /// of the investment validation core, as <see cref="MapFailure"/> is.
+    /// </summary>
+    internal static IResult MapFailureProblem(
+        InvestmentTransactionsRepository.CreateFailure failure,
+        InvestmentTransactionsRepository.FailureDetail? detail = null)
+    {
+        switch (failure)
+        {
+            case InvestmentTransactionsRepository.CreateFailure.AmountPlacesExceedCurrency
+                when detail is { CurrencyCode: { } currency, Field: { } field }:
+                return MoneyPlaces.Refusal(currency, field);
+            case InvestmentTransactionsRepository.CreateFailure.RateUnavailable
+                when detail is { MissingRates: { Count: > 0 } missing }:
+                return BusinessError.Problem(
+                    BusinessError.Codes.RateUnavailable,
+                    "Each moved lot's cost converts at the exchange rate for the day it was acquired, "
+                    + "and these rates are missing: "
+                    + string.Join("; ", missing.Select(m =>
+                        $"{m.FromCurrency} to {m.ToCurrency} for {m.Date.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture)}"))
+                    + ". Nothing was moved.",
+                    title: null,
+                    extra: new Dictionary<string, object?> { ["rateUnavailable"] = missing });
+            default:
+                var (code, message) = MapFailure(failure);
+                return BusinessError.Problem(code, message);
+        }
+    }
 }

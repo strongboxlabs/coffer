@@ -76,6 +76,7 @@ public static class MasterKeyContracts
         bool DriveTokenRotated,
         int NotificationTargetsRotated,
         bool OauthKeysRotated,
+        bool UpgradeTokenRotated,
         string? PreviousKeyArchivedAt,
         bool RestartPending);
 }

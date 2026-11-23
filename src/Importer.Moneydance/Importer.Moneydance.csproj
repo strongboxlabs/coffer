@@ -11,16 +11,20 @@
 
   <ItemGroup>
     <PackageReference Include="Dapper" Version="2.1.89" />
+    <PackageReference Include="Ical.Net" Version="5.2.4" />
     <PackageReference Include="Npgsql" Version="10.0.3" />
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\Coffer.Domain.Annotations\Coffer.Domain.Annotations.csproj" />
     <ProjectReference Include="..\Coffer.Domain.Investment\Coffer.Domain.Investment.csproj" />
+    <!-- ADR-0114 D15: the import accepts a currency when its places fit Coffer's. -->
+    <ProjectReference Include="..\Coffer.Domain.Money\Coffer.Domain.Money.csproj" />
     <ProjectReference Include="..\Coffer.Domain.Reminders\Coffer.Domain.Reminders.csproj" />
   </ItemGroup>
 
-  <!-- The CLI (coffer-import-moneydance) was this assembly before the ADR-0071
-       lib/CLI split; it still consumes internal pipeline/repo/reader types. -->
+  <!-- The diagnostics CLI (coffer-import-moneydance) was this assembly before the
+       ADR-0071 lib/CLI split; it still consumes internal pipeline/repo/reader types. -->
   <ItemGroup>
     <InternalsVisibleTo Include="Importer.Moneydance.Tests" />
     <InternalsVisibleTo Include="coffer-import-moneydance" />

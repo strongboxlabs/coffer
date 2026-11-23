@@ -16,10 +16,10 @@ namespace Coffer.Api.Tests.Integration.Reminders;
 /// </summary>
 /// <remarks>
 /// <para>
-/// The first shape of this feature required TWO switches — a per-reminder option and a
-/// per-ledger one — and shipped the exact defect ADR-0097 set out to remove: a user
-/// ticked Auto-post, saved, and nothing happened, silently, because the other switch was
-/// off and there was no hint that it existed. The per-reminder tick IS the opt-in.
+/// Requiring TWO switches — a per-reminder option and a per-ledger one — reproduces the
+/// exact defect ADR-0097 sets out to remove: a user ticks Auto-post, saves, and nothing
+/// happens, silently, because the other switch is off and nothing hints that it exists.
+/// So the per-reminder tick IS the opt-in.
 /// </para>
 /// <para>
 /// The per-ledger row still exists and still matters — it is what makes this a
@@ -29,11 +29,12 @@ namespace Coffer.Api.Tests.Integration.Reminders;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ReminderAutoPostImplicitEnableTests
+public sealed class ReminderAutoPostImplicitEnableTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ReminderAutoPostImplicitEnableTests(PostgresFixture fixture) => _fixture = fixture;
+    public ReminderAutoPostImplicitEnableTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -63,7 +64,7 @@ public sealed class ReminderAutoPostImplicitEnableTests
 
     private async Task<ScheduledJobRow?> AutoPostRowAsync(Guid ledgerId)
     {
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         return await db.ScheduledJobs.AsNoTracking()
             .FirstOrDefaultAsync(j => j.LedgerId == ledgerId && j.JobType == JobTypes.ReminderAutoPost);
     }
@@ -72,7 +73,7 @@ public sealed class ReminderAutoPostImplicitEnableTests
 
     private async Task<Setup> NewLedgerAsync(ApiFactory factory)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
         return new Setup(ledger, await AuthedClientAsync(factory, ledger), bank.Id, cat.Id);
@@ -84,7 +85,7 @@ public sealed class ReminderAutoPostImplicitEnableTests
     [Fact]
     public async Task Creating_an_auto_post_reminder_enables_the_job()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await NewLedgerAsync(factory);
         using var client = s.Client;
 
@@ -108,7 +109,7 @@ public sealed class ReminderAutoPostImplicitEnableTests
     [Fact]
     public async Task Creating_an_ordinary_reminder_does_not_enable_the_job()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await NewLedgerAsync(factory);
         using var client = s.Client;
 
@@ -121,14 +122,14 @@ public sealed class ReminderAutoPostImplicitEnableTests
     /// Turning Auto-post on by EDITING an existing reminder enables the job too.
     /// </summary>
     /// <remarks>
-    /// The likelier path in practice: the reminder already exists and the user adds
-    /// auto-posting later. Wiring only the create endpoints would leave that tick silent —
-    /// the original defect, surviving in the case people actually hit.
+    /// Every write that can turn Auto-post on must enable the job, not only the create
+    /// endpoints: a reminder that gains auto-posting through an edit otherwise has no
+    /// enabled job, and its tick never runs.
     /// </remarks>
     [Fact]
     public async Task Editing_a_reminder_to_add_auto_post_enables_the_job()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await NewLedgerAsync(factory);
         using var client = s.Client;
 
@@ -143,6 +144,86 @@ public sealed class ReminderAutoPostImplicitEnableTests
         var row = await AutoPostRowAsync(s.Ledger.LedgerId);
         Assert.NotNull(row);
         Assert.True(row!.Enabled);
+    }
+
+    /// <summary>
+    /// A reminder save that is refused writes nothing, the auto-post job included: the
+    /// reminder that asked for auto-posting was never saved.
+    /// </summary>
+    /// <remarks>
+    /// The job is written through the request's own database context, so enabling it
+    /// after a refusal would also save whatever the refused edit had changed before it
+    /// was refused; the bank cases assert the reminder is as it was.
+    /// </remarks>
+    [Theory]
+    [InlineData("bank-edit-another-source")]
+    [InlineData("bank-edit-end-before-start")]
+    [InlineData("bank-edit-notes-from-another-side")]
+    [InlineData("investment-edit-another-brokerage")]
+    [InlineData("investment-create-invalid-shape")]
+    public async Task A_refused_reminder_save_does_not_enable_the_job(string refusal)
+    {
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        var s = await NewLedgerAsync(factory);
+        using var client = s.Client;
+        var brokerage = await s.Ledger.AddInvestmentAccountAsync("brokerage");
+        var otherBrokerage = await s.Ledger.AddInvestmentAccountAsync("other brokerage");
+        var otherBank = await s.Ledger.AddBankAccountAsync("savings");
+        CreateInvestmentTransactionRequest TransferFrom(Guid account, bool withCounterpart = true) => new()
+        {
+            BrokerageAccountId = account, Action = "transfer", TransferAccountId = withCounterpart ? s.BankId : null,
+            Amount = 75m, PostedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+        };
+        async Task<Guid> InvestmentReminderAsync()
+        {
+            var created = await client.PostAsJsonAsync($"/api/ledgers/{s.Ledger.LedgerId}/reminders/investment",
+                new CreateInvestmentReminderRequest
+                {
+                    Rrule = "FREQ=MONTHLY;BYMONTHDAY=1", StartDate = new DateOnly(2026, 1, 1),
+                    Transaction = TransferFrom(brokerage.Id),
+                });
+            Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+            return (await created.Content.ReadFromJsonAsync<ReminderDetail>())!.Id;
+        }
+
+        var bankUrl = $"/api/ledgers/{s.Ledger.LedgerId}/reminders/{await CreateReminderAsync(client, s.Ledger, s.BankId, s.CatId, acdays: null)}";
+        var resp = refusal switch
+        {
+            "bank-edit-another-source" => await client.PatchAsJsonAsync(bankUrl, new EditReminderRequest
+            {
+                AutoCommitDaysBefore = 3, Payee = "Changed",
+                Postings = new PatchReminderPostings
+                {
+                    SourceAccountId = otherBank.Id,
+                    Items = [new TransactionPosting { CounterpartyAccountId = s.CatId, Amount = -1500m }],
+                },
+            }),
+            "bank-edit-end-before-start" => await client.PatchAsJsonAsync(bankUrl, new EditReminderRequest
+            {
+                AutoCommitDaysBefore = 3, Payee = "Changed", EndDate = new DateOnly(2025, 12, 1),
+            }),
+            "bank-edit-notes-from-another-side" => await client.PatchAsJsonAsync(bankUrl, new EditReminderRequest
+            {
+                AutoCommitDaysBefore = 3, Payee = "Changed",
+                Notes = new TransactionNotesRequest { Side = s.CatId, Memo = "changed" },
+            }),
+            "investment-edit-another-brokerage" => await client.PatchAsJsonAsync(
+                $"/api/ledgers/{s.Ledger.LedgerId}/reminders/{await InvestmentReminderAsync()}/investment",
+                new EditInvestmentReminderRequest { AutoCommitDaysBefore = 3, Transaction = TransferFrom(otherBrokerage.Id) }),
+            _ => await client.PostAsJsonAsync($"/api/ledgers/{s.Ledger.LedgerId}/reminders/investment",
+                new CreateInvestmentReminderRequest
+                {
+                    Rrule = "FREQ=MONTHLY;BYMONTHDAY=1", StartDate = new DateOnly(2026, 1, 1), AutoCommitDaysBefore = 3,
+                    Transaction = TransferFrom(brokerage.Id, withCounterpart: false),
+                }),
+        };
+
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
+        Assert.Null(await AutoPostRowAsync(s.Ledger.LedgerId));
+        var bank = (await client.GetFromJsonAsync<ReminderDetail>(bankUrl))!;
+        Assert.Equal("Rent", bank.Payee);
+        Assert.Null(bank.EndDate);
+        Assert.Null(bank.AutoCommitDaysBefore);
     }
 
     /// <summary>
@@ -166,7 +247,7 @@ public sealed class ReminderAutoPostImplicitEnableTests
     [Fact]
     public async Task An_auto_disabled_job_is_not_re_enabled_by_editing_a_reminder()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await NewLedgerAsync(factory);
         using var client = s.Client;
 
@@ -174,7 +255,7 @@ public sealed class ReminderAutoPostImplicitEnableTests
         Assert.True((await AutoPostRowAsync(s.Ledger.LedgerId))!.Enabled);
 
         // The scheduler gives up on it.
-        await using (var db = _fixture.NewServiceDbContext())
+        await using (var db = Db.NewServiceDbContext())
         {
             var row = await db.ScheduledJobs.SingleAsync(
                 j => j.LedgerId == s.Ledger.LedgerId && j.JobType == JobTypes.ReminderAutoPost);
@@ -211,7 +292,7 @@ public sealed class ReminderAutoPostImplicitEnableTests
     [Fact]
     public async Task A_reminder_save_does_not_overwrite_a_chosen_run_time()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await NewLedgerAsync(factory);
         using var client = s.Client;
 

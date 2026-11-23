@@ -9,13 +9,11 @@
  * provider that threw, a short-circuit on a loading state, an async render
  * nobody awaited.
  *
- * It is not theoretical. One shipped (#504): the only case in its block with
- * no `await`, so both `queryByText` calls ran on the pending frame where the
- * component short-circuits and the DOM is empty. Found by adversarial review
- * of a release diff, after release. Two more were found by the sweep that
- * produced this rule, and one of them — SplitsGrid "says nothing at all when
- * every posting is complete" — passed against a SplitsGrid mutated to
- * `return null`.
+ * The typical shape: the only case in its block with no `await`, so its
+ * `queryByText` calls run on the pending frame where the component
+ * short-circuits and the DOM is empty. A test that a grid "says nothing at all
+ * when every posting is complete", written this way, passes against that grid
+ * mutated to `return null`.
  *
  * WHAT COUNTS AS AN ANCHOR. Any assertion that a blank DOM would FAIL:
  * `getBy*`/`findBy*` (they throw when absent), `toBeInTheDocument`,
@@ -32,10 +30,9 @@
  * heuristic, and worth a rule instead of a habit: the predicate is exact, so
  * there is nothing to suppress and no judgement to get wrong.
  *
- * Measured when written: 2 hits across 896 test blocks. The suite is clean, so
- * this exists to keep it that way — the three instances above were each found
- * by something other than the test suite, which is the one defect a test suite
- * is blind to by construction.
+ * A test suite is blind to this defect in its own tests by construction, so the
+ * check is a lint rule over every test block rather than something a test can
+ * catch.
  */
 
 const NEGATIVE_MATCHERS = new Set([

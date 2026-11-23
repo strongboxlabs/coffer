@@ -13,7 +13,7 @@ using Coffer.Api.Errors;
 namespace Coffer.Api.Auth.Webauthn;
 
 /// <summary>
-/// The actions that need a fresh passkey tap (2026-10-12 audit, M2), each with its own
+/// The actions that need a fresh passkey tap (ADR-0105 D1), each with its own
 /// challenge flow so a tap minted for one can't approve another (mig 248).
 /// </summary>
 public static class StepUpActions
@@ -27,11 +27,12 @@ public static class StepUpActions
     public const string BackupPassphrase = "backup-passphrase";
     public const string BackupDelete = "backup-delete";
     public const string McpWrites = "mcp-writes";
+    public const string Upgrade = "upgrade";
 
     public static readonly IReadOnlySet<string> All = new HashSet<string>(StringComparer.Ordinal)
     {
         PasskeyAdd, PasskeyDelete, RecoveryCodes, McpToken, GrantAdmin,
-        Restore, BackupPassphrase, BackupDelete, McpWrites,
+        Restore, BackupPassphrase, BackupDelete, McpWrites, Upgrade,
     };
 
     /// <summary>The challenge flow a tap for <paramref name="action"/> is minted under.</summary>

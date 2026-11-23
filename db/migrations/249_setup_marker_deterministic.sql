@@ -3,10 +3,10 @@
 --
 -- 248 backfilled system_settings['setup.completed'] on every install that
 -- already had a user, and its updated_at took the column default: now(), the
--- moment the migration ran. So the same data migrated twice gave two different
--- rows. The restore drill found it: a backup restored onto this build is
--- migrated at restore time, the database it replaces was migrated at upgrade
--- time, and the two disagreed on that one timestamp and nothing else.
+-- moment the migration ran. So the same data migrated twice gives two different
+-- rows: a backup restored onto this build is migrated at restore time, the
+-- database it replaces was migrated at upgrade time, and the two disagree on
+-- that one timestamp, which fails the restore drill's comparison.
 --
 -- A migration's result has to depend on the data, not on when it ran. Setup
 -- completed when the first real user was created, so that is the value: it is

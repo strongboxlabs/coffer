@@ -1,4 +1,4 @@
-import type { CsvDelimiterName, CsvMappingShape } from '@/lib/types';
+import type { CsvDecimalSeparatorName, CsvDelimiterName, CsvMappingShape } from '@/lib/types';
 
 /**
  * Reading a sample of a delimited file well enough to POINT AT ITS COLUMNS.
@@ -142,32 +142,110 @@ function looksLike(value: string, format: string): boolean {
 }
 
 /**
+ * Each decimal separator, and the grouping mark that goes with it (ADR-0114 D15).
+ *
+ * A record keyed by the vocabulary, so the YAML comment that lists the accepted values
+ * is derived from it and cannot drift from what the type allows.
+ */
+const DECIMAL_SEPARATORS: Record<CsvDecimalSeparatorName, { decimal: string; group: string }> = {
+    point: { decimal: '.', group: ',' },
+    comma: { decimal: ',', group: '.' },
+};
+
+/** A cell without what decorates money and is not part of its number: parentheses,
+ *  whitespace and the commonest currency symbols. */
+function undecorated(value: string): string {
+    return value.trim().replace(/[()\s$€£¥]/g, '');
+}
+
+/**
+ * Whether a cell is a number under one separator, written strictly: digits grouped in
+ * threes by the grouping mark, then at most one decimal mark and its digits.
+ *
+ * Strict on purpose, and used only to guess the separator. A loose reading that drops
+ * every comma takes a decimal comma for a grouping mark, so a cell written with one
+ * would read as a whole number under the point reading and the guess could never see it.
+ */
+function readsStrictly(bare: string, separator: CsvDecimalSeparatorName): boolean {
+    const g = `\\${DECIMAL_SEPARATORS[separator].group}`;
+    const d = `\\${DECIMAL_SEPARATORS[separator].decimal}`;
+    return new RegExp(`^[-+]?(\\d{1,3}(${g}\\d{3})+|\\d+)(${d}\\d+)?$`).test(bare);
+}
+
+/**
+ * Guess a file's decimal separator from cells of its sample (ADR-0114 D15).
+ *
+ * A cell decides only when one reading takes it and the other does not: a grouping
+ * mark followed by something other than three digits, or a grouping mark after the
+ * decimal mark, is unreadable one way. A cell both readings take (a whole number, or a
+ * single mark followed by exactly three digits) says nothing. Cells that are not
+ * numbers at all, such as dates and payees, are refused by both and say nothing either.
+ *
+ * Comma only when more cells decide for it than for the point. A tie, including a
+ * sample with nothing decisive in it, is guessed as point, the only reading a file
+ * ever had. Made only when a layout is first made: a saved layout keeps the separator
+ * it was saved with and is never guessed again.
+ */
+export function guessDecimalSeparator(values: readonly string[]): CsvDecimalSeparatorName {
+    let point = 0;
+    let comma = 0;
+    for (const value of values) {
+        const bare = undecorated(value);
+        if (bare === '') continue;
+        const asPoint = readsStrictly(bare, 'point');
+        const asComma = readsStrictly(bare, 'comma');
+        if (asPoint && !asComma) point++;
+        else if (asComma && !asPoint) comma++;
+    }
+    return comma > point ? 'comma' : 'point';
+}
+
+/**
+ * A money cell's number under the separator, as a plain decimal string with a point,
+ * or null when it is not money.
+ *
+ * Lenient about grouping, as this reading has always been: every grouping mark is
+ * dropped wherever it sits, so a grouping in twos still reads. Up to three decimals,
+ * because a currency with three places writes three (ADR-0114 D15); more than that is
+ * a price or a rate, not money.
+ */
+function moneyNumber(value: string, separator: CsvDecimalSeparatorName): string | null {
+    const { decimal, group } = DECIMAL_SEPARATORS[separator];
+    const bare = undecorated(value).split(group).join('');
+    if (!new RegExp(`^[-+]?\\d+(\\${decimal}\\d{1,3})?$`).test(bare)) return null;
+    return bare.replace(decimal, '.');
+}
+
+/**
  * How much a value looks like money.
  *
  * Weighted rather than boolean, because the trap is a column of plain integers — a
  * reference or cheque number reads as a perfectly good number and would otherwise win
  * the amount column outright. Cents and a currency symbol are what actually distinguish
  * money from a number that happens to be there.
+ *
+ * Read under the guessed decimal separator. Read always with a point, a decimal-comma
+ * cell lost its comma as a grouping mark and scored as a plain integer, so the amount
+ * column of a comma-decimal file scored like a reference number.
  */
-function moneyScore(value: string): number {
+function moneyScore(value: string, separator: CsvDecimalSeparatorName): number {
     const text = value.trim();
     if (text === '') return 0;
     const decorated = /[$\u20ac\u00a3\u00a5]/.test(text) || /^\(.*\)$/.test(text);
-    const bare = text.replace(/[()\s$\u20ac\u00a3\u00a5,]/g, '');
-    if (!/^[-+]?\d+(\.\d{1,2})?$/.test(bare)) return 0;
-    return 1 + (decorated ? 2 : 0) + (/\.\d{1,2}$/.test(bare) ? 2 : 0);
+    const number = moneyNumber(text, separator);
+    if (number === null) return 0;
+    return 1 + (decorated ? 2 : 0) + (number.includes('.') ? 2 : 0);
 }
 
 /** The size of a money cell, ignoring sign — null when it is not money at all. */
-function moneyMagnitude(value: string): number | null {
-    const bare = value.trim().replace(/[()\s$\u20ac\u00a3\u00a5,]/g, '');
-    if (!/^[-+]?\d+(\.\d{1,2})?$/.test(bare)) return null;
-    return Math.abs(Number(bare));
+function moneyMagnitude(value: string, separator: CsvDecimalSeparatorName): number | null {
+    const number = moneyNumber(value, separator);
+    return number === null ? null : Math.abs(Number(number));
 }
 
 /** Typical size of the money in a column, for telling an amount from a balance. */
-function typicalSize(values: string[]): number {
-    const sizes = values.map(moneyMagnitude).filter((n): n is number => n !== null);
+function typicalSize(values: string[], separator: CsvDecimalSeparatorName): number {
+    const sizes = values.map((v) => moneyMagnitude(v, separator)).filter((n): n is number => n !== null);
     if (sizes.length === 0) return Number.POSITIVE_INFINITY;
     return sizes.reduce((a, b) => a + b, 0) / sizes.length;
 }
@@ -180,10 +258,10 @@ function looksLikeAnyDate(value: string): boolean {
 /**
  * Everything the wizard can work out from the file itself.
  *
- * <b>Guessing only the delimiter was the defect.</b> The date format sat hard-coded at
- * `MM/dd/yyyy` while `plausibleDateFormats` was computed and spent purely on ordering
- * the dropdown — so an ISO file opened with the one setting that cannot read it, and the
- * preview said "0 transactions" with a warning per row. Sniffing the separator and then
+ * <b>Guessing only the delimiter is not enough.</b> With the date format hard-coded at
+ * `MM/dd/yyyy` and `plausibleDateFormats` spent purely on ordering the dropdown, an ISO
+ * file opens with the one setting that cannot read it, and the preview says
+ * "0 transactions" with a warning per row. Sniffing the separator and then
  * hard-coding the two fields most likely to be wrong is worse than not guessing: it
  * looks answered.
  *
@@ -208,7 +286,7 @@ export function guessChoices(text: string): WizardChoices {
 
     // The date column and its format are chosen TOGETHER — a column is only the date
     // column by virtue of some format reading it, and picking the column first would
-    // then have to hard-code a format for it, which is the bug being fixed.
+    // then have to hard-code a format for it.
     let dateColumn = 1;
     let dateFormat: string = DATE_FORMATS[0];
     let bestDate = 0;
@@ -233,12 +311,17 @@ export function guessChoices(text: string): WizardChoices {
     // it DID reach, a file with money in column 1 and no dates at all, it fired on the
     // fallback dateColumn of 1 and pushed the amount off the only column that had any.
     // A guard that cannot fire except to do harm is worse than no guard.
+    //
+    // The decimal separator is guessed first, from every cell of the body, because the
+    // money test reads each cell under it (ADR-0114 D15). Dates and payees are numbers
+    // under neither reading, so they do not vote.
+    const decimalSeparator = guessDecimalSeparator(body.flatMap((r) => r.map((c) => c.trim())));
     let amountColumn = Math.min(2, columns);
     let bestMoney = 0;
     let bestSize = Number.POSITIVE_INFINITY;
     for (let i = 0; i < columns; i++) {
         const values = body.map((r) => at(r, i));
-        const score = values.reduce((sum, v) => sum + moneyScore(v), 0);
+        const score = values.reduce((sum, v) => sum + moneyScore(v, decimalSeparator), 0);
         if (score === 0) continue;
         // A RUNNING BALANCE is the same shape as an amount and scores identically —
         // same cents, same currency symbol — so position cannot separate them. It is
@@ -246,7 +329,7 @@ export function guessChoices(text: string): WizardChoices {
         // is what breaks the tie. Picking by position instead put the balance in the
         // amount column for the commonest checking-account export there is:
         // Date, Description, Amount, Balance.
-        const size = typicalSize(values);
+        const size = typicalSize(values, decimalSeparator);
         if (score > bestMoney || (score === bestMoney && size < bestSize)) {
             bestMoney = score;
             bestSize = size;
@@ -284,6 +367,7 @@ export function guessChoices(text: string): WizardChoices {
         amountInvert: false,
         debitColumn: Math.min(3, columns),
         creditColumn: Math.min(4, columns),
+        decimalSeparator,
     };
 }
 
@@ -301,6 +385,8 @@ export interface WizardChoices {
     amountInvert: boolean;
     debitColumn: number;
     creditColumn: number;
+    /** How the file writes decimals, for either amount shape (ADR-0114 D15). */
+    decimalSeparator: CsvDecimalSeparatorName;
 }
 
 /**
@@ -324,7 +410,8 @@ export function toYaml(c: WizardChoices): string {
     const lines = [
         '# Coffer CSV mapping. Anything after a # is a comment.',
         '# Columns are numbered from 1, left to right, as in the grid above.',
-        'version: 1',
+        // Version 2 names the decimal separator, and requires it (ADR-0114 D15).
+        'version: 2',
         '',
         // Derived, not typed out: a hand-written list of the accepted values is a
         // second copy that goes stale the moment a delimiter is added.
@@ -353,6 +440,10 @@ export function toYaml(c: WizardChoices): string {
     lines.push(
         '',
         'amount:',
+        // First in the block, because it applies to either shape: below the shape's
+        // keys it would read as part of the commented-out swap.
+        `  # ${(Object.keys(DECIMAL_SEPARATORS) as CsvDecimalSeparatorName[]).join(' | ')}`,
+        `  decimal_separator: ${c.decimalSeparator}`,
         '  # signed: one column carrying a +/- sign.',
         '  # debit_credit: two columns, one of them empty on every row.',
         `  shape: ${c.amountShape}`,
@@ -393,6 +484,10 @@ export function toYaml(c: WizardChoices): string {
  * still need a value to render. Those fall back to the same first guesses a new document
  * gets, so switching shape lands somewhere sensible rather than on column 0 — and
  * nothing is written back to the document until a control is actually touched.
+ *
+ * The decimal separator is the document's, never a guess: a saved layout keeps the
+ * separator it was saved with (ADR-0114 D15). A version-1 document has no such key and
+ * reads with a point, the only reading it ever had.
  */
 export function choicesFromShape(shape: CsvMappingShape): WizardChoices {
     return {
@@ -408,6 +503,7 @@ export function choicesFromShape(shape: CsvMappingShape): WizardChoices {
         amountInvert: shape.amountInvert,
         debitColumn: shape.debitColumn ?? 3,
         creditColumn: shape.creditColumn ?? 4,
+        decimalSeparator: shape.version >= 2 ? shape.decimalSeparator : 'point',
     };
 }
 

@@ -7,16 +7,16 @@ namespace Coffer.Importer.Moneydance.Json.Typed;
 /// split applies to.
 /// </summary>
 /// <remarks>
-/// Schema observed in real-world exports:
+/// Schema (illustrative values):
 /// <code>
 /// { "obj_type": "csplit",
 ///   "id":       "&lt;uuid&gt;",
 ///   "curr":     "&lt;security md-id&gt;",
-///   "dt":       20240610,        // yyyymmdd, effective date
+///   "dt":       20200102,        // yyyymmdd, effective date
 ///   "ratio":    "2.0",           // post-split qty multiplier
 ///   "oldshrs":  "2",             // audit
 ///   "newshrs":  "1",             // audit
-///   "ts":       1718029530123 }  // event millis, sub-day ordering
+///   "ts":       1577966400000 }  // event millis, sub-day ordering
 /// </code>
 /// Coffer persists ratio as the load-bearing field; <see cref="OldShares"/>
 /// and <see cref="NewShares"/> are kept for audit / round-trip.

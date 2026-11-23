@@ -1,5 +1,6 @@
 using Coffer.Api.Db.Repositories;
 using Coffer.Api.Tests.Integration.Infra;
+using Coffer.Domain.Investment;
 
 namespace Coffer.Api.Tests.Integration.Reporting;
 
@@ -11,28 +12,29 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// migration-172 feeder). Covers the cash-inclusive basis (a contribution left as
 /// cash must not read as a loss), the TWR chain across an intermediate flow
 /// (time-weighted diverges from money-weighted), and the non-positive-base null
-/// path. <c>ReturnsAsync</c> had no integration coverage before this.
+/// path.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class InvestmentReturnsTests
+public sealed class InvestmentReturnsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public InvestmentReturnsTests(PostgresFixture fixture) => _fixture = fixture;
+    public InvestmentReturnsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Utc(int y, int m, int d) => new(y, m, d, 0, 0, 0, DateTimeKind.Utc);
 
     [Fact]
     public async Task Returns_value_cash_inclusive_so_an_uninvested_contribution_is_not_a_loss()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
 
         // Deposit into the brokerage; it stays as cash (never invested).
         await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, 1000m, Utc(2024, 1, 10));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -44,8 +46,8 @@ public sealed class InvestmentReturnsTests
         Assert.Equal(0m, result.StartValue);
         Assert.Equal(1000m, result.EndValue);
 
-        // The contribution was never invested → no gain, no loss. The old
-        // securities-only basis would have reported roughly -100% here.
+        // The contribution was never invested → no gain, no loss. A
+        // securities-only basis would report roughly -100% here.
         Assert.NotNull(result.TimeWeightedReturn);
         Assert.True(Math.Abs(result.TimeWeightedReturn!.Value) < 1e-9,
             $"expected ~0% TWR, got {result.TimeWeightedReturn}");
@@ -58,7 +60,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_time_weighted_chains_across_an_intermediate_flow()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
@@ -76,7 +78,7 @@ public sealed class InvestmentReturnsTests
         // Year end: a feed close 10% above the second buy price revalues both lots.
         await ledger.AddSecurityPriceAsync(sec, 22m, Utc(2024, 10, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -105,19 +107,18 @@ public sealed class InvestmentReturnsTests
 
     // ---- partial coverage: empty for part of the window ---------------------
     //
-    // TWR used to be voided outright by any sub-period with a non-positive base,
-    // which meant an account empty at EITHER end of the window reported nothing at
-    // all. On a real ledger that was most of its accounts — every rollover source
-    // (empty after) and every rollover destination (empty before) — and each of
-    // them has a perfectly good time-weighted return over the stretch it held
-    // money. The chain now skips the dormant stretches and annualizes over the
-    // covered time, which the result carries so a partial span can't be read as a
-    // full one.
+    // Voiding TWR outright on any sub-period with a non-positive base would mean an
+    // account empty at EITHER end of the window reports nothing at all. That
+    // includes every rollover source (empty after) and every rollover destination
+    // (empty before) — and each of them has a perfectly good time-weighted return
+    // over the stretch it held money. The chain skips the dormant stretches and
+    // annualizes over the covered time, which the result carries so a partial span
+    // can't be read as a full one.
 
     [Fact]
     public async Task Returns_time_weighted_covers_only_the_stretch_the_account_held_money()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
 
@@ -126,7 +127,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, 1000m, Utc(2024, 1, 10));
         await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, -1000m, Utc(2024, 2, 20));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -156,8 +157,7 @@ public sealed class InvestmentReturnsTests
     }
 
     /// <summary>
-    /// The destination half, and the shape found on a real ledger behind a column
-    /// that read "n/a": a window that opens BEFORE the account was funded. Since-
+    /// The destination half, and the shape that, unhandled, leaves a column reading "n/a": a window that opens BEFORE the account was funded. Since-
     /// inception hides this — it anchors at the first flow, so the account is never
     /// observed empty — but an explicit fromUtc does not, and every fixed reporting
     /// window (last 5 years, since a given year) is an explicit fromUtc.
@@ -165,7 +165,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_account_scope_reports_twr_from_first_funding_when_the_window_opens_earlier()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var source = await ledger.AddInvestmentAccountAsync("Old 401(k)");
         var destination = await ledger.AddInvestmentAccountAsync("Rollover IRA");
@@ -178,7 +178,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddInvestmentBuyAsync(destination.Id, holdings, sec, 600m, 10m, Utc(2024, 7, 1));
         await ledger.AddSecurityPriceAsync(sec, 12m, Utc(2024, 12, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -214,7 +214,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_time_weighted_is_null_when_the_account_held_nothing_all_window()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
 
@@ -223,7 +223,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, 1000m, Utc(2024, 1, 10));
         await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, -1000m, Utc(2024, 1, 10));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -237,15 +237,15 @@ public sealed class InvestmentReturnsTests
 
     // ---- the per-account roster ---------------------------------------------
     //
-    // A ledger-scope report could not say which accounts it covered, so a caller
-    // had to guess — and guessing by current balance drops exactly the accounts a
-    // rollover emptied. The roster answers it, and is held to one invariant: its
+    // A ledger-scope report that cannot say which accounts it covered leaves a
+    // caller to guess — and guessing by current balance drops exactly the accounts
+    // a rollover emptied. The roster answers it, and is held to one invariant: its
     // rows sum to the report they sit under.
 
     [Fact]
     public async Task Returns_ledger_scope_rosters_every_brokerage_including_the_emptied_ones()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var source = await ledger.AddInvestmentAccountAsync("Old 401(k)");
         var destination = await ledger.AddInvestmentAccountAsync("Rollover IRA");
@@ -255,7 +255,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(source.Id, bank.Id, 10_000m, Utc(2023, 6, 1));
         await ledger.AddTransactionPairAsync(destination.Id, source.Id, 10_000m, Utc(2024, 7, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -289,7 +289,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_roster_omits_an_account_that_was_empty_and_untouched_throughout()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var live = await ledger.AddInvestmentAccountAsync("Live Brokerage");
         var emptied = await ledger.AddInvestmentAccountAsync("Emptied Brokerage");
@@ -300,7 +300,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(emptied.Id, bank.Id, 3_000m, Utc(2024, 3, 1));
         await ledger.AddTransactionPairAsync(emptied.Id, bank.Id, -3_000m, Utc(2024, 9, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -324,7 +324,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_ledger_scope_roster_rows_sum_to_the_reported_totals()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var cash = await ledger.AddInvestmentAccountAsync("Cash Brokerage");
         var invested = await ledger.AddInvestmentAccountAsync("Invested Brokerage");
@@ -339,7 +339,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddInvestmentBuyAsync(invested.Id, holdings, sec, 500m, 10m, Utc(2024, 2, 1));
         await ledger.AddSecurityPriceAsync(sec, 14m, Utc(2024, 11, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -368,7 +368,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_roster_rows_sum_when_a_flow_lands_on_the_window_start()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var first = await ledger.AddInvestmentAccountAsync("Brokerage One");
         var second = await ledger.AddInvestmentAccountAsync("Brokerage Two");
@@ -376,7 +376,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(first.Id, bank.Id, 3_000m, Utc(2024, 1, 15));
         await ledger.AddTransactionPairAsync(second.Id, bank.Id, 1_000m, Utc(2024, 6, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         // Since-inception: startDate IS 2024-01-15, the instant of the first flow.
@@ -398,12 +398,12 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_account_scope_has_no_roster()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, 1_000m, Utc(2024, 1, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -419,20 +419,19 @@ public sealed class InvestmentReturnsTests
     // A net figure invites a single-event story: a large net outflow is equally
     // consistent with one withdrawal of that size and with a still larger outflow
     // partly offset by a much smaller inflow, and a reader holding one salient
-    // event will bind the number to it. A real report
-    // did exactly that. The parts are already classified when the net is summed,
-    // so they travel with it.
+    // event will bind the number to it. The parts are already classified when
+    // the net is summed, so they travel with it.
 
     /// <summary>
-    /// The reported scenario, reconstructed at the shape that produced it: a
-    /// retirement account rolled out mid-window while employer contributions kept
-    /// arriving and small expenses kept leaving. The net matches NO single event —
-    /// which is precisely why it must not be described as one.
+    /// A window mixing a large outbound transfer with smaller inbound
+    /// contributions and small outbound expenses: the net matches NO single
+    /// event, so the report carries the gross inflow and outflow halves, each
+    /// split by source, alongside it.
     /// </summary>
     [Fact]
     public async Task Returns_splits_net_contributions_into_gross_halves_by_source()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var plan = await ledger.AddInvestmentAccountAsync("Employer Plan");
         var ira = await ledger.AddInvestmentAccountAsync("Rollover IRA");
@@ -446,7 +445,7 @@ public sealed class InvestmentReturnsTests
             plan.Id, fees.Id, -500m, Utc(2024, 4, 1), postingRole: "transfer");
         await ledger.AddTransactionPairAsync(ira.Id, plan.Id, 90_000m, Utc(2024, 7, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -474,15 +473,15 @@ public sealed class InvestmentReturnsTests
             result.NetContributions,
             result.ContributionsBySource.Sum(s => s.In + s.Out));
 
-        // The point of the exercise: the rollover and the net are different figures.
-        // Nothing in the response now lets those be conflated.
+        // The point of the exercise: the outbound transfer and the net are different
+        // figures, and the response carries both, so they cannot be conflated.
         Assert.NotEqual(-90_000m, result.NetContributions);
     }
 
     [Fact]
     public async Task Returns_ledger_scope_omits_an_internal_rollover_from_the_breakdown()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var plan = await ledger.AddInvestmentAccountAsync("Employer Plan");
         var ira = await ledger.AddInvestmentAccountAsync("Rollover IRA");
@@ -490,7 +489,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(plan.Id, bank.Id, 100_000m, Utc(2024, 1, 1));
         await ledger.AddTransactionPairAsync(ira.Id, plan.Id, 90_000m, Utc(2024, 7, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -509,7 +508,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_attributes_an_in_kind_transfer_to_its_own_source()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var source = await ledger.AddInvestmentAccountAsync("Old IRA");
         var dest = await ledger.AddInvestmentAccountAsync("New IRA");
@@ -523,7 +522,7 @@ public sealed class InvestmentReturnsTests
             dest.Id, dest.HoldingsAccountId!.Value,
             sec, 100m, 100m, Utc(2024, 7, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -543,22 +542,22 @@ public sealed class InvestmentReturnsTests
     // ---- scope-relative external flows -----------------------------------
     //
     // A transfer between two brokerages is INTERNAL to the ledger but EXTERNAL to
-    // either account on its own. Classifying by counterparty account type made
-    // every 'investment' counterparty internal at both scopes, so the balance step
-    // landed in the return: the source reported the rollover as a catastrophic
-    // loss and the destination reported it as spectacular growth. These fix the
-    // rule at "outside this report's perimeter" and pin both scopes.
+    // either account on its own. Classifying by counterparty account type would
+    // make every 'investment' counterparty internal at both scopes, so the balance
+    // step would land in the return: the source would report the rollover as a
+    // catastrophic loss and the destination as spectacular growth. The rule is
+    // "outside this report's perimeter", and these pin both scopes.
 
     /// <summary>
     /// Rolling money OUT to another brokerage is a withdrawal from the source
     /// account's own return. A deposit in, 60% of it rolled out at mid-year, nothing
-    /// gained or lost: 0% TWR. Under the type-based rule that step-down was pure
-    /// performance and this read about -60%/yr.
+    /// gained or lost: 0% TWR. Under a type-based rule that step-down would be pure
+    /// performance and this would read about -60%/yr.
     /// </summary>
     [Fact]
     public async Task Returns_account_scope_counts_a_rollover_out_to_another_brokerage_as_a_withdrawal()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var source = await ledger.AddInvestmentAccountAsync("Old 401(k)");
         var destination = await ledger.AddInvestmentAccountAsync("Rollover IRA");
@@ -566,7 +565,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(source.Id, bank.Id, 10_000m, Utc(2024, 1, 1));
         await ledger.AddTransactionPairAsync(destination.Id, source.Id, 6_000m, Utc(2024, 7, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -591,14 +590,14 @@ public sealed class InvestmentReturnsTests
     /// <summary>
     /// The mirror image: money rolled IN is a contribution to the destination, not
     /// growth. A bank deposit seeded, then an equal amount rolled in, nothing earned
-    /// → 0% TWR and net contributions of both together. Under the type-based rule
-    /// this read ~+100%/yr with netContributions reporting only the half that came
-    /// from a bank.
+    /// → 0% TWR and net contributions of both together. Under a type-based rule
+    /// this would read ~+100%/yr with netContributions reporting only the half that
+    /// came from a bank.
     /// </summary>
     [Fact]
     public async Task Returns_account_scope_counts_a_rollover_in_from_another_brokerage_as_a_contribution()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var source = await ledger.AddInvestmentAccountAsync("Old 401(k)");
         var destination = await ledger.AddInvestmentAccountAsync("Rollover IRA");
@@ -607,7 +606,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(source.Id, bank.Id, 9_000m, Utc(2024, 1, 1));
         await ledger.AddTransactionPairAsync(destination.Id, source.Id, 1_000m, Utc(2024, 7, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -625,14 +624,14 @@ public sealed class InvestmentReturnsTests
     }
 
     /// <summary>
-    /// Regression guard on the half that was already right: across the WHOLE
+    /// The other half: across the WHOLE
     /// ledger the same rollover nets to zero and must not register as a flow.
     /// Net contributions stay at the deposit that entered from the bank.
     /// </summary>
     [Fact]
     public async Task Returns_ledger_scope_still_treats_a_rollover_between_brokerages_as_internal()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var source = await ledger.AddInvestmentAccountAsync("Old 401(k)");
         var destination = await ledger.AddInvestmentAccountAsync("Rollover IRA");
@@ -640,7 +639,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(source.Id, bank.Id, 10_000m, Utc(2024, 1, 1));
         await ledger.AddTransactionPairAsync(destination.Id, source.Id, 6_000m, Utc(2024, 7, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -667,7 +666,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_does_not_count_an_in_brokerage_trade_as_an_external_flow()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
@@ -677,7 +676,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddInvestmentBuyAsync(brokerage.Id, holdings, sec, 100m, 10m, Utc(2024, 1, 1));
         await ledger.AddSecurityPriceAsync(sec, 12m, Utc(2024, 10, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         foreach (var (scopeName, scopedId) in
@@ -705,7 +704,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_account_scope_counts_a_transfer_to_a_sibling_less_brokerage_as_a_withdrawal()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var source = await ledger.AddInvestmentAccountAsync("Brokerage");
         var cashOnly = await ledger.AddInvestmentAccountAsync(
@@ -715,7 +714,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(source.Id, bank.Id, 10_000m, Utc(2024, 1, 1));
         await ledger.AddTransactionPairAsync(cashOnly.Id, source.Id, 6_000m, Utc(2024, 7, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -739,7 +738,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_ledger_scope_keeps_a_sibling_less_brokerage_inside_the_perimeter()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var source = await ledger.AddInvestmentAccountAsync("Brokerage");
         var cashOnly = await ledger.AddInvestmentAccountAsync(
@@ -748,7 +747,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(source.Id, bank.Id, 10_000m, Utc(2024, 1, 1));
         await ledger.AddTransactionPairAsync(cashOnly.Id, source.Id, 6_000m, Utc(2024, 7, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -770,7 +769,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_account_scope_ignores_a_rollover_between_two_other_brokerages()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var watched = await ledger.AddInvestmentAccountAsync("Watched");
         var other1 = await ledger.AddInvestmentAccountAsync("Other One");
@@ -780,7 +779,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(other1.Id, bank.Id, 50_000m, Utc(2024, 1, 1));
         await ledger.AddTransactionPairAsync(other2.Id, other1.Id, 50_000m, Utc(2024, 7, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -802,14 +801,14 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_counts_a_bank_withdrawal_as_external_at_both_scopes()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
 
         await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, 10_000m, Utc(2024, 1, 1));
         await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, -6_000m, Utc(2024, 7, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         foreach (var (scopeName, scopedId) in
@@ -847,7 +846,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_does_not_count_a_cash_dividend_as_a_contribution()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var income = await ledger.AddCategoryAsync("Dividends", kind: "income");
@@ -856,7 +855,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(
             brokerage.Id, income.Id, 100m, Utc(2024, 7, 1), postingRole: "income");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -875,13 +874,12 @@ public sealed class InvestmentReturnsTests
     /// as a dividend, but carries posting role <c>transfer</c> — it is outside
     /// money arriving, not earnings. A deposit seeded, an employer contribution of a
     /// tenth of it, nothing gained: 0% and contributions of both together. Counting
-    /// it as return is what let employer money read as investment skill on a real
-    /// account.
+    /// it as return would misread employer money as investment skill.
     /// </summary>
     [Fact]
     public async Task Returns_counts_an_employer_contribution_as_an_external_flow()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var employer = await ledger.AddCategoryAsync(
@@ -891,7 +889,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(
             brokerage.Id, employer.Id, 100m, Utc(2024, 7, 1), postingRole: "transfer");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -914,7 +912,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_treats_a_fee_as_return_reducing_not_a_withdrawal()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var fees = await ledger.AddCategoryAsync("Investment Fees", kind: "expense");
@@ -923,7 +921,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(
             brokerage.Id, fees.Id, -100m, Utc(2024, 7, 1), postingRole: "fee");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -948,7 +946,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_treats_a_negative_income_role_posting_as_return_reducing()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var expense = await ledger.AddCategoryAsync("Account Maintenance", kind: "expense");
@@ -957,7 +955,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(
             brokerage.Id, expense.Id, -100m, Utc(2024, 7, 1), postingRole: "income");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -980,7 +978,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_counts_a_transfer_out_to_a_category_as_a_withdrawal()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var expense = await ledger.AddCategoryAsync("Tuition", kind: "expense");
@@ -989,7 +987,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(
             brokerage.Id, expense.Id, -100m, Utc(2024, 7, 1), postingRole: "transfer");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -1011,7 +1009,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_ignores_a_hidden_rollover_leg()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var source = await ledger.AddInvestmentAccountAsync("Old 401(k)");
         var destination = await ledger.AddInvestmentAccountAsync("Rollover IRA");
@@ -1023,7 +1021,7 @@ public sealed class InvestmentReturnsTests
         // Mig 103's is_hidden filter only applies on the next recompute run.
         await ledger.RecomputeBalancesAsync(new[] { source.Id, destination.Id });
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -1050,7 +1048,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_since_inception_anchors_on_first_activity_when_there_is_no_external_flow()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var income = await ledger.AddCategoryAsync("Employer Contribution", kind: "income");
@@ -1060,7 +1058,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddInvestmentBuyAsync(brokerage.Id, holdings, sec, 100m, 10m, Utc(2024, 1, 1));
         await ledger.AddSecurityPriceAsync(sec, 12m, Utc(2024, 10, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -1108,7 +1106,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_anchors_since_inception_on_a_funded_opened_on()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync(
             "Opened With Cash",
             openingBalance: 10_000m,
@@ -1120,7 +1118,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddInvestmentBuyAsync(brokerage.Id, holdings, sec, 100m, 100m, Utc(2024, 1, 1));
         await ledger.AddSecurityPriceAsync(sec, 121m, Utc(2024, 12, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -1149,7 +1147,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_ignores_opened_on_when_the_opening_balance_is_zero()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync(
             "Opened Empty",
@@ -1162,7 +1160,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddInvestmentBuyAsync(brokerage.Id, holdings, sec, 100m, 100m, Utc(2024, 1, 1));
         await ledger.AddSecurityPriceAsync(sec, 121m, Utc(2024, 12, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -1186,7 +1184,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_never_lets_opened_on_truncate_earlier_history()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync(
             "Late Start Date",
@@ -1195,7 +1193,7 @@ public sealed class InvestmentReturnsTests
 
         await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, 1_000m, Utc(2024, 1, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -1207,6 +1205,142 @@ public sealed class InvestmentReturnsTests
     }
 
     /// <summary>
+    /// A funded opening balance is the brokerage's money from its start date, never before.
+    /// At ledger scope a second brokerage opened partway through the window with a balance
+    /// holds nothing before then, and its balance comes in on that day as money in: the
+    /// time-weighted chain gets a boundary there instead of carrying the balance, idle,
+    /// through every earlier sub-period. Mutation caught: the balance valued as held before
+    /// its start date (the earlier sub-period diluted, B in the start value), or counted
+    /// from its start date with no flow (the balance read as return).
+    /// </summary>
+    [Fact]
+    public async Task Returns_counts_a_later_brokerages_opening_balance_from_its_start_date()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("Checking");
+        var a = await ledger.AddInvestmentAccountAsync("Brokerage A");
+        var b = await ledger.AddInvestmentAccountAsync(
+            "Brokerage B", openingBalance: 5_000m, openedOn: new DateOnly(2024, 6, 1));
+        var sec = await ledger.AddSecurityAsync("Growth", "GRW");
+        await ledger.AddTransactionPairAsync(a.Id, bank.Id, 10_000m, Utc(2023, 1, 10));
+        await ledger.AddInvestmentBuyAsync(a.Id, a.HoldingsAccountId!.Value, sec, 100m, 50m, Utc(2023, 1, 10));
+        await ledger.AddSecurityPriceAsync(sec, 60m, Utc(2024, 3, 1));
+        await ledger.AddSecurityPriceAsync(sec, 66m, Utc(2024, 9, 1));
+
+        await using var db = Db.NewDbContext();
+        var repository = new InvestmentReportingRepository(db, TimeProvider.System);
+
+        var result = await repository.ReturnsAsync(
+            ledger.LedgerId, accountId: null, fromUtc: null, toUtc: null, nowUtc: Utc(2025, 1, 1));
+
+        // Since inception from A's funding: nothing held before it, A's funding and B's
+        // balance in, and A ends with its uninvested cash and its units at the last price
+        // beside B's balance.
+        Assert.Equal(Utc(2023, 1, 10), result.StartDate);
+        Assert.Equal(0m, result.StartValue);
+        Assert.Equal(16_600m, result.EndValue);
+        Assert.Equal(15_000m, result.NetContributions);
+        Assert.Equal(1_600m, result.Gain);
+        var opening = Assert.Single(result.ContributionsBySource, s => s.Source == "opening_balances");
+        Assert.Equal(5_000m, opening.In);
+        Assert.Equal(0m, opening.Out);
+        var bRow = Assert.Single(result.Accounts!, r => r.AccountId == b.Id);
+        Assert.Equal(0m, bRow.StartValue);
+        Assert.Equal(5_000m, bRow.EndValue);
+
+        // A alone until B's start date, its units at the March price there; then both, from
+        // that value plus B's balance to the end value.
+        var twr = ReturnsCalculator.Twr(
+        [
+            new ReturnsCalculator.Boundary(Utc(2023, 1, 10), 0m, -10_000m),
+            new ReturnsCalculator.Boundary(Utc(2024, 6, 1), 11_000m, -5_000m),
+            new ReturnsCalculator.Boundary(Utc(2025, 1, 1), 16_600m, 0m),
+        ]);
+        Assert.Equal(ReturnsCalculator.TwrOutcome.Solved, twr.Outcome);
+        Assert.Equal(twr.Rate!.Value, result.TimeWeightedReturn!.Value, 9);
+
+        // An explicit window that opens before B's start date does not hold B's balance.
+        var windowed = await repository.ReturnsAsync(
+            ledger.LedgerId, accountId: null, fromUtc: Utc(2024, 1, 1), toUtc: null, nowUtc: Utc(2025, 1, 1));
+        Assert.Equal(10_000m, windowed.StartValue);
+        Assert.Equal(5_000m, windowed.NetContributions);
+        Assert.Equal(1_600m, windowed.Gain);
+
+        // A window that opens on B's start date is valued before it opens, so the balance
+        // is its first-day money in, as a contribution dated there would be.
+        var fromStart = await repository.ReturnsAsync(
+            ledger.LedgerId, accountId: b.Id, fromUtc: Utc(2024, 6, 1), toUtc: null, nowUtc: Utc(2025, 1, 1));
+        Assert.Equal(0m, fromStart.StartValue);
+        Assert.Equal(5_000m, fromStart.NetContributions);
+        Assert.Equal(0m, fromStart.Gain);
+    }
+
+    /// <summary>
+    /// The running balance stands on the opening balance whatever the dates, so a posting
+    /// dated before the start date already holds it, as the register shows: the balance
+    /// arrives at that posting, not on the start date, and the brokerage is never valued
+    /// below nothing. Mutation caught: the balance taken out up to the start date (the
+    /// brokerage valued at minus the balance between the posting and the start date, and
+    /// its own since-inception start value and contributions changed).
+    /// </summary>
+    [Fact]
+    public async Task Returns_counts_an_opening_balance_from_a_posting_before_its_start_date()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("Checking");
+        var b = await ledger.AddInvestmentAccountAsync(
+            "Brokerage B", openingBalance: 5_000m, openedOn: new DateOnly(2024, 6, 1));
+        await ledger.AddTransactionPairAsync(b.Id, bank.Id, -3_000m, Utc(2024, 3, 1));
+
+        await using var db = Db.NewDbContext();
+        var repository = new InvestmentReportingRepository(db, TimeProvider.System);
+
+        // Its own since inception: from the withdrawal, holding the balance there.
+        var own = await repository.ReturnsAsync(
+            ledger.LedgerId, accountId: b.Id, fromUtc: null, toUtc: null, nowUtc: Utc(2025, 1, 1));
+        Assert.Equal(Utc(2024, 3, 1), own.StartDate);
+        Assert.Equal(5_000m, own.StartValue);
+        Assert.Equal(-3_000m, own.NetContributions);
+        Assert.Equal(2_000m, own.EndValue);
+        Assert.DoesNotContain(own.ContributionsBySource, s => s.Source == "opening_balances");
+
+        // A window from before: nothing held as it opens, the balance in on the day of the
+        // withdrawal, and the withdrawal out.
+        var windowed = await repository.ReturnsAsync(
+            ledger.LedgerId, accountId: null, fromUtc: Utc(2024, 1, 1), toUtc: null, nowUtc: Utc(2025, 1, 1));
+        Assert.Equal(0m, windowed.StartValue);
+        Assert.Equal(2_000m, windowed.NetContributions);
+        Assert.Equal(0m, windowed.Gain);
+        var opening = Assert.Single(windowed.ContributionsBySource, s => s.Source == "opening_balances");
+        Assert.Equal(5_000m, opening.In);
+    }
+
+    /// <summary>
+    /// A balance whose start date falls after the window's end was never held in it: it
+    /// is no since-inception anchor, and the window holds nothing at either end. Mutation
+    /// caught: the anchor left on the start date, valued with the balance at the start and
+    /// without it at the end, a loss of the whole balance.
+    /// </summary>
+    [Fact]
+    public async Task Returns_does_not_anchor_on_a_start_date_after_the_window_ends()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var b = await ledger.AddInvestmentAccountAsync(
+            "Not Yet Open", openingBalance: 1_000m, openedOn: new DateOnly(2024, 6, 1));
+
+        await using var db = Db.NewDbContext();
+        var repository = new InvestmentReportingRepository(db, TimeProvider.System);
+
+        var result = await repository.ReturnsAsync(
+            ledger.LedgerId, accountId: b.Id, fromUtc: null, toUtc: Utc(2024, 3, 1), nowUtc: Utc(2025, 1, 1));
+
+        Assert.Equal(0m, result.StartValue);
+        Assert.Equal(0m, result.EndValue);
+        Assert.Equal(0m, result.NetContributions);
+        Assert.Equal(0m, result.Gain);
+    }
+
+    /// <summary>
     /// The one case that legitimately has no window: an account nothing has ever
     /// happened to. There is no activity to anchor on, so start and end collapse —
     /// and both figures must say so rather than produce one.
@@ -1214,10 +1348,10 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_reports_no_rate_for_an_account_with_no_activity_at_all()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Untouched");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -1231,7 +1365,7 @@ public sealed class InvestmentReturnsTests
         Assert.Null(result.MoneyWeightedReturn);
         Assert.Null(result.TimeWeightedReturn);
         // Both blanks must explain themselves — a null with no reason is the loose
-        // end that let the solver's invented rate pass for an answer in the first place.
+        // end that lets a solver's invented rate pass for an answer.
         Assert.False(string.IsNullOrEmpty(result.MoneyWeightedUnavailableReason));
         Assert.False(string.IsNullOrEmpty(result.TimeWeightedUnavailableReason));
     }
@@ -1244,7 +1378,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_since_inception_still_prefers_the_first_external_flow()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var income = await ledger.AddCategoryAsync("Dividends", kind: "income");
@@ -1253,7 +1387,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(brokerage.Id, income.Id, 100m, Utc(2024, 1, 1));
         await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, 900m, Utc(2024, 6, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -1270,13 +1404,13 @@ public sealed class InvestmentReturnsTests
     /// The pairing invariant, across every shape the suite builds: a null rate
     /// always carries a reason and a non-null rate never does — for BOTH figures.
     /// Asserted over a matrix rather than one fixture, because the two sides are
-    /// computed by separate code paths that previously disagreed about whether an
-    /// unexplained blank was acceptable.
+    /// computed by separate code paths that could each drift on whether an
+    /// unexplained blank is acceptable.
     /// </summary>
     [Fact]
     public async Task Returns_always_pairs_a_null_rate_with_a_reason_and_never_the_reverse()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var income = await ledger.AddCategoryAsync("Dividends", kind: "income");
         var source = await ledger.AddInvestmentAccountAsync("Old 401(k)");
@@ -1291,7 +1425,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(emptied.Id, bank.Id, 5_000m, Utc(2024, 1, 10));
         await ledger.AddTransactionPairAsync(emptied.Id, bank.Id, -5_000m, Utc(2024, 2, 20));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var scopes = new (string Label, Guid? AccountId)[]
@@ -1327,7 +1461,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_account_scope_handles_a_rollover_inside_an_explicit_window()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var source = await ledger.AddInvestmentAccountAsync("Old 401(k)");
         var destination = await ledger.AddInvestmentAccountAsync("Rollover IRA");
@@ -1335,7 +1469,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(source.Id, bank.Id, 10_000m, Utc(2023, 6, 1));
         await ledger.AddTransactionPairAsync(destination.Id, source.Id, 6_000m, Utc(2024, 7, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -1357,8 +1491,8 @@ public sealed class InvestmentReturnsTests
     // Every leg of the header faces an account inside its OWN brokerage, so the
     // counterparty perimeter test sees nothing crossing — the destination booked
     // the arrival as performance and the source booked the departure as a loss.
-    // On a real ledger one transfer put the receiving account at a triple-digit
-    // annual gain and its counterpart at an annual loss at the same time.
+    // So a single transfer could put the receiving account at an absurd annual
+    // gain and its counterpart at an annual loss at the same time.
     //
     // Detection is header-level: the header is a flow when its legs SPAN the
     // perimeter. These pin all three outcomes that rule has to produce.
@@ -1371,7 +1505,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_counts_an_in_kind_transfer_in_as_a_contribution()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var source = await ledger.AddInvestmentAccountAsync("Old IRA");
         var dest = await ledger.AddInvestmentAccountAsync("New IRA");
@@ -1387,7 +1521,7 @@ public sealed class InvestmentReturnsTests
             sec, 100m, 100m, Utc(2024, 7, 1));
         await ledger.AddSecurityPriceAsync(sec, 100m, Utc(2024, 10, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -1408,7 +1542,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_counts_an_in_kind_transfer_out_as_a_withdrawal()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var source = await ledger.AddInvestmentAccountAsync("Old IRA");
         var dest = await ledger.AddInvestmentAccountAsync("New IRA");
@@ -1423,7 +1557,7 @@ public sealed class InvestmentReturnsTests
             sec, 100m, 100m, Utc(2024, 7, 1));
         await ledger.AddSecurityPriceAsync(sec, 100m, Utc(2024, 10, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -1443,7 +1577,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_ledger_scope_treats_an_in_kind_transfer_as_internal()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var source = await ledger.AddInvestmentAccountAsync("Old IRA");
         var dest = await ledger.AddInvestmentAccountAsync("New IRA");
@@ -1458,7 +1592,7 @@ public sealed class InvestmentReturnsTests
             sec, 100m, 100m, Utc(2024, 7, 1));
         await ledger.AddSecurityPriceAsync(sec, 110m, Utc(2024, 10, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
@@ -1477,16 +1611,15 @@ public sealed class InvestmentReturnsTests
     // ---- sizing a request before spending it ---------------------------------
     //
     // The cost of a returns call is the valuation loop, and the loop runs once per
-    // instant money crossed the scope's boundary. A caller could previously only
-    // discover that count by waiting for the call — up to a minute — or by reading
-    // it out of a refusal message. The estimate answers it from the SAME scope
+    // instant money crossed the scope's boundary. Without an estimate a caller could
+    // only discover that count by waiting for the call. The estimate answers it from the SAME scope
     // resolution the real call uses, so the two can never disagree about what
     // counts.
 
     [Fact]
     public async Task Returns_cost_estimate_counts_the_instants_the_report_would_value()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
@@ -1500,7 +1633,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddInvestmentBuyAsync(brokerage.Id, holdings, sec, 10m, 100m, Utc(2024, 2, 1));
         await ledger.AddInvestmentBuyAsync(brokerage.Id, holdings, sec, 10m, 100m, Utc(2024, 3, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var estimate = await repository.ReturnsCostEstimateAsync(
@@ -1523,7 +1656,7 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_cost_estimate_is_scope_relative()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var source = await ledger.AddInvestmentAccountAsync("Old 401(k)");
         var destination = await ledger.AddInvestmentAccountAsync("Rollover IRA");
@@ -1531,7 +1664,7 @@ public sealed class InvestmentReturnsTests
         await ledger.AddTransactionPairAsync(source.Id, bank.Id, 10_000m, Utc(2024, 1, 1));
         await ledger.AddTransactionPairAsync(destination.Id, source.Id, 6_000m, Utc(2024, 7, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var ledgerScope = await repository.ReturnsCostEstimateAsync(
@@ -1549,21 +1682,20 @@ public sealed class InvestmentReturnsTests
     }
 
     /// <summary>
-    /// There is no boundary ceiling any more. This seeds well past the 400 that
-    /// MaxReturnsBoundaries used to refuse at and asserts a time-weighted figure
-    /// comes back — the whole point of migrations 200 and 201.
+    /// There is no boundary ceiling (migrations 200 and 201). This seeds 500 flow
+    /// instants and asserts a time-weighted figure comes back.
     /// </summary>
     [Fact]
     public async Task Returns_computes_time_weighted_past_the_old_boundary_ceiling()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var sec = await ledger.AddSecurityAsync("Growth", "GRW");
 
-        // 500 distinct flow instants — over the old cap of 400, which would have
-        // returned a null TWR with a cost-limit reason.
+        // 500 distinct flow instants; a fixed cap below that would return a null
+        // TWR with a cost-limit reason.
         const int flowCount = 500;
         var start = Utc(2024, 1, 1);
         await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, 10_000m, start);
@@ -1572,7 +1704,7 @@ public sealed class InvestmentReturnsTests
             await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, 10m, start.AddDays(i));
         await ledger.AddSecurityPriceAsync(sec, 110m, start.AddDays(flowCount + 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var estimate = await repository.ReturnsCostEstimateAsync(
@@ -1592,22 +1724,22 @@ public sealed class InvestmentReturnsTests
     [Fact]
     public async Task Returns_reports_covered_days_beside_covered_years()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
 
         // Funded well after the window opens: covered span is a fraction of it.
         await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, 1_000m, Utc(2024, 10, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var result = await repository.ReturnsAsync(
             ledger.LedgerId, accountId: null,
             fromUtc: Utc(2024, 1, 1), toUtc: null, nowUtc: Utc(2024, 12, 31));
 
-        // Days, not just years. A report reading a fractional-year span as "ten
-        // weeks" when it was over three months is the conversion this removes — and
+        // Days, not just years. Converting a fractional-year span back to days can
+        // read a span of over three months as "ten weeks" — and
         // with an interior gap the caller cannot derive days from CoveredTo −
         // CoveredFrom either, since
         // covered time is the SUM of the invested stretches.

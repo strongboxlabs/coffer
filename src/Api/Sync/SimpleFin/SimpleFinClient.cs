@@ -18,8 +18,8 @@ namespace Coffer.Api.Sync.SimpleFin;
 ///     base64url-encoded setup token the user pastes from
 ///     simplefin.org for the long-lived access URL.
 ///   • <see cref="GetInstitutionNameAsync"/> — optional follow-up
-///     read after exchange, used to populate
-///     <c>feed_connections.institution_name</c> for the wizard.
+///     read after exchange: the name a new connection starts with
+///     (<c>feed_connections.institution_name</c>).
 ///   • <see cref="GetAccountsWithTransactionsAsync"/> — full sync
 ///     pull, called from <see cref="Coffer.Api.Ingest.SimpleFin.SimpleFinPullProvider"/>.
 /// </summary>
@@ -133,16 +133,24 @@ public sealed class SimpleFinClient
     }
 
     /// <summary>
-    /// Probe an access URL: fetch the FI's connection list without
+    /// Probe an access URL: fetch the feed's connection list without
     /// any transactions (<c>?version=2&amp;start-date=...future...</c>)
-    /// and return the first <c>connections[].name</c>. Used to
-    /// populate <c>feed_connections.institution_name</c> on connect;
-    /// failure is non-fatal (institution name stays NULL, sync slice
-    /// populates it from the first transaction pull).
+    /// and name the connection after its institution when it has one.
+    /// The name a new <c>feed_connections</c> row starts with; failure
+    /// is non-fatal, and nothing fills the name in later (syncs never
+    /// write it; only a rename does).
     /// </summary>
-    /// <returns>Institution display name, or <c>null</c> if the
-    /// probe failed, the access URL is revoked, or the feed has no
-    /// connections.</returns>
+    /// <remarks>
+    /// One SimpleFIN connection can reach accounts at several
+    /// institutions, each a <c>connections[]</c> entry. Named after
+    /// one of them, it would read as that institution's alone, so a
+    /// name is returned only when the list holds exactly one distinct
+    /// non-blank name (compared trimmed, ordinal). Several, or none,
+    /// return null, which the SPA shows as "SimpleFIN".
+    /// </remarks>
+    /// <returns>The one institution's name, trimmed, or <c>null</c>
+    /// if the list names several or none, the probe failed, or the
+    /// access URL is revoked.</returns>
     public async Task<string?> GetInstitutionNameAsync(
         string accessUrl,
         CancellationToken cancellationToken = default)
@@ -168,29 +176,31 @@ public sealed class SimpleFinClient
             using var json = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken)
                                                .ConfigureAwait(false);
 
-            // v2: connections is a top-level array. Each entry has
-            // `name` (institution display name).
+            // v2: connections is a top-level array, one entry per
+            // institution the access reaches, each with its `name`.
+            string? only = null;
             if (json.RootElement.TryGetProperty("connections", out var connections)
                 && connections.ValueKind == JsonValueKind.Array)
             {
                 foreach (var c in connections.EnumerateArray())
                 {
-                    if (c.TryGetProperty("name", out var n)
-                        && n.ValueKind == JsonValueKind.String)
-                    {
-                        var name = n.GetString();
-                        if (!string.IsNullOrWhiteSpace(name)) return name;
-                    }
+                    if (!c.TryGetProperty("name", out var n)
+                        || n.ValueKind != JsonValueKind.String)
+                        continue;
+                    var name = n.GetString()?.Trim();
+                    if (string.IsNullOrEmpty(name)) continue;
+                    if (only is null) only = name;
+                    else if (!string.Equals(only, name, StringComparison.Ordinal)) return null;
                 }
             }
-            return null;
+            return only;
         }
         catch (Exception ex)
         {
             // Best-effort enrichment — never block the connect flow on
-            // a slow / flaky probe. The wizard renders "SimpleFIN" as
-            // the fallback until first sync fills this in. Log at Debug so
-            // the swallow is never fully silent (ADR-0086).
+            // a slow / flaky probe. The SPA renders "SimpleFIN" for a
+            // connection with no name. Log at Debug so the swallow is
+            // never fully silent (ADR-0086).
             _logger?.LogDebug(ex, "SimpleFIN institution-name probe failed; falling back to default label");
             return null;
         }
@@ -428,8 +438,8 @@ public sealed class SimpleFinClient
         // SimpleFIN v2: `payee` is the cleaned merchant / counterparty
         // name; `description` is the raw bank-format text. Capture
         // both — the orchestrator maps payee→txn_headers.payee and
-        // description→txn_headers.memo (previously we put description
-        // into both, dropping the cleaner payee).
+        // description→txn_headers.memo (putting description into both
+        // would drop the cleaner payee).
         var payee = ReadString(txn, "payee");
         var description = ReadString(txn, "description");
         var pending = txn.TryGetProperty("pending", out var pd)
@@ -473,8 +483,10 @@ public sealed class SimpleFinClient
     private static decimal? ReadDecimalString(JsonElement el, string property)
     {
         // SimpleFIN v2 serialises money as a JSON string (preserves
-        // the bank's exact two-decimal value across the wire — JSON
-        // numbers go through float in some clients). We parse with
+        // the bank's exact figure across the wire, however many places
+        // it carries — JSON numbers go through float in some clients).
+        // The figure is kept as sent; the ingest write fits it to the
+        // account currency's places (ADR-0114 D15). We parse with
         // InvariantCulture so a ',' decimal locale doesn't drop the
         // value silently.
         if (!el.TryGetProperty(property, out var v)) return null;

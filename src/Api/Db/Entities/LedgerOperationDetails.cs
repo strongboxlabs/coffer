@@ -32,6 +32,15 @@ internal sealed record QuoteRunDetails
     // the activity log so a quote refresh says WHICH provider moved the prices.
     [JsonPropertyName("prices_from_fetch")]     public int PricesFromFetch { get; init; }
     [JsonPropertyName("prices_from_simplefin")] public int PricesFromSimplefin { get; init; }
+    // ADR-0114 D5 (amendment): securities whose currency a Yahoo read confirmed for the
+    // first time this run, and the fetch rows re-stamped to it.
+    [JsonPropertyName("currencies_confirmed")]  public int CurrenciesConfirmed { get; init; }
+    [JsonPropertyName("rows_restamped")]        public int RowsRestamped { get; init; }
+    // The outside market series the run stored (ADR-0114 D11): exchange-rate days and
+    // benchmark growth days, new days only. A standalone backfill's row carries the same
+    // two and zero prices.
+    [JsonPropertyName("rates_inserted")]           public int RatesInserted { get; init; }
+    [JsonPropertyName("benchmark_days_inserted")]  public int BenchmarkDaysInserted { get; init; }
 }
 
 /// <summary>

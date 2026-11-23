@@ -13,14 +13,14 @@ import { Panel, PanelBody } from '@/components/ui/Panel';
  * request in the query string, plus a single-use `consent_ticket`.
  *
  * What the page SHOWS comes from the server, looked up by that ticket: the name
- * the app registered with and the redirect it registered (2026-10-12 security
- * audit, H1). It used to read both from the link, so whoever wrote the link chose
- * what the user saw — "Connect Claude… sends results to localhost".
+ * the app registered with and the redirect it registered (ADR-0105 D5). Read from
+ * the link, both would be chosen by whoever wrote the link — "Connect Claude…
+ * sends results to localhost".
  *
  * Allow / Deny each POST the original OAuth parameters back to /oauth/authorize
  * (a server endpoint) with a `decision` and the ticket; the cookie rides the
  * same-origin POST. The server honours Allow only with the ticket it minted for
- * this user and this exact request (M1). This is an authed route, so an anonymous
+ * this user and this exact request (ADR-0105 D5). This is an authed route, so an anonymous
  * visitor is already bounced to /login by the route guard.
  */
 export function ConsentPage() {

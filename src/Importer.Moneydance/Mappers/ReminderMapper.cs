@@ -39,11 +39,17 @@ public static class ReminderMapper
         UnparseableStartDate,   // sdt missing or malformed
     }
 
+    /// <summary>
+    /// Outcome of mapping one reminder. <see cref="HeaderTags"/> and
+    /// <see cref="LegTags"/> are the template's tag names, as its notes were planned.
+    /// </summary>
     public sealed record MapResult(
         TxnHeaderRow? Header,
         IReadOnlyList<TxnLegRow> Legs,
         RecurringTransactionRow? Row,
-        SkipReason? Skip);
+        SkipReason? Skip,
+        IReadOnlyList<string>? HeaderTags = null,
+        IReadOnlyList<LegTagSeed>? LegTags = null);
 
     public static MapResult Map(
         MdReminder reminder,
@@ -74,6 +80,14 @@ public static class ReminderMapper
             if (accountByMdId[split.AcctId].Id != sourceRef.Id) emittable.Add(split);
         if (emittable.Count == 0) return Skip(SkipReason.NoSplits);
 
+        // Same rule as the live bank route, so a template and the occurrences
+        // fired from it agree: a one-posting brokerage cash move is 'transfer'.
+        // The bank route only ever sees txns that are not investment-shaped, so
+        // the rule is gated the same way here.
+        var (action, postingRole) = txn.IsInvestmentShape
+            ? (null, null)
+            : BrokerageCashTransfer.Classify(sourceRef, emittable.Count);
+
         var templateHeaderId = Guid.NewGuid();
         var postedAt = new DateTimeOffset(startDate.Value.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
 
@@ -83,7 +97,8 @@ public static class ReminderMapper
             Origin:              "manual",
             ExternalId:          "mdreminder:" + reminder.Id,
             Payee:               NullIfEmpty(reminder.Description) ?? NullIfEmpty(txn.Description),
-            Memo:                NullIfEmpty(reminder.Memo) ?? NullIfEmpty(txn.Memo),
+            // Planned with the legs below: the reminder's memo, else its txn's.
+            Memo:                null,
             PostedAt:            postedAt,
             // NOT NULL since mig 189: reminders have no MD `td`, so the posted
             // date stands in for "no distinct tax date".
@@ -98,18 +113,24 @@ public static class ReminderMapper
             ClearedByUserId:     null,
             OnlineMatchFitid:    null,
             OnlineMatchFiId:     null,
-            Action:              null,
+            Action:              action,
+            // Mig 263: the reminder's account (txn.acctid, also the series source),
+            // stamped below once the legs exist.
+            OriginatingAccountId: null,
             ProviderKey:         null,
             IsMergeWinner:       false,
             ProviderRawPayload:  null,
             IsRecurringTemplate: true);
 
         var legs = new List<TxnLegRow>(emittable.Count * 2);
-        var isMultiSplit = emittable.Count > 1;
+        var postings = new List<MoneydanceNotes.BankPosting>(emittable.Count);
         foreach (var split in emittable)
         {
             var targetRef = accountByMdId[split.AcctId];
-            var legMemo = isMultiSplit ? NullIfEmpty(split.Description) : null;
+            postings.Add(new MoneydanceNotes.BankPosting(split, targetRef.Id));
+            // As an imported transaction's legs: each side at its own currency's
+            // decimals, a category side the real side's amount (MdAmounts.Posting).
+            var (sourceAmount, targetAmount) = MdAmounts.Posting(split, sourceRef, targetRef);
 
             legs.Add(new TxnLegRow(
                 Id:           Guid.NewGuid(),
@@ -117,11 +138,12 @@ public static class ReminderMapper
                 LedgerId:     ledgerId,
                 AccountId:    sourceRef.Id,
                 PostingIndex: split.Index,
-                LegMemo:      legMemo,
-                Amount:       AccountMapper.MinorUnitsToDecimal(split.ParentAmount),
+                LegMemo:      null,
+                Amount:       sourceAmount,
                 SecurityId:   null,
                 Quantity:     null,
-                UnitPrice:    null));
+                UnitPrice:    null,
+                PostingRole:  postingRole));
 
             legs.Add(new TxnLegRow(
                 Id:           Guid.NewGuid(),
@@ -129,11 +151,12 @@ public static class ReminderMapper
                 LedgerId:     ledgerId,
                 AccountId:    targetRef.Id,
                 PostingIndex: split.Index,
-                LegMemo:      legMemo,
-                Amount:       AccountMapper.MinorUnitsToDecimal(split.SplitAmount),
+                LegMemo:      null,
+                Amount:       targetAmount,
                 SecurityId:   null,
                 Quantity:     null,
-                UnitPrice:    null));
+                UnitPrice:    null,
+                PostingRole:  postingRole));
         }
 
         // acdays: -1 = auto-commit OFF (manual); >= 0 = auto-commit that many
@@ -170,7 +193,21 @@ public static class ReminderMapper
             IsActive:             true,
             Origin:               "moneydance_import");
 
-        return new MapResult(header, legs, row, Skip: null);
+        // The template's notes, placed as a live bank-route transaction's are
+        // (MoneydanceNotes), from the reminder's account, which is on every
+        // posting's source leg and so the template's originating account. The
+        // memo is the reminder's own, else its txn's; Moneydance keeps no feed
+        // memo on a reminder.
+        var plan = MoneydanceNotes.PlanBankRoute(
+            ImportAnnotations.ShapeOf(sourceRef, action, legs),
+            sourceRef.Id,
+            MoneydanceNotes.WrittenMemo(reminder.Memo, txn.Memo),
+            txn.Description,
+            reminder.Tags,
+            postings);
+        var stamped = ImportAnnotations.Stamp(plan, header, legs);
+
+        return new MapResult(stamped.Header, stamped.Legs, row, Skip: null, stamped.HeaderTags, stamped.LegTags);
     }
 
     private static MapResult Skip(SkipReason reason) => new(null, [], null, reason);

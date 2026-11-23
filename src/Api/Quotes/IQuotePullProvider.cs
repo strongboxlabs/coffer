@@ -41,6 +41,11 @@ public interface IQuotePullProvider
     /// </summary>
     bool RequiresOptIn { get; }
 
+    /// <summary>The host an egress provider sends its requests to, which the Quotes tab
+    /// names beside its switch: the host alone, never a path, port or query. Null for a
+    /// provider that sends nothing.</summary>
+    string? DestinationHost => null;
+
     /// <summary>Fetch the latest available prices for the
     /// supplied securities. Best-effort: a provider that can't
     /// resolve a ticker omits it from <see cref="QuoteResult.Quotes"/>

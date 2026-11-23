@@ -8,13 +8,17 @@ Relates: [ADR-0013](0013-webauthn-passkey-auth.md), [ADR-0015](0015-importer-hos
 > **Superseded in part (2026-08-02).** D1's `provision --mode {clean|demo}`
 > subcommand and `scripts/provision.sh` are **retired**, and the placeholder
 > Default/Demo ledger rows this ADR relied on are **dropped by migration 186**.
-> D1 assumed the CLI would always run before the first user; it never did on the
-> documented dev path, so fresh installs kept two empty ledgers and the setup
-> picker offered them as if they held data. Install shape is now a single
+> D1 assumed the CLI always runs before the first user; on the documented dev
+> path it does not, so a fresh install keeps two empty ledgers and the setup
+> picker offers them as if they held data. Install shape is now a single
 > checkbox on the setup form — see
 > [ADR-0088](0088-setup-asks-one-question.md). D2 (UI-driven import), D3/D4
 > (authenticated restore) and D5 (starter categories, now scoped to ledgers
 > created empty) stand.
+>
+> **Moved (2026-11-18).** Setup no longer offers the Demo: it is added from the
+> hub, generated for the day it is added — see
+> [ADR-0115](0115-the-demo-is-generated-imported-and-seeded-from-the-hub.md).
 
 ## Context
 
@@ -32,7 +36,7 @@ Three gaps in the "stand up / populate / recover" story:
    in-UI way to restore — the exact deferred item ADR-0060 called out. This is also
    the path to **migrate from another install**.
 
-An audit confirmed a **zero-ledger install is safe**: the API and SPA already
+A **zero-ledger install is safe**: the API and SPA already
 handle an empty ledger list ([LandingPage.tsx](../../src/Web/src/routes/landing/LandingPage.tsx)
 empty state; the setup ceremony's "create new ledger" path works with zero
 existing ledgers). The only hard dependency on the Default *row* is the importer
@@ -76,14 +80,18 @@ Exposed to **any authenticated user** (not admin-only) as **new-ledger-only**
 
 - `POST /api/imports/moneydance/preview` — multipart upload; parses + dry-runs;
   returns per-type counts (accounts/txns/securities/…) and validation warnings.
-  No DB writes.
+  No DB writes. *Amended 2026-10-25:* the preview returns the counts only; the
+  validation warnings are reported by the job status once the import has run (see
+  the amendment "the validation warnings are shown on the done step").
 - `POST /api/imports/moneydance` — creates the named new ledger owned by the
   caller, enqueues a **background job**, returns a job id.
 - `GET /api/imports/moneydance/{jobId}` — job status/progress for polling.
 
 Long imports (a full history is one large bulk insert, under a 10-min command
 timeout) run in the background, not a request. Upload ceiling mirrors restore (~128 MB); the CLI stays the escape hatch
-for larger exports.
+for larger exports. *Amended 2026-10-25:* there is no CLI import any more; the
+wizard is the only import path and its ceiling is the operator's setting (see the
+amendment at the end).
 
 ### D3 — Authenticated admin restore
 
@@ -165,7 +173,9 @@ ledger hub / landing.
 3. **Confirm** — starts the background job; a progress screen shows step/percentage
    (polling `/{jobId}`).
 4. **Done** — open the new ledger. Failure → error with the validation report; no
-   partial ledger (import is transactional).
+   partial ledger (import is transactional). *Amended 2026-10-25:* a failed
+   validation check does not fail the import; the done step lists each failed check
+   above the Open ledger button (amendment at the end).
 
 **Restore (admin, System → Backups)** — a "Restore" section below backups.
 1. **Source** — primary: upload `.cofferbak` + passphrase. Secondary: pick a listed
@@ -192,7 +202,8 @@ ledger hub / landing.
 
 - The importer CLI's no-args fallback assumes the Default row; on a `clean` install
   that row is gone, so CLI users must pass `--ledger-name`. Update the CLI's
-  fallback error to say so (it already errors clearly).
+  fallback error to say so (it already errors clearly). *Amended 2026-10-25:* the
+  CLI import is removed, so neither flag exists.
 - Import becomes a per-user, resource-bearing operation (any user can start a large
   background job); a concurrency/size guard keeps one install honest. (TBD: exact
   limits.)
@@ -204,7 +215,8 @@ ledger hub / landing.
 ## Resolved defaults
 
 - **Import limits:** one running import per user at a time; ~128 MB upload cap
-  (mirrors restore). Larger exports use the CLI.
+  (mirrors restore). Larger exports use the CLI. *Amended 2026-10-25:* no CLI
+  import remains; an operator raises the wizard's ceiling instead.
 - **Demo grant:** `demo` mode auto-grants the first user **owner** of the Demo
   ledger (it's their install).
 
@@ -212,3 +224,87 @@ ledger hub / landing.
 
 - Reconcile D4 with the existing KEK-rotation key-id, if one exists (reuse vs new)
   — resolved during Slice D by reading the rotation code.
+
+## Amendment, 2026-10-25 — the wizard is the only import path
+
+D2 kept the command-line `import` beside the wizard as an escape hatch for exports
+over the upload ceiling. Two import paths are two writers to keep in step, and the
+command-line one ran from a source checkout straight against the database, outside
+the API's permissions and its import audit record: a ledger it created was owned by
+the system user, not a person. The ceiling it worked around is now an
+operator setting (`COFFER_IMPORT_MAX_UPLOAD_MB`), with the memory check in front of
+the parse.
+
+The command-line `import` is removed, along with `prune-batch`, which only undid a
+re-import into a ledger in use (ADR-0052, amendment of this date). The wizard is the
+only import path; every import creates a new ledger owned by the person who ran it.
+The name typed for it is a label and is never looked up: the import runs as
+`coffer_service`, which bypasses row-level security, so resolving the name could reach
+ledgers the importer cannot see (ADR-0052, amendment of this date). The command-line
+tool keeps the read-only `audit` and `reconcile` diagnostics, which write nothing.
+
+The command-line import was the one place an import's validation result was shown,
+including the `no-dropped-transactions` check. The wizard shows only that the job
+finished (the preview's validation warnings planned in D2 were not built). The API
+now writes a warning to the server log naming the job, the new ledger and each failed
+check; `reconcile` lists the dropped transactions themselves. *Amended 2026-10-25:*
+the wizard now shows them too (next amendment).
+
+The restore drill's dataset generator builds the pinned release's own importer from
+that release's tag and runs its command-line import (ADR-0061, amendment of this
+date). That holds only while the pinned release still has that command: no release
+from the one that removes it onward does, so the generator cannot pin a later schema
+as it stands.
+
+## Amendment, 2026-10-25 — the validation warnings are shown on the done step
+
+D2 planned validation warnings for the wizard, on the preview. The checks read the
+ledger the import wrote, so a preview that writes nothing has nothing for them to
+read; and with the wizard the only import path, a failed check reached only the
+server log. The ledger is committed whatever the checks find, so the person who ran
+the import has to be told what it could not bring in.
+
+The warnings are built on the wizard's last step instead. When a job succeeds, its
+status (`GET /api/imports/moneydance/{jobId}`) carries:
+
+- `warnings` — one `{ check, message }` per failed check, in the validator's order.
+  The message is the check's plain-language summary for the person who ran the
+  import, with what the check counted (`CheckSummaries`). Each check also keeps its
+  own account of the failure in the importer's terms (`CheckResult.Message`), for
+  diagnosis; that one is not sent, because the person reading the wizard does not
+  have those terms;
+- `skippedTransactions` — one `{ date, reason, security, ticker, shares }` per
+  transaction the pipeline steps did not import, in pipeline order: `date` is
+  `YYYY-MM-DD`, or null when the export's date is not a calendar date; `reason` is
+  the importer's own name for it;
+- `skippedTransactionsNotListed` — how many more were skipped than are listed. The
+  list stops at a fixed number of rows (`ImportJobOutcome.SkippedTransactionsListed`),
+  because the status is held in memory and polled while the wizard is open.
+
+All three are empty (zero) while the job runs and when it fails. They are read off the
+result the import already returns; nothing new is computed beyond the wording.
+
+With no warnings the done step is unchanged: "Import complete." With warnings the
+status line says "Import complete, with N warning(s)." and each failed check gets a
+box with a plain title and that summary; an unknown check shows its name. The
+`no-dropped-transactions` box comes first, whatever the validator's order, because it
+is the one the user acts on. It lists the skipped transactions (date, security,
+shares, and a plain label for each known reason) in a table that scrolls within the
+box, with the count not listed, and says to fix them in Moneydance and import the
+export again into a new ledger. One live region carries the run's progress and then
+its result, so a screen reader announces the change, and it holds focus once the run
+starts. The warnings live
+only on this screen and in the job status, which is gone once the user starts another
+import or the server restarts, so the server-log warning stays.
+
+## Amendment, 2026-10-28 — a job reports its end once its run has ended
+
+The job status turns `succeeded` or `failed` as the run's last act, after everything
+else the run does: the import's transaction committed and its connection returned, the
+`ledger_operations` row for a successful import (family `ingest`, provider
+`moneydance`) committed, and the parsed export and its memory slot (FU-092) released.
+The wizard stops polling as soon as the status leaves `running` and offers what comes
+next: "Open ledger" on success, "Start over" on failure. A status that ended before the
+run would let those show a ledger whose Activity row is not there yet, or refuse the
+next upload as "already running".
+The manual backup run follows the same rule (`BackupRunCoordinator`, ADR-0060).

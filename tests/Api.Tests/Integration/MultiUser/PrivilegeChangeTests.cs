@@ -18,18 +18,19 @@ namespace Coffer.Api.Tests.Integration.MultiUser;
 /// audit (FU-090).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class PrivilegeChangeTests
+public sealed class PrivilegeChangeTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public PrivilegeChangeTests(PostgresFixture fixture) => _fixture = fixture;
+    public PrivilegeChangeTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private LedgersRepository NewLedgers() => new(
-        _fixture.NewDbContext(), _fixture.NewServiceFactory(), _fixture.NewLedgerKeyService(), TimeProvider.System);
+        Db.NewDbContext(), Db.NewServiceFactory(), Db.NewLedgerKeyService(), TimeProvider.System);
 
     private async Task<int> HumanOwnersAsync(Guid ledgerId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.UserLedgerGrants.CountAsync(
             g => g.LedgerId == ledgerId && g.Role == "owner" && g.UserId != UserRow.SystemUserId);
     }
@@ -42,7 +43,7 @@ public sealed class PrivilegeChangeTests
         // overlap every chance.
         for (var round = 0; round < 20; round++)
         {
-            var ledger = await SyntheticLedger.CreateAsync(_fixture);
+            var ledger = await SyntheticLedger.CreateAsync(Db);
             var second = await ledger.AddMemberAsync("owner");
 
             var results = await Task.WhenAll(
@@ -60,7 +61,7 @@ public sealed class PrivilegeChangeTests
     private async Task<HttpClient> CookieClientForAsync(ApiFactory factory, Guid userId)
     {
         var (plaintext, hash) = SessionService.GenerateCookieValue();
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             db.AuthSessions.Add(new SessionRow
             {
@@ -75,7 +76,7 @@ public sealed class PrivilegeChangeTests
 
     private async Task<AdminAuditEventRow?> AuditAsync(string action, Guid actor, string detailContains)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.AdminAuditEvents.AsNoTracking()
             .Where(e => e.Action == action && e.ActorUserId == actor && e.Detail!.Contains(detailContains))
             .SingleOrDefaultAsync();
@@ -84,9 +85,9 @@ public sealed class PrivilegeChangeTests
     [Fact]
     public async Task Member_role_changes_and_removals_are_audited_and_a_no_op_is_not()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var member = await ledger.AddMemberAsync("viewer");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var owner = await CookieClientForAsync(factory, ledger.UserId);
         var url = $"/api/ledgers/{ledger.LedgerId}/members/{member}";
 
@@ -105,12 +106,12 @@ public sealed class PrivilegeChangeTests
     [Fact]
     public async Task Disabling_enabling_and_revoking_admin_are_audited()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var target = await ledger.AddMemberAsync("viewer");
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             await db.Users.Where(u => u.Id == ledger.UserId || u.Id == target)
                 .ExecuteUpdateAsync(s => s.SetProperty(u => u.IsAdmin, _ => true));
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var admin = await CookieClientForAsync(factory, ledger.UserId);
 
         Assert.Equal(HttpStatusCode.NoContent, (await admin.PutAsJsonAsync(
@@ -128,8 +129,8 @@ public sealed class PrivilegeChangeTests
     [Fact]
     public async Task Issuing_and_revoking_a_ledger_invite_are_audited_without_the_token()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var owner = await CookieClientForAsync(factory, ledger.UserId);
 
         var issued = await owner.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/invites",
@@ -142,7 +143,7 @@ public sealed class PrivilegeChangeTests
         Assert.DoesNotContain(token, row!.Detail);
 
         Guid inviteId;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             inviteId = await db.Invites.Where(i => i.LedgerId == ledger.LedgerId).Select(i => i.Id).SingleAsync();
         Assert.Equal(HttpStatusCode.NoContent,
             (await owner.DeleteAsync($"/api/ledgers/{ledger.LedgerId}/invites/{inviteId}")).StatusCode);

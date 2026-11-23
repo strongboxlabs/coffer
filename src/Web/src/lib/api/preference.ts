@@ -1,7 +1,8 @@
 import type {
-    DashboardPrefs,
+    DashboardPrefsV2,
     QuoteProvider,
     QuotesPrefs,
+    StoredDashboardPrefs,
 } from '../types/preference';
 import { request } from './_request';
 
@@ -30,21 +31,36 @@ export function saveQuotesPrefs(
     );
 }
 
-/** GET /preferences/dashboard — the Overview layout (empty = default). */
-export function fetchDashboardPrefs(ledgerId: string): Promise<DashboardPrefs> {
-    return request<DashboardPrefs>(
+/** GET /preferences/dashboard — the stored home-screen layout, whatever its version,
+ *  with the row's `updatedAt` (null and an empty document when nothing is stored). */
+export function fetchDashboardPrefs(ledgerId: string): Promise<StoredDashboardPrefs> {
+    return request<StoredDashboardPrefs>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/preferences/dashboard`,
     );
 }
 
-/** PUT /preferences/dashboard — replace the Overview layout. */
+/**
+ * PUT /preferences/dashboard — replace the layout if nobody saved since `updatedAt`
+ * (null: nothing stored when it was read). A stale save is 422
+ * `dashboard-prefs-stale` and writes nothing. Answers the saved document with the
+ * row's new `updatedAt`, which the next save echoes.
+ */
 export function saveDashboardPrefs(
     ledgerId: string,
-    prefs: DashboardPrefs,
-): Promise<DashboardPrefs> {
-    return request<DashboardPrefs>(
+    prefs: DashboardPrefsV2,
+    updatedAt: string | null,
+): Promise<StoredDashboardPrefs> {
+    return request<StoredDashboardPrefs>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/preferences/dashboard`,
-        { method: 'PUT', body: prefs },
+        { method: 'PUT', body: { ...prefs, updatedAt } },
+    );
+}
+
+/** DELETE /preferences/dashboard — reset to the default layout. 204. */
+export function deleteDashboardPrefs(ledgerId: string): Promise<void> {
+    return request<void>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/preferences/dashboard`,
+        { method: 'DELETE' },
     );
 }
 

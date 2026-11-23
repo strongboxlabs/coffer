@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type RefObject } from 'react';
 
 import { ActionFooter } from './ActionFooter';
 import { Modal } from './Modal';
@@ -53,8 +53,8 @@ export interface ConfirmDialogProps {
     onConfirm: () => void;
     /** Fired when the user cancels (Esc, Cancel button, backdrop). */
     onCancel: () => void;
-    /** Disable the affirmative button — useful when a mutation is
-     *  in flight. */
+    /** Disable the affirmative button: it is unavailable for a reason
+     *  other than a request in flight. For that, pass `isConfirming`. */
     confirmDisabled?: boolean;
     /** If false, clicking the backdrop is a no-op. Default true. */
     dismissOnBackdrop?: boolean;
@@ -64,10 +64,17 @@ export interface ConfirmDialogProps {
      *  single accidental click can't catastrophically delete N rows.
      *  Comparison is case-insensitive, whitespace-trimmed. */
     requireTypedConfirmation?: string;
-    /** When true, swap the Confirm button into a "working…" state with
-     *  the affirmative action disabled. Used while a bulk mutation is
-     *  in flight to prevent a re-fire on double-click. */
+    /** When true, the confirm's request is in flight: the Confirm button
+     *  reads "Working…", keeps focus, and refuses a press from the mouse,
+     *  Enter or Space (pending.ts, ADR-0023 §L). A double click sends one
+     *  request: the first press holds the button until the request it
+     *  started has settled, before this flag has rendered. */
     isConfirming?: boolean;
+    /** Where focus goes on close when the control that opened the confirm
+     *  cannot take it back, because the confirmed action took it away (Modal's
+     *  fallbackFocusRef, ADR-0023 §L): a Clear log that empties its list and
+     *  goes with it hands focus to the list. */
+    fallbackFocusRef?: RefObject<HTMLElement | null>;
 }
 
 export function ConfirmDialog({
@@ -83,6 +90,7 @@ export function ConfirmDialog({
     dismissOnBackdrop = true,
     requireTypedConfirmation,
     isConfirming = false,
+    fallbackFocusRef,
 }: ConfirmDialogProps) {
     const confirmRef = useRef<HTMLButtonElement | null>(null);
     const typeInputRef = useRef<HTMLInputElement | null>(null);
@@ -92,7 +100,9 @@ export function ConfirmDialog({
         requireTypedConfirmation === undefined
         || typedValue.trim().toLowerCase()
             === requireTypedConfirmation.trim().toLowerCase();
-    const affirmDisabled = confirmDisabled || isConfirming || !typedSatisfied;
+    // Unavailable (the phrase is not typed yet) is not busy: a confirm whose
+    // request is in flight stays focused and refuses to act instead.
+    const affirmDisabled = confirmDisabled || !typedSatisfied;
 
     // Reset typed-confirmation text on close so a subsequent open
     // doesn't show stale input.
@@ -119,6 +129,7 @@ export function ConfirmDialog({
             onClose={onCancel}
             titleId="confirm-dialog-title"
             dismissOnBackdrop={dismissOnBackdrop}
+            fallbackFocusRef={fallbackFocusRef}
             className="max-w-md"
         >
             <div className="flex flex-col gap-4 p-5">
@@ -151,9 +162,12 @@ export function ConfirmDialog({
                             value={typedValue}
                             onChange={(e) => setTypedValue(e.target.value)}
                             onKeyDown={(e) => {
-                                if (e.key === 'Enter' && typedSatisfied && !affirmDisabled) {
+                                // Enter presses Confirm, as Enter in a form's field
+                                // presses its default button: Confirm refuses it while
+                                // unavailable or busy, and a press it is held by.
+                                if (e.key === 'Enter') {
                                     e.preventDefault();
-                                    onConfirm();
+                                    confirmRef.current?.click();
                                 }
                             }}
                             autoComplete="off"
@@ -167,9 +181,11 @@ export function ConfirmDialog({
                     confirmRef={confirmRef}
                     cancel={{ label: cancelLabel, onClick: onCancel }}
                     confirm={{
-                        label: isConfirming ? 'Working…' : confirmLabel,
+                        label: confirmLabel,
+                        pendingLabel: 'Working…',
                         onClick: onConfirm,
                         disabled: affirmDisabled,
+                        pending: isConfirming,
                         variant: variant === 'danger' ? 'danger' : 'primary',
                     }}
                 />

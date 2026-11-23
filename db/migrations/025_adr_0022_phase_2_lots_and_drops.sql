@@ -15,7 +15,7 @@
 -- Existing rows in lots / merge_candidates reference legacy txn ids
 -- that won't exist after the drop. We truncate both up-front; the
 -- investment importer's re-import populates lots, and merge_candidates
--- is a short-lived "pending review" queue (no production data lives
+-- is a short-lived "pending review" queue (nothing durable lives
 -- there).
 --
 -- Old running-balance trigger functions (`fn_recompute_balance_after`,

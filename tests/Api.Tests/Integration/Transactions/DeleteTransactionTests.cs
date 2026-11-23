@@ -19,13 +19,11 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// them.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class DeleteTransactionTests
+public sealed class DeleteTransactionTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public DeleteTransactionTests(PostgresFixture fixture)
+    public DeleteTransactionTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -48,7 +46,7 @@ public sealed class DeleteTransactionTests
         var (fromLegId, _) = await ledger.AddTransactionPairAsync(
             bankId, catId, -25m,
             new DateTime(2026, 5, 13, 12, 0, 0, DateTimeKind.Utc));
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.TxnLegs.AsNoTracking()
             .Where(l => l.Id == fromLegId)
             .Select(l => l.HeaderId)
@@ -69,32 +67,35 @@ public sealed class DeleteTransactionTests
         var toLegId = Guid.NewGuid();
         var postedAt = new DateTime(2026, 5, 13, 12, 0, 0, DateTimeKind.Utc);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         // Mig 107: origin/provider_key. An MD-imported QIF row.
         // needs_review=true mirrors a freshly-ingested feed row awaiting
-        // acceptance — the state that must be cleared on soft-delete (D3).
+        // acceptance — the state that must be cleared on soft-delete (ADR-0052 D3).
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             INSERT INTO txn_headers
-                (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, needs_review)
+                (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, needs_review,
+                 originating_account_id)
             VALUES
                 ({headerId}, {ledger.LedgerId}, 'file_import', 'qif',
-                 {externalId}, 'feed-payee', {postedAt},{postedAt}, true);
+                 {externalId}, 'feed-payee', {postedAt},{postedAt}, true, {bankId});
             INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount)
             VALUES
                 ({fromLegId}, {headerId}, {ledger.LedgerId}, {bankId}, 0, -25.0),
                 ({toLegId},   {headerId}, {ledger.LedgerId}, {catId},  0,  25.0);");
+        // Raw SQL reaches no writer: store the presentation as the upgrade's backfill does.
+        await ledger.RecomputeNotesAsync(headerId);
         return headerId;
     }
 
     [Fact]
     public async Task Delete_manual_header_hard_deletes_and_cascades_legs()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("groceries");
         var headerId = await SeedManualHeaderAsync(ledger, bank.Id, cat.Id);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.DeleteAsync(
@@ -105,7 +106,7 @@ public sealed class DeleteTransactionTests
         Assert.NotNull(body);
         Assert.Equal("hard-deleted", body!.Kind);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var headerExists = await db.TxnHeaders.AnyAsync(h => h.Id == headerId);
         var legsExist = await db.TxnLegs.AnyAsync(l => l.HeaderId == headerId);
         Assert.False(headerExists);
@@ -115,13 +116,13 @@ public sealed class DeleteTransactionTests
     [Fact]
     public async Task Delete_feed_header_soft_hides_and_preserves_legs()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("groceries");
         var headerId = await SeedFeedHeaderAsync(
             ledger, bank.Id, cat.Id, externalId: "md-test-12345");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.DeleteAsync(
@@ -132,13 +133,13 @@ public sealed class DeleteTransactionTests
         Assert.NotNull(body);
         Assert.Equal("soft-hidden", body!.Kind);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == headerId);
         Assert.True(header.IsHidden);
         // ADR-0052 D3: soft-delete clears needs_review so a deleted row can't
         // linger in the review queue as hidden-but-pending (the limbo that
-        // stranded feed rows on a real ledger).
+        // stranded feed rows).
         Assert.False(header.NeedsReview);
         Assert.Equal("md-test-12345", header.ExternalId);
 
@@ -149,13 +150,13 @@ public sealed class DeleteTransactionTests
     [Fact]
     public async Task Delete_cross_ledger_header_returns_422()
     {
-        var ledgerA = await SyntheticLedger.CreateAsync(_fixture);
-        var ledgerB = await SyntheticLedger.CreateAsync(_fixture);
+        var ledgerA = await SyntheticLedger.CreateAsync(Db);
+        var ledgerB = await SyntheticLedger.CreateAsync(Db);
         var bankB = await ledgerB.AddBankAccountAsync("checking");
         var catB = await ledgerB.AddCategoryAsync("groceries");
         var headerB = await SeedManualHeaderAsync(ledgerB, bankB.Id, catB.Id);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledgerA);
 
         var response = await client.DeleteAsync(
@@ -165,7 +166,7 @@ public sealed class DeleteTransactionTests
         var body = await response.Content.ReadAsStringAsync();
         Assert.Contains("transaction-not-in-ledger", body);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var stillThere = await db.TxnHeaders.AnyAsync(h => h.Id == headerB);
         Assert.True(stillThere);
     }

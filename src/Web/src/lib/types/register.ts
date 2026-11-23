@@ -16,6 +16,8 @@
 // `InvestmentRowDto`). The API emits the `kind` discriminator as the
 // first property of each row object.
 
+import type { RateUnavailable } from './conversion';
+
 /**
  * Reconciliation status. The normalized 3-state vocabulary stored
  * per-leg in `txn_leg_recon` (migration 171, ADR-0082; formerly
@@ -34,6 +36,67 @@
 export type ReconStatus = 'uncleared' | 'reconciling' | 'cleared';
 
 /**
+ * Which memo-and-tags rule a row follows in the register it is shown in. Mirror
+ * of API `NotesKinds`.
+ *
+ *   - `onePosting`          — a one-split; this side shows its own value, else
+ *                             the other side's (inherited).
+ *   - `eventCounterpartOne` — the other side of a one-posting investment event
+ *                             (an Xfr seen from the bank account). Read-only.
+ *   - `splitSide`           — the account that owns a multi-split. The
+ *                             transaction row shows the transaction's memo and
+ *                             tags; each line shows only its own.
+ *   - `splitOpposite`       — one line of a multi-split, seen from that line's
+ *                             other account. Read-only; its own value, else the
+ *                             line's.
+ *   - `eventSide`           — a brokerage or holdings account of a multi-posting
+ *                             event. Shows the event's memo and tags.
+ *   - `eventOpposite`       — any other account of a multi-posting event (a fee
+ *                             category, a funding brokerage). Read-only.
+ */
+export type NotesKind =
+    | 'onePosting'
+    | 'eventCounterpartOne'
+    | 'splitSide'
+    | 'splitOpposite'
+    | 'eventSide'
+    | 'eventOpposite';
+
+/**
+ * The memo-and-tags fields of a register row and of each `/legs` leg. Mirror of
+ * API `IRegisterRowNotes`. Everything the row shows, filters on and edits comes
+ * from the server's rule; the raw per-leg values are not on the wire, so the
+ * client cannot show anything the rule did not decide.
+ */
+export interface RegisterRowNotes {
+    /** What this register shows for the row. */
+    memo: string | null;
+    /** What this register shows for the row. Always an array. */
+    tags: string[];
+    /** The shown memo is the other side's; the row draws the inherited marker. */
+    memoInherited: boolean;
+    /** The shown tags are the other side's; the row draws the inherited marker. */
+    tagsInherited: boolean;
+    /** What the row would show with its own memo blank, as the row is stored.
+     *  The editors show it as the placeholder while the field is empty and the
+     *  save keeps the leg it is on. */
+    inheritedMemo: string | null;
+    /** What the row would show with its own tags blank. Always an array. */
+    inheritedTags: string[];
+    /** The account an inherited value comes from ("from X"). */
+    inheritFromAccountId: string | null;
+    /** The transaction's memo, only where it is in play: a split-side row and a
+     *  multi-posting event. Null everywhere else. */
+    headerMemo: string | null;
+    /** The transaction's tags, on the same rows as `headerMemo`; null elsewhere. */
+    headerTags: string[] | null;
+    notesKind: NotesKind;
+    /** Edit and Duplicate are not offered on this row, and Delete is not either, as
+     *  before this release: the row menu offers Show other side and Show raw data. */
+    isReadOnly: boolean;
+}
+
+/**
  * The ~40 fields every register row carries regardless of domain.
  * Mirror of the universal members on API `RegisterRowDto`.
  *
@@ -42,23 +105,35 @@ export type ReconStatus = 'uncleared' | 'reconciling' | 'cleared';
  * safe — the rounded printed value matches the DB. Don't perform
  * client-side arithmetic with these; the API is the source of truth.
  */
-export interface RegisterRowBase {
+export interface RegisterRowBase extends RegisterRowNotes {
     id: string;
     accountId: string;
     payee: string | null;
-    memo: string | null;
     amount: number;
     postedAt: string;
     transactedAt: string | null;
     /** Normalized 3-state reconciliation vocabulary (migration 030). */
     status: ReconStatus;
     isHidden: boolean;
-    /** The row has been edited since it arrived: it has a
-     *  `txn_header_originals` row (migration 230). Name kept from when the
-     *  signal was "has a `txn_header_overrides` row" — same question, answered
-     *  from the other side, and now true for investment edits too. */
-    hasOverrides: boolean;
+    /**
+     * The currency `amount` is in (ADR-0114 D7): on a real account, that account's; on
+     * a category, which has no currency of its own, the real account's on the other
+     * side of the posting, so one category register can mix currencies.
+     */
+    currencyCode: string;
+    /**
+     * The running balance after this row. On a real account, the account's own, in
+     * its own currency. On a category it combines accounts: each transaction converted
+     * into the reporting currency at its own date and summed in walk order; null from
+     * the first row whose rate is missing onward, named in `balanceRateUnavailable`.
+     */
     balanceAfter: number | null;
+    /** The currency `balanceAfter` is in: the account's own on a real account, the
+     *  ledger's reporting currency on a category. */
+    balanceCurrencyCode: string;
+    /** Every missing rate a null category balance needed, from the category's first
+     *  transaction to this row; absent otherwise (ADR-0114 D9). */
+    balanceRateUnavailable?: RateUnavailable[];
     origin: string;
     isPending: boolean;
     externalId: string | null;
@@ -77,9 +152,15 @@ export interface RegisterRowBase {
     counterpartyAccountId: string | null;
     counterpartyAccountName: string | null;
     counterpartyAccountType: string | null;
-    /** Always an array (possibly empty), never null. Deterministic
-     *  order (alpha by tag name). */
-    tags: string[];
+    /**
+     * The counterparty leg's own amount on a transfer between real accounts in different
+     * currencies, signed, in `counterpartyCurrencyCode` (ADR-0114 D13, D14): the register
+     * shows it after the account chip. Null on a mirrored pair: a category row, a
+     * transfer in one currency, a posting with no other side.
+     */
+    counterpartyAmount?: number | null;
+    /** The currency `counterpartyAmount` is in; null exactly when it is. */
+    counterpartyCurrencyCode?: string | null;
     /**
      * Always-present owning-header id (migration 028). The SPA's
      * inline-edit POSTs use this directly; distinct from `txnGroupId`
@@ -100,26 +181,6 @@ export interface RegisterRowBase {
      */
     createdAt: string;
     /**
-     * Raw leg-level memo (migration 032, ADR-0025). Null when the leg
-     * has no override AND no canonical `leg_memo` — distinct from the
-     * COALESCEd `memo` field above. Split-leg rows display this
-     * directly; the editor loads it into the per-posting memo input.
-     */
-    legMemo: string | null;
-    /**
-     * Tags on THIS posting (ADR-0103, mig 243). Always an array, never null.
-     * Distinct from `tags` above, which carries the HEADER's — neither is
-     * derived from the other. The register row does not render these (ADR-0103
-     * D4); the editor loads them into the per-posting tag field.
-     */
-    legTags: readonly string[];
-    /**
-     * Raw header-level memo (migration 032, ADR-0025). Null when
-     * neither the header override nor the canonical header row has a
-     * memo. The editor's umbrella "Memo" input loads from this.
-     */
-    headerMemo: string | null;
-    /**
      * OFX FITID — the bank's per-transaction unique id (migration 034).
      * Universal: both bank and investment rows can originate from OFX.
      * The composite `(onlineMatchFiId, onlineMatchFitid)` is the dedup
@@ -133,6 +194,27 @@ export interface RegisterRowBase {
      *  landed; the register renders these with a distinct treatment
      *  until the user clicks Approve. */
     needsReview: boolean;
+    /**
+     * The bank's figure as the row's originals keep it (ADR-0114 D15): the amount on its
+     * originating account, in the row's stored sign, exactly as sent. A string, so every
+     * digit arrives, a trailing zero included; never parse it into a number to show it.
+     * Null when the row has no originals, or they predate the column.
+     */
+    originalAmount?: string | null;
+    /** An import or a promote-on-clear rounded `originalAmount` to the account currency's
+     *  places. With `needsReview` it shows the Review marker. */
+    roundedAtImport?: boolean;
+    /**
+     * The bank's cleared figure that put the row back in review because the row does not
+     * hold it (ADR-0114 D15): a merged transaction's when `reviewClearedByMatch`, else the
+     * row's own, on a split whose lines add up to another total. A string, exactly as
+     * sent, as `originalAmount` is. Null when no such hold explains the row's review. With
+     * `needsReview` it shows the Review marker in place of the rounded note.
+     */
+    reviewClearedAmount?: string | null;
+    /** `reviewClearedAmount` is a merged transaction's figure: this row is the one it was
+     *  folded into. */
+    reviewClearedByMatch?: boolean;
     /**
      * Verbatim provider JSON for this transaction (migration 078/079).
      * The register's right-click "Show raw provider data" modal
@@ -252,13 +334,20 @@ export interface InvestmentRow extends RegisterRowBase {
     transferAccountId: string | null;
     transferAccountName: string | null;
     transferAccountType: string | null;
+    /** The transfer slot's other leg, on the transfer account, signed, in
+     *  `transferCurrencyCode`, when that account is a real account in another currency
+     *  than this one (ADR-0114 D13, D14): an Xfr, BuyXfr, SellXfr or DividendXfr between
+     *  currencies. Null when the transfer mirrors. */
+    transferAmount?: number | null;
+    /** The transfer account's currency; null exactly when `transferAmount` is. */
+    transferCurrencyCode?: string | null;
     feeAmount: number | null;
     /**
      * The event's SETTLED money (ADR-0073 D1) — the trade value — where
      * `amount` is ADR-0028's net of this account's legs.
      *
-     * They differ exactly when the event is cash-neutral, and on a real
-     * brokerage register that is a large share of the entries: a reinvestment
+     * They differ exactly when the event is cash-neutral, which every
+     * reinvestment is: a reinvestment
      * is income +X and security −X on one sleeve, so its net is structurally
      * zero however large the dividend was. Null when no leg carries one.
      */
@@ -291,6 +380,46 @@ export type RegisterEntry =
           groupId: string;
           legs: RegisterRow[];
       };
+
+/**
+ * One entry of `GET /api/ledgers/{ledgerId}/transactions/entries`. Mirror of API
+ * `Coffer.Api.Contracts.LedgerEntryDto`: a register entry exactly as the register of
+ * `accountId` shows it, with that account's currency. The same header can be an entry
+ * on more than one account (a transfer between two of them is one on each), so an
+ * entry is named by its account and its own key, never by its header alone.
+ */
+export interface LedgerEntry {
+    /** The account whose register shows `entry`. */
+    accountId: string;
+    /** That account's currency, the one every amount in `entry` is in. Entries in
+     *  different currencies sit on one page; nothing converts them. */
+    currencyCode: string;
+    entry: RegisterEntry;
+}
+
+/**
+ * Mirror of API `Coffer.Api.Contracts.LedgerEntriesPage`: the newest register entries
+ * across the ledger (every account that is not a category or a holdings sibling,
+ * inactive ones too), newest first. A first page only: there is no cursor, and the
+ * registers are where the rest is read.
+ */
+export interface LedgerEntriesPage {
+    entries: LedgerEntry[];
+    /** More entries match than the page holds. */
+    hasMore: boolean;
+}
+
+/**
+ * What a save of one header answers with when it is scoped to an account
+ * (the bank and investment PATCH, approve and merge): every entry the
+ * surviving header has in that account, in register order, with the same
+ * grouping as a page. Several rows can share a header, because each line of a
+ * split seen from its other side is its own entry. A header with no entry
+ * there answers 204 instead.
+ */
+export interface SavedHeaderEntries {
+    entries: RegisterEntry[];
+}
 
 /**
  * Mirror of API `Coffer.Api.Contracts.RegisterPage`. One page of
@@ -352,8 +481,9 @@ export interface DeleteTransactionResponse {
  * - `yearMonth`: ISO `yyyy-MM`, sortable as a string. The track's
  *   year-gutter labels are derived from the year part; the full
  *   key is the cache identity.
- * - `count`: distinct register entries (header count) in this month.
- *   Used by hover tooltips ("Mar 2024 — 87 entries").
+ * - `count`: register entries in this month, as the page groups them:
+ *   one per header on the side it belongs to, one per line on an
+ *   opposite side. Used by hover tooltips ("Mar 2024 — 87 entries").
  * - `sampleHeaderId`: most-recent header in the bucket by canonical
  *   `(posted_at, seq)`. Used as the seek anchor:
  *   `register.refresh(sampleHeaderId)` opens a window with that
@@ -376,6 +506,11 @@ export interface IndexBucketDto {
  */
 export interface HeaderBalanceDto {
     headerId: string;
-    balanceAfter: number;
+    /** As the register row shows it: on a category converted into the reporting
+     *  currency, and null when a rate it needs is missing. */
+    balanceAfter: number | null;
+    /** Per-(header, account) cash delta, as stored, in the account's own currency. */
     netAmount: number;
+    /** Absent unless `balanceAfter` is null for a missing rate. */
+    balanceRateUnavailable?: RateUnavailable[];
 }

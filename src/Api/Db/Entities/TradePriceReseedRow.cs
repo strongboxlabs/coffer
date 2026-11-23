@@ -2,8 +2,8 @@ namespace Coffer.Api.Db.Entities;
 
 /// <summary>
 /// Keyless result of <c>fn_trade_price_reseed(ledger, security, day)</c>
-/// (migration 234) — the price the rule chose and wrote, or NULL when no
-/// eligible leg prices that day.
+/// (migrations 234, 274) — the price the rule chose and wrote, in the currency of the
+/// brokerage that made the trade, or NULL when no eligible leg prices that day.
 /// </summary>
 /// <remarks>
 /// A table-returning function rather than a scalar so EF can materialise it:

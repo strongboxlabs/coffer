@@ -15,11 +15,12 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// revaluation and the point-cap guard.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class NetWorthHistoryTests
+public sealed class NetWorthHistoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public NetWorthHistoryTests(PostgresFixture fixture) => _fixture = fixture;
+    public NetWorthHistoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Utc(int y, int m, int d) => new(y, m, d, 0, 0, 0, DateTimeKind.Utc);
 
@@ -28,7 +29,7 @@ public sealed class NetWorthHistoryTests
     // does not exercise, so real instances over the same context suffice.
     private static AccountsReportingRepository NewRepository(AppDbContext db)
     {
-        var balances = new AccountBalancesRepository(db);
+        var balances = new AccountBalancesRepository(db, TimeProvider.System);
         var investment = new InvestmentReportingRepository(db, TimeProvider.System);
         var overview = new OverviewRepository(db, balances, investment);
         return new AccountsReportingRepository(db, balances, investment, overview);
@@ -37,7 +38,7 @@ public sealed class NetWorthHistoryTests
     [Fact]
     public async Task NetWorthHistory_folds_cash_and_split_adjusted_holdings_per_period()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("Checking");
         var income = await ledger.AddCategoryAsync("Income", kind: "income");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
@@ -55,7 +56,7 @@ public sealed class NetWorthHistoryTests
         // 2024-02-01: a feed close above the trade price revalues the position.
         await ledger.AddSecurityPriceAsync(sec, 15m, Utc(2024, 2, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = NewRepository(db);
 
         var history = await repository.NetWorthHistoryAsync(
@@ -83,7 +84,7 @@ public sealed class NetWorthHistoryTests
         // ADR-0085: a historical point values every account that was open THEN,
         // including one since closed (e.g. a 401k rolled over mid-window).
         // Filtering current is_active would drop it and understate history.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("Checking");
         var income = await ledger.AddCategoryAsync("Income", kind: "income");
         var rolledOver = await ledger.AddBankAccountAsync("Old 401k (later closed)");
@@ -96,7 +97,7 @@ public sealed class NetWorthHistoryTests
         // Closed NOW (after the reporting window) — must NOT erase the history.
         await ledger.SetIsActiveAsync(rolledOver.Id, isActive: false);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = NewRepository(db);
 
         var history = await repository.NetWorthHistoryAsync(
@@ -111,9 +112,9 @@ public sealed class NetWorthHistoryTests
     [Fact]
     public async Task NetWorthHistory_rejects_a_range_that_would_exceed_the_point_cap()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = NewRepository(db);
 
         // Monthly over six decades (~720 points) blows past the 600-point cap that
@@ -131,9 +132,9 @@ public sealed class NetWorthHistoryTests
         // a daily series. Nothing in the response said so, and it was already
         // reachable: the `net_worth_history` MCP tool documents
         // month/quarter/year while its parser accepts the whole enum.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = NewRepository(db);
 
         var ex = await Assert.ThrowsAsync<ReportRequestException>(() =>
@@ -147,10 +148,10 @@ public sealed class NetWorthHistoryTests
     {
         // The guard must not catch None, which is the documented "unspecified"
         // default and the value every caller that omits the argument sends.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await ledger.AddBankAccountAsync("Checking", openingBalance: 500m);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var history = await NewRepository(db).NetWorthHistoryAsync(
             ledger.LedgerId, Utc(2026, 1, 1), Utc(2026, 4, 1), ReportTimeBucket.None);
 

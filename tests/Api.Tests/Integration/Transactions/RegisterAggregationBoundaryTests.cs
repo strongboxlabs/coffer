@@ -25,11 +25,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class RegisterAggregationBoundaryTests
+public sealed class RegisterAggregationBoundaryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public RegisterAggregationBoundaryTests(PostgresFixture fixture) => _fixture = fixture;
+    public RegisterAggregationBoundaryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -55,11 +56,11 @@ public sealed class RegisterAggregationBoundaryTests
     [MemberData(nameof(Amounts))]
     public async Task Running_balance_is_exact_after_every_row(string name, decimal amount)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> CreateAsync(int day, decimal value)
@@ -103,7 +104,7 @@ public sealed class RegisterAggregationBoundaryTests
                 $"{name}: balance after row {i + 1} was {row.BalanceAfter}, expected {expected}");
             // Money stays at the cent: an accumulator that widened the scale would
             // show up here before the value itself was visibly wrong.
-            Assert.Equal(decimal.Round(row.BalanceAfter, Boundary.MoneyScale), row.BalanceAfter);
+            Assert.Equal(decimal.Round(row.BalanceAfter!.Value, Boundary.MoneyScale), row.BalanceAfter);
         }
     }
 }

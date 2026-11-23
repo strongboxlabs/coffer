@@ -27,7 +27,7 @@ const INVESTMENT_ACCOUNT_ID = '00000000-0000-0000-0000-000000000200';
 const TEST_LEDGER: LedgerSummary = {
     id: LEDGER_ID,
     name: 'Personal',
-    role: 'owner',
+    role: 'owner', currencyCode: 'USD',
 };
 
 function makeAccount(overrides: Partial<AccountSummary> & { id: string }): AccountSummary {

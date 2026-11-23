@@ -5,14 +5,12 @@
  * categories, and a category's register faces money accounts. This module is
  * the one place that turns that into words.
  *
- * It exists because the same defect shipped three times. The register's column
- * header, the editor's counterparty field and the sort menu each said
- * "Category" on a register whose counterparties are accounts, and each was
- * fixed on its own — by a hand-written `facingAccounts ? 'Account' :
- * 'Category'` ternary, copied into whichever file had just been caught. Five
- * more surfaces had never been given one. A surface that names a counterparty
- * now takes a `CounterpartyKind` and gets its words here, so a new one cannot
- * hard-code the noun without visibly ignoring the prop it was handed.
+ * The defect it prevents: a column header, a counterparty field or a sort menu
+ * saying "Category" on a register whose counterparties are accounts. A
+ * hand-written `facingAccounts ? 'Account' : 'Category'` ternary per file fixes
+ * one surface and misses the rest. A surface that names a counterparty takes a
+ * `CounterpartyKind` and gets its words here, so a new one cannot hard-code the
+ * noun without visibly ignoring the prop it was handed.
  */
 
 export type CounterpartyKind = 'category' | 'account';

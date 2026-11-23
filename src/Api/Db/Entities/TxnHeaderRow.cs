@@ -2,11 +2,13 @@ namespace Coffer.Api.Db.Entities;
 
 /// <summary>
 /// EF entity for <c>txn_headers</c> (ADR-0022). One row per event;
-/// carries the umbrella metadata (payee/memo/posted-at/check-number).
+/// carries the shared metadata (payee/posted-at/check-number), and the memo
+/// and tags only of a multi-posting transaction: a one-posting transaction's
+/// are on its legs.
 /// </summary>
 /// <remarks>
 /// <para>API mutations against header rows go through the
-/// <c>RegisterRepository</c>'s LINQ surface. Tags attach via
+/// <c>RegisterRepository</c>'s LINQ surface. Transaction-level tags attach via
 /// <c>txn_header_tags</c>. Since migration 230 this row always holds the
 /// CURRENT values; the feed's are captured once, on the first edit, to
 /// <c>txn_header_originals</c> (<see cref="TxnHeaderOriginalRow"/>).</para>
@@ -15,23 +17,39 @@ namespace Coffer.Api.Db.Entities;
 /// <c>txn_leg_recon</c> (<see cref="TxnLegReconRow"/>; ADR-0082, migration
 /// 171) — reconciliation is a per-account activity, so the header no longer
 /// carries <c>status</c> / <c>cleared_at</c> / <c>cleared_by_user_id</c>.</para>
+///
+/// <para>No public constructor: a header is built only by the factories in
+/// <c>TxnHeaderRow.Factories.cs</c>, each of which takes the originating account
+/// (migration 263), so a header written without one cannot be expressed. EF
+/// materialises through the private parameterless constructor.</para>
 /// </remarks>
-internal sealed class TxnHeaderRow
+internal sealed partial class TxnHeaderRow
 {
+    private TxnHeaderRow() { }
+
     public Guid Id { get; init; }
     public Guid LedgerId { get; init; }
     public string Origin { get; init; } = string.Empty;
     public string? ExternalId { get; init; }
-    // Payee / Memo / CheckNumber / PostedAt / TransactedAt are mutable
-    // (get; set;) and BOTH write paths now assign them directly. The bank path
-    // used to write txn_header_overrides instead, on the ADR-0003 reasoning
-    // that a feed-imported row's raw values must stay immutable. Migration 230
-    // keeps that guarantee and moves it: HeaderOriginals.CaptureAsync
-    // snapshots the feed's values to txn_header_originals before the first
-    // edit overwrites them, so they are still recoverable — while reads stop
-    // paying for a COALESCE and a cleared field becomes expressible.
+    // Payee / CheckNumber / PostedAt / TransactedAt are mutable (get; set;) and
+    // the write paths assign them directly; the memo is the write primitive's. ADR-0003's
+    // guarantee that a feed-imported row's raw values stay recoverable lives in
+    // the sidecar (migration 230): HeaderOriginals.CaptureAsync snapshots the
+    // feed's values to txn_header_originals before the first edit overwrites
+    // them — while reads pay for no COALESCE and a cleared field is expressible.
     public string? Payee { get; set; }
-    public string? Memo { get; set; }
+
+    /// <summary>
+    /// The transaction's memo: set only on a multi-posting transaction (a split, an
+    /// event of several postings); a one-posting transaction keeps its memos on its
+    /// legs. Written only by the write primitive's adapter, through
+    /// <see cref="AssignMemo"/>.
+    /// </summary>
+    public string? Memo { get; private set; }
+
+    /// <summary>Store a planned header memo (see <see cref="Memo"/>).</summary>
+    internal void AssignMemo(string? memo) => Memo = memo;
+
     public DateTime PostedAt { get; set; }
     public DateTime? TransactedAt { get; set; }
     public string? CheckNumber { get; set; }
@@ -71,12 +89,13 @@ internal sealed class TxnHeaderRow
     /// (<c>get; set;</c>) — the Approve endpoint writes the flag
     /// in place, same pattern as the other mutable in-place fields.</summary>
     public bool NeedsReview { get; set; }
-    /// <summary>Investment-action label for the event (Buy / Sell /
-    /// Div / DivReinvest / Interest / Transfer / MiscInc / MiscExp /
-    /// Split). NULL on non-investment events. Migration 047 moved
-    /// this from the per-leg column to the header — action is a
-    /// property of the WHOLE event, not of an individual posting;
-    /// multi-posting investment events (Buy+Fee, DivReinvest,
+    /// <summary>The event's investment action: a stored value from the
+    /// ADR-0027 catalog (<c>buy</c> / <c>sell</c> / <c>dividend_cash</c> /
+    /// <c>dividend_reinvest</c> / … and ADR-0065's <c>transfer_shares</c>),
+    /// never the word the SPA shows for it. NULL on non-investment events.
+    /// Migration 047 moved this from the per-leg column to the header —
+    /// action is a property of the WHOLE event, not of an individual
+    /// posting; multi-posting investment events (Buy+Fee, Reinvest,
     /// buyx/sellx/divx) share one primary action across their
     /// postings.</summary>
     public string? Action { get; set; }
@@ -112,6 +131,42 @@ internal sealed class TxnHeaderRow
     /// the editor never rebuilds it from shares x price. Null when the provider
     /// stated none, or for rows imported before that migration.</summary>
     public decimal? IngestAmount { get; set; }
+
+    /// <summary>
+    /// Migration 301 (ADR-0114 D15): the bank's cleared figure, exactly as sent, that put
+    /// the row back in review because the row does not hold it: a merged loser's when
+    /// <see cref="ReviewClearedByMatch"/>, else the row's own, on a split whose lines add up
+    /// to another total. Null when the last promote-on-clear to hold the row did so for a
+    /// rounding, and on a row none held. Read only while <see cref="NeedsReview"/>.
+    /// </summary>
+    /// <remarks>Written only with the flag it explains, through
+    /// <see cref="HoldForClearedFigure"/> and <see cref="HoldForRounding"/>, so a reason
+    /// left from an earlier hold is never read as the current one.</remarks>
+    public decimal? ReviewClearedAmount { get; private set; }
+
+    /// <summary>Migration 301 (ADR-0114 D15): true when <see cref="ReviewClearedAmount"/>
+    /// is a merged loser's cleared figure, so this row is the winner it was folded into.</summary>
+    public bool ReviewClearedByMatch { get; private set; }
+
+    /// <summary>Put the row in review because the bank cleared it, or a row merged into it
+    /// (<paramref name="byMatch"/>), at <paramref name="bankFigure"/>, which the row does
+    /// not hold (ADR-0114 D15).</summary>
+    internal void HoldForClearedFigure(decimal bankFigure, bool byMatch)
+    {
+        NeedsReview = true;
+        ReviewClearedAmount = bankFigure;
+        ReviewClearedByMatch = byMatch;
+    }
+
+    /// <summary>Put the row in review because its cleared figure was rounded to its
+    /// currency's places (ADR-0114 D15); the rounded note says why, so no cleared figure
+    /// is kept.</summary>
+    internal void HoldForRounding()
+    {
+        NeedsReview = true;
+        ReviewClearedAmount = null;
+        ReviewClearedByMatch = false;
+    }
     /// <summary>Migration 114: provider-extracted security identifier
     /// string (OFX: SECLIST-resolved ticker or raw CUSIP fallback).
     /// Persisted at ingest time so the editor's Accept flow can
@@ -195,4 +250,39 @@ internal sealed class TxnHeaderRow
     /// traceable to its (series, date). NULL off the reminder path.
     /// </summary>
     public DateOnly? OccurrenceDate { get; set; }
+
+    /// <summary>
+    /// The account the transaction was entered from (migration 263):
+    /// the entering side of a one-split, the split side of a multi-split, the
+    /// brokerage of an investment event (the source brokerage of an in-kind transfer).
+    /// </summary>
+    /// <remarks>
+    /// Set by the factory that built the header; changed only by
+    /// <see cref="AssignOriginatingAccount"/>, when a reshape hands ownership to the
+    /// side that does it (a split from the other side, turning a row into an event,
+    /// moving an event to another brokerage) or a repoint leaves no leg on it.
+    /// Nullable because a header with no legs names no account; every API writer
+    /// builds one with legs, so it is never NULL on a header the API writes.
+    /// </remarks>
+    public Guid? OriginatingAccountId { get; private set; }
+
+    /// <summary>Hand the header to another account (see <see cref="OriginatingAccountId"/>).</summary>
+    internal void AssignOriginatingAccount(Guid accountId) => OriginatingAccountId = accountId;
+
+    /// <summary>Whether a delete of this transaction removes it outright (see
+    /// <see cref="IsDeletedOutright"/>), else it is hidden.</summary>
+    internal bool DeletesOutright() =>
+        IsDeletedOutright(ExternalId, RecurringTransactionId, OccurrenceDate, IsRecurringTemplate);
+
+    /// <summary>
+    /// Whether the single delete of a transaction (bank or investment) removes it outright,
+    /// which un-merges every row merged into it (<c>is_merged_into</c> ON DELETE SET NULL):
+    /// a row with no external id that is no reminder occurrence. A feed or import row is
+    /// hidden, so a re-sync does not bring it back, and so is a reminder occurrence, whose
+    /// slot stamp keeps the slot consumed (migration 218).
+    /// </summary>
+    internal static bool IsDeletedOutright(
+        string? externalId, Guid? recurringTransactionId, DateOnly? occurrenceDate, bool isRecurringTemplate) =>
+        externalId is null
+        && !(recurringTransactionId is not null && occurrenceDate is not null && !isRecurringTemplate);
 }

@@ -12,7 +12,7 @@ namespace Coffer.Importer.Moneydance.Tests.Mappers;
 /// <see cref="TxnLegRow"/> per MD split (one on each account; paired
 /// structurally via shared <c>PostingIndex</c>). Tests assert header
 /// fields once, leg count per posting, leg amount sign-pairing, and the
-/// memo/payee precedence preserved from PR #38 / #42.
+/// memo/payee precedence (ADR-0022).
 /// </summary>
 public sealed class TransactionMapperTests
 {
@@ -41,7 +41,7 @@ public sealed class TransactionMapperTests
         var categories = new HashSet<string>(categoryMdIds ?? [], StringComparer.Ordinal);
         return mdIds.ToDictionary(
             id => id,
-            id => new AccountRef(Guid.NewGuid(), categories.Contains(id) ? "category" : "bank"),
+            id => new AccountRef(Guid.NewGuid(), categories.Contains(id) ? "category" : "bank", AmountDecimals: 2),
             StringComparer.Ordinal);
     }
 
@@ -59,6 +59,35 @@ public sealed class TransactionMapperTests
         var counterpart = result.Legs.Single(l =>
             l.AccountId != primaryAccountId && l.PostingIndex == postingIndex);
         return (origin, counterpart);
+    }
+
+    [Fact]
+    public void Map_stamps_the_home_account_as_the_originating_account()
+    {
+        // Migration 263: the Moneydance home (acctid), literally — on a
+        // one-split to another real account and on a split whose lines go elsewhere.
+        var transfer = TxnFromJson("""
+            {
+              "obj_type":"txn","id":"t-own-1","acctid":"a-home","desc":"Payee A",
+              "dt":"20240102","stat":" ",
+              "0.id":"s-0","0.acctid":"a-other","0.samt":"-500","0.pamt":"500"
+            }
+            """);
+        var split = TxnFromJson("""
+            {
+              "obj_type":"txn","id":"t-own-2","acctid":"a-home","desc":"Payee A",
+              "dt":"20240102","stat":" ",
+              "0.id":"s-0","0.acctid":"a-cat","0.samt":"300","0.pamt":"-300",
+              "1.id":"s-1","1.acctid":"a-other","1.samt":"200","1.pamt":"-200"
+            }
+            """);
+        var accounts = AccountMap(categoryMdIds: ["a-cat"], "a-home", "a-other", "a-cat");
+
+        var one = TransactionMapper.Map(transfer, accounts, TestLedgerId, importSource: "test");
+        var many = TransactionMapper.Map(split, accounts, TestLedgerId, importSource: "test");
+
+        Assert.Equal(accounts["a-home"].Id, one.Header!.OriginatingAccountId);
+        Assert.Equal(accounts["a-home"].Id, many.Header!.OriginatingAccountId);
     }
 
     [Fact]
@@ -81,12 +110,12 @@ public sealed class TransactionMapperTests
         Assert.NotNull(result.Header);
         Assert.Equal(2, result.Legs.Count);
 
-        // Header carries the event envelope — payee/memo/status/external_id
-        // — once. Curated Description wins over raw OFX ol.orig-payee per
-        // PR #38; parent memo carries forward verbatim.
+        // Header carries the event envelope — payee/status/external_id — once.
+        // Curated Description wins over raw OFX ol.orig-payee. A one-split has no
+        // header memo: the memo is the entered side's own (below).
         Assert.Equal(TestLedgerId,    result.Header.LedgerId);
         Assert.Equal("Fuel Stop",        result.Header.Payee);
-        Assert.Equal("DOE,JOHN", result.Header.Memo);
+        Assert.Null(result.Header.Memo);
         // Migration 030: MD's raw "X" letter-code maps to the normalized
         // "cleared" state; the mapper also stamps cleared_at to satisfy
         // the DB CHECK (status='cleared') ⇔ (cleared_at IS NOT NULL).
@@ -108,11 +137,9 @@ public sealed class TransactionMapperTests
         Assert.Equal(result.Header.Id, origin.HeaderId);
         Assert.Equal(result.Header.Id, counterpart.HeaderId);
 
-        // Single-split events: leg_memo is NULL on both sides — the view
-        // falls back to header memo so the register doesn't echo the payee
-        // (the PR #42 regression). MD's 0.desc default to parent desc is
-        // not propagated as leg memo for single-leg events.
-        Assert.Null(origin.LegMemo);
+        // One-split: the entered side holds the memo; the other side has no
+        // 0.desc of its own, so it holds nothing and shows the memo inherited.
+        Assert.Equal("DOE,JOHN", origin.LegMemo);
         Assert.Null(counterpart.LegMemo);
     }
 
@@ -333,10 +360,9 @@ public sealed class TransactionMapperTests
     [Fact]
     public void Map_prefers_user_curated_description_over_ol_orig_payee()
     {
-        // Regression: the mapper used to prefer ol.orig-payee (the raw OFX
-        // original) over Description (what the user sees in MD after any
-        // merge/cleanup). That surfaced as register rows showing the
-        // bank's noisy original payee instead of the curated one. Fix:
+        // ol.orig-payee is the raw OFX original; Description is what the
+        // user sees in MD after any merge/cleanup. Preferring the original
+        // shows the bank's noisy payee instead of the curated one, so
         // Description wins; ol.orig-payee is only a fallback for entries
         // with no Description set.
         var txn = TxnFromJson("""
@@ -354,7 +380,8 @@ public sealed class TransactionMapperTests
 
         Assert.Null(result.Skip);
         Assert.Equal("Fuel Stop",          result.Header!.Payee);   // curated, not raw
-        Assert.Equal("DOE,JOHN", result.Header.Memo);     // curated, not raw
+        var (origin, _) = PairFor(result, accounts["a-cash"].Id, postingIndex: 0);
+        Assert.Equal("DOE,JOHN", origin.LegMemo);                   // curated, not raw
     }
 
     [Fact]
@@ -397,9 +424,8 @@ public sealed class TransactionMapperTests
     [Fact]
     public void Map_carries_per_split_memo_on_each_origin_leg_when_multi_split()
     {
-        // After PR #38 / #42 the leg memo is per-leg on multi-splits and
-        // NULL on single-splits. ADR-0022 keeps the same product
-        // behaviour: legs on a multi-split paycheck carry their distinct
+        // The leg memo is per-leg on multi-splits and NULL on
+        // single-splits (ADR-0022): legs on a multi-split paycheck carry their distinct
         // memo (Salary / Federal Tax / Medicare Tax) on both sides of
         // the pair.
         var txn = TxnFromJson("""
@@ -434,11 +460,11 @@ public sealed class TransactionMapperTests
     }
 
     [Fact]
-    public void Map_per_split_memo_appears_on_both_legs_of_a_posting()
+    public void Map_per_split_memo_sits_on_the_origin_leg_only()
     {
-        // Symmetric posting: viewing the category-side register (e.g.
-        // "Taxes:Federal Income Tax") should also surface the leg
-        // memo. Both legs of one posting carry the same leg_memo.
+        // The category-side register (e.g. "Taxes:Federal Income Tax") shows the
+        // line memo inherited from the origin leg: the opposite side of a split
+        // line is read-only, so a copy there would only freeze a stale value.
         var txn = TxnFromJson("""
             {
               "obj_type":"txn","id":"paycheck-2","acctid":"a-checking",
@@ -458,17 +484,15 @@ public sealed class TransactionMapperTests
         var (origin, counterpart) = PairFor(result, accounts["a-checking"].Id, postingIndex: 0);
 
         Assert.Equal("Federal Tax", origin.LegMemo);
-        Assert.Equal("Federal Tax", counterpart.LegMemo);
+        Assert.Null(counterpart.LegMemo);
     }
 
     [Fact]
-    public void Map_single_split_leaves_leg_memo_null_even_when_md_supplies_per_leg_desc()
+    public void Map_single_split_ignores_a_split_desc_that_is_only_the_payee_copy()
     {
-        // Regression from PR #38 (fixed in PR #42): MD often defaults a
-        // single-split's `0.desc` to the parent's `desc` (payee). Naïvely
-        // copying it to LegMemo would echo the payee into the memo column.
-        // ADR-0022 keeps that fix: single-split rows leave leg_memo NULL
-        // and the view falls back to header memo.
+        // MD defaults a single-split's `0.desc` to the parent's `desc` (payee).
+        // Storing that copy as the other side's own memo would echo the payee into
+        // its memo column, so it is no value: the other side inherits the memo.
         var txn = TxnFromJson("""
             {
               "obj_type":"txn","id":"t-single","acctid":"a-cash",
@@ -482,16 +506,18 @@ public sealed class TransactionMapperTests
 
         Assert.Null(result.Skip);
         Assert.Equal("Fuel Stop",          result.Header!.Payee);
-        Assert.Equal("DOE,JOHN", result.Header.Memo);
-        Assert.All(result.Legs, l => Assert.Null(l.LegMemo));
+        Assert.Null(result.Header.Memo);
+        var (origin, counterpart) = PairFor(result, accounts["a-cash"].Id, postingIndex: 0);
+        Assert.Equal("DOE,JOHN", origin.LegMemo);
+        Assert.Null(counterpart.LegMemo);
     }
 
     [Fact]
     public void Map_uses_dt_for_posted_at_ignoring_dtentered()
     {
-        // Regression: the mapper used to prefer `dtentered` (when the user
-        // typed the transaction) over `dt` (the date they assigned). That
-        // broke future-dated and back-dated entries.
+        // `dt` (the date the user assigned) wins over `dtentered` (when they
+        // typed the transaction). Preferring `dtentered` would break
+        // future-dated and back-dated entries.
         var txn = TxnFromJson("""
             {
               "obj_type":"txn","id":"t-time","acctid":"a-cash","desc":"x","dt":"20191214",
@@ -562,44 +588,20 @@ public sealed class TransactionMapperTests
     }
 
     [Fact]
-    public void ExtractTags_returns_the_transactions_own_tags_and_not_its_splits()
+    public void Map_binds_each_splits_tags_to_that_splits_leg_with_the_shared_set_merged_in()
     {
-        // It used to union the splits in, because ADR-0009 put tags at header
-        // level and a split tag had nowhere else to go. ADR-0103 gave it
-        // somewhere, so folding up here as well would record "reimbursable"
-        // twice and make the two levels indistinguishable.
+        // The case per-posting tags exist for: one header, postings that are
+        // about different things — a payment split across two projects, each
+        // line tagged with its project. A union at header level cannot say
+        // which posting "Project B" was about, which is the only question the
+        // tag was recording. Moneydance's transaction-level set belongs to every
+        // line's other side, which is read-only on a split, so each line takes it.
         var txn = TxnFromJson("""
             {
-              "obj_type":"txn","id":"t-tags","acctid":"a-cash","desc":"x","dt":"20240101",
-              "tags":"vacation,2024",
-              "0.id":"s0","0.acctid":"a-cat","0.samt":"100","0.pamt":"-100","0.tags":"vacation,reimbursable",
-              "1.id":"s1","1.acctid":"a-other","1.samt":"50","1.pamt":"-50","1.tags":""
-            }
-            """);
-
-        var tags = TransactionMapper.ExtractTags(txn);
-
-        Assert.Equal(2, tags.Count);
-        Assert.Contains("vacation", tags);
-        Assert.Contains("2024",     tags);
-        // Nothing is dropped — what the header loses, the leg gains. The split's
-        // own tag belongs to the split, which Map binds to that split's leg.
-        Assert.DoesNotContain("reimbursable", tags);
-    }
-
-    [Fact]
-    public void Map_binds_each_splits_tags_to_that_splits_leg()
-    {
-        // The rental-property case that reopened ADR-0009: one header, postings
-        // that are about different things. A union at header level cannot say
-        // which posting "Property B" was about, which is the only question the
-        // tag was recording.
-        var txn = TxnFromJson("""
-            {
-              "obj_type":"txn","id":"t-rent","acctid":"a-cash","desc":"rent","dt":"20240101",
-              "tags":"rental",
-              "0.id":"s0","0.acctid":"a-cat","0.samt":"100","0.pamt":"-100","0.tags":"Property A",
-              "1.id":"s1","1.acctid":"a-cat","1.samt":"50","1.pamt":"-50","1.tags":"Property B"
+              "obj_type":"txn","id":"t-split","acctid":"a-cash","desc":"supplies","dt":"20240101",
+              "tags":"work",
+              "0.id":"s0","0.acctid":"a-cat","0.samt":"100","0.pamt":"-100","0.tags":"Project A",
+              "1.id":"s1","1.acctid":"a-cat","1.samt":"50","1.pamt":"-50","1.tags":"Project B"
             }
             """);
 
@@ -607,29 +609,34 @@ public sealed class TransactionMapperTests
         var result = TransactionMapper.Map(txn, accounts, TestLedgerId, importSource: "test");
 
         Assert.NotNull(result.Header);
-        Assert.Equal(["rental"], result.Tags);
+        Assert.Empty(result.HeaderTags);
 
         Assert.Equal(2, result.LegTags.Count);
-        var byTag = result.LegTags.ToDictionary(x => x.Tags.Single(), x => x.LegId);
-        Assert.Contains("Property A", byTag.Keys);
-        Assert.Contains("Property B", byTag.Keys);
+        var byTag = result.LegTags.ToDictionary(x => x.Tags[0], x => x);
+        Assert.Equal(["Project A", "work"], byTag["Project A"].Tags);
+        Assert.Equal(["Project B", "work"], byTag["Project B"].Tags);
 
-        // Two DIFFERENT legs, and both are legs this map actually produced —
+        // Two DIFFERENT legs, both origin legs this map actually produced —
         // otherwise the pairing is a tuple that happens to typecheck.
-        Assert.NotEqual(byTag["Property A"], byTag["Property B"]);
-        var legIds = result.Legs.Select(l => l.Id).ToHashSet();
-        Assert.Contains(byTag["Property A"], legIds);
-        Assert.Contains(byTag["Property B"], legIds);
+        Assert.NotEqual(byTag["Project A"].LegId, byTag["Project B"].LegId);
+        var originLegIds = result.Legs.Where(l => l.AccountId == accounts["a-cash"].Id).Select(l => l.Id).ToHashSet();
+        Assert.Contains(byTag["Project A"].LegId, originLegIds);
+        Assert.Contains(byTag["Project B"].LegId, originLegIds);
     }
 
     [Fact]
-    public void ExtractTags_returns_empty_when_nothing_tagged()
+    public void Map_writes_no_tags_when_nothing_is_tagged()
     {
         var txn = TxnFromJson("""
-            {"obj_type":"txn","id":"t-bare","acctid":"a","desc":"x","dt":"20240101",
-             "0.id":"s","0.acctid":"a","0.samt":"0","0.pamt":"0"}
+            {"obj_type":"txn","id":"t-bare","acctid":"a-cash","desc":"x","dt":"20240101",
+             "0.id":"s","0.acctid":"a-cat","0.samt":"100","0.pamt":"-100"}
             """);
-        Assert.Empty(TransactionMapper.ExtractTags(txn));
+        var accounts = AccountMap(categoryMdIds: ["a-cat"], "a-cash", "a-cat");
+
+        var result = TransactionMapper.Map(txn, accounts, TestLedgerId, importSource: "test");
+
+        Assert.Empty(result.HeaderTags);
+        Assert.Empty(result.LegTags);
     }
 
     [Fact]
@@ -726,5 +733,381 @@ public sealed class TransactionMapperTests
 
         Assert.Null(result.Skip);
         Assert.Null(result.Header!.CheckNumber);
+    }
+
+    // -- feed originals (FU-024) ----------------------------------------------
+    //
+    // The header carries what the user curated in Moneydance; the bank's own
+    // text (ol.orig-payee / ol.orig-memo) is only a fallback for a blank. When
+    // the two differ, the feed's value is seeded into txn_header_originals —
+    // the state the API's first edit would have left — and when they agree
+    // nothing is seeded, since an originals row is what marks the feed text as
+    // differing from the curated text (resolved_transactions.has_overrides).
+
+    [Fact]
+    public void Map_seeds_originals_when_the_feed_payee_differs()
+    {
+        var txn = TxnFromJson("""
+            {
+              "obj_type":"txn","id":"t-orig-payee","acctid":"a-cash",
+              "desc":"Fuel Stop","memo":"curated memo",
+              "ol.orig-payee":"FUEL STOP 0000000000",
+              "dt":"20240101",
+              "0.id":"s","0.acctid":"a-cat","0.samt":"500","0.pamt":"-500"
+            }
+            """);
+        var accounts = AccountMap(categoryMdIds: ["a-cat"], "a-cash", "a-cat");
+
+        var result = TransactionMapper.Map(txn, accounts, TestLedgerId, importSource: "test");
+
+        var seed = Assert.IsType<HeaderOriginalsSeed>(result.Originals);
+        Assert.Equal(result.Header!.Id, seed.HeaderId);
+        Assert.Equal("FUEL STOP 0000000000", seed.Payee);
+        // No feed memo, so the original memo is the one written.
+        Assert.Equal("curated memo", seed.Memo);
+        // ADR-0114 D15: the amount as written on the originating account.
+        Assert.Equal(-5.00m, seed.Amount);
+    }
+
+    [Fact]
+    public void Map_seeds_the_split_amount_on_the_originating_account_not_one_line()
+    {
+        var txn = TxnFromJson("""
+            {
+              "obj_type":"txn","id":"t-orig-split","acctid":"a-cash",
+              "desc":"Fuel Stop","ol.orig-payee":"FUEL STOP RAW","dt":"20240101",
+              "0.id":"s0","0.acctid":"a-cat","0.samt":"500","0.pamt":"-500",
+              "1.id":"s1","1.acctid":"a-cat2","1.samt":"125","1.pamt":"-125"
+            }
+            """);
+        var accounts = AccountMap(categoryMdIds: ["a-cat", "a-cat2"], "a-cash", "a-cat", "a-cat2");
+
+        var result = TransactionMapper.Map(txn, accounts, TestLedgerId, importSource: "test");
+
+        var seed = Assert.IsType<HeaderOriginalsSeed>(result.Originals);
+        // Both lines on the account, not one, and not every leg (which sums to zero).
+        Assert.Equal(-6.25m, seed.Amount);
+    }
+
+    [Fact]
+    public void Map_seeds_originals_when_the_feed_memo_differs()
+    {
+        var txn = TxnFromJson("""
+            {
+              "obj_type":"txn","id":"t-orig-memo","acctid":"a-cash",
+              "desc":"Fuel Stop","memo":"curated memo",
+              "ol.orig-payee":"Fuel Stop","ol.orig-memo":"raw memo",
+              "dt":"20240101",
+              "0.id":"s","0.acctid":"a-cat","0.samt":"500","0.pamt":"-500"
+            }
+            """);
+        var accounts = AccountMap(categoryMdIds: ["a-cat"], "a-cash", "a-cat");
+
+        var result = TransactionMapper.Map(txn, accounts, TestLedgerId, importSource: "test");
+
+        var seed = Assert.IsType<HeaderOriginalsSeed>(result.Originals);
+        Assert.Equal(result.Header!.Id, seed.HeaderId);
+        Assert.Equal("Fuel Stop", seed.Payee);
+        Assert.Equal("raw memo",  seed.Memo);
+    }
+
+    [Fact]
+    public void Map_seeds_both_feed_values_when_both_differ()
+    {
+        var txn = TxnFromJson("""
+            {
+              "obj_type":"txn","id":"t-orig-both","acctid":"a-cash",
+              "desc":"Fuel Stop","memo":"curated memo",
+              "ol.orig-payee":"FUEL STOP 0000000000","ol.orig-memo":"raw memo",
+              "dt":"20240101",
+              "0.id":"s","0.acctid":"a-cat","0.samt":"500","0.pamt":"-500"
+            }
+            """);
+        var accounts = AccountMap(categoryMdIds: ["a-cat"], "a-cash", "a-cat");
+
+        var result = TransactionMapper.Map(txn, accounts, TestLedgerId, importSource: "test");
+
+        var seed = Assert.IsType<HeaderOriginalsSeed>(result.Originals);
+        Assert.Equal("FUEL STOP 0000000000", seed.Payee);
+        Assert.Equal("raw memo",             seed.Memo);
+        // The transaction itself still carries the curated values: the payee on
+        // the header, the memo on the entered side of this one-split.
+        Assert.Equal("Fuel Stop",    result.Header!.Payee);
+        Assert.Equal("curated memo", PairFor(result, accounts["a-cash"].Id, postingIndex: 0).Origin.LegMemo);
+    }
+
+    [Theory]
+    // Feed values equal to the curated ones: the feed text does not differ.
+    [InlineData("Fuel Stop", "curated memo", "Fuel Stop", "curated memo")]
+    // No feed values at all.
+    [InlineData("Fuel Stop", "curated memo", null, null)]
+    // Blank feed values are no values.
+    [InlineData("Fuel Stop", "curated memo", "  ", "")]
+    // Blank curated payee: the feed payee IS the written payee (the fallback).
+    [InlineData("", "curated memo", "FUEL STOP 0000000000", null)]
+    // Blank curated memo: the feed memo IS the written memo (the fallback).
+    [InlineData("Fuel Stop", "", null, "raw memo")]
+    // Memos are stored trimmed, so surrounding white space is no difference.
+    [InlineData("Fuel Stop", "curated memo", null, " curated memo ")]
+    [InlineData("Fuel Stop", "", null, " raw memo ")]
+    public void Map_seeds_no_originals_when_the_feed_agrees_with_what_was_written(
+        string desc, string memo, string? origPayee, string? origMemo)
+    {
+        var olFields = (origPayee is null ? "" : $"\"ol.orig-payee\":\"{origPayee}\",")
+                     + (origMemo  is null ? "" : $"\"ol.orig-memo\":\"{origMemo}\",");
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"t-orig-none","acctid":"a-cash",
+              "desc":"{{desc}}","memo":"{{memo}}",{{olFields}}
+              "dt":"20240101",
+              "0.id":"s","0.acctid":"a-cat","0.samt":"500","0.pamt":"-500"
+            }
+            """);
+        var accounts = AccountMap(categoryMdIds: ["a-cat"], "a-cash", "a-cat");
+
+        var result = TransactionMapper.Map(txn, accounts, TestLedgerId, importSource: "test");
+
+        Assert.NotNull(result.Header);
+        Assert.Null(result.Originals);
+    }
+
+    // -- brokerage cash moves on the bank route -------------------------------
+    //
+    // A brokerage row reaches this mapper whenever it carries neither an
+    // `invest.txntype` nor an investment xfer_type: QIF-origin cash rows
+    // (qif_invst_action XOut / XIn / Cash / ContribX / MiscIncX with
+    // xfrtp_bank) and plain rows with no xfer_type at all. ADR-0027 already
+    // names these 'transfer'; the investment route's txntype "bank" writes
+    // exactly that. Without it the register derives no action for a
+    // brokerage row whose other side is a category, and the investment editor
+    // opens on "Pick action...".
+
+    private const string Brokerage      = "a-brokerage";
+    private const string OtherBrokerage = "a-brokerage-2";
+    private const string IncomeCat      = "a-income";
+    private const string ExpenseCat     = "a-expense";
+    private const string BlankCat       = "a-blank";
+    private const string BankAcct       = "a-bank";
+
+    /// <summary>
+    /// Two brokerages (with Holdings siblings, as AccountImportStep wires
+    /// them), a bank account, and three categories. The blank-named category
+    /// is a category like any other by the time it reaches this mapper — its
+    /// name is the account step's business, not this one's.
+    /// </summary>
+    private static IReadOnlyDictionary<string, AccountRef> BrokerageAccountMap() =>
+        new Dictionary<string, AccountRef>(StringComparer.Ordinal)
+        {
+            [Brokerage]      = new(Guid.NewGuid(), "investment", HoldingsAccountId: Guid.NewGuid(), AmountDecimals: 2),
+            [OtherBrokerage] = new(Guid.NewGuid(), "investment", HoldingsAccountId: Guid.NewGuid(), AmountDecimals: 2),
+            [IncomeCat]      = new(Guid.NewGuid(), "category", AmountDecimals: 2),
+            [ExpenseCat]     = new(Guid.NewGuid(), "category", AmountDecimals: 2),
+            [BlankCat]       = new(Guid.NewGuid(), "category", AmountDecimals: 2),
+            [BankAcct]       = new(Guid.NewGuid(), "bank", AmountDecimals: 2),
+        };
+
+    [Theory]
+    [InlineData("XOut",     IncomeCat)]
+    [InlineData("XOut",     ExpenseCat)]
+    [InlineData("XOut",     BlankCat)]
+    [InlineData("XOut",     BankAcct)]
+    [InlineData("XOut",     OtherBrokerage)]
+    [InlineData("XIn",      IncomeCat)]
+    [InlineData("XIn",      ExpenseCat)]
+    [InlineData("XIn",      BlankCat)]
+    [InlineData("XIn",      BankAcct)]
+    [InlineData("XIn",      OtherBrokerage)]
+    [InlineData("Cash",     IncomeCat)]
+    [InlineData("Cash",     ExpenseCat)]
+    [InlineData("Cash",     BlankCat)]
+    [InlineData("Cash",     BankAcct)]
+    [InlineData("Cash",     OtherBrokerage)]
+    [InlineData("ContribX", IncomeCat)]
+    [InlineData("ContribX", ExpenseCat)]
+    [InlineData("ContribX", BlankCat)]
+    [InlineData("ContribX", BankAcct)]
+    [InlineData("ContribX", OtherBrokerage)]
+    [InlineData("MiscIncX", IncomeCat)]
+    [InlineData("MiscIncX", ExpenseCat)]
+    [InlineData("MiscIncX", BlankCat)]
+    [InlineData("MiscIncX", BankAcct)]
+    [InlineData("MiscIncX", OtherBrokerage)]
+    public void Qif_brokerage_cash_row_with_one_split_is_a_transfer(string qifWord, string target)
+    {
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"t-qif-cash","acctid":"{{Brokerage}}",
+              "desc":"Cash move","memo":"note","dt":"20240101","chk":"{{qifWord}}",
+              "qif_invst_action":"{{qifWord}}","xfer_type":"xfrtp_bank",
+              "0.id":"s0","0.acctid":"{{target}}","0.invest.splittype":"xfr",
+              "0.samt":"100","0.pamt":"-100"
+            }
+            """);
+        Assert.False(txn.IsInvestmentShape);   // the premise: this IS the bank route
+        var accounts = BrokerageAccountMap();
+
+        var result = TransactionMapper.Map(txn, accounts, TestLedgerId, importSource: "test");
+
+        Assert.Null(result.Skip);
+        Assert.Equal("transfer", result.Header!.Action);
+        var (origin, counterpart) = PairFor(result, accounts[Brokerage].Id, postingIndex: 0);
+        Assert.Equal(accounts[target].Id, counterpart.AccountId);
+        Assert.Equal("transfer", origin.PostingRole);
+        Assert.Equal("transfer", counterpart.PostingRole);
+
+        // Everything else the bank route writes is untouched: the QIF word
+        // stays the check number verbatim, payee and memo are the curated ones,
+        // the memo on the brokerage leg that holds a one-posting event's value.
+        Assert.Equal(qifWord,     result.Header.CheckNumber);
+        Assert.Equal("Cash move", result.Header.Payee);
+        Assert.Equal("note",      origin.LegMemo);
+        Assert.Null(counterpart.LegMemo);
+    }
+
+    [Theory]
+    [InlineData(IncomeCat)]
+    [InlineData(BankAcct)]
+    public void Plain_brokerage_row_with_one_split_is_a_transfer(string target)
+    {
+        // No qif word, no xfer_type, no splittype: nothing on the row says
+        // "investment", and it is still cash moving in or out of a brokerage.
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"t-plain","acctid":"{{Brokerage}}",
+              "desc":"Plain move","dt":"20240101",
+              "0.id":"s0","0.acctid":"{{target}}","0.samt":"100","0.pamt":"-100"
+            }
+            """);
+        var accounts = BrokerageAccountMap();
+
+        var result = TransactionMapper.Map(txn, accounts, TestLedgerId, importSource: "test");
+
+        Assert.Null(result.Skip);
+        Assert.Equal("transfer", result.Header!.Action);
+        Assert.All(result.Legs, l => Assert.Equal("transfer", l.PostingRole));
+    }
+
+    [Fact]
+    public void Brokerage_transfer_keeps_tags_fitid_and_recon_seeds()
+    {
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"t-kept","acctid":"{{Brokerage}}",
+              "desc":"Cash move","dt":"20240101","stat":"X",
+              "qif_invst_action":"XOut","xfer_type":"xfrtp_bank","tags":"one",
+              "ol_fitid_1":"FIT-1","ol_fi_id":"FI-1",
+              "0.id":"s0","0.acctid":"{{BankAcct}}","0.samt":"100","0.pamt":"-100",
+              "0.stat":"X","0.tags":"two"
+            }
+            """);
+        var accounts = BrokerageAccountMap();
+
+        var result = TransactionMapper.Map(txn, accounts, TestLedgerId, importSource: "test");
+
+        Assert.Equal("transfer", result.Header!.Action);
+        // Every tag on the brokerage leg: the bank side of the event is read-only.
+        Assert.Empty(result.HeaderTags);
+        var (origin, counterpart) = PairFor(result, accounts[Brokerage].Id, postingIndex: 0);
+        var legTag = Assert.Single(result.LegTags);
+        Assert.Equal(origin.Id, legTag.LegId);
+        Assert.Equal(["two", "one"], legTag.Tags);
+        Assert.Equal("FIT-1", result.Header.OnlineMatchFitid);
+        Assert.Equal("FI-1",  result.Header.OnlineMatchFiId);
+        Assert.Equal(2, result.LegRecons.Count);
+        Assert.Contains(result.LegRecons, r => r.LegId == origin.Id);
+        Assert.Contains(result.LegRecons, r => r.LegId == counterpart.Id);
+    }
+
+    [Fact]
+    public void Brokerage_row_with_more_than_one_split_stays_actionless()
+    {
+        // Fail closed. A single posting is unambiguously a cash move; two or
+        // more could be anything (a split paycheck deposit, a fee netted
+        // against a contribution), and 'transfer' would assert a shape nobody
+        // read off the data.
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"t-multi","acctid":"{{Brokerage}}",
+              "desc":"Two ways","dt":"20240101",
+              "qif_invst_action":"XOut","xfer_type":"xfrtp_bank",
+              "0.id":"s0","0.acctid":"{{IncomeCat}}","0.samt":"100","0.pamt":"-100",
+              "1.id":"s1","1.acctid":"{{BankAcct}}","1.samt":"50","1.pamt":"-50"
+            }
+            """);
+        var accounts = BrokerageAccountMap();
+
+        var result = TransactionMapper.Map(txn, accounts, TestLedgerId, importSource: "test");
+
+        Assert.Null(result.Skip);
+        Assert.Equal(4, result.Legs.Count);
+        Assert.Null(result.Header!.Action);
+        Assert.All(result.Legs, l => Assert.Null(l.PostingRole));
+    }
+
+    [Fact]
+    public void Brokerage_row_counts_splits_after_dropping_self_references()
+    {
+        // The count is of EMITTABLE splits. A split back to the brokerage
+        // itself never becomes a posting, so it cannot make a one-posting
+        // cash move ambiguous.
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"t-selfref","acctid":"{{Brokerage}}",
+              "desc":"Cash move","dt":"20240101",
+              "qif_invst_action":"XIn","xfer_type":"xfrtp_bank",
+              "0.id":"s0","0.acctid":"{{Brokerage}}","0.samt":"0","0.pamt":"0",
+              "1.id":"s1","1.acctid":"{{BankAcct}}","1.samt":"-100","1.pamt":"100"
+            }
+            """);
+        var accounts = BrokerageAccountMap();
+
+        var result = TransactionMapper.Map(txn, accounts, TestLedgerId, importSource: "test");
+
+        Assert.Equal(2, result.Legs.Count);
+        Assert.Equal("transfer", result.Header!.Action);
+        Assert.All(result.Legs, l => Assert.Equal("transfer", l.PostingRole));
+    }
+
+    [Fact]
+    public void Bank_home_xfrtp_bank_row_stays_actionless()
+    {
+        // Regression guard: the rule is about the brokerage, not about
+        // xfrtp_bank. A checking-account row carries the same xfer_type on
+        // every ordinary transfer and payment.
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"t-bank-home","acctid":"{{BankAcct}}",
+              "desc":"Ordinary","dt":"20240101","xfer_type":"xfrtp_bank",
+              "0.id":"s0","0.acctid":"{{ExpenseCat}}","0.samt":"100","0.pamt":"-100"
+            }
+            """);
+        var accounts = BrokerageAccountMap();
+
+        var result = TransactionMapper.Map(txn, accounts, TestLedgerId, importSource: "test");
+
+        Assert.Null(result.Skip);
+        Assert.Null(result.Header!.Action);
+        Assert.All(result.Legs, l => Assert.Null(l.PostingRole));
+    }
+
+    [Fact]
+    public void Bank_home_row_into_a_brokerage_stays_actionless()
+    {
+        // The other end of the same money. Its home is the bank, so the bank
+        // route's existing behaviour stands (the register derives 'Xfr' for a
+        // two-real-account posting on its own).
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"t-bank-to-brokerage","acctid":"{{BankAcct}}",
+              "desc":"Fund it","dt":"20240101","xfer_type":"xfrtp_bank",
+              "0.id":"s0","0.acctid":"{{Brokerage}}","0.samt":"100","0.pamt":"-100"
+            }
+            """);
+        var accounts = BrokerageAccountMap();
+
+        var result = TransactionMapper.Map(txn, accounts, TestLedgerId, importSource: "test");
+
+        Assert.Null(result.Header!.Action);
+        Assert.All(result.Legs, l => Assert.Null(l.PostingRole));
     }
 }

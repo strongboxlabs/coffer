@@ -17,6 +17,7 @@ import type {
     PatchInvestmentTransactionRequest,
 } from '../types/investment';
 import { request } from './_request';
+import { requestSavedEntries } from './savedEntries';
 
 /**
  * POST /api/ledgers/{ledgerId}/investment-transactions — create
@@ -43,11 +44,12 @@ export function createInvestmentTransaction(
  * full postings reshape per ADR-0025. The supplied body IS the new
  * state of the world; null on a field means null in the saved state.
  *
- * When <c>accountId</c> is supplied, the response is the freshly-
- * resolved <c>RegisterEntry</c> for the saved header on that account
- * — used by the SPA to patch the register window in place (via
- * <c>mutateEntries</c>) without losing scroll position or row order.
- * When omitted, the endpoint replies 204.
+ * When <c>accountId</c> is supplied, the response is every freshly-
+ * resolved entry the saved header has on that account
+ * (<c>SavedHeaderEntries</c>) — used by the SPA to swap that header's
+ * rows in place (via <c>replaceHeaderEntries</c>) without losing scroll
+ * position or row order. It resolves to an empty list when the header has
+ * none there, and when <c>accountId</c> is omitted (the endpoint replies 204).
  *
  * Same 422 vocabulary as POST plus `transaction-not-in-ledger`
  * (header doesn't exist or wrong ledger) and
@@ -59,11 +61,11 @@ export function patchInvestmentTransaction(
     headerId: string,
     body: PatchInvestmentTransactionRequest,
     accountId?: string,
-): Promise<RegisterEntry | null> {
+): Promise<RegisterEntry[]> {
     const url = accountId
         ? `/api/ledgers/${encodeURIComponent(ledgerId)}/investment-transactions/${encodeURIComponent(headerId)}?account_id=${encodeURIComponent(accountId)}`
         : `/api/ledgers/${encodeURIComponent(ledgerId)}/investment-transactions/${encodeURIComponent(headerId)}`;
-    return request<RegisterEntry | null>(url, { method: 'PATCH', body });
+    return requestSavedEntries(url, { method: 'PATCH', body });
 }
 
 /**
@@ -77,25 +79,26 @@ export function approveInvestmentTransaction(
     ledgerId: string,
     headerId: string,
     accountId?: string,
-): Promise<RegisterEntry | null> {
+): Promise<RegisterEntry[]> {
     const base = `/api/ledgers/${encodeURIComponent(ledgerId)}/investment-transactions/${encodeURIComponent(headerId)}/approve`;
     const url = accountId ? `${base}?account_id=${encodeURIComponent(accountId)}` : base;
-    return request<RegisterEntry | null>(url, { method: 'POST' });
+    return requestSavedEntries(url, { method: 'POST' });
 }
 
 /**
  * Fold `headerId` into `fromHeaderId` — the investment twin of
- * `mergeTransaction`, same inverted direction and same response (the SURVIVOR).
+ * `mergeTransaction`, same inverted direction and same response (the
+ * SURVIVOR's entries).
  */
 export function mergeInvestmentTransaction(
     ledgerId: string,
     headerId: string,
     fromHeaderId: string,
     accountId?: string,
-): Promise<RegisterEntry | null> {
+): Promise<RegisterEntry[]> {
     const base = `/api/ledgers/${encodeURIComponent(ledgerId)}/investment-transactions/${encodeURIComponent(headerId)}/merge`;
     const url = accountId ? `${base}?account_id=${encodeURIComponent(accountId)}` : base;
-    return request<RegisterEntry | null>(url, { method: 'POST', body: { fromHeaderId } });
+    return requestSavedEntries(url, { method: 'POST', body: { fromHeaderId } });
 }
 
 /**
@@ -121,8 +124,10 @@ export function deleteInvestmentTransaction(
  * GET /api/ledgers/{ledgerId}/investment-transactions/{headerId}/merge-candidates —
  * settled investment rows the edited (fresh, needs-review) row could fold
  * into: same brokerage + security, matching principal (or quantity), within
- * ±7 effective days. Drives the editor's "possible matches" panel. Empty
- * array when the row isn't merge-eligible (mirrors the bank client).
+ * ±7 effective days. Drives the editor's "Merge candidates" strip; picking
+ * one folds the edited row into it on save, through
+ * {@link mergeInvestmentTransaction}. Empty array when the row isn't
+ * merge-eligible (mirrors the bank client).
  */
 export function fetchInvestmentMergeCandidates(
     ledgerId: string,
@@ -142,7 +147,7 @@ export function fetchInvestmentMergeCandidates(
  * With `asOf`, the position at that instant, from the FIFO walk; with
  * `excludeHeaderId` too, without that transaction (FU-097). That is what a
  * sale being edited actually met: today's lots know only today, so editing
- * an old sale on a since-closed account showed "no open lots".
+ * an old sale on a since-closed account against them would show "no open lots".
  */
 export function fetchOpenLots(
     ledgerId: string,

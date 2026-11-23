@@ -18,8 +18,11 @@ namespace Coffer.Api.Mcp;
 public static class TagsTools
 {
     [McpServerTool(Name = "list_tags"), Description(
-        "List a ledger's tags with usage counts: id, name, color, and usageCount (the " +
-        "number of transactions carrying the tag; 0 = unused). Tags are freeform labels " +
+        "List a ledger's tags with usage counts: id, name, color, transactionCount (the " +
+        "distinct transactions the tag is in play on a line of, which is what a register, " +
+        "filter or report shows, and the number to quote as how many) and " +
+        "usageCount (the number of assignments, transaction level and per side, so a " +
+        "transfer tagged on both sides counts twice; 0 = unused). Tags are freeform labels " +
         "orthogonal to the single category — a transaction can carry several (e.g. " +
         "'reimbursable', 'tax-deductible', 'vacation-2026'). Resolve a tagId here to " +
         "filter or group other queries by tag. Use list_ledgers first to resolve ledgerId.")]

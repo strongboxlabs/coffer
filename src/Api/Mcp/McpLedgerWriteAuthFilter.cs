@@ -22,10 +22,9 @@ namespace Coffer.Api.Mcp;
 /// blocked attempt is still recorded.
 /// </summary>
 /// <remarks>
-/// Fails closed (FU-093). It used to pass any write call whose <c>ledgerId</c> was missing,
-/// misnamed or not a GUID, on the reasoning that no write tool lacked one — true, and
-/// enforced by nothing, so a future tool taking <c>ledger</c> or <c>id</c> would have been
-/// checked by RLS alone. A write with no readable <c>ledgerId</c> is now refused, and
+/// Fails closed (FU-093). Passing a write call whose <c>ledgerId</c> is missing, misnamed
+/// or not a GUID would leave a tool taking <c>ledger</c> or <c>id</c> checked by RLS
+/// alone. So a write with no readable <c>ledgerId</c> is refused, and
 /// <c>McpWriteGuardTests</c> holds every write tool to taking one.
 /// </remarks>
 public static class McpLedgerWriteAuthFilter

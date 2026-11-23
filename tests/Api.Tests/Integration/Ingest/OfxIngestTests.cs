@@ -21,13 +21,11 @@ namespace Coffer.Api.Tests.Integration.Ingest;
 /// real-shape OFX 1.x SGML, OFX 2.x XML, and QFX wire formats.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class OfxIngestTests
+public sealed class OfxIngestTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public OfxIngestTests(PostgresFixture fixture)
+    public OfxIngestTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(
@@ -64,8 +62,8 @@ public sealed class OfxIngestTests
 
     /// <summary>
     /// OFX 1.x (SGML) bank statement. Single account, two
-    /// transactions. The header block + unclosed tags are
-    /// real-world (typical retail-bank export shape).
+    /// transactions. The header block + unclosed tags follow
+    /// the OFX 1.x SGML format.
     /// </summary>
     private const string Ofx1BankSingleAccount = """
         OFXHEADER:100
@@ -206,8 +204,8 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task Preview_returns_discovered_accounts_for_multi_account_qfx()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -232,8 +230,8 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task Preview_rejects_empty_upload_with_422()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -248,8 +246,8 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task Preview_rejects_garbage_with_422()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -265,9 +263,9 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task Import_persists_bank_transactions_with_ofx_origin_and_fitid()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -280,7 +278,7 @@ public sealed class OfxIngestTests
         Assert.Equal(2, result!.TransactionsForReview);
         Assert.Equal(0, result.AlreadyKnown);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var headers = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId && h.Origin == "file_import" && h.ProviderKey == "ofx")
             .OrderBy(h => h.PostedAt)
@@ -295,14 +293,125 @@ public sealed class OfxIngestTests
         Assert.Equal("999999999", coffee.OnlineMatchFiId);
         Assert.Equal("COFFEE SHOP", coffee.Payee);
         Assert.True(coffee.NeedsReview);
+
+        // An upload's run is recorded as one: only the Demo's seeded import, which nothing
+        // uploaded, passes another value (ADR-0115 D3).
+        var run = await db.LedgerOperations.AsNoTracking().SingleAsync(o => o.LedgerId == ledger.LedgerId);
+        Assert.Equal(("ofx", "file-upload"), (run.ProviderKey, run.TriggeredVia));
+    }
+
+    /// <summary>
+    /// A statement in another currency than the account imported into is refused before
+    /// the import run opens, so neither a run nor a row is written (ADR-0114 D13); the
+    /// same file imports into an account in its own currency.
+    /// </summary>
+    [Fact]
+    public async Task A_statement_in_another_currency_than_the_account_is_refused_before_the_run_opens()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var dollars = await ledger.AddBankAccountAsync("checking", currencyCode: "USD");
+        var euros = await ledger.AddBankAccountAsync("girokonto", currencyCode: "EUR");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+        var euroStatement = Ofx1BankSingleAccount.Replace("<CURDEF>USD", "<CURDEF>EUR", StringComparison.Ordinal);
+
+        var refused = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/import",
+            FileUpload(euroStatement, accountId: dollars.Id, providerAccountId: "999999999:1234567890"));
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, refused.StatusCode);
+        using (var problem = JsonDocument.Parse(await refused.Content.ReadAsStringAsync()))
+            Assert.Equal("ofx_statement_currency_mismatch", problem.RootElement.GetProperty("code").GetString());
+        await using (var db = Db.NewDbContext())
+        {
+            Assert.Equal(0, await db.LedgerOperations.CountAsync(r => r.LedgerId == ledger.LedgerId));
+            Assert.Equal(0, await db.TxnHeaders.CountAsync(h => h.LedgerId == ledger.LedgerId));
+        }
+
+        var imported = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/import",
+            FileUpload(euroStatement, accountId: euros.Id, providerAccountId: "999999999:1234567890"));
+        Assert.Equal(HttpStatusCode.OK, imported.StatusCode);
+        await using var check = Db.NewDbContext();
+        Assert.Equal(2, await check.TxnHeaders.CountAsync(h => h.LedgerId == ledger.LedgerId
+                                                                && h.OriginatingAccountId == euros.Id));
+    }
+
+    /// <summary>QIF and CSV state no currency, so either imports into an account in any
+    /// currency.</summary>
+    [Fact]
+    public async Task A_file_that_states_no_currency_imports_into_an_account_in_any_currency()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var euros = await ledger.AddBankAccountAsync("girokonto", currencyCode: "EUR");
+        var yen = await ledger.AddBankAccountAsync("futsuu", currencyCode: "JPY");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var qif = new MultipartFormDataContent();
+        qif.Add(new ByteArrayContent(Encoding.UTF8.GetBytes("!Type:Bank\nD01/05/2026\nT-12.34\nPSAMPLE STORE\n^\n")),
+            "file", "export.qif");
+        qif.Add(new StringContent(euros.Id.ToString()), "accountId");
+        qif.Add(new StringContent("qif"), "providerAccountId");
+        Assert.Equal(HttpStatusCode.OK,
+            (await client.PostAsync($"/api/ledgers/{ledger.LedgerId}/ingest/qif/import", qif)).StatusCode);
+
+        var csv = new MultipartFormDataContent();
+        csv.Add(new ByteArrayContent(Encoding.UTF8.GetBytes("2026-09-02,SAMPLE STORE,-1200\n")), "file", "statement.csv");
+        csv.Add(new StringContent(yen.Id.ToString()), "accountId");
+        csv.Add(new StringContent("csv"), "providerAccountId");
+        csv.Add(new StringContent("""
+            version: 1
+            delimiter: comma
+            header_rows: 0
+            date:
+              column: 1
+              format: yyyy-MM-dd
+            payee:
+              column: 2
+            amount:
+              shape: signed
+              column: 3
+            """), "mappingYaml");
+        Assert.Equal(HttpStatusCode.OK,
+            (await client.PostAsync($"/api/ledgers/{ledger.LedgerId}/ingest/csv/import", csv)).StatusCode);
+
+        await using var db = Db.NewDbContext();
+        Assert.Equal(1, await db.TxnHeaders.CountAsync(h => h.OriginatingAccountId == euros.Id));
+        Assert.Equal(1, await db.TxnHeaders.CountAsync(h => h.OriginatingAccountId == yen.Id));
+    }
+
+    [Fact]
+    public async Task An_imported_rows_memo_is_the_imported_accounts_own()
+    {
+        // A one-split's memo sits on the side that entered it, never the header; an
+        // ingested row is entered from the account imported into, which owns it.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var resp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/import",
+            FileUpload(Ofx1BankSingleAccount, accountId: bank.Id, providerAccountId: "999999999:1234567890"));
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        await using var db = Db.NewDbContext();
+        var coffee = await db.TxnHeaders.AsNoTracking()
+            .SingleAsync(h => h.LedgerId == ledger.LedgerId && h.ExternalId == "FITID-COFFEE-1");
+        Assert.Null(coffee.Memo);
+        Assert.Equal(bank.Id, coffee.OriginatingAccountId);
+        var notes = await ledger.LoadNotesAsync(coffee.Id);
+        Assert.Equal("COFFEE SHOP 0042", notes.Legs.Single(l => l.Key.AccountId == bank.Id).Value.Memo);
+        Assert.All(notes.Legs.Where(l => l.Key.AccountId != bank.Id), l => Assert.True(l.Value.IsEmpty));
+        await OriginatingAccountCheck.AssertHoldsAsync(Db, ledger.LedgerId);
     }
 
     [Fact]
     public async Task Import_dispatches_only_the_requested_provider_account()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Multi-account file; import only the bank block. The card
@@ -312,7 +421,7 @@ public sealed class OfxIngestTests
             FileUpload(QfxMultiAccount, accountId: bank.Id, providerAccountId: "999999999:1111111111"));
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var headers = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId && h.Origin == "file_import" && h.ProviderKey == "ofx")
             .Select(h => h.ExternalId)
@@ -324,9 +433,9 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task Reimport_dedups_against_existing_ofx_fitid()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // First import.
@@ -347,7 +456,7 @@ public sealed class OfxIngestTests
         Assert.Equal(2, result.AlreadyKnown);
 
         // DB end-state: exactly 2 rows, not 4.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var count = await db.TxnHeaders.AsNoTracking()
             .CountAsync(h => h.LedgerId == ledger.LedgerId && h.Origin == "file_import" && h.ProviderKey == "ofx");
         Assert.Equal(2, count);
@@ -363,7 +472,7 @@ public sealed class OfxIngestTests
         // misses it, so re-importing the same bank's OFX would
         // double-enter the row. The OFX-only online-match OR-branch
         // must recognise it as already-known.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var uncategorized = await ledger.AddBankAccountAsync("seed-counterparty");
 
@@ -371,23 +480,23 @@ public sealed class OfxIngestTests
         // FITID the Ofx1BankSingleAccount fixture's first row uses
         // (BANKID 999999999, FITID FITID-COFFEE-1), under a non-ofx
         // provider_key and is_merged_into = null (a live header).
-        await using (var seed = _fixture.NewDbContext())
+        await using (var seed = Db.NewDbContext())
         {
             var headerId = Guid.NewGuid();
-            seed.TxnHeaders.Add(new TxnHeaderRow
-            {
-                Id = headerId,
-                LedgerId = ledger.LedgerId,
-                Origin = "online_import",
-                ProviderKey = "moneydance",        // != "ofx" — the cross-source case
-                Payee = "COFFEE SHOP",
-                PostedAt = new DateTime(2026, 1, 5, 0, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 1, 5, 0, 0, 0, DateTimeKind.Utc),                IsPending = false,
-                NeedsReview = false,
-                ExternalId = "md-coffee-1",        // MD's own id — NOT the OFX FITID
-                OnlineMatchFiId = "999999999",     // preserved OFX BANKID
-                OnlineMatchFitid = "FITID-COFFEE-1", // preserved OFX FITID
-                IsMergedInto = null,
-            });
+            var header = TxnHeaderRow.NewIngested(
+                headerId, ledger.LedgerId, bank.Id,
+                origin: "online_import",
+                externalId: "md-coffee-1",          // MD's own id — NOT the OFX FITID
+                onlineMatchFitid: "FITID-COFFEE-1", // preserved OFX FITID
+                onlineMatchFiId: "999999999");      // preserved OFX BANKID
+            header.ProviderKey = "moneydance";      // != "ofx" — the cross-source case
+            header.Payee = "COFFEE SHOP";
+            header.PostedAt = new DateTime(2026, 1, 5, 0, 0, 0, DateTimeKind.Utc);
+            header.TransactedAt = new DateTime(2026, 1, 5, 0, 0, 0, DateTimeKind.Utc);
+            header.IsPending = false;
+            header.NeedsReview = false;
+            header.IsMergedInto = null;
+            seed.TxnHeaders.Add(header);
             seed.TxnLegs.Add(new TxnLegRow
             {
                 Id = Guid.NewGuid(), HeaderId = headerId, LedgerId = ledger.LedgerId,
@@ -400,8 +509,10 @@ public sealed class OfxIngestTests
             });
             await seed.SaveChangesAsync();
         }
+        // Written past every writer: store the presentation as the upgrade's backfill does.
+        await ledger.RecomputeAllNotesAsync();
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Import the OFX file: its FITID-COFFEE-1 row matches the
@@ -421,12 +532,17 @@ public sealed class OfxIngestTests
         // No second coffee header was inserted under the ofx
         // provider_key — the OFX-origin set has exactly the one new
         // payroll row.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var ofxHeaders = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "ofx")
             .Select(h => h.ExternalId)
             .ToListAsync();
         Assert.Equal(new[] { "FITID-PAYROLL-1" }, ofxHeaders);
+        // The new row is owned by the account it was imported into (mig 263).
+        Assert.Equal(bank.Id, await db.TxnHeaders.AsNoTracking()
+            .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "ofx")
+            .Select(h => h.OriginatingAccountId)
+            .SingleAsync());
 
         // The coffee FITID exists exactly once across the whole
         // ledger (the seeded MD row) — never double-entered.
@@ -791,8 +907,8 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task Malformed_aggregate_is_rejected_as_bad_input_not_a_500()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Derived from the good fixture rather than written out again, so
@@ -816,8 +932,8 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task Option_rows_are_skipped_with_a_warning_not_imported_as_shares()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -853,8 +969,8 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task Preview_surfaces_investment_block_with_supported_count()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -887,9 +1003,9 @@ public sealed class OfxIngestTests
                 + "Share-only moves aren't imported in this slice.",
             warnings);
         // Fractional units keep full 12dp precision without trailing
-        // zeros — a sub-cent residual sweep is the real-world shape
-        // that motivated the message (a workplace-plan recordkeeper
-        // moving a sub-thousandth fraction of a share out).
+        // zeros — a residual sweep of a tiny fraction of a share would
+        // otherwise round to zero units and leave the user nothing to
+        // find the row by.
         Assert.Contains(
             "OFX TRANSFER (OUT) row skipped (FAKE, -0.000876543 units, 2026-01-31). "
                 + "Share-only moves aren't imported in this slice.",
@@ -916,9 +1032,9 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task Import_carries_the_reinvest_total_when_it_differs_from_shares_times_price()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -927,7 +1043,7 @@ public sealed class OfxIngestTests
                 providerAccountId: "inv:brokerX:INV-0001"));
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.LedgerId == ledger.LedgerId
                 && h.ExternalId == "INV-FITID-REINV-ROUND");
@@ -964,12 +1080,12 @@ public sealed class OfxIngestTests
     /// Re-importing the same file REPAIRS a row that predates a carrier.
     /// </summary>
     /// <remarks>
-    /// The file path counted a known FITID and <c>continue</c>d without writing
-    /// anything, so a carrier added after a row was first imported could never
-    /// reach it. That is not academic: mig 228 added <c>ingest_amount</c>
-    /// because the editor was rebuilding a REINVEST's total from shares x price
-    /// and landing a cent out — and the obvious repair, re-importing the file,
-    /// reported a dedup and changed nothing.
+    /// A file path that counts a known FITID and <c>continue</c>s without writing
+    /// anything means a carrier added after a row was first imported can never
+    /// reach it. Mig 228's <c>ingest_amount</c> is such a carrier: without it the
+    /// editor rebuilds a REINVEST's total from shares x price and can land a cent
+    /// out, and the obvious repair, re-importing the file, must not report a dedup
+    /// and change nothing.
     ///
     /// The NULL here simulates exactly that row: imported before the column
     /// existed, so the migration left it empty with nothing to backfill from.
@@ -977,9 +1093,9 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task Reimport_backfills_carriers_the_stored_row_is_missing()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<FileIngestImportResponse> ImportAsync()
@@ -996,11 +1112,10 @@ public sealed class OfxIngestTests
         Assert.Equal(1, first.TransactionsForReview);
 
         // Age the row back to how a pre-228 import left it.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
-            // LEDGER-SCOPED. The suite shares one database and sibling tests
-            // import this same FITID into their own ledgers; an unscoped UPDATE
-            // reaches across all of them and corrupts whatever runs next.
+            // LEDGER-SCOPED, as the product's own writes are: the FITID is only
+            // unique within a ledger.
             await db.Database.ExecuteSqlInterpolatedAsync(
                 $"UPDATE txn_headers SET ingest_amount = NULL, provider_raw_payload = NULL WHERE external_id = 'INV-FITID-REINV-ROUND' AND ledger_id = {ledger.LedgerId}");
         }
@@ -1010,7 +1125,7 @@ public sealed class OfxIngestTests
         Assert.Equal(0, second.TransactionsForReview);
         Assert.Equal(1, second.AlreadyKnown);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var rows = await db.TxnHeaders.AsNoTracking()
                 .Where(h => h.LedgerId == ledger.LedgerId
@@ -1029,9 +1144,9 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task Reimport_does_not_overwrite_a_carrier_that_is_already_set()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var content = FileUpload(OfxReinvestRoundingStatement, accountId: brokerage.Id,
@@ -1040,7 +1155,7 @@ public sealed class OfxIngestTests
             (await client.PostAsync(
                 $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/import", content)).StatusCode);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             // Ledger-scoped, as above.
             await db.Database.ExecuteSqlInterpolatedAsync(
@@ -1053,7 +1168,7 @@ public sealed class OfxIngestTests
                 FileUpload(OfxReinvestRoundingStatement, accountId: brokerage.Id,
                     providerAccountId: "inv:brokerX:INV-0001"))).StatusCode);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var header = await db.TxnHeaders.AsNoTracking()
                 .SingleAsync(h => h.LedgerId == ledger.LedgerId
@@ -1065,9 +1180,9 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task Import_persists_investment_actions_with_ticker_hints()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -1081,7 +1196,7 @@ public sealed class OfxIngestTests
         // TRANSFER stays in the Errors list (warning, not failure).
         Assert.Contains(result.Errors, e => e.Code == "ofx_investment_type_unsupported");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var headers = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "ofx")
             .OrderBy(h => h.PostedAt)
@@ -1101,7 +1216,7 @@ public sealed class OfxIngestTests
         // (ADR-0038, mig 115) returns null for every leg of every row.
         // The editor's Phase 3d upgrade flow lets the user create
         // the mapping at first-use.
-        await using (var rv = _fixture.NewDbContext())
+        await using (var rv = Db.NewDbContext())
         {
             var resolvedIds = await rv.ResolvedTransactions.AsNoTracking()
                 .Where(r => headers.Select(h => h.Id).Contains(r.HeaderId))
@@ -1182,9 +1297,9 @@ public sealed class OfxIngestTests
         // LEFT JOIN provider_security_mappings on it — recording a
         // mapping makes the resolved id appear on every matching row
         // on the next read, with no backfill anywhere in the code.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Import 4 OFX investment rows; all reference the same
@@ -1199,7 +1314,7 @@ public sealed class OfxIngestTests
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
         List<Guid> headerIds;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             headerIds = await db.TxnHeaders.AsNoTracking()
                 .Where(h => h.LedgerId == ledger.LedgerId
@@ -1222,7 +1337,7 @@ public sealed class OfxIngestTests
         // InvestmentTransactionsEndpoint forwards the
         // ProviderSecurityHint to UpsertAsync.
         var securityId = await ledger.AddSecurityAsync("Fake Test Stock", ticker: "FAKE");
-        await using (var ctx = _fixture.NewDbContext())
+        await using (var ctx = Db.NewDbContext())
         {
             var repo = new Coffer.Api.Db.Repositories.ProviderSecurityMappingsRepository(ctx, TimeProvider.System);
             await repo.UpsertAsync(
@@ -1237,7 +1352,7 @@ public sealed class OfxIngestTests
         // next read for every header carrying the matching ticker
         // hint — no backfill needed, including for the four rows the
         // user hasn't opened yet.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var postResolution = await db.ResolvedTransactions.AsNoTracking()
                 .Where(r => headerIds.Contains(r.HeaderId))
@@ -1251,13 +1366,13 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task Import_resolves_seclist_ticker_against_existing_provider_mapping()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         // Pre-populate a (provider_key='ofx', provider_security_id='FAKE') →
         // security_id mapping so the SECLIST resolver's ticker hint
         // lands on a real Coffer security at insert time.
         var securityId = await ledger.AddSecurityAsync("Fake Test Stock", ticker: "FAKE");
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             db.ProviderSecurityMappings.Add(new Coffer.Api.Db.Entities.ProviderSecurityMappingRow
             {
@@ -1271,14 +1386,14 @@ public sealed class OfxIngestTests
             await db.SaveChangesAsync();
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var resp = await client.PostAsync(
             $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/import",
             FileUpload(OfxInvestmentStatement, accountId: brokerage.Id, providerAccountId: "inv:brokerX:INV-0001"));
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using var verify = _fixture.NewDbContext();
+        await using var verify = Db.NewDbContext();
         var headerIds = await verify.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "ofx")
             .Select(h => h.Id)
@@ -1298,11 +1413,11 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task Import_422s_when_account_does_not_belong_to_ledger()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var bobAccount = await bob.AddBankAccountAsync("bobs-checking");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, alice);
 
         // alice's session uploading a file targeted at bob's account.
@@ -1316,11 +1431,11 @@ public sealed class OfxIngestTests
     /// account's review count.
     /// </summary>
     /// <remarks>
-    /// The count reads <c>resolved_transactions</c>, which is per-LEG, while its
-    /// documented contract is per-<c>txn_headers</c> row. Splitting a row before
-    /// approving it puts several legs on the same account, so one transaction
-    /// reported itself as three — visible in the dot's tooltip and aria-label,
-    /// which say "N transactions to review".
+    /// The count reads the register's legs, one per posting, and counts entries.
+    /// Splitting a row before approving it puts several legs on the same account,
+    /// which that register shows as one split entry, so a per-leg count would report
+    /// one transaction as several — visible in the dot's tooltip and aria-label, which
+    /// say "N transactions to review".
     ///
     /// Reached the way a person reaches it: import, then split without
     /// approving. A PATCH that carries postings but no Approve leaves
@@ -1329,12 +1444,12 @@ public sealed class OfxIngestTests
     [Fact]
     public async Task An_unreviewed_row_split_across_categories_counts_once()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("Checking");
         var groceries = await ledger.AddCategoryAsync("Groceries");
         var household = await ledger.AddCategoryAsync("Household");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -1344,7 +1459,7 @@ public sealed class OfxIngestTests
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
         Guid headerId;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             headerId = (await db.TxnHeaders.AsNoTracking()
                 .SingleAsync(h => h.LedgerId == ledger.LedgerId
@@ -1378,7 +1493,7 @@ public sealed class OfxIngestTests
             $"expected 2xx, got {(int)patch.StatusCode}: "
             + await patch.Content.ReadAsStringAsync());
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             // The premise: the split really did land two legs on this account,
             // and the row really is still awaiting review.
@@ -1392,6 +1507,114 @@ public sealed class OfxIngestTests
 
         // Still one transaction to review, not two.
         Assert.Equal(before, await ReviewCountAsync(client, ledger, checking.Id));
+    }
+
+    /// <summary>
+    /// A row awaiting review whose split puts two lines on one other real account counts
+    /// once on its own account and twice on that one: that register shows each line as
+    /// an entry of its own, and the count counts entries as the register shows them.
+    /// </summary>
+    [Fact]
+    public async Task An_unreviewed_split_onto_one_other_account_counts_each_of_its_entries_there()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var accountA = await ledger.AddBankAccountAsync("Account A");
+        var accountB = await ledger.AddBankAccountAsync("Account B");
+
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var resp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/import",
+            FileUpload(Ofx1BankSingleAccount, accountId: accountA.Id,
+                providerAccountId: "999999999:1234567890"));
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        Guid headerId;
+        await using (var db = Db.NewDbContext())
+        {
+            headerId = (await db.TxnHeaders.AsNoTracking()
+                .SingleAsync(h => h.LedgerId == ledger.LedgerId
+                    && h.ExternalId == "FITID-COFFEE-1")).Id;
+        }
+        var beforeOnA = await ReviewCountAsync(client, ledger, accountA.Id);
+        Assert.Equal(0, await ReviewCountAsync(client, ledger, accountB.Id));
+
+        // Split the debit in two, both lines to Account B, WITHOUT approving.
+        const decimal LineOne = -10.00m, LineTwo = -2.34m;
+        var patch = await client.PatchAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/transactions/{headerId}",
+            new PatchTransactionRequest
+            {
+                Postings = new PatchTransactionPostings
+                {
+                    SourceAccountId = accountA.Id,
+                    Items = new[]
+                    {
+                        new TransactionPosting { CounterpartyAccountId = accountB.Id, Amount = LineOne },
+                        new TransactionPosting { CounterpartyAccountId = accountB.Id, Amount = LineTwo },
+                    },
+                },
+            });
+        Assert.True(patch.IsSuccessStatusCode,
+            $"expected 2xx, got {(int)patch.StatusCode}: " + await patch.Content.ReadAsStringAsync());
+
+        // The premise: two legs on Account B, and the row still awaits review.
+        await using (var db = Db.NewDbContext())
+        {
+            Assert.Equal(2, await db.TxnLegs.AsNoTracking()
+                .CountAsync(l => l.HeaderId == headerId && l.AccountId == accountB.Id));
+            Assert.True((await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == headerId)).NeedsReview);
+        }
+
+        // One split entry on its own account; one entry per line on the other.
+        Assert.Equal(beforeOnA, await ReviewCountAsync(client, ledger, accountA.Id));
+        Assert.Equal(2, await ReviewCountAsync(client, ledger, accountB.Id));
+        using var counts = JsonDocument.Parse(await client.GetStringAsync(
+            $"/api/ledgers/{ledger.LedgerId}/transactions/status-counts?account_id={accountB.Id}"));
+        Assert.Equal(2, counts.RootElement.GetProperty("needsReview").GetInt32());
+    }
+
+    /// <summary>
+    /// Every account's review count comes from one statement, however many accounts have
+    /// rows to review: the count is part of the account listing's own read, not one read
+    /// per account.
+    /// </summary>
+    [Fact]
+    public async Task The_accounts_listing_reads_every_review_count_in_one_statement()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var accountA = await ledger.AddBankAccountAsync("Account A");
+        var accountB = await ledger.AddBankAccountAsync("Account B");
+
+        var capture = new ExplainCapture
+        {
+            Selects = sql => sql.Contains("resolved_transactions", StringComparison.Ordinal),
+        };
+        await using var factory = new ApiFactory(Db).WithoutDevAuth().WithServices(capture.Register);
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        foreach (var (account, number) in new[] { (accountA, "1234567890"), (accountB, "1234567891") })
+        {
+            var resp = await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/ofx/import",
+                FileUpload(Ofx1BankSingleAccount.Replace("<ACCTID>1234567890", $"<ACCTID>{number}", StringComparison.Ordinal),
+                    accountId: account.Id, providerAccountId: $"999999999:{number}"));
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        }
+
+        capture.Enabled = true;
+        var accounts = await client.GetFromJsonAsync<List<JsonElement>>(
+            $"/api/ledgers/{ledger.LedgerId}/accounts?includeInactive=true");
+        capture.Enabled = false;
+        var statements = capture.Drain();
+        foreach (var (sql, plan) in statements)
+            Output.WriteLine(sql + Environment.NewLine + plan);
+
+        // The premise: more than one account has a count, so a read per account would show.
+        Assert.True(accounts!.Count(a => a.GetProperty("needsReviewCount").GetInt32() > 0) >= 2);
+        Assert.Single(statements);
+        Assert.Contains("FROM accounts", statements[0].Sql, StringComparison.Ordinal);
     }
 
     /// <summary>The review count the sidebar dot reads, for one account.</summary>

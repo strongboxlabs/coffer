@@ -1,14 +1,24 @@
 import { useState } from 'react';
-import { useMutation } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import { ApiError, setBackupPassphrase } from '@/lib/api';
 import { errorMessage } from '@/lib/errorMessage';
 import { Button } from '@/components/ui/Button';
 import { FieldLabel } from '@/components/ui/FieldLabel';
 import { Modal } from '@/components/ui/Modal';
+import { pendingTextProps } from '@/components/ui/pending';
 
 /** Mirror of the server minimum (AdminBackupsEndpoints.MinPassphraseLength). */
 const MIN_LENGTH = 8;
+
+/**
+ * A passphrase field. Pending while the save is in flight (ADR-0023 §L): the save
+ * sends what was typed at the press and its success closes the dialog, so a change
+ * made meanwhile would be dropped unseen. It looks as a disabled field does.
+ */
+const FIELD = 'rounded border border-border bg-surface px-3 py-1.5 text-sm focus-visible:outline-none '
+    + 'focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50 '
+    + 'aria-disabled:cursor-not-allowed aria-disabled:opacity-50';
 
 /**
  * Set / rotate the backup passphrase (ADR-0060). Two fields (passphrase + confirm)
@@ -16,10 +26,9 @@ const MIN_LENGTH = 8;
  * is never stored. Rotating affects FUTURE backups only — existing artifacts still
  * need the previous passphrase, which the dialog calls out.
  *
- * The warning used to say the passphrase "cannot be recovered". That was never quite
- * true — the server unseals it on every scheduled backup — and since ADR-0092 D7 it
- * is plainly false: an admin can look it up behind a passkey prompt. The copy now
- * draws the line where it actually falls, which is losing the *server*, because a
+ * The warning does not say the passphrase "cannot be recovered": the server unseals
+ * it on every scheduled backup, and under ADR-0092 D7 an admin can look it up behind
+ * a passkey prompt. The copy draws the line where it actually falls, which is losing the *server*, because a
  * warning an operator can catch out is one they stop believing.
  */
 export function SetBackupPassphraseDialog({
@@ -87,7 +96,8 @@ export function SetBackupPassphraseDialog({
                             autoFocus
                             autoComplete="new-password"
                             aria-invalid={tooShort}
-                            className="rounded border border-border bg-surface px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                            className={FIELD}
+                            {...pendingTextProps<HTMLInputElement>(mutation.isPending)}
                         />
                         <span className="text-[0.6875rem] text-text-subtle">
                             At least {MIN_LENGTH} characters.
@@ -103,7 +113,8 @@ export function SetBackupPassphraseDialog({
                             onChange={(e) => setConfirm(e.target.value)}
                             autoComplete="new-password"
                             aria-invalid={mismatch}
-                            className="rounded border border-border bg-surface px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                            className={FIELD}
+                            {...pendingTextProps<HTMLInputElement>(mutation.isPending)}
                         />
                         {mismatch ? (
                             <span role="alert" className="text-[0.6875rem] text-state-danger">
@@ -122,12 +133,12 @@ export function SetBackupPassphraseDialog({
                 </div>
                 <footer className="flex justify-end gap-2 border-t border-border bg-surface-muted/30 px-4 py-2">
                     <Button type="button" variant="secondary" size="sm" onClick={onClose}
-                        disabled={mutation.isPending}>
+                        pending={mutation.isPending}>
                         Cancel
                     </Button>
                     <Button type="submit" variant="primary" size="sm"
-                        disabled={!canSubmit || mutation.isPending}>
-                        {mutation.isPending ? 'Saving…' : isRotate ? 'Change' : 'Set passphrase'}
+                        disabled={!canSubmit} pending={mutation.isPending} pendingLabel="Saving…">
+                        {isRotate ? 'Change' : 'Set passphrase'}
                     </Button>
                 </footer>
             </form>

@@ -18,21 +18,22 @@ namespace Coffer.Api.Tests.Integration.Quotes;
 /// / scheduled refresh) fans to all.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class PostSyncQuoteScopeTests
+public sealed class PostSyncQuoteScopeTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public PostSyncQuoteScopeTests(PostgresFixture fixture) => _fixture = fixture;
+    public PostSyncQuoteScopeTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     [Fact]
     public async Task RunPullAsync_invokes_only_the_named_provider()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedHeldSecurityAsync(ledger);
 
         var holdings = new SpyPullProvider(SimpleFinHoldingsQuoteProvider.Key);
         var external = new SpyPullProvider("yahoo");
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var orchestrator = new QuoteOrchestrator(
             db,
             new IQuotePullProvider[] { holdings, external },
@@ -48,7 +49,7 @@ public sealed class PostSyncQuoteScopeTests
 
         // The run is still recorded as a quote refresh (ADR-0055), attributed
         // post-sync — so the Activity timeline shows it identically to before.
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var run = await read.LedgerOperations.AsNoTracking()
             .Where(r => r.LedgerId == ledger.LedgerId && r.Family == "quote")
             .SingleAsync();
@@ -62,12 +63,12 @@ public sealed class PostSyncQuoteScopeTests
     {
         // The contrast that makes the single-provider scoping meaningful: the
         // explicit refresh path DOES reach every registered provider.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedHeldSecurityAsync(ledger);
 
         var holdings = new SpyPullProvider(SimpleFinHoldingsQuoteProvider.Key);
         var external = new SpyPullProvider("yahoo");
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var orchestrator = new QuoteOrchestrator(
             db,
             new IQuotePullProvider[] { holdings, external },
@@ -84,14 +85,14 @@ public sealed class PostSyncQuoteScopeTests
     [Fact]
     public async Task Quote_run_records_which_source_moved_the_prices()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedHeldSecurityAsync(ledger);
 
         // A provider that actually prices the held security, tagged as the
         // SimpleFIN feed source (ADR-0070). D: the run must attribute it.
         var provider = new PricingPullProvider(
             SimpleFinHoldingsQuoteProvider.Key, PriceSource.Simplefin);
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var orchestrator = new QuoteOrchestrator(
             db,
             new IQuotePullProvider[] { provider },
@@ -102,7 +103,7 @@ public sealed class PostSyncQuoteScopeTests
         await orchestrator.RunPullAsync(
             ledger.LedgerId, SimpleFinHoldingsQuoteProvider.Key, "post-sync", ledger.UserId);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var run = await read.LedgerOperations.AsNoTracking()
             .Where(r => r.LedgerId == ledger.LedgerId && r.Family == "quote")
             .SingleAsync();

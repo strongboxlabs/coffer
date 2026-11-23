@@ -1,45 +1,46 @@
 import type { ReactNode } from 'react';
 
 import type { InvestmentRow } from '@/lib/types';
+import { readOnlyBadge } from '@/lib/annotations/notes';
 import { formatLedgerDateLong } from '@/lib/dates';
-import { formatCurrency, formatSignedAmount } from '@/lib/money';
 
 import type {
     RegisterRowBodyCtx,
     RegisterRowContainerCtx,
     RegisterRowStrategy,
 } from '../shell/RegisterRow';
+import { resolveRowStatus } from '../shell/registerStatus';
 import { INVESTMENT_REGISTER_COLS } from '../investment/columns';
 import { investmentStrategy } from './investmentStrategy';
+import { rowAmountText, rowBalance } from './registerMoney';
 
 // ---------------------------------------------------------------------------
 // Investment register row STRATEGY (ADR-0030 reuse). Implements
-// `RegisterRowStrategy<InvestmentRow>`: the cells AFTER the
-// shared lead for all three row variants (txn / split-parent / split-leg)
-// via one `renderBody` switch. This is where the per-variant JSX from the
-// three former investment row components (InvestmentTxnRow,
-// InvestmentSplitParentRow, InvestmentSplitLegRow) was relocated verbatim
-// — same class strings, same cell renderers from `./investmentStrategy`,
-// same "↗ Split" treatment / tree glyph / expand control. The shell
-// (shell/RegisterRow) owns the container + lead.
+// `RegisterRowStrategy<InvestmentRow>`: the cells AFTER the shared lead. The
+// shell (shell/RegisterRow) owns the container + lead.
+//
+// Only the flat row variant exists here. The server collapses every entry on
+// an investment account into one event row (ADR-0080), and a split's lines on
+// their other side are each their own read-only row, so this register has no
+// expandable split parent and no leg rows.
 // ---------------------------------------------------------------------------
-
-function formatBalance(balance: number | null, currency: string): string {
-    if (balance === null) return '—';
-    return formatCurrency(balance, currency);
-}
 
 function renderTxnBody(
     txn: InvestmentRow,
     ctx: RegisterRowBodyCtx,
 ): ReactNode {
-    const { currency, isTargetSplit } = ctx;
-    const amountText = formatSignedAmount(txn.amount, currency);
-    const balanceText = formatBalance(txn.balanceAfter, currency);
+    const { currency, today } = ctx;
+    const scheduled = resolveRowStatus(txn, today) === 'scheduled';
+    // Each in the currency the row names; on a brokerage both are its own (ADR-0114 D7).
+    const amountText = rowAmountText(txn);
+    const balanceText = rowBalance(txn, '—');
     const dateText = formatLedgerDateLong(txn.postedAt);
     const dateSubLabel = investmentStrategy.renderDateSubLabel?.(txn) ?? null;
     const actionSubLabel = investmentStrategy.renderActionSubLabel?.(txn) ?? null;
-    const amountSubtitle = investmentStrategy.renderAmountSubtitle?.(txn) ?? null;
+    const amountSubtitle = investmentStrategy.renderAmountSubtitle(txn, currency);
+    // A read-only row names where it is edited: the split's own register, or
+    // the brokerage the event belongs to.
+    const badge = ctx.isReadOnly ? readOnlyBadge(txn.notesKind) : null;
     return (
         <>
             {/* Slot 3: date + tax-date subtitle */}
@@ -53,48 +54,61 @@ function renderTxnBody(
             </span>
             {/* Slot 4: action chip + check# subtitle. The check number is an MD
                 marker qualifying the ACTION (Auto / EXfr / Xfr), so it stacks
-                here; slot 3's second line is the tax date. */}
+                here; slot 3's second line is the tax date.
+
+                A read-only row puts its badge here too, on a line of its own
+                above the chip: it sat in front of the payee, where it
+                left the payee and memo a letter each. Every row in this
+                register has a chip (`markUnset`), so a badged row always has
+                both, and "↗ Investment" beside the longer chips (BuyXfr,
+                DividendXfr) is wider than the track; stacked, neither is cut
+                and the chip keeps the left edge every other row's chip has. */}
             <span className="min-w-0">
-                <span className="block">{investmentStrategy.renderSlot4(txn)}</span>
+                {badge !== null ? (
+                    <span className="mb-0.5 block">
+                        <span
+                            className="inline-flex shrink-0 items-center rounded bg-accent-soft px-1 py-px text-[0.625rem] font-medium uppercase tracking-wide text-accent"
+                            title={
+                                badge === 'investment'
+                                    ? 'Part of an investment transaction in another account · view + edit it there'
+                                    : 'One line of a split transaction · edit it in the split’s own register'
+                            }
+                        >
+                            {badge === 'investment' ? '↗ Investment' : '↗ Split'}
+                        </span>
+                    </span>
+                ) : null}
+                <span className="block">{investmentStrategy.renderSlot4(txn, { markUnset: true })}</span>
                 {actionSubLabel ? (
                     <span className="block font-mono text-[0.6875rem] text-text-muted">
                         {actionSubLabel}
                     </span>
                 ) : null}
             </span>
-            {/* Slot 5: payee + memo (with "↗ Split" prefix on
-                target-side rows per ADR-0036). */}
+            {/* Slot 5: payee + memo, the cell's full width. */}
             <span className="min-w-0">
-                {isTargetSplit ? (
-                    <span className="flex min-w-0 items-baseline gap-1">
-                        <span
-                            className="inline-flex shrink-0 items-center rounded bg-accent-soft px-1 py-px text-[0.625rem] font-medium uppercase tracking-wide text-accent"
-                            title="Counter-side of a split transaction · edit + delete from the source-side register"
-                        >
-                            ↗ Split
-                        </span>
-                        <span className="min-w-0">
-                            {investmentStrategy.renderSlot5(txn)}
-                        </span>
-                    </span>
-                ) : (
-                    investmentStrategy.renderSlot5(txn)
-                )}
+                {investmentStrategy.renderSlot5(txn, ctx.accountPaths)}
             </span>
-            {/* Slot 6: category | transfer + fee */}
+            {/* Slot 6: category | transfer + fee, and the tags */}
             <span className="flex min-w-0 flex-col gap-0.5">
-                {investmentStrategy.renderSlot6(txn, ctx.accountPaths)}
+                {investmentStrategy.renderSlot6(txn, ctx.accountPaths, ctx.systemCategoryIds)}
             </span>
             {/* Slot 7: security + shares @ price */}
             <span className="min-w-0">
-                {investmentStrategy.renderSlot7?.(txn) ?? null}
+                {investmentStrategy.renderSlot7(txn, currency)}
             </span>
-            {/* Slot 8: signed amount + fee subtitle */}
+            {/* Slot 8: signed amount + fee subtitle. ADR-0023 §H, as in the
+                bank register: a debit is red, a credit default, and a
+                Scheduled row drops the colour to the row's own muting. */}
             <span className="text-right font-mono tabular-nums">
                 <span
                     className={
                         'block ' +
-                        (txn.amount < 0 ? 'text-text' : 'text-state-success')
+                        (scheduled
+                            ? ''
+                            : txn.amount < 0
+                                ? 'text-state-danger'
+                                : 'text-text')
                     }
                 >
                     {amountText}
@@ -109,163 +123,11 @@ function renderTxnBody(
     );
 }
 
-function renderSplitParentBody(
-    aggregate: InvestmentRow,
-    ctx: RegisterRowBodyCtx,
-): ReactNode {
-    // The page passes the synthesized cluster aggregate as `row`, so the
-    // cells read off it directly (mirrors the former
-    // InvestmentSplitParentRow). The aggregate is built from
-    // `canonicalLeg(legs)` (legs[0]) + the shared `groupAmount` /
-    // `groupBalanceAfter` helpers (ADR-0080), so it carries legs[0]'s date.
-    const { currency, expand } = ctx;
-    const amountText = formatSignedAmount(aggregate.amount, currency);
-    const balanceText = formatBalance(aggregate.balanceAfter, currency);
-    const dateText = formatLedgerDateLong(aggregate.postedAt);
-    const dateSubLabel = investmentStrategy.renderDateSubLabel?.(aggregate) ?? null;
-    const actionSubLabel = investmentStrategy.renderActionSubLabel?.(aggregate) ?? null;
-    return (
-        <>
-            {/* Slot 3: date + tax-date subtitle */}
-            <span className="font-mono tabular-nums text-text">
-                <span className="block">{dateText}</span>
-                {dateSubLabel ? (
-                    <span className="block text-[0.6875rem] text-text-muted">
-                        {dateSubLabel}
-                    </span>
-                ) : null}
-            </span>
-            {/* Slot 4: action chip (derived 'Xfr' on target splits) + check#. */}
-            <span className="min-w-0">
-                <span className="block">{investmentStrategy.renderSlot4(aggregate)}</span>
-                {actionSubLabel ? (
-                    <span className="block font-mono text-[0.6875rem] text-text-muted">
-                        {actionSubLabel}
-                    </span>
-                ) : null}
-            </span>
-            {/* Slot 5: "↗ Split" treatment + payee/memo — same chip the
-                flat target rows carry (ADR-0036). */}
-            <span className="min-w-0">
-                <span className="flex min-w-0 items-baseline gap-1">
-                    <span
-                        className="inline-flex shrink-0 items-center rounded bg-accent-soft px-1 py-px text-[0.625rem] font-medium uppercase tracking-wide text-accent"
-                        title="Counter-side of a split transaction · edit + delete from the source-side register"
-                    >
-                        ↗ Split
-                    </span>
-                    <span className="min-w-0">
-                        {investmentStrategy.renderSlot5(aggregate)}
-                    </span>
-                </span>
-            </span>
-            {/* Slot 6: the expand affordance — "▸ N splits" toggling the
-                leg rows. Reuses the same column the flat row uses for
-                category / transfer / fee. */}
-            <span className="flex min-w-0 flex-col gap-0.5">
-                <button
-                    type="button"
-                    aria-expanded={expand?.expanded ?? false}
-                    onClick={(e) => {
-                        e.stopPropagation();
-                        expand?.onToggle();
-                    }}
-                    className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[0.6875rem] font-medium text-text-muted hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
-                >
-                    {/* FU-062, same sizing as the bank strategy: a triangle
-                        fills less of its em box than a letter, so at the
-                        button's 11px the one control on the row read as the
-                        smallest thing on it. `leading-none` keeps the line box
-                        from growing. */}
-                    {/* `not-italic` for the same reason as the bank strategy:
-                        a scheduled row is italic and a skewed triangle reads as
-                        a rendering fault. */}
-                    <span aria-hidden className="text-[0.875rem] not-italic leading-none">
-                        {expand?.expanded ? '▾' : '▸'}
-                    </span>
-                    {expand?.count ?? 0} splits
-                </button>
-            </span>
-            {/* Slot 7: security — usually empty on Xfr target splits, but
-                rendered through the same renderer for consistency. */}
-            <span className="min-w-0">
-                {investmentStrategy.renderSlot7?.(aggregate) ?? null}
-            </span>
-            {/* Slot 8: net signed amount across the cluster's legs. */}
-            <span className="text-right font-mono tabular-nums">
-                <span
-                    className={
-                        'block ' +
-                        (aggregate.amount < 0 ? 'text-text' : 'text-state-success')
-                    }
-                >
-                    {amountText}
-                </span>
-            </span>
-            {/* Slot 9: REAL post-header balance (not a fabricated
-                per-leg step). */}
-            <span className="text-right font-mono tabular-nums text-text">
-                {balanceText}
-            </span>
-        </>
-    );
-}
-
-function renderSplitLegBody(
-    leg: InvestmentRow,
-    ctx: RegisterRowBodyCtx,
-): ReactNode {
-    const { currency } = ctx;
-    // The shell renders the two blank lead cells (checkbox + status); this
-    // body covers the remaining seven cells (mirrors the former
-    // InvestmentSplitLegRow).
-    return (
-        <>
-            {/* Slot 3: blank — date is the group's, on the parent row. */}
-            <span role="cell" />
-            {/* Slot 4: action chip (the leg's derived action). */}
-            <span role="cell">{investmentStrategy.renderSlot4(leg)}</span>
-            {/* Slot 5: tree-prefix glyph + per-leg memo (the
-                differentiator); payee already shows on the parent. */}
-            <span role="cell" className="min-w-0 pl-4">
-                <span className="block truncate">
-                    <span aria-hidden className="mr-1 text-text-subtle">└</span>
-                    {leg.legMemo ?? <span className="text-text-subtle">—</span>}
-                </span>
-            </span>
-            {/* Slot 6: category | transfer · fee for this leg. */}
-            <span role="cell" className="flex min-w-0 flex-col gap-0.5">
-                {investmentStrategy.renderSlot6(leg, ctx.accountPaths)}
-            </span>
-            {/* Slot 7: security for this leg (usually empty on Xfr). */}
-            <span role="cell" className="min-w-0">
-                {investmentStrategy.renderSlot7?.(leg) ?? null}
-            </span>
-            {/* Slot 8: the leg's OWN signed amount. */}
-            <span
-                role="cell"
-                className={
-                    'text-right font-mono tabular-nums ' +
-                    (leg.amount < 0 ? 'text-text' : 'text-state-success')
-                }
-            >
-                {formatSignedAmount(leg.amount, currency)}
-            </span>
-            {/* Slot 9: balance intentionally blank on leg rows — only the
-                group's final balance is meaningful in the running flow.
-                Truly blank (no glyph), matching the bank split-leg. */}
-            <span role="cell" />
-        </>
-    );
-}
-
-// Investment-specific container attributes (preserved exactly as the
-// three former investment components emitted them): `data-headerid` on
-// the txn + split-parent rows (not legs), `data-focused` on every
-// variant. `aria-rowindex` is emitted here too now: it was bank-only, so a
-// screen reader moving through a brokerage register was told nothing about
-// where it was. `data-scheduled` stays bank-only (investment rows are never
-// scheduled).
+// Investment-specific container attributes: `data-headerid` and
+// `data-focused` on every row. `aria-rowindex` is emitted here too: it was
+// bank-only, so a screen reader moving through a brokerage register was told
+// nothing about where it was. `data-scheduled` comes from the shared
+// RegisterRow, as it does for the bank.
 function investmentContainerAttrs(
     row: InvestmentRow,
     ctx: RegisterRowContainerCtx,
@@ -274,10 +136,10 @@ function investmentContainerAttrs(
         dataAttrs: {
             'aria-rowindex':
                 ctx.rowIndex !== undefined ? ctx.rowIndex + 1 : undefined,
-            'data-headerid': ctx.variant === 'split-leg' ? undefined : row.headerId,
+            'data-headerid': row.headerId,
             'data-focused': ctx.focused ? 'true' : 'false',
         },
-        // Leg muting + row-state styling now live in the shared RegisterRow.
+        // Row-state styling lives in the shared RegisterRow.
     };
 }
 
@@ -290,13 +152,6 @@ export const investmentRowStrategy: RegisterRowStrategy<InvestmentRow> = {
     cursorClassName: 'cursor-pointer',
     containerAttrs: investmentContainerAttrs,
     renderBody(row, ctx) {
-        switch (ctx.variant) {
-            case 'split-parent':
-                return renderSplitParentBody(row, ctx);
-            case 'split-leg':
-                return renderSplitLegBody(row, ctx);
-            default:
-                return renderTxnBody(row, ctx);
-        }
+        return renderTxnBody(row, ctx);
     },
 };

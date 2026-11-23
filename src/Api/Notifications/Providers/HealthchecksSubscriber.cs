@@ -7,9 +7,9 @@ namespace Coffer.Api.Notifications.Providers;
 /// </summary>
 /// <remarks>
 /// The reason this exists rather than a webhook to a chat app: it is the only
-/// subscriber class that can report what did NOT happen. Snapshots and backups once
-/// stopped for days and nothing said anything, because the thing that should
-/// have complained was the thing that had stopped running. A monitor outside the
+/// subscriber class that can report what did NOT happen. When snapshots or backups
+/// stop, nothing inside the deployment says anything, because the thing that should
+/// complain is the thing that has stopped running. A monitor outside the
 /// deployment counts the pings it expected and alerts on their absence — no code
 /// inside a dead container can do that (ADR-0096 D5).
 /// <para>
@@ -48,9 +48,9 @@ public sealed class HealthchecksSubscriber : INotificationSubscriber
         // human-facing scale it has no representation for — the docs are explicit that
         // the request body is stored for diagnostics and does not affect alerting.
         //
-        // It used to key off `Severity == Critical`, which meant any critical event
-        // reaching a heartbeat target marked THAT check down regardless of what the
-        // event was about. Routing now guarantees only this monitor's own signals
+        // Not keyed off `Severity == Critical`: that would let any critical event
+        // reaching a heartbeat target mark THAT check down regardless of what the
+        // event was about. Routing guarantees only this monitor's own signals
         // arrive (NotificationPublisher.Wants), so the mapping here is total: Success
         // pings, Failure reports down, and nothing else can get this far.
         var isFailure = notification.Signal == MonitorSignal.Failure;

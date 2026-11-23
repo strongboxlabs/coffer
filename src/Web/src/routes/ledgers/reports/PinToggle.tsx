@@ -1,4 +1,5 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 import { Pin, PinOff } from 'lucide-react';
 
 import {
@@ -75,9 +76,11 @@ export function ReportPinToggle({
         <IconButton
             aria-label={pinned ? `Unpin ${name}` : `Pin ${name} to sidebar`}
             aria-pressed={pinned}
-            disabled={toggle.isPending || loading}
+            pending={toggle.isPending || loading}
             onClick={() => toggle.mutate()}
-            className={pinned ? 'text-accent' : undefined}
+            // A pending button shows its resting look on hover (IconButton), so
+            // the pinned colour is restated for it.
+            className={pinned ? 'text-accent aria-disabled:hover:text-accent' : undefined}
         >
             {pinned
                 ? <PinOff aria-hidden className="size-icon-sm" />

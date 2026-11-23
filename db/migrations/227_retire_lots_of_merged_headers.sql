@@ -5,8 +5,8 @@
 -- WHAT WAS WRONG. `recompute_holdings_cost_basis` applies the FIFO walk's output
 -- to the `lots` table by updating the rows the walk produced. Lots whose leg
 -- sits on a hidden or merged header are excluded from the walk (mig 163), and
--- the function said so in a comment — "left untouched" — without noticing that
--- untouched means LEFT AT THE QUANTITY THEY HELD BEFORE.
+-- the function says so in a comment — "left untouched" — but untouched means
+-- LEFT AT THE QUANTITY THEY HELD BEFORE.
 --
 -- Merge a duplicate buy into its winner and `holdings.quantity` correctly
 -- becomes the winner's shares alone, while the loser's lot stays open next to
@@ -32,8 +32,7 @@
 -- EXTRACTED FROM THE LIVE CATALOGUE with pg_get_functiondef, not copied from
 -- mig 163 or 169 — the body has drifted from both (163's "Lot reset to acquired
 -- state" block no longer exists; the FIFO walk moved into `holdings_fifo_walk`).
--- Copying an older migration forward is how mig 205 silently reverted a fix and
--- 209 had to undo it.
+-- Copying an older migration forward silently reverts every fix made since.
 --
 -- BACKFILL. Existing databases carry whatever phantom lots they already have, so
 -- the migration runs the recompute once over every holding to settle them.

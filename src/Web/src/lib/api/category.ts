@@ -1,11 +1,11 @@
 // Category-management endpoints (Slice A) — the /categories REST
-// surface behind the manage-categories Settings panel. Hierarchy ops
+// surface behind the manage-categories panel (the Categories tab of Structure). Hierarchy ops
 // only (list-with-usage, reparent, merge, delete); create / rename /
 // activate reuse the accounts endpoints (./account.ts), since
 // categories ARE accounts.
 
 import type {
-    CategoryNode,
+    CategoryList,
     MergeCategoryRequest,
     MergeCategoryResponse,
     ReparentCategoryRequest,
@@ -15,16 +15,17 @@ import { request } from './_request';
 /**
  * GET /api/ledgers/{ledgerId}/categories — every category in the ledger
  * with its hierarchy pointer + usage counts (txn legs + child
- * categories), the source for the management tree. With
+ * categories), the source for the management tree, and the ledger's
+ * display currency its figures are formatted in. With
  * `includeInactive: true`, deactivated categories (e.g. merged-away
  * sources) are also returned, flagged via `CategoryNode.isActive`.
  */
 export function fetchCategories(
     ledgerId: string,
     options?: { includeInactive?: boolean },
-): Promise<CategoryNode[]> {
+): Promise<CategoryList> {
     const query = options?.includeInactive ? '?includeInactive=true' : '';
-    return request<CategoryNode[]>(
+    return request<CategoryList>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/categories${query}`,
     );
 }
@@ -50,11 +51,18 @@ export function reparentCategory(
 /**
  * POST /api/ledgers/{ledgerId}/categories/{categoryId}/merge — merge this
  * (source) category into `targetId`: repoint every leg, reparent the
- * source's children to the target, and deactivate the source
- * (reversible). Both must be the same kind. `dryRun: true` previews the
- * move counts without writing. 422 codes: `account-not-in-ledger`,
- * `account-not-a-category`, `category-kind-mismatch`, `category-merge-self`,
- * `account-is-system`.
+ * source's children to the target, and deactivate the source (the row is
+ * kept; reactivating it brings back an empty category, and nothing moves
+ * back). The kinds may differ (ADR-0017): a cross-kind merge is how a
+ * category is reclassified. The target must not sit beneath the source.
+ * `dryRun: true` previews the move counts without writing. The response also
+ * says how many budget targets moved and how many were dropped (ADR-0099;
+ * both zero on a dry run). 422 codes: `account-not-in-ledger`,
+ * `account-not-a-category`, `category-merge-self`, `account-is-system`,
+ * `category-cycle`, and `rate-unavailable` (ADR-0114 D12): both categories hold a
+ * target for a month in different currencies and the rate is missing, so nothing
+ * merged. Its detail names the month and the pair, and the error's
+ * `rateUnavailable` carries the pair and day.
  */
 export function mergeCategory(
     ledgerId: string,

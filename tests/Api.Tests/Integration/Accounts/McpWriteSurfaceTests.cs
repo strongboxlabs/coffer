@@ -18,11 +18,27 @@ namespace Coffer.Api.Tests.Integration.Accounts;
 /// context is fine because every method is explicitly ledger-scoped.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class McpWriteSurfaceTests
+public sealed class McpWriteSurfaceTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
+    public McpWriteSurfaceTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
-    public McpWriteSurfaceTests(PostgresFixture fixture) => _fixture = fixture;
+    /// <summary>
+    /// The context a repository under test writes through, wired as production wires
+    /// it: a tracked save's derived state (balances, holdings, the stored memo-and-tags
+    /// presentation) is written by the save interceptors, which a bare context lacks.
+    /// </summary>
+    private AppDbContext Writer() => Db.NewServiceFactory().Create();
+
+    /// <summary>
+    /// <see cref="Writer"/> as the request context runs it for <paramref name="userId"/>:
+    /// the app role with that member's user on the connection, plus the save interceptors
+    /// production registers. A write that checks the caller's grant (a tag merge repointing
+    /// saved reports) needs the user; the interceptors keep the context production-shaped.
+    /// </summary>
+    private AppDbContext WriterAs(Guid userId) => Db.NewRequestDbContextAsUser(userId);
 
     // A guard that permits writes (kill-switch on + write scope), so these tests
     // exercise the real write path; the guard itself is proved in McpWriteGuardTests.
@@ -33,7 +49,7 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task Merge_moves_transactions_reparents_children_and_deactivates_source()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var source = await ledger.AddCategoryAsync("Groceries (old)", "expense");
         var target = await ledger.AddCategoryAsync("Groceries", "expense");
@@ -41,7 +57,7 @@ public sealed class McpWriteSurfaceTests
         await ledger.AddTransactionPairAsync(bank.Id, source.Id, -50m, Utc(5));
         await ledger.AddTransactionPairAsync(bank.Id, source.Id, -20m, Utc(6));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var outcome = await new AccountsRepository(db, new LegDerivedRecomputeService(db), TimeProvider.System)
             .MergeCategoryAsync(ledger.LedgerId, source.Id, target.Id, dryRun: false);
 
@@ -49,7 +65,7 @@ public sealed class McpWriteSurfaceTests
         Assert.Equal(2, outcome.TransactionsMoved);
         Assert.Equal(1, outcome.ChildrenReparented);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         // Every referencing leg moved to the target; none remain on the source.
         Assert.Equal(0, await read.TxnLegs
             .CountAsync(l => l.LedgerId == ledger.LedgerId && l.AccountId == source.Id));
@@ -66,20 +82,20 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task Merge_dryRun_reports_counts_without_writing()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var source = await ledger.AddCategoryAsync("A", "expense");
         var target = await ledger.AddCategoryAsync("B", "expense");
         await ledger.AddTransactionPairAsync(bank.Id, source.Id, -10m, Utc(7));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var outcome = await new AccountsRepository(db, new LegDerivedRecomputeService(db), TimeProvider.System)
             .MergeCategoryAsync(ledger.LedgerId, source.Id, target.Id, dryRun: true);
 
         Assert.Equal(AccountsRepository.MergeCategoryResult.Ok, outcome.Result);
         Assert.Equal(1, outcome.TransactionsMoved);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         // Untouched: leg still on the source, source still active.
         Assert.Equal(1, await read.TxnLegs
             .CountAsync(l => l.LedgerId == ledger.LedgerId && l.AccountId == source.Id));
@@ -89,12 +105,12 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task Merge_allows_a_kind_change_but_still_guards_non_category_and_self()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var expense = await ledger.AddCategoryAsync("Exp", "expense");
         var income = await ledger.AddCategoryAsync("Inc", "income");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var repo = new AccountsRepository(db, new LegDerivedRecomputeService(db), TimeProvider.System);
 
         // A DIFFERENT KIND IS NOW ALLOWED (ADR-0017). This arm asserted
@@ -117,7 +133,7 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task Merge_recomputes_posting_counts_on_co_occurring_split_header()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var source = await ledger.AddCategoryAsync("Source", "expense");
         var target = await ledger.AddCategoryAsync("Target", "expense");
@@ -125,11 +141,11 @@ public sealed class McpWriteSurfaceTests
         var (_, headerId) = await ledger.AddMultiSplitAsync(
             bank.Id, new[] { (source.Id, 30m), (target.Id, 20m) }, Utc(9));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         await new AccountsRepository(db, new LegDerivedRecomputeService(db), TimeProvider.System)
             .MergeCategoryAsync(ledger.LedgerId, source.Id, target.Id, dryRun: false);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         // After the merge BOTH postings touch the target, so its legs' denormalized
         // account_postings_on_header must be recomputed to 2 (== header_total): the
         // target now ORIGINATES the header. A stale 1 would prove the posting-count
@@ -145,13 +161,13 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task Delete_removes_empty_category_but_guards_in_use()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var empty = await ledger.AddCategoryAsync("Empty", "expense");
         var used = await ledger.AddCategoryAsync("Used", "expense");
         await ledger.AddTransactionPairAsync(bank.Id, used.Id, -5m, Utc(8));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var repo = new AccountsRepository(db, new LegDerivedRecomputeService(db), TimeProvider.System);
 
         var inUse = await repo.DeleteCategoryAsync(ledger.LedgerId, used.Id, dryRun: false);
@@ -161,7 +177,7 @@ public sealed class McpWriteSurfaceTests
         var ok = await repo.DeleteCategoryAsync(ledger.LedgerId, empty.Id, dryRun: false);
         Assert.Equal(AccountsRepository.DeleteCategoryResult.Ok, ok.Result);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         Assert.False(await read.Accounts.AnyAsync(a => a.Id == empty.Id));   // gone
         Assert.True(await read.Accounts.AnyAsync(a => a.Id == used.Id));     // preserved
     }
@@ -169,10 +185,10 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task SetSecurityClassification_fills_nulls_then_overwrite_corrects()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var secId = await ledger.AddSecurityAsync("Some Fund", "FUND", assetClass: null);   // unclassified
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var repo = new SecuritiesRepository(db, TimeProvider.System);
 
         // Fill an empty field.
@@ -184,47 +200,47 @@ public sealed class McpWriteSurfaceTests
         var r2 = await McpWriteTools.SetSecurityClassification(
             Guard, repo, ledger.LedgerId, secId, assetClass: "fixed_income", overwrite: false);
         Assert.True(r2.Ok);
-        await using (var read = _fixture.NewDbContext())
+        await using (var read = Db.NewDbContext())
             Assert.Equal("equity",
-                (await new SecuritiesRepository(read, TimeProvider.System).GetByIdAsync(ledger.LedgerId, secId))!.AssetClass);
+                (await new SecuritiesRepository(read, TimeProvider.System).GetByIdAsync(ledger.LedgerId, secId, today: null))!.AssetClass);
 
         // overwrite=true is the deliberate correction.
         var r3 = await McpWriteTools.SetSecurityClassification(
             Guard, repo, ledger.LedgerId, secId, assetClass: "real_assets", overwrite: true);
         Assert.True(r3.Ok);
-        await using (var read = _fixture.NewDbContext())
+        await using (var read = Db.NewDbContext())
             Assert.Equal("real_assets",
-                (await new SecuritiesRepository(read, TimeProvider.System).GetByIdAsync(ledger.LedgerId, secId))!.AssetClass);
+                (await new SecuritiesRepository(read, TimeProvider.System).GetByIdAsync(ledger.LedgerId, secId, today: null))!.AssetClass);
     }
 
     [Fact]
     public async Task SetSecurityClassification_dryRun_previews_without_writing()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var secId = await ledger.AddSecurityAsync("Other Fund", "FND2", assetClass: null);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var result = await McpWriteTools.SetSecurityClassification(
             Guard, new SecuritiesRepository(db, TimeProvider.System), ledger.LedgerId, secId,
             assetClass: "equity", dryRun: true);
         Assert.True(result.Ok);
         Assert.Contains("asset=equity", result.After);
 
-        await using var read = _fixture.NewDbContext();
-        Assert.Null((await new SecuritiesRepository(read, TimeProvider.System).GetByIdAsync(ledger.LedgerId, secId))!.AssetClass);
+        await using var read = Db.NewDbContext();
+        Assert.Null((await new SecuritiesRepository(read, TimeProvider.System).GetByIdAsync(ledger.LedgerId, secId, today: null))!.AssetClass);
     }
 
     [Fact]
     public async Task SetTransactionCategory_recategorizes_a_simple_transaction()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var source = await ledger.AddCategoryAsync("Dining", "expense");
         var target = await ledger.AddCategoryAsync("Groceries", "expense");
         var (fromLeg, _) = await ledger.AddTransactionPairAsync(bank.Id, source.Id, -25m, Utc(10));
         var headerId = await ledger.ResolveHeaderIdAsync(fromLeg);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var outcome = await new TransactionsRepository(db, TimeProvider.System)
             .RecategorizeAsync(ledger.LedgerId, headerId, target.Id, dryRun: false);
 
@@ -232,7 +248,7 @@ public sealed class McpWriteSurfaceTests
         Assert.Equal("Dining", outcome.BeforeCategory);
         Assert.Equal("Groceries", outcome.AfterCategory);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         Assert.Equal(0, await read.TxnLegs
             .CountAsync(l => l.HeaderId == headerId && l.AccountId == source.Id));
         Assert.Equal(1, await read.TxnLegs
@@ -242,19 +258,19 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task SetTransactionCategory_dryRun_previews_without_writing()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var source = await ledger.AddCategoryAsync("Dining", "expense");
         var target = await ledger.AddCategoryAsync("Groceries", "expense");
         var (fromLeg, _) = await ledger.AddTransactionPairAsync(bank.Id, source.Id, -25m, Utc(13));
         var headerId = await ledger.ResolveHeaderIdAsync(fromLeg);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var outcome = await new TransactionsRepository(db, TimeProvider.System)
             .RecategorizeAsync(ledger.LedgerId, headerId, target.Id, dryRun: true);
         Assert.Equal(TransactionsRepository.RecategorizeResult.Ok, outcome.Result);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         Assert.Equal(1, await read.TxnLegs
             .CountAsync(l => l.HeaderId == headerId && l.AccountId == source.Id));  // unchanged
     }
@@ -262,7 +278,7 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task SetTransactionCategory_rejects_split_and_transfer()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var savings = await ledger.AddBankAccountAsync("savings");
         var cat = await ledger.AddCategoryAsync("Dining", "expense");
@@ -275,7 +291,7 @@ public sealed class McpWriteSurfaceTests
         var (_, splitHeader) = await ledger.AddMultiSplitAsync(
             bank.Id, new[] { (cat.Id, 10m), (cat2.Id, 20m) }, Utc(12));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var repo = new TransactionsRepository(db, TimeProvider.System);
 
         Assert.Equal(TransactionsRepository.RecategorizeResult.NoCategoryLeg,
@@ -291,7 +307,7 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task SetSplitPostingCategory_repoints_the_fromCategory_posting_and_leaves_the_rest()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense");
         var target = await ledger.AddCategoryAsync("Household", "expense");
@@ -300,7 +316,7 @@ public sealed class McpWriteSurfaceTests
         var (_, headerId) = await ledger.AddMultiSplitAsync(
             bank.Id, new[] { (groceries.Id, 30m), (target.Id, 20m) }, Utc(9));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var outcome = await new TransactionsRepository(db, TimeProvider.System).RecategorizeSplitPostingsAsync(
             ledger.LedgerId, headerId, groceries.Id, dining.Id, dryRun: false);
 
@@ -309,7 +325,7 @@ public sealed class McpWriteSurfaceTests
         Assert.Equal("Groceries", outcome.FromCategory);
         Assert.Equal("Dining", outcome.ToCategory);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var catNames = await (
             from l in read.TxnLegs
             join a in read.Accounts on l.AccountId equals a.Id
@@ -327,17 +343,17 @@ public sealed class McpWriteSurfaceTests
     {
         // Recategorizing rebuilds the FULL posting set and hands it to PatchAsync,
         // which renumbers posting_index from array position. So the order of the
-        // list this repository builds IS the user's split order — and it used to be
-        // built from a leg read with no ORDER BY, which Postgres does not order for
-        // you. Recategorizing one line of a long paycheck split could silently
-        // reshuffle every other line of it, in the register and in the editor.
+        // list this repository builds IS the user's split order — and a leg read with
+        // no ORDER BY is not ordered by Postgres. Built that way, recategorizing one
+        // line of a long paycheck split could silently reshuffle every other line of
+        // it, in the register and in the editor.
         //
-        // HONEST LIMIT: whether this test FAILS without the fix depends on the heap
-        // order a seq scan happens to return, so it is a regression guard on the
-        // invariant rather than a proof of the bug. The two sequential calls make a
+        // HONEST LIMIT: whether this test FAILS without an ORDER BY depends on the
+        // heap order a seq scan happens to return, so it is a regression guard on the
+        // invariant rather than a proof of the failure. The two sequential calls make a
         // permutation likelier (each rewrites every leg, moving rows in the heap),
         // but the assertion is the point: the arrangement the user made survives.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var alpha = await ledger.AddCategoryAsync("Alpha", "expense");
         var bravo = await ledger.AddCategoryAsync("Bravo", "expense");
@@ -353,14 +369,14 @@ public sealed class McpWriteSurfaceTests
             Utc(9));
 
         // Move the MIDDLE posting twice, so every leg gets rewritten both times.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.Equal(
                 TransactionsRepository.SplitPostingRecategorizeResult.Ok,
                 (await new TransactionsRepository(db, TimeProvider.System).RecategorizeSplitPostingsAsync(
                     ledger.LedgerId, headerId, charlie.Id, midway.Id, dryRun: false)).Result);
         }
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.Equal(
                 TransactionsRepository.SplitPostingRecategorizeResult.Ok,
@@ -368,7 +384,7 @@ public sealed class McpWriteSurfaceTests
                     ledger.LedgerId, headerId, midway.Id, arrived.Id, dryRun: false)).Result);
         }
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var ordered = await (
             from l in read.TxnLegs
             join a in read.Accounts on l.AccountId equals a.Id
@@ -395,7 +411,7 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task SetSplitPostingCategory_moves_every_fromCategory_posting_in_a_header()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense");
         var target = await ledger.AddCategoryAsync("Household", "expense");
@@ -404,14 +420,14 @@ public sealed class McpWriteSurfaceTests
         var (_, headerId) = await ledger.AddMultiSplitAsync(
             bank.Id, new[] { (groceries.Id, 10m), (groceries.Id, 20m), (target.Id, 5m) }, Utc(9));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var outcome = await new TransactionsRepository(db, TimeProvider.System).RecategorizeSplitPostingsAsync(
             ledger.LedgerId, headerId, groceries.Id, dining.Id, dryRun: false);
 
         Assert.Equal(TransactionsRepository.SplitPostingRecategorizeResult.Ok, outcome.Result);
         Assert.Equal(2, outcome.Moved);   // both Groceries postings
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var catNames = await (
             from l in read.TxnLegs
             join a in read.Accounts on l.AccountId equals a.Id
@@ -425,7 +441,7 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task SetSplitPostingCategory_rejects_a_non_split_and_an_investment()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense");
         var dining = await ledger.AddCategoryAsync("Dining", "expense");
@@ -438,7 +454,7 @@ public sealed class McpWriteSurfaceTests
             brokerage.Id, brokerage.HoldingsAccountId!.Value, sec, 10m, 5m, Utc(10));
         var buyHeader = await ledger.ResolveHeaderIdAsync(buyLeg);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var repo = new TransactionsRepository(db, TimeProvider.System);
 
         // Single-posting bank txn → NotSplit (set_transaction_category handles those).
@@ -454,7 +470,7 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task SetSplitPostingCategory_tool_bulk_previews_then_persists_with_rejects()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense");
         var target = await ledger.AddCategoryAsync("Household", "expense");
@@ -469,7 +485,7 @@ public sealed class McpWriteSurfaceTests
         var ids = new[] { split1, split2, simpleHeader };
 
         // dryRun: moves 2 (one Groceries posting per split), simple rejected, nothing written.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var preview = await McpWriteTools.SetSplitPostingCategory(
                 Guard, new TransactionsRepository(db, TimeProvider.System), ledger.LedgerId, ids,
@@ -479,11 +495,11 @@ public sealed class McpWriteSurfaceTests
             Assert.Equal("Dining", preview.Category);
             Assert.Contains(preview.Rejects, r => r.HeaderId == simpleHeader && r.Reason == "not-a-split");
         }
-        await using (var read = _fixture.NewDbContext())
+        await using (var read = Db.NewDbContext())
             Assert.True(await read.TxnLegs.AnyAsync(l => l.HeaderId == split1 && l.AccountId == groceries.Id));
 
         // Real write.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var result = await McpWriteTools.SetSplitPostingCategory(
                 Guard, new TransactionsRepository(db, TimeProvider.System), ledger.LedgerId, ids,
@@ -492,7 +508,7 @@ public sealed class McpWriteSurfaceTests
             Assert.Equal(2, result.Moved);
             Assert.Single(result.Rejects);
         }
-        await using (var read = _fixture.NewDbContext())
+        await using (var read = Db.NewDbContext())
         {
             Assert.False(await read.TxnLegs.AnyAsync(l =>
                 (l.HeaderId == split1 || l.HeaderId == split2) && l.AccountId == groceries.Id));
@@ -507,7 +523,7 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task BulkSetTransactionCategory_recategorizes_simple_ones_and_lists_rejects()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var savings = await ledger.AddBankAccountAsync("savings");
         var source = await ledger.AddCategoryAsync("Dining", "expense");
@@ -523,7 +539,7 @@ public sealed class McpWriteSurfaceTests
         var h2 = await ledger.ResolveHeaderIdAsync(s2);
         var xferH = await ledger.ResolveHeaderIdAsync(xfer);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var result = await McpWriteTools.SetTransactionCategory(
             Guard, new TransactionsRepository(db, TimeProvider.System), ledger.LedgerId,
             new[] { h1, h2, xferH, split }, target.Id, dryRun: false);
@@ -535,7 +551,7 @@ public sealed class McpWriteSurfaceTests
         Assert.Contains(result.Rejects, r => r.HeaderId == xferH && r.Reason == "transfer");
         Assert.Contains(result.Rejects, r => r.HeaderId == split && r.Reason == "split");
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         // The two simple txns' category legs moved to the target; the split's stayed put.
         Assert.Equal(2, await read.TxnLegs
             .CountAsync(l => l.LedgerId == ledger.LedgerId && l.AccountId == target.Id));
@@ -544,13 +560,13 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task BulkSetTransactionCategory_rejects_whole_call_when_target_is_not_a_category()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var source = await ledger.AddCategoryAsync("Dining", "expense");
         var (s1, _) = await ledger.AddTransactionPairAsync(bank.Id, source.Id, -25m, Utc(14));
         var h1 = await ledger.ResolveHeaderIdAsync(s1);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         // Target is a bank account, not a category → batch-level reject, nothing written.
         var result = await McpWriteTools.SetTransactionCategory(
             Guard, new TransactionsRepository(db, TimeProvider.System), ledger.LedgerId, new[] { h1 }, bank.Id, dryRun: false);
@@ -558,7 +574,7 @@ public sealed class McpWriteSurfaceTests
         Assert.False(result.Ok);
         Assert.Equal("target-category-not-in-ledger", result.Error);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         Assert.Equal(1, await read.TxnLegs
             .CountAsync(l => l.HeaderId == h1 && l.AccountId == source.Id)); // untouched
     }
@@ -566,14 +582,14 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task BulkSetTransactionCategory_dryRun_previews_without_writing()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var source = await ledger.AddCategoryAsync("Dining", "expense");
         var target = await ledger.AddCategoryAsync("Groceries", "expense");
         var (s1, _) = await ledger.AddTransactionPairAsync(bank.Id, source.Id, -25m, Utc(16));
         var h1 = await ledger.ResolveHeaderIdAsync(s1);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var result = await McpWriteTools.SetTransactionCategory(
             Guard, new TransactionsRepository(db, TimeProvider.System), ledger.LedgerId, new[] { h1 }, target.Id, dryRun: true);
 
@@ -581,7 +597,7 @@ public sealed class McpWriteSurfaceTests
         Assert.True(result.DryRun);
         Assert.Equal(1, result.Recategorized);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         Assert.Equal(1, await read.TxnLegs
             .CountAsync(l => l.HeaderId == h1 && l.AccountId == source.Id)); // unchanged
     }
@@ -591,18 +607,18 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task RenameTag_renames_in_place_and_rejects_a_name_clash()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var work = await ledger.AddBareTagAsync("work");
         await ledger.AddBareTagAsync("personal");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var repo = new TagsRepository(db);
 
         Assert.True((await McpWriteTools.RenameTag(Guard, repo, ledger.LedgerId, work, newName: "job")).Ok);
         // Renaming onto an existing name is refused (merge_tags is the tool for that).
         Assert.False((await McpWriteTools.RenameTag(Guard, repo, ledger.LedgerId, work, newName: "personal")).Ok);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         Assert.True(await read.Tags.AnyAsync(t => t.Id == work && t.Name == "job"));
         Assert.True(await read.Tags.AnyAsync(t => t.Name == "personal" && t.LedgerId == ledger.LedgerId));
     }
@@ -610,59 +626,70 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task MergeTags_repoints_assignments_and_deletes_source()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("Dining", "expense");
         var (leg1, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -10m, Utc(17));
         var (leg2, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -20m, Utc(18));
-        var h1 = await ledger.ResolveHeaderIdAsync(leg1);
-        var reimburse = await ledger.AddTagAsync(leg1, "reimburse");      // source, on h1
-        var reimbursable = await ledger.AddTagAsync(leg2, "reimbursable"); // target, on h2
+        await ledger.SetSideTagsAsync(leg1, bank.Id, ["reimburse"], bank.Id);      // source, on the first
+        await ledger.SetSideTagsAsync(leg2, bank.Id, ["reimbursable"], bank.Id);   // target, on the second
+        var reimburse = await TagIdAsync(ledger, "reimburse");
+        var reimbursable = await TagIdAsync(ledger, "reimbursable");
 
-        await using var db = _fixture.NewDbContext();
+        // As the request context runs it: the merging member's user on the connection,
+        // which the saved-report repoint checks for an owner or editor grant.
+        await using var db = WriterAs(ledger.UserId);
         var result = await McpWriteTools.MergeTags(
             Guard, new TagsRepository(db), ledger.LedgerId, reimburse, reimbursable);
         Assert.True(result.Ok);
 
-        await using var read = _fixture.NewDbContext();
-        Assert.False(await read.Tags.AnyAsync(t => t.Id == reimburse));                       // source gone
-        Assert.True(await read.TxnHeaderTags.AnyAsync(x => x.HeaderId == h1 && x.TagId == reimbursable)); // repointed
+        await using var read = Db.NewDbContext();
+        Assert.False(await read.Tags.AnyAsync(t => t.Id == reimburse));                         // source gone
+        Assert.True(await read.TxnLegTags.AnyAsync(x => x.LegId == leg1 && x.TagId == reimbursable)); // repointed
+    }
+
+    private async Task<Guid> TagIdAsync(SyntheticLedger ledger, string name)
+    {
+        await using var db = Db.NewDbContext();
+        return await db.Tags.Where(t => t.LedgerId == ledger.LedgerId && t.Name == name).Select(t => t.Id).SingleAsync();
     }
 
     [Fact]
     public async Task DeleteTag_removes_the_tag_and_cascades_its_assignments()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("Dining", "expense");
         var (leg, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -10m, Utc(19));
-        var temp = await ledger.AddTagAsync(leg, "temp");
+        await ledger.SetSideTagsAsync(leg, bank.Id, ["temp"], bank.Id);
+        var temp = await TagIdAsync(ledger, "temp");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         Assert.True((await McpWriteTools.DeleteTag(Guard, new TagsRepository(db), ledger.LedgerId, temp)).Ok);
 
-        await using var read = _fixture.NewDbContext();
-        Assert.False(await read.Tags.AnyAsync(t => t.Id == temp));            // gone
-        Assert.False(await read.TxnHeaderTags.AnyAsync(x => x.TagId == temp)); // assignment cascaded
+        await using var read = Db.NewDbContext();
+        Assert.False(await read.Tags.AnyAsync(t => t.Id == temp));          // gone
+        Assert.False(await read.TxnLegTags.AnyAsync(x => x.TagId == temp)); // assignment cascaded
     }
 
     [Fact]
     public async Task CleanupUnusedTags_removes_only_zero_use_tags()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("Dining", "expense");
         var (leg, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -10m, Utc(20));
-        var used = await ledger.AddTagAsync(leg, "used");
+        await ledger.SetSideTagsAsync(leg, bank.Id, ["used"], bank.Id);
+        var used = await TagIdAsync(ledger, "used");
         await ledger.AddBareTagAsync("orphan-a");
         await ledger.AddBareTagAsync("orphan-b");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var result = await McpWriteTools.CleanupUnusedTags(Guard, new TagsRepository(db), ledger.LedgerId);
         Assert.True(result.Ok);
         Assert.Contains("removed 2", result.After);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         Assert.Equal(1, await read.Tags.CountAsync(t => t.LedgerId == ledger.LedgerId)); // only 'used' remains
         Assert.True(await read.Tags.AnyAsync(t => t.Id == used));
     }
@@ -672,28 +699,72 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task Price_add_update_delete_round_trips_and_marks_manual()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var secId = await ledger.AddSecurityAsync("Some Fund", "FND");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var repo = new SecuritiesRepository(db, TimeProvider.System);
 
-        var add = await McpWriteTools.AddPrice(Guard, repo, ledger.LedgerId, secId, Utc(15), close: 100m);
+        var add = await McpWriteTools.AddPrice(Guard, repo, ledger.LedgerId, secId, Utc(15), close: 100m, currency: "usd");
         Assert.True(add.Ok);
         var priceId = add.Id;
 
         var upd = await McpWriteTools.UpdatePrice(Guard, repo, ledger.LedgerId, secId, priceId, close: 105m);
         Assert.True(upd.Ok);
-        await using (var read = _fixture.NewDbContext())
+        await using (var read = Db.NewDbContext())
         {
             var row = await read.SecurityPrices.FirstAsync(p => p.Id == priceId);
             Assert.Equal(105m, row.Price);
+            Assert.Equal("USD", row.CurrencyCode);
             Assert.Equal(PriceSource.Manual, row.Source);   // a hand-entered/edited price owns its day
         }
 
         Assert.True((await McpWriteTools.DeletePrice(Guard, repo, ledger.LedgerId, secId, priceId)).Ok);
-        await using (var read = _fixture.NewDbContext())
+        await using (var read = Db.NewDbContext())
             Assert.False(await read.SecurityPrices.AnyAsync(p => p.Id == priceId));
+    }
+
+    [Fact]
+    public async Task Add_price_without_a_currency_takes_the_latest_prices_currency()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var secId = await ledger.AddSecurityAsync("Some Fund", "FND");
+        await using var db = Writer();
+        var repo = new SecuritiesRepository(db, TimeProvider.System);
+        Assert.True((await McpWriteTools.AddPrice(Guard, repo, ledger.LedgerId, secId, Utc(10), close: 50m, currency: "CHF")).Ok);
+
+        var preview = await McpWriteTools.AddPrice(Guard, repo, ledger.LedgerId, secId, Utc(15), close: 51m, dryRun: true);
+        var add = await McpWriteTools.AddPrice(Guard, repo, ledger.LedgerId, secId, Utc(15), close: 51m);
+
+        Assert.True(preview.Ok);
+        Assert.Contains("CHF", preview.After);
+        Assert.True(add.Ok);
+        Assert.Contains("CHF", add.After);
+        await using var read = Db.NewDbContext();
+        Assert.Equal("CHF", (await read.SecurityPrices.FirstAsync(p => p.Id == add.Id)).CurrencyCode);
+    }
+
+    [Fact]
+    public async Task Add_price_without_a_currency_is_refused_when_none_can_be_inferred()
+    {
+        // No price yet and no account holds it: nothing says what currency the figure is in.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var secId = await ledger.AddSecurityAsync("Some Fund", "FND");
+        await using var db = Writer();
+        var repo = new SecuritiesRepository(db, TimeProvider.System);
+
+        var preview = await McpWriteTools.AddPrice(Guard, repo, ledger.LedgerId, secId, Utc(15), close: 51m, dryRun: true);
+        var add = await McpWriteTools.AddPrice(Guard, repo, ledger.LedgerId, secId, Utc(15), close: 51m);
+        var invalid = await McpWriteTools.AddPrice(Guard, repo, ledger.LedgerId, secId, Utc(15), close: 51m, currency: "EURO");
+
+        Assert.False(preview.Ok);
+        Assert.Equal("security-price-currency-required", preview.Error);
+        Assert.False(add.Ok);
+        Assert.Equal("security-price-currency-required", add.Error);
+        Assert.False(invalid.Ok);
+        Assert.Equal("security-price-currency-invalid", invalid.Error);
+        await using var read = Db.NewDbContext();
+        Assert.False(await read.SecurityPrices.AnyAsync(p => p.SecurityId == secId));
     }
 
     private static AccountsRepository AccountsRepo(AppDbContext db) =>
@@ -702,13 +773,13 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task CreateCategory_creates_a_category()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Writer();
         var r = await McpWriteTools.CreateCategory(Guard, AccountsRepo(db), ledger.LedgerId, "Snacks", "expense");
         Assert.True(r.Ok);
         Assert.NotEqual(Guid.Empty, r.Id);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var acct = await read.Accounts.AsNoTracking().FirstOrDefaultAsync(a => a.Id == r.Id);
         Assert.NotNull(acct);
         Assert.Equal("Snacks", acct!.Name);
@@ -719,28 +790,28 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task RenameCategory_renames()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var cat = await ledger.AddCategoryAsync("Old", "expense");
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var r = await McpWriteTools.RenameCategory(Guard, AccountsRepo(db), ledger.LedgerId, cat.Id, "New");
         Assert.True(r.Ok);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         Assert.Equal("New", (await read.Accounts.AsNoTracking().FirstAsync(a => a.Id == cat.Id)).Name);
     }
 
     [Fact]
     public async Task ReparentCategory_moves_then_blocks_a_cycle()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var parent = await ledger.AddCategoryAsync("Parent", "expense");
         var child = await ledger.AddCategoryAsync("Child", "expense");
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var repo = AccountsRepo(db);
 
         var moved = await McpWriteTools.ReparentCategory(Guard, repo, ledger.LedgerId, child.Id, parent.Id);
         Assert.True(moved.Ok);
-        await using (var read = _fixture.NewDbContext())
+        await using (var read = Db.NewDbContext())
             Assert.Equal(parent.Id, (await read.Accounts.AsNoTracking().FirstAsync(a => a.Id == child.Id)).ParentId);
 
         // Moving the parent under its own (now) child would close a loop → rejected.
@@ -752,15 +823,15 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task UpdateSecurity_sets_ticker_and_name()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var secId = await ledger.AddSecurityAsync("Old Name", ticker: null);
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var r = await McpWriteTools.UpdateSecurity(
             Guard, new SecuritiesRepository(db, TimeProvider.System), ledger.LedgerId, secId, ticker: "NEWX", name: "New Name");
         Assert.True(r.Ok);
 
-        await using var read = _fixture.NewDbContext();
-        var sec = await new SecuritiesRepository(read, TimeProvider.System).GetByIdAsync(ledger.LedgerId, secId);
+        await using var read = Db.NewDbContext();
+        var sec = await new SecuritiesRepository(read, TimeProvider.System).GetByIdAsync(ledger.LedgerId, secId, today: null);
         Assert.Equal("NEWX", sec!.Ticker);
         Assert.Equal("New Name", sec.Name);
     }
@@ -768,9 +839,9 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task SetSecurityComponents_sets_lookthrough_sleeves()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var secId = await ledger.AddSecurityAsync("Balanced Fund", "BAL", assetClass: "multi_asset");
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var sleeves = new[]
         {
             new SecurityComponentDto("equity", "us", 60m),
@@ -779,7 +850,7 @@ public sealed class McpWriteSurfaceTests
         var r = await McpWriteTools.SetSecurityComponents(Guard, new SecuritiesRepository(db, TimeProvider.System), ledger.LedgerId, secId, sleeves);
         Assert.True(r.Ok);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var comps = await new SecuritiesRepository(read, TimeProvider.System).GetComponentsAsync(ledger.LedgerId, secId);
         Assert.Equal(2, comps!.Count);
         Assert.Contains(comps, c => c.AssetClass == "equity" && c.Region == "us" && c.Weight == 60m);
@@ -789,10 +860,10 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task MergeSecurities_repoints_mappings_and_deactivates_source()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddSecurityAsync("Dup Fund", "DUP");
         var target = await ledger.AddSecurityAsync("Keeper Fund", "KEEP");
-        await using (var seed = _fixture.NewDbContext())
+        await using (var seed = Db.NewDbContext())
         {
             seed.ProviderSecurityMappings.Add(new ProviderSecurityMappingRow
             {
@@ -803,11 +874,11 @@ public sealed class McpWriteSurfaceTests
             await seed.SaveChangesAsync();
         }
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var r = await McpWriteTools.MergeSecurities(Guard, new SecuritiesRepository(db, TimeProvider.System), ledger.LedgerId, source, target, dryRun: false);
         Assert.True(r.Ok);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         // Source deactivated (reversible), not deleted.
         Assert.False((await read.Securities.AsNoTracking().FirstAsync(s => s.Id == source)).IsActive);
         Assert.True(await read.Securities.AsNoTracking().AnyAsync(s => s.Id == source));
@@ -819,16 +890,24 @@ public sealed class McpWriteSurfaceTests
 
     // ---- set_transaction_tags (ADR-0081 D6 — the bulk exception) ----
 
+    /// <summary>Every tag stored on the transaction, header or leg: a one-split's
+    /// land on the writing side's leg.</summary>
     private static async Task<List<string>> TagNamesForHeader(AppDbContext db, Guid ledgerId, Guid headerId) =>
-        await (from p in db.TxnHeaderTags.AsNoTracking()
-               where p.HeaderId == headerId && p.LedgerId == ledgerId
-               join t in db.Tags.AsNoTracking() on p.TagId equals t.Id
-               select t.Name).ToListAsync();
+        (await (from p in db.TxnHeaderTags.AsNoTracking()
+                where p.HeaderId == headerId && p.LedgerId == ledgerId
+                join t in db.Tags.AsNoTracking() on p.TagId equals t.Id
+                select t.Name).ToListAsync())
+        .Concat(await (from l in db.TxnLegs.AsNoTracking()
+                       where l.HeaderId == headerId
+                       join p in db.TxnLegTags.AsNoTracking() on l.Id equals p.LegId
+                       join t in db.Tags.AsNoTracking() on p.TagId equals t.Id
+                       select t.Name).ToListAsync())
+        .ToList();
 
     [Fact]
     public async Task SetTransactionTags_bulk_tags_many_headers_and_inserts_a_new_tag_once()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("Dining", "expense");
         var (leg1, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -10m, Utc(3));
@@ -836,16 +915,17 @@ public sealed class McpWriteSurfaceTests
         var h1 = await ledger.ResolveHeaderIdAsync(leg1);
         var h2 = await ledger.ResolveHeaderIdAsync(leg2);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var outcome = await new TransactionsRepository(db, TimeProvider.System)
-            .SetTransactionTagsAsync(ledger.LedgerId, new[] { h1, h2 }, new[] { "reimbursable" }, dryRun: false);
+            .SetTransactionTagsAsync(ledger.LedgerId, new[] { h1, h2 }, bank.Id, new[] { "reimbursable" }, dryRun: false);
 
         Assert.Equal(TransactionsRepository.SetTagsResult.Ok, outcome.Result);
         Assert.Equal(2, outcome.HeaderCount);
 
-        await using var read = _fixture.NewDbContext();
-        // Both headers carry the tag...
-        Assert.Equal(2, await read.TxnHeaderTags.CountAsync(t => t.LedgerId == ledger.LedgerId));
+        await using var read = Db.NewDbContext();
+        // Both transactions carry the tag, on the bank side of each one-split...
+        Assert.Equal(2, await read.TxnLegTags.CountAsync(t => t.LedgerId == ledger.LedgerId));
+        Assert.Equal(0, await read.TxnHeaderTags.CountAsync(t => t.LedgerId == ledger.LedgerId));
         // ...and the brand-new tag hit the dictionary EXACTLY once (resolve-once across
         // the batch — a per-header re-resolve would have inserted a duplicate row).
         Assert.Equal(1, await read.Tags
@@ -855,51 +935,51 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task SetTransactionTags_is_a_replace_set_and_empty_clears()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("Dining", "expense");
         var (leg, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -10m, Utc(5));
         var h = await ledger.ResolveHeaderIdAsync(leg);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Writer())
             await new TransactionsRepository(db, TimeProvider.System)
-                .SetTransactionTagsAsync(ledger.LedgerId, new[] { h }, new[] { "a", "b" }, dryRun: false);
+                .SetTransactionTagsAsync(ledger.LedgerId, new[] { h }, bank.Id, new[] { "a", "b" }, dryRun: false);
 
         // Replace: {a,b} -> {b,c}
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Writer())
             await new TransactionsRepository(db, TimeProvider.System)
-                .SetTransactionTagsAsync(ledger.LedgerId, new[] { h }, new[] { "b", "c" }, dryRun: false);
-        await using (var read = _fixture.NewDbContext())
+                .SetTransactionTagsAsync(ledger.LedgerId, new[] { h }, bank.Id, new[] { "b", "c" }, dryRun: false);
+        await using (var read = Db.NewDbContext())
             Assert.Equal(new[] { "b", "c" },
                 (await TagNamesForHeader(read, ledger.LedgerId, h)).OrderBy(n => n).ToArray());
 
         // Clear: [] removes every pairing.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Writer())
             await new TransactionsRepository(db, TimeProvider.System)
-                .SetTransactionTagsAsync(ledger.LedgerId, new[] { h }, Array.Empty<string>(), dryRun: false);
-        await using (var read = _fixture.NewDbContext())
+                .SetTransactionTagsAsync(ledger.LedgerId, new[] { h }, bank.Id, Array.Empty<string>(), dryRun: false);
+        await using (var read = Db.NewDbContext())
             Assert.Empty(await TagNamesForHeader(read, ledger.LedgerId, h));
     }
 
     [Fact]
     public async Task SetTransactionTags_rejects_whole_batch_when_a_header_is_foreign()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("Dining", "expense");
         var (leg, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -10m, Utc(6));
         var h = await ledger.ResolveHeaderIdAsync(leg);
         var foreign = Guid.NewGuid();
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var outcome = await new TransactionsRepository(db, TimeProvider.System)
-            .SetTransactionTagsAsync(ledger.LedgerId, new[] { h, foreign }, new[] { "x" }, dryRun: false);
+            .SetTransactionTagsAsync(ledger.LedgerId, new[] { h, foreign }, bank.Id, new[] { "x" }, dryRun: false);
 
         Assert.Equal(TransactionsRepository.SetTagsResult.HeadersNotInLedger, outcome.Result);
         Assert.Contains(foreign, outcome.UnknownHeaderIds);
 
         // All-or-nothing: the valid header was NOT tagged, no tag row created.
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         Assert.Empty(await TagNamesForHeader(read, ledger.LedgerId, h));
         Assert.Equal(0, await read.Tags.CountAsync(t => t.LedgerId == ledger.LedgerId && t.Name == "x"));
     }
@@ -907,21 +987,24 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task SetTransactionTags_dryRun_reports_without_writing()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("Dining", "expense");
         var (leg, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -10m, Utc(7));
         var h = await ledger.ResolveHeaderIdAsync(leg);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var outcome = await new TransactionsRepository(db, TimeProvider.System)
-            .SetTransactionTagsAsync(ledger.LedgerId, new[] { h }, new[] { "preview" }, dryRun: true);
+            .SetTransactionTagsAsync(ledger.LedgerId, new[] { h }, bank.Id, new[] { "preview" }, dryRun: true);
 
         Assert.Equal(TransactionsRepository.SetTagsResult.Ok, outcome.Result);
         Assert.Equal(1, outcome.HeaderCount);
         Assert.Contains("preview", outcome.Tags);
+        // The dry run says where the tags would land.
+        Assert.Equal(new SetTransactionTagsPlacement(h, SetTransactionTagsContract.LandsOnSide, null),
+            Assert.Single(outcome.Placements));
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         Assert.Empty(await TagNamesForHeader(read, ledger.LedgerId, h));   // nothing written
         Assert.Equal(0, await read.Tags.CountAsync(t => t.LedgerId == ledger.LedgerId && t.Name == "preview"));
     }
@@ -929,27 +1012,90 @@ public sealed class McpWriteSurfaceTests
     [Fact]
     public async Task SetTransactionTags_tool_summarizes_ok_and_flags_unknown_and_empty()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("Dining", "expense");
         var (leg, _) = await ledger.AddTransactionPairAsync(bank.Id, cat.Id, -10m, Utc(8));
         var h = await ledger.ResolveHeaderIdAsync(leg);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Writer();
         var repo = new TransactionsRepository(db, TimeProvider.System);
 
-        var ok = await McpWriteTools.SetTransactionTags(Guard, repo, ledger.LedgerId, new[] { h }, new[] { "x" });
+        var ok = await McpWriteTools.SetTransactionTags(Guard, repo, ledger.LedgerId, new[] { h }, bank.Id, new[] { "x" });
         Assert.True(ok.Ok);
         Assert.Contains("tagged 1", ok.After);
 
         var bad = await McpWriteTools.SetTransactionTags(
-            Guard, repo, ledger.LedgerId, new[] { Guid.NewGuid() }, new[] { "x" });
+            Guard, repo, ledger.LedgerId, new[] { Guid.NewGuid() }, bank.Id, new[] { "x" });
         Assert.False(bad.Ok);
         Assert.Contains("not-in-ledger", bad.Error);
 
         var empty = await McpWriteTools.SetTransactionTags(
-            Guard, repo, ledger.LedgerId, Array.Empty<Guid>(), new[] { "x" });
+            Guard, repo, ledger.LedgerId, Array.Empty<Guid>(), bank.Id, new[] { "x" });
         Assert.False(empty.Ok);
         Assert.Equal("no-transactions", empty.Error);
+
+        var noAccount = await McpWriteTools.SetTransactionTags(
+            Guard, repo, ledger.LedgerId, new[] { h }, Guid.Empty, new[] { "x" });
+        Assert.False(noAccount.Ok);
+        Assert.Equal("accountId-required", noAccount.Error);
+    }
+
+    [Fact]
+    public async Task SetTransactionTags_refuses_the_whole_call_when_a_row_is_read_only_from_the_account()
+    {
+        // A split's line seen from its category is read-only there: that register
+        // cannot edit its tags. One such row refuses the call, and nothing is tagged,
+        // the one-split that could have been tagged included.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var dining = await ledger.AddCategoryAsync("Dining", "expense");
+        var fuel = await ledger.AddCategoryAsync("Fuel", "expense");
+        var (oneLeg, _) = await ledger.AddTransactionPairAsync(bank.Id, dining.Id, -10m, Utc(9));
+        var one = await ledger.ResolveHeaderIdAsync(oneLeg);
+        var split = await ledger.AddMultiSplitAsync(bank.Id, [(dining.Id, -5m), (fuel.Id, -7m)], Utc(9));
+        var splitHeader = await ledger.ResolveHeaderIdAsync(split.OriginIds[0]);
+
+        await using var db = WriterAs(ledger.UserId);
+        var result = await McpWriteTools.SetTransactionTags(
+            Guard, new TransactionsRepository(db, TimeProvider.System), ledger.LedgerId,
+            new[] { one, splitHeader }, dining.Id, new[] { "x" });
+
+        Assert.False(result.Ok);
+        Assert.Contains(splitHeader.ToString(), result.Error);
+        Assert.Contains(SetTransactionTagsContract.ReadOnlyRowReason, result.Error);
+        Assert.Contains(result.Placements, p => p.TransactionId == splitHeader && p.Refused == SetTransactionTagsContract.ReadOnlyRowReason);
+        await using var read = Db.NewDbContext();
+        Assert.Empty(await TagNamesForHeader(read, ledger.LedgerId, one));
+        Assert.Empty(await TagNamesForHeader(read, ledger.LedgerId, splitHeader));
+    }
+
+    [Fact]
+    public async Task SetTransactionTags_dry_run_says_a_split_takes_the_tags_as_a_whole()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var dining = await ledger.AddCategoryAsync("Dining", "expense");
+        var fuel = await ledger.AddCategoryAsync("Fuel", "expense");
+        var split = await ledger.AddMultiSplitAsync(bank.Id, [(dining.Id, -5m), (fuel.Id, -7m)], Utc(10));
+        var splitHeader = await ledger.ResolveHeaderIdAsync(split.OriginIds[0]);
+
+        await using var db = WriterAs(ledger.UserId);
+        var repo = new TransactionsRepository(db, TimeProvider.System);
+        var preview = await McpWriteTools.SetTransactionTags(
+            Guard, repo, ledger.LedgerId, new[] { splitHeader }, bank.Id, new[] { "trip" }, dryRun: true);
+
+        Assert.True(preview.Ok);
+        Assert.Equal(SetTransactionTagsContract.LandsOnTransaction, Assert.Single(preview.Placements).LandsOn);
+        await using (var read = Db.NewDbContext())
+            Assert.Empty(await TagNamesForHeader(read, ledger.LedgerId, splitHeader));
+
+        var written = await McpWriteTools.SetTransactionTags(
+            Guard, repo, ledger.LedgerId, new[] { splitHeader }, bank.Id, new[] { "trip" });
+        Assert.True(written.Ok);
+        await using var after = Db.NewDbContext();
+        Assert.Equal(1, await after.TxnHeaderTags.CountAsync(t => t.HeaderId == splitHeader));
+        Assert.Equal(0, await (from l in after.TxnLegs where l.HeaderId == splitHeader
+                               join p in after.TxnLegTags on l.Id equals p.LegId select p).CountAsync());
     }
 }

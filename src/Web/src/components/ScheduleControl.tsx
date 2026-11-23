@@ -1,7 +1,9 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import { errorMessage } from '@/lib/errorMessage';
 import { formatRelative } from '@/lib/ledgerOperationDisplay';
+import { pendingTextProps, usePendingChoiceProps } from '@/components/ui/pending';
 
 /** The subset of a schedule this control reads — satisfied by both the
  *  per-ledger Schedule and the global BackupSchedule. */
@@ -75,7 +77,7 @@ export function ScheduleControl({
      * Reminder auto-post: ticking "Auto-post / N days before" on a reminder IS the
      * opt-in, and the API turns the job on when a reminder first asks. A second
      * checkbox here would be a switch the user has to go and find before their first
-     * tick did anything — which was the original defect, one level up.
+     * tick does anything. An opt-in the user has given must not wait on a second one.
      *
      * A RE-ENABLE control still appears when the job has been switched OFF, because it
      * auto-disables after five consecutive failures and a time-only panel would
@@ -84,6 +86,8 @@ export function ScheduleControl({
     enabledElsewhere?: boolean;
 }) {
     const queryClient = useQueryClient();
+    // The on/off switch writes: it holds from the change (pending.ts).
+    const pendingChoiceProps = usePendingChoiceProps();
     const query = useQuery({ queryKey: [...queryKey], queryFn: load });
     const mutation = useMutation({
         mutationFn: (body: ScheduleSaveBody) => save(body),
@@ -108,9 +112,9 @@ export function ScheduleControl({
         const [h, m] = value.split(':').map(Number);
         if (Number.isNaN(h) || Number.isNaN(m)) return;
         mutation.mutate({
-            // `schedule?.enabled ?? true` was wrong and shipped. GET synthesizes
-            // `enabled: false` when no row exists, so the ?? never fired and setting a
-            // time CREATED A DISABLED ROW — after which auto-post could never turn
+            // `schedule?.enabled ?? true` alone is not enough. GET synthesizes
+            // `enabled: false` when no row exists, so the ?? never fires and setting a
+            // time would CREATE A DISABLED ROW — after which auto-post could never turn
             // itself on, because a reminder only creates the schedule when absent.
             // A job that has no disabled state is always saved enabled.
             enabled: enabledElsewhere ? true : (schedule?.enabled ?? true),
@@ -121,9 +125,10 @@ export function ScheduleControl({
     }
 
     // Allow turning OFF even when canEnable is false (you can always disable);
-    // only block turning ON.
-    const toggleDisabled = query.isPending || mutation.isPending
-        || (!canEnable && !(schedule?.enabled ?? false));
+    // only block turning ON. While the schedule is read or saved the switch
+    // waits on it: pending, so it keeps focus (pending.ts), not disabled.
+    const toggleDisabled = !canEnable && !(schedule?.enabled ?? false);
+    const toggleWaits = query.isPending || mutation.isPending;
 
     return (
         <div className="space-y-2">
@@ -131,9 +136,9 @@ export function ScheduleControl({
                 /*
                  * No switch, and no "turn back on" either. This job has no disabled
                  * state: it runs because a reminder asked to be auto-posted, and it stops
-                 * because none does. A re-enable control shipped here briefly and was
-                 * shown for jobs nobody had ever turned on, because GET synthesizes
-                 * `enabled: false` for a job with no row.
+                 * because none does. A re-enable control here would be shown for jobs
+                 * nobody had ever turned on, because GET synthesizes `enabled: false`
+                 * for a job with no row.
                  */
                 <div className="text-sm font-medium">{label}</div>
             ) : (
@@ -142,8 +147,10 @@ export function ScheduleControl({
                         type="checkbox"
                         checked={schedule?.enabled ?? false}
                         disabled={toggleDisabled}
-                        onChange={(e) => setEnabled(e.target.checked)}
-                        className="size-icon-md rounded border-border text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                        className="size-icon-md rounded border-border text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
+                        {...pendingChoiceProps<HTMLInputElement>(toggleWaits, {
+                            onChange: (e) => setEnabled(e.target.checked),
+                        })}
                     />
                     <span>{label}</span>
                 </label>
@@ -156,10 +163,11 @@ export function ScheduleControl({
                 <input
                     type="time"
                     value={timeValue(schedule?.hourLocal ?? 19, schedule?.minuteLocal ?? 0)}
-                    disabled={(!enabledElsewhere && !schedule?.enabled) || mutation.isPending}
+                    disabled={!enabledElsewhere && !schedule?.enabled}
                     onChange={(e) => setTime(e.target.value)}
-                    className="rounded border border-border bg-surface px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
+                    className="rounded border border-border bg-surface px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
                     aria-label="Daily run time"
+                    {...pendingTextProps<HTMLInputElement>(mutation.isPending)}
                 />
                 <span className="text-[0.6875rem]">
                     {schedule?.enabled && !schedule.timezone

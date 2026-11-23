@@ -110,8 +110,10 @@ describe('parseRrule', () => {
     it('parses monthly numeric, last-day, and default day-of-month', () => {
         expect(parseRrule('FREQ=MONTHLY;BYMONTHDAY=10')).toEqual(state({ freq: 'monthly', monthDay: 10 }));
         expect(parseRrule('FREQ=MONTHLY;BYMONTHDAY=-1')).toEqual(state({ freq: 'monthly', monthDay: 'last' }));
-        // MONTHLY with no BYMONTHDAY defaults to day 1
-        expect(parseRrule('FREQ=MONTHLY')).toEqual(state({ freq: 'monthly', monthDay: 1 }));
+        // MONTHLY with no BYMONTHDAY recurs on the start's day; with no start
+        // there is no day to hold, so the editor cannot hold the rule.
+        expect(parseRrule('FREQ=MONTHLY')).toBeNull();
+        expect(parseRrule('FREQ=MONTHLY', '2026-03-18')).toEqual(state({ freq: 'monthly', monthDay: 18 }));
     });
 
     it('tolerates an RRULE: prefix and lowercase keys', () => {
@@ -160,5 +162,50 @@ describe('buildRrule <-> parseRrule round-trip', () => {
         for (const s of samples) {
             expect(humanizeRrule(buildRrule(s))).not.toBe('Custom schedule');
         }
+    });
+});
+
+// RFC 5545 takes a day the rule leaves out from DTSTART, and the server's expander
+// anchors DTSTART at the series start: so does every reading here.
+describe('a rule that names no day', () => {
+    // 2026-03-18 is a Wednesday.
+    const START = '2026-03-18';
+
+    it('reads a monthly rule on the start\'s day', () => {
+        expect(humanizeRrule('FREQ=MONTHLY', START)).toBe('Monthly on the 18th');
+        expect(humanizeRrule('FREQ=MONTHLY;INTERVAL=2', '2026-01-31')).toBe('Every 2 months on the 31st');
+    });
+
+    it('saves a monthly rule unchanged on the same day', () => {
+        const parsed = parseRrule('FREQ=MONTHLY', START)!;
+        expect(parsed.monthDay).toBe(18);
+        expect(buildRrule(parsed)).toBe('FREQ=MONTHLY;BYMONTHDAY=18');
+    });
+
+    it('reads and saves a weekly rule on the start\'s weekday', () => {
+        expect(humanizeRrule('FREQ=WEEKLY', START)).toBe('Every week on Wed');
+        const parsed = parseRrule('FREQ=WEEKLY', START)!;
+        expect(parsed.weekdays).toEqual(['WE']);
+        expect(buildRrule(parsed)).toBe('FREQ=WEEKLY;BYDAY=WE');
+    });
+
+    it('lets a day the rule names win over the start\'s', () => {
+        expect(humanizeRrule('FREQ=MONTHLY;BYMONTHDAY=5', START)).toBe('Monthly on the 5th');
+        expect(parseRrule('FREQ=MONTHLY;BYMONTHDAY=5', START)!.monthDay).toBe(5);
+        expect(parseRrule('FREQ=WEEKLY;BYDAY=MO', START)!.weekdays).toEqual(['MO']);
+    });
+
+    it('takes no day from the start for a rule that places its day another way', () => {
+        expect(humanizeRrule('FREQ=MONTHLY;BYSETPOS=2;BYDAY=MO', START)).toBe('Monthly');
+    });
+
+    it('holds no rule whose parts the editor would drop on save', () => {
+        // Yearly anchors on the start's month and day; a BYMONTH it names would be lost.
+        expect(parseRrule('FREQ=YEARLY;BYMONTH=3', START)).toBeNull();
+        expect(parseRrule('FREQ=MONTHLY;BYMONTHDAY=5;UNTIL=20270101', START)).toBeNull();
+        expect(parseRrule('FREQ=WEEKLY;BYDAY=MO;COUNT=10', START)).toBeNull();
+        expect(parseRrule('FREQ=WEEKLY;INTERVAL=2;BYDAY=MO;WKST=SU', START)).toBeNull();
+        // A yearly rule with nothing else saves as it reads.
+        expect(buildRrule(parseRrule('FREQ=YEARLY', START)!)).toBe('FREQ=YEARLY');
     });
 });

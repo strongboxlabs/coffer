@@ -15,7 +15,9 @@
 export { ApiError, request } from './api/_request';
 export { fetchCurrentUser } from './api/auth';
 export { fetchVersion } from './api/meta';
-export { fetchVisibleLedgers, checkBalanceHealth, repairBalances, checkLedgerConsistency, repairProjection, createLedger, renameLedger, deleteLedger } from './api/ledger';
+export { fetchVisibleLedgers, checkLedgerConsistency, fetchConsistencyState, repairProjection, createLedger, renameLedger, updateLedger, deleteLedger } from './api/ledger';
+export { startDemoLedger, fetchDemoJob } from './api/demo';
+export type { DemoJob, DemoJobPhase } from './api/demo';
 export { fetchLedgerMembers, setLedgerMemberRole, removeLedgerMember } from './api/member';
 export type { LedgerMember } from './types/member';
 export { fetchAdminUsers, setUserDisabled, setUserAdmin, signUserOutEverywhere } from './api/adminUsers';
@@ -36,12 +38,15 @@ export {
     createAccount,
     updateAccount,
     loanPaymentPreview,
-    fetchAccountGroups,
-    createAccountGroup,
-    patchAccountGroup,
-    deleteAccountGroup,
-    addAccountGroupMember,
-    removeAccountGroupMember,
+    fetchAccountBalances,
+    fetchAccountSubtotals,
+    fetchBalanceForecast,
+    fetchAccountFolders,
+    createAccountFolder,
+    renameAccountFolder,
+    moveAccountFolder,
+    deleteAccountFolder,
+    setAccountFolder,
     mapAccountToFeed,
     unbindAccountFromFeed,
     setAccountSyncFromDate,
@@ -58,6 +63,8 @@ export {
 } from './api/category';
 export {
     fetchTags,
+    createTag,
+    fetchTagTransactions,
     patchTag,
     mergeTag,
     deleteTag,
@@ -85,21 +92,26 @@ export {
 export {
     fetchFeedConnections,
     createFeedConnection,
+    renameFeedConnection,
     deleteFeedConnection,
     syncFeedConnection,
     syncAccount,
     syncAllConnections,
     fetchFeedConnectionAccounts,
-    fetchSyncRuns,
     fetchSyncRunDetail,
 } from './api/feed';
-export type { FetchRegisterArgs, RegisterDirection, RegisterStatusCounts } from './api/register';
+export type {
+    EntriesDirection,
+    FetchRegisterArgs,
+    FetchTransactionEntriesArgs,
+    RegisterDirection,
+    RegisterStatusCounts,
+} from './api/register';
 export {
     fetchRegister,
+    fetchTransactionEntries,
     setReconStatus,
     deleteTransaction,
-    unhideTransaction,
-    moveTransactionToAccount,
     fetchIndexBuckets,
     fetchStatusCounts,
     fetchBalancesForHeaders,
@@ -126,14 +138,18 @@ export { fetchPayees } from './api/payee';
 export {
     fetchMcpTokens,
     createMcpToken,
+    renameMcpToken,
     revokeMcpToken,
     fetchOAuthGrants,
+    renameOAuthGrant,
     revokeOAuthGrant,
     fetchMcpSetting,
     setMcpSetting,
+    fetchMcpConnections,
+    renameMcpConnection,
+    revokeMcpConnection,
     fetchMcpClients,
     revokeMcpClient,
-    setMcpClientLabel,
     pruneMcpClients,
     fetchMcpAudit,
     clearMcpAudit,
@@ -143,6 +159,8 @@ export {
     type IssuedMcpToken,
     type OAuthGrantSummary,
     type McpSetting,
+    type McpConnection,
+    type McpConnectionKind,
     type McpClient,
     type McpAuditEntry,
     type McpInvocationStatus,
@@ -155,8 +173,17 @@ export {
     bulkMoveToAccount,
 } from './api/selection';
 export { refreshQuotes } from './api/quote';
+export {
+    fetchBenchmarks,
+    addBenchmark,
+    removeBenchmark,
+    fetchFxRatesView,
+    fetchFxRatePage,
+    addFxRate,
+} from './api/marketSeries';
 export { fetchLedgerOperations } from './api/ledgerOperation';
-export { fetchLedgerOverview } from './api/overview';
+export { fetchLedgerOverview, fetchNetWorthHistory } from './api/overview';
+export { fetchReturns, fetchAllocation } from './api/portfolio';
 export {
     deleteBudgetTarget,
     fetchBudgetProgress,
@@ -167,6 +194,7 @@ export {
 export type {
     BudgetTargetEntry,
     BudgetTargetEntryResult,
+    FillBudgetTargetsRequest,
     FillBudgetTargetsResponse,
 } from './api/budget';
 export {
@@ -175,8 +203,9 @@ export {
     saveQuotesPrefs,
     fetchDashboardPrefs,
     saveDashboardPrefs,
+    deleteDashboardPrefs,
 } from './api/preference';
-export { fetchSchedule, saveSchedule } from './api/schedule';
+export { fetchSchedule, fetchSchedules, saveSchedule } from './api/schedule';
 export {
     BACKUPS_QUERY_KEY,
     fetchBackups,
@@ -195,6 +224,17 @@ export {
     setBackupRetention,
     validateRestoreKek,
 } from './api/backup';
+export {
+    UPGRADE_CONFIRM_PHRASE,
+    UPGRADE_QUERY_KEY,
+    fetchUpgradeStatus,
+    checkForUpgrade,
+    preflightUpgrade,
+    startUpgrade,
+    saveUpgradeSettings,
+    saveUpgradeToken,
+    clearUpgradeToken,
+} from './api/upgrade';
 export {
     fetchMasterKeyStatus,
     revealMasterKey,
@@ -223,7 +263,6 @@ export {
     setReminderActive,
     skipReminder,
     unskipReminder,
-    fireReminder,
     fireReminderBank,
     fireReminderInvestment,
     createReminderBank,
@@ -237,8 +276,10 @@ export {
     createNotificationSubscriber,
     deleteNotificationSubscriber,
     fetchSystemEvents,
+    fetchSystemAttention,
     fetchLedgerAttention,
     fetchLedgerEvents,
+    fetchOutstandingProblems,
     fetchLedgerNotifications,
     fetchLedgerNotificationProviders,
     createLedgerNotificationSubscriber,
@@ -247,6 +288,7 @@ export {
 export {
     specToQuery,
     fetchReportSummary,
+    fetchReturnsSeries,
     fetchSavedReports,
     createSavedReport,
     patchSavedReport,

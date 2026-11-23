@@ -63,9 +63,9 @@ public sealed class BootstrapTokenService
     /// <summary>
     /// Whether first-run setup has happened: the <c>setup.completed</c> marker setup
     /// writes with the first user (backfilled by mig 248). Not "a passkey exists"
-    /// (2026-10-12 audit, S3) — a user may delete their last passkey and keep recovery
-    /// codes, and counting passkeys then re-armed setup on a live install, which put the
-    /// pre-auth whole-database restore back in reach of whoever read the next setup URL.
+    /// (ADR-0105 D7) — a user may delete their last passkey and keep recovery
+    /// codes, and counting passkeys would then re-arm setup on a live install, putting the
+    /// pre-auth whole-database restore back in reach of whoever reads the next setup URL.
     /// </summary>
     private static Task<bool> SetupCompleteAsync(AppDbContext db, CancellationToken cancellationToken) =>
         db.SystemSettings.AnyAsync(

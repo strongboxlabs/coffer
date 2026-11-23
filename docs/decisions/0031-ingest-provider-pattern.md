@@ -1,7 +1,14 @@
 # 0031 — Data ingest provider pattern
 
 * Status: Accepted (direction locked; D1–D5 in §"Open decisions" remain
-  TBD and will resolve in subsequent slices)
+  TBD and will resolve in subsequent slices); Phase 4 amended 2026-11-14 and §2, §4
+  amended 2026-11-16 by [ADR-0114](0114-benchmarks-and-currency-conversion.md) (an OFX import whose statement currency differs from the
+  target account's is refused before the run opens, as is a feed bound to an account in
+  another currency; an ingested amount finer than its account's currency is rounded to
+  the currency's places, the bank's figure is kept, and the row lands needing review,
+  marked as rounded; a CSV layout carries a decimal separator, point or comma, required
+  from mapping schema version 2, and the other character groups the whole part in
+  thousands or lakh-style, the one grouping rule QIF reads by)
 * Date: 2026-05-22
 * Related: ADR-0006 (SimpleFIN over Plaid), ADR-0022 (postings model),
   ADR-0025 (transactions as postings list), ADR-0027 (investment
@@ -10,7 +17,7 @@
 
 ## Context
 
-Today we have one ingest source in production — SimpleFIN — implemented
+There is one live ingest source — SimpleFIN — implemented
 as a single 774-line `SimpleFinSyncService`
 that interleaves HTTP fetch, parse, dedup, needs-review marking,
 `sync_runs` lifecycle, and DB writes. The Moneydance JSON importer
@@ -106,6 +113,16 @@ The orchestrator handles:
   the MD importer's preserved OFX state and future OFX/QFX direct
   importers; they are NOT a SimpleFIN dedup surface.
 - Needs-review flag application per-row
+  *(Amended 2026-11-16, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D15: an amount with more places than its
+  account's currency allows is rounded to the currency's places, half away from zero,
+  before it is written. The bank's figure is kept exactly as sent, in the row's originals
+  (`txn_header_originals.amount`, with its rounded-at-import flag, seeded at import;
+  [ADR-0100](0100-canonical-holds-current-sidecar-holds-original.md)), and the row lands
+  needing review, marked as rounded and showing that figure. This holds on every ingest
+  path: SimpleFIN, OFX/QFX, QIF, CSV, the brokerage CSV shim
+  ([ADR-0098](0098-brokerage-csv-is-a-shim-to-qif.md)) and a pending row that clears
+  (promote-on-clear). The shim hands its cash amounts on exactly, so the one
+  rounding is at the ingest write (settled by Claude, 2026-11-16).)*
 - `sync_runs` row creation + closing (status, counters, errors)
 - Mapping the provider's typed records → `txn_headers` + `txn_legs`
   writes via the existing `TransactionsRepository` and
@@ -146,6 +163,26 @@ CSV is the most format-variant source. We support two tiers:
   debit/credit). The mapping is data, not code; user creates one
   per institution via a column-mapping wizard (queued for the CSV
   slice).
+  *(Amended 2026-11-16, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D15: a mapping also carries a decimal
+  separator, point or comma, as a key of the layout's YAML, so the mapping schema,
+  `CsvMappingValidator` and the MCP mapping tools' descriptions (`validate_csv_mapping`,
+  `save_csv_mapping`) name it. The wizard guesses it from the sample only when a layout
+  is first made, and shows the guess; a saved layout keeps the separator it was saved
+  with and is never guessed again. The key is required in mapping schema version 2:
+  `CsvMappingValidator.CurrentVersion` goes to 2, because a document valid before would
+  now be rejected. A version-1 document, stored or sent, is still accepted and reads with
+  a point, the only reading it ever had, and a layout written without a sample, by hand
+  or through the MCP tools, must name the separator (settled by Claude, 2026-11-16).
+  Each amount cell is read with the layout's separator. The other character may group
+  the whole part, in thousands (a first group of one to three digits, then groups of
+  three) or lakh-style (a first group of one or two digits, groups of two, then a last
+  group of three, with two grouping characters at least), and the first group never
+  starts with a zero: the one grouping rule QIF reads by (ADR-0114 D15). A version-1 layout reads
+  lakh-grouped amounts under a point, as it always did.
+  A cell that cannot be read with it is reported in the preview's warnings as
+  `csv_row_unreadable`, naming the line, and only readable rows are counted. This fixes
+  a defect: the provider read every comma as a thousands separator, so a file written
+  with decimal commas was read a hundred times too large, with no warning.)*
 - **Per-institution custom providers** (e.g.
   `BrokerageCsvProvider : IFileProvider`, provider key
   `"csv-brokerage-a"`) — hand-coded parsing for institutions whose
@@ -188,22 +225,24 @@ agreed; unresolved decisions are surfaced, not papered over).
   provided); null on bank-shape rows + on rows the classifier
   couldn't read.
 - **D2. Investment-action classification ownership.** ~~SimpleFIN
-  sends free-text descriptions only (no Buy/Sell/Div field). Either
+  sends free-text descriptions only (no Buy/Sell/Dividend field). Either
   the provider classifies and tags the action, or the orchestrator
   runs a shared classifier.~~ **Resolved per Phase 3:** the
   provider classifies. Description conventions are provider-
   specific (SimpleFIN's `"YOU BOUGHT ETFA"` vs OFX's `INVTRAN` type
   enum vs CSV's column map), so the regex / lookup table lives
   with the provider. `SimpleFinDescriptionClassifier` covers
-  Buy / Sell / Div / DivReinvest / Transfer; abstains on
+  Buy / Sell / Dividend / Reinvest / Transfer; abstains on
   unrecognized descriptions. Orchestrator stays neutral —
   it sees `Action?` on the typed record and dispatches.
 - **D3. Moneydance importer fate.** In-scope (becomes a batch
   provider; the CLI thins to a generic dispatcher invoking the
-  orchestrator) or out-of-scope (stays transitional per
-  `project_user_bound_data_io` until a Phase-6 user-bound import UI
-  lands). The pattern itself doesn't depend on this; the CLI's
-  refactor is independently scoped.
+  orchestrator) or out-of-scope (stays transitional until a Phase-6
+  user-bound import UI lands). The pattern itself doesn't depend on this; the CLI's
+  refactor is independently scoped. *Amended 2026-10-25:* settled outside this ADR.
+  The import is an in-app action ([ADR-0071](0071-install-provisioning-ui-import-authed-restore.md)),
+  now the only import path; the CLI keeps only the read-only `audit` and
+  `reconcile` diagnostics.
 - **D4. File-provider connection lifecycle.** Either file uploads
   create a synthetic `feed_connection` row per upload (uniform
   `sync_runs.feed_connection_id` lineage), or `sync_runs` gains a
@@ -222,8 +261,7 @@ agreed; unresolved decisions are surfaced, not papered over).
 Phase 3 extends `SimpleFinPullProvider` to brokerage accounts. The
 problem isn't translation (the wire format is identical for bank
 + brokerage on SimpleFIN); it's deciding what to do with cash-flow
-rows that happen to land in an investment account. The Middle
-scope agreed in the design pass:
+rows that happen to land in an investment account. The scope:
 
 ### Description classifier
 
@@ -295,23 +333,24 @@ row (unchanged from Phase 2).
 > mapped ticker or not, and carries the investment detail in the
 > `ingest_*` header columns instead (migration 076 records the
 > decision; migrations 113/114/228 are the columns). The reason is an
-> invariant, not a preference: `trg_validate_posting_role`
-> (migration 057) makes `txn_legs.posting_role` and
-> `txn_headers.action` inseparable, so an "investment-shape row with
+> invariant, not a preference: `txn_legs.posting_role` is set exactly
+> when `txn_headers.action` is. No trigger enforces it (migration 084
+> dropped `trg_validate_posting_role`); the repository code that writes
+> investment rows upholds it (`InvestmentTransactionsRepository`
+> create and patch, `IngestOrchestrator`), so an "investment-shape row with
 > `needs_review=true`" cannot be written without also committing to an
 > action the wire does not reliably carry. The investment shape
 > therefore appears only at Accept, which clears `needs_review` in the
 > same transaction.
 >
-> **Consequence, and the bug it caused.** `action IS NOT NULL` and
-> `needs_review = true` are mutually exclusive on any real row. The
-> investment merge-candidates query was written against step 2 and
-> demanded both, plus a holdings security leg — so it returned an empty
-> list for every row a person could actually be reviewing, which is the
-> only state it is ever invoked in. It shipped that way and stayed
-> green, because the only writer of the state it required is a raw
-> `UPDATE txn_headers SET needs_review = TRUE` in its own test fixture.
-> It now anchors on what an unreviewed row has: the non-category leg
+> **Consequence.** `action IS NOT NULL` and `needs_review = true` are
+> mutually exclusive on any real row. A merge-candidates query written
+> against step 2 — demanding both, plus a holdings security leg —
+> returns an empty list for every row a person could actually be
+> reviewing, which is the only state it is ever invoked in, and only a
+> test fixture's raw `UPDATE txn_headers SET needs_review = TRUE` can
+> make it pass. The investment merge-candidates query anchors on what
+> an unreviewed row has: the non-category leg
 > for the account and date, and `ingest_amount` / `ingest_shares` /
 > `ingest_security_id` for the money, the share count and the security
 > — the same negative leg test the bank anchor has always used.
@@ -354,8 +393,8 @@ that ticker.
 SimpleFIN's `holdings[]` block is not consumed in Phase 3. The
 existing recompute trigger derives `holdings` from `txn_legs`
 once the user upgrades each row. A future slice can add a
-holdings-reconciliation panel (Rich scope from the Phase 3 design
-pass) without churning the contract decided here.
+holdings-reconciliation panel without churning the contract decided
+here.
 
 ## Consequences
 
@@ -418,6 +457,11 @@ Each slice is an independent PR:
    orchestrator's file dedup is origin-scoped on `external_id`
    per mig 105; the OR-branch on `(online_match_fi_id,
    online_match_fitid)` is captured in `docs/maintainer/follow-ups.md`.
+   *(Amended 2026-11-14, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D13: an OFX import whose statement currency
+   differs from the target account's is refused before the run opens
+   (`IngestOrchestrator.RunFileAsync`). Binding a SimpleFIN account whose currency
+   differs from the Coffer account's is refused the same way. Both refusals were
+   settled by Claude.)*
 5. **Phase 5** — CSV generic provider + `feed_csv_mappings` schema
    + column-mapping wizard UI.
 6. **Phase 6** — per-BROKERAGE CSV providers as needed. Shipped for

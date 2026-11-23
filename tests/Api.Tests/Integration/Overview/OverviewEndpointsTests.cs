@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 
 using Coffer.Api.Contracts;
 using Coffer.Api.Db.Entities;
+using Coffer.Api.Db.Repositories;
 using Coffer.Api.Tests.Integration.Infra;
 
 namespace Coffer.Api.Tests.Integration.Overview;
@@ -16,13 +17,11 @@ namespace Coffer.Api.Tests.Integration.Overview;
 /// investment contribution = brokerage cash + holdings market value.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class OverviewEndpointsTests
+public sealed class OverviewEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public OverviewEndpointsTests(PostgresFixture fixture)
+    public OverviewEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -39,7 +38,7 @@ public sealed class OverviewEndpointsTests
     [Fact]
     public async Task Overview_sums_net_worth_across_types_with_investment_value()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
         // Opening balances; the transaction pair below exercises the
         // balance_after path on Checking/Savings (each opening, plus or minus the
@@ -60,7 +59,7 @@ public sealed class OverviewEndpointsTests
         await ledger.AddTransactionPairAsync(
             checkingId, savingsId, 300m, new DateTime(2026, 6, 2, 0, 0, 0, DateTimeKind.Utc));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync($"/api/ledgers/{ledger.LedgerId}/overview");
@@ -73,7 +72,7 @@ public sealed class OverviewEndpointsTests
         Assert.Equal(-200m, dto.TotalLiabilities);
         Assert.Equal(7300m, dto.NetWorth);
         Assert.Equal(1500m, dto.InvestmentsValue);
-        Assert.False(dto.MixedCurrency);
+        Assert.Empty(dto.RateUnavailable);
 
         // Investment roll-up (holdings only): the gain is value less cost, and the
         // percent is that gain over cost.
@@ -96,26 +95,104 @@ public sealed class OverviewEndpointsTests
         Assert.Equal(brokerage.Id, investment.Accounts[0].Id);
     }
 
-    [Fact]
-    public async Task Overview_flags_mixed_currency()
+    /// <summary>Seeds a fetched EUR→USD rate a few days back, covered through today, as
+    /// the rate fetcher writes them (ADR-0114 D6).</summary>
+    private async Task SeedEurUsdAsync(SyntheticLedger ledger, decimal rate)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        await using var db = Db.NewAppDbContextAsUser(ledger.UserId);
+        db.FxRates.Add(new Coffer.Api.Db.Entities.FxRateRow
+        {
+            Id = Guid.NewGuid(), LedgerId = ledger.LedgerId, FromCurrency = "EUR", ToCurrency = "USD",
+            RateDate = today.AddDays(-3), Rate = rate, Source = Coffer.Api.Db.Entities.FxRateSource.Frankfurter,
+        });
+        db.FxPairCoverage.Add(new Coffer.Api.Db.Entities.FxPairCoverageRow
+        {
+            LedgerId = ledger.LedgerId, FromCurrency = "EUR", ToCurrency = "USD", FetchedThroughDate = today,
+        });
+        await db.SaveChangesAsync();
+    }
+
+    /// <summary>
+    /// A ledger whose accounts span currencies converts every combined figure into its
+    /// reporting currency at the latest rate (ADR-0114 D7); each account row stays in its
+    /// own currency.
+    /// </summary>
+    [Fact]
+    public async Task Overview_converts_combined_figures_and_keeps_account_rows_native()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);   // reporting currency USD
         await AddAccountAsync(ledger, "bank", "USD Account", 100m, "USD");
         await AddAccountAsync(ledger, "bank", "EUR Account", 50m, "EUR");
+        await SeedEurUsdAsync(ledger, 1.1m);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var dto = (await (await client.GetAsync($"/api/ledgers/{ledger.LedgerId}/overview"))
             .Content.ReadFromJsonAsync<LedgerOverviewDto>())!;
-        Assert.True(dto.MixedCurrency);
+        Assert.Equal("USD", dto.CurrencyCode);
+        Assert.Equal(155m, dto.NetWorth);
+        Assert.Equal(155m, dto.TotalAssets);
+        Assert.Empty(dto.RateUnavailable);
+        var bank = dto.AccountGroups.Single(g => g.AccountType == "bank");
+        Assert.Equal(155m, bank.Subtotal);
+        var eur = bank.Accounts.Single(a => a.CurrencyCode == "EUR");
+        Assert.Equal(50m, eur.Balance);
+    }
+
+    /// <summary>
+    /// A missing rate fails closed (ADR-0114 D9): every combined figure that needs it is
+    /// null and names the pair, never a partial sum; the account rows keep their own
+    /// figures.
+    /// </summary>
+    [Fact]
+    public async Task Overview_with_a_missing_rate_is_null_and_names_it_never_a_partial_sum()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await AddAccountAsync(ledger, "bank", "USD Account", 100m, "USD");
+        await AddAccountAsync(ledger, "bank", "EUR Account", 50m, "EUR");
+
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var dto = (await (await client.GetAsync($"/api/ledgers/{ledger.LedgerId}/overview"))
+            .Content.ReadFromJsonAsync<LedgerOverviewDto>())!;
+        Assert.Null(dto.NetWorth);
+        Assert.Null(dto.TotalAssets);
+        var why = Assert.Single(dto.RateUnavailable);
+        Assert.Equal(("EUR", "USD", RateUnavailable.Code), (why.FromCurrency, why.ToCurrency, why.Reason));
+        var bank = dto.AccountGroups.Single(g => g.AccountType == "bank");
+        Assert.Null(bank.Subtotal);
+        Assert.Equal(100m, bank.Accounts.Single(a => a.CurrencyCode == "USD").Balance);
+        Assert.Equal(50m, bank.Accounts.Single(a => a.CurrencyCode == "EUR").Balance);
+    }
+
+    /// <summary>The portfolio is in the ledger's reporting currency, whatever its
+    /// brokerages are kept in (ADR-0114 D7).</summary>
+    [Fact]
+    public async Task Portfolio_figures_are_in_the_reporting_currency()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db, currencyCode: "EUR");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+        var created = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/accounts",
+            new CreateAccountRequest { Name = "Brokerage A", AccountType = "investment", CurrencyCode = "GBP" });
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+
+        var dto = (await (await client.GetAsync($"/api/ledgers/{ledger.LedgerId}/overview"))
+            .Content.ReadFromJsonAsync<LedgerOverviewDto>())!;
+        Assert.Equal("EUR", dto.CurrencyCode);
+        Assert.Equal("EUR", dto.Portfolio.CurrencyCode);
+        Assert.Equal("GBP", dto.AccountGroups.Single(g => g.AccountType == "investment").Accounts[0].CurrencyCode);
     }
 
     [Fact]
     public async Task Overview_returns_422_on_unknown_ledger()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync($"/api/ledgers/{Guid.NewGuid()}/overview");
@@ -127,12 +204,12 @@ public sealed class OverviewEndpointsTests
     {
         // ADR-0085: net worth reflects real value; is_active is a UI-surfacing
         // flag, not a valuation gate. A closed account still holding value counts.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await AddAccountAsync(ledger, "bank", "Open", 1000m);
         var closedId = await AddAccountAsync(ledger, "bank", "Closed but funded", 4000m);
         await ledger.SetIsActiveAsync(closedId, isActive: false);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync($"/api/ledgers/{ledger.LedgerId}/overview");

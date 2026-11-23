@@ -17,9 +17,8 @@ describe('Line', () => {
 
     it('draws NOTHING for fewer than two points', () => {
         // A one-point polyline is invisible anyway, and rendering it would
-        // leave an empty element for a test to find and believe in. This is
-        // also the behaviour SpendCurve already had, discovered by
-        // characterising it: a projection that is over the ceiling from its
+        // leave an empty element for a test to find and believe in. SpendCurve
+        // behaves the same way: a projection that is over the ceiling from its
         // first step has a single under-ceiling point and draws no accent line.
         expect(svg(<Line points={[PTS[0]!]} className="stroke-accent" />)
             .querySelector('polyline')).toBeNull();

@@ -8,9 +8,9 @@ import { Modal } from '@/components/ui/Modal';
  * Name a delimited-file layout — the one dialog behind every "save this as" and
  * "rename this".
  *
- * <b>A dialog rather than a row that appears in place.</b> The wizard used to reveal a
- * name field inside its Layout bar, which had no way of going away again: once shown it
- * sat there through everything else, and the bar changed height under the reader. A
+ * <b>A dialog rather than a row that appears in place.</b> A name field revealed inside
+ * the wizard's Layout bar has no way of going away again: once shown it sits there
+ * through everything else, and the bar changes height under the reader. A
  * dialog opens, is answered or dismissed, and leaves nothing behind.
  *
  * Shared because the settings panel asks the same question about the same things, and
@@ -56,7 +56,7 @@ export function LayoutNameDialog({
                         className="mt-1 w-full"
                         value={name}
                         autoFocus
-                        placeholder="e.g. Store card statement"
+                        placeholder="e.g. Card statement CSV"
                         onChange={(e) => setName(e.target.value)}
                     />
                 </label>
@@ -69,9 +69,11 @@ export function LayoutNameDialog({
                 <ActionFooter
                     cancel={{ label: 'Cancel', onClick: onClose }}
                     confirm={{
-                        label: pending ? 'Saving…' : submitLabel,
+                        label: submitLabel,
+                        pendingLabel: 'Saving…',
                         type: 'submit',
-                        disabled: trimmed === '' || problem !== null || pending,
+                        disabled: trimmed === '' || problem !== null,
+                        pending,
                     }}
                 />
             </form>

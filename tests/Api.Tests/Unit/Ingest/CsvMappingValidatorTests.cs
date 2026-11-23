@@ -14,12 +14,11 @@ namespace Coffer.Api.Tests.Unit.Ingest;
 public sealed class CsvMappingValidatorTests
 {
     /// <summary>
-    /// The shape of the first real target: a department-store card export. Tab-delimited
-    /// despite a .csv name, no header row, a currency symbol in the amount, and amounts
-    /// signed from the issuer's perspective so a purchase reads positive.
-    /// Synthesised — no real statement data.
+    /// A card-issuer export shape: tab-delimited despite a .csv name, no header row, a
+    /// currency symbol in the amount, and amounts signed from the issuer's perspective so
+    /// a purchase reads positive. Synthesised.
     /// </summary>
-    private const string StoreCardYaml = """
+    private const string CardIssuerYaml = """
         version: 1
         delimiter: tab
         header_rows: 0
@@ -38,7 +37,7 @@ public sealed class CsvMappingValidatorTests
     [Fact]
     public void A_real_world_shape_validates_and_keeps_every_value()
     {
-        var mapping = CsvMappingValidator.Validate(StoreCardYaml, out var errors);
+        var mapping = CsvMappingValidator.Validate(CardIssuerYaml, out var errors);
 
         Assert.Empty(errors);
         Assert.NotNull(mapping);
@@ -61,7 +60,7 @@ public sealed class CsvMappingValidatorTests
         // THE reason this validator is strict. A document reader ignores what it does not
         // recognise, so `ammount` would leave the amount unmapped — and the importer
         // would read some other column as money without ever saying so.
-        var yaml = StoreCardYaml.Replace("amount:", "ammount:", StringComparison.Ordinal);
+        var yaml = CardIssuerYaml.Replace("amount:", "ammount:", StringComparison.Ordinal);
 
         var mapping = CsvMappingValidator.Validate(yaml, out var errors);
 
@@ -137,7 +136,7 @@ public sealed class CsvMappingValidatorTests
         // Columns are 1-based because the wizard says "column 1". A 0 accepted as an
         // index would read a different field than its author meant, and in an amount
         // position that means importing a date as money.
-        var yaml = StoreCardYaml.Replace("column: 2", "column: 0", StringComparison.Ordinal);
+        var yaml = CardIssuerYaml.Replace("column: 2", "column: 0", StringComparison.Ordinal);
 
         var mapping = CsvMappingValidator.Validate(yaml, out var errors);
 
@@ -148,7 +147,7 @@ public sealed class CsvMappingValidatorTests
     [Fact]
     public void One_field_cannot_be_both_the_date_and_the_amount()
     {
-        var yaml = StoreCardYaml.Replace("column: 2", "column: 1", StringComparison.Ordinal);
+        var yaml = CardIssuerYaml.Replace("column: 2", "column: 1", StringComparison.Ordinal);
 
         var mapping = CsvMappingValidator.Validate(yaml, out var errors);
 
@@ -161,7 +160,7 @@ public sealed class CsvMappingValidatorTests
     {
         // Otherwise the mapping looks fine and the IMPORT fails on every line, which
         // reads as "the file is broken" rather than "the mapping is".
-        var yaml = StoreCardYaml.Replace("format: MM/dd/yyyy", "format: nonsense", StringComparison.Ordinal);
+        var yaml = CardIssuerYaml.Replace("format: MM/dd/yyyy", "format: nonsense", StringComparison.Ordinal);
 
         var mapping = CsvMappingValidator.Validate(yaml, out var errors);
 
@@ -201,7 +200,7 @@ public sealed class CsvMappingValidatorTests
     {
         // A document meant to be hand-edited has to say WHERE. The delimiter is on line 2.
         var mapping = CsvMappingValidator.Validate(
-            StoreCardYaml.Replace("delimiter: tab", "delimiter: tabs", StringComparison.Ordinal),
+            CardIssuerYaml.Replace("delimiter: tab", "delimiter: tabs", StringComparison.Ordinal),
             out var errors);
 
         Assert.Null(mapping);
@@ -222,13 +221,114 @@ public sealed class CsvMappingValidatorTests
     public void A_document_from_a_future_version_is_refused_by_name()
     {
         // schema_version exists so a stored document is read by the validator that
-        // understood it. Refusing loudly beats reading version 2 keys as unknown ones.
-        var yaml = StoreCardYaml.Replace("version: 1", "version: 2", StringComparison.Ordinal);
+        // understood it. Refusing loudly beats reading a later version's keys as unknown ones.
+        var yaml = CardIssuerYaml.Replace("version: 1", "version: 3", StringComparison.Ordinal);
 
         var mapping = CsvMappingValidator.Validate(yaml, out var errors);
 
         Assert.Null(mapping);
-        Assert.Contains(errors, e => e.Path == "version" && e.Message.Contains("Unsupported version 2"));
+        Assert.Contains(errors, e => e.Path == "version" && e.Message.Contains("Unsupported version 3"));
+    }
+
+    // --- the decimal separator (ADR-0114 D15) -------------------------------------
+
+    /// <summary>A version-2 document, its amount block given per shape.</summary>
+    private static string Version2(string amount) => $"""
+        version: 2
+        delimiter: semicolon
+        date:
+          column: 1
+          format: dd.MM.yyyy
+        payee:
+          column: 2
+        amount:
+        {amount}
+        """;
+
+    private static string SignedAmount(string separatorLine) =>
+        "  shape: signed\n  column: 3\n" + separatorLine;
+
+    private static string DebitCreditAmount(string separatorLine) =>
+        "  shape: debit_credit\n  debit_column: 3\n  credit_column: 4\n" + separatorLine;
+
+    [Theory]
+    [InlineData("signed", "point", CsvDecimalSeparator.Point)]
+    [InlineData("signed", "comma", CsvDecimalSeparator.Comma)]
+    [InlineData("debit_credit", "point", CsvDecimalSeparator.Point)]
+    [InlineData("debit_credit", "comma", CsvDecimalSeparator.Comma)]
+    public void A_version_2_document_reads_with_the_separator_it_names(
+        string shape, string name, CsvDecimalSeparator expected)
+    {
+        var line = $"  decimal_separator: {name}";
+        var yaml = Version2(shape == "signed" ? SignedAmount(line) : DebitCreditAmount(line));
+
+        var mapping = CsvMappingValidator.Validate(yaml, out var errors);
+
+        Assert.Empty(errors);
+        Assert.Equal(CsvMappingValidator.CurrentVersion, mapping!.Version);
+        Assert.Equal(expected, mapping.DecimalSeparator);
+    }
+
+    [Theory]
+    [InlineData("signed")]
+    [InlineData("debit_credit")]
+    public void A_version_2_document_without_a_decimal_separator_is_refused(string shape)
+    {
+        // A layout written without a sample has nothing else to say which character
+        // its file writes decimals after, and guessing at import would read a decimal
+        // comma as grouping, silently.
+        var yaml = Version2(shape == "signed" ? SignedAmount("") : DebitCreditAmount(""));
+
+        var mapping = CsvMappingValidator.Validate(yaml, out var errors);
+
+        Assert.Null(mapping);
+        var problem = Assert.Single(errors);
+        Assert.Equal("amount.decimal_separator", problem.Path);
+        Assert.Equal("Required, and missing.", problem.Message);
+    }
+
+    [Fact]
+    public void A_decimal_separator_that_is_not_a_name_is_refused_with_the_names_it_could_be()
+    {
+        var yaml = Version2(SignedAmount("  decimal_separator: dot"));
+
+        var mapping = CsvMappingValidator.Validate(yaml, out var errors);
+
+        Assert.Null(mapping);
+        var problem = Assert.Single(errors);
+        Assert.Equal("amount.decimal_separator", problem.Path);
+        Assert.Equal(11, problem.Line);
+        Assert.Equal("'dot' is not a decimal separator. Use one of: "
+            + string.Join(", ", CsvMappingValidator.AcceptedDecimalSeparators) + ".", problem.Message);
+        Assert.Equal(["comma", "point"], CsvMappingValidator.AcceptedDecimalSeparators.Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public void A_version_1_document_still_validates_and_reads_with_a_point()
+    {
+        // Every layout saved before version 2 is stored as version 1 and re-validated on
+        // each use, so this has to keep passing forever.
+        var mapping = CsvMappingValidator.Validate(CardIssuerYaml, out var errors);
+
+        Assert.Empty(errors);
+        Assert.Equal(CsvMappingValidator.LegacyVersion, mapping!.Version);
+        Assert.Equal(CsvDecimalSeparator.Point, mapping.DecimalSeparator);
+    }
+
+    [Fact]
+    public void A_decimal_separator_in_a_version_1_document_is_an_unknown_key()
+    {
+        // Version 1 never had the key, so the ordinary unknown-key rule applies: a
+        // document that names a comma and is read with a point would be worse than one
+        // refused.
+        var yaml = CardIssuerYaml + "\n  decimal_separator: comma";
+
+        var mapping = CsvMappingValidator.Validate(yaml, out var errors);
+
+        Assert.Null(mapping);
+        var problem = Assert.Single(errors);
+        Assert.Equal("amount.decimal_separator", problem.Path);
+        Assert.StartsWith("Unknown key 'decimal_separator'.", problem.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -242,19 +342,22 @@ public sealed class CsvMappingValidatorTests
     }
 
     /// <summary>
-    /// The document the web wizard writes, verbatim — guidance comments and all.
+    /// The document the web wizard writes (<c>toYaml</c> in <c>csvSniff.ts</c>), verbatim —
+    /// guidance comments and all — for the card issuer's file with a point as its decimal
+    /// separator.
     /// </summary>
     /// <remarks>
     /// The YAML tab exists so someone can go past the form, and a bare document is a
     /// poor thing to hand them: an unused optional key is invisible, and the amount
     /// block has two shapes neither of which hints at the other. So the wizard writes
     /// the options out as comments. That only works if the gate ignores every one of
-    /// them, which is what these two tests are for.
+    /// them, which is what these two tests are for. The wizard writes version 2, which
+    /// names the decimal separator (ADR-0114 D15).
     /// </remarks>
     private const string WizardYaml = """
         # Coffer CSV mapping. Anything after a # is a comment.
         # Columns are numbered from 1, left to right, as in the grid above.
-        version: 1
+        version: 2
 
         # comma | tab | semicolon | pipe
         delimiter: tab
@@ -276,6 +379,8 @@ public sealed class CsvMappingValidatorTests
         #   column: 4
 
         amount:
+          # point | comma
+          decimal_separator: point
           # signed: one column carrying a +/- sign.
           # debit_credit: two columns, one of them empty on every row.
           shape: signed
@@ -289,6 +394,23 @@ public sealed class CsvMappingValidatorTests
           #   credit_column: 4
         """;
 
+    /// <summary><see cref="WizardYaml"/> with every comment and blank line taken out.</summary>
+    private const string WizardBareYaml = """
+        version: 2
+        delimiter: tab
+        header_rows: 0
+        date:
+          column: 1
+          format: MM/dd/yyyy
+        payee:
+          column: 3
+        amount:
+          decimal_separator: point
+          shape: signed
+          column: 2
+          invert: true
+        """;
+
     [Fact]
     public void Comments_are_guidance_and_never_reach_the_gate()
     {
@@ -299,11 +421,17 @@ public sealed class CsvMappingValidatorTests
         // debit_credit's keys are refused under `shape: signed`. If comments were read
         // as content, this document could not validate at all.
         var commented = CsvMappingValidator.Validate(WizardYaml, out var errors);
-        var bare = CsvMappingValidator.Validate(StoreCardYaml, out _);
+        var bare = CsvMappingValidator.Validate(WizardBareYaml, out var bareErrors);
 
         Assert.Empty(errors);
+        Assert.Empty(bareErrors);
         Assert.NotNull(commented);
         Assert.Equal(bare, commented);
+        // The wizard writes the current version, which names the decimal separator.
+        Assert.Equal(CsvMappingValidator.CurrentVersion, commented!.Version);
+        Assert.Equal(CsvDecimalSeparator.Point, commented.DecimalSeparator);
+        // The card issuer's file read the same way under version 1, but for the version.
+        Assert.Equal(CsvMappingValidator.Validate(CardIssuerYaml, out _)! with { Version = commented.Version }, commented);
     }
 
     [Fact]

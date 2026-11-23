@@ -1,0 +1,56 @@
+-- =============================================================================
+-- 261 — drop trg_account_folders_refuse_cycle + function
+-- =============================================================================
+--
+-- Per [ADR-0032](../decisions/0032-triggers-as-last-resort.md), validation
+-- invariants live in API code, and a trigger is allowed only where no API path
+-- can carry the rule. Migration 258 added this one anyway, as "the backstop for a
+-- race or a caller that skips the API". That is the case ADR-0032's first gate
+-- rules out (engineering-standards §3.3: "Don't add a trigger to cover for a
+-- writer that should be doing the work itself; fix the writer"), so it goes.
+--
+-- INVARIANT (migration 258):
+--     no account folder is its own ancestor.
+--
+-- The trigger fired BEFORE INSERT OR UPDATE OF parent_id ON account_folders,
+-- took a per-ledger advisory lock, walked the new parent's ancestors, and raised
+-- check_violation (constraint name ck_account_folders_acyclic) on reaching the row.
+--
+-- AUDIT — every writer of account_folders.parent_id:
+--
+--   * AccountFoldersRepository.MoveAsync — the one write that names a new parent
+--     for an existing folder. It reads the folder's account type, which never
+--     changes, then locks every folder of that type in the ledger (its section)
+--     before reading anything else, walks the new parent's ancestors, and refuses
+--     a cycle as account-folder-cycle. Two moves in one
+--     section run one after the other, so two moves that would only together make
+--     a cycle cannot both pass: the second walks the tree the first left. That
+--     lock replaces the trigger's advisory lock.
+--   * AccountFoldersRepository.CreateAsync — inserts a new row, which has no
+--     descendants, so it cannot close a cycle.
+--   * AccountFoldersRepository.DeleteAsync — moves the deleted folder's
+--     sub-folders up to its own parent, an ancestor they already had, which removes
+--     ancestry and adds none. It takes the same section lock as a move.
+--   * fn_ledger_snapshot_restore — replays the folders of a snapshot, captured from
+--     a tree that was acyclic when it was taken. The trigger's walk ended at any
+--     parent not yet inserted, so restore never relied on it; the deferred parent
+--     reference still checks every parent at the end of the restore.
+--   * fn_ledger_snapshot_clear / fn_ledger_delete — delete every folder; they set
+--     no parent.
+--   * No MCP tool and no importer writes folders.
+--
+-- Proven by AccountFoldersEndpointsTests:
+--   Folders_nest_move_and_refuse_a_cycle_or_another_types_parent (direct and
+--   indirect cycles), Two_concurrent_moves_that_only_together_make_a_cycle_end_with_
+--   one_refused_and_no_cycle (the race the trigger's lock covered),
+--   A_delete_waits_for_a_move_in_progress_anywhere_in_its_section,
+--   A_snapshot_restore_brings_back_a_nested_folder_tree_and_its_accounts, and
+--   No_trigger_guards_folders_after_migration_261_and_only_the_txn_headers_guards_remain.
+--
+-- Direct-SQL changes to a folder's parent are the operator's responsibility
+-- (engineering-standards §3.3). No data changes: the drop removes a check, and
+-- every existing row already passed it.
+-- =============================================================================
+
+DROP TRIGGER IF EXISTS trg_account_folders_refuse_cycle ON account_folders;
+DROP FUNCTION IF EXISTS fn_account_folders_refuse_cycle();

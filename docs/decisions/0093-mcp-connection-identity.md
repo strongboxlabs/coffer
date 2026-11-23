@@ -1,12 +1,12 @@
 # 0093 — Naming the MCP connection: role-named config, a shown address, operator labels
 
-* Status: Accepted
+* Status: Accepted; D3 superseded by [0107](0107-connections-are-what-people-hold.md)
 * Date: 2026-08-07
 * Related: ADR-0063 (MCP server, `/mcp`, off by default), ADR-0081 (write control-plane, D5 client management), ADR-0013 (WebAuthn origins), ADR-0092 (config that names its role rather than its channel)
 
 ## Context
 
-Three unrelated-looking papercuts turned out to share a cause: nothing in the
+Three unrelated-looking papercuts share a cause: nothing in the
 deployment says *where the MCP server is* or *which connection is which*. An
 operator connecting a client has to know, from outside the product, what address
 to use; and once several clients are connected, the admin list cannot tell them

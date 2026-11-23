@@ -1,6 +1,10 @@
+import { useId, type ChangeEventHandler } from 'react';
+
 import { type RecurrenceState, buildRrule, humanizeRrule } from '@/lib/recurrence';
 import { FieldLabel } from '@/components/ui/FieldLabel';
+import { pendingChoiceProps, pendingTextProps, usePendingButtonProps } from '@/components/ui/pending';
 import { cn } from '@/lib/cn';
+import type { SecondAmountDirection } from '@/lib/secondAmount';
 
 // Recurrence builder for the reminder editor (ADR-0051 slice B). The schedule
 // section of the reminder dialog: a fully controlled view over the closed
@@ -15,9 +19,15 @@ import { cn } from '@/lib/cn';
 // inputs). The server (Ical.Net) owns RRULE expansion; buildRrule/humanizeRrule
 // drive the live preview line only.
 
+// The field primitives' disabled look (pending.ts, HOW IT LOOKS), for a field
+// pending with the save (aria-disabled) and for one that does not apply
+// (disabled: the day of month while "Last day" is ticked) alike.
+const PENDING_LOOK = 'aria-disabled:cursor-not-allowed aria-disabled:opacity-50';
+const DISABLED_LOOK = 'disabled:cursor-not-allowed disabled:opacity-50';
+
 const inputClass =
     'mt-1 w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm text-text ' +
-    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent';
+    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ' + PENDING_LOOK + ' ' + DISABLED_LOOK;
 
 const FREQ_OPTIONS: ReadonlyArray<{ value: RecurrenceState['freq']; label: string; unit: string }> = [
     { value: 'daily', label: 'Daily', unit: 'day' },
@@ -89,19 +99,43 @@ export function defaultSchedule(startDate: string): ScheduleValue {
 export function RecurrenceBuilder(props: {
     value: ScheduleValue;
     onChange: (next: ScheduleValue) => void;
-    disabled?: boolean;
+    /**
+     * The reminder's save is in flight: the fields and the day toggles keep
+     * focus and refuse input (pending.ts).
+     */
+    pending?: boolean;
     /**
      * Can this reminder estimate its amount (mig 220)? Single-posting, non-loan only.
      *
      * Passed in rather than derived here because this component sees the SCHEDULE, not
-     * the postings — its whole prop surface is value/onChange/disabled, and reaching for
+     * the postings — its whole prop surface is value/onChange/pending, and reaching for
      * the transaction shape would couple it to the editor that hosts it. The server
      * rejects the ineligible combination regardless; hiding the control is the courtesy,
      * not the guard.
      */
     estimateEligible?: boolean;
+    /**
+     * The template is a transfer between two real accounts in different currencies, the
+     * money arriving in `accountName` (`received`) or leaving it (`sent`), in
+     * `toCurrency`, against the source in `fromCurrency`: an estimate then sets that side
+     * for each occurrence from the rate on its due date (ADR-0114 D13), and the Schedule
+     * says so under the choice (board OT-4). Null or absent for any other template.
+     */
+    transferAcrossCurrencies?: {
+        accountName: string;
+        fromCurrency: string;
+        toCurrency: string;
+        direction: SecondAmountDirection;
+    } | null;
 }): React.JSX.Element {
-    const { value, onChange, disabled = false, estimateEligible = false } = props;
+    const pendingProps = usePendingButtonProps();
+    const { value, onChange, pending = false, estimateEligible = false } = props;
+    const transfer = props.transferAcrossCurrencies ?? null;
+    const transferLineId = useId();
+    // Every text-like field's pending props, and a choice's with its change.
+    const textField = pendingTextProps<HTMLInputElement>(pending);
+    const choice = <E extends HTMLElement>(change: ChangeEventHandler<E>) =>
+        pendingChoiceProps<E>(pending, { onChange: change });
     const { recurrence } = value;
     const freqMeta = FREQ_OPTIONS.find((f) => f.value === recurrence.freq) ?? FREQ_OPTIONS[0];
 
@@ -145,7 +179,7 @@ export function RecurrenceBuilder(props: {
     const monthDayNumber = typeof recurrence.monthDay === 'number' ? recurrence.monthDay : 1;
 
     const preview =
-        humanizeRrule(buildRrule(recurrence)) +
+        humanizeRrule(buildRrule(recurrence), value.startDate) +
         (value.startDate ? ` · from ${value.startDate}` : '') +
         (value.endDate ? `, until ${value.endDate}` : '');
 
@@ -158,9 +192,8 @@ export function RecurrenceBuilder(props: {
                     <select
                         className={inputClass}
                         value={recurrence.freq}
-                        disabled={disabled}
                         aria-label="Frequency"
-                        onChange={(e) => handleFreq(e.target.value as RecurrenceState['freq'])}
+                        {...choice<HTMLSelectElement>((e) => handleFreq(e.target.value as RecurrenceState['freq']))}
                     >
                         {FREQ_OPTIONS.map((f) => (
                             <option key={f.value} value={f.value}>{f.label}</option>
@@ -175,7 +208,7 @@ export function RecurrenceBuilder(props: {
                             min={1}
                             className={cn(inputClass, 'mt-0 w-fixed-80px')}
                             value={recurrence.interval}
-                            disabled={disabled}
+                            {...textField}
                             aria-label="Interval"
                             onChange={(e) => {
                                 const n = Number.parseInt(e.target.value, 10);
@@ -200,18 +233,20 @@ export function RecurrenceBuilder(props: {
                                 <button
                                     key={d.code}
                                     type="button"
-                                    disabled={disabled}
                                     aria-pressed={on}
                                     aria-label={d.code}
                                     title={d.code}
-                                    onClick={() => toggleWeekday(d.code)}
+                                    {...pendingProps(pending, () => toggleWeekday(d.code))}
                                     className={cn(
                                         'size-control-32px rounded-full border text-xs font-medium transition-colors',
                                         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent',
                                         'disabled:pointer-events-none disabled:opacity-50',
+                                        // Pending looks as disabled does, and keeps its
+                                        // pointer events: no hover (pending.ts).
+                                        'aria-disabled:cursor-default aria-disabled:opacity-50',
                                         on
                                             ? 'border-accent bg-accent text-text-inverse'
-                                            : 'border-border bg-surface text-text hover:bg-surface-hover',
+                                            : 'border-border bg-surface text-text hover:bg-surface-hover aria-disabled:hover:bg-surface',
                                     )}
                                 >
                                     {/* Distinguish the two S / two T columns for screen readers via aria-label. */}
@@ -236,7 +271,8 @@ export function RecurrenceBuilder(props: {
                                 max={31}
                                 className={cn(inputClass, 'mt-1 w-fixed-96px')}
                                 value={monthDayIsLast ? '' : monthDayNumber}
-                                disabled={disabled || monthDayIsLast}
+                                disabled={monthDayIsLast}
+                                {...textField}
                                 aria-label="Day of month"
                                 onChange={(e) => {
                                     const n = Number.parseInt(e.target.value, 10);
@@ -249,12 +285,11 @@ export function RecurrenceBuilder(props: {
                             <input
                                 type="checkbox"
                                 checked={monthDayIsLast}
-                                disabled={disabled}
-                                onChange={(e) =>
+                                className={PENDING_LOOK}
+                                {...choice<HTMLInputElement>((e) =>
                                     emitRecurrence({
                                         monthDay: e.target.checked ? 'last' : dayOfMonth(value.startDate),
-                                    })
-                                }
+                                    }))}
                             />
                             <span className="text-sm text-text">Last day</span>
                         </label>
@@ -274,7 +309,7 @@ export function RecurrenceBuilder(props: {
                     type="date"
                     className={inputClass}
                     value={value.startDate}
-                    disabled={disabled}
+                    {...textField}
                     aria-label="Start date"
                     onChange={(e) => onChange({ ...value, startDate: e.target.value })}
                 />
@@ -289,8 +324,8 @@ export function RecurrenceBuilder(props: {
                             type="radio"
                             name="recurrence-end-mode"
                             checked={value.endDate === null}
-                            disabled={disabled}
-                            onChange={() => onChange({ ...value, endDate: null })}
+                            className={PENDING_LOOK}
+                            {...choice<HTMLInputElement>(() => onChange({ ...value, endDate: null }))}
                         />
                         <span>Never</span>
                     </label>
@@ -299,16 +334,15 @@ export function RecurrenceBuilder(props: {
                             type="radio"
                             name="recurrence-end-mode"
                             checked={value.endDate !== null}
-                            disabled={disabled}
+                            className={PENDING_LOOK}
                             // Selecting "On" seeds a concrete end date (one year
                             // out) so the choice registers and the date field is
                             // populated and editable; "Never" clears it again.
-                            onChange={() =>
+                            {...choice<HTMLInputElement>(() =>
                                 onChange({
                                     ...value,
                                     endDate: value.endDate ?? oneYearAfter(value.startDate),
-                                })
-                            }
+                                }))}
                         />
                         <span>On</span>
                     </label>
@@ -316,7 +350,7 @@ export function RecurrenceBuilder(props: {
                         type="date"
                         className={cn(inputClass, 'mt-0 w-fixed-176px')}
                         value={value.endDate ?? ''}
-                        disabled={disabled}
+                        {...textField}
                         aria-label="End date"
                         onChange={(e) => onChange({ ...value, endDate: e.target.value || null })}
                     />
@@ -333,8 +367,8 @@ export function RecurrenceBuilder(props: {
                                 type="radio"
                                 name="recurrence-amount-mode"
                                 checked={value.estimateSampleCount === null}
-                                disabled={disabled}
-                                onChange={() => onChange({ ...value, estimateSampleCount: null })}
+                                className={PENDING_LOOK}
+                                {...choice<HTMLInputElement>(() => onChange({ ...value, estimateSampleCount: null }))}
                             />
                             <span>As entered</span>
                         </label>
@@ -343,16 +377,17 @@ export function RecurrenceBuilder(props: {
                                 type="radio"
                                 name="recurrence-amount-mode"
                                 checked={value.estimateSampleCount !== null}
-                                disabled={disabled}
-                                onChange={() =>
+                                aria-describedby={transfer !== null && value.estimateSampleCount !== null
+                                    ? transferLineId
+                                    : undefined}
+                                className={PENDING_LOOK}
+                                {...choice<HTMLInputElement>(() =>
                                     onChange({
                                         ...value,
-                                        // 3 is the default the maintainer specified: enough to
-                                        // smooth a variable bill, short enough to track a real
-                                        // change in it.
+                                        // 3 is the default: enough to smooth a variable bill,
+                                        // short enough to track a real change in it.
                                         estimateSampleCount: value.estimateSampleCount ?? 3,
-                                    })
-                                }
+                                    }))}
                             />
                             <span>Estimate from history</span>
                         </label>
@@ -363,12 +398,13 @@ export function RecurrenceBuilder(props: {
                                     type="number"
                                     min={1}
                                     /* Matches the server CHECK, which REJECTS out of range
-                                       rather than clamping — this column shipped with its
-                                       cap, so there are no legacy rows to keep editable. */
+                                       rather than clamping — the column has always carried
+                                       its cap, so there are no out-of-range rows to keep
+                                       editable. */
                                     max={24}
                                     className={cn(inputClass, 'mt-0 w-fixed-64px')}
                                     value={value.estimateSampleCount}
-                                    disabled={disabled}
+                                    {...textField}
                                     aria-label="Occurrences to average"
                                     onChange={(e) => {
                                         const n = Number.parseInt(e.target.value, 10);
@@ -390,6 +426,17 @@ export function RecurrenceBuilder(props: {
                             below is used.
                         </p>
                     ) : null}
+                    {/* Where an estimate's other side comes from, on a transfer between
+                        currencies (ADR-0114 D13, board OT-4). */}
+                    {value.estimateSampleCount !== null && transfer !== null ? (
+                        <p id={transferLineId} className="mt-1 text-[0.6875rem] text-text-subtle">
+                            {transfer.direction === 'received'
+                                ? `The amount received in ${transfer.accountName}`
+                                : `The amount sent from ${transfer.accountName}`} is set from the stored{' '}
+                            {transfer.fromCurrency} to {transfer.toCurrency} rate on each due date. With no
+                            stored rate for that date, the occurrence is not posted until you enter that amount.
+                        </p>
+                    ) : null}
                 </div>
             ) : null}
 
@@ -402,8 +449,8 @@ export function RecurrenceBuilder(props: {
                             type="radio"
                             name="recurrence-commit-mode"
                             checked={value.autoCommitDaysBefore === null}
-                            disabled={disabled}
-                            onChange={() => onChange({ ...value, autoCommitDaysBefore: null })}
+                            className={PENDING_LOOK}
+                            {...choice<HTMLInputElement>(() => onChange({ ...value, autoCommitDaysBefore: null }))}
                         />
                         <span>Manual approval</span>
                     </label>
@@ -412,13 +459,12 @@ export function RecurrenceBuilder(props: {
                             type="radio"
                             name="recurrence-commit-mode"
                             checked={value.autoCommitDaysBefore !== null}
-                            disabled={disabled}
-                            onChange={() =>
+                            className={PENDING_LOOK}
+                            {...choice<HTMLInputElement>(() =>
                                 onChange({
                                     ...value,
                                     autoCommitDaysBefore: value.autoCommitDaysBefore ?? 0,
-                                })
-                            }
+                                }))}
                         />
                         <span>Auto-post</span>
                     </label>
@@ -440,7 +486,7 @@ export function RecurrenceBuilder(props: {
                                 max={90}
                                 className={cn(inputClass, 'mt-0 w-fixed-80px')}
                                 value={value.autoCommitDaysBefore}
-                                disabled={disabled}
+                                {...textField}
                                 aria-label="Days before due"
                                 onChange={(e) => {
                                     const n = Number.parseInt(e.target.value, 10);

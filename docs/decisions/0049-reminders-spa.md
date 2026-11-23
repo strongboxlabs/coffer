@@ -1,6 +1,12 @@
 # 0049 — Reminders SPA (calendar + agenda, parity with a better UX)
 
-* Status: Accepted
+* Status: Accepted; D3 and D10 amended 2026-11-14 by [ADR-0114](0114-benchmarks-and-currency-conversion.md) (D3: an estimating
+  transfer between currencies sets its other side through the one rate rule for each due
+  date, both figures carry "≈", and with no rate its fire is refused, and (2026-11-16, D15)
+  each estimate rounds once at its account's currency's places, half away from zero;
+  D10: a fixed-amount series between currencies seeds both amounts from the template);
+  D10 amended 2026-11-17 (an estimating series' occurrence opens on its estimate, in one
+  currency too)
 * Date: 2026-06-15
 * Related: ADR-0047 (reminders backend + mutation API), ADR-0048 (live/template
   view layer), ADR-0023 (modern-web UX conventions), ADR-0043 (account/category
@@ -23,7 +29,7 @@ The goal is **feature parity with a better UX** (ADR-0021/0023 idioms; clearer
 frequency phrasing; colour+sign amounts) — not a visual copy (per the
 "MD parity = features, not visuals" principle).
 
-## Decisions (agreed with the user)
+## Decisions
 
 ### D1 — One route, calendar + agenda together (parity centerpiece)
 
@@ -34,14 +40,21 @@ view toggle. **Upcoming** = a full-width month-grid calendar over
 chip opens an action popover (see D7). The Home dashboard remains OUT (separate
 ADR); the upcoming endpoint is built to be reusable by it.
 
+*Amended 2026-11-06 ([ADR-0109](0109-overview-is-an-attention-first-home.md)'s third
+slice): the route takes `?reminder=<id>`, which opens that series' editor as the list's
+Edit does, so a link elsewhere (the home screen's Cash ahead) can name the reminder it is
+about.* The parameter holds the dialog open: closing it clears the parameter in place,
+so Back does not reopen it, and focus goes to the tab of the view showing. An id that
+names no series opens nothing and says nothing.
+
 ### D2 — Sub-slice plan (each = one PR)
 
 - **R1 — View & act:** the route + nav + the `reminders` client/types + the
   **recurrence humanizer**, the **full-width month calendar** (chips = the
   occurrences) + the **click-chip action popover** (D7), and the read detail;
   plus the three shape-agnostic actions — **Record/fire**, **Skip**,
-  **Disable/Enable**. No authoring. Ships value over the user's imported
-  reminders (after re-import materializes them).
+  **Disable/Enable**. No authoring. Ships value over imported reminders
+  (once re-import materializes them).
 - **R2 — Author:** the create/edit dialog (bank + investment transaction
   sub-forms reusing the live editors) + the **recurrence picker** (RRULE
   builder) + start/end/auto-commit; and a hard-delete affordance for manual
@@ -55,10 +68,52 @@ detail→legs) and carries none of the editor-extraction / RRULE-builder risk.
 
 ### D3 — Amounts everywhere (Moneydance parity)
 
-The agenda, calendar day-popover, and detail show each occurrence's **signed,
-colour-coded amount** (`formatSignedAmount`; outflow `state-danger`, inflow
-`state-success`). The backend already supplies it (\#202); no per-row detail
-fetch. This was the key gap vs MD and is the most prominent datum in its view.
+The agenda, calendar day-popover, and detail show each occurrence's **signed
+amount** (`formatSignedAmount`). The backend already supplies it (\#202); no
+per-row detail fetch. This was the key gap vs MD and is the most prominent datum
+in its view.
+
+*Amended 2026-10-31: the amount is muted, not colour-coded.* An occurrence is
+unposted, so its amount is not news: `text-text-muted`, never red or green
+(ADR-0023 §H).
+
+*Amended 2026-11-04: each amount is in its series' source account's currency.*
+An occurrence carries that currency (`GET /reminders/upcoming`), and the
+management list's series now carries it too (`GET /reminders` adds
+`currencyCode`, read whether or not the account is active). A series with no
+single source has no currency, and its amount is the template's 0, which is no
+figure: the list prints a dash and a calendar chip prints no amount, never one
+in dollars. Before this, every amount on the page was printed in dollars
+whatever the account's currency.
+
+*Amended 2026-11-06: an estimating series' amount is marked "≈" wherever it is shown.*
+A series set to estimate its amount carries `estimate` on each occurrence. Every surface
+that prints such an amount marks it "≈": the Reminders list, its calendar chips, the
+occurrence dialog, the home screen's Bills rows (upcoming and overdue) and Cash ahead's
+lowest figures. The mark holds whether or not an estimate could be made yet. Until the
+series has posted, the amount is the one entered on the reminder, which stands in for an
+amount not yet known, so it is no more certain than an estimate. One predicate decides it
+(`lib/reminderEstimate.ts`), and its title says which case applies: estimated from recent
+occurrences, or the amount entered until an estimate can be made. A series with a fixed
+amount carries no mark.
+
+*Amended 2026-11-14 by [ADR-0114](0114-benchmarks-and-currency-conversion.md) D13: an estimating transfer between currencies
+estimates both sides.* Its source side is estimated as before. Its other side is set for
+each occurrence from the source estimate at the rate `RateDay.Of` gives the due date
+(ADR-0114 D7, D9: a day before the server's UTC today reads its own rate, today or later
+the latest, and a lapsed pair has none), derived from the two accounts' stored rates
+against the reporting currency (ADR-0114 D13), and `fx_rates` is never written. The other
+side, and the reason it has none, are resolved per occurrence (series and due date), not
+per series as the existing reasons are. With no rate the occurrence has no estimate,
+under a new reason code in `EstimateUnavailable`, and its fire is refused
+(`EstimateUnavailableForFire`), as an estimate with no history is. Both figures are
+estimates, and both carry the "≈" mark above. With no rate, the mark takes the existing
+title for an estimate that cannot be made yet (`estimateTitle`); no new wording is
+added. Under Manual approval the occurrence dialog shows both figures, and the second
+amount can be corrected before posting. *(Extended 2026-11-16, ADR-0114 D15.)* Every
+estimate, the source side's and, between currencies, the other side's, is rounded once
+at its own account's currency's places, half away from zero; the source estimate
+rounded half to even at two places before (settled by Claude, 2026-11-16).
 
 ### D4 — Zero new dependencies (hand-roll, per the pinned-deps posture)
 
@@ -74,20 +129,19 @@ fetch. This was the key gap vs MD and is the most prominent datum in its view.
   i18n edge cases beyond the month label; the day cells are static, but the
   occurrence chips are interactive (they open the action popover — D7).
 
-### D5 — Nav: a Hub link now; sidebar entry deferred to a maintainer decision
+### D5 — Nav: a Hub link now; sidebar entry deferred
 
 R1 ships a **Reminders link on the Ledger Hub header row** (next to Bank feeds /
 Settings) — the on-convention discovery path.
 
 A top-level **sidebar rail entry** is **deferred**, not shipped. There is a real
-conflict: ADR-0047 D7 called for a sidebar entry, but `AuthedSidebar` was
-subsequently built to *deliberately funnel all per-feature management through
-the Hub* ("management funnels through the Hub rather than sprouting a per-feature
-icon in the rail" — its own comment). Reminders are a daily-driver "what's due"
-surface, which is the argument FOR a rail entry; the implemented convention is
-the argument against. Rather than unilaterally override that convention, R1 uses
-the Hub link and the rail-entry call is left to the maintainer (add it, or keep
-Hub-only). This supersedes ADR-0047 D7's sidebar wording.
+conflict: ADR-0047 D7 called for a sidebar entry, but `AuthedSidebar` is built to
+*deliberately funnel all per-feature management through the Hub* ("management
+funnels through the Hub rather than sprouting a per-feature icon in the rail" —
+its own comment). Reminders are a daily-driver "what's due" surface, which is the
+argument FOR a rail entry; the implemented convention is the argument against.
+R1 keeps the convention and uses the Hub link; a rail entry stays an open
+decision (add it, or keep Hub-only). This supersedes ADR-0047 D7's sidebar wording.
 
 ### D6 — Reuse map
 
@@ -102,12 +156,12 @@ draft/fields layer (`useInvestmentTxnDraft`, `legsToDraft`).
 
 ### D7 — Calendar-popover rework (supersedes the R1 side-rail agenda)
 
-R1's first cut paired a read-only calendar with a separate actionable agenda
-side-rail. That drew every occurrence **twice** (a dead calendar chip + an
-agenda row) with no visual correlation between them — the calendar was
-decoration and the agenda didn't need it. The rework makes the **calendar the
+A read-only calendar paired with a separate actionable agenda side-rail draws
+every occurrence **twice** (a dead calendar chip + an agenda row) with no visual
+correlation between them — the calendar is decoration and the agenda doesn't
+need it. The rework makes the **calendar the
 single surface**: one full-width month grid with taller cells, where each chip
-IS its occurrence (payee + signed, colour-coded amount; `●` un-fired vs `✓`
+IS its occurrence (payee + signed amount in the chip's own colour; `●` un-fired vs `✓`
 posted). Clicking an un-fired chip opens a **left-click detail CARD** anchored
 under it — a small `Popover` primitive (`role="dialog"`; Esc / outside-click /
 edge-flip) holding the occurrence detail (payee + amount + date) and **Post** /
@@ -127,7 +181,7 @@ Post or Skip on an occurrence also marks every EARLIER un-acted occurrence
 (within `[start, date)`) as skipped, so the calendar + next-due cursor never
 strand months of overdue chips; the cursor then lands on the first slot after
 the acted one. An earlier ALREADY-FIRED occurrence is preserved — real cash,
-never re-skipped. The user confirmed **Post cascades like Skip**; because a
+never re-skipped. **Post cascades like Skip**; because a
 Post-cascade can abandon un-posted past *income*, the confirm warns and a
 post-action notice reports the exact count + how far back
 (`skippedEarlierCount` / `skippedEarlierFrom` on the fire/skip responses).
@@ -145,6 +199,21 @@ Three fire routes, symmetric per shape:
 - `POST /fire/investment` (`FireInvestmentReminderRequest`) — adjust-at-post for
   an investment series. `FireInvestmentAsync` **reuses** the live
   `InvestmentTransactionsRepository.CreateAsync` (holdings + lots + FIFO).
+
+*Amended 2026-10-24: `POST /fire` is removed.* The API serves only the UI, and the UI
+posts every occurrence through the per-shape routes with the values its dialog shows.
+The verbatim clone remains only as the auto-post job's write
+([ADR-0097](0097-reminder-auto-post.md), 2026-10-24 amendment): it leaves earlier
+occurrences open instead of cascading, and refuses an investment template.
+
+*Amended 2026-10-27 ([ADR-0108](0108-memo-and-tags-per-side.md) D3, D14): what the two fire routes refuse, and the bank
+body's notes.* Both answer 422 `reminder-template-has-no-lines` for a template
+with no lines, which names no account to post from. Both refuse an inactive
+account as a live create does: `/fire/bank` with `account-inactive`,
+`/fire/investment` with the investment create's own inactive-account codes.
+`FireBankReminderRequest` carries the memo and tags in a `notes` member, the
+live create's (ADR-0025, amendment of this date), written from its source
+account.
 
 Both live `CreateAsync` methods gained an occurrence-stamp parameter + an
 ambient-transaction check, so each fire path runs the live create + catch-up
@@ -175,16 +244,31 @@ clicking Skip no longer trips the register's outside-click-cancel),
 gained `sourceAccountId` so the SPA can split bank legs into postings + identify
 the investment brokerage.
 
-**Editor harmonization (ADR-0023 §P):** the investment register editor's
-Cancel/Save moved from top-right of its first row to a bottom footer built with
-the shared `Button` primitive, matching bank — fixing a long-standing
-inconsistency in the live register editors and giving both a consistent footer
-(with the leading slot).
+**Editor footer (ADR-0023 §P):** both register editors put Cancel/Save in a
+bottom footer built with the shared `Button` primitive, with the leading slot.
+
+*(Amended 2026-11-14, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D14.)* A fixed-amount series between currencies
+seeds both amounts from the template, as the reminder series editor does, and neither is
+refilled from a rate. `reminderBankPrefill`, which this dialog and the series editor
+both seed from, builds each posting from the source leg's amount alone and drops the
+counterpart leg's (`reminderOccurrenceDraft.ts`). One fix serves both hosts: it carries
+the counterpart's amount as the posting's second amount. While the second amount
+shows, the dialog layout gains one track for it (ADR-0025, 2026-11-14 amendment).
+
+*(Amended 2026-11-17, decided by the owner.)* An occurrence of an estimating series opens
+on its estimate, not on the template's amount, whatever its currencies. The template legs
+still seed the rest of the editor. When the occurrence has an estimate, `reminderBankPrefill`
+sets the posting's amount to it, and sets the second amount only when the estimate carries
+the other side's (ADR-0114 D13). So the Amount field starts at the figure the dialog's
+subtitle prints with "≈" (D3), the one auto-post writes ([ADR-0097](0097-reminder-auto-post.md)).
+Before, only an estimating transfer between currencies opened on its estimate, and a series in
+one currency opened on the template's amount. With no estimate yet, the series opens on the
+template's amount as before. The field stays editable, and the occurrence posts what it holds.
 
 ### D11 — Skipped occurrences stay visible (read-only trail) + cursor-horizon fix
 
-Two refinements after the catch-up cascade (D8) landed in practice (acting on a
-years-overdue imported reminder skipped dozens of occurrences):
+Two refinements for the catch-up cascade (D8), which on a years-overdue imported
+reminder skips every occurrence in between:
 
 - **Skipped slots are shown, not hidden.** `GET /upcoming` previously dropped
   skipped `(series, date)` slots, so a catch-up that cleared months of overdue

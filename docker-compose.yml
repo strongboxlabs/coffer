@@ -3,9 +3,9 @@ services:
     image: postgres:16
     # Prefixed so a second install on the same Docker engine doesn't collide.
     # Compose already scopes NETWORKS and VOLUMES by project name, but a pinned
-    # container_name is global: a throwaway restore drill, or a dev stack beside a
-    # real install, failed with "container name is already in use" while every other
-    # resource was cleanly separated. Defaults to the old value, so existing installs
+    # container_name is global: a throwaway restore drill, or a dev stack beside
+    # another install, would fail with "container name is already in use" while every
+    # other resource is cleanly separated. Defaults to the old value, so existing installs
     # and the scripts that default to `coffer-postgres` are unaffected.
     container_name: ${COFFER_CONTAINER_PREFIX:-coffer}-postgres
     environment:
@@ -42,16 +42,16 @@ services:
       # The entrypoint exports PGPASSWORD for the db/init phase precisely so
       # that auth-required `local` works, so role creation is unaffected.
       #
-      # APPLIES TO FRESH INSTALLS ONLY: initdb runs once. An install created
-      # before this landed keeps trust in its PGDATA — see
-      # scripts/harden-pg-hba.sh for the one-time fix.
+      # APPLIES TO FRESH INSTALLS ONLY: initdb runs once. A PGDATA initialised
+      # without these flags keeps trust auth — scripts/harden-pg-hba.sh
+      # switches it to scram-sha-256.
       POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---auth-local=scram-sha-256 --auth-host=scram-sha-256}
     # Log every connection and disconnection. With scram everywhere (above) plus
     # RLS as the authorization boundary, the database is the last line of defence,
-    # and until now a successful login left no trace at all — there was no way to
+    # and without these a successful login leaves no trace at all — no way to
     # answer "who connected, as which role, from where?" after the fact. The pair
-    # also makes a credential-stuffing attempt against the published loopback port
-    # visible, and records the session duration a disconnection closes.
+    # also makes a credential-stuffing attempt against a published port visible, and
+    # records the session duration a disconnection closes.
     #
     # Passed as server flags rather than a mounted postgresql.conf so the image's
     # own config keeps working; the entrypoint execs whatever `command` supplies.
@@ -75,8 +75,8 @@ services:
     # A GUI client (pgAdmin, DataGrip) cannot reach into a container and does need a
     # host port. Add docker-compose.dev.yml to your COMPOSE_FILE (see .env.example) or
     # write the three-line ports stanza into a docker-compose.override.yml. Bind it to
-    # 127.0.0.1: on 0.0.0.0 this put the database on every interface of the host,
-    # offering all three roles to anything that could route to it.
+    # 127.0.0.1: on 0.0.0.0 it puts the database on every interface of the host,
+    # offering all three roles to anything that can route to it.
     secrets:
       - postgres_password
       - coffer_service_password
@@ -85,9 +85,8 @@ services:
       - postgres_data:/var/lib/postgresql/data
       # Init scripts run once on a fresh data directory and mint the
       # two application roles. The schema itself is owned by the API's
-      # DbUp runner from PR 3.8 onward (Phase 3 transition flagged in
-      # docs/operations.md) — `db/migrations` is no longer mounted
-      # here.
+      # DbUp runner (docs/operations.md, "Schema application"), so
+      # `db/migrations` is not mounted here.
       - ./db/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
@@ -105,7 +104,7 @@ services:
     # socket dir, then re-execs as `postgres` via gosu — so it needs CHOWN,
     # DAC_OVERRIDE and FOWNER for the former and SETUID/SETGID for the latter.
     #
-    # MEASURED, not guessed: with a bare `cap_drop: [ALL]` a FRESH install dies
+    # With a bare `cap_drop: [ALL]` a FRESH install dies
     # during init with `chmod: changing permissions of '/var/lib/postgresql/data':
     # Operation not permitted` followed by `error: failed switching to 'postgres':
     # operation not permitted` — exit 1, no database. With the five added back,
@@ -152,12 +151,11 @@ services:
     # package). Local `up --build` tags the built image with this same name, so
     # dev and published stay consistent. Pin a version on a recovery host via
     # COFFER_IMAGE_TAG (default: latest).
-    # REQUIRED, with no default on purpose. This used to fall back to the public
-    # package, which meant a private install silently pulled from a registry that
-    # wasn't its own unless someone remembered to override it — and the release
-    # workflow publishes to ghcr.io/<the building repo's owner>/coffer, so the
-    # fallback was wrong for every fork. There is no default that is right for
-    # everyone, so there is no default: scripts/install.sh derives this from the
+    # REQUIRED, with no default on purpose. The release workflow publishes to
+    # ghcr.io/<the building repo's owner>/coffer, so any fixed default is wrong for
+    # every fork: a private install would silently pull from a registry that isn't
+    # its own unless someone remembered to override it. There is no default that is
+    # right for everyone, so there is no default: scripts/install.sh derives this from the
     # repo it fetched its config from and writes it into .env, so the image and
     # the config can't come from different places.
     # Pinned by digest when .env carries the one the release recorded (FU-094): the
@@ -181,6 +179,12 @@ services:
         condition: service_healthy
     environment:
       ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Production}
+      # What the upgrade tab needs to know about this install (ADR-0110). The repository is the one
+      # the host updater resolves releases from, so the app and the host cannot look at different
+      # ones; install.sh writes the other two.
+      COFFER_API__Upgrade__Repository: ${COFFER_REPO:-strongboxlabs/coffer}
+      COFFER_API__Upgrade__InstallDir: ${COFFER_INSTALL_DIR:-}
+      COFFER_API__Upgrade__HostNote: ${COFFER_UPGRADE_HOST_NOTE:-}
       # coffer_app (NOBYPASSRLS) at request time; coffer_service (BYPASSRLS) for
       # migrations + pre-auth. Host is the compose service name.
       # No Password= in either string — it is injected at startup from the
@@ -199,8 +203,7 @@ services:
       # projected k8s Secret work too, though a read-only file cannot be rotated
       # from the UI.
       #
-      # There is no env var carrying the key any more (ADR-0094 removed
-      # COFFER_MASTER_KEK_BASE64). The API mints its own on first boot when the
+      # No env var carries the key (ADR-0094). The API mints its own on first boot when the
       # database holds no wrapped material and the setup ceremony shows it once; an
       # install whose key exists elsewhere supplies it by writing the key file, which
       # is also how a restore carries a source key across.
@@ -220,12 +223,11 @@ services:
       # covers a subdomain. install.sh sets both; duplicates dedupe at runtime
       # (the RP origin set is a HashSet). For a 3rd origin add COFFER_WEB_ORIGIN_2
       # below as Origins__2.
-      # Named for their role, not their slot. `Origins__1` was the MCP host only by
-      # a convention described in prose — nothing enforced it, and Api:Mcp:PublicUrl
-      # below is a second consumer of that value, which would have made the
-      # convention load-bearing. COFFER_WEB_ORIGIN_0/_1 still work: the nested
-      # default keeps every existing .env valid, so an install upgrades without
-      # touching its config.
+      # Named for their role, not their slot. A slot number standing for "the MCP
+      # host" is a convention nothing enforces, and Api:Mcp:PublicUrl below is a
+      # second consumer of that value, which would make the convention load-bearing.
+      # COFFER_WEB_ORIGIN_0/_1 still work: the nested default keeps every existing
+      # .env valid, so an install upgrades without touching its config.
       COFFER_API__Fido2__Origins__0: ${COFFER_WEB_URL:-${COFFER_WEB_ORIGIN_0:-http://localhost:8080}}
       COFFER_API__Fido2__Origins__1: ${COFFER_MCP_URL:-${COFFER_WEB_ORIGIN_1:-http://localhost:8080}}
       # The address an operator hands to an MCP client. Deliberately blank unless
@@ -247,8 +249,9 @@ services:
       # stored backups (FU-072). An upload that would leave less is refused before it is
       # written.
       COFFER_API__Backup__RestoreFreeSpaceReserveMb: ${COFFER_RESTORE_FREE_SPACE_RESERVE_MB:-1024}
-      # The largest Moneydance export the import accepts, in MB (FU-092). Its parse is held
-      # in memory at about 6.5x the file, one export at a time.
+      # The largest Moneydance export the import accepts, in MB (FU-092). Its parse is assumed
+      # to need 6.5x the file in memory (a fixed safety factor: an estimate, not a bound),
+      # one export at a time.
       COFFER_API__Import__MaxUploadMb: ${COFFER_IMPORT_MAX_UPLOAD_MB:-512}
       # Proxies whose X-Forwarded-For/-Proto/-Host are believed (FU-088): addresses and
       # CIDR ranges, comma separated. Empty = loopback and the private ranges, which is
@@ -257,6 +260,11 @@ services:
       # Networks a notification target or SimpleFIN URL may reach beyond public https
       # addresses (FU-082), e.g. a LAN ntfy at 192.168.1.0/24. Empty = none.
       COFFER_API__Outbound__AllowedNetworks: ${COFFER_OUTBOUND_ALLOWED_NETWORKS:-}
+      # Where exchange rates are fetched from (ADR-0114 D4), when a ledger turns on the
+      # Frankfurter opt-in on Settings → Quotes. Empty = the public service,
+      # https://api.frankfurter.dev. Point it at your own Frankfurter container to keep the
+      # requests on your network; it is your URL, so the outbound guard above does not apply.
+      COFFER_QUOTES__Frankfurter__BaseUrl: ${COFFER_FX_RATES_URL:-}
       # Workstation GC (memory-footprint tuning). Server GC — the ASP.NET Core
       # default — allocates a heap per logical CPU and is lazy about returning
       # memory, so on a multi-core host with no pressure the process climbs to
@@ -265,7 +273,7 @@ services:
       # negligible throughput cost. Pairs with mem_limit below.
       DOTNET_gcServer: "0"
     # Every interface unless API_BIND names one (FU-084): the empty default publishes
-    # "8080:8080" exactly as before, IPv6 included, and API_BIND=127.0.0.1 keeps it to
+    # "8080:8080" on every interface, IPv6 included, and API_BIND=127.0.0.1 keeps it to
     # this machine. Docker's port rules bypass ufw and firewalld, so the host firewall
     # does not close it.
     ports:
@@ -283,6 +291,11 @@ services:
       # never carries it either. Back this volume up on its own, or keep the key
       # from System → Encryption somewhere safe.
       - coffer_keys:/app/keys
+      # The upgrade mailbox (ADR-0110): requests the app writes and status the host updater
+      # writes back, in a volume of their own so the host reads them without ever seeing
+      # the data or the keys. Docker seeds a new volume from the image directory, so it is
+      # created owned by the API user on an install that never had it.
+      - coffer_mailbox:/app/mailbox
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -309,6 +322,7 @@ volumes:
   postgres_data:
   coffer_data:
   coffer_keys:
+  coffer_mailbox:
 
 # Database role passwords, as files rather than environment variables (see the
 # environment blocks above for why). Compose bind-mounts each one read-only at

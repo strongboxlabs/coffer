@@ -10,7 +10,7 @@ import { MembersPanel } from './MembersPanel';
 import { SnapshotsPanel } from './SnapshotsPanel';
 import { FeedConnectionsPanel } from './FeedConnectionsPanel';
 import { MarketDataPanel } from './MarketDataPanel';
-import { DashboardLayoutPanel } from './DashboardLayoutPanel';
+import { ExchangeRatesPanel } from './ExchangeRatesPanel';
 import { ActivityPanel } from './ActivityPanel';
 import { NotificationsPanel } from './NotificationsPanel';
 import { ImportLayoutsPanel } from './ImportLayoutsPanel';
@@ -21,13 +21,15 @@ import { SETTINGS_TABS, coerceSettingsTab, type SettingsTab } from './settingsTa
 /**
  * `/ledgers/:ledgerId/settings` — per-ledger settings (ADR-0037 slice 2).
  * Tabbed: General (name + maintenance + danger zone), Snapshots (backups),
- * Bank feeds (SimpleFIN), Quotes (price providers), Activity (ledger-operation
- * timeline), and the Dashboard layout.
+ * Bank feeds (SimpleFIN), Quotes (price and rate providers, benchmarks), Exchange
+ * rates (the pairs the ledger converts at, ADR-0114 D10), Notifications, Activity
+ * (ledger-operation timeline) and Import layouts. The Overview's layout is not
+ * here: it is customised on the Overview itself.
  *
  * The active tab is URL state (`?tab=`) so tabs deep-link and survive refresh,
  * and the Overview's "View activity" link can target the Activity tab directly
- * (ADR-0069 nav swap). Absent/invalid → General. Categories graduated to its
- * own top-level destination in the same swap.
+ * (ADR-0069 nav swap). Absent/invalid → General. Categories left Settings in the
+ * same swap and now has a tab of its own on Structure (ADR-0111).
  */
 export function SettingsPage() {
     const { ledgerId } = useParams({ strict: false }) as { ledgerId: string };
@@ -101,9 +103,10 @@ export function SettingsPage() {
                                 aria-selected={tab === t.id}
                                 onClick={() => setTab(t.id)}
                                 className={
-                                    tab === t.id
-                                        ? '-mb-px border-b-2 border-accent px-3 py-1.5 font-semibold text-text'
-                                        : '-mb-px border-b-2 border-transparent px-3 py-1.5 text-text-muted hover:text-text'
+                                    '-mb-px border-b-2 px-3 py-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent '
+                                    + (tab === t.id
+                                        ? 'border-accent font-semibold text-text'
+                                        : 'border-transparent text-text-muted hover:text-text')
                                 }
                             >
                                 <span className="inline-flex items-center gap-1.5">
@@ -128,11 +131,11 @@ export function SettingsPage() {
                     {tab === 'snapshots' ? <SnapshotsPanel ledgerId={ledgerId} /> : null}
                     {tab === 'feeds' ? <FeedConnectionsPanel ledgerId={ledgerId} /> : null}
                     {tab === 'quotes' ? <MarketDataPanel ledgerId={ledgerId} /> : null}
+                    {tab === 'rates' ? <ExchangeRatesPanel ledgerId={ledgerId} /> : null}
                     {tab === 'notifications' ? (
                         <NotificationsPanel ledgerId={ledgerId} />
                     ) : null}
                     {tab === 'activity' ? <ActivityPanel ledgerId={ledgerId} /> : null}
-                    {tab === 'dashboard' ? <DashboardLayoutPanel ledgerId={ledgerId} /> : null}
                     {tab === 'layouts' ? <ImportLayoutsPanel ledgerId={ledgerId} /> : null}
                 </div>
             </MainPane>

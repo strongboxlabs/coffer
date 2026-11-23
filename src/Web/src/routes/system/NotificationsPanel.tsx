@@ -1,5 +1,6 @@
-import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import {
     fetchNotificationProviders,
@@ -12,11 +13,33 @@ import type { NotificationProvider, NotificationSubscriber } from '@/lib/types';
 import { formatLedgerDateTime } from '@/lib/dates';
 import { errorMessage } from '@/lib/errorMessage';
 import { Button } from '@/components/ui/Button';
+import { Checkbox } from '@/components/ui/Checkbox';
 import { Panel, PanelBody, PanelHead } from '@/components/ui/Panel';
+import { pendingChoiceProps, pendingTextProps } from '@/components/ui/pending';
+import { useRowRemovalFocus } from '@/components/ui/rowRemovalFocus';
+
+/** A field of the add form, which looks as a disabled one does while it is pending. */
+const ADD_FIELD = 'mt-1 w-full rounded border border-border bg-surface p-2 '
+    + 'disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50';
 
 const PROVIDERS_KEY = ['admin-notification-providers'] as const;
 const SUBSCRIBERS_KEY = ['admin-notification-subscribers'] as const;
 const EVENTS_KEY = ['admin-system-events'] as const;
+
+/**
+ * Every notification topic, mirroring the API's `NotificationTopics.All`. A target with no topic
+ * filter receives every topic EXCEPT `upgrade`, which a target receives only by naming it (ADR-0110),
+ * so opting in means sending the full list with it. Keep in step with the API; `NotificationTopicsTests`
+ * pins the API side, and the opt-in test here pins what this panel sends.
+ */
+const ALL_TOPICS = ['backup', 'snapshot', 'sync', 'quotes', 'consistency', 'scheduler', 'upgrade'] as const;
+
+/** A target's topics in words: the full list reads as "all topics", upgrade notices included. */
+function describeTopics(topics: readonly string[] | null | undefined): string {
+    if (!topics || topics.length === 0) return 'all topics';
+    if (ALL_TOPICS.every((t) => topics.includes(t))) return 'all topics, upgrade notices included';
+    return topics.join(', ');
+}
 
 /**
  * Admin — where deployment-scope notifications go (ADR-0096).
@@ -24,7 +47,7 @@ const EVENTS_KEY = ['admin-system-events'] as const;
  * The load-bearing element on this screen is the absence-detection warning. A
  * message-only target (Discord, ntfy, Slack) reaches a phone in seconds when
  * something breaks and says nothing at all when the deployment is dead — which is
- * the failure that ran for days unnoticed. Someone who configures a chat webhook
+ * the failure that otherwise goes unnoticed. Someone who configures a chat webhook
  * and sees a test message arrive will reasonably believe they are covered, so this
  * panel says plainly when they are not.
  */
@@ -53,10 +76,23 @@ export function NotificationsPanel() {
 
     const [subscriberKey, setSubscriberKey] = useState('');
     const [url, setUrl] = useState('');
+    // An added target clears the URL, which leaves Add target disabled with
+    // focus on it; focus goes to the URL field it waits on (ADR-0023 §L).
+    const urlRef = useRef<HTMLInputElement>(null);
     const [minSeverity, setMinSeverity] = useState('warning');
+    // A removed target takes its row's Remove with it: focus goes to the next
+    // row's Remove, the previous row's, or the URL field Add target waits on
+    // (ADR-0023 §L).
+    const removeControl = useRowRemovalFocus(
+        (subscribers.data?.subscribers ?? []).map((s) => s.id),
+        urlRef,
+    );
     // The monitor a heartbeat target will watch. The list comes from the API's coverage
     // map rather than being hardcoded here, so a new job appears without a UI change.
     const [monitors, setMonitors] = useState('');
+    // Off by default and never carried over: an available release reaches a target only by this
+    // being ticked for that target (ADR-0110).
+    const [upgradeNotices, setUpgradeNotices] = useState(false);
 
     const coverage = subscribers.data?.monitorCoverage ?? {};
     const uncovered = Object.keys(coverage).filter((m) => !coverage[m]).sort();
@@ -75,11 +111,15 @@ export function NotificationsPanel() {
                 // Sent only for a heartbeat provider; the API rejects it on a message
                 // one, because a message target is bound to nothing.
                 monitors: chosen?.detectsAbsence ? monitors : undefined,
+                // Only a message target takes topics, and only an opted-in one needs them: with
+                // none sent it hears every topic but upgrade notices.
+                topics: !chosen?.detectsAbsence && upgradeNotices ? [...ALL_TOPICS] : undefined,
             }),
         onSuccess: () => {
             // Clear the URL specifically: it is a credential, and it is write-only
             // server-side, so leaving it in the form is the only place it lingers.
             setUrl('');
+            setUpgradeNotices(false);
             invalidate();
         },
     });
@@ -99,8 +139,8 @@ export function NotificationsPanel() {
                 </p>
             </header>
 
-            {/* A failed subscribers query used to leave `coverage` empty, so `uncovered`
-                was empty and this banner simply vanished — the strongest possible
+            {/* A failed subscribers query leaves `coverage` empty, so `uncovered`
+                is empty and this banner would simply vanish — the strongest possible
                 claim ("everything is watched") made on the strength of no data at
                 all. Say what happened instead.
 
@@ -172,10 +212,7 @@ export function NotificationsPanel() {
                                 <p className="text-xs text-text-muted">
                                     {s.monitors
                                         ? `watches ${s.monitors} · pings on success, /fail on failure`
-                                        : `at ${s.minSeverity} and above` +
-                                          (s.topics && s.topics.length > 0
-                                              ? ` · ${s.topics.join(', ')}`
-                                              : ' · all topics')}
+                                        : `at ${s.minSeverity} and above · ${describeTopics(s.topics)}`}
                                 </p>
                                 {/* Delivery health, surfaced rather than logged: a target
                                     that quietly stopped working must not look identical
@@ -197,11 +234,12 @@ export function NotificationsPanel() {
                                 )}
                             </div>
                             <Button
+                                ref={removeControl(s.id)}
                                 type="button"
                                 variant="secondary"
                                 className="shrink-0"
                                 onClick={() => remove.mutate(s.id)}
-                                disabled={remove.isPending}
+                                pending={remove.isPending}
                             >
                                 Remove
                             </Button>
@@ -217,10 +255,16 @@ export function NotificationsPanel() {
                 <PanelBody className="space-y-3">
                     <label className="block text-sm">
                         <span className="text-text-muted">Provider</span>
+                        {/* Every field of the add form is pending while the add is in
+                            flight: its success clears the URL and the upgrade-notices
+                            box, and a change made meanwhile would be dropped or never
+                            sent (ADR-0023 §L). */}
                         <select
-                            className="mt-1 w-full rounded border border-border bg-surface p-2"
+                            className={ADD_FIELD}
                             value={subscriberKey}
-                            onChange={(e) => setSubscriberKey(e.target.value)}
+                            {...pendingChoiceProps<HTMLSelectElement>(add.isPending, {
+                                onChange: (e) => setSubscriberKey(e.target.value),
+                            })}
                         >
                             <option value="">Choose…</option>
                             {providers.data?.map((p: NotificationProvider) => (
@@ -247,9 +291,11 @@ export function NotificationsPanel() {
                         <label className="block text-sm">
                             <span className="text-text-muted">Watches</span>
                             <select
-                                className="mt-1 w-full rounded border border-border bg-surface p-2"
+                                className={ADD_FIELD}
                                 value={monitors}
-                                onChange={(e) => setMonitors(e.target.value)}
+                                {...pendingChoiceProps<HTMLSelectElement>(add.isPending, {
+                                    onChange: (e) => setMonitors(e.target.value),
+                                })}
                             >
                                 <option value="">Choose the job…</option>
                                 {(chosen?.monitors ?? []).map((m) => (
@@ -267,11 +313,13 @@ export function NotificationsPanel() {
                             URL {chosen?.detectsAbsence ? '(the ping URL)' : '(the webhook)'}
                         </span>
                         <input
+                            ref={urlRef}
                             type="url"
-                            className="mt-1 w-full rounded border border-border bg-surface p-2"
+                            className={ADD_FIELD}
                             value={url}
                             onChange={(e) => setUrl(e.target.value)}
                             placeholder="https://…"
+                            {...pendingTextProps<HTMLInputElement>(add.isPending)}
                         />
                     </label>
                     <p className="text-xs text-text-muted">
@@ -302,9 +350,11 @@ export function NotificationsPanel() {
                         <label className="block text-sm">
                             <span className="text-text-muted">Send at</span>
                             <select
-                                className="mt-1 w-full rounded border border-border bg-surface p-2"
+                                className={ADD_FIELD}
                                 value={minSeverity}
-                                onChange={(e) => setMinSeverity(e.target.value)}
+                                {...pendingChoiceProps<HTMLSelectElement>(add.isPending, {
+                                    onChange: (e) => setMinSeverity(e.target.value),
+                                })}
                             >
                                 <option value="info">Everything, including routine</option>
                                 <option value="warning">Warnings and problems</option>
@@ -312,6 +362,26 @@ export function NotificationsPanel() {
                             </select>
                         </label>
                     )}
+
+                    {/* The one topic a target hears only by asking: a new release is news, and a
+                        target set to "everything" must not start receiving it unasked. A heartbeat
+                        target is bound to one job and has no topics to choose. */}
+                    {chosen && !chosen.detectsAbsence ? (
+                        <Checkbox
+                            checked={upgradeNotices}
+                            pending={add.isPending}
+                            onChange={(e) => setUpgradeNotices(e.target.checked)}
+                            label={
+                                <span>
+                                    Also send upgrade notices
+                                    <span className="block text-xs text-text-muted">
+                                        Off by default. This target hears that a new release is
+                                        available only if you tick this.
+                                    </span>
+                                </span>
+                            }
+                        />
+                    ) : null}
 
                     {add.isError ? (
                         <p role="alert" className="text-sm text-state-danger">
@@ -322,9 +392,12 @@ export function NotificationsPanel() {
                     <Button
                         type="button"
                         onClick={() => add.mutate()}
-                        disabled={add.isPending || subscriberKey === '' || url.trim() === ''}
+                        disabled={subscriberKey === '' || url.trim() === ''}
+                        pending={add.isPending}
+                        pendingLabel="Adding…"
+                        fallbackFocusRef={urlRef}
                     >
-                        {add.isPending ? 'Adding…' : 'Add target'}
+                        Add target
                     </Button>
                 </PanelBody>
             </Panel>
@@ -353,8 +426,8 @@ export function NotificationsPanel() {
                         <ul className="space-y-1 text-sm">
                             {events.data.slice(0, 20).map((e) => (
                                 <li key={e.id} className="flex gap-2">
-                                    {/* Same omission as the ledger list had, and the same
-                                        reason it matters: "recent events" with no times
+                                    {/* Timed for the same reason as the ledger list:
+                                        "recent events" with no times
                                         cannot distinguish something happening now from
                                         something that happened last week. */}
                                     <time

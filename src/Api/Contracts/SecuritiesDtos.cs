@@ -14,15 +14,24 @@ public sealed record SecuritySummaryDto(
     string? AssetClass,
     string? Exchange,
     bool IsActive,
-    /// <summary>Sum of <c>holdings.quantity</c> across every Holdings
-    /// sibling that touches this security in the ledger. 0 when the
-    /// security has never been held.</summary>
+    /// <summary>Quantity held on the caller's today (migration 259) across every
+    /// Holdings sibling in the ledger: a trade or split the register calls Scheduled
+    /// is not counted yet. 0 when the security is not held today.</summary>
     decimal TotalQuantity,
-    /// <summary>Latest <c>security_prices.price</c> for this security;
-    /// null when no price has ever been recorded.</summary>
+    /// <summary>Latest <c>security_prices.price</c> dated on or before the caller's
+    /// today, else the unit price of the security's last trade in the ledger
+    /// (ADR-0084, 2026-10-21 amendment), back-adjusted onto the day's split basis for
+    /// any split after it, so <see cref="TotalQuantity"/> times it is today's value.
+    /// Null when the security has neither.</summary>
     decimal? LatestPrice,
-    /// <summary>Date-only as-of marker for <see cref="LatestPrice"/>.</summary>
-    DateOnly? LatestPriceAsOf);
+    /// <summary>The date <see cref="LatestPrice"/> was observed: the close's, or the
+    /// trade's.</summary>
+    DateOnly? LatestPriceAsOf,
+    /// <summary>The currency <see cref="LatestPrice"/> is in, and so the amount the
+    /// catalog prints beside it (the price times <see cref="TotalQuantity"/>), by the
+    /// detail's rule (<see cref="SecurityDetailDto.PriceCurrencyCode"/>): the price's,
+    /// else the holding accounts', else the ledger's.</summary>
+    string PriceCurrencyCode);
 
 /// <summary>
 /// Body of <c>POST /api/ledgers/{lid}/securities</c>. Mirrors the Add
@@ -95,12 +104,21 @@ public sealed record SecurityDetailDto(
     string? AssetClass,
     string? Exchange,
     bool IsActive,
+    /// <summary>Quantity held on the caller's today across the ledger (migration
+    /// 259), as <see cref="SecuritySummaryDto.TotalQuantity"/>.</summary>
     decimal TotalQuantity,
-    /// <summary>Sum of <c>holdings.cost_basis</c> across the ledger.</summary>
-    decimal TotalCostBasis,
+    /// <summary>FIFO cost basis of what is held that day, across the ledger, in
+    /// <see cref="CostBasisCurrencyCode"/> (ADR-0114 D7): a position kept in another
+    /// currency converts lot by lot at each lot's acquisition date. Null when a rate is
+    /// missing, named in <see cref="CostBasisRateUnavailable"/> (ADR-0114 D9).</summary>
+    decimal? TotalCostBasis,
+    /// <summary>As <see cref="SecuritySummaryDto.LatestPrice"/>: the latest close
+    /// dated on or before the day, else the last trade's price, on the day's split
+    /// basis.</summary>
     decimal? LatestPrice,
     DateOnly? LatestPriceAsOf,
-    /// <summary>Most recent ten prices, newest first.</summary>
+    /// <summary>Most recent ten prices, newest first, whatever their date: a
+    /// history, not today's figures.</summary>
     IReadOnlyList<SecurityPricePointDto> RecentPrices,
     /// <summary>ADR-0054 D2: provider-symbol override (null → use ticker).</summary>
     string? QuoteSymbol,
@@ -118,7 +136,46 @@ public sealed record SecurityDetailDto(
     string? FiCredit,
     string? TaxCharacter,
     string? ClassificationSource,
-    string? ClassificationConfidence);
+    string? ClassificationConfidence,
+    /// <summary>The currency <see cref="LatestPrice"/> is in: the currency of the close it
+    /// was read from; for a last trade's price, the security's newest price row's; with no
+    /// price row at all, <see cref="HoldingsCurrencyCode"/>. Only the price is in it: the
+    /// market value and the gain combine the holding accounts, so they are in the
+    /// reporting currency (<see cref="MarketValueCurrencyCode"/>).</summary>
+    string PriceCurrencyCode,
+    /// <summary>The currency of the accounts that hold the security that day: the one
+    /// code they share, or the first in ordinal order when they span several. With no
+    /// account holding it, the ledger's reporting currency. The fallback for
+    /// <see cref="PriceCurrencyCode"/>; no figure here sums in it.</summary>
+    string HoldingsCurrencyCode,
+    /// <summary>The currency <see cref="TotalCostBasis"/> is in: the ledger's reporting
+    /// currency, because the basis combines every account holding the security.</summary>
+    string CostBasisCurrencyCode,
+    /// <summary>Why <see cref="TotalCostBasis"/> is null: each missing pair and day
+    /// (ADR-0114 D9). Empty when it has a value.</summary>
+    IReadOnlyList<RateUnavailable> CostBasisRateUnavailable,
+    /// <summary>What is held that day at <see cref="LatestPrice"/>, across the ledger, in
+    /// <see cref="MarketValueCurrencyCode"/> (ADR-0114 D7): each position from the price's
+    /// currency into its brokerage's, then into the reporting currency, both at the latest
+    /// rate, summed and rounded once. Null with no current price (and no reason), or when
+    /// a rate is missing, named in <see cref="MarketValueRateUnavailable"/> (ADR-0114 D9).</summary>
+    decimal? MarketValue,
+    /// <summary>The currency <see cref="MarketValue"/> is in: the ledger's reporting
+    /// currency, because the value combines every account holding the security.</summary>
+    string MarketValueCurrencyCode,
+    /// <summary>Why <see cref="MarketValue"/> is null when a rate is missing: each pair and
+    /// day (ADR-0114 D9). Empty otherwise.</summary>
+    IReadOnlyList<RateUnavailable> MarketValueRateUnavailable,
+    /// <summary><see cref="MarketValue"/> less <see cref="TotalCostBasis"/>, in
+    /// <see cref="UnrealizedGainCurrencyCode"/>. Null when either is.</summary>
+    decimal? UnrealizedGain,
+    /// <summary>The currency <see cref="UnrealizedGain"/> is in: the reporting currency,
+    /// as both its terms are.</summary>
+    string UnrealizedGainCurrencyCode,
+    /// <summary>Why <see cref="UnrealizedGain"/> is null when a rate is missing: the
+    /// market value's and the cost basis's missing rates, distinct (ADR-0114 D9). Empty
+    /// otherwise.</summary>
+    IReadOnlyList<RateUnavailable> UnrealizedGainRateUnavailable);
 
 /// <summary>One multi-asset look-through sleeve (ADR-0067): the percent (0-100)
 /// of the wrapper in an asset class + optional region.</summary>
@@ -172,13 +229,22 @@ public sealed record SecurityPricesPage(
     IReadOnlyList<SecurityPriceRowDto> Items,
     string? CursorForOlder,
     /// <summary>Total price-count across ALL pages for the badge.</summary>
-    int TotalCount);
+    int TotalCount,
+    /// <summary>The currency a new hand-entered price takes when none is given, for the
+    /// editor to prefill (ADR-0114 D5): the latest price's currency, else the one currency
+    /// every account holding the security is in. Null when neither answers; an add without
+    /// a currency is then refused with <c>security-price-currency-required</c>.</summary>
+    string? DefaultCurrencyCode = null);
 
 /// <summary>Body of <c>POST .../securities/{sid}/prices</c>.</summary>
 public sealed class CreateSecurityPriceRequest
 {
     public decimal Price { get; init; }
     public DateOnly PriceDate { get; init; }
+    /// <summary>The price's ISO 4217 currency (ADR-0114 D5), trimmed and upper-cased; not
+    /// three characters is <c>security-price-currency-invalid</c>. Omitted or blank, the
+    /// security's latest price's currency, else its holding accounts' when they agree,
+    /// else <c>security-price-currency-required</c>.</summary>
     public string? CurrencyCode { get; init; }
     public decimal? High { get; init; }
     public decimal? Low { get; init; }
@@ -212,8 +278,11 @@ public sealed record SecurityTransactionDto(
     Guid AccountId,
     string AccountName,
     DateTime PostedAt,
-    /// <summary>Header-level <c>txn_headers.action</c> (migration 047)
-    /// — Buy / Sell / Div / etc.</summary>
+    /// <summary>Header-level <c>txn_headers.action</c> (migration 047):
+    /// the stored ADR-0027 catalog value (<c>buy</c> / <c>sell</c> /
+    /// <c>dividend_cash</c> / <c>dividend_reinvest</c> / … and ADR-0065's
+    /// <c>transfer_shares</c>), never the word the SPA shows for it. NULL when
+    /// the header has no action.</summary>
     string? Action,
     /// <summary>Signed cash impact on the brokerage account. NULL on
     /// legs that don't book cash (e.g. holdings-side principal leg
@@ -221,7 +290,14 @@ public sealed record SecurityTransactionDto(
     decimal Amount,
     decimal? Quantity,
     decimal? UnitPrice,
-    string? Payee);
+    string? Payee,
+    /// <summary>The currency of the account the row names (<see cref="AccountId"/>), the
+    /// brokerage that owns the trade's own leg, never another brokerage on the same
+    /// transaction (the other side of an in-kind transfer, a funding brokerage): its
+    /// <see cref="Amount"/> and <see cref="UnitPrice"/> are in it, the way a reminder, a
+    /// security's price and a line carry theirs (ADR-0109 D9). A closed brokerage keeps
+    /// its own.</summary>
+    string CurrencyCode);
 
 /// <summary>Cursor-paginated transactions page for the Detail panel.</summary>
 public sealed record SecurityTransactionsPage(

@@ -1,6 +1,7 @@
 # 0051 — Reminder CRUD + next-due cursor correctness
 
-* Status: Accepted (slices A–C implemented)
+* Status: Accepted (slices A–C implemented); D3 amended 2026-11-14 by [ADR-0114](0114-benchmarks-and-currency-conversion.md) (the
+  second amount and its rate line reach the series editor through the shared editor)
 * Date: 2026-06-16
 * Related: ADR-0047 (reminders backend / recurring transactions), ADR-0048
   (live-template data-layer views), ADR-0049 (reminders SPA), ADR-0043
@@ -9,30 +10,29 @@
 
 ## Context
 
-Two gaps surfaced after the reminders SPA (ADR-0049) shipped and the user began
-running real Moneydance data:
+The reminders SPA (ADR-0049) leaves two gaps for imported Moneydance reminders:
 
 1. **`next_due_date` is NULL on imported reminders.** The importer set the
    recurrence (RRULE, start, end, MD's acknowledged date) but left the cursor
    null — it had no recurrence expander (that lived in the API, `src/Api/`, which
    the importer cannot reference). A naive recompute would be worse: with no
-   fired/skipped history in Coffer, an imported reminder running since 2015 would
-   strand the cursor on its *first* occurrence and, on first fire, cascade-skip a
-   decade of phantom "overdue" slots.
+   fired/skipped history in Coffer, an imported reminder running for years would
+   strand the cursor on its *first* occurrence and, on first fire, cascade-skip
+   years of phantom "overdue" slots.
 2. **There is no reminder-creation UI.** The SPA can fire / skip / list / show a
    calendar, but a series can only be created by the importer — there's no way to
    add a reminder in-app, edit one, or turn an existing transaction into a
    reminder. The create/edit endpoints (`POST` / `PATCH /reminders`, bank +
    investment) already exist from ADR-0047; only the UI is missing.
 
-## Decisions (agreed with the user)
+## Decisions
 
 ### D1 — `next_due` is anchored to the acknowledged floor
 
 `next_due` = the first RRULE occurrence **strictly after**
-`last_acknowledged_date` (Moneydance's `ackdt`, already carried on import). Every
-imported reminder in the real data has a recent ack date, so this lands the
-cursor on the genuine next payment. Occurrences **on or before** the floor are
+`last_acknowledged_date` (Moneydance's `ackdt`, already carried on import). MD
+moves `ackdt` forward as each occurrence is recorded, so for a reminder in use
+this lands the cursor on the genuine next payment. Occurrences **on or before** the floor are
 treated as already handled **everywhere** that walks the series:
 
 * the **cursor** (`ComputeNextDueAsync`) skips them, and
@@ -59,16 +59,22 @@ project; the API picks it up transitively.
 ### D3 — Reminder editor: account-derived kind, reusing the existing transaction form
 
 A new `ReminderEditorDialog` (web) creates and edits a reminder **series**. Shape
-decisions (settled with the user, June 2026):
+decisions:
 
 * **The source account determines the kind.** The user picks the source account
   first; its type derives whether the reminder is bank or investment. There is
-  **no manual kind toggle**. On edit, the kind is fixed by the existing series.
+  **no manual kind toggle**. On edit, the kind is fixed by the existing series, and
+  so is the source account: the editor offers no source picker, and the API refuses
+  an edit that names another source (`reminder-source-immutable`) and writes nothing.
 * **Reuse the existing new-transaction form** for the transaction shape — once
   the account is picked, embed the SAME editor the register uses (`TxnRowEdit`
   for bank, `InvestmentTxnRowEdit` for investment), NOT a bespoke posting editor.
   The reminders occurrence dialog (ADR-0049) already embeds these, so the reuse
   pattern is proven.
+  *(Amended 2026-11-14, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D14: the second amount and its rate line reach
+  the series editor through this shared editor, as one extra track while they show.
+  The prefill and the rate line belong to the editor, whatever the row came from; the
+  import and feed write paths never derive an amount from a rate.)*
 * **Schedule section** wraps the form — a recurrence builder (Daily / Weekly /
   Monthly / Yearly + interval + day-of-month/week + start + optional end)
   producing the RRULE (validated by the shared expander), plus
@@ -82,7 +88,7 @@ decisions (settled with the user, June 2026):
 
 The dialog combines the reused form's transaction body with the schedule into ONE
 save → existing `POST /reminders[/investment]` (create) / `PATCH` (edit). Bank +
-investment ship in ONE PR (the user chose this over a bank-first split).
+investment ship in ONE PR (rather than a bank-first split).
 
 ### D4 — Three entry points into the editor
 
@@ -95,6 +101,22 @@ investment ship in ONE PR (the user chose this over a bank-first split).
   inverted investment draft) with the **schedule left blank** for the user to
   fill (chosen over a guessed default). The prefill reuses each register's
   existing Duplicate mapping (`rowsToDuplicatePrefill` / `legsToDraft`).
+
+### Amendment, 2026-10-27 — the editor carries memo and tags per side (ADR-0108 D1, D14)
+
+* **Template lines keep their identity.** The reminder read contract
+  (`ReminderDetail`) exposes each leg's id (`ReminderLegDto.LegId`). A bank edit
+  names each line it keeps by the id of that line's leg on the series source, and
+  the line keeps its memo and tags only through it; a line sent without one is new
+  and starts blank, and an id that names no such leg, or names one twice, is
+  refused. There is no fallback matching by posting and account.
+* **The read contract carries the stored tags**, the template header's own and each
+  leg's own, and the editor seeds its Tags field from them, so a picked tag restates
+  the stored set instead of replacing one the user never saw.
+* **The form has a Tags field.** It is the embedded transaction editor's (D3), now
+  wired through save, load and fire.
+* **An edit keeps a deactivated account the template already uses**, bank and
+  investment alike, and refuses a newly chosen inactive one; a create stays strict.
 
 ## Consequences
 
@@ -121,4 +143,6 @@ C. **Add reminder from a transaction (both registers)** — the D4 "Create
    editor + occurrence modal) and two `RecurrenceBuilder` fixes — the "On"
    end-date radio was a no-op, and weekly allowed an empty `BYDAY` that silently
    fell back to the start-date weekday — plus a short-month day-of-month hint.
-   **(Implemented.)**
+   **(Implemented.)** *(2026-11-03: the shell is now `components/ui/EditorDialog`,
+   the same chrome shared with every dialog that hosts a transaction editor,
+   with its own style-guide section.)*

@@ -4,10 +4,10 @@
 --
 -- A whole-database restore now builds the backup as a NEW database and swaps it
 -- in with two renames (ADR-0061, amended 2026-10-09), instead of wiping the live
--- schema object by object. The wipe enumerated object kinds by hand; migration
--- 200's aggregate and 202's composite types were not on the list, and from
--- v0.62.0 every restore over an existing install failed in production while the
--- UI said "Restore complete".
+-- schema object by object. The wipe enumerates object kinds by hand, and
+-- migration 200's aggregate and 202's composite types are not on its list, so
+-- from v0.62.0 a wipe-based restore over an existing install fails while the UI
+-- reports "Restore complete".
 --
 -- The swap needs two things of the service role that a fresh install grants in
 -- db/init and an existing one gets from scripts/provision-restore-privileges.sh:

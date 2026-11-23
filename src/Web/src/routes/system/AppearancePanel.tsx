@@ -18,21 +18,20 @@ import {
 // personal display preference, stored per device in localStorage rather than
 // against the account (see lib/theme.ts for why).
 //
-// STAGED, not live. Selecting used to apply immediately, which repainted the
-// whole app on every click — clicking down a list of four themes strobed it.
-// Selection moves a local draft; Save commits.
+// STAGED, not live. Applying on selection repaints the whole app on every
+// click — clicking down a list of four themes strobes it. Selection moves a
+// local draft; Save commits.
 //
 // ONE PREVIEW, ONE VARIABLE. Each card shows its own option against the
 // APPLIED values of the other two axes, never the drafts. That looks like a
 // small detail and is the whole reason the panel reads as staged.
 //
-// It did not start that way: every preview followed every draft, so one
-// density click repainted 7 of the 10 cards and one theme click darkened 6 of
-// them. Nothing was ever saved — the root attributes were correct throughout —
-// but a panel where most of the surface changes the instant you click is
-// indistinguishable from one that applied your choice, and it was reported as
-// exactly that. "Staged" is a claim about what the user sees, not about where
-// the state lives.
+// If every preview followed every draft, one density click would repaint 7 of
+// the 10 cards and one theme click would darken 6 of them. Nothing would be
+// saved — the root attributes stay correct throughout — but a panel where most
+// of the surface changes the instant you click is indistinguishable from one
+// that applied your choice. "Staged" is a claim about what the user sees, not
+// about where the state lives.
 //
 // The cost, stated plainly: stage a theme AND a colour together and the colour
 // cards still show the old theme until you save. That is the honest reading —
@@ -265,8 +264,8 @@ function Preview(
                     }
                 >
                     <span className="flex items-center gap-1">
-                        {/* the accent badge — the preview used to contain no accent
-                            token at all, which made every colour look identical */}
+                        {/* the accent badge — a preview with no accent token at all
+                            makes every colour look identical */}
                         <span className="inline-flex size-icon-xs items-center justify-center rounded-full bg-accent-soft text-[0.5rem] font-bold text-accent-soft-text">
                             ✓
                         </span>

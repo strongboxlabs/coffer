@@ -27,19 +27,19 @@ OFX likewise stamps `posted_at` to midnight UTC. Within a single
 date, the recompute orders by `(event_at, leg_id)` — leg_id is
 effectively arbitrary.
 
-The clamp violated an invariant the user reasonably expected:
+The clamp violates an invariant:
 
 > For a history of buys / sells / reinvests (no splits), the final
 > share count equals `SUM(quantity deltas)`. That sum is invariant
 > under permutation.
 
-Real-data evidence, found on a real ledger: a fund whose lifetime
-quantity SUM is exactly 0 — fully bought and fully sold. The
-recompute produced a small fractional share count instead. That
-fraction arose entirely from intra-day permutations of one day's
-many mixed events: when ordering placed a transient sell against
-`running_qty = 0`, the sell was dropped; later reinvests added the
-fraction against the clamped-to-zero base.
+The failure, stated as a case: a fund fully bought and fully sold has
+a lifetime quantity SUM of exactly 0, yet the clamped recompute can
+leave it holding a fractional share count. That fraction comes
+entirely from intra-day permutation of a day's mixed events: when
+ordering places a transient sell against `running_qty = 0`, the sell
+is dropped, and later reinvests add their shares against the
+clamped-to-zero base.
 
 ## Decision
 
@@ -93,8 +93,8 @@ before.
 * **No data-collection pressure on intra-day ordering**. Neither
   MD nor OFX gives us reliable broker-true intra-day sequence;
   the algorithm no longer requires it.
-* **That fund converges to 0**. Without any other change to data or
-  imports.
+* **A fully-sold fund converges to 0**. Without any other change to
+  data or imports.
 * **Drift caused by past clamping in already-walked holdings is
   repaired** by the migration's one-shot full recompute call.
 

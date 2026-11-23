@@ -46,8 +46,12 @@ public sealed record PullContext(
 /// account id is the local binding; <c>LastSyncedAt</c> is the
 /// per-account watermark the provider uses for incremental fetch
 /// (NULL means "never synced — request the full window").
+/// <c>CurrencyCode</c> is the ledger account's currency, which the provider holds a
+/// fetched account's reported currency to (ADR-0114 D13); null when the caller does not
+/// supply it, and then nothing is judged.
 /// </summary>
 public sealed record MappedAccountWatermark(
     Guid LedgerAccountId,
     string ExternalId,
-    DateTime? LastSyncedAt);
+    DateTime? LastSyncedAt,
+    string? CurrencyCode = null);

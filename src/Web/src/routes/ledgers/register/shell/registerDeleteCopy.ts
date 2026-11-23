@@ -1,9 +1,9 @@
 import type { RegisterRow } from '@/lib/types';
 
 /**
- * Shared single-row delete-confirmation copy (review #18). Both
- * register pages showed the SAME manual-vs-feed title / body / CTA
- * for a single-row delete; the wording lives here in one place.
+ * Shared single-row delete-confirmation copy. Both register pages
+ * show the SAME manual-vs-feed title / body / CTA for a single-row
+ * delete; the wording lives here in one place.
  *
  * BankRegisterPage's combined single+bulk ConfirmDialog reuses this
  * for the single-row branch (its bulk branch has its own copy +

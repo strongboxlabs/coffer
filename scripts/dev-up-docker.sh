@@ -47,7 +47,8 @@ if command -v taskkill >/dev/null 2>&1; then
     if command -v netstat >/dev/null 2>&1; then
         for vp in 5173 5174 5175 5176; do
             for pid in $(netstat -ano 2>/dev/null | grep -E 'LISTENING' | grep -E "[:.]${vp}[[:space:]]" | awk '{print $NF}' | sort -u); do
-                if tasklist //FI "PID eq ${pid}" 2>/dev/null | grep -qi 'node.exe'; then
+                if tasklist_out="$(tasklist //FI "PID eq ${pid}" 2>/dev/null)" \
+                        && grep -qi 'node.exe' <<<"$tasklist_out"; then
                     echo "[dev-up-docker] stopping native Vite (node PID ${pid})"
                     taskkill //F //PID "${pid}" >/dev/null 2>&1 || true
                 fi
@@ -80,15 +81,14 @@ fi
 # /api/meta/version — makes the image label always match the code. An exported shell
 # var wins over .env in compose substitution, so this overrides the pinned value for
 # the build without touching .env (whose value still drives pull-based prod hosts).
-source_version="$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' "$repo_root/src/Api/Api.csproj" | head -1 | tr -d '[:space:]')"
+source_version="$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' "$repo_root/src/Api/Api.csproj" | sed -n 1p | tr -d '[:space:]')"
 if [ -n "$source_version" ]; then
     # Deliberately NOT written back to .env (see above). But that leaves a trap worth
     # naming out loud: the override only exists inside THIS script's environment, so a
     # bare `docker compose run/exec/build` typed afterwards falls back to .env's pinned
-    # tag and silently targets a DIFFERENT image. That cost a real debugging session —
-    # a `compose run` picked up a six-version-old image and made a working fix look
+    # tag and silently targets a DIFFERENT image, which can make a working fix look
     # broken. Say so whenever the two disagree.
-    pinned_tag="$(sed -n 's/^COFFER_IMAGE_TAG=//p' "$repo_root/.env" | head -1 | tr -d '[:space:]')"
+    pinned_tag="$(sed -n 's/^COFFER_IMAGE_TAG=//p' "$repo_root/.env" | sed -n 1p | tr -d '[:space:]')"
     export COFFER_IMAGE_TAG="$source_version"
     echo "[dev-up-docker] image tag ← Api.csproj <Version> = $source_version"
     if [ -n "$pinned_tag" ] && [ "$pinned_tag" != "$source_version" ]; then
@@ -138,14 +138,14 @@ docker compose up -d
 
 # Reap build cruft this rebuild left behind: the superseded image layers, and
 # build cache older than a week (recent layers stay, so the next rebuild is still
-# fast). ~13 GB of stale cache observed after weeks of rebuilds. No data risk —
+# fast). Stale cache otherwise grows without bound across rebuilds. No data risk —
 # neither touches volumes or running containers; guarded so cleanup never fails up.
 docker image prune -f >/dev/null 2>&1 || true
 docker builder prune -f --filter until=168h >/dev/null 2>&1 || true
 
 # API port: compose defaults to 8080 (override via API_PORT in .env).
 port=8080
-api_port_line="$(grep -E '^[[:space:]]*API_PORT[[:space:]]*=' "$repo_root/.env" | head -1 || true)"
+api_port_line="$(grep -E '^[[:space:]]*API_PORT[[:space:]]*=' "$repo_root/.env" | sed -n 1p || true)"
 if [ -n "$api_port_line" ]; then
     port="$(printf '%s' "${api_port_line#*=}" | tr -d '[:space:]')"
 fi
@@ -183,11 +183,10 @@ fi
 # stderr would just be noise on every subsequent dev-up.
 # NB: `dotnet coffer-api.dll`, not `coffer-api` — the image's ENTRYPOINT is
 # ["dotnet","coffer-api.dll"] and there is no apphost binary on PATH inside the
-# container. (The retired provision.sh used `exec api coffer-api bootstrap-token`,
-# which always exited 127; it was masked because its output was never checked.)
+# container, so `coffer-api bootstrap-token` exits 127 there.
 # The subcommand also emits DbUp log lines on stdout, hence the grep for the URL.
 setup_url="$(docker compose exec -T api dotnet coffer-api.dll bootstrap-token 2>/dev/null \
-    | grep -oE 'https?://[^[:space:]]+/setup/[^[:space:]]+' | head -1 || true)"
+    | grep -oE 'https?://[^[:space:]]+/setup/[^[:space:]]+' | sed -n 1p || true)"
 
 echo ""
 echo "[dev-up-docker] ready — http://localhost:${port}"

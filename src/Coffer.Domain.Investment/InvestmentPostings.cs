@@ -87,7 +87,7 @@ public static class InvestmentPostings
     /// </summary>
     /// <param name="securityId">When non-null, stamped on the cash
     ///   side so per-security register queries include this row
-    ///   (Div / DivXfr / Misc emit a <c>sec</c> split with qty=0
+    ///   (Dividend / DividendXfr / Misc emit a <c>sec</c> split with qty=0
     ///   purely to link a security id — that id rides through to
     ///   the cash leg here).</param>
     public static InvestmentPosting BuildCategoryPair(
@@ -96,22 +96,22 @@ public static class InvestmentPostings
         decimal cashAmount,
         decimal categoryAmount,
         string postingRole,
-        Guid? securityId = null,
-        string? legMemo = null)
+        Guid? securityId = null)
     {
         if (postingRole is not (PostingRoles.Income or PostingRoles.Fee))
             throw new ArgumentException(
                 $"BuildCategoryPair requires posting_role 'income' or 'fee'; got '{postingRole}'.",
                 nameof(postingRole));
 
+        // No memo on either leg: an event's memo is placed by the write primitive,
+        // never copied onto both sides of a posting.
         var cash = new InvestmentLegSpec(
             AccountId:    brokerageAccountId,
             Amount:       cashAmount,
             PostingRole:  postingRole,
             SecurityId:   securityId,
             Quantity:     null,
-            UnitPrice:    null,
-            LegMemo:      legMemo);
+            UnitPrice:    null);
 
         var category = new InvestmentLegSpec(
             AccountId:    categoryAccountId,
@@ -119,8 +119,7 @@ public static class InvestmentPostings
             PostingRole:  postingRole,
             SecurityId:   null,
             Quantity:     null,
-            UnitPrice:    null,
-            LegMemo:      legMemo);
+            UnitPrice:    null);
 
         return new InvestmentPosting(cash, category);
     }
@@ -133,20 +132,17 @@ public static class InvestmentPostings
         Guid brokerageAccountId,
         Guid otherAccountId,
         decimal brokerageAmount,
-        decimal otherAmount,
-        string? legMemo = null)
+        decimal otherAmount)
     {
         var cash = new InvestmentLegSpec(
             AccountId:    brokerageAccountId,
             Amount:       brokerageAmount,
-            PostingRole:  PostingRoles.Transfer,
-            LegMemo:      legMemo);
+            PostingRole:  PostingRoles.Transfer);
 
         var other = new InvestmentLegSpec(
             AccountId:    otherAccountId,
             Amount:       otherAmount,
-            PostingRole:  PostingRoles.Transfer,
-            LegMemo:      legMemo);
+            PostingRole:  PostingRoles.Transfer);
 
         return new InvestmentPosting(cash, other);
     }

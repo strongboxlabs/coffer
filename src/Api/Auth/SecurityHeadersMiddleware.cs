@@ -4,9 +4,9 @@ namespace Coffer.Api.Auth;
 /// The browser security headers, on every response (FU-091).
 /// </summary>
 /// <remarks>
-/// <para>The app sent none, and the docs did not ask the proxy for them, so whether an install
-/// had them depended on a proxy configuration nobody was told to write. Set here, every
-/// install has them whatever is in front of it; a proxy that adds its own is harmless.</para>
+/// <para>Left to the proxy, whether an install has them depends on a proxy configuration
+/// nobody is told to write. Set here, every install has them whatever is in front of it;
+/// a proxy that adds its own is harmless.</para>
 /// <list type="bullet">
 /// <item><b>Content-Security-Policy.</b> Everything from this origin and nothing else: the
 /// fonts are bundled, the pre-paint theme script is a file rather than inline, and the SPA

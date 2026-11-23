@@ -5,9 +5,9 @@ namespace Coffer.Api.Db.Entities;
 /// cash balance at one of many requested instants.
 /// <para>
 /// The batched form exists because a TWR boundary valuation needs cash as well as
-/// holdings, and calling the per-instant function once per boundary meant one round
-/// trip per boundary, every one over the same balance rows. With migration 200 having batched the holdings
-/// half, this was the remaining per-boundary cost.
+/// holdings, and calling the per-instant function once per boundary costs one round
+/// trip per boundary, every one over the same balance rows. Migration 200 batches the
+/// holdings half; this batches the cash half.
 /// </para>
 /// </summary>
 internal sealed class AccountBalanceAsOfInstantRow

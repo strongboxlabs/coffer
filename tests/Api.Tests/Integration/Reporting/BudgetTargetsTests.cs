@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 
+using Coffer.Api.Db.Entities;
 using Coffer.Api.Db.Repositories;
 using Coffer.Api.Tests.Integration.Infra;
 
@@ -21,20 +22,21 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// silently — hence this file.</para>
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class BudgetTargetsTests
+public sealed class BudgetTargetsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
+    public BudgetTargetsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
-    public BudgetTargetsTests(PostgresFixture fixture) => _fixture = fixture;
-
-    private BudgetTargetsRepository Repo() => new(_fixture.NewDbContext(), TimeProvider.System);
+    private BudgetTargetsRepository Repo() => new(Db.NewDbContext(), TimeProvider.System);
 
     private static readonly DateOnly Month = new(2026, 3, 1);
 
     [Fact]
     public async Task A_target_round_trips_and_normalises_to_the_first_of_the_month()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var food = await ledger.AddCategoryAsync("Food");
 
         // Deliberately mid-month on the way in. The column CHECK only permits the
@@ -54,7 +56,7 @@ public sealed class BudgetTargetsTests
     [Fact]
     public async Task A_targeted_ancestor_refuses_the_child_and_names_the_ancestor()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var taxes = await ledger.AddCategoryAsync("Taxes");
         var federal = await ledger.AddCategoryAsync("Federal", parentId: taxes.Id);
 
@@ -78,7 +80,7 @@ public sealed class BudgetTargetsTests
         // The mirror, and the direction an implementation is likelier to miss:
         // walking UP from the row being set finds nothing, because the conflict is
         // underneath it.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var taxes = await ledger.AddCategoryAsync("Taxes");
         var federal = await ledger.AddCategoryAsync("Federal", parentId: taxes.Id);
 
@@ -97,7 +99,7 @@ public sealed class BudgetTargetsTests
         // Grandparent -> parent -> child, with the target on the grandchild. A check
         // that only looked one level would let this through, and the ceiling would
         // then count the same money twice.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var home = await ledger.AddCategoryAsync("Home");
         var utilities = await ledger.AddCategoryAsync("Utilities", parentId: home.Id);
         var electric = await ledger.AddCategoryAsync("Electric", parentId: utilities.Id);
@@ -113,7 +115,7 @@ public sealed class BudgetTargetsTests
     [Fact]
     public async Task Replacing_your_own_target_is_an_edit_and_not_a_conflict()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var food = await ledger.AddCategoryAsync("Food");
 
         await Repo().SetAsync(ledger.LedgerId, food.Id, Month, 250m);
@@ -129,7 +131,7 @@ public sealed class BudgetTargetsTests
     {
         // The invariant is about ANCESTRY, not about the tree being flat. Getting
         // this wrong would make the feature nearly unusable.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var home = await ledger.AddCategoryAsync("Home");
         var gas = await ledger.AddCategoryAsync("Gas", parentId: home.Id);
         var water = await ledger.AddCategoryAsync("Water", parentId: home.Id);
@@ -147,7 +149,7 @@ public sealed class BudgetTargetsTests
     {
         // The invariant is per MONTH. Last month's parent target must not block this
         // month's child target, or the feature would seize up after one use.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var taxes = await ledger.AddCategoryAsync("Taxes");
         var federal = await ledger.AddCategoryAsync("Federal", parentId: taxes.Id);
 
@@ -160,7 +162,7 @@ public sealed class BudgetTargetsTests
     [Fact]
     public async Task Deleting_clears_the_way_for_a_descendant()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var taxes = await ledger.AddCategoryAsync("Taxes");
         var federal = await ledger.AddCategoryAsync("Federal", parentId: taxes.Id);
 
@@ -181,7 +183,7 @@ public sealed class BudgetTargetsTests
     {
         // The composite FK points at accounts(id, ledger_id) and categories ARE rows
         // in accounts, so the database would happily take this.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
 
         var outcome = await Repo().SetAsync(ledger.LedgerId, bank.Id, Month, 100m);
@@ -192,7 +194,7 @@ public sealed class BudgetTargetsTests
     [Fact]
     public async Task An_unknown_category_is_refused_rather_than_written()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var outcome = await Repo().SetAsync(ledger.LedgerId, Guid.NewGuid(), Month, 100m);
         Assert.Equal(BudgetTargetsRepository.SetResult.CategoryNotInLedger, outcome.Result);
     }
@@ -204,7 +206,7 @@ public sealed class BudgetTargetsTests
         // ancestor and a descendant in the SAME batch. The batch must be validated
         // against itself, not only against what is already stored — and the outcome
         // must not depend on the order the caller happened to send.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var taxes = await ledger.AddCategoryAsync("Taxes");
         var federal = await ledger.AddCategoryAsync("Federal", parentId: taxes.Id);
         var food = await ledger.AddCategoryAsync("Food");
@@ -235,7 +237,7 @@ public sealed class BudgetTargetsTests
     // -----------------------------------------------------------------
 
     private BudgetProgressRepository Progress() =>
-        new(new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System), _fixture.NewDbContext(), TimeProvider.System);
+        new(new ReportingRepository(Db.NewDbContext(), TimeProvider.System), Db.NewDbContext(), TimeProvider.System);
 
     private static DateTime JustInside(int year, int month) =>
         new(year, month, 1, 0, 30, 0, DateTimeKind.Utc);
@@ -246,9 +248,8 @@ public sealed class BudgetTargetsTests
         // THE arithmetic D1a exists for. A parent's rolled-up normal already
         // CONTAINS its child's normal, so substituting the child's typed target
         // means removing what was counted and adding what was decided. Summing
-        // both numbers instead is the bug that drew a ceiling nearly twice too high,
-        // in a new costume.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // both numbers instead would draw a ceiling nearly twice too high.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var home = await ledger.AddCategoryAsync("Home");
         var electric = await ledger.AddCategoryAsync("Electric", parentId: home.Id);
@@ -288,7 +289,7 @@ public sealed class BudgetTargetsTests
     [Fact]
     public async Task A_targeted_row_marks_at_its_target_and_ignores_its_history()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var food = await ledger.AddCategoryAsync("Food");
         foreach (var m in new[] { 1, 2, 3 })
@@ -310,7 +311,7 @@ public sealed class BudgetTargetsTests
         // Otherwise typing a number against a quiet category looks like the write
         // failed: the category appears in neither summary, so nothing would come
         // back for it.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var quiet = await ledger.AddCategoryAsync("Sabbatical");
 
         await Repo().SetAsync(ledger.LedgerId, quiet.Id, new DateOnly(2026, 4, 1), 500m);
@@ -331,8 +332,88 @@ public sealed class BudgetTargetsTests
 
     private AccountsRepository Accounts()
     {
-        var db = _fixture.NewDbContext();
+        var db = Db.NewDbContext();
         return new AccountsRepository(db, new LegDerivedRecomputeService(db), TimeProvider.System);
+    }
+
+    /// <summary>The owner changes the ledger's reporting currency (ADR-0114 D7): every
+    /// target typed from then on is stamped with it, and those typed before keep theirs.</summary>
+    private async Task SetReportingCurrencyAsync(SyntheticLedger ledger, string code)
+    {
+        // The ledgers row is written by the service role, as every ledger setting is.
+        await using var db = Db.NewServiceDbContext();
+        await db.Ledgers.Where(l => l.Id == ledger.LedgerId)
+            .ExecuteUpdateAsync(s => s.SetProperty(l => l.CurrencyCode, code));
+    }
+
+    /// <summary>A USD source target and a EUR destination target for March, the month
+    /// past, so the rate is the month's last day's (ADR-0114 D12).</summary>
+    private async Task<(SyntheticLedger Ledger, AccountRow Source, AccountRow Dest)> TwoCurrencyTargetsAsync()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var source = await ledger.AddCategoryAsync("Category A");
+        var dest = await ledger.AddCategoryAsync("Category B");
+        await Repo().SetAsync(ledger.LedgerId, source.Id, Month, 300m);                    // USD
+        await Repo().SetAsync(ledger.LedgerId, source.Id, new DateOnly(2026, 2, 1), 120m); // USD, source only
+        await SetReportingCurrencyAsync(ledger, "EUR");
+        await Repo().SetAsync(ledger.LedgerId, dest.Id, Month, 500m);                      // EUR
+        return (ledger, source, dest);
+    }
+
+    [Fact]
+    public async Task A_merge_converts_the_source_target_into_the_destinations_currency_at_the_months_last_day()
+    {
+        var (ledger, source, dest) = await TwoCurrencyTargetsAsync();
+        await using (var writer = Db.NewAppDbContextAsUser(ledger.UserId))
+        {
+            writer.FxRates.Add(new Coffer.Api.Db.Entities.FxRateRow
+            {
+                Id = Guid.NewGuid(), LedgerId = ledger.LedgerId, FromCurrency = "USD", ToCurrency = "EUR",
+                RateDate = new DateOnly(2026, 3, 31), Rate = 0.9m, Source = Coffer.Api.Db.Entities.FxRateSource.Frankfurter,
+            });
+            writer.FxPairCoverage.Add(new Coffer.Api.Db.Entities.FxPairCoverageRow
+            {
+                LedgerId = ledger.LedgerId, FromCurrency = "USD", ToCurrency = "EUR",
+                FetchedThroughDate = new DateOnly(2026, 4, 30),
+            });
+            await writer.SaveChangesAsync();
+        }
+
+        var outcome = await Accounts().MergeCategoryAsync(ledger.LedgerId, source.Id, dest.Id, dryRun: false);
+        Assert.Equal(AccountsRepository.MergeCategoryResult.Ok, outcome.Result);
+
+        var march = Assert.Single(await Repo().ForMonthAsync(ledger.LedgerId, Month));
+        Assert.Equal(dest.Id, march.CategoryId);
+        Assert.Equal(500m + 300m * 0.9m, march.Amount);   // in the destination's EUR
+        Assert.Equal("EUR", march.CurrencyCode);
+        // A month only the source has moves over with its own currency.
+        var feb = Assert.Single(await Repo().ForMonthAsync(ledger.LedgerId, new DateOnly(2026, 2, 1)));
+        Assert.Equal((dest.Id, 120m, "USD"), (feb.CategoryId, feb.Amount, feb.CurrencyCode));
+    }
+
+    [Fact]
+    public async Task A_merge_needing_a_missing_rate_is_refused_whole_and_writes_nothing()
+    {
+        var (ledger, source, dest) = await TwoCurrencyTargetsAsync();
+        var bank = await ledger.AddBankAccountAsync("Account A");
+        await ledger.AddTransactionPairAsync(source.Id, bank.Id, 25m, new DateTime(2026, 3, 10, 0, 0, 0, DateTimeKind.Utc));
+
+        foreach (var dryRun in new[] { true, false })
+        {
+            var outcome = await Accounts().MergeCategoryAsync(ledger.LedgerId, source.Id, dest.Id, dryRun);
+            Assert.Equal(AccountsRepository.MergeCategoryResult.RateUnavailable, outcome.Result);
+            Assert.Equal(new Coffer.Api.Contracts.RateUnavailable("USD", "EUR", new DateOnly(2026, 3, 31)), outcome.MissingRate);
+        }
+
+        // Nothing moved: both targets where they were, the transaction still the source's,
+        // and the source still active.
+        var march = await Repo().ForMonthAsync(ledger.LedgerId, Month);
+        Assert.Equal(
+            [(dest.Id, 500m, "EUR"), (source.Id, 300m, "USD")],
+            march.Select(t => (t.CategoryId, t.Amount, t.CurrencyCode)).OrderBy(t => t.Item3, StringComparer.Ordinal).ToArray());
+        await using var db = Db.NewDbContext();
+        Assert.Equal(1, await db.TxnLegs.CountAsync(l => l.AccountId == source.Id));
+        Assert.True(await db.Accounts.Where(a => a.Id == source.Id).Select(a => a.IsActive).SingleAsync());
     }
 
     [Fact]
@@ -344,7 +425,7 @@ public sealed class BudgetTargetsTests
         // the destination's actuals for months long past grow by the source's spend
         // the instant it commits. Leaving the mark alone would make each of those
         // months read as newly over budget for a reason nobody chose.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddCategoryAsync("Groceries");
         var dest = await ledger.AddCategoryAsync("Food shopping");
 
@@ -377,7 +458,7 @@ public sealed class BudgetTargetsTests
         // Reparenting the child under the destination is what creates the clash,
         // so the merge has to resolve it — and report it, rather than lose a typed
         // number quietly.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddCategoryAsync("Utilities");
         var child = await ledger.AddCategoryAsync("Electric", parentId: source.Id);
         var dest = await ledger.AddCategoryAsync("Home");
@@ -398,12 +479,95 @@ public sealed class BudgetTargetsTests
     }
 
     [Fact]
+    public async Task A_merge_drops_a_target_that_would_arrive_beneath_one_the_destinations_ancestor_holds()
+    {
+        // The same rule, upward. Legal before: Home (a root) holds a target for the month,
+        // Utilities (a root elsewhere) holds one for the same month, and Water, under Home, holds
+        // none. Merging Utilities into Water would put Utilities' target under Home's, which D1a
+        // forbids and SetAsync would have refused, so the merge resolves it the same way: the
+        // ancestor wins, and the count says so.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var home = await ledger.AddCategoryAsync("Home");
+        var water = await ledger.AddCategoryAsync("Water", parentId: home.Id);
+        var utilities = await ledger.AddCategoryAsync("Utilities");
+        var february = new DateOnly(2026, 2, 1);
+
+        await Repo().SetAsync(ledger.LedgerId, home.Id, Month, 400m);
+        await Repo().SetAsync(ledger.LedgerId, utilities.Id, Month, 90m);
+        // A month Home does not cover: this one arrives, and stays.
+        await Repo().SetAsync(ledger.LedgerId, utilities.Id, february, 70m);
+
+        var outcome = await Accounts().MergeCategoryAsync(
+            ledger.LedgerId, utilities.Id, water.Id, dryRun: false);
+
+        Assert.Equal(AccountsRepository.MergeCategoryResult.Ok, outcome.Result);
+        Assert.Equal(1, outcome.BudgetTargetsDropped);
+        // One of the two arrived and was kept; the other was dropped, and is not also counted as moved.
+        Assert.Equal(1, outcome.BudgetTargetsMoved);
+
+        var march = Assert.Single(await Repo().ForMonthAsync(ledger.LedgerId, Month));
+        Assert.Equal(home.Id, march.CategoryId);
+        Assert.Equal(400m, march.Amount);
+        var feb = Assert.Single(await Repo().ForMonthAsync(ledger.LedgerId, february));
+        Assert.Equal(water.Id, feb.CategoryId);
+        Assert.Equal(70m, feb.Amount);
+    }
+
+    [Fact]
+    public async Task A_merge_drops_a_target_the_destinations_own_sub_category_holds_for_a_month_the_destination_now_covers()
+    {
+        // The third direction. Utilities has two children, each with a target for the month: legal,
+        // since the parent holds none. Merging Electric into Utilities moves Electric's target ONTO
+        // Utilities, which now covers the month for Water beneath it too. Water is not arriving
+        // from anywhere, so neither of the other two checks looks at it.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var utilities = await ledger.AddCategoryAsync("Utilities");
+        var electric = await ledger.AddCategoryAsync("Electric", parentId: utilities.Id);
+        var water = await ledger.AddCategoryAsync("Water", parentId: utilities.Id);
+
+        await Repo().SetAsync(ledger.LedgerId, electric.Id, Month, 90m);
+        await Repo().SetAsync(ledger.LedgerId, water.Id, Month, 60m);
+
+        var outcome = await Accounts().MergeCategoryAsync(
+            ledger.LedgerId, electric.Id, utilities.Id, dryRun: false);
+
+        Assert.Equal(AccountsRepository.MergeCategoryResult.Ok, outcome.Result);
+        Assert.Equal(1, outcome.BudgetTargetsMoved);
+        Assert.Equal(1, outcome.BudgetTargetsDropped);
+        // The ancestor wins: the number that moved onto Utilities stays, and the child's goes.
+        var row = Assert.Single(await Repo().ForMonthAsync(ledger.LedgerId, Month));
+        Assert.Equal(utilities.Id, row.CategoryId);
+        Assert.Equal(90m, row.Amount);
+    }
+
+    [Fact]
+    public async Task A_merge_into_a_category_whose_ancestors_hold_no_clashing_month_drops_nothing()
+    {
+        // The upward check must not fire on its own: an ancestor with a target for a different
+        // month leaves every arriving target where it is.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var home = await ledger.AddCategoryAsync("Home");
+        var water = await ledger.AddCategoryAsync("Water", parentId: home.Id);
+        var utilities = await ledger.AddCategoryAsync("Utilities");
+
+        await Repo().SetAsync(ledger.LedgerId, home.Id, new DateOnly(2026, 1, 1), 400m);
+        await Repo().SetAsync(ledger.LedgerId, utilities.Id, Month, 90m);
+
+        var outcome = await Accounts().MergeCategoryAsync(
+            ledger.LedgerId, utilities.Id, water.Id, dryRun: false);
+
+        Assert.Equal(0, outcome.BudgetTargetsDropped);
+        Assert.Equal(1, outcome.BudgetTargetsMoved);
+        Assert.Equal(water.Id, Assert.Single(await Repo().ForMonthAsync(ledger.LedgerId, Month)).CategoryId);
+    }
+
+    [Fact]
     public async Task A_reparent_that_would_stack_two_targets_is_refused()
     {
         // A move is not a combine. It carries no instruction to treat anything as
         // one thing, so unlike the merge it refuses rather than picking a winner
         // and discarding somebody's number.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var home = await ledger.AddCategoryAsync("Home");
         var loose = await ledger.AddCategoryAsync("Electric");
 
@@ -424,7 +588,7 @@ public sealed class BudgetTargetsTests
     {
         // A dry run that answers Ok and then fails for real is worse than having no
         // dry run: the MCP tools and the move dialog both use it to pre-check.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var home = await ledger.AddCategoryAsync("Home");
         var loose = await ledger.AddCategoryAsync("Electric");
         await Repo().SetAsync(ledger.LedgerId, home.Id, Month, 400m);
@@ -441,7 +605,7 @@ public sealed class BudgetTargetsTests
     {
         // The invariant is per MONTH. Refusing across months would make the tree
         // unreorganisable for anyone who has ever set a target.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var home = await ledger.AddCategoryAsync("Home");
         var loose = await ledger.AddCategoryAsync("Electric");
 
@@ -462,16 +626,16 @@ public sealed class BudgetTargetsTests
         // Nothing in CI, preflight or the schema guards enumerates relrowsecurity,
         // and a table added after mig 174 gets no protection unless it declares the
         // pair itself (ALTER DEFAULT PRIVILEGES already grants coffer_app write, so
-        // "no policy" means "no refusal"). mig 207 shipped two tables without RLS
-        // and it survived to mig 213. This is the assertion that would have caught it.
-        var mine = await SyntheticLedger.CreateAsync(_fixture);
-        var stranger = await SyntheticLedger.CreateAsync(_fixture);
+        // "no policy" means "no refusal"). This is the assertion that catches a
+        // missing policy here.
+        var mine = await SyntheticLedger.CreateAsync(Db);
+        var stranger = await SyntheticLedger.CreateAsync(Db);
         var food = await mine.AddCategoryAsync("Food");
 
         Assert.Equal(BudgetTargetsRepository.SetResult.Ok,
             (await Repo().SetAsync(mine.LedgerId, food.Id, Month, 250m)).Result);
 
-        await using var asStranger = _fixture.NewAppDbContextAsUser(stranger.UserId);
+        await using var asStranger = Db.NewAppDbContextAsUser(stranger.UserId);
         var visible = await asStranger.BudgetTargets.AsNoTracking()
             .Where(t => t.LedgerId == mine.LedgerId)
             .ToListAsync();
@@ -481,8 +645,106 @@ public sealed class BudgetTargetsTests
         // And the owner still sees their own, so the policy filters by grant rather
         // than refusing everything — a policy that denied unconditionally would also
         // make the assertion above pass.
-        await using var asOwner = _fixture.NewAppDbContextAsUser(mine.UserId);
+        await using var asOwner = Db.NewAppDbContextAsUser(mine.UserId);
         Assert.Single(await asOwner.BudgetTargets.AsNoTracking()
             .Where(t => t.LedgerId == mine.LedgerId).ToListAsync());
+    }
+
+    [Fact]
+    public async Task A_typed_target_is_in_the_ledgers_reporting_currency()
+    {
+        // ADR-0114 D12: a target is typed in the ledger's reporting currency at the time.
+        // The ledger is not in USD, the code a writer that stamped a constant instead of
+        // reading the ledger would most likely write, so such a writer fails here.
+        var ledger = await SyntheticLedger.CreateAsync(Db, currencyCode: "EUR");
+        var food = await ledger.AddCategoryAsync("Food");
+        var rent = await ledger.AddCategoryAsync("Rent");
+
+        Assert.Equal(BudgetTargetsRepository.SetResult.Ok,
+            (await Repo().SetAsync(ledger.LedgerId, food.Id, Month, 250m)).Result);
+        var bulk = await Repo().SetManyAsync(ledger.LedgerId, Month, new[] { (rent.Id, 900m) });
+        Assert.Equal(BudgetTargetsRepository.SetResult.Ok, Assert.Single(bulk).Result);
+
+        var rows = await Repo().ForMonthAsync(ledger.LedgerId, Month);
+        Assert.Equal(2, rows.Count);
+        Assert.All(rows, r => Assert.Equal("EUR", r.CurrencyCode));
+    }
+
+    [Fact]
+    public async Task Retyping_a_target_stores_it_in_the_current_reporting_currency()
+    {
+        // ADR-0114 D12: a target keeps the currency it was typed in until it is retyped.
+        // The seed is the state a change of the reporting currency leaves: targets typed
+        // in the old currency on a ledger now reported in another.
+        var ledger = await SyntheticLedger.CreateAsync(Db, currencyCode: "EUR");
+        var food = await ledger.AddCategoryAsync("Food");
+        var rent = await ledger.AddCategoryAsync("Rent");
+        var untouched = await ledger.AddCategoryAsync("Travel");
+        await using (var db = Db.NewDbContext())
+        {
+            foreach (var category in new[] { food.Id, rent.Id, untouched.Id })
+            {
+                db.BudgetTargets.Add(new Coffer.Api.Db.Entities.BudgetTargetRow
+                {
+                    LedgerId = ledger.LedgerId, CategoryId = category, TargetMonth = Month,
+                    Amount = 100m, CurrencyCode = "USD",
+                    CreatedAt = new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc),
+                    UpdatedAt = new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc),
+                });
+            }
+            await db.SaveChangesAsync();
+        }
+
+        await Repo().SetAsync(ledger.LedgerId, food.Id, Month, 250m);
+        await Repo().SetManyAsync(ledger.LedgerId, Month, new[] { (rent.Id, 900m) });
+
+        var byCategory = (await Repo().ForMonthAsync(ledger.LedgerId, Month))
+            .ToDictionary(r => r.CategoryId, r => (r.Amount, r.CurrencyCode));
+        Assert.Equal((250m, "EUR"), byCategory[food.Id]);
+        Assert.Equal((900m, "EUR"), byCategory[rent.Id]);
+        // A target nobody retyped reads as it was typed.
+        Assert.Equal((100m, "USD"), byCategory[untouched.Id]);
+    }
+
+    [Fact]
+    public async Task A_stored_target_that_needs_a_missing_rate_names_its_currency_and_no_target_names_none()
+    {
+        // ADR-0114 D9, D12: a target typed in another currency whose rate is missing is
+        // null and named, which is exactly how a row with no target and a missing rate
+        // for its SPEND reads. Only the stored target's own currency tells them apart:
+        // the screen needs it to show "no rate" rather than an empty target, and to
+        // still offer the clear.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var dollars = await ledger.AddBankAccountAsync("Account A");
+        var unconverted = await ledger.AddCategoryAsync("Category A");
+        var native = await ledger.AddCategoryAsync("Category B");
+        var untargeted = await ledger.AddCategoryAsync("Category C");
+        await Repo().SetAsync(ledger.LedgerId, unconverted.Id, Month, 300m);   // USD
+        await ledger.AddTransactionPairAsync(dollars.Id, untargeted.Id, -40m, JustInside(2026, 3), payee: "c");
+        await SetReportingCurrencyAsync(ledger, "EUR");                         // no USD rate at all
+        await Repo().SetAsync(ledger.LedgerId, native.Id, Month, 500m);        // EUR
+
+        var res = await Progress().GetAsync(ledger.LedgerId, new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc), 3);
+        var rows = res.Rows.ToDictionary(r => r.CategoryId);
+
+        var a = rows[unconverted.Id];
+        Assert.Null(a.Target);
+        Assert.Equal("USD", a.TargetCurrencyCode);
+        Assert.Contains(new Coffer.Api.Contracts.RateUnavailable("USD", "EUR", new DateOnly(2026, 3, 31)),
+            a.RateUnavailable ?? []);
+
+        Assert.Equal((500m, "EUR"), (rows[native.Id].Target, rows[native.Id].TargetCurrencyCode));
+
+        var c = rows[untargeted.Id];
+        Assert.Null(c.Target);
+        Assert.NotNull(c.RateUnavailable);   // its spend needs the same missing rate
+        Assert.Null(c.TargetCurrencyCode);
+
+        // The MCP tool answers the same (ADR-0114 D9: every surface).
+        var tool = await Coffer.Api.Mcp.BudgetTools.BudgetProgress(
+            Progress(), TimeProvider.System, ledger.LedgerId, "2026-03");
+        var toolRows = tool.Rows.ToDictionary(r => r.CategoryId);
+        Assert.Equal("USD", toolRows[unconverted.Id].TargetCurrencyCode);
+        Assert.Null(toolRows[untargeted.Id].TargetCurrencyCode);
     }
 }

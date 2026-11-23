@@ -105,6 +105,8 @@ public static class SavedReportsEndpoints
             return Results.BadRequest(new { error = "name must not be blank." });
         if (request.Spec is { } spec && spec.ValueKind != JsonValueKind.Object)
             return Results.BadRequest(new { error = "spec must be a JSON object." });
+        if (request.Spec is { } patched && SpecFieldProblem(patched) is { } fieldProblem)
+            return fieldProblem;
         if (request.Visibility is not null && !SavedReportVisibility.IsValid(request.Visibility))
             return Results.BadRequest(new { error = "visibility must be 'private' or 'ledger'." });
 
@@ -193,14 +195,37 @@ public static class SavedReportsEndpoints
         return Results.NoContent();
     }
 
-    private static IResult? Validate(string? name, JsonElement? spec, string? visibility)
+    /// <summary>
+    /// A new saved report's checks: a name, a spec that is a JSON object whose read fields
+    /// are well formed, and a known visibility. The 400 the first failure gets, or null.
+    /// </summary>
+    /// <remarks>Shared with the Demo's examples phase, which runs them on each saved report
+    /// it writes (ADR-0115).</remarks>
+    internal static IResult? Validate(string? name, JsonElement? spec, string? visibility)
     {
         if (string.IsNullOrWhiteSpace(name))
             return Results.BadRequest(new { error = "name is required." });
         if (spec is not { } value || value.ValueKind != JsonValueKind.Object)
             return Results.BadRequest(new { error = "spec must be a JSON object." });
+        if (SpecFieldProblem(value) is { } fieldProblem)
+            return fieldProblem;
         if (visibility is not null && !SavedReportVisibility.IsValid(visibility))
             return Results.BadRequest(new { error = "visibility must be 'private' or 'ledger'." });
+        return null;
+    }
+
+    /// <summary>
+    /// The fields of a spec the server reads by name, checked before the spec is stored as it
+    /// came: a Returns report's <c>benchmark</c> is absent, null, or a benchmark symbol
+    /// (ADR-0114 D1). It is not checked against the ledger's benchmarks: a pick that names a
+    /// symbol removed since stays valid and draws nothing, so re-saving such a report succeeds.
+    /// </summary>
+    private static IResult? SpecFieldProblem(JsonElement spec)
+    {
+        if (spec.TryGetProperty("benchmark", out var benchmark)
+            && benchmark.ValueKind != JsonValueKind.Null
+            && (benchmark.ValueKind != JsonValueKind.String || !BenchmarkSymbol.IsValid(benchmark.GetString())))
+            return Results.BadRequest(new { error = "spec.benchmark must be a benchmark symbol, such as VT, or null." });
         return null;
     }
 }

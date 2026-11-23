@@ -19,19 +19,20 @@ namespace Coffer.Api.Tests.Integration.Mcp;
 /// constraints (a column typo or a bad constraint fails here, not just at build).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class McpAuditRecorderTests
+public sealed class McpAuditRecorderTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public McpAuditRecorderTests(PostgresFixture fixture) => _fixture = fixture;
+    public McpAuditRecorderTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private McpAuditRecorder NewRecorder() =>
         new(PostgresFixture.ServiceFactoryFor(Options.Create(
-            new ApiOptions { ServiceConnectionString = _fixture.ServiceConnectionString })), TimeProvider.System);
+            new ApiOptions { ServiceConnectionString = Db.ServiceConnectionString })), TimeProvider.System);
 
     private async Task<McpToolInvocationRow> ReadRowAsync(Guid id)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.McpToolInvocations.AsNoTracking().SingleAsync(r => r.Id == id);
     }
 
@@ -40,7 +41,7 @@ public sealed class McpAuditRecorderTests
     {
         // The attempt is written BEFORE the tool, so a call that then hangs / times
         // out / crashes still leaves a visible row (ADR-0086 attempt integrity).
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var args = new Dictionary<string, JsonElement>
         {
             ["ledgerId"] = JsonSerializer.SerializeToElement(ledger.LedgerId.ToString()),
@@ -63,7 +64,7 @@ public sealed class McpAuditRecorderTests
     [Fact]
     public async Task RecordAttempt_handles_null_args_and_missing_ledger()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
         var id = await NewRecorder().RecordAttemptAsync(
             ledger.UserId, "merge_category", arguments: null, traceId: null);
@@ -78,7 +79,7 @@ public sealed class McpAuditRecorderTests
     [Fact]
     public async Task Finalize_ok_marks_a_terminal_success()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var recorder = NewRecorder();
         var id = await recorder.RecordAttemptAsync(ledger.UserId, "add_price", arguments: null, traceId: null);
 
@@ -93,7 +94,7 @@ public sealed class McpAuditRecorderTests
     [Fact]
     public async Task Finalize_error_marks_a_terminal_error()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var recorder = NewRecorder();
         var id = await recorder.RecordAttemptAsync(ledger.UserId, "merge_category", arguments: null, traceId: null);
 
@@ -108,9 +109,9 @@ public sealed class McpAuditRecorderTests
     [Fact]
     public async Task Finalize_cancelled_is_a_distinct_terminal_state()
     {
-        // The state that would have answered the incident: a client timeout /
-        // cancellation is 'cancelled', not 'error' and not a lost row (ADR-0086).
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // A client timeout / cancellation is 'cancelled', not 'error' and not a
+        // lost row (ADR-0086), so the audit says what happened to the call.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var recorder = NewRecorder();
         var id = await recorder.RecordAttemptAsync(
             ledger.UserId, "convert_in_kind_transfer", arguments: null, traceId: null);

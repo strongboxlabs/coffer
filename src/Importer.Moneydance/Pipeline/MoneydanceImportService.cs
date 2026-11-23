@@ -8,15 +8,24 @@ namespace Coffer.Importer.Moneydance.Pipeline;
 
 /// <summary>
 /// Parse-time summary of a Moneydance export (per <c>obj_type</c> counts).
-/// Produced without touching the database — backs both the CLI <c>--dry-run</c>
-/// and the API import-preview step (ADR-0071 D2).
+/// Produced without touching the database — backs the API import-preview step
+/// (ADR-0071 D2).
 /// </summary>
+/// <param name="BaseCurrencyCode">The ISO code of the file's base currency (the
+/// <c>curr</c> item with <c>isbase</c> set), which the wizard offers as the new ledger's
+/// reporting currency (ADR-0114 D7); null when <paramref name="CurrencyProblems"/> says
+/// why it cannot be read.</param>
+/// <param name="CurrencyProblems">Each reason the file's currencies cannot be imported,
+/// one sentence each, naming the account (<see cref="Mappers.MdCurrencies.Problems"/>).
+/// A file with any is refused: no currency is ever defaulted.</param>
 public sealed record MoneydanceImportPreview(
     string Exporter,
     long MoneydanceBuild,
     long ExportDate,
     int TotalItems,
-    IReadOnlyList<ObjTypeCount> ObjTypeCounts);
+    IReadOnlyList<ObjTypeCount> ObjTypeCounts,
+    string? BaseCurrencyCode,
+    IReadOnlyList<string> CurrencyProblems);
 
 /// <summary>One <c>obj_type</c> bucket and how many items it holds.</summary>
 public sealed record ObjTypeCount(string ObjType, int Count);
@@ -38,52 +47,40 @@ public sealed record MoneydanceImportResult(
     TimeSpan Elapsed);
 
 /// <summary>
-/// Thrown when an import targets a ledger that already holds transactions.
-/// The Moneydance import SEEDS a fresh ledger once (ADR-0052 D2); it is never a
-/// re-import. Callers map this to a friendly "create a new ledger" error.
-/// </summary>
-public sealed class ImportRefusedException : Exception
-{
-    public ImportRefusedException(Guid ledgerId, string ledgerName, int existingTransactions)
-        : base($"Ledger '{ledgerName}' already has {existingTransactions:N0} transaction(s); " +
-               "the Moneydance import seeds a fresh ledger only.")
-    {
-        LedgerId = ledgerId;
-        LedgerName = ledgerName;
-        ExistingTransactions = existingTransactions;
-    }
-
-    public Guid LedgerId { get; }
-    public string LedgerName { get; }
-    public int ExistingTransactions { get; }
-}
-
-/// <summary>
-/// Reusable Moneydance import pipeline, decoupled from the CLI (ADR-0071 D2).
-/// The CLI command and the API import endpoint both drive it; the only
-/// CLI-specific concern left in <c>ImportCommand</c> is console rendering.
+/// Reusable Moneydance import pipeline (ADR-0071 D2). The API import endpoint
+/// drives <see cref="ImportAsync"/>, the only path that writes a ledger; the CLI's
+/// read-only <c>reconcile</c> diagnostic drives <see cref="ReconcileAsync"/>.
 /// </summary>
 public interface IMoneydanceImportService
 {
     /// <summary>Parse-time summary; no database access.</summary>
-    MoneydanceImportPreview Preview(MdExport export);
+    /// <param name="reportingCurrency">The reporting currency the import was given, which
+    /// its currencies are checked against (<see cref="Mappers.MdCurrencies.Problems"/>);
+    /// null for the file's base currency, the wizard's default.</param>
+    MoneydanceImportPreview Preview(MdExport export, string? reportingCurrency = null);
 
     /// <summary>
     /// Run the full import inside a single transaction on the supplied open
-    /// connection. Resolves/creates the target ledger (granting
-    /// <paramref name="ownerUserId"/> ownership of a new one), enforces the
-    /// seed-once guard, runs every pipeline step, validates, and commits.
-    /// Throws <see cref="ImportRefusedException"/> if the target ledger already
-    /// holds transactions.
+    /// connection: create a new ledger named <paramref name="ledgerName"/>, owned
+    /// by <paramref name="ownerUserId"/>, run every pipeline step into it,
+    /// validate, and commit. It never writes into an existing ledger, so the
+    /// ledger is seeded exactly once (ADR-0052 D2): the transaction that fills it
+    /// is the one that creates it.
     /// </summary>
+    /// <param name="beforeCommit">Runs last inside the import's transaction, with the
+    /// ledger's id: what a caller derives from the imported rows commits or rolls back
+    /// with them.</param>
+    /// <param name="currencyCode">The new ledger's reporting currency (ADR-0114 D7), in
+    /// stored form (three upper-case characters), written with the ledger row.</param>
     Task<MoneydanceImportResult> ImportAsync(
         NpgsqlConnection connection,
         MdExport export,
-        Guid? existingLedgerId,
-        string? newLedgerName,
+        string ledgerName,
         Guid ownerUserId,
         IProgress<ImportProgressUpdate>? progress,
-        CancellationToken cancellationToken);
+        CancellationToken cancellationToken,
+        Func<NpgsqlTransaction, Guid, CancellationToken, Task>? beforeCommit = null,
+        string currencyCode = LedgersRepository.DefaultCurrencyCode);
 
     /// <summary>
     /// Read-only reconcile: run the mapping-bearing steps against an
@@ -104,8 +101,9 @@ public interface IMoneydanceImportService
         CancellationToken cancellationToken);
 }
 
-/// <summary>One security's position as a fresh import would compute it.</summary>
-public sealed record ReconcileHolding(string? Ticker, string Name, decimal Quantity, decimal CostBasis);
+/// <summary>One security's position as a fresh import would compute it.
+/// <paramref name="CurrencyCode"/> is its account's, the currency its cost basis is in.</summary>
+public sealed record ReconcileHolding(string? Ticker, string Name, decimal Quantity, decimal CostBasis, string CurrencyCode);
 
 /// <summary>
 /// One (ticker, date, quantity) bucket where the fresh import and the compared
@@ -145,7 +143,27 @@ public sealed class MoneydanceImportService : IMoneydanceImportService
     /// <summary>Number of pipeline steps — the progress denominator.</summary>
     public const int PipelineStepCount = 10;
 
-    public MoneydanceImportPreview Preview(MdExport export)
+    /// <summary>
+    /// The step names an import reports, in the order it runs them: the
+    /// <see cref="ImportStepResult.StepName"/> of each <see cref="ImportProgressUpdate"/>.
+    /// Progress is reported after a step completes, so a reader that shows the step in
+    /// progress reads the next name here. Its count is <see cref="PipelineStepCount"/>.
+    /// </summary>
+    public static readonly IReadOnlyList<string> PipelineStepNames =
+    [
+        "securities",
+        "accounts",
+        "security_splits",
+        "transactions",
+        "investment_transactions",
+        "security_prices",
+        "trade-price-seed",
+        "recurring_transactions",
+        "balance-recompute",
+        "posting-count-recompute",
+    ];
+
+    public MoneydanceImportPreview Preview(MdExport export, string? reportingCurrency = null)
     {
         var counts = export.AllItems
             .GroupBy(item => item.ObjType, StringComparer.Ordinal)
@@ -153,43 +171,50 @@ public sealed class MoneydanceImportService : IMoneydanceImportService
             .OrderByDescending(row => row.Count)
             .ToList();
 
+        var currencies = Mappers.MdCurrencies.From(export);
         return new MoneydanceImportPreview(
             export.Metadata.Exporter,
             export.Metadata.MoneydanceBuild,
             export.Metadata.ExportDate,
             export.AllItems.Count,
-            counts);
+            counts,
+            currencies.BaseCurrencyCode,
+            currencies.Problems(export, reportingCurrency));
     }
 
     public async Task<MoneydanceImportResult> ImportAsync(
         NpgsqlConnection connection,
         MdExport export,
-        Guid? existingLedgerId,
-        string? newLedgerName,
+        string ledgerName,
         Guid ownerUserId,
         IProgress<ImportProgressUpdate>? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<NpgsqlTransaction, Guid, CancellationToken, Task>? beforeCommit = null,
+        string currencyCode = LedgersRepository.DefaultCurrencyCode)
     {
         var stopwatch = Stopwatch.StartNew();
+
+        // ADR-0114: every account takes its own Moneydance currency and every price the
+        // file's base currency, so a file where either cannot be read is refused before
+        // anything is written. The endpoint has refused it already; this is the
+        // pipeline's own guarantee for any other caller.
+        var currencies = Mappers.MdCurrencies.From(export);
+        var currencyProblems = currencies.Problems(export, currencyCode);
+        if (currencyProblems.Count > 0)
+            throw new InvalidDataException(
+                "The export's currencies cannot be imported: " + string.Join(" ", currencyProblems));
 
         await using var transaction =
             await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-        // Resolve the ledger up front (creating it if newLedgerName names a new
-        // one) so every step stamps rows consistently.
-        var ledgersRepo = new LedgersRepository(connection);
-        var ledger = await ledgersRepo
-            .ResolveOrCreateAsync(existingLedgerId, newLedgerName, ownerUserId, cancellationToken)
-            .ConfigureAwait(false);
-
         // ADR-0052 D2: seed a fresh ledger, once. MD re-keys txn.Id on
         // online-merge, so importing into a populated ledger would resurrect
-        // hidden/merged rows as duplicates. Refuse any ledger with transactions.
-        var existingTxns = await new TransactionsRepository(connection)
-            .CountTransactionHeadersAsync(ledger.Id, cancellationToken)
+        // hidden/merged rows as duplicates. The ledger is created here, in the
+        // transaction that fills it, so no other rows can be in it; the name is
+        // only a label and is never looked up.
+        var ledger = await new LedgersRepository(connection)
+            .CreateOwnedAsync(ledgerName, ownerUserId, cancellationToken, currencyCode)
             .ConfigureAwait(false);
-        if (existingTxns > 0)
-            throw new ImportRefusedException(ledger.Id, ledger.Name, existingTxns);
 
         var importContext = new ImportContext(export, ledger.Id);
         var steps = new List<ImportStepResult>(PipelineStepCount);
@@ -216,9 +241,9 @@ public sealed class MoneydanceImportService : IMoneydanceImportService
         Advance(await ReminderImportStep.RunAsync(connection, importContext, ImportSource, cancellationToken).ConfigureAwait(false));
         // Everything above wrote its rows inside this transaction, so the planner
         // still holds PRE-IMPORT statistics: on a fresh install it believes
-        // txn_legs has a few dozen rows when it now has six figures. The two
+        // txn_legs is nearly empty when it now holds the whole import. The two
         // recompute steps below are the first statements big enough to care, and a
-        // plan chosen for a 72-row table does not survive contact with a six-figure
+        // plan chosen for a near-empty table does not survive contact with a full
         // one. ANALYZE
         // inside a transaction sees this transaction's own uncommitted rows, which
         // is exactly what makes it usable here (VACUUM would not be).
@@ -234,15 +259,21 @@ public sealed class MoneydanceImportService : IMoneydanceImportService
 
         // Parity expects the count of MD accounts RESOLVED into the ledger
         // (created OR adopted) = AccountByMdId — not the accounts step's Written
-        // count (0 on a seed-only re-run).
+        // count (0 on a seed-only re-run). Less the blank leaf categories that
+        // resolve to the system Uncategorized: they share a Coffer-native row
+        // and have no junction of their own to count.
+        var expectedMdAccounts = importContext.AccountByMdId.Count - importContext.MdIdsOnUncategorized.Count;
         var validation = await new ImportValidator(connection)
-            .ValidateAsync(ledger.Id, expectedMdAccountCount: importContext.AccountByMdId.Count, cancellationToken)
+            .ValidateAsync(ledger.Id, expectedMdAccountCount: expectedMdAccounts, cancellationToken)
             .ConfigureAwait(false);
-        // Silent drops are data loss — a lossy import must FAIL its validation
-        // so both the CLI and the UI import wizard surface it (they render the
-        // report). Detail lives in each step's Skips; the CLI also prints the
-        // per-transaction table.
+        // Silent drops are data loss — a lossy import must FAIL its validation,
+        // which the caller reports (the API's job status carries each failed check
+        // and the steps' Skips to the wizard, and its log names the checks).
         validation = AppendNoDroppedTxnsCheck(validation, steps);
+        validation = AppendSecurityTypesCheck(validation, importContext.UnrecognisedSecurityTypes);
+
+        if (beforeCommit is not null)
+            await beforeCommit(transaction, ledger.Id, cancellationToken).ConfigureAwait(false);
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
@@ -263,7 +294,7 @@ public sealed class MoneydanceImportService : IMoneydanceImportService
         // Ephemeral ledger — the transaction never commits, so it (and every
         // row written below) vanishes on rollback.
         var ledger = await new LedgersRepository(connection)
-            .ResolveOrCreateAsync(null, "__reconcile_scratch__", ownerUserId, cancellationToken)
+            .CreateOwnedAsync("__reconcile_scratch__", ownerUserId, cancellationToken)
             .ConfigureAwait(false);
 
         var ctx = new ImportContext(export, ledger.Id);
@@ -281,8 +312,10 @@ public sealed class MoneydanceImportService : IMoneydanceImportService
         // the caller can diff them against a real ledger's positions.
         const string holdingsSql = """
             SELECT s.ticker AS Ticker, s.name AS Name,
-                   h.quantity AS Quantity, h.cost_basis AS CostBasis
+                   h.quantity AS Quantity, h.cost_basis AS CostBasis,
+                   a.currency_code AS CurrencyCode
             FROM holdings h JOIN securities s ON s.id = h.security_id
+                            JOIN accounts a ON a.id = h.account_id
             WHERE h.ledger_id = @ledgerId
             ORDER BY h.quantity DESC
             """;
@@ -355,26 +388,68 @@ public sealed class MoneydanceImportService : IMoneydanceImportService
         return new ReconcileResult(steps, holdings, diffs);
     }
 
+    /// <summary>The steps that import transactions. Their <see cref="ImportStepResult.Skipped"/>
+    /// counts transactions; another step's counts other things (the securities step's are
+    /// the fiat currencies it passes over), so only these are held to their list.</summary>
+    internal static readonly IReadOnlySet<string> TransactionStepNames =
+        new HashSet<string>(StringComparer.Ordinal) { "transactions", "investment_transactions" };
+
     /// <summary>
     /// Append a "no-dropped-transactions" check to the validation report, built
-    /// from the steps' <see cref="ImportStepResult.Skips"/>. Fails (surfacing in
-    /// the CLI + UI) when any transaction was dropped — silent drops are data
-    /// loss and must never pass quietly.
+    /// from the steps' <see cref="ImportStepResult.Skips"/>. Fails when any
+    /// transaction was dropped — silent drops are data loss and must never pass
+    /// quietly. A transaction step whose <see cref="ImportStepResult.Skipped"/>
+    /// count exceeds its list also fails it: a drop without a reason is still a
+    /// drop, and the list is what the wizard shows.
     /// </summary>
     internal static ImportValidator.ValidationReport AppendNoDroppedTxnsCheck(
         ImportValidator.ValidationReport report,
         IReadOnlyList<ImportStepResult> steps)
     {
         var dropped = steps.SelectMany(s => s.Skips ?? []).ToList();
-        var check = dropped.Count == 0
-            ? new ImportValidator.CheckResult("no-dropped-transactions", true, null)
-            : new ImportValidator.CheckResult("no-dropped-transactions", false,
-                $"{dropped.Count} transaction(s) dropped — " +
+        var unlisted = steps
+            .Where(s => TransactionStepNames.Contains(s.StepName))
+            .Select(s => (s.StepName, Count: s.Skipped - (s.Skips?.Count ?? 0)))
+            .Where(u => u.Count > 0)
+            .ToList();
+        var total = dropped.Count + unlisted.Sum(u => u.Count);
+        var check = total == 0
+            ? ImportValidator.CheckResult.Pass("no-dropped-transactions")
+            : ImportValidator.CheckResult.Fail("no-dropped-transactions",
+                $"{total} transaction(s) dropped — " +
                 string.Join("; ", dropped
                     .GroupBy(d => (d.Reason, Sec: d.Ticker ?? d.Security ?? "(none)"))
                     .OrderByDescending(g => g.Count())
                     .Take(10)
-                    .Select(g => $"{g.Count()}× {g.Key.Reason} [{g.Key.Sec}]")));
+                    .Select(g => $"{g.Count()}× {g.Key.Reason} [{g.Key.Sec}]")
+                    .Concat(unlisted.Select(u => $"{u.Count}× without a reason [{u.StepName}]"))),
+                CheckSummaries.NotImported(total));
+        return report with { Checks = [.. report.Checks, check] };
+    }
+
+    /// <summary>
+    /// Append a "security-types-recognised" check: fails when any security's
+    /// <c>sec_type</c> code was not in <see cref="Mappers.MdSecurityType"/>'s table,
+    /// so it was imported with vehicle type Other (ADR-0016, amendment of
+    /// 2026-11-18). Nothing is lost — the security, its holdings and its trades are
+    /// all imported — so, like every check, it only warns; the person can set the
+    /// vehicle with Edit security.
+    /// </summary>
+    internal static ImportValidator.ValidationReport AppendSecurityTypesCheck(
+        ImportValidator.ValidationReport report,
+        IReadOnlyList<UnrecognisedSecurityType> unrecognised)
+    {
+        var codes = unrecognised
+            .Select(u => u.Code)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+        var check = unrecognised.Count == 0
+            ? ImportValidator.CheckResult.Pass("security-types-recognised")
+            : ImportValidator.CheckResult.Fail("security-types-recognised",
+                $"{unrecognised.Count} security(ies) with an unrecognised sec_type code "
+                + $"({string.Join(", ", codes)}) imported with vehicle type Other",
+                CheckSummaries.UnrecognisedSecurityTypes(unrecognised.Count, codes));
         return report with { Checks = [.. report.Checks, check] };
     }
 }

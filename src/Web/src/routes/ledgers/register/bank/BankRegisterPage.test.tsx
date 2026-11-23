@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import {
@@ -11,6 +11,7 @@ import {
 } from '@tanstack/react-router';
 
 import { BankRegisterPage } from './BankRegisterPage';
+import { NO_NOTES } from '@/lib/annotations/rowNotesFixture';
 import { ApiError } from '@/lib/api';
 import * as apiModule from '@/lib/api';
 import type {
@@ -48,7 +49,7 @@ const FOCUS_ID = '00000000-0000-0000-0000-0000000000f0';
 const TEST_LEDGER: LedgerSummary = {
     id: LEDGER_ID,
     name: 'Personal',
-    role: 'owner',
+    role: 'owner', currencyCode: 'USD',
 };
 const TEST_ACCOUNT: AccountSummary = {
     id: ACCOUNT_ID,
@@ -70,19 +71,19 @@ function makeTxn(
     overrides: Partial<BankRow> & { id: string },
 ): BankRow {
     const defaults: BankRow = {
+        ...NO_NOTES,
         kind: 'bank',
-    legTags: [],
         id: '',
         accountId: ACCOUNT_ID,
         payee: 'Coffee Shop',
-        memo: null,
         amount: -4.5,
         postedAt: '2026-05-01T12:00:00Z',
         transactedAt: null,
         status: 'uncleared',
         isHidden: false,
-        hasOverrides: false,
         balanceAfter: 100,
+        currencyCode: 'USD',
+        balanceCurrencyCode: 'USD',
         origin: 'manual',
         isPending: false,
         externalId: null,
@@ -93,13 +94,10 @@ function makeTxn(
         counterpartyAccountId: null,
         counterpartyAccountName: null,
         counterpartyAccountType: null,
-        tags: [],
         headerId: '00000000-0000-0000-0000-000000000000',
         clearedAt: null,
         clearedByUserId: null,
         createdAt: '2026-05-01T12:00:00Z',
-        legMemo: null,
-        headerMemo: null,
         onlineMatchFitid: null,
         onlineMatchFiId: null,
         needsReview: false,
@@ -118,6 +116,19 @@ function makeTxn(
 /** Wrap a single transaction into a single-txn register entry. */
 function entryOf(t: BankRow): RegisterEntry {
     return { kind: 'txn', txn: t, groupId: null, legs: null };
+}
+
+/**
+ * A precise write refreshes the home screen's reads (ADR-0079 as amended
+ * 2026-11-03) and leaves the register's window key alone, which would re-seed
+ * the window and move the user off their row.
+ */
+function expectHomeRefreshedNotRegister(spy: { mock: { calls: unknown[][] } }) {
+    const keys = spy.mock.calls.map((c) => (c[0] as { queryKey?: unknown[] } | undefined)?.queryKey);
+    expect(keys).toContainEqual(['home', LEDGER_ID]);
+    expect(keys).toContainEqual(['overview', LEDGER_ID]);
+    expect(keys).toContainEqual(['budget-progress', LEDGER_ID]);
+    expect(keys.filter((k) => k?.[0] === 'register')).toEqual([]);
 }
 
 function renderRegister(
@@ -147,7 +158,7 @@ function renderRegister(
         path: '/ledgers/$ledgerId',
         component: () => <main>detail</main>,
     });
-    // A category register's breadcrumb links at the Categories destination;
+    // A category register's breadcrumb links at the Categories tab of Structure;
     // TanStack throws on a <Link to> with no matching route.
     const categoriesRoute = createRoute({
         getParentRoute: () => root,
@@ -170,6 +181,18 @@ function renderRegister(
             <RouterProvider router={router as any} />
         </QueryClientProvider>,
     );
+}
+
+/**
+ * The bulk footer's count reads exactly `text`. The count element is found by
+ * its own text inside the footer region and compared whole, so a read-only part
+ * that should be absent, or present, fails it.
+ */
+async function expectFooterCount(text: string) {
+    const region = await screen.findByRole('region', { name: /bulk actions/i });
+    await waitFor(() => {
+        expect(within(region).getByText(/\d+ selected/).textContent).toBe(text);
+    });
 }
 
 describe('BankRegisterPage', () => {
@@ -260,7 +283,7 @@ describe('BankRegisterPage', () => {
         // prepended without going negative — so this announced the first row
         // of the register as row 1000001. Its paired `aria-rowcount` was the
         // LOADED entry count, making the whole announcement "row 1000001 of
-        // 87" on an account with tens of thousands of rows.
+        // <one loaded page>" on an account far longer than one page.
         const txns = [
             makeTxn({ id: 't1', payee: 'Coffee Shop' }),
             makeTxn({ id: 't2', payee: 'Paycheck' }),
@@ -488,6 +511,54 @@ it('toggles the Scheduled filter', async () => {
         });
     });
 
+    it('disables bulk unhide when a read-only row is selected, as it does delete', async () => {
+        // Two hidden rows: one line of a split owned by another account, read-only
+        // here, and an ordinary row this register can change.
+        const target = makeTxn({
+            id: 'h-target',
+            headerId: '00000000-0000-0000-0000-0000000000b1',
+            payee: 'Split line',
+            isReadOnly: true,
+            isHidden: true,
+        });
+        const own = makeTxn({
+            id: 'h-own',
+            headerId: '00000000-0000-0000-0000-0000000000b2',
+            payee: 'Mis-imported',
+            isHidden: true,
+        });
+        vi.spyOn(apiModule, 'fetchRegister').mockImplementation((args) =>
+            Promise.resolve({
+                entries: (args.hidden ? [target, own] : [makeTxn({ id: 'v1', payee: 'Coffee Shop' })]).map(entryOf),
+                cursorForOlder: null,
+                cursorForNewer: null,
+            }),
+        );
+        vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
+        vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([TEST_ACCOUNT]);
+
+        renderRegister();
+
+        const user = userEvent.setup();
+        await user.click(await screen.findByRole('button', { name: /^Show:/i }));
+        await user.click(await screen.findByRole('option', { name: /^Hidden/i }));
+
+        await user.click(await screen.findByRole('checkbox', { name: `Select transaction ${target.id}` }));
+        const unhide = await screen.findByRole('button', { name: /^Unhide$/ });
+        await waitFor(() => {
+            expect(unhide).toBeDisabled();
+        });
+        expect(unhide).toHaveAttribute('title', expect.stringMatching(/canonical owner is elsewhere/i));
+
+        // The ordinary row alone may be un-hidden: the gate is the read-only row.
+        await user.click(screen.getByRole('checkbox', { name: `Select transaction ${target.id}` }));
+        await user.click(screen.getByRole('checkbox', { name: `Select transaction ${own.id}` }));
+        await waitFor(() => {
+            expect(screen.getByRole('button', { name: /^Unhide$/ })).toBeEnabled();
+        });
+        expect(screen.getByRole('button', { name: /^Unhide$/ })).toHaveAttribute('title', 'Unhide the selection');
+    });
+
     it('offers Move to account (but not Unhide) in the bulk bar for a normal selection', async () => {
         // ADR-0072 D3: Move re-files any selection and is available in every
         // view; Unhide only appears in the Hidden view.
@@ -514,6 +585,59 @@ it('toggles the Scheduled filter', async () => {
         expect(
             screen.queryByRole('button', { name: /^Unhide$/ }),
         ).not.toBeInTheDocument();
+    });
+
+    it('keeps the selection when Escape on the editor\'s Save button cancels the edit', async () => {
+        // The page's Escape clears the selection, and the editor's cancels the
+        // edit. One Escape on a button inside the editor is the editor's alone.
+        const edited = makeTxn({
+            id: 't-edited',
+            headerId: '00000000-0000-0000-0000-0000000000e1',
+            payee: 'Edited row',
+            counterpartyAccountId: '00000000-0000-0000-0000-0000000000c1',
+            counterpartyAccountName: 'Category A',
+        });
+        const picked = makeTxn({
+            id: 't-picked',
+            headerId: '00000000-0000-0000-0000-0000000000e2',
+            payee: 'Selected row',
+        });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(edited), entryOf(picked)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+        vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
+        vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([TEST_ACCOUNT]);
+        vi.spyOn(apiModule, 'fetchSelectionSummary').mockResolvedValue({
+            count: 1, totalCount: 1, readOnlyCount: 0, sumOnAccount: -4.5, currencyCode: 'USD',
+        });
+
+        renderRegister();
+        const user = userEvent.setup();
+
+        const checkbox = await screen.findByRole('checkbox', { name: `Select transaction ${picked.id}` });
+        await user.click(checkbox);
+        expect(checkbox).toBeChecked();
+
+        fireEvent.dblClick((await screen.findByText('Edited row')).closest('[role="row"]')!);
+        const save = await screen.findByRole('button', { name: /^Save/ });
+        act(() => save.focus());
+        expect(save).toHaveFocus();
+
+        await user.keyboard('{Escape}');
+
+        await waitFor(() => expect(document.querySelector('[data-editing="true"]')).toBeNull());
+        expect(screen.getByText('Edited row')).toBeInTheDocument();
+        expect(screen.getByRole('checkbox', { name: `Select transaction ${picked.id}` })).toBeChecked();
+        await expectFooterCount('1 selected');
+
+        // With no editor open, the page's Escape still clears it.
+        expect(document.activeElement?.tagName).not.toBe('INPUT');
+        await user.keyboard('{Escape}');
+        await waitFor(() => {
+            expect(screen.getByRole('checkbox', { name: `Select transaction ${picked.id}` })).not.toBeChecked();
+        });
     });
 
     it('toggles the Needs review filter tab', async () => {
@@ -584,7 +708,9 @@ it('toggles the Scheduled filter', async () => {
         // is checked — stub it so the count/Σ readout is deterministic.
         vi.spyOn(apiModule, 'fetchSelectionSummary').mockResolvedValue({
             count: 1,
-            sumOnAccount: -4.5,
+            totalCount: 1,
+            readOnlyCount: 0,
+            sumOnAccount: -4.5, currencyCode: 'USD',
         });
         const bulkDeleteSpy = vi
             .spyOn(apiModule, 'bulkDeleteTransactions')
@@ -629,10 +755,11 @@ it('toggles the Scheduled filter', async () => {
                 queryKey: ['accounts', LEDGER_ID],
             });
         });
+        expectHomeRefreshedNotRegister(invalidateSpy);
     });
 
     it('all-mode delete is enabled and a large count shows the typed-confirm', async () => {
-        // All-mode bulk delete is no longer gated client-side: the
+        // All-mode bulk delete is not gated client-side: the
         // server restricts all-mode ops to headers this account
         // ORIGINATES (ADR-0036), so clicking the header checkbox (→
         // 'all' mode) leaves Delete enabled. A large server count
@@ -646,7 +773,9 @@ it('toggles the Scheduled filter', async () => {
         vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([TEST_ACCOUNT]);
         vi.spyOn(apiModule, 'fetchSelectionSummary').mockResolvedValue({
             count: 250,
-            sumOnAccount: -250000,
+            totalCount: 250,
+            readOnlyCount: 0,
+            sumOnAccount: -250000, currencyCode: 'USD',
         });
 
         renderRegister();
@@ -670,6 +799,82 @@ it('toggles the Scheduled filter', async () => {
         expect(within(dialog).getByRole('textbox')).toBeInTheDocument();
     });
 
+    describe('the footer count', () => {
+        const EDITABLE = makeTxn({
+            id: 'f-editable',
+            headerId: '00000000-0000-0000-0000-0000000000d1',
+            payee: 'Own row',
+        });
+        const READ_ONLY = makeTxn({
+            id: 'f-read-only',
+            headerId: '00000000-0000-0000-0000-0000000000d2',
+            payee: 'Split line',
+            notesKind: 'splitOpposite',
+            isReadOnly: true,
+        });
+
+        function mockRows(accounts: AccountSummary[] = [TEST_ACCOUNT]) {
+            vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+                entries: [entryOf(EDITABLE), entryOf(READ_ONLY)],
+                cursorForOlder: null,
+                cursorForNewer: null,
+            });
+            vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
+            vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue(accounts);
+        }
+
+        it('names the read-only part of an explicit selection from its loaded rows while the summary is in flight', async () => {
+            mockRows();
+            // Never answers: until it does, the read-only part comes from the loaded rows.
+            vi.spyOn(apiModule, 'fetchSelectionSummary').mockReturnValue(new Promise(() => {}));
+            renderRegister();
+
+            const user = userEvent.setup();
+            await user.click(await screen.findByRole('checkbox', { name: `Select transaction ${EDITABLE.id}` }));
+            await expectFooterCount('1 selected');
+
+            await user.click(screen.getByRole('checkbox', { name: `Select transaction ${READ_ONLY.id}` }));
+            await expectFooterCount('2 selected · 1 read-only');
+        });
+
+        it('counts a select-all from the server, read-only rows included; the delete still names what it deletes', async () => {
+            mockRows();
+            vi.spyOn(apiModule, 'fetchSelectionSummary').mockResolvedValue({
+                count: 12,
+                totalCount: 15,
+                readOnlyCount: 3,
+                sumOnAccount: -120, currencyCode: 'USD',
+            });
+            renderRegister();
+
+            const user = userEvent.setup();
+            await user.click(await screen.findByRole('checkbox', {
+                name: /select all transactions in this account/i,
+            }));
+            await expectFooterCount('15 selected · 3 read-only');
+
+            await user.click(await screen.findByRole('button', { name: /^Delete$/ }));
+            expect(await screen.findByRole('dialog')).toHaveTextContent(/Delete 12 transactions\?/i);
+        });
+
+        it('reads "N selected" for a select-all with no read-only row', async () => {
+            mockRows();
+            vi.spyOn(apiModule, 'fetchSelectionSummary').mockResolvedValue({
+                count: 2,
+                totalCount: 2,
+                readOnlyCount: 0,
+                sumOnAccount: -9, currencyCode: 'USD',
+            });
+            renderRegister();
+
+            const user = userEvent.setup();
+            await user.click(await screen.findByRole('checkbox', {
+                name: /select all transactions in this account/i,
+            }));
+            await expectFooterCount('2 selected');
+        });
+    });
+
     it('Accept (approve) invalidates the per-ledger accounts query (resets the sidebar review-dot)', async () => {
         const txn = makeTxn({ id: 't1', payee: 'Synced', needsReview: true });
         vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
@@ -679,16 +884,16 @@ it('toggles the Scheduled filter', async () => {
         });
         vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
         vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([TEST_ACCOUNT]);
-        // Accept-as-is is a COMMAND with its own route now, not a PATCH whose
-        // entire body was one flag. Spying on patchTransaction as well pins that
-        // it is NOT used — otherwise this test would keep passing if the call
-        // quietly went back to the old shape.
+        // Accept-as-is is a COMMAND with its own route, not a PATCH whose entire
+        // body is one flag. Spying on patchTransaction as well pins that it is
+        // NOT used — otherwise this test would keep passing if the call quietly
+        // became a PATCH.
         const approveSpy = vi
             .spyOn(apiModule, 'approveTransaction')
-            .mockResolvedValue(null);
+            .mockResolvedValue([]);
         const patchSpy = vi
             .spyOn(apiModule, 'patchTransaction')
-            .mockResolvedValue(null);
+            .mockResolvedValue([]);
         const invalidateSpy = vi.spyOn(
             QueryClient.prototype,
             'invalidateQueries',
@@ -719,6 +924,40 @@ it('toggles the Scheduled filter', async () => {
                 queryKey: ['accounts', LEDGER_ID],
             });
         });
+        expectHomeRefreshedNotRegister(invalidateSpy);
+    });
+
+    it('Accept from the editor refreshes the home screen\'s reads, and not the register window', async () => {
+        // A counterparty, so the editor's Accept is enabled.
+        const txn = makeTxn({
+            id: 't1', payee: 'Synced', needsReview: true,
+            counterpartyAccountId: '00000000-0000-0000-0000-0000000000c1',
+            counterpartyAccountName: 'Category A',
+        });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(txn)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+        vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
+        vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([TEST_ACCOUNT]);
+        vi.spyOn(apiModule, 'fetchBalancesForHeaders').mockResolvedValue([]);
+        const patchSpy = vi
+            .spyOn(apiModule, 'patchTransaction')
+            .mockResolvedValue([entryOf({ ...txn, needsReview: false })]);
+        const invalidateSpy = vi.spyOn(QueryClient.prototype, 'invalidateQueries');
+
+        renderRegister();
+
+        fireEvent.dblClick((await screen.findByText('Synced')).closest('[role="row"]')!);
+        fireEvent.click(await screen.findByRole('button', { name: 'Accept' }));
+
+        await waitFor(() => expect(patchSpy).toHaveBeenCalled());
+        expect(patchSpy.mock.calls[0]![2]).toMatchObject({ approve: true });
+        await waitFor(() => {
+            expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['accounts', LEDGER_ID] });
+        });
+        expectHomeRefreshedNotRegister(invalidateSpy);
     });
 
     it('breadcrumbs link to the parent ledger, with no "All ledgers" root', async () => {
@@ -844,6 +1083,63 @@ it('toggles the Scheduled filter', async () => {
             expect(
                 screen.queryByRole('button', { name: /Move to account/i }),
             ).not.toBeInTheDocument();
+        });
+
+        describe('the footer count', () => {
+            // A category's read-only rows: a split's lines seen from the
+            // category, and a dividend's category leg (the event is the
+            // brokerage's).
+            const OWN = makeTxn({
+                id: 'cf-own',
+                headerId: '00000000-0000-0000-0000-0000000000e1',
+                accountId: CHILD_ID,
+            });
+            const SPLIT_SIDE = makeTxn({
+                id: 'cf-split',
+                headerId: '00000000-0000-0000-0000-0000000000e2',
+                accountId: CHILD_ID,
+                notesKind: 'splitOpposite',
+                isReadOnly: true,
+            });
+            const EVENT_SIDE = makeTxn({
+                id: 'cf-event',
+                headerId: '00000000-0000-0000-0000-0000000000e3',
+                accountId: CHILD_ID,
+                notesKind: 'eventOpposite',
+                isReadOnly: true,
+            });
+
+            it('names the read-only part of an explicit selection from its loaded rows while the summary is in flight', async () => {
+                mockTree([OWN, SPLIT_SIDE, EVENT_SIDE].map(entryOf));
+                // Never answers: until it does, the read-only part comes from the loaded rows.
+                vi.spyOn(apiModule, 'fetchSelectionSummary').mockReturnValue(new Promise(() => {}));
+                renderRegister(`/ledgers/${LEDGER_ID}/accounts/${CHILD_ID}`);
+
+                const user = userEvent.setup();
+                await user.click(await screen.findByRole('checkbox', { name: `Select transaction ${OWN.id}` }));
+                await expectFooterCount('1 selected');
+
+                await user.click(screen.getByRole('checkbox', { name: `Select transaction ${SPLIT_SIDE.id}` }));
+                await user.click(screen.getByRole('checkbox', { name: `Select transaction ${EVENT_SIDE.id}` }));
+                await expectFooterCount('3 selected · 2 read-only');
+            });
+
+            it('counts a select-all from the server, read-only rows included', async () => {
+                mockTree([OWN, SPLIT_SIDE, EVENT_SIDE].map(entryOf));
+                vi.spyOn(apiModule, 'fetchSelectionSummary').mockResolvedValue({
+                    count: 1,
+                    totalCount: 3,
+                    readOnlyCount: 2,
+                    sumOnAccount: 4.5, currencyCode: 'USD',
+                });
+                renderRegister(`/ledgers/${LEDGER_ID}/accounts/${CHILD_ID}`);
+
+                const user = userEvent.setup();
+                await user.click(await screen.findByRole('checkbox', {
+                    name: /select all transactions/i,
+                }));
+                await expectFooterCount('3 selected · 2 read-only');
+            });
         });
 
         it('offers no New transaction, because a category cannot hold one', async () => {
@@ -983,6 +1279,9 @@ it('toggles the Scheduled filter', async () => {
             cursorForNewer: null,
         });
         vi.spyOn(apiModule, 'fetchHeaderLegs').mockResolvedValue([]);
+        // The rows wait for the account, whose currency they are printed in.
+        vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
+        vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([TEST_ACCOUNT]);
 
         renderRegister();
 
@@ -1064,9 +1363,8 @@ it('toggles the Scheduled filter', async () => {
         });
     });
 
-    // The bank's merge SAVE path, which had never been tested. It has shipped
-    // since #341 and works; the gap is why the INVESTMENT register could be
-    // missing the same branch entirely and nobody noticed for as long.
+    // The bank's merge SAVE path. Without a test, a register can lack this
+    // branch entirely while every other test stays green.
     //
     // Direction is inverted: the edited row becomes the LOSER and the chosen
     // candidate survives, so the server returns the SURVIVOR's entry. Patching
@@ -1077,9 +1375,9 @@ it('toggles the Scheduled filter', async () => {
         const loser = makeTxn({
             id: 'l1', headerId: LOSER_HEADER, payee: 'imported dupe',
             // NO counterparty — an uncategorised imported row, which is what
-            // most needs-review rows look like. Folding one used to be a
-            // silent no-op: buildSaveBody validated the postings before it
-            // reached the merge stamp.
+            // most needs-review rows look like. Folding one must not be a
+            // silent no-op, which it would be if buildSaveBody validated the
+            // postings before it reached the merge stamp.
             needsReview: true,
         });
         const winner = makeTxn({
@@ -1096,34 +1394,31 @@ it('toggles the Scheduled filter', async () => {
             {
                 headerId: WINNER_HEADER,
                 payee: 'the keeper',
-                memo: null,
                 postedAt: '2026-05-01T12:00:00Z',
-                daysDelta: 0,
-                tags: [],
                 postings: [
                     {
                         counterpartyAccountId: '00000000-0000-0000-0000-0000000000c1',
                         counterpartyAccountName: 'Groceries',
-                        amount: 4.5,
-                        legMemo: null,
                     },
                 ],
+                origin: 'manual',
             },
         ]);
-        // The server folds the loser away and returns the SURVIVOR's entry.
+        // The server folds the loser away and returns the SURVIVOR's entries.
         // Merging is a COMMAND with its own route; patchTransaction is spied too
         // so a silent return to merge-by-PATCH fails rather than passing.
         const mergeSpy = vi
             .spyOn(apiModule, 'mergeTransaction')
-            .mockResolvedValue(entryOf(winner));
+            .mockResolvedValue([entryOf(winner)]);
         const patchSpy = vi
             .spyOn(apiModule, 'patchTransaction')
-            .mockResolvedValue(entryOf(winner));
+            .mockResolvedValue([entryOf(winner)]);
         // Saving kicks off the in-place balance refresh. Unstubbed it reaches the
         // real fetch with a relative URL, which the test environment cannot parse
         // — today an ignored rejection, and a hard "unhandled error" failure on a
-        // newer jsdom, which is how the dependency bump surfaced it.
+        // newer jsdom.
         vi.spyOn(apiModule, 'fetchBalancesForHeaders').mockResolvedValue([]);
+        const invalidateSpy = vi.spyOn(QueryClient.prototype, 'invalidateQueries');
 
         renderRegister();
 
@@ -1138,11 +1433,11 @@ it('toggles the Scheduled filter', async () => {
 
         await waitFor(() => expect(mergeSpy).toHaveBeenCalled());
         // EXACT, not objectContaining: the body carries the merge stamp and
-        // nothing else. It used to pair an `approve: true`, which put the
-        // "a merged loser is not awaiting review" invariant in the caller —
-        // so clients that did not send it left the row flagged. The server owns
-        // it now, and the route has no approve field at all, which is a stronger
-        // guarantee than pinning a body shape: there is nothing to creep back.
+        // nothing else. Pairing it with `approve: true` would put the "a merged
+        // loser is not awaiting review" invariant in the caller, so clients that
+        // did not send it would leave the row flagged. The server owns it, and
+        // the route has no approve field at all, which is a stronger guarantee
+        // than pinning a body shape: there is nothing to creep back.
         //
         // The WINNER is the third argument — the direction is inverted, and
         // asserting it here is what catches a swap of loser and survivor.
@@ -1154,6 +1449,7 @@ it('toggles the Scheduled filter', async () => {
             expect(screen.queryByText('imported dupe')).not.toBeInTheDocument();
         });
         expect(screen.getAllByText('the keeper')).toHaveLength(1);
+        expectHomeRefreshedNotRegister(invalidateSpy);
     });
 });
 
@@ -1213,15 +1509,14 @@ describe('BankRegisterPage — focus anchoring', () => {
     });
 
     /**
-     * The regression that motivated the whole change.
+     * The central case for anchoring.
      */
     it('focuses nothing when the server declines to anchor', async () => {
         // The server pins an anchor only when the row matches the active filter
         // and otherwise returns the ordinary most-recent page — saying nothing
-        // about which it did. The hook used to read "anchor requested" as
-        // "anchor is at index 0" and focus whatever sat there. With a status tab
-        // active, saving a row out of that tab therefore focused and scrolled to
-        // an unrelated row.
+        // about which it did. Reading "anchor requested" as "anchor is at index
+        // 0" would focus whatever sat there: with a status tab active, saving a
+        // row out of that tab would focus and scroll to an unrelated row.
         const unrelated = makeTxn({ id: 'z1', headerId: 'not-the-anchor', payee: 'Unrelated' });
         vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
             entries: [entryOf(unrelated)],
@@ -1240,6 +1535,236 @@ describe('BankRegisterPage — focus anchoring', () => {
             document.querySelector('[data-headerid="not-the-anchor"]')
                 ?.getAttribute('data-focused'),
         ).toBe('false');
+    });
+});
+
+/**
+ * The row list is the register's focus home (ADR-0023 §D, §E, §L). Rows never
+ * take focus; a control that takes itself away (the bulk bar's Clear selection
+ * and a bulk action that clears the selection, the inline editor and the
+ * new-row form however they close) hands focus to the row list, never to the
+ * page. From there the register's keys work as from anywhere.
+ */
+describe('BankRegisterPage — the row list is focus\'s home', () => {
+    const FIRST = makeTxn({
+        id: 't-first', headerId: '00000000-0000-0000-0000-0000000000e1', payee: 'First row',
+        counterpartyAccountId: '00000000-0000-0000-0000-0000000000c1',
+        counterpartyAccountName: 'Category A',
+    });
+    const SECOND = makeTxn({ id: 't-second', headerId: '00000000-0000-0000-0000-0000000000e2', payee: 'Second row' });
+
+    beforeEach(() => {
+        vi.restoreAllMocks();
+        vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([TEST_LEDGER]);
+        vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([TEST_ACCOUNT]);
+        vi.spyOn(apiModule, 'fetchBalancesForHeaders').mockResolvedValue([]);
+        vi.spyOn(apiModule, 'fetchSelectionSummary').mockResolvedValue({
+            count: 1, totalCount: 1, readOnlyCount: 0, sumOnAccount: -4.5, currencyCode: 'USD',
+        });
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({
+            entries: [entryOf(FIRST), entryOf(SECOND)],
+            cursorForOlder: null,
+            cursorForNewer: null,
+        });
+    });
+
+    const rowList = () => screen.getByRole('grid', { name: 'Transactions' });
+    const focusedRow = () => document.querySelector('[data-focused="true"]')?.getAttribute('data-headerid') ?? null;
+
+    async function selectSecond(user: ReturnType<typeof userEvent.setup>) {
+        const checkbox = await screen.findByRole('checkbox', { name: `Select transaction ${SECOND.id}` });
+        await user.click(checkbox);
+        expect(checkbox).toBeChecked();
+    }
+
+    async function openEditor() {
+        fireEvent.dblClick((await screen.findByText('First row')).closest('[role="row"]')!);
+        await screen.findByRole('button', { name: /^Save/ });
+        expect(document.querySelector('[data-editing="true"]')).not.toBeNull();
+    }
+
+    const editorClosed = () => expect(document.querySelector('[data-editing="true"]')).toBeNull();
+
+    it('is a named grid that takes focus without being a Tab stop', async () => {
+        renderRegister();
+        await screen.findByText('First row');
+
+        expect(rowList()).toHaveAttribute('tabindex', '-1');
+        expect(rowList().className).toContain('focus-visible:ring');
+    });
+
+    it('takes focus when Clear selection takes itself away', async () => {
+        renderRegister();
+        const user = userEvent.setup();
+        await selectSecond(user);
+
+        await user.click(await screen.findByRole('button', { name: 'Clear selection' }));
+
+        await waitFor(() => expect(screen.queryByRole('button', { name: 'Clear selection' })).toBeNull());
+        expect(rowList()).toHaveFocus();
+    });
+
+    it('takes focus when a bulk delete clears the bar', async () => {
+        vi.spyOn(apiModule, 'bulkDeleteTransactions').mockResolvedValue({ hardDeleted: 1, softHidden: 0 });
+        renderRegister();
+        const user = userEvent.setup();
+        await selectSecond(user);
+
+        await user.click(await screen.findByRole('button', { name: /^Delete$/ }));
+        await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: /^Delete$/ }));
+
+        await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+        await waitFor(() => expect(screen.queryByRole('button', { name: 'Clear selection' })).toBeNull());
+        expect(rowList()).toHaveFocus();
+    });
+
+    it('takes focus when Escape cancels an inline edit', async () => {
+        renderRegister();
+        const user = userEvent.setup();
+        await openEditor();
+
+        await user.keyboard('{Escape}');
+
+        await waitFor(editorClosed);
+        expect(rowList()).toHaveFocus();
+        // Focus the keyboard handed it is ringed; only focus a press gave it is not.
+        expect(rowList()).not.toHaveAttribute('data-pressed');
+    });
+
+    it('takes focus when Cancel closes an inline edit', async () => {
+        renderRegister();
+        const user = userEvent.setup();
+        await openEditor();
+
+        await user.click(screen.getByRole('button', { name: /^Cancel/ }));
+
+        await waitFor(editorClosed);
+        expect(rowList()).toHaveFocus();
+    });
+
+    it('takes focus when Save closes an inline edit', async () => {
+        vi.spyOn(apiModule, 'patchTransaction').mockResolvedValue([entryOf(FIRST)]);
+        renderRegister();
+        const user = userEvent.setup();
+        await openEditor();
+
+        await user.click(screen.getByRole('button', { name: /^Save/ }));
+
+        await waitFor(editorClosed);
+        expect(rowList()).toHaveFocus();
+    });
+
+    it.each([
+        ['Escape', async (user: ReturnType<typeof userEvent.setup>) => { await user.keyboard('{Escape}'); }],
+        ['Cancel', async (user: ReturnType<typeof userEvent.setup>) => {
+            await user.click(screen.getByRole('button', { name: /^Cancel/ }));
+        }],
+    ])('takes focus when %s closes the new-row form', async (_how, close) => {
+        renderRegister();
+        const user = userEvent.setup();
+        await screen.findByText('First row');
+        await user.click(screen.getByRole('button', { name: /\+ New transaction/i }));
+        await screen.findByRole('button', { name: /^Save/ });
+
+        await close(user);
+
+        await waitFor(() => expect(screen.queryByRole('button', { name: /^Save/ })).toBeNull());
+        expect(rowList()).toHaveFocus();
+    });
+
+    it('leaves focus where a press outside the editor put it', async () => {
+        renderRegister();
+        const user = userEvent.setup();
+        await openEditor();
+        const search = screen.getByRole('searchbox', { name: 'Search transactions' });
+
+        await user.click(search);
+
+        await waitFor(editorClosed);
+        expect(search).toHaveFocus();
+    });
+
+    it('leaves focus the user moved elsewhere while the save ran', async () => {
+        let finish: (value: RegisterEntry[]) => void = () => {};
+        vi.spyOn(apiModule, 'patchTransaction').mockReturnValue(
+            new Promise<RegisterEntry[]>((resolve) => { finish = resolve; }),
+        );
+        renderRegister();
+        const user = userEvent.setup();
+        await openEditor();
+        await user.click(screen.getByRole('button', { name: /^Save/ }));
+        // A press outside does not cancel an editor whose save is in flight.
+        const search = screen.getByRole('searchbox', { name: 'Search transactions' });
+        await user.click(search);
+        expect(document.querySelector('[data-editing="true"]')).not.toBeNull();
+
+        await act(async () => finish([entryOf(FIRST)]));
+
+        await waitFor(editorClosed);
+        expect(search).toHaveFocus();
+    });
+
+    it('works the register\'s keys with focus on it: the arrows, Enter and N', async () => {
+        renderRegister();
+        const user = userEvent.setup();
+        await selectSecond(user);
+        await user.click(await screen.findByRole('button', { name: 'Clear selection' }));
+        await waitFor(() => expect(rowList()).toHaveFocus());
+
+        await user.keyboard('{ArrowDown}');
+        expect(focusedRow()).toBe(FIRST.headerId);
+        await user.keyboard('{ArrowDown}');
+        expect(focusedRow()).toBe(SECOND.headerId);
+        expect(rowList()).toHaveFocus();
+
+        await user.keyboard('{ArrowUp}{Enter}');
+        expect(await screen.findByRole('button', { name: /^Save/ })).toBeInTheDocument();
+        await user.keyboard('{Escape}');
+        await waitFor(editorClosed);
+        expect(rowList()).toHaveFocus();
+
+        await user.keyboard('n');
+        expect(await screen.findByRole('button', { name: /^Save/ })).toBeInTheDocument();
+    });
+
+    // An empty register draws a placeholder instead of the list: focus goes to
+    // "+ New transaction", the register's add control, never to the page.
+    it.each([
+        ['Escape', async (user: ReturnType<typeof userEvent.setup>) => { await user.keyboard('{Escape}'); }],
+        ['Cancel', async (user: ReturnType<typeof userEvent.setup>) => {
+            await user.click(screen.getByRole('button', { name: /^Cancel/ }));
+        }],
+    ])('gives focus to + New transaction when %s closes the new-row form in an empty account', async (_how, close) => {
+        vi.spyOn(apiModule, 'fetchRegister').mockResolvedValue({ entries: [], cursorForOlder: null, cursorForNewer: null });
+        renderRegister();
+        const user = userEvent.setup();
+        await screen.findByText('No transactions in this account.');
+        const add = screen.getByRole('button', { name: /\+ New transaction/i });
+        await user.click(add);
+        await screen.findByRole('button', { name: /^Save/ });
+
+        await close(user);
+
+        await waitFor(() => expect(screen.queryByRole('button', { name: /^Save/ })).toBeNull());
+        expect(add).toHaveFocus();
+    });
+
+    it('gives focus to + New transaction when a bulk delete takes the last rows away', async () => {
+        let entries: RegisterEntry[] = [entryOf(SECOND)];
+        vi.spyOn(apiModule, 'fetchRegister').mockImplementation(async () => ({ entries, cursorForOlder: null, cursorForNewer: null }));
+        vi.spyOn(apiModule, 'bulkDeleteTransactions').mockImplementation(async () => {
+            entries = [];
+            return { hardDeleted: 1, softHidden: 0 };
+        });
+        renderRegister();
+        const user = userEvent.setup();
+        await selectSecond(user);
+
+        await user.click(await screen.findByRole('button', { name: /^Delete$/ }));
+        await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: /^Delete$/ }));
+
+        await screen.findByText('No transactions in this account.');
+        await waitFor(() => expect(screen.getByRole('button', { name: /\+ New transaction/i })).toHaveFocus());
     });
 });
 

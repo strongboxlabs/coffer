@@ -11,8 +11,8 @@ category / status — was written **twice**:
 
 - **SQL**, in `register_entry_keys` (mig 164, extended by 166), for the windowed
   keyset page. This one is non-negotiable: the page is a sliding window over a
-  cursor, so the client can't filter what it hasn't loaded (that was bug \#322);
-  the filter must run server-side inside the cursor walk.
+  cursor, so the client can't filter what it hasn't loaded; the filter must run
+  server-side inside the cursor walk.
 - **LINQ**, in `RegisterRepository.ApplyRegisterFilterPredicates`, for the two
   full-set aggregates that don't paginate — the date-rail buckets
   (`GetIndexBucketsAsync`) and the status-count badges (`GetStatusCountsAsync`) —
@@ -25,9 +25,8 @@ the LINQ side. The status precedence (scheduled › pending › recon) was encod
 three places (SQL arm, LINQ arm, and the in-memory bucketing in the counts). And
 the copies had already drifted in one subtle way: the SQL used calendar-date
 comparison (`posted_at::date`), the LINQ used a UTC-instant (`PostedAt >= midnight
-UTC`) — identical only while the DB session is UTC (it is today), divergent at
-day boundaries otherwise. A 2026-07-14 review flagged the whole arrangement as a
-standing drift hazard rather than a live bug.
+UTC`) — identical only while the DB session is UTC, divergent at day boundaries
+otherwise. The arrangement is a standing drift hazard rather than a live bug.
 
 ## Decisions
 
@@ -56,9 +55,9 @@ are now single-sourced on `posted_at::date`.
 
 Both functions took `p_account_id uuid`. A **parent category has no postings of
 its own** — they all sit on its children — so a register that could only name
-one account could never show a category's own money: opening "Taxes" showed an
-empty register while the Categories tree, the sidebar and the budget all
-reported five figures against it. The scope is therefore `p_account_ids uuid[]`,
+one account could never show a category's own money: opening a parent category
+shows an empty register while the Categories tree, the sidebar and the budget
+all report a total against it. The scope is therefore `p_account_ids uuid[]`,
 and the single-account case passes an array of one.
 
 - The predicate went from `rt.account_id = $1` to `rt.account_id = ANY($1)`.
@@ -74,7 +73,7 @@ and the single-account case passes an array of one.
 - Widening BOTH together is what keeps D1 true: the page, the rail, the counts
   and select-all scope identically because they share the primitive.
 - `= ANY(array)` on a one-element array plans as an equality, so the register's
-  hottest query is unchanged; a category subtree is tens of rows, not thousands.
+  hottest query is unchanged; a category subtree is a short array.
 
 Who chooses the set is the API's business, not the function's:
 `RegisterRepository.ResolveScopeAsync` expands a category to its descendants
@@ -86,8 +85,8 @@ one-element array otherwise.
 The primitive is a single-`SELECT` `LANGUAGE sql STABLE` function, which the
 Postgres planner **inlines** into the caller. This is load-bearing: if it were an
 optimization barrier, the page would materialize full filtered history before the
-`LIMIT` — a regression on the app's core read path. Verified on real data
-(a ledger with a six-figure leg count) with `EXPLAIN`: the plan composed over the primitive is
+`LIMIT` — a regression on the app's core read path. Verified with `EXPLAIN`:
+the plan composed over the primitive is
 **identical** to the pre-167 inline plan — same cost, same node tree, no
 `Function Scan` barrier, `LIMIT` selectivity and the account index scan preserved.
 
@@ -115,5 +114,23 @@ So `p_hidden` is `(p_hidden IS NULL OR is_hidden = p_hidden)`.
   primitive too (`ResolveCursorForHeaderAsync`), so a focused row the filter
   excludes is never pinned to the top; a non-matching anchor falls through to
   the most-recent *filtered* page (not an empty one). The SPA complements this
-  by clearing `?focus=` when a filter changes. (Follow-up to the initial slice —
-  the case where a scheduled non-matching row showed under a category filter.)
+  by clearing `?focus=` when a filter changes, so a scheduled non-matching row
+  cannot show under a category filter.
+
+## Amendment, 2026-10-26 — the one definition is LINQ over the stored presentation (mig 266)
+
+The filter's one definition is now `RegisterQuery.Filtered`, in LINQ over
+`resolved_transactions`, and the page (`RegisterQuery.EntryKeysAsync`), the anchor, the
+rail buckets, the status counts and a filtered select-all read it, so the property this
+ADR set up holds unchanged. Its memo, tag and text predicates read the stored
+memo-and-tags presentation: a tag filter matches the tags in play for the leg (on a split
+side the transaction's with the line's own; elsewhere what the row shows, inherited tags
+included), and a text search matches the memo the row shows and, where the header is in
+play, the transaction's. The entry key is the stored grouping (ADR-0036, 2026-10-26
+amendment).
+
+Migration 266 dropped `register_entry_keys` and `register_filtered_entries` together with
+the view's own memo and tag columns they filtered on, so the rowtype binding noted under
+Consequences no longer applies. `RegisterFilterConsistencyTests` still pins the surfaces'
+agreement, and `RegisterEntryKeyTests` holds every register, filter and sort to the rule
+run over the ledger's loaded rows, in place of the SQL check of the functions.

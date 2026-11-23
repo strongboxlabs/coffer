@@ -9,6 +9,8 @@ export interface BackupSummary {
     createdAtUtc: string;
     /** "Never delete" pin — excluded from local + Drive retention (ADR-0062). */
     pinned: boolean;
+    /** Set for a backup held for an upgrade started from the app, e.g. "before upgrade 0.128.1 to 0.129.0" (ADR-0110). Not an admin pin. */
+    upgradeLabel?: string | null;
 }
 
 /** GFS retention policy (ADR-0074). The single source of truth that governs

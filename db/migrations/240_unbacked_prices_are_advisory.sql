@@ -1,12 +1,11 @@
 -- ---------------------------------------------------------------------------
 -- 240 — a price nothing derives is ADVISORY, not a finding.
 --
--- Migration 239 reported these as `orphaned` inside the consistency check,
--- alongside genuine disagreements. On a real ledger that produced a panel
--- reading "N of M no longer backed by a trade", with a Repair button that
--- would not have touched one of them, asking the reader to "decide" with
--- nothing to decide on. It was unreadable, and the framing was wrong before the
--- wording was.
+-- Migration 239 reports these as `orphaned` inside the consistency check,
+-- alongside genuine disagreements: a panel reading "N of M no longer backed by
+-- a trade", with a Repair button that touches none of them, asking the reader
+-- to "decide" with nothing to decide on. The framing is wrong, not only the
+-- wording.
 --
 -- WHY IT CANNOT BE A FINDING. `security_prices` records THAT a trade produced a
 -- row (`source = 'trade'`) and never WHICH trade — the table has no link to a

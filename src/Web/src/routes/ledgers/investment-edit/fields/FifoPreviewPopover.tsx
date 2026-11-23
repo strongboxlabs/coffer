@@ -25,6 +25,9 @@ interface FifoPreviewPopoverProps {
     /** The transaction being edited, left out of the position it is
      *  measured against. Null for a new one. */
     excludeHeaderId: string | null;
+    /** The brokerage's currency, which every lot's cost is in. Null while the
+     *  editor does not know it: the costs are left blank until it does. */
+    currency: string | null;
 }
 
 /**
@@ -48,7 +51,9 @@ export function FifoPreviewPopover({
     sharesInput,
     postedAt,
     excludeHeaderId,
+    currency,
 }: FifoPreviewPopoverProps) {
+    const money = (amount: number) => (currency === null ? '' : formatCurrency(amount, currency));
     const isTransfer = action === 'transfer_shares';
     const visible = (action === 'sell' || action === 'sellx' || isTransfer)
         && securityId !== null
@@ -96,10 +101,10 @@ export function FifoPreviewPopover({
                                 {c.acquiredAt.slice(0, 10)}
                             </span>
                             <span>
-                                {fmt(c.qtyConsumed)}/{fmt(c.qtyAvailable)} sh @ {fmtUsd(c.unitCost)}
+                                {fmt(c.qtyConsumed)}/{fmt(c.qtyAvailable)} sh @ {money(c.unitCost)}
                             </span>
                             <span className="text-text">
-                                {fmtUsd(c.basisClosed)}
+                                {money(c.basisClosed)}
                             </span>
                         </li>
                     ))}
@@ -109,7 +114,7 @@ export function FifoPreviewPopover({
             <div className="mt-1 flex items-baseline justify-between border-t border-border pt-1 text-text">
                 <span>{isTransfer ? 'Total basis carried' : 'Total basis closed'}</span>
                 <span className="font-mono tabular-nums font-semibold">
-                    {fmtUsd(plan.totalBasis)}
+                    {money(plan.totalBasis)}
                 </span>
             </div>
 
@@ -173,4 +178,3 @@ export function computeFifoPlan(
 }
 
 const fmt = formatShares;
-const fmtUsd = formatCurrency;

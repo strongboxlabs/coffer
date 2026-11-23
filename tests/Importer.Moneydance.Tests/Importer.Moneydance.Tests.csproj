@@ -10,6 +10,15 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- diagnosticMessages: the per-test database fixture's end-of-run failure (a
+         database left behind, a failed drop, a changed template or role) is a
+         collection cleanup failure, which the console logger at minimal verbosity
+         prints as its exception type alone. The fixture also writes it as a
+         diagnostic message, which this setting makes the console print in full. -->
+    <None Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="10.1.0" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
     <PackageReference Include="Testcontainers.PostgreSql" Version="4.16.0" />
@@ -22,16 +31,23 @@
          arrives through Testcontainers' port-forwarding path. Audit warnings are errors,
          so carrying it fails the build.
 
-         This project was missed when Api.Tests was pinned, and a local build did NOT
-         catch it: NuGet audits at RESTORE time, and this project's restore was cached,
-         so no fresh audit ran. Public CI restores clean and failed every shard. If you
-         touch either pin, verify with a forced restore rather than an incremental build.
+         Each test project needs its own pin. A local build does not show a missing
+         one: NuGet audits at RESTORE time, so a cached restore runs no fresh audit,
+         while CI restores clean and fails. If you touch either pin, verify with a
+         forced restore rather than an incremental build.
          Remove both once Testcontainers' own floor moves past it. -->
     <PackageReference Include="SSH.NET" Version="2026.0.0" />
+    <!-- The same System.Security.Cryptography.Xml pin as Api.Tests, for the same
+         reason: it arrives through the Api project's OpenIddict closure (referenced
+         below for the migration runner), and this plain test SDK project audits the
+         transitive. Its Pkcs dependency moves with it. Remove with Api.Tests' pin. -->
+    <PackageReference Include="System.Security.Cryptography.Xml" Version="10.0.14" />
   </ItemGroup>
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <!-- Every database test's constructor takes an ITestOutputHelper (DatabaseTest). -->
+    <Using Include="Xunit.Abstractions" />
   </ItemGroup>
 
   <ItemGroup>
@@ -44,11 +60,36 @@
     -->
     <Compile Include="..\Api.Tests\Integration\Infra\Boundary.cs"
              Link="Infra\Boundary.cs" />
+    <!-- The stored-equals-computed check both fixtures end with, linked for the same
+         reason: two copies of the check could disagree on what counts as drift. -->
+    <Compile Include="..\Api.Tests\Integration\Infra\StoredNotesDatabaseCheck.cs"
+             Link="Infra\StoredNotesDatabaseCheck.cs" />
+    <!--
+      The per-test database machinery (clone from the template, end-of-test session
+      checks, background drop, leftover report) is the API test project's, linked for
+      the same reason: two copies of an isolation guarantee drift, and the copy that
+      drifted is the one nobody is looking at. It depends only on Npgsql and xunit.
+    -->
+    <Compile Include="..\Api.Tests\Integration\Infra\TestDatabaseCluster.cs"
+             Link="Infra\TestDatabaseCluster.cs" />
+    <!-- Migration 264's register display before and after, read the same way by the
+         API's upgrade tests and the importer's vintage tests. -->
+    <Compile Include="..\Api.Tests\Integration\Infra\RegisterDisplay.cs"
+             Link="Infra\RegisterDisplay.cs" />
+    <!-- The memo and tag placement invariants, held over the importer's fixtures here
+         and over the whole Demo, its examples included, by the API's tests: one copy. -->
+    <Compile Include="..\Api.Tests\Integration\Infra\MemoPlacementInvariants.cs"
+             Link="Infra\MemoPlacementInvariants.cs" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Importer.Moneydance\Importer.Moneydance.csproj" />
     <ProjectReference Include="..\..\src\Importer.Moneydance.Cli\Importer.Moneydance.Cli.csproj" />
+    <!-- For the production MigrationRunner (and DbSessionTimeZone): the template is
+         migrated the way an install is, as coffer_service, not by a copy of the runner,
+         and an install runs the API's C# migration steps between the SQL files
+         (MigrationRunner.CSharpSteps). -->
+    <ProjectReference Include="..\..\src\Api\Api.csproj" />
   </ItemGroup>
 
 </Project>

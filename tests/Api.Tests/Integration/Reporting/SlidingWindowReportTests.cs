@@ -14,16 +14,17 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// range — the shape of defect that reads as green all the way to production.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class SlidingWindowReportTests
+public sealed class SlidingWindowReportTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SlidingWindowReportTests(PostgresFixture fixture) => _fixture = fixture;
+    public SlidingWindowReportTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     [Fact]
     public async Task A_sliding_window_excludes_spending_older_than_itself()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense");
 
@@ -34,7 +35,7 @@ public sealed class SlidingWindowReportTests
         await ledger.AddTransactionPairAsync(groceries.Id, bank.Id, 30m, now.AddMonths(-1));
         await ledger.AddTransactionPairAsync(groceries.Id, bank.Id, 500m, now.AddMonths(-10));
 
-        var repo = new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System);
+        var repo = new ReportingRepository(Db.NewDbContext(), TimeProvider.System);
 
         var sliding = await repo.SummarizeAsync(new ReportSpec
         {

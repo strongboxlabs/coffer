@@ -1,12 +1,12 @@
 -- 205 — bound what the FIFO writer STORES, so nothing unbounded reaches a client
 --
--- Companion to mig 204, which fixed a live OverflowException by rounding
+-- Companion to mig 204, which prevents an OverflowException by rounding
 -- holdings_cost_basis_as_of. This closes the same hazard on the write side.
 --
--- WHAT THIS IS NOT. It is not a fix for an observed failure. Four fixtures — large
--- magnitudes, non-terminating unit costs, fractional consumed quantities — all
--- produced clean 2dp values in realized_gains, so the write path is not currently
--- emitting long scale and no report is broken by it.
+-- WHAT THIS IS NOT. It does not fix a path that fails today. Fixtures with large
+-- magnitudes, non-terminating unit costs and fractional consumed quantities all
+-- produce clean 2dp values in realized_gains, so the write path does not currently
+-- emit long scale and no report is broken by it.
 --
 -- WHY DO IT ANYWAY. Every money column in realized_gains is plain NUMERIC —
 -- quantity, proceeds, cost_basis_sold, realized_gain and the three _lt columns from
@@ -17,9 +17,9 @@
 --   a two-decimal amount / 7, times a twelve-decimal quantity     -> 30 digits
 --   a twelve-decimal quantity, times a nine-figure amount / 3      -> 32 digits
 --
--- System.Decimal holds 28-29 and Npgsql throws rather than truncate — exactly how
--- holdings_snapshot broke in 0.63.0. That the same shape stays short here today is a
--- property of the current data, not of the code.
+-- System.Decimal holds 28-29 and Npgsql throws rather than truncate — the failure
+-- mig 204 closes for holdings_snapshot. That the same shape stays short in the
+-- fixtures is a property of their inputs, not of the code.
 --
 -- Before mig 202 the walk read unit_cost from lots.unit_cost, a NUMERIC(25,12)
 -- COLUMN, so the schema bounded it on the way in. Moving the walk in-memory removed
@@ -29,8 +29,8 @@
 --
 -- Rounded HERE rather than inside holdings_fifo_walk deliberately: redefining that
 -- 200-line body in a second migration would mean the current definition could only
--- be reconstructed by diffing two files, which is how a port earlier in this series
--- silently dropped three behaviours by starting from a superseded copy.
+-- be reconstructed by diffing two files, and a port that starts from a superseded
+-- copy silently drops behaviours (see 202).
 --
 -- Money 4dp, shares 12dp — the convention of holdings.cost_basis NUMERIC(19,4),
 -- lots.unit_cost NUMERIC(25,12), and migrations 172 / 200 / 204.

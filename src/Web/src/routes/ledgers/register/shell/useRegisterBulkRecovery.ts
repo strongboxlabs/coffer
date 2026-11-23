@@ -1,9 +1,11 @@
-import { useCallback, useState } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useCallback, useRef, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import { ApiError, bulkMoveToAccount, bulkUnhideTransactions } from '@/lib/api';
 import type { BulkMoveAccountResponse, BulkUnhideResponse } from '@/lib/types';
 import type { UseSelectionResult } from '@/lib/useSelection';
+import { invalidateHomeReads } from '@/lib/registerInvalidation';
 
 /**
  * Bulk recovery actions (ADR-0072 D2/D3) shared by BOTH registers so they can't
@@ -34,6 +36,9 @@ export interface UseRegisterBulkRecoveryResult {
     onMoveConfirm: (targetAccountId: string) => void;
     moveError: string | null;
     bulkMovePending: boolean;
+    /** How many transfers the landed move left keeping two amounts (ADR-0114 D13). Above
+     *  0, the move dialog stays open on that line and Done; 0 otherwise. */
+    moveBecameTwoAmount: number;
 }
 
 export function useRegisterBulkRecovery({
@@ -46,11 +51,18 @@ export function useRegisterBulkRecovery({
     const queryClient = useQueryClient();
     const [moveDialogOpen, setMoveDialogOpen] = useState(false);
     const [moveError, setMoveError] = useState<string | null>(null);
+    const [moveBecameTwoAmount, setMoveBecameTwoAmount] = useState(0);
+    // Each open or close of the move dialog starts a new session. A move answers
+    // only the session it was pressed in, so one that lands after its dialog was
+    // closed (or closed and opened again for another selection) neither closes
+    // nor rewrites the dialog now showing.
+    const moveSession = useRef(0);
 
     const invalidateAfterBulk = useCallback(() => {
         selection.clear();
         onRefresh();
         queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+        invalidateHomeReads(queryClient, ledgerId);
         queryClient.invalidateQueries({
             queryKey: ['register-index-buckets', ledgerId, accountId],
         });
@@ -64,31 +76,54 @@ export function useRegisterBulkRecovery({
         onSuccess: invalidateAfterBulk,
     });
 
-    const moveMutation = useMutation<BulkMoveAccountResponse, ApiError, string>({
-        mutationFn: (targetAccountId) =>
+    const moveMutation = useMutation<
+        BulkMoveAccountResponse,
+        ApiError,
+        { targetAccountId: string; session: number }
+    >({
+        mutationFn: ({ targetAccountId }) =>
             bulkMoveToAccount(ledgerId, selection.selection, targetAccountId),
-        onSuccess: () => {
-            setMoveDialogOpen(false);
-            setMoveError(null);
+        onSuccess: (result, { session }) => {
+            // The refresh happens whenever the move lands.
             invalidateAfterBulk();
+            if (session !== moveSession.current) return;
+            setMoveError(null);
+            // A move that left transfers keeping two amounts says so, and the dialog
+            // stays open on that line until it is closed (ADR-0114 D13, decided by the
+            // owner, 2026-11-18); otherwise it closes.
+            if (result.becameTwoAmount > 0) setMoveBecameTwoAmount(result.becameTwoAmount);
+            else setMoveDialogOpen(false);
         },
-        onError: (err) => setMoveError(err.detail || 'Move failed.'),
+        onError: (err, { session }) => {
+            if (session === moveSession.current) setMoveError(err.detail || 'Move failed.');
+        },
     });
 
     return {
         onBulkUnhide: useCallback(() => unhideMutation.mutate(), [unhideMutation]),
         bulkUnhidePending: unhideMutation.isPending,
         moveDialogOpen,
+        // Opens on the picker, as a new session.
         openMoveDialog: useCallback(() => {
+            moveSession.current += 1;
             setMoveError(null);
+            setMoveBecameTwoAmount(0);
             setMoveDialogOpen(true);
         }, []),
-        closeMoveDialog: useCallback(() => setMoveDialogOpen(false), []),
+        // Done and Escape close through here too; a move still saving no longer
+        // answers this dialog.
+        closeMoveDialog: useCallback(() => {
+            moveSession.current += 1;
+            setMoveDialogOpen(false);
+            setMoveBecameTwoAmount(0);
+        }, []),
         onMoveConfirm: useCallback(
-            (targetAccountId: string) => moveMutation.mutate(targetAccountId),
+            (targetAccountId: string) =>
+                moveMutation.mutate({ targetAccountId, session: moveSession.current }),
             [moveMutation],
         ),
         moveError,
         bulkMovePending: moveMutation.isPending,
+        moveBecameTwoAmount,
     };
 }

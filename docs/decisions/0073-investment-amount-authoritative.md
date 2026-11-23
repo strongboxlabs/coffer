@@ -1,6 +1,10 @@
 # 0073 — Investment money is authoritative at 2 decimals; price is derived
 
-Status: Accepted
+Status: Accepted; D2 amended 2026-11-14 and D1, D2 and D3 amended 2026-11-16 by
+[ADR-0114](0114-benchmarks-and-currency-conversion.md) (the second amount is outside the recalc matrix; the price input shows
+the brokerage's currency; money is authoritative at its currency's ISO 4217 minor units,
+not at 2 decimals, and the 2-place CHECK of migration 159 is replaced by a 3-place
+ceiling)
 Date: 2026-07-10
 Relates: [ADR-0027](0027-investment-action-catalog.md), [ADR-0029](0029-investment-transaction-editor.md), [ADR-0034](0034-header-walk-running-balance.md), [ADR-0064](0064-fifo-cost-basis.md)
 
@@ -22,8 +26,8 @@ three symptoms:
    cash leg became a slightly different figure once accepted (`price × shares`,
    rounded for display). The actual money paid was silently altered.
 2. **Fractional amounts.** The unrounded four-decimal product landed on the leg —
-   `txn_legs.amount` is `numeric(19,4)`, so sub-cent money was storable, and a real
-   ledger held such legs.
+   `txn_legs.amount` is `numeric(19,4)`, so sub-cent money was storable, and the
+   product put it there.
 3. **Fractional balances showing a negative zero.** Those sub-cent legs summed into
    the running balances (`txn_header_account_balances`), so a balance a fraction of
    a cent below zero rendered as a minus sign before a zero amount.
@@ -52,8 +56,8 @@ reported price is preserved separately in `ingest_unit_price`.
 > carries the reconciliation and the read surface calls this one `SettledAmount`.
 
 `price × shares` need **not** equal the amount — a rounded price against an exact
-total is normal and faithful to the feed (see
-[[feedback_importers_report_feed_not_cash_model]]). Lot cost basis uses the same
+total is normal and faithful to the feed (importers report the feed, not a cash
+model; ADR-0042 D3). Lot cost basis uses the same
 authoritative amount, so basis == cash paid.
 
 When a caller omits `Amount` on a share-trade action, the server falls back to
@@ -77,6 +81,14 @@ total and `price` = `amount ÷ shares`. All arithmetic uses **magnitudes** — s
 store shares negative while amount/price are non-negative; the old `> 0` guard
 silently disabled the link on every sell.
 
+*(Amended 2026-11-14, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D14.)* The second amount of a transfer between
+currencies is outside this matrix. On a new entry, until the second amount is typed in,
+it follows Amount (including an Amount derived from shares × price) and the date, at
+the rate `RateDay.Of` gives that date, derived from the stored rates against the
+reporting currency (ADR-0114 D13). Once typed, it stays, and a saved
+transaction is never refilled. The price input's symbol is the brokerage's currency, since price × shares =
+amount.
+
 ### D3 — Scrub residual state + guard (migration 159)
 
 Round the existing sub-cent leg amounts to 2dp (sec/income pairs are ±X and
@@ -88,6 +100,48 @@ money can never again carry sub-cent fractions. For rows accepted *before* this
 change the original import total is unrecoverable, so those round to 2dp; only
 future accepts preserve the exact total.
 
+### Amendment, 2026-11-16 — money at each currency's minor units ([ADR-0114](0114-benchmarks-and-currency-conversion.md))
+
+D1, D2 and D3 above stay as written: they record the 2-place model as it shipped, and
+migration 159 is never edited. From [ADR-0114](0114-benchmarks-and-currency-conversion.md) D15 on, money is held at its own
+currency's ISO 4217 minor units, 0, 2 or 3 places, not at 2 places for every currency.
+Prices, share quantities and exchange rates are not money and do not follow this rule.
+
+- **D1.** `Amount` is still the money and price is still derived, but the money is exact
+  at the brokerage account's currency's places, not at 2 decimals. A typed amount finer
+  than those places is refused with a 422 and a named error code that names the currency
+  and its places (settled by Claude, 2026-11-16). The fallback for an omitted `Amount`
+  rounds `price × |shares|` once at the account currency's places, half away from zero,
+  as every figure the API computes is rounded (settled by Claude, 2026-11-16).
+  `unit_price` is still derived to 6 decimals and gets no money rounding; a price shows
+  at least its currency's places and at most max(6, places) (settled by Claude,
+  2026-11-16).
+- **D2.** The matrix's `amount = shares × price` rounds at the brokerage's currency's
+  places, not at 2 decimals, and the Amount input's step and blur rounding follow the
+  same places (ADR-0023 §H). The price input takes `step="any"` and gets no money rounding
+  (settled by Claude, 2026-11-16).
+- **D3.** Migration 301 replaces `ck_txn_legs_amount_scale_2` with a currency-agnostic
+  ceiling, `CHECK (amount = round(amount, 3))`, added `NOT VALID` and then validated.
+  Every row already stored is at 2 places, so every row passes. `txn_legs.amount` stays
+  `NUMERIC(19,4)`. CLF and UYW, the fund units with four places, are refused as account
+  and ledger currencies, so three places is the most any account's money needs. A CHECK
+  on `txn_legs` cannot read the account's currency, so the exact per-currency rule is
+  enforced in the API's writers, and the database keeps only the ceiling; there is no
+  trigger ([ADR-0032](0032-triggers-as-last-resort.md)) (settled by Claude, 2026-11-16). The same migration
+  redefines `recompute_holdings_cost_basis` to round at each account's places through an
+  `IMMUTABLE` SQL minor-units function generated from the checked-in ISO 4217 data file
+  the API and the SPA share (ADR-0114 D15), so lot basis still equals the cash paid
+  (settled by Claude, 2026-11-16).
+- **Figures already stored** that do not fit their currency's places are kept: there is
+  no rounding migration and no pre-upgrade script. A write validates only the values it
+  changes, so an edit that leaves such an amount unchanged passes. An account or ledger
+  currency already stored that would now be refused for any reason (not an ISO 4217
+  currency with an exponent, an "N.A." entry, or the 4-place fund units CLF and UYW)
+  keeps working at 2 places, as today (settled by Claude, 2026-11-16). The consistency
+  check lists the figures that do not fit and those codes as an advisory, as ADR-0084
+  D6's unbacked-price advisory is: shown beside its verdict, not counted in it, and with
+  no repair; the cure is an edit by an owner or editor (settled by Claude, 2026-11-16).
+
 ## Consequences
 
 - Accepting an imported trade preserves the exact amount; the displayed per-share
@@ -96,3 +150,7 @@ future accepts preserve the exact total.
 - The 2dp `CHECK` encodes the current **USD / 2-decimal** money model (all money
   is formatted at 2dp). Multi-currency with non-2dp minor units would revisit the
   constraint alongside the formatters — TBD, out of scope here.
+  *(Resolved 2026-11-16 by [ADR-0114](0114-benchmarks-and-currency-conversion.md) D15: the constraint and the formatters were
+  revisited together. The CHECK becomes the 3-place ceiling above, the exact rule per
+  currency lives in the API, and money is formatted at its currency's minor units
+  (ADR-0023 §H).)*

@@ -10,15 +10,14 @@ import type { AccountSummary } from '@/lib/types/account';
 // that can only fail, and on a category register what puts the useful
 // operation, recategorise, on screen.
 //
-// Banking and investment accounts used to be kept apart here too. That was
-// reversed on 2026-10-09 — both are money accounts a cash row can move between
-// — and whether a PARTICULAR row may cross (a split may not; an investment
-// event may not, unless it is a cash-only transfer) is a per-row question only
-// the server can answer.
+// Banking and investment accounts are NOT kept apart — both are money accounts
+// a cash row can move between — and whether a PARTICULAR row may cross (a split
+// may not; an investment event may not, unless it is a cash-only transfer) is a
+// per-row question only the server can answer.
 //
-// Worth having rather than trusting the server: the bug this came from was a
-// category's register offering every money account, and a user who selects one
-// and is rejected has learned nothing about what they were allowed to do.
+// Worth having rather than trusting the server: a category's register that
+// offered every money account would leave a user who selects one and is
+// rejected having learned nothing about what they were allowed to do.
 
 function account(over: Partial<AccountSummary> & { id: string; name: string }): AccountSummary {
     return {
@@ -54,6 +53,7 @@ function offeredFor(sourceAccountId: string, sourceAccountType: string): string[
             count={2}
             pending={false}
             error={null}
+            becameTwoAmount={0}
             onConfirm={() => {}}
             onCancel={() => {}}
         />,
@@ -83,8 +83,8 @@ describe('the move dialog offers only the register’s own side of the category 
     });
 
     it('offers only categories from a category’s register', () => {
-        // THE CASE THIS CAME FROM. This dialog used to list every money
-        // account here, and picking one re-pointed the category leg onto it.
+        // THE CENTRAL CASE. Listing every money account here would let a pick
+        // re-point the category leg onto it.
         const offered = offeredFor('c-food', 'category').join(' | ');
 
         expect(offered).toContain('Fuel');
@@ -95,9 +95,8 @@ describe('the move dialog offers only the register’s own side of the category 
     });
 
     it('offers the bank accounts from a brokerage, and never a category', () => {
-        // The reverse direction, which used to offer nothing at all here. A
-        // contribution filed against the brokerage that belongs in checking
-        // can now be moved back. Which rows may actually go is the server's
+        // The reverse direction. A contribution filed against the brokerage
+        // that belongs in checking can be moved back. Which rows may actually go is the server's
         // call — a split, or a trade, is refused there with a reason.
         const offered = offeredFor('a-inv', 'investment').join(' | ');
 
@@ -120,6 +119,7 @@ describe('the move dialog offers only the register’s own side of the category 
                 count={1}
                 pending={false}
                 error={null}
+                becameTwoAmount={0}
                 onConfirm={() => {}}
                 onCancel={() => {}}
             />,
@@ -139,6 +139,7 @@ describe('the move dialog offers only the register’s own side of the category 
                 count={2}
                 pending={false}
                 error={null}
+                becameTwoAmount={0}
                 onConfirm={() => {}}
                 onCancel={() => {}}
             />,

@@ -1,5 +1,6 @@
 using Dapper;
 using Coffer.Importer.Moneydance.Db;
+using LegNotes = Coffer.Api.Db.LegNotes;
 
 namespace Coffer.Importer.Moneydance.Tests.Db;
 
@@ -18,13 +19,11 @@ namespace Coffer.Importer.Moneydance.Tests.Db;
 /// path itself.
 /// </remarks>
 [Collection(DbCollection.Name)]
-public sealed class TransactionsRepositoryTests
+public sealed class TransactionsRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public TransactionsRepositoryTests(PostgresFixture fixture)
+    public TransactionsRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static AccountRow Bank(string externalId, string name) =>
@@ -74,7 +73,7 @@ public sealed class TransactionsRepositoryTests
             IsMergedInto: null, ImportSource: "test",
             ClearedAt: posted, ClearedByUserId: null,
             OnlineMatchFitid: null, OnlineMatchFiId: null,
-            Action: null);
+            Action: null, OriginatingAccountId: bankId);
 
         var origin = new TxnLegRow(
             Id: Guid.NewGuid(), HeaderId: headerId, LedgerId: TestLedger.Id, AccountId: bankId,
@@ -92,8 +91,7 @@ public sealed class TransactionsRepositoryTests
     [Fact]
     public async Task BulkUpsert_writes_header_and_legs()
     {
-        await using var connection = _fixture.OpenConnection();
-        await ResetAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var accountsRepo = new AccountsRepository(connection);
         var bankId = await accountsRepo.UpsertByExternalIdAsync(Bank("md-bank", "Checking"));
@@ -109,6 +107,7 @@ public sealed class TransactionsRepositoryTests
             await txnsRepo.BulkUpsertAsync(
                 new[] { header },
                 new[] { origin, counterpart });
+            await LegNotes.RecomputeLedgerOnAsync(tx, TestLedger.Id, default);
             await tx.CommitAsync();
         }
 
@@ -134,8 +133,7 @@ public sealed class TransactionsRepositoryTests
         // other. The bank importer supplies per-leg recon seeds; the persist
         // must write ONLY the seeded legs (not fan a single status across every
         // leg of the header).
-        await using var connection = _fixture.OpenConnection();
-        await ResetAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var accountsRepo = new AccountsRepository(connection);
         var checkingId = await accountsRepo.UpsertByExternalIdAsync(Bank("md-chk", "Checking"));
@@ -158,6 +156,7 @@ public sealed class TransactionsRepositoryTests
         {
             await txnsRepo.BulkUpsertAsync(
                 new[] { header }, new[] { origin, counterpart }, legRecons: legRecons);
+            await LegNotes.RecomputeLedgerOnAsync(tx, TestLedger.Id, default);
             await tx.CommitAsync();
         }
 
@@ -178,8 +177,7 @@ public sealed class TransactionsRepositoryTests
         // the header-fan, even though the header carries Status='cleared'. Guards
         // the investment case where a sec-split cleared under an uncleared parent
         // yields no per-leg seeds and would otherwise re-flatten via the header.
-        await using var connection = _fixture.OpenConnection();
-        await ResetAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var accountsRepo = new AccountsRepository(connection);
         var bankId = await accountsRepo.UpsertByExternalIdAsync(Bank("md-e-bank", "Checking"));
@@ -195,6 +193,7 @@ public sealed class TransactionsRepositoryTests
             await txnsRepo.BulkUpsertAsync(
                 new[] { header }, new[] { origin, counterpart },
                 legRecons: Array.Empty<LegReconSeed>());
+            await LegNotes.RecomputeLedgerOnAsync(tx, TestLedger.Id, default);
             await tx.CommitAsync();
         }
 
@@ -207,8 +206,7 @@ public sealed class TransactionsRepositoryTests
     [Fact]
     public async Task BulkUpsert_respects_caller_rollback()
     {
-        await using var connection = _fixture.OpenConnection();
-        await ResetAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var accountsRepo = new AccountsRepository(connection);
         var bankId = await accountsRepo.UpsertByExternalIdAsync(
@@ -244,11 +242,5 @@ public sealed class TransactionsRepositoryTests
 
         Assert.Equal(beforeHeaders, await txnsRepo.CountHeadersAsync());
         Assert.Equal(beforeLegs,    await txnsRepo.CountLegsAsync());
-    }
-
-    private static async Task ResetAsync(Npgsql.NpgsqlConnection connection)
-    {
-        await connection.ExecuteAsync(
-            "TRUNCATE account_external_ids, accounts, txn_headers, txn_legs CASCADE;");
     }
 }

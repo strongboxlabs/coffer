@@ -6,7 +6,9 @@ import { ApiError, fetchHoldings } from '@/lib/api';
 import type { HoldingsViewDto, PositionDto } from '@/lib/types';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { cn } from '@/lib/cn';
-import { formatCurrency, formatShares } from '@/lib/money';
+import { atDisplayPrecision, formatCurrency, formatPrice, formatShares } from '@/lib/money';
+
+import { NoRate } from './home/Money';
 
 // Portfolio View for one investment account (slice A1.b), split across two
 // pieces so the register page can show portfolio info without the per-
@@ -27,16 +29,23 @@ const NDASH = '–'; // en dash; used for null current-value cells
 
 const HOLDINGS_STALE_MS = 60_000;
 
-/** Pretty signed-percent — two decimals, a leading `+` on a gain and `-` on a loss. */
+/**
+ * Two decimals, `-` on a loss and no sign on a gain (ADR-0023 §H). A change that prints
+ * as a zero is a plain zero, as the gain beside it is, never a negative one.
+ */
 function fmtPercent(value: number): string {
-    const sign = value > 0 ? '+' : '';
-    return `${sign}${value.toFixed(2)}%`;
+    const shown = value.toFixed(2);
+    return `${/^-0\.0+$/.test(shown) ? shown.slice(1) : shown}%`;
 }
 
+/** A percent change at the two places `fmtPercent` prints it; a printed zero is never below zero. */
+function shownPercentChange(value: number): number {
+    return Number(value.toFixed(2));
+}
+
+/** A loss is news, so it is red; a gain is default text, never green (ADR-0023 §H). */
 function gainTextTone(gain: number): string {
-    if (gain > 0) return 'text-state-success';
-    if (gain < 0) return 'text-state-danger';
-    return 'text-text';
+    return gain < 0 ? 'text-state-danger' : 'text-text';
 }
 
 interface HoldingsPanelProps {
@@ -87,18 +96,27 @@ export function PortfolioBar({
     } else if (data !== undefined) {
         const s = data.summary;
         const c = data.currencyCode;
+        // A figure that needs a missing rate reads "no rate" (ADR-0114 D9); the server
+        // leaves one null for no other reason, so a null with nothing named is a dash.
+        const missing = s.rateUnavailable ?? [];
+        const figure = (v: number | null) => (
+            v !== null ? formatCurrency(v, c) : missing.length > 0 ? <NoRate missing={missing} /> : NDASH);
         summary = (
             <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
-                <Stat label="Total" value={formatCurrency(s.total, c)} strong />
-                <Stat label="Portfolio" value={formatCurrency(s.portfolioValue, c)} />
-                <Stat label="Cash" value={formatCurrency(s.cashBalance, c)} />
+                <Stat label="Total" value={figure(s.total)} strong />
+                <Stat label="Portfolio" value={figure(s.portfolioValue)} />
+                <Stat label="Cash" value={figure(s.cashBalance)} />
                 <Stat
                     label="Unrealized"
                     value={
-                        <span className={gainTextTone(s.unrealizedGain)}>
-                            {formatCurrency(s.unrealizedGain, c)} (
-                            {fmtPercent(s.percentChange)})
-                        </span>
+                        s.unrealizedGain === null || s.percentChange === null ? figure(null) : (
+                            // One span prints both, so it is red when either prints as a loss.
+                            <span className={gainTextTone(Math.min(
+                                atDisplayPrecision(s.unrealizedGain, c), shownPercentChange(s.percentChange)))}>
+                                {formatCurrency(atDisplayPrecision(s.unrealizedGain, c), c)} (
+                                {fmtPercent(s.percentChange)})
+                            </span>
+                        )
                     }
                 />
             </div>
@@ -261,8 +279,25 @@ function PositionRow({ position: p, currency }: PositionRowProps) {
     // Un-priced positions render their current* columns as a dash —
     // better signal than a zero amount / 0% which would imply "actually zero."
     const hasPrice = p.currentPrice !== null;
-    const gainTone =
-        p.unrealizedGain === null ? 'text-text-subtle' : gainTextTone(p.unrealizedGain);
+    // The price is in its own currency: the account's unless named (ADR-0114 D5).
+    const priceCurrency = p.priceCurrencyCode ?? currency;
+    // A position priced in another currency is valued in the account's currency at the
+    // latest rate, `accountValue`, which is what the account adds up and what the gain
+    // compares with the cost (ADR-0114 D7). Its value in the price's currency shows
+    // beneath, so the conversion can be read off the row.
+    const foreign = p.priceCurrencyCode !== undefined && p.priceCurrencyCode !== currency;
+    const missing = p.rateUnavailable ?? [];
+    // A figure null for want of a rate says so; one null for want of a price is a dash.
+    const nullFigure = missing.length > 0 ? <NoRate missing={missing} /> : NDASH;
+    // The prices (price, cost per share) print through formatPrice, and the money through
+    // formatCurrency at the currency's places (ADR-0114 D15). The gain takes its sign and
+    // its red from the figure as it prints, so a residue below one minor unit is a zero.
+    // The percent takes its own, from its two printed places: a gain that prints as a
+    // zero beside a percent that prints as a loss leaves the percent red.
+    const shownGain = p.unrealizedGain === null ? null : atDisplayPrecision(p.unrealizedGain, currency);
+    const gainTone = shownGain === null ? 'text-text-subtle' : gainTextTone(shownGain);
+    const shownPercent = p.percentChange === null ? null : shownPercentChange(p.percentChange);
+    const percentTone = shownPercent === null ? 'text-text-subtle' : gainTextTone(shownPercent);
 
     return (
         <tr className="border-b border-border/30 bg-surface hover:bg-surface-hover">
@@ -282,26 +317,35 @@ function PositionRow({ position: p, currency }: PositionRowProps) {
                 {formatShares(p.quantity)}
             </td>
             <td className="px-3 py-2 text-right font-mono tabular-nums">
-                {hasPrice ? formatCurrency(p.currentPrice!, currency) : NDASH}
+                {hasPrice ? formatPrice(p.currentPrice!, priceCurrency) : NDASH}
             </td>
             <td className="px-3 py-2 text-right font-mono tabular-nums">
-                {formatCurrency(p.costPerShare, currency)}
+                {formatPrice(p.costPerShare, currency)}
             </td>
             <td className="px-3 py-2 text-right font-mono tabular-nums">
                 {formatCurrency(p.costBasis, currency)}
             </td>
             <td className="px-3 py-2 text-right font-mono tabular-nums">
-                {p.currentValue !== null
-                    ? formatCurrency(p.currentValue, currency)
-                    : NDASH}
+                {!foreign ? (
+                    p.currentValue !== null ? formatCurrency(p.currentValue, currency) : NDASH
+                ) : (
+                    <div className="flex flex-col items-end">
+                        <span data-position-value="account">
+                            {p.accountValue != null ? formatCurrency(p.accountValue, currency) : nullFigure}
+                        </span>
+                        {p.currentValue !== null ? (
+                            <span data-position-value="price" className="text-[0.625rem] text-text-muted">
+                                {formatCurrency(p.currentValue, priceCurrency)}
+                            </span>
+                        ) : null}
+                    </div>
+                )}
             </td>
             <td className={`px-3 py-2 text-right font-mono tabular-nums ${gainTone}`}>
-                {p.unrealizedGain !== null
-                    ? formatCurrency(p.unrealizedGain, currency)
-                    : NDASH}
+                {shownGain !== null ? formatCurrency(shownGain, currency) : nullFigure}
             </td>
-            <td className={`px-3 py-2 text-right font-mono tabular-nums ${gainTone}`}>
-                {p.percentChange !== null ? fmtPercent(p.percentChange) : NDASH}
+            <td className={`px-3 py-2 text-right font-mono tabular-nums ${percentTone}`}>
+                {p.percentChange !== null ? fmtPercent(p.percentChange) : nullFigure}
             </td>
         </tr>
     );

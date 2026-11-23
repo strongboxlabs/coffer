@@ -23,11 +23,12 @@ namespace Coffer.Api.Tests.Integration.LedgerOperations;
 /// subset trains people to ignore the one signal that matters.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ConsistencyRepairIsRecordedTests
+public sealed class ConsistencyRepairIsRecordedTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ConsistencyRepairIsRecordedTests(PostgresFixture fixture) => _fixture = fixture;
+    public ConsistencyRepairIsRecordedTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Utc(int y, int m, int d) => new(y, m, d, 0, 0, 0, DateTimeKind.Utc);
 
@@ -51,7 +52,7 @@ public sealed class ConsistencyRepairIsRecordedTests
     {
         for (var attempt = 0; attempt < 100; attempt++)
         {
-            await using (var svc = _fixture.NewServiceDbContext())
+            await using (var svc = Db.NewServiceDbContext())
             {
                 if (await svc.LedgerConsistencyStates.AsNoTracking()
                         .AnyAsync(r => r.LedgerId == ledger.LedgerId && r.LastCheckedAt != null))
@@ -75,7 +76,7 @@ public sealed class ConsistencyRepairIsRecordedTests
     [Fact]
     public async Task Repairing_a_projection_records_what_was_repaired()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
@@ -85,12 +86,12 @@ public sealed class ConsistencyRepairIsRecordedTests
         await ledger.AddInvestmentBuyAsync(
             brokerage.Id, holdings, security, 10m, 137.25m, Utc(2024, 3, 15));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Nothing recorded before — otherwise the assertion after the repair could
         // be satisfied by an event from somewhere else entirely.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.False(await db.LedgerEvents.AsNoTracking().AnyAsync(
                 e => e.LedgerId == ledger.LedgerId && e.EventKey == "consistency.repaired"));
@@ -102,7 +103,7 @@ public sealed class ConsistencyRepairIsRecordedTests
             content: null);
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var ev = Assert.Single(await db.LedgerEvents.AsNoTracking()
                 .Where(e => e.LedgerId == ledger.LedgerId && e.EventKey == "consistency.repaired")
@@ -119,7 +120,7 @@ public sealed class ConsistencyRepairIsRecordedTests
         // And on the ledger's own state row, which is the part an operator with
         // several ledgers reads — the event log answers "what happened", this
         // answers "which of these has been touched".
-        await using (var svc = _fixture.NewServiceDbContext())
+        await using (var svc = Db.NewServiceDbContext())
         {
             var state = await svc.LedgerConsistencyStates.AsNoTracking()
                 .SingleAsync(r => r.LedgerId == ledger.LedgerId);
@@ -130,31 +131,31 @@ public sealed class ConsistencyRepairIsRecordedTests
     }
 
     [Fact]
-    public async Task A_repair_stamps_the_repair_and_leaves_the_verdict_alone()
+    public async Task A_repair_records_the_verdict_of_the_full_check_after_it()
     {
-        // A repair fixes ONE projection. Writing a verdict off that result would
-        // claim more than was checked, and healthy is the dangerous direction: it
-        // reads as "nothing to do here" while other projections may still be wrong.
-        // The monitor's next pass settles the verdict; this endpoint does not.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // A repair fixes ONE projection, so its verdict is not read off that
+        // projection: it is the full check the repair runs once it has committed,
+        // which claims no more than was checked. Healthy is the dangerous direction
+        // ("nothing to do here"), and it is written only when every projection
+        // agrees.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
         await ledger.AddInvestmentBuyAsync(
             brokerage.Id, holdings, security, 10m, 137.25m, Utc(2024, 3, 15));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         await WaitForBootCheckAsync(ledger);
 
-        // Pin the verdict, so "unchanged" is a comparison against a known value
+        // Pin the verdict, so "replaced" is a comparison against a known value
         // rather than against whatever the boot pass happened to write.
         //
         // Truncated to the column's microseconds: timestamptz has no room for
-        // .NET's 100ns ticks, so a raw UtcNow comes back five digits shorter and
-        // the equality below fails on a round-trip rather than on a rewrite.
+        // .NET's 100ns ticks, so a raw UtcNow comes back five digits shorter.
         var checkedAt = ToMicroseconds(DateTime.UtcNow.AddMinutes(-3));
-        await using (var svc = _fixture.NewServiceDbContext())
+        await using (var svc = Db.NewServiceDbContext())
         {
             var seeded = await svc.LedgerConsistencyStates
                 .SingleAsync(r => r.LedgerId == ledger.LedgerId);
@@ -170,35 +171,88 @@ public sealed class ConsistencyRepairIsRecordedTests
             content: null);
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using (var svc = _fixture.NewServiceDbContext())
+        // The stored row is the repair's full check, not the repaired projection alone:
+        // the raw purchase left its position unstored too, which the trade-price repair
+        // does not touch, so the verdict stays unhealthy and names what is left.
+        var repair = (await resp.Content.ReadFromJsonAsync<ProjectionRepairResult>())!;
+        Assert.True(repair.ProjectionAfter().Healthy);
+        Assert.NotNull(repair.After);
+        Assert.False(repair.After.Healthy);
+        var left = repair.After.Projections.Where(p => !p.Healthy).Select(p => p.Projection)
+            .Order(StringComparer.Ordinal).ToArray();
+        Assert.Contains(ConsistencyProjections.Holdings, left);
+        await using (var svc = Db.NewServiceDbContext())
         {
             var state = await svc.LedgerConsistencyStates.AsNoTracking()
                 .SingleAsync(r => r.LedgerId == ledger.LedgerId);
             Assert.NotNull(state.LastRepairedAt);
             Assert.False(state.Healthy);
-            Assert.Equal(checkedAt, state.LastCheckedAt);
-            Assert.Equal([ConsistencyProjections.TradePrices], state.FailingProjections);
+            Assert.True(state.LastCheckedAt > checkedAt);
+            Assert.Equal(state.LastRepairedAt, state.LastCheckedAt);
+            Assert.Equal(left, state.FailingProjections);
         }
     }
 
     [Fact]
-    public async Task A_repair_before_any_check_records_itself_without_inventing_a_verdict()
+    public async Task The_stored_verdict_reads_back_without_running_a_check()
     {
-        // The branch that exists in production for a ledger the monitor has not
-        // reached yet. "Unknown" is a real state and gets a NULL: false would
-        // render as UNHEALTHY for a ledger nothing has examined, and a backdated
-        // timestamp would be a magic value saying the same thing worse.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await ledger.AddInvestmentAccountAsync("Brokerage");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+        await WaitForBootCheckAsync(ledger);
+        var path = $"/api/ledgers/{ledger.LedgerId}/balances/consistency/state";
+
+        // A verdict the check would not reach on its own, so reading it back proves
+        // the read returns the stored row rather than checking again.
+        var checkedAt = ToMicroseconds(DateTime.UtcNow.AddMinutes(-3));
+        var repairedAt = ToMicroseconds(DateTime.UtcNow.AddMinutes(-9));
+        await using (var svc = Db.NewServiceDbContext())
+        {
+            var seeded = await svc.LedgerConsistencyStates.SingleAsync(r => r.LedgerId == ledger.LedgerId);
+            seeded.LastCheckedAt = checkedAt;
+            seeded.Healthy = false;
+            seeded.FailingProjections = [ConsistencyProjections.TradePrices];
+            seeded.LastRepairedAt = repairedAt;
+            await svc.SaveChangesAsync();
+        }
+
+        var state = (await client.GetFromJsonAsync<LedgerConsistencyStateDto>(path))!;
+        Assert.Equal(checkedAt, state.LastCheckedAt);
+        Assert.False(state.Healthy);
+        Assert.Equal([ConsistencyProjections.TradePrices], state.FailingProjections);
+        Assert.Equal(repairedAt, state.LastRepairedAt);
+
+        // Never checked: no verdict, which reads as "not checked yet", never unhealthy.
+        await using (var svc = Db.NewServiceDbContext())
+        {
+            await svc.LedgerConsistencyStates.Where(r => r.LedgerId == ledger.LedgerId).ExecuteDeleteAsync();
+        }
+        var unknown = (await client.GetFromJsonAsync<LedgerConsistencyStateDto>(path))!;
+        Assert.Null(unknown.Healthy);
+        Assert.Null(unknown.LastCheckedAt);
+        Assert.Null(unknown.LastRepairedAt);
+        Assert.Empty(unknown.FailingProjections);
+    }
+
+    [Fact]
+    public async Task A_repair_before_any_check_records_the_check_it_ran()
+    {
+        // The branch that exists in production for a ledger the monitor has not
+        // reached yet. The repair's own full check is a verdict, taken now, so the
+        // row it writes holds it rather than an unknown.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await ledger.AddInvestmentAccountAsync("Brokerage");
+
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Wait for the boot pass, THEN clear what it wrote. Deleting first would
         // only race it; deleting after is what puts the ledger back into the
         // never-checked state this test is about. The next tick is 15 minutes out.
         await WaitForBootCheckAsync(ledger);
-        await using (var svc = _fixture.NewServiceDbContext())
+        await using (var svc = Db.NewServiceDbContext())
         {
             await svc.LedgerConsistencyStates
                 .Where(r => r.LedgerId == ledger.LedgerId)
@@ -211,12 +265,12 @@ public sealed class ConsistencyRepairIsRecordedTests
             content: null);
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using (var svc = _fixture.NewServiceDbContext())
+        await using (var svc = Db.NewServiceDbContext())
         {
             var state = await svc.LedgerConsistencyStates.AsNoTracking()
                 .SingleAsync(r => r.LedgerId == ledger.LedgerId);
-            Assert.Null(state.Healthy);
-            Assert.Null(state.LastCheckedAt);
+            Assert.True(state.Healthy);
+            Assert.NotNull(state.LastCheckedAt);
             Assert.Empty(state.FailingProjections);
             Assert.NotNull(state.LastRepairedAt);
         }
@@ -228,10 +282,10 @@ public sealed class ConsistencyRepairIsRecordedTests
         // The no-op case is the one worth keeping. "I ran it and it was already
         // fine" is exactly the state an operator cannot otherwise distinguish from
         // "nobody has looked at this ledger", which is FU-012's complaint.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await ledger.AddInvestmentAccountAsync("Brokerage");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -240,7 +294,7 @@ public sealed class ConsistencyRepairIsRecordedTests
             content: null);
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var ev = Assert.Single(await db.LedgerEvents.AsNoTracking()
             .Where(e => e.LedgerId == ledger.LedgerId && e.EventKey == "consistency.repaired")
             .ToListAsync());

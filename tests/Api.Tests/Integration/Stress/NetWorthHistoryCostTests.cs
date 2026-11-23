@@ -18,14 +18,10 @@ namespace Coffer.Api.Tests.Integration.Stress;
 /// </summary>
 /// <remarks>
 /// <para>
-/// This exists to answer one scheduled question and then be kept. ADR-0008
-/// deferred a <c>monthly_account_balances</c> materialized view on the grounds
-/// that the feature it would serve did not exist yet; that feature shipped, and
-/// the series had to be capped at 600 points precisely because every point is
-/// aggregated live — two as-of feeder calls per point. Whether the view is worth
-/// building is a measurement nobody had taken, so the deferral has been
-/// re-argued from the same unmeasured premise ever since. The numbers below are
-/// the input to that decision.
+/// ADR-0008 defers a <c>monthly_account_balances</c> materialized view. The
+/// net-worth series is capped at 600 points because every point is aggregated
+/// live — two as-of feeder calls per point. Whether the view is worth building
+/// is a measurement, and the numbers below are the input to that decision.
 /// </para>
 /// <para>
 /// <b>No timing assertion</b>, per this lane's standing rule: it runs on whatever
@@ -37,20 +33,19 @@ namespace Coffer.Api.Tests.Integration.Stress;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class NetWorthHistoryCostTests
+public sealed class NetWorthHistoryCostTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
     private readonly ITestOutputHelper _output;
 
     public NetWorthHistoryCostTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
         _output = output;
     }
 
     private static AccountsReportingRepository Build(AppDbContext db)
     {
-        var balances = new AccountBalancesRepository(db);
+        var balances = new AccountBalancesRepository(db, TimeProvider.System);
         var investment = new InvestmentReportingRepository(db, TimeProvider.System);
         return new AccountsReportingRepository(
             db, balances, investment, new OverviewRepository(db, balances, investment));
@@ -59,12 +54,12 @@ public sealed class NetWorthHistoryCostTests
     [Fact]
     public async Task Net_worth_history_prints_its_per_point_cost_and_agrees_across_buckets()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var seeded = Stopwatch.StartNew();
-        await StressLedger.SeedAsync(_fixture, ledger, StressLedger.Scale.Default);
+        await StressLedger.SeedAsync(Db, ledger, StressLedger.Scale.Default);
         seeded.Stop();
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         // Npgsql's 30s default would cut off the thing being measured.
         db.Database.SetCommandTimeout(600);
         var repository = Build(db);
@@ -121,5 +116,76 @@ public sealed class NetWorthHistoryCostTests
         Assert.True(compared > 20,
             $"only {compared} year-ends lined up with a month-end; the agreement "
             + "check compared almost nothing and would pass against a broken series");
+    }
+
+    /// <summary>
+    /// What the home screen's net-worth reads cost: the overview with and without a
+    /// <c>since</c> comparison, and the thirteen-point series its net-worth widget asks
+    /// for, at four times the default bank volume, at that volume with the quiet accounts
+    /// a long-lived ledger gathers (<see cref="LongLivedAccounts"/>), and at the deep
+    /// investment shape.
+    /// </summary>
+    /// <remarks>
+    /// Run with the session's <c>statement_timeout</c> at the API's command timeout, so
+    /// a read that would time out in the app fails here rather than finishing slowly.
+    /// The agreement checks hold on any hardware: the comparison equals the series'
+    /// point at the month-end, and the series' last point equals the overview.
+    /// </remarks>
+    [Theory]
+    [InlineData("4x-default")]
+    [InlineData("4x-long-lived")]
+    [InlineData("deep")]
+    public async Task The_home_screen_net_worth_reads_print_their_cost(string shape)
+    {
+        var scale = shape == "deep"
+            ? StressLedger.Scale.Deep
+            : StressLedger.Scale.Default with { BankTxns = StressLedger.Scale.Default.BankTxns * 4 };
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var seeded = await StressLedger.SeedAsync(Db, ledger, scale);
+        if (shape == "4x-long-lived") await LongLivedAccounts.AddAsync(ledger);
+
+        await using var db = Db.NewDbContext();
+        await db.Database.OpenConnectionAsync();
+        await db.Database.ExecuteSqlRawAsync("SET statement_timeout = '30s'");
+        var balances = new AccountBalancesRepository(db, TimeProvider.System);
+        var investment = new InvestmentReportingRepository(db, TimeProvider.System);
+        var overview = new OverviewRepository(db, balances, investment);
+        var reporting = new AccountsReportingRepository(db, balances, investment, overview);
+
+        // A caller's today inside the seeded span, and the month-end before it.
+        var today = new DateOnly(2026, 6, 15);
+        var since = new DateOnly(2026, 5, 31);
+        var from = new DateTime(2025, 6, 1, 0, 0, 0, DateTimeKind.Utc);
+        var to = new DateTime(2026, 6, 30, 0, 0, 0, DateTimeKind.Utc);
+
+        async Task<(T Result, double Ms)> TimeAsync<T>(Func<Task<T>> read)
+        {
+            await read();   // warm
+            var samples = new List<double>();
+            T result = default!;
+            for (var i = 0; i < 3; i++)
+            {
+                var watch = Stopwatch.StartNew();
+                result = await read();
+                samples.Add(watch.Elapsed.TotalMilliseconds);
+            }
+            samples.Sort();
+            return (result, samples[1]);
+        }
+
+        var (plain, plainMs) = await TimeAsync(() => overview.GetAsync(ledger.LedgerId, today));
+        var (withSince, sinceMs) = await TimeAsync(() => overview.GetAsync(ledger.LedgerId, today, since));
+        var (series, seriesMs) = await TimeAsync(() =>
+            reporting.NetWorthHistoryAsync(ledger.LedgerId, from, to, ReportTimeBucket.Month, today));
+
+        _output.WriteLine(string.Create(CultureInfo.InvariantCulture,
+            $"home-load {shape}: seed {seeded.TotalSeconds:F1}s; overview {plainMs:F0} ms; overview+since {sinceMs:F0} ms; net-worth series ({series.Points.Count} points) {seriesMs:F0} ms (median of 3, warm)"));
+
+        Assert.Equal(13, series.Points.Count);
+        Assert.Contains(series.Points, p => p.NetWorth != 0m);
+        var comparison = withSince.Comparison!;
+        Assert.False(comparison.NoHistory);
+        Assert.Equal(comparison.NetWorth.Then, series.Points.Single(p => DateOnly.FromDateTime(p.AsOf) == since).NetWorth);
+        Assert.Equal(plain.NetWorth, series.Points[^1].NetWorth);
     }
 }

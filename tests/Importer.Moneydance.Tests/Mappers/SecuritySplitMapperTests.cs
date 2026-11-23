@@ -30,22 +30,22 @@ public sealed class SecuritySplitMapperTests
         new Dictionary<string, SecurityRef>(StringComparer.Ordinal) { [mdId] = new(securityId, decimals) };
 
     [Fact]
-    public void Map_translates_a_real_export_csplit()
+    public void Map_translates_a_moneydance_csplit()
     {
-        // A 2-for-1 split in the shape a real export writes it.
+        // A 2-for-1 split in the shape Moneydance writes it.
         var securityId = Guid.NewGuid();
         var csplit = CsplitFromJson("""
             {
-              "obj_type":"csplit","id":"8ed56ccd-0ec2-4b34-884a-dfe4b3ecddf0",
-              "curr":"a8e7b723-4fcc-4b12-8e1d-60d0883fcba1",
+              "obj_type":"csplit","id":"00000000-0000-0000-0000-000000000001",
+              "curr":"00000000-0000-0000-0000-000000000002",
               "dt":"20240610","ratio":"2.0","oldshrs":"2","newshrs":"1",
-              "ts":"1718029530123"
+              "ts":"1718020800000"
             }
             """);
 
         var result = SecuritySplitMapper.Map(
             csplit,
-            SecurityMap("a8e7b723-4fcc-4b12-8e1d-60d0883fcba1", securityId),
+            SecurityMap("00000000-0000-0000-0000-000000000002", securityId),
             LedgerId);
 
         Assert.Null(result.Skip);
@@ -56,7 +56,7 @@ public sealed class SecuritySplitMapperTests
         Assert.Equal(2.0m, row.Ratio);
         Assert.Equal(2m,   row.OldShares);
         Assert.Equal(1m,   row.NewShares);
-        Assert.Equal("8ed56ccd-0ec2-4b34-884a-dfe4b3ecddf0", row.ExternalId);
+        Assert.Equal("00000000-0000-0000-0000-000000000001", row.ExternalId);
     }
 
     [Fact]

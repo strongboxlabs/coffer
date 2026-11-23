@@ -1,15 +1,15 @@
+import { forwardRef } from 'react';
+
 import { cn } from '@/lib/cn';
 
 import { IconButton } from './IconButton';
 
 // A visible way into a row's context menu.
 //
-// WHY THIS EXISTS. The Tags and Categories settings panels had NO visible
-// controls at all — `grep -c '<Button|<IconButton'` returned 0 for both — and
-// eight actions (rename, recolour, merge, delete, add sub-category, move) were
-// reachable only by right-clicking a row. A `title="Right-click for actions"`
-// tooltip was the entire discovery mechanism, and tooltips do not exist on
-// touch and are not announced as affordances.
+// WHY THIS EXISTS. A row whose actions (rename, recolour, merge, delete, add
+// sub-category, move) are reachable only by right-clicking has no visible
+// affordance. A `title="Right-click for actions"` tooltip does not fill that
+// gap: tooltips do not exist on touch and are not announced as affordances.
 //
 // Right-click stays: on a list you use often it is faster, and removing it
 // would punish the people who already know. This is the discoverable path, not
@@ -22,33 +22,43 @@ import { IconButton } from './IconButton';
 // right-click-only. A control on every row of a dense grid would cost more than it
 // buys, so the gap is recorded in ADR-0021 Rule 10 rather than closed here.
 //
-// (This comment used to name "Categorize / Move / Delete". Categorize is not on
-// the bar and never has been — it is blocked on a bulk endpoint that does not
-// exist — so the comment was advertising a visible path that was not there.)
+// (Categorize is not on the bar: it is blocked on a bulk endpoint that does not
+// exist.)
+//
+// The ref is the button's: a list whose row menu can take the row away gives
+// it to useRowRemovalFocus, so focus moves on to the next row's button.
 
-export function RowActionsButton({
-    label,
-    onOpen,
-    disabled,
-    size = 'md',
-    className,
-}: {
+interface RowActionsButtonProps {
     /** Announced to screen readers — name the row, e.g. `Actions for Groceries`. */
     label: string;
     /** Given the button's own rectangle so the menu can anchor to it rather
      *  than to a pointer position the keyboard never produces. */
     onOpen: (anchor: { x: number; y: number }) => void;
     disabled?: boolean;
+    /** A request the row waits on is in flight: the button keeps focus and
+     *  refuses to open (pending.ts). */
+    pending?: boolean;
     /** `sm` (20px) fits the sidebar's ~23px nav rows; see IconButton. */
     size?: 'sm' | 'md';
     /** For positioning only — the sidebar overlays it on a reserved slot. */
     className?: string;
-}) {
+}
+
+export const RowActionsButton = forwardRef<HTMLButtonElement, RowActionsButtonProps>(function RowActionsButton({
+    label,
+    onOpen,
+    disabled,
+    pending,
+    size = 'md',
+    className,
+}, ref) {
     return (
         <IconButton
+            ref={ref}
             aria-label={label}
             aria-haspopup="menu"
             disabled={disabled}
+            pending={pending}
             size={size}
             className={cn('shrink-0', className)}
             onClick={(e) => {
@@ -71,4 +81,4 @@ export function RowActionsButton({
             </svg>
         </IconButton>
     );
-}
+});

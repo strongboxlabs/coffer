@@ -6,6 +6,10 @@ export type CsvDelimiterName = 'comma' | 'tab' | 'semicolon' | 'pipe';
 /** The amount shapes a mapping may name. Matches the API's closed vocabulary. */
 export type CsvAmountShapeName = 'signed' | 'debit_credit';
 
+/** The decimal separators an amount block may name, as `amount.decimal_separator`
+ *  (ADR-0114 D15), required from schema version 2. Matches the API's closed vocabulary. */
+export type CsvDecimalSeparatorName = 'point' | 'comma';
+
 /**
  * What a document SAYS, as the server read it.
  *
@@ -28,6 +32,10 @@ export interface CsvMappingShape {
     amountInvert: boolean;
     debitColumn: number | null;
     creditColumn: number | null;
+    /** The amount block's decimal separator. A version-1 document has no such key and
+     *  reads as `point`, so a saved layout loads back with its separator and is never
+     *  re-guessed. */
+    decimalSeparator: CsvDecimalSeparatorName;
 }
 
 /** One stored mapping document. */

@@ -20,11 +20,11 @@ namespace Coffer.Importer.Moneydance.Pipeline;
 /// re-inserts fresh balance rows in canonical
 /// <c>(posted_at, seq)</c> order.</para>
 ///
-/// <para>One-shot, N+1 by design — the importer typically touches a
-/// few hundred accounts; per-account round-trip cost is dominated
-/// by the recompute itself (a CTE + UPSERT). Wrapping into a single
-/// DO block would shave maybe ~5% off the wall clock and lose the
-/// per-account progress feedback.</para>
+/// <para>One-shot, N+1 by design — one round-trip per account, and
+/// each round-trip's cost is dominated by the recompute itself (a
+/// CTE + UPSERT), not by the trip. Wrapping into a single DO block
+/// would save only the round-trips and lose the per-account progress
+/// feedback.</para>
 /// </remarks>
 internal sealed class BalanceRecomputeStep
 {

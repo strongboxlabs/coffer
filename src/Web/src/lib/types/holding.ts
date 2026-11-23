@@ -1,5 +1,7 @@
 // Portfolio / Holdings View API types (slice A1).
 
+import type { RateUnavailable } from './conversion';
+
 /**
  * Mirror of API `Coffer.Api.Contracts.HoldingsViewDto`. Portfolio View
  * payload for one investment account (slice A1.a). The brokerage is
@@ -15,14 +17,21 @@ export interface HoldingsViewDto {
     positions: PositionDto[];
 }
 
-/** Aggregate totals across all positions plus the brokerage's cash side. */
+/**
+ * Aggregate totals across all positions plus the brokerage's cash side, all in
+ * `HoldingsViewDto.currencyCode`: a position priced in another currency counts at its
+ * `accountValue`, converted at the latest rate (ADR-0114 D7). A figure that needs a
+ * missing rate is null, with every figure derived from it, and `rateUnavailable`
+ * names each (ADR-0114 D9); the field is absent when nothing is missing.
+ */
 export interface PortfolioSummaryDto {
-    portfolioValue: number;
-    costBasis: number;
-    unrealizedGain: number;
-    percentChange: number;
-    cashBalance: number;
-    total: number;
+    portfolioValue: number | null;
+    costBasis: number | null;
+    unrealizedGain: number | null;
+    percentChange: number | null;
+    cashBalance: number | null;
+    total: number | null;
+    rateUnavailable?: RateUnavailable[];
 }
 
 /**
@@ -31,6 +40,15 @@ export interface PortfolioSummaryDto {
  * exists for this security yet — manual-entry / pre-feed-integration
  * territory; the panel renders those positions with a dash placeholder
  * instead of a misleading zero amount.
+ *
+ * `costBasis` and `costPerShare` are in the account's currency, as its trades are.
+ * `currentPrice` and `currentValue` are in the price's currency: the account's,
+ * unless `priceCurrencyCode` names another. Such a position also carries
+ * `accountValue`, its value converted into the account's currency at the latest rate
+ * (ADR-0114 D7), and its `unrealizedGain` and `percentChange` compare that with the
+ * cost basis. When the rate is missing those three are null and `rateUnavailable`
+ * names it. The three added fields are absent for a position priced in the account's
+ * currency.
  */
 export interface PositionDto {
     securityId: string;
@@ -45,4 +63,7 @@ export interface PositionDto {
     currentValue: number | null;
     unrealizedGain: number | null;
     percentChange: number | null;
+    priceCurrencyCode?: string;
+    accountValue?: number | null;
+    rateUnavailable?: RateUnavailable[];
 }

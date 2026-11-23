@@ -18,11 +18,10 @@
 -- `holdings.quantity` and cost basis. Indistinguishable from a
 -- "real" position from the API's read path.
 --
--- Real-data evidence, found on a real ledger: a DivReinvest in an
--- MD export that was a manual test entry (no OFX provenance) was
--- soft-deleted in the SPA. Holdings still reflected the shares it
--- added, and those shares were the entire discrepancy between
--- Coffer's share count and the broker's (which held none).
+-- The failure it produces: a manual DivReinvest (no OFX provenance)
+-- soft-deleted in the SPA still has its shares in holdings, so
+-- Coffer's share count exceeds the broker's by exactly the shares
+-- that deleted entry added.
 --
 -- THE FIX
 --

@@ -5,19 +5,25 @@
 -- ADR-0031 Phase 5. A generic provider reads a file according to one of these rows
 -- instead of a hand-written parser per institution.
 --
--- WHY A DOCUMENT AND NOT TYPED COLUMNS. This was first written as a dozen typed
--- columns with CHECK constraints, and the first real target file argued it down. One
--- department-store export produced this many surprises on its own:
+-- WHY A DOCUMENT AND NOT TYPED COLUMNS. The variance a delimited export can carry
+-- is too wide for typed columns with CHECK constraints. What the mapping
+-- describes, per field:
 --
---     * TAB-delimited, despite a .csv extension — zero commas in the whole file
---     * NO header row: line 1 is already data
---     * UTF-8 WITH BOM
---     * a currency symbol inside the amount field
---     * amounts signed from the ISSUER's perspective (a purchase is POSITIVE
---       because it increases what you owe)
---     * a fixed-width, space-padded description packing merchant, city and state
+--     * delimiter    — comma, tab, semicolon or pipe, whatever the file's
+--                      extension says
+--     * header_rows  — leading lines to skip, 0 when line 1 is already data
+--     * footer_rows  — trailing lines to skip
+--     * date         — the column and its format
+--     * amount       — `signed` (one column; `invert` for a file signed from the
+--                      ISSUER's perspective, where a purchase is POSITIVE because
+--                      it increases what you owe) or `debit_credit` (two columns)
+--     * payee, memo  — the columns the text comes from
 --
--- Every one of those would have been a column, and that is one file. A schema that
+-- What every mapping gets from the reader, with no field: UTF-8 with or without
+-- a BOM, a currency symbol, spaces or accounting parentheses inside an amount,
+-- and padding trimmed from the date, payee and memo text.
+--
+-- Every field would be a column. A schema that
 -- needs a migration per institution is the wrong shape for a format nobody controls,
 -- and the churn would land on every existing row as a nullable-with-default. The
 -- definition is therefore a YAML document, versioned, which people can also edit by
@@ -38,9 +44,8 @@
 --
 --   * UNKNOWN KEYS ARE REJECTED. A document parser's default is to ignore what it
 --     does not recognise, so a mistyped `ammount_column` would leave the amount
---     unmapped and the import would read a different column as money. Silent
---     misconfiguration is the failure mode this whole repo keeps finding; a typo has
---     to be an error, not a no-op.
+--     unmapped and the import would read a different column as money. A typo has
+--     to be an error, not a silent no-op.
 --   * Cross-field rules the CHECKs used to hold (shape <-> which columns) are
 --     asserted in the validator instead.
 --   * Column indexes are 1-BASED. A 0 would read the wrong field rather than fail,
@@ -94,9 +99,9 @@ CREATE TABLE feed_csv_mappings (
         CHECK (schema_version >= 1)
 );
 
--- One name per ledger: the wizard offers these by name, and two "Store card" rows
--- would make the choice a coin flip. Case-insensitive, because "Store card" and
--- "store card" are the same choice to the person reading the list.
+-- One name per ledger: the wizard offers these by name, and two "Checking export" rows
+-- would make the choice a coin flip. Case-insensitive, because "Checking export" and
+-- "checking export" are the same choice to the person reading the list.
 CREATE UNIQUE INDEX uq_feed_csv_mappings_ledger_name
     ON feed_csv_mappings (ledger_id, lower(name));
 

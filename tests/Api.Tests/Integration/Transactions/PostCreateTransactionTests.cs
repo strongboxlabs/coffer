@@ -19,13 +19,11 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// the empty-list rejection, and the cross-ledger guards.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class PostCreateTransactionTests
+public sealed class PostCreateTransactionTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public PostCreateTransactionTests(PostgresFixture fixture)
+    public PostCreateTransactionTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -41,7 +39,7 @@ public sealed class PostCreateTransactionTests
 
     private async Task<Seed> SeedAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
         var toiletries = await ledger.AddCategoryAsync("toiletries");
@@ -55,7 +53,7 @@ public sealed class PostCreateTransactionTests
     public async Task Post_creates_a_single_posting_header()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var postedAt = new DateTime(2026, 5, 12, 12, 0, 0, DateTimeKind.Utc);
@@ -65,7 +63,7 @@ public sealed class PostCreateTransactionTests
             {
                 PostedAt = postedAt,
                 Payee = "Grocery Store",
-                Memo = "weekly",
+                Notes = new TransactionNotesRequest { Side = seed.BankId, Memo = "weekly" },
                 SourceAccountId = seed.BankId,
                 Postings = new[]
                 {
@@ -82,7 +80,7 @@ public sealed class PostCreateTransactionTests
         var headerId = doc.RootElement.GetProperty("headerId").GetGuid();
         Assert.NotEqual(Guid.Empty, headerId);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == headerId);
         Assert.Equal("manual", header.Origin);
@@ -105,13 +103,20 @@ public sealed class PostCreateTransactionTests
         Assert.Equal(0, bankLeg.PostingIndex);
         Assert.Equal(0, groceriesLeg.PostingIndex);
         Assert.Equal(0m, bankLeg.Amount + groceriesLeg.Amount);
+
+        // A one-split's memo is the entering side's own: on its leg, never the header;
+        // the other side inherits it. The entering side owns the transaction.
+        Assert.Equal("weekly", bankLeg.LegMemo);
+        Assert.Null(groceriesLeg.LegMemo);
+        Assert.Null(header.Memo);
+        Assert.Equal(seed.BankId, header.OriginatingAccountId);
     }
 
     [Fact]
     public async Task Post_persists_check_number_on_header()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -132,7 +137,7 @@ public sealed class PostCreateTransactionTests
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         var headerId = doc.RootElement.GetProperty("headerId").GetGuid();
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == headerId);
         Assert.Equal("1042", header.CheckNumber);
@@ -142,7 +147,7 @@ public sealed class PostCreateTransactionTests
     public async Task Post_creates_a_multi_split_with_three_postings()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -154,9 +159,20 @@ public sealed class PostCreateTransactionTests
                 SourceAccountId = seed.BankId,
                 Postings = new[]
                 {
-                    new TransactionPosting { CounterpartyAccountId = seed.GroceriesId, Amount = -60m, LegMemo = "groceries" },
-                    new TransactionPosting { CounterpartyAccountId = seed.ToiletriesId, Amount = -40m, LegMemo = "toiletries" },
-                    new TransactionPosting { CounterpartyAccountId = seed.GroceriesId, Amount = -25m, LegMemo = "snacks" },
+                    new TransactionPosting { CounterpartyAccountId = seed.GroceriesId, Amount = -60m },
+                    new TransactionPosting { CounterpartyAccountId = seed.ToiletriesId, Amount = -40m },
+                    new TransactionPosting { CounterpartyAccountId = seed.GroceriesId, Amount = -25m },
+                },
+                Notes = new TransactionNotesRequest
+                {
+                    Side = seed.BankId,
+                    Memo = "monthly run",
+                    Lines =
+                    [
+                        new TransactionLineNotesRequest { Index = 0, Memo = "groceries" },
+                        new TransactionLineNotesRequest { Index = 1, Memo = "toiletries" },
+                        new TransactionLineNotesRequest { Index = 2, Memo = "snacks" },
+                    ],
                 },
             });
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
@@ -164,7 +180,7 @@ public sealed class PostCreateTransactionTests
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         var headerId = doc.RootElement.GetProperty("headerId").GetGuid();
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId)
             .OrderBy(l => l.PostingIndex)
@@ -186,13 +202,21 @@ public sealed class PostCreateTransactionTests
         var bankLegs = legs.Where(l => l.AccountId == seed.BankId).ToList();
         Assert.Equal(3, bankLegs.Count);
         Assert.Equal(-125m, bankLegs.Sum(l => l.Amount));
+
+        // A split's memo is the whole transaction's, on the header; each line's own
+        // sits on the split side's leg of that line, never the opposite side's.
+        Assert.Equal(new string?[] { "groceries", "toiletries", "snacks" }, bankLegs.Select(l => l.LegMemo).ToArray());
+        Assert.All(legs.Where(l => l.AccountId != seed.BankId), l => Assert.Null(l.LegMemo));
+        var header = await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == headerId);
+        Assert.Equal("monthly run", header.Memo);
+        Assert.Equal(seed.BankId, header.OriginatingAccountId);
     }
 
     [Fact]
     public async Task Post_rejects_empty_postings_list()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -221,7 +245,7 @@ public sealed class PostCreateTransactionTests
         // bank-feed merge into a paycheck target round-trips into a
         // 422.
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -233,8 +257,8 @@ public sealed class PostCreateTransactionTests
                 SourceAccountId = seed.BankId,
                 Postings = new[]
                 {
-                    new TransactionPosting { CounterpartyAccountId = seed.GroceriesId, Amount = -60m, LegMemo = "Gross" },
-                    new TransactionPosting { CounterpartyAccountId = seed.ToiletriesId, Amount = 0m,  LegMemo = "Surtax placeholder" },
+                    new TransactionPosting { CounterpartyAccountId = seed.GroceriesId, Amount = -60m },
+                    new TransactionPosting { CounterpartyAccountId = seed.ToiletriesId, Amount = 0m },
                 },
             });
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
@@ -242,7 +266,7 @@ public sealed class PostCreateTransactionTests
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         var headerId = doc.RootElement.GetProperty("headerId").GetGuid();
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId)
             .ToListAsync();
@@ -256,7 +280,7 @@ public sealed class PostCreateTransactionTests
     public async Task Post_rejects_self_posting()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -281,7 +305,7 @@ public sealed class PostCreateTransactionTests
     public async Task Post_rejects_missing_counterparty()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -310,7 +334,7 @@ public sealed class PostCreateTransactionTests
     public async Task Post_rejects_missing_source_account()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -335,7 +359,7 @@ public sealed class PostCreateTransactionTests
     public async Task Post_rejects_missing_posted_at()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -360,9 +384,9 @@ public sealed class PostCreateTransactionTests
     public async Task Post_returns_422_ledger_not_visible_when_user_has_no_grant()
     {
         var seed = await SeedAsync();
-        var otherLedger = await SyntheticLedger.CreateAsync(_fixture);
+        var otherLedger = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, otherLedger);
 
         var response = await client.PostAsJsonAsync(
@@ -387,10 +411,10 @@ public sealed class PostCreateTransactionTests
     public async Task Post_returns_422_account_not_in_ledger_when_counterparty_belongs_elsewhere()
     {
         var seed = await SeedAsync();
-        var otherLedger = await SyntheticLedger.CreateAsync(_fixture);
+        var otherLedger = await SyntheticLedger.CreateAsync(Db);
         var otherCategory = await otherLedger.AddCategoryAsync("foreign-cat");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(

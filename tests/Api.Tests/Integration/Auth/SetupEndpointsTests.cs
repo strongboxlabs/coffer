@@ -32,13 +32,11 @@ namespace Coffer.Api.Tests.Integration.Auth;
 /// boundary.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class SetupEndpointsTests
+public sealed class SetupEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SetupEndpointsTests(PostgresFixture fixture)
+    public SetupEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static IWebAuthnService NewWebAuthnSubstitute(byte[]? credentialId = null)
@@ -108,13 +106,7 @@ public sealed class SetupEndpointsTests
     /// </summary>
     private async Task<string> SeedBootstrapTokenAsync()
     {
-        await using var db = _fixture.NewDbContext();
-        // TRUNCATE is the cleanest way to wipe global state between
-        // setup tests; EF doesn't have a native equivalent so we route
-        // the SQL through the DbContext's connection.
-        await db.Database.ExecuteSqlRawAsync(
-            "TRUNCATE bootstrap_tokens, webauthn_credentials, webauthn_pending_challenges CASCADE;");
-
+        await using var db = Db.NewDbContext();
         var (plaintext, hash) = BootstrapTokenService.GenerateToken();
         db.BootstrapTokens.Add(new BootstrapTokenRow
         {
@@ -125,71 +117,13 @@ public sealed class SetupEndpointsTests
         return plaintext;
     }
 
-    /// <summary>
-    /// Wipe every user except the seeded system user, plus any
-    /// "new-ledger" rows those users created via the setup ceremony.
-    /// Setup tests assert on counts and on freshly-created rows.
-    /// </summary>
-    /// <remarks>
-    /// Order matters because of the ≥1-owner deferred trigger on
-    /// user_ledger_grants. The user-cascade through grants would leave
-    /// any setup-created new ledger orphaned, and the trigger fires at
-    /// COMMIT. So we delete those ledgers first.
-    ///
-    /// We restrict the ledger delete to rows without a grant for the system
-    /// user — that's the discriminator between "created by a SetupEndpoints
-    /// test" (no system-user grant) and "created by SyntheticLedger" for some
-    /// other test class (which DOES grant the system user, so it survives this
-    /// reset). Other classes' synthetic ledgers also have accounts hanging off
-    /// them under <c>accounts_ledger_id_fkey ON DELETE RESTRICT</c>; a blanket
-    /// delete here would 23503-fail at the FK. Keeping them out of scope dodges
-    /// that without making the reset schema-aware of every dependent table.
-    ///
-    /// (The "not the seeded Default ledger" clause is gone — ADR-0088 / migration
-    /// 186 removed that row, so there is nothing to exclude.)
-    /// </remarks>
-    private async Task ResetUsersAsync()
-    {
-        await using var db = _fixture.NewDbContext();
-
-        // The ledgers this reset removes: setup-created, i.e. not system-owned.
-        var targetLedgerIds = await db.Ledgers
-            .Where(l => !db.UserLedgerGrants.Any(g =>
-                    g.LedgerId == l.Id && g.UserId == UserRow.SystemUserId))
-            .Select(l => l.Id)
-            .ToListAsync();
-
-        // Tear each one down with the PRODUCT's ledger delete (migration 141's
-        // fn_ledger_delete, the same routine DELETE /api/ledgers/{id} uses)
-        // rather than hand-rolled per-table deletes.
-        //
-        // Thirteen tables are ON DELETE RESTRICT against `ledgers` (accounts,
-        // securities, holdings, lots, txn_headers, txn_legs, security_prices,
-        // security_splits, tags, feed_connections, ledger_operations,
-        // account_external_ids, txn_header_account_balances), so a correct
-        // teardown has to know the full order. Duplicating that here means the
-        // reset silently rots the next time a RESTRICT table is added — and when
-        // it rots it doesn't fail the test that caused it, it poisons whichever
-        // sibling test resets next. Since ADR-0088 a setup-created ledger can be
-        // a full Demo import rather than a bare category tree, so this is no
-        // longer hypothetical.
-        foreach (var ledgerId in targetLedgerIds)
-        {
-            await db.LedgerDelete(ledgerId).Select(r => r.LedgerId).FirstAsync();
-        }
-        await db.Users
-            .Where(u => u.Id != UserRow.SystemUserId)
-            .ExecuteDeleteAsync();
-    }
-
     [Fact]
     public async Task Begin_returns_options_and_persists_a_pending_challenge()
     {
-        await ResetUsersAsync();
         var token = await SeedBootstrapTokenAsync();
         var sub = NewWebAuthnSubstitute();
 
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithService(_ => sub);
         using var client = factory.CreateClient();
 
@@ -204,7 +138,7 @@ public sealed class SetupEndpointsTests
         Assert.NotEqual(Guid.Empty, challengeId);
 
         // The challenge row exists, in setup flow, unconsumed.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.PendingChallenges.AsNoTracking()
             .Where(c => c.Id == challengeId)
             .Select(c => new { c.Flow, c.ConsumedAt })
@@ -216,11 +150,10 @@ public sealed class SetupEndpointsTests
     [Fact]
     public async Task Begin_rejects_an_invalid_token_with_401()
     {
-        await ResetUsersAsync();
         await SeedBootstrapTokenAsync();        // valid token persisted, but the test sends a different one
 
         var sub = NewWebAuthnSubstitute();
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var response = await client.PostAsJsonAsync(
@@ -234,10 +167,9 @@ public sealed class SetupEndpointsTests
     [Fact]
     public async Task Begin_rejects_a_taken_username_with_422_and_code()
     {
-        await ResetUsersAsync();
         var token = await SeedBootstrapTokenAsync();
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             db.Users.Add(new UserRow
             {
@@ -250,7 +182,7 @@ public sealed class SetupEndpointsTests
         }
 
         var sub = NewWebAuthnSubstitute();
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var response = await client.PostAsJsonAsync(
@@ -272,7 +204,7 @@ public sealed class SetupEndpointsTests
     {
         var token = await SeedBootstrapTokenAsync();
         var sub = NewWebAuthnSubstitute();
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var response = await client.PostAsJsonAsync(
@@ -287,12 +219,11 @@ public sealed class SetupEndpointsTests
     [Fact]
     public async Task Complete_persists_user_credential_recovery_codes_and_issues_a_cookie()
     {
-        await ResetUsersAsync();
         var token = await SeedBootstrapTokenAsync();
 
         var credentialId = RandomBytes(64);
         var sub = NewWebAuthnSubstitute(credentialId);
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         // /begin
@@ -326,9 +257,9 @@ public sealed class SetupEndpointsTests
         var codes = completeDoc.RootElement.GetProperty("recoveryCodes").EnumerateArray()
             .Select(e => e.GetString()!).ToArray();
         Assert.Equal(10, codes.Length);
-        // No ledger without the demo opt-in (ADR-0088).
-        Assert.Equal(JsonValueKind.Null, completeDoc.RootElement.GetProperty("ledgerId").ValueKind);
-        Assert.Equal(JsonValueKind.Null, completeDoc.RootElement.GetProperty("ledgerName").ValueKind);
+        // Setup creates no ledger, so the response names none (ADR-0088).
+        Assert.False(completeDoc.RootElement.TryGetProperty("ledgerId", out _));
+        Assert.False(completeDoc.RootElement.TryGetProperty("ledgerName", out _));
 
         // The master key comes back too (ADR-0092 D2): startup minted it on this
         // install and setup is the one moment the operator is present, verified, and
@@ -340,7 +271,7 @@ public sealed class SetupEndpointsTests
 
         // …and the disclosure is audited, so "who saw the key" has an answer even
         // for the unavoidable bootstrap one.
-        await using (var auditDb = _fixture.NewDbContext())
+        await using (var auditDb = Db.NewDbContext())
         {
             Assert.Contains(
                 await auditDb.AdminAuditEvents.AsNoTracking()
@@ -351,7 +282,7 @@ public sealed class SetupEndpointsTests
 
         // DB state: user, credential, recovery codes, bootstrap token
         // consumed, and NO ledger grant.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var user = await db.Users.AsNoTracking()
             .Where(u => u.Id == userId)
             .Select(u => new { u.Username, u.CreatedBy, u.IsAdmin })
@@ -370,10 +301,9 @@ public sealed class SetupEndpointsTests
     [Fact]
     public async Task Complete_rejects_unknown_challenge_id()
     {
-        await ResetUsersAsync();
         var token = await SeedBootstrapTokenAsync();
         var sub = NewWebAuthnSubstitute();
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var response = await client.PostAsJsonAsync(
@@ -390,7 +320,6 @@ public sealed class SetupEndpointsTests
     [Fact]
     public async Task Complete_returning_a_failed_attestation_leaves_no_DB_side_effects()
     {
-        await ResetUsersAsync();
         var token = await SeedBootstrapTokenAsync();
 
         var sub = Substitute.For<IWebAuthnService>();
@@ -404,7 +333,7 @@ public sealed class SetupEndpointsTests
            .Returns<Task<WebAuthnRegistrationOutcome>>(_ =>
                throw new Fido2VerificationException("forged signature"));
 
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var beginResp = await client.PostAsJsonAsync(
@@ -428,7 +357,7 @@ public sealed class SetupEndpointsTests
                 doc.RootElement.GetProperty("code").GetString());
 
         // No user, no credential, no recovery codes, token still alive.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Equal(0, await db.Users.CountAsync(u => u.Username == "alice"));
         Assert.Equal(0, await db.WebAuthnCredentials.CountAsync());
         Assert.Equal(1, await db.BootstrapTokens.CountAsync(t => t.ConsumedAt == null));
@@ -438,15 +367,15 @@ public sealed class SetupEndpointsTests
     public async Task Info_accepts_a_valid_token_and_offers_no_ledger_list()
     {
         var token = await SeedBootstrapTokenAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var response = await client.GetAsync($"/api/auth/setup/{token}/info");
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
         // ADR-0088: /info exists to validate the token. It must NOT advertise
-        // ledgers — the rows it used to list were empty placeholders, and
-        // offering them is what made the first-run choice misleading.
+        // ledgers — offering placeholder rows makes the first-run choice
+        // misleading.
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.False(doc.RootElement.TryGetProperty("availableLedgers", out _));
     }
@@ -454,7 +383,7 @@ public sealed class SetupEndpointsTests
     [Fact]
     public async Task Info_rejects_invalid_token_with_401()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var response = await client.GetAsync($"/api/auth/setup/not-a-real-token/info");
@@ -462,19 +391,18 @@ public sealed class SetupEndpointsTests
     }
 
     /// <summary>
-    /// The demo opt-in (ADR-0088) seeds a real ledger through the import
-    /// pipeline and grants the new user ownership. This is the only path by
-    /// which setup produces a ledger, and it must produce a POPULATED one —
-    /// an empty ledger called "Demo" is the exact bug this ADR removed.
+    /// Setup creates no ledger, whatever the client asks (ADR-0088). A client built when
+    /// setup could add a Demo still sends <c>includeDemo</c>: the field is ignored, setup
+    /// completes, and the user owns nothing, so the hub's Demo button is the only way to
+    /// a Demo.
     /// </summary>
     [Fact]
-    public async Task Complete_with_IncludeDemo_seeds_a_populated_Demo_ledger()
+    public async Task Complete_creates_no_ledger()
     {
-        await ResetUsersAsync();
         var token = await SeedBootstrapTokenAsync();
         var credentialId = RandomBytes(64);
         var sub = NewWebAuthnSubstitute(credentialId);
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var beginResp = await client.PostAsJsonAsync(
@@ -483,31 +411,33 @@ public sealed class SetupEndpointsTests
         var challengeId = JsonDocument.Parse(await beginResp.Content.ReadAsStringAsync())
             .RootElement.GetProperty("challengeId").GetGuid();
 
-        var completeResp = await client.PostAsJsonAsync(
-            $"/api/auth/setup/{token}/complete",
+        // The body an older client sends: the request plus includeDemo, which the
+        // request type no longer declares.
+        var body = JsonSerializer.SerializeToNode(
             new SetupCompleteRequest
             {
                 ChallengeId = challengeId,
                 AttestationResponse = FakeAttestation(credentialId),
                 CredentialNickname = "YubiKey",
-                IncludeDemo = true,
-            });
+            },
+            JsonSerializerOptions.Web)!.AsObject();
+        body["includeDemo"] = true;
+
+        await using (var before = Db.NewDbContext())
+            Assert.Equal(0, await before.Ledgers.CountAsync());
+
+        var completeResp = await client.PostAsJsonAsync($"/api/auth/setup/{token}/complete", body);
         Assert.Equal(HttpStatusCode.OK, completeResp.StatusCode);
 
         using var doc = JsonDocument.Parse(await completeResp.Content.ReadAsStringAsync());
         var userId = doc.RootElement.GetProperty("userId").GetGuid();
-        // The seed is best-effort, so a null ledger here means it threw —
-        // assert explicitly rather than letting the null slide through.
-        Assert.Equal(JsonValueKind.String, doc.RootElement.GetProperty("ledgerId").ValueKind);
-        var ledgerId = doc.RootElement.GetProperty("ledgerId").GetGuid();
-        Assert.Equal("Demo", doc.RootElement.GetProperty("ledgerName").GetString());
+        Assert.False(doc.RootElement.TryGetProperty("ledgerId", out _));
+        Assert.False(doc.RootElement.TryGetProperty("ledgerName", out _));
 
-        await using var db = _fixture.NewDbContext();
-        Assert.Equal(1, await db.Ledgers.CountAsync(l => l.Id == ledgerId));
-        Assert.Equal(1, await db.UserLedgerGrants.CountAsync(
-            g => g.UserId == userId && g.LedgerId == ledgerId && g.Role == "owner"));
-        // Populated, not a shell — the whole point.
-        Assert.True(await db.Accounts.CountAsync(a => a.LedgerId == ledgerId) > 0,
-            "Demo ledger should carry the sample dataset's accounts.");
+        await using var db = Db.NewDbContext();
+        // The user exists, so the setup did run; it created nothing to own.
+        Assert.Equal(1, await db.Users.CountAsync(u => u.Id == userId));
+        Assert.Equal(0, await db.UserLedgerGrants.CountAsync(g => g.UserId == userId));
+        Assert.Equal(0, await db.Ledgers.CountAsync());
     }
 }

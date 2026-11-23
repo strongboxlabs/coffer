@@ -13,7 +13,7 @@
 --      MD, confirmed/rejected by the user, by which heuristic, against
 --      which feed item." Dropping that on import would make every
 --      future SimpleFIN sync re-prompt the user about matches they
---      already resolved (most of the rows in an MD-sourced export).
+--      already resolved in MD.
 --
 -- Column mapping from MD JSON → schema:
 --   ol_fitid_1      → online_match_fitid
@@ -53,9 +53,8 @@ COMMENT ON COLUMN txn_headers.online_match_fi_id IS
 
 COMMENT ON COLUMN txn_headers.online_match_status IS
     'MD''s lifecycle code for the online match (e.g. unmatched / matched / '
-    'confirmed / rejected). Preserves the user''s years of bank-feed '
-    'review work so future SimpleFIN sync does not re-prompt on resolved '
-    'matches.';
+    'confirmed / rejected). Preserves bank-feed review work done in MD '
+    'so future SimpleFIN sync does not re-prompt on resolved matches.';
 
 COMMENT ON COLUMN txn_headers.online_match_type IS
     'How the match was determined: exact FITID round-trip (high confidence), '
@@ -69,10 +68,9 @@ COMMENT ON COLUMN txn_headers.online_match_orig_id IS
 
 -- Partial index — the SimpleFIN sync dedup query reads
 -- (ledger_id, online_match_fi_id, online_match_fitid) for every
--- incoming feed item. Partial because most rows are CSV / manual /
--- non-online and NULL on these columns — no point indexing the bulk
--- of the table when only part of the rows in a typical MD-sourced
--- ledger carry FITIDs.
+-- incoming feed item. Partial because CSV / manual / non-online rows
+-- are NULL on these columns and can never match the lookup, so there
+-- is no point indexing them; only rows that carry a FITID are entered.
 CREATE INDEX idx_txn_headers_online_match_lookup
     ON txn_headers (ledger_id, online_match_fi_id, online_match_fitid)
     WHERE online_match_fitid IS NOT NULL;

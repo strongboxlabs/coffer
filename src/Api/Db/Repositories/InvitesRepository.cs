@@ -61,7 +61,7 @@ public sealed class InvitesRepository
     /// Does NOT consume — the preview, the redeem steps and accept all use it.
     /// </summary>
     /// <remarks>
-    /// "Can still issue it" (2026-10-12 audit, M6): an invite carries its sender's
+    /// "Can still issue it" (ADR-0105 D4): an invite carries its sender's
     /// authority, so it lasts only as long as that authority does. The sender must be
     /// enabled. A ledger in the invite needs its sender to own that ledger still, whether
     /// or not they are an admin (FU-095): access to a ledger is its owners' to give.

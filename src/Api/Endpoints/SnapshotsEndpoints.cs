@@ -93,6 +93,8 @@ public static class SnapshotsEndpoints
             LedgerSnapshotsRepository.CreateOutcome.Created =>
                 Results.Ok(new CreateSnapshotResponse(ToSummary(
                     result.Row!,
+                    (await snapshots.StoredSizesAsync(ledgerId, cancellationToken)
+                        .ConfigureAwait(false)).GetValueOrDefault(result.Row!.Id),
                     await meta.GetLatestSchemaScriptAsync(cancellationToken)
                         .ConfigureAwait(false) ?? string.Empty))),
             LedgerSnapshotsRepository.CreateOutcome.AtCap =>
@@ -114,7 +116,10 @@ public static class SnapshotsEndpoints
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         LedgerSnapshotsRepository snapshots,
+        ServiceDbContextFactory serviceFactory,
+        ILoggerFactory loggerFactory,
         MetaRepository meta,
+        TimeProvider clock,
         CancellationToken cancellationToken)
     {
         var visible = await ledgers.GetVisibleByIdAsync(
@@ -124,10 +129,19 @@ public static class SnapshotsEndpoints
                 "Ledger not found or not visible to this user.");
 
         var rows = await snapshots.ListAsync(ledgerId, cancellationToken).ConfigureAwait(false);
+        // The chunks are service-role only (mig 254): a chunk holds every member's rows, so the
+        // request role has no privilege on them. Sizes are read through the service role once the
+        // caller's access to the ledger is established above, as the create endpoint does.
+        await using var svc = serviceFactory.Create();
+        var stored = await new LedgerSnapshotsRepository(
+                svc, loggerFactory.CreateLogger<LedgerSnapshotsRepository>(), clock)
+            .StoredSizesAsync(ledgerId, cancellationToken).ConfigureAwait(false);
         // Read once for the whole list, not per row.
         var liveSchemaVersion = await meta.GetLatestSchemaScriptAsync(cancellationToken)
             .ConfigureAwait(false) ?? string.Empty;
-        return Results.Ok(rows.Select(r => ToSummary(r, liveSchemaVersion)).ToList());
+        return Results.Ok(rows
+            .Select(r => ToSummary(r, stored.GetValueOrDefault(r.Id), liveSchemaVersion))
+            .ToList());
     }
 
     /// <summary>
@@ -160,8 +174,8 @@ public static class SnapshotsEndpoints
         var operations = new LedgerOperationsRepository(svc);
 
         // Durable audit (ADR-0055/0086): a restore replaces the ledger's data in
-        // place, so it earns a ledger_operations row + an app-log line (import
-        // already logs; restore was previously silent). Written on the service
+        // place, so it earns a ledger_operations row + an app-log line, as an
+        // import does. Written on the service
         // context the restore runs on (this route is owner-only; the role is the
         // API's check, not RLS's). Written INSIDE the restore transaction, so the
         // restore and its record commit together — and a failure here rolls the
@@ -188,11 +202,9 @@ public static class SnapshotsEndpoints
             // so that verdict is no longer a statement about anything. Null it —
             // "unknown" rather than a guess in either direction (mig 242).
             //
-            // This is not theoretical tidiness. Before the cadence gate the
-            // monitor re-checked every 15 minutes, so a restored ledger was
-            // re-verified almost immediately; with a 12-hour cadence a restore
-            // that brought back a snapshot captured WHILE drifted would sit
-            // behind a stale green for half a day. Nulling LastCheckedAt makes
+            // With a 12-hour check cadence, a restore that brings back a
+            // snapshot captured WHILE drifted would otherwise sit behind a stale
+            // green for up to half a day. Nulling LastCheckedAt makes
             // the ledger due on the next tick, without this endpoint knowing what
             // the cadence is.
             //
@@ -296,6 +308,7 @@ public static class SnapshotsEndpoints
     /// </param>
     private static SnapshotSummaryDto ToSummary(
         Coffer.Api.Db.Entities.LedgerSnapshotRow row,
+        long storedBytes,
         string liveSchemaVersion)
         => new(
             Id: row.Id,
@@ -304,7 +317,7 @@ public static class SnapshotsEndpoints
             Kind: row.Kind,
             Description: row.Description,
             SchemaVersion: row.SchemaVersion,
-            ContentSizeUncompressed: row.ContentSizeUncompressed,
+            ContentSizeStored: storedBytes,
             Restorable: string.Equals(
                 row.SchemaVersion, liveSchemaVersion, StringComparison.Ordinal));
 }

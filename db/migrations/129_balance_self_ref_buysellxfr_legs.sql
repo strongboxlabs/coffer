@@ -9,10 +9,9 @@
 -- The netting actually happens across the PAIRED buy / fee leg (a separate
 -- header / split), not within this one header. The mapper is fixed going
 -- forward (it now books the proceeds); this corrects the rows already
--- written. The case it repairs: a closed brokerage account whose cash
--- balance reads negative by EXACTLY the sum of the dropped proceeds.
--- Booking them brings that account to zero, as a wound-down account
--- should read.
+-- written. The symptom: a brokerage account's cash balance reads
+-- negative by EXACTLY the sum of the dropped proceeds, so a wound-down
+-- account does not read zero. Booking the proceeds corrects it.
 --
 -- Mechanism: for each affected header the sec-pair brokerage-cash leg
 -- (amount 0, paired by posting_index with the share-bearing holdings leg)

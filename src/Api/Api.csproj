@@ -14,15 +14,15 @@
          the assembly by the StampGitVersion target below and surfaced
          via GET /api/meta/version. We compose InformationalVersion
          ourselves, so suppress the SDK's automatic +<sha> append. -->
-    <Version>0.125.1</Version>
+    <Version>0.141.0</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 
   <!-- FU-089: dev auth (any request with X-Dev-Auth: 1 is the admin) is compiled only into
        builds that ask for it. Debug builds do, so local runs and `dotnet test` keep it;
        Release builds do not, so the image, which the Dockerfile publishes in Release, has no
-       dev-auth code at all, whatever its environment and configuration say. It used to be
-       excluded at runtime only, by environment plus config, both settable on a host. The CI
+       dev-auth code at all, whatever its environment and configuration say. Excluding it at
+       runtime only, by environment plus config, is not enough: both are settable on a host. The CI
        and preflight Release builds the tests run against pass -p:CofferDevAuth=true. -->
   <PropertyGroup>
     <CofferDevAuth Condition="'$(CofferDevAuth)' == '' And '$(Configuration)' == 'Debug'">true</CofferDevAuth>
@@ -39,20 +39,19 @@
        ContinueOnError + defaulted, so a .git-less build falls back to
        build 0 / "nogit" rather than failing the build.
 
-       That fallback IS what a container build hit: .dockerignore excludes
-       .git (rightly — the history has no business in a build context), so
-       every published image reported "0.62.0+nogit" and a build number of
-       0. The degradation was graceful and silent, which made the identity
-       useless exactly where it matters most: a running deployment could
-       name its release but not the commit behind it, and every image of a
-       given release looked identical.
+       A container build takes that fallback on its own: .dockerignore
+       excludes .git (rightly — the history has no business in a build
+       context), so the image would report "<version>+nogit" and a build
+       number of 0. The degradation is graceful and silent, which makes the
+       identity useless exactly where it matters most: a running deployment
+       could name its release but not the commit behind it, and every image
+       of a given release would look identical.
 
-       So each value is now OVERRIDABLE: pass GitShortSha / GitCommitCount /
+       So each value is OVERRIDABLE: pass GitShortSha / GitCommitCount /
        GitCommitDate and the corresponding git call is skipped. The
        Dockerfile takes them as build args and the release workflow supplies
        them from the tagged commit, which it knows without needing .git in
-       the context. Local builds are unchanged — nothing is passed, so git
-       is consulted as before. -->
+       the context. Local builds pass nothing, so git is consulted. -->
   <Target Name="StampGitVersion" BeforeTargets="GetAssemblyVersion;CoreGenerateAssemblyInfo;GenerateAssemblyInfo">
     <Exec Condition="'$(GitCommitCount)' == ''" Command="git rev-list --count HEAD" ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
       <Output TaskParameter="ConsoleOutput" PropertyName="GitCommitCount" />
@@ -71,13 +70,13 @@
       <Output TaskParameter="ExitCode" PropertyName="GitDateExit" />
     </Exec>
     <PropertyGroup>
-      <!-- THREE states, not two, and missing the third shipped a git error
-           message as the version string.
+      <!-- THREE states, not two; missing the third puts a git error message
+           in the version string.
 
            A skipped Exec (value supplied) leaves ExitCode EMPTY, so the
            fallback cannot key on the exit code alone — '' != '0' would
-           overwrite a supplied sha with "nogit". That is why these tested the
-           VALUE. But an Exec that RAN AND FAILED leaves the value non-empty:
+           overwrite a supplied sha with "nogit". A VALUE test alone fails the
+           other way: an Exec that RAN AND FAILED leaves the value non-empty:
            ConsoleToMSBuild captures git's own "fatal: not a git repository"
            into the property, so the value test sees something and the fallback
            never fires. The build then stamps
@@ -89,11 +88,10 @@
            and the About panel renders as the commit — twice, since CommitDate
            is the same text and its "have we got one" guard passes too.
 
-           This only became reachable when the sdk image started shipping git:
-           before that the Exec failed to START (no value captured, empty,
-           fallback fired), which is why the comment above described a
-           degradation that no longer happened. Local builds hit it because
-           .dockerignore excludes .git, so the build stage is not a repo.
+           An Exec that fails to START (no git on the image) captures nothing,
+           so the value test does catch that case. An image that ships git
+           runs it and fails, because .dockerignore excludes .git and the build
+           stage is not a repo.
 
            So: clear the value when the Exec ran and failed, THEN apply the
            empty-value fallback. A skipped Exec still has an empty ExitCode and
@@ -126,20 +124,26 @@
          with this project's AGPL-3.0-only. Not hand-rolled: quoted delimiters,
          doubled quotes and newlines inside quotes are where a splitter silently
          shifts an amount into the wrong field. -->
-    <PackageReference Include="CsvHelper" Version="33.1.0" />
+    <PackageReference Include="CsvHelper" Version="34.0.0" />
     <PackageReference Include="YamlDotNet" Version="18.1.0" />
     <PackageReference Include="dbup-postgresql" Version="6.1.5" />
-    <PackageReference Include="Fido2.AspNet" Version="4.3.1" />
-    <PackageReference Include="Google.Apis.Drive.v3" Version="1.77.0.4276" />
+    <PackageReference Include="Fido2.AspNet" Version="4.3.2" />
+    <!-- Pin the transitive System.Formats.Cbor (via Fido2) to a patched version.
+         Fido2 4.3.2 pulls 9.0.0, which has GHSA-vmv3-wvjp-wqpj (CVE-2026-118747,
+         moderate: a denial of service in the CBOR reader). Fixed in 10.0.15 for the
+         10.x line; the resolver satisfies Fido2's 9.0.0 floor with it. Drop the pin
+         once Fido2 raises its own floor. -->
+    <PackageReference Include="System.Formats.Cbor" Version="10.0.15" NoWarn="NU1510" />
+    <PackageReference Include="Google.Apis.Drive.v3" Version="1.78.0.4327" />
     <PackageReference Include="Konscious.Security.Cryptography.Argon2" Version="1.3.1" />
-    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.13" />
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.14" />
     <!-- Pin the transitive Microsoft.OpenApi to a patched version. AspNetCore.OpenApi
          10.0.9 pulls 2.0.0, which has GHSA-v5pm-xwqc-g5wc (high: a circular schema
          reference can stack-overflow the OpenAPI parser). Fixed in 2.7.5; same major,
          so the resolver satisfies AspNetCore.OpenApi's floor with it. -->
-    <PackageReference Include="Microsoft.OpenApi" Version="2.12.2" />
-    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.13" />
-    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0" />
+    <PackageReference Include="Microsoft.OpenApi" Version="2.13.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.14" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.4.0" />
     <PackageReference Include="Npgsql" Version="10.0.3" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
     <PackageReference Include="Npgsql.OpenTelemetry" Version="10.0.3" />
@@ -150,15 +154,18 @@
          (`OfxFileProvider`) — if upstream stalls, MIT lets us vendor
          `src/OfxNet/` directly into the repo. -->
     <PackageReference Include="OfxNet" Version="1.8.1" />
-    <PackageReference Include="OpenIddict.AspNetCore" Version="7.7.2" />
-    <PackageReference Include="OpenIddict.EntityFrameworkCore" Version="7.7.2" />
-    <PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.20.0" />
-    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.20.0" />
-    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.20.0" />
+    <PackageReference Include="OpenIddict.AspNetCore" Version="7.8.0" />
+    <PackageReference Include="OpenIddict.EntityFrameworkCore" Version="7.8.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.20.1" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.20.1" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.20.2" />
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\Coffer.Domain.Annotations\Coffer.Domain.Annotations.csproj" />
     <ProjectReference Include="..\Coffer.Domain.Investment\Coffer.Domain.Investment.csproj" />
+    <!-- ADR-0114 D15: each currency's ISO 4217 minor units, the table the SPA reads too. -->
+    <ProjectReference Include="..\Coffer.Domain.Money\Coffer.Domain.Money.csproj" />
     <ProjectReference Include="..\Coffer.Domain.Reminders\Coffer.Domain.Reminders.csproj" />
     <!-- ADR-0071 D2: the API drives the Moneydance import pipeline for the
          in-app "new ledger from export" flow. References the Spectre-free
@@ -168,26 +175,39 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Api.Tests" />
+    <!-- The importer's tests settle the stored memo-and-tags presentation after the rows
+         they write past the writers, with the upgrade's own backfill. -->
+    <InternalsVisibleTo Include="Importer.Moneydance.Tests" />
   </ItemGroup>
 
   <!-- ADR-0071 D5: the curated starter category tree seeded into new ledgers.
        Embedded (not read from disk) so it ships in the assembly.
        GENERATED from the demo sample's curated core (ADR-0091) — do not
        hand-edit the .json; edit data/samples/moneydance-export-demo.base.json
-       and re-run data/samples/starter-categories.gen.mjs. -->
+       and re-run data/samples/starter-categories.gen.mjs. Nested nodes, each
+       with its kind (income, expense or adjustment), up to three levels deep. -->
   <ItemGroup>
     <EmbeddedResource Include="Provisioning\starter-categories.json"
                       LogicalName="Coffer.Api.Provisioning.starter-categories.json" />
-    <!-- The bundled sample dataset, embedded so ProvisioningService can seed the
-         Demo ledger when setup's one question is answered yes (ADR-0088; it was
-         the retired `provision` subcommand that first needed this). Canonical
-         copy stays in data/samples (the importer tests read it there); the
-         .dockerignore carves data/samples back into the build context.
-         ITSELF GENERATED (FU-009): data/samples/moneydance-export-demo.gen.mjs
-         builds it from the curated .base.json plus a synthetic household
-         history. Hand-edits to the .json are lost on the next regeneration. -->
-    <EmbeddedResource Include="..\..\data\samples\moneydance-export-demo.json"
-                      LogicalName="Coffer.Api.Provisioning.moneydance-export-demo.json" />
+    <!-- The Demo generator's curated core (Provisioning/Demo/DemoBase.cs): the root,
+         every category, the fiat currencies and the other base rows, re-emitted
+         verbatim into each generated Demo export. It carries no history; the
+         generator writes the accounts, securities and transactions. The
+         .dockerignore carves data/samples back into the build context. -->
+    <EmbeddedResource Include="..\..\data\samples\moneydance-export-demo.base.json"
+                      LogicalName="Coffer.Api.Provisioning.Demo.base.json" />
+    <!-- The investment action words (ADR-0027): the one table the SPA names actions
+         with and the register's Action sort orders by, so the two cannot drift. The
+         SPA imports the same file; the image's API stage copies all of src/, so it is
+         in the build context there too. -->
+    <EmbeddedResource Include="..\Web\src\lib\investmentActionWords.json"
+                      LogicalName="Coffer.Api.investment-action-words.json" />
+    <!-- The Demo's Home layout and catalog report pins (Provisioning/DemoSeeding/
+         DemoHomeLayout.cs): widget and catalog keys live in the SPA, so the layout lives
+         beside them, where the SPA's drift test checks it against both catalogs, and
+         names the Demo's rows by reference for the examples phase to resolve. -->
+    <EmbeddedResource Include="..\Web\src\lib\demoHomeLayout.json"
+                      LogicalName="Coffer.Api.demo-home-layout.json" />
   </ItemGroup>
 
 </Project>

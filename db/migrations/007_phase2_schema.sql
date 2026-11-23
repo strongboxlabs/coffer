@@ -1,5 +1,5 @@
--- Phase 2 prep: schema refinements informed by inspecting the real Moneydance
--- export. Captured in ADRs 0016 and 0017. No data exists yet (the importer
+-- Phase 2 prep: schema refinements informed by Moneydance's export format.
+-- Captured in ADRs 0016 and 0017. No data exists yet (the importer
 -- hasn't run), so this is pure DDL — no data migration is required or
 -- attempted.
 --

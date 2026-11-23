@@ -21,10 +21,10 @@ namespace Coffer.Api.Auth;
 /// <see cref="OpenIddictKeysFromDatabase"/>.
 /// </summary>
 /// <remarks>
-/// <para>They used to be files under <c>data/openiddict</c>. No backup carried them, so a
-/// restore onto a new host invalidated every MCP token (ID2004); and they were written
-/// 0644 and non-atomically, so a torn <c>signing.pem</c> bricked boot. In the database
-/// they travel with every backup, rotation re-wraps them, and post-restore reconciliation
+/// <para>Not files under <c>data/openiddict</c>: no backup carries those, so a restore
+/// onto a new host would invalidate every MCP token (ID2004); and a file written 0644
+/// and non-atomically can be torn, and a torn <c>signing.pem</c> bricks boot. In the
+/// database they travel with every backup, rotation re-wraps them, and post-restore reconciliation
 /// replaces a pair sealed under another install's key.</para>
 /// <para>The first boot with the table moves the files in and deletes them, so connected
 /// clients stay signed in across the upgrade. A key is minted instead when its file cannot

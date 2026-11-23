@@ -80,16 +80,42 @@ public static class CsvMappingTools
     /// <summary>The amount shapes, as the description names them.</summary>
     internal const string ShapeList = "signed | debit_credit";
 
+    /// <summary>The decimal separators, as the description names them (ADR-0114 D15).</summary>
+    internal const string DecimalSeparatorList = "point | comma";
+
+    /// <summary>
+    /// What the description says about the decimal separator (ADR-0114 D15), shared by
+    /// validate_csv_mapping and save_csv_mapping so the two cannot teach it differently.
+    /// </summary>
+    /// <remarks>
+    /// Three things, each of which an agent writing a layout from a few pasted lines
+    /// needs: the key is required in version 2 and nothing guesses it; a version-1
+    /// document still reads with a point and has no such key; and a cell that does not
+    /// read with the separator is reported per row at import, not refused here, because
+    /// the document cannot see the file.
+    /// </remarks>
+    internal const string DecimalSeparatorGuidance =
+        "amount.decimal_separator is one of: " + DecimalSeparatorList + ", and is REQUIRED " +
+        "in version 2, the version to write: it is the character the file writes its " +
+        "decimals after, and the other one groups thousands, only in groups of three " +
+        "digits or in lakh grouping (groups of two before a last group of three). Nothing guesses it from a layout, so read it off the sample lines; when " +
+        "there are none, ask, because reading a decimal comma as a thousands separator " +
+        "turns every amount into a far larger one. A version-1 document has no such key " +
+        "(it is refused there as unknown) and still reads every amount with a point. " +
+        "A cell that does not read with the chosen separator is not a document problem: " +
+        "the import or preview reports it per row as csv_row_unreadable naming the line, " +
+        "skips that row, and counts only the rows that read.";
+
     /// <summary>The worked example in the description. See <see cref="DelimiterList"/>.</summary>
     internal const string ExampleDocument =
-        "  version: 1\n" +
+        "  version: 2\n" +
         "  delimiter: tab            # " + DelimiterList + "\n" +
         "  header_rows: 0            # optional, default 0\n" +
         "  footer_rows: 0            # optional, default 0\n" +
         "  date:   { column: 1, format: MM/dd/yyyy }   # .NET format, M is month\n" +
         "  payee:  { column: 3 }\n" +
         "  memo:   { column: 4 }     # optional\n" +
-        "  amount: { shape: signed, column: 2, invert: true }\n";
+        "  amount: { shape: signed, column: 2, invert: true, decimal_separator: point }\n";
 
     [McpServerTool(Name = "validate_csv_mapping"), Description(
         "Check a mapping document WITHOUT saving it. Returns valid plus every problem " +
@@ -104,7 +130,8 @@ public static class CsvMappingTools
         "and credit_column instead of column, and no invert. " +
         "Set invert: true when the file signs from the ISSUER's point of view — a " +
         "purchase POSITIVE because it increases what you owe — since Coffer signs from " +
-        "the account holder's, where a purchase is money out.")]
+        "the account holder's, where a purchase is money out. " +
+        DecimalSeparatorGuidance)]
     public static McpCsvMappingVerdict ValidateCsvMapping(
         [Description("The YAML document to check.")] string definitionYaml)
     {

@@ -3,6 +3,8 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import { WHOLE_TREE_SCAN_TIMEOUT_MS } from '@/lib/wholeTreeScan';
+
 /**
  * Lengths that must NOT move when the density axis moves `--spacing`.
  *
@@ -16,16 +18,12 @@ import { describe, expect, it } from 'vitest';
  *     drops the class with no build error and no console warning — the same
  *     silent failure `designTokens.test.ts` exists for, and the reason this
  *     file's first assertion is a spelling check rather than a style check.
- *     The sweep that introduced these tokens produced three such classes
- *     (`w-fixed-24px`, `-28px`, `-32px`) on the first pass.
  *
- *   * A SPLIT PAIR is worse, because it paints something plausible. Those
- *     three classes came from `h-7 w-7` becoming `h-7 w-fixed-28px`: the
- *     height still scaled, the width no longer did, and every icon button in
- *     the app would have gone visibly non-square at any density except 1x.
- *     Nothing about that is visible in review — the markup reads fine, and at
- *     the default density it renders correctly. It was caught only because
- *     those three tokens happened not to exist yet.
+ *   * A SPLIT PAIR is worse, because it paints something plausible. When
+ *     `h-7 w-7` becomes `h-7 w-fixed-28px`, the height still scales and the
+ *     width no longer does, so the element goes non-square at any density
+ *     except 1x. Nothing about that is visible in review — the markup reads
+ *     fine, and at the default density it renders correctly.
  *
  * So: assertion 1 catches the name that paints nothing, assertion 2 catches
  * the icon that slipped back onto the numeric scale, and assertion 3 pins the
@@ -41,11 +39,11 @@ const SIZERS = ['size', 'w', 'h', 'min-w', 'min-h', 'max-w', 'max-h'];
 /**
  * The pinned families. A utility naming any other suffix is a typo.
  *
- * `control` was missing here for one commit, and nothing went red: the
- * spelling check simply stopped seeing `h-control-28px` and friends, so 43
- * utilities were exempt from the assertion meant to cover them. It surfaced
- * only because the Rule 10 spacer check, which reuses this list, went from
- * finding a square to finding nothing. Keep the two coupled for that reason.
+ * A family missing from this list turns nothing red: the spelling check simply
+ * stops seeing its utilities (`h-control-28px` and friends), so they are exempt
+ * from the assertion meant to cover them. The Rule 10 spacer check reuses this
+ * list, so the omission shows there as finding nothing where it should find a
+ * square. Keep the two coupled for that reason.
  */
 const FAMILIES = ['icon', 'dot', 'swatch', 'fixed', 'control'];
 
@@ -129,7 +127,7 @@ describe('pinned lengths', () => {
         expect(seen).toBeGreaterThan(50);
         // Listed rather than counted — the failure has to name the typo.
         expect(offenders).toEqual([]);
-    });
+    }, WHOLE_TREE_SCAN_TIMEOUT_MS);
 
     it('sets no size from the numeric scale', () => {
         // The strongest form of the rule, and the reason it can be this
@@ -137,11 +135,10 @@ describe('pinned lengths', () => {
         // no such thing as a size that should scale. Anything setting a width,
         // a height or a square belongs on a named token.
         //
-        // Stated as a total ban rather than a threshold on purpose. The
-        // earlier draft of this guard allowed squares above 20px on the theory
-        // that a control box may scale; that theory is what produced the split
-        // `h-7 w-fixed-28px` pair, because it made "which of these two halves
-        // is allowed to move" a judgement call at every call site.
+        // Stated as a total ban rather than a threshold on purpose. A threshold
+        // (say, squares above 20px may scale, because a control box may) yields
+        // split pairs like `h-7 w-fixed-28px`, because it makes "which of these
+        // two halves is allowed to move" a judgement call at every call site.
         const offenders: string[] = [];
         for (const file of sourceFiles(SRC)) {
             const rel = file.slice(SRC.length + 1).replaceAll('\\', '/');
@@ -157,14 +154,14 @@ describe('pinned lengths', () => {
                 });
         }
         expect(offenders).toEqual([]);
-    });
+    }, WHOLE_TREE_SCAN_TIMEOUT_MS);
 
     it('keeps the Rule 10 row-action spacer the same size as IconButton', () => {
         // ADR-0021 Rule 10: "A row with no actions gets a same-size spacer, so
         // the columns of rows that do have them stay aligned." Their equality
         // is a rule, not a coincidence, and nothing else in the suite asserts
         // it — a change that moved one and not the other would misalign every
-        // category row, and at the default density it would still look right.
+        // row on Structure's lists, and at the default density it would still look right.
         //
         // Pinned to the DEFAULT size by name rather than to "the first square
         // in IconButton.tsx". That shortcut broke the moment IconButton grew a
@@ -175,7 +172,7 @@ describe('pinned lengths', () => {
         expect(iconButton).toContain("size = 'md'");
         expect(iconButton).toContain("size === 'sm' ? 'size-control-20px' : 'size-control-28px'");
 
-        const spacer = squareOf('routes/ledgers/settings/CategoriesPanel.tsx');
+        const spacer = squareOf('routes/ledgers/structure/StructureRow.tsx');
         expect(spacer).toBe('size-control-28px');
     });
 

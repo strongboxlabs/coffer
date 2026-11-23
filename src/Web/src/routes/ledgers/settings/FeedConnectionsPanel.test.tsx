@@ -46,13 +46,13 @@ describe('FeedConnectionsPanel', () => {
         vi.restoreAllMocks();
         // The owner's view by default: connecting and configuring are theirs (FU-095).
         vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([
-            { id: LEDGER_ID, name: 'Personal', role: 'owner' },
+            { id: LEDGER_ID, name: 'Personal', role: 'owner', currencyCode: 'USD' },
         ]);
     });
 
     it("offers an editor the sync, and not the owner's connect, disconnect or mapping", async () => {
         vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([
-            { id: LEDGER_ID, name: 'Personal', role: 'editor' },
+            { id: LEDGER_ID, name: 'Personal', role: 'editor', currencyCode: 'USD' },
         ]);
         vi.spyOn(apiModule, 'fetchFeedConnections').mockResolvedValue([{
             id: 'conn-1', ledgerId: LEDGER_ID, provider: 'simplefin', institutionName: 'Example Bank',
@@ -161,6 +161,60 @@ describe('FeedConnectionsPanel', () => {
                 setupToken: 'paste-this-from-simplefin',
             });
         });
+    });
+
+    it('gives focus to the setup-token field when a connection clears it and leaves Connect disabled', async () => {
+        vi.spyOn(apiModule, 'fetchFeedConnections').mockResolvedValue([]);
+        const create = vi.spyOn(apiModule, 'createFeedConnection').mockResolvedValue({
+            id: 'new-1', ledgerId: LEDGER_ID, provider: 'simplefin', institutionName: 'Newly Connected',
+            status: 'active', lastSyncedAt: null, createdAt: '2026-05-15T12:00:00Z',
+        });
+        const user = userEvent.setup();
+
+        renderPage();
+
+        const input = await screen.findByLabelText(/simplefin setup token/i);
+        await user.type(input, 'paste-this-from-simplefin');
+        const connect = screen.getByRole('button', { name: /^connect$/i });
+        await user.click(connect);
+
+        await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+        await waitFor(() => expect(input).toHaveValue(''));
+        expect(connect).toBeDisabled();
+        expect(input).toHaveFocus();
+    });
+
+    it('keeps the setup-token field focused through a connect sent with Enter, and sends one', async () => {
+        // The field whose Enter runs the action is not disabled while the
+        // connect is in flight: it keeps focus, and its Enter refuses instead.
+        vi.spyOn(apiModule, 'fetchFeedConnections').mockResolvedValue([]);
+        let finish: () => void = () => {};
+        const create = vi.spyOn(apiModule, 'createFeedConnection').mockImplementation(() => new Promise((resolve) => {
+            finish = () => resolve({
+                id: 'new-1', ledgerId: LEDGER_ID, provider: 'simplefin', institutionName: 'Newly Connected',
+                status: 'active', lastSyncedAt: null, createdAt: '2026-05-15T12:00:00Z',
+            });
+        }));
+        const user = userEvent.setup();
+
+        renderPage();
+
+        const input = await screen.findByLabelText(/simplefin setup token/i);
+        await user.type(input, 'paste-this-from-simplefin{Enter}');
+        expect(await screen.findByRole('button', { name: /connecting/i })).toHaveAttribute('aria-busy', 'true');
+        expect(input).toBeEnabled();
+        expect(input).toHaveFocus();
+        await user.keyboard('{Enter}');
+        expect(create).toHaveBeenCalledTimes(1);
+        // Pending, not disabled: the field refuses what is typed while the connect
+        // whose success clears it is in flight, so nothing typed is dropped unseen.
+        await user.keyboard('more');
+        expect(input).toHaveValue('paste-this-from-simplefin');
+        expect(input).toHaveAttribute('aria-disabled', 'true');
+
+        finish();
+        await waitFor(() => expect(input).toHaveValue(''));
+        expect(input).toHaveFocus();
     });
 
     it('surfaces API errors on connect as an inline alert', async () => {
@@ -287,7 +341,7 @@ describe('FeedConnectionsPanel', () => {
         ).toHaveTextContent(/5.*new transaction.*2.*still pending/i);
     });
 
-    it('toggles the Sync activity panel and lists recent runs (slice 2c.1)', async () => {
+    it('has no Sync activity strip: run history lives in Settings → Activity', async () => {
         const connections: FeedConnectionSummary[] = [{
             id: 'c1',
             ledgerId: LEDGER_ID,
@@ -299,41 +353,12 @@ describe('FeedConnectionsPanel', () => {
         }];
         vi.spyOn(apiModule, 'fetchFeedConnections').mockResolvedValue(connections);
         vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([]);
-        const runs = vi.spyOn(apiModule, 'fetchSyncRuns').mockResolvedValue([
-            {
-                id: 'run-1',
-                feedConnectionId: 'c1',
-                status: 'completed',
-                txnsFetched: 5,
-                txnsInserted: 5,
-                txnsPromoted: 0,
-                txnsAlreadyKnown: 0,
-                txnsStillPending: 0,
-                errorMessage: null,
-                startedAt: '2026-05-16T10:00:00Z',
-                completedAt: '2026-05-16T10:00:05Z',
-                triggeredByUserId: null,
-                errorCount: 0,
-                promotionCount: 0,
-            },
-        ]);
-        const user = userEvent.setup();
 
         renderPage({ initialConnections: connections });
 
-        // Panel starts collapsed — clicking the toggle fires the
-        // runs fetch (gated on `expanded`).
-        const toggle = await screen.findByRole('button', {
-            name: /sync activity/i,
-        });
-        expect(runs).not.toHaveBeenCalled();
-        await user.click(toggle);
-        await waitFor(() => {
-            expect(runs).toHaveBeenCalledWith(LEDGER_ID, 'c1', 5);
-        });
-        expect(await screen.findByText(/completed/i)).toBeInTheDocument();
-        // Headline counters for a clean run.
-        expect(screen.getByText(/5 new/i)).toBeInTheDocument();
+        // Anchor on the connection's own row so the absence is judged against a rendered panel.
+        expect(await screen.findByRole('button', { name: /sync now/i })).toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /sync activity/i })).toBeNull();
     });
 
     it('shows the Re-connect required banner when sync flips to needs_reauth', async () => {
@@ -396,6 +421,8 @@ describe('FeedConnectionsPanel', () => {
                     message: 'Bank A maintenance window',
                     simpleFinConnectionId: 'c-A',
                     simpleFinAccountId: null,
+                    providerKey: null,
+                    accountLabel: null,
                 },
             ],
         });
@@ -523,6 +550,92 @@ describe('FeedConnectionsPanel', () => {
         await waitFor(() => {
             expect(unbind).toHaveBeenCalledWith(LEDGER_ID, 'ledger-acct-checking');
         });
+    });
+
+    describe('a mapping that lands swaps the row\'s controls, and focus goes to the first that takes the pressed one\'s place', () => {
+        // ADR-0023 §L: a control that replaces itself hands focus on, never to the page.
+        const connections: FeedConnectionSummary[] = [{
+            id: 'c1',
+            ledgerId: LEDGER_ID,
+            provider: 'simplefin',
+            institutionName: 'Test Bank',
+            status: 'active',
+            lastSyncedAt: '2026-05-16T12:00:00Z',
+            createdAt: '2026-05-15T12:00:00Z',
+        }];
+        const feedAccount = (bound: boolean) => ({
+            simpleFinAccountId: 'sf-1',
+            name: 'My Checking',
+            orgName: 'Test Bank',
+            currency: 'USD',
+            balance: 100,
+            lastSeenAt: '2026-05-16T12:00:00Z',
+            boundLedgerAccountId: bound ? 'ledger-acct-checking' : null,
+            boundLedgerAccountName: bound ? 'Test Bank Checking' : null,
+            boundLedgerAccountSyncFrom: null,
+        });
+        const checking = {
+            id: 'ledger-acct-checking',
+            ledgerId: LEDGER_ID,
+            parentId: null,
+            name: 'Checking',
+            accountType: 'bank' as const,
+            categoryKind: null,
+            currencyCode: 'USD',
+            isActive: true,
+            isSystem: false,
+            feedConnectionId: null,
+            needsReviewCount: 0,
+            holdingsAccountId: null,
+            isTradeCommission: false,
+        };
+
+        it('Unmap gives focus to the picker', async () => {
+            let bound = true;
+            vi.spyOn(apiModule, 'fetchFeedConnections').mockResolvedValue(connections);
+            vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([]);
+            vi.spyOn(apiModule, 'fetchFeedConnectionAccounts').mockImplementation(async () => [feedAccount(bound)]);
+            vi.spyOn(apiModule, 'unbindAccountFromFeed').mockImplementation(async () => { bound = false; });
+            const invalidated = vi.spyOn(QueryClient.prototype, 'invalidateQueries');
+            const user = userEvent.setup();
+            renderPage({ initialConnections: connections });
+
+            const unmap = await screen.findByRole('button', { name: /^unmap$/i });
+            unmap.focus();
+            await user.keyboard('{Enter}');
+
+            const picker = await screen.findByRole('combobox');
+            await waitFor(() => expect(picker).toHaveFocus());
+            expectHomeRefreshed(invalidated);
+        });
+
+        it('Map gives focus to Sync from…', async () => {
+            let bound = false;
+            vi.spyOn(apiModule, 'fetchFeedConnections').mockResolvedValue(connections);
+            vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([checking]);
+            vi.spyOn(apiModule, 'fetchFeedConnectionAccounts').mockImplementation(async () => [feedAccount(bound)]);
+            vi.spyOn(apiModule, 'mapAccountToFeed').mockImplementation(async () => { bound = true; return undefined as never; });
+            const invalidated = vi.spyOn(QueryClient.prototype, 'invalidateQueries');
+            const user = userEvent.setup();
+            renderPage({ initialConnections: connections });
+
+            await user.selectOptions(await screen.findByRole('combobox'), 'ledger-acct-checking');
+            const map = screen.getByRole('button', { name: /^map$/i });
+            map.focus();
+            await user.keyboard('{Enter}');
+
+            const syncFrom = await screen.findByRole('button', { name: /sync from/i });
+            await waitFor(() => expect(syncFrom).toHaveFocus());
+            expectHomeRefreshed(invalidated);
+        });
+
+        /** A binding moves which account a feed fills, which the home screen reads (ADR-0079). */
+        function expectHomeRefreshed(spy: { mock: { calls: unknown[][] } }) {
+            const keys = spy.mock.calls.map((c) => (c[0] as { queryKey?: unknown } | undefined)?.queryKey);
+            expect(keys).toContainEqual(['home', LEDGER_ID]);
+            expect(keys).toContainEqual(['overview', LEDGER_ID]);
+            expect(keys).toContainEqual(['budget-progress', LEDGER_ID]);
+        }
     });
 
     it('Sync all fires syncAllConnections and renders the aggregate summary (slice 2c.3)', async () => {
@@ -734,5 +847,267 @@ describe('FeedConnectionsPanel — an account the provider has stopped listing',
 
         expect(await screen.findByText(/dropped checking/i)).toBeInTheDocument();
         expect(screen.queryByText(/not seen since/i)).toBeNull();
+    });
+});
+
+describe('FeedConnectionsPanel — by role (ADR-0023 §L)', () => {
+    const asRole = (role: 'owner' | 'editor' | 'viewer') => {
+        vi.restoreAllMocks();
+        vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([{ id: LEDGER_ID, name: 'Personal', role, currencyCode: 'USD' }]);
+        vi.spyOn(apiModule, 'fetchFeedConnections').mockResolvedValue([{
+            id: 'conn-1', ledgerId: LEDGER_ID, provider: 'simplefin', institutionName: 'Example Bank',
+            status: 'active', lastSyncedAt: null, lastError: null, createdAt: '2026-10-01T00:00:00Z',
+        } as FeedConnectionSummary]);
+        vi.spyOn(apiModule, 'fetchFeedConnectionAccounts').mockResolvedValue([]);
+        vi.spyOn(apiModule, 'fetchSchedule').mockReturnValue(new Promise(() => {}));
+    };
+    /** The connection's row, once the reader's role has arrived: an owner-only line
+     *  says it has, one way or the other. */
+    const settledRow = async () => {
+        const row = (await screen.findByText('Example Bank')).closest('li') as HTMLElement;
+        await waitFor(() => expect(apiModule.fetchVisibleLedgers).toHaveBeenCalled());
+        return row;
+    };
+
+    it('gives a viewer the connections, and no sync, sync schedule or how to connect', async () => {
+        asRole('viewer');
+        renderPage();
+        const row = await settledRow();
+        expect(await screen.findByText(/only an owner of this ledger can connect/i)).toBeInTheDocument();
+        // Told nothing it cannot do.
+        expect(screen.queryByText(/You can sync/)).toBeNull();
+
+        // What it reads stays: the row's own disclosure of its recent syncs.
+        expect(within(row).queryByRole('button', { name: /sync now/i })).toBeNull();
+        expect(within(row).queryByRole('button', { name: /disconnect/i })).toBeNull();
+        expect(screen.queryByRole('button', { name: 'Sync all' })).toBeNull();
+        expect(screen.queryByText('Sync automatically')).toBeNull();
+        expect(screen.queryByText(/Generate a setup token/)).toBeNull();
+    });
+
+    it('gives an editor sync and its schedule, and not how to connect', async () => {
+        asRole('editor');
+        renderPage();
+        const row = await settledRow();
+        expect(await within(row).findByRole('button', { name: /sync now/i })).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'Sync all' })).toBeInTheDocument();
+        expect(screen.getByText('Sync automatically')).toBeInTheDocument();
+        expect(screen.queryByText(/Generate a setup token/)).toBeNull();
+        expect(screen.getByText(/You can sync the connections that exist\./)).toBeInTheDocument();
+    });
+
+    it('tells the owner how to connect', async () => {
+        asRole('owner');
+        renderPage();
+        await settledRow();
+        expect(await screen.findByText(/Generate a setup token/)).toBeInTheDocument();
+        expect(screen.getByText('Sync automatically')).toBeInTheDocument();
+    });
+});
+
+describe('FeedConnectionsPanel — renaming a connection', () => {
+    const connection = (name: string | null): FeedConnectionSummary => ({
+        id: 'conn-1', ledgerId: LEDGER_ID, provider: 'simplefin', institutionName: name,
+        status: 'active', lastSyncedAt: null, createdAt: '2026-10-01T00:00:00Z',
+    });
+
+    /** The server: the connection's stored name, and each rename sent to it, answered
+     *  when the test settles it. */
+    function server() {
+        let stored: string | null = 'Feed A';
+        const sent: { name: string; settle: (outcome: 'ok' | ApiError) => void }[] = [];
+        vi.spyOn(apiModule, 'fetchFeedConnections').mockImplementation(async () => [connection(stored)]);
+        const rename = vi.spyOn(apiModule, 'renameFeedConnection').mockImplementation((_ledger, _id, body) =>
+            new Promise<FeedConnectionSummary>((resolve, reject) => {
+                sent.push({
+                    name: body.name,
+                    settle: (outcome) => {
+                        if (outcome !== 'ok') return reject(outcome);
+                        stored = body.name;
+                        resolve(connection(stored));
+                    },
+                });
+            }));
+        return { rename, sent };
+    }
+
+    /** The panel as `role` sees it. The role and the list are in the cache from the
+     *  first render, so a control the row leaves out is left out of a settled row, not
+     *  of one still waiting for the role. */
+    function renderAs(role: 'owner' | 'editor' | 'viewer') {
+        vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([{ id: LEDGER_ID, name: 'Personal', role, currencyCode: 'USD' }]);
+        vi.spyOn(apiModule, 'fetchFeedConnectionAccounts').mockResolvedValue([]);
+        vi.spyOn(apiModule, 'fetchAccounts').mockResolvedValue([]);
+        vi.spyOn(apiModule, 'fetchSchedule').mockReturnValue(new Promise(() => {}));
+        const queryClient = new QueryClient({
+            defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+        });
+        queryClient.setQueryData(['ledgers'], [{ id: LEDGER_ID, name: 'Personal', role, currencyCode: 'USD' }]);
+        queryClient.setQueryData(['feed-connections', LEDGER_ID], [connection('Feed A')]);
+        render(
+            <QueryClientProvider client={queryClient}>
+                <FeedConnectionsPanel ledgerId={LEDGER_ID} />
+            </QueryClientProvider>,
+        );
+    }
+
+    const row = () => screen.getByText('Not synced yet').closest('li') as HTMLElement;
+    const pencil = () => within(row()).getByRole('button', { name: 'Rename connection' });
+    const field = () => within(row()).getByRole('textbox', { name: 'Connection name' });
+
+    beforeEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    it('puts the pencil right after the name, for an owner, who sees Disconnect', async () => {
+        server();
+        renderAs('owner');
+
+        const name = await screen.findByText('Feed A');
+        expect(name.nextElementSibling).toBe(pencil());
+        expect(pencil()).toHaveAttribute('title', 'Rename');
+        expect(within(row()).getByRole('button', { name: 'Disconnect' })).toBeInTheDocument();
+    });
+
+    it.each(['editor', 'viewer'] as const)('offers an %s no pencil, as it offers no Disconnect', async (role) => {
+        server();
+        renderAs(role);
+
+        expect(await screen.findByText('Feed A')).toBeInTheDocument();
+        // An editor's Sync now says the row is drawn for the role it was given.
+        if (role === 'editor') expect(within(row()).getByRole('button', { name: 'Sync now' })).toBeInTheDocument();
+        expect(within(row()).queryByRole('button', { name: 'Disconnect' })).toBeNull();
+        expect(within(row()).queryByRole('button', { name: 'Rename connection' })).toBeNull();
+    });
+
+    it('edits the name in place, with its text selected and the pencil out of the way', async () => {
+        server();
+        renderAs('owner');
+        const user = userEvent.setup();
+
+        await user.click(await screen.findByRole('button', { name: 'Rename connection' }));
+
+        const input = field() as HTMLInputElement;
+        expect(input).toHaveFocus();
+        expect(input).toHaveValue('Feed A');
+        expect([input.selectionStart, input.selectionEnd]).toEqual([0, 'Feed A'.length]);
+        expect(input).toHaveAttribute('maxlength', '80');
+        expect(within(row()).queryByRole('button', { name: 'Rename connection' })).toBeNull();
+    });
+
+    it('saves on Enter: the new name shows at once and the pencil, pending, holds focus and refuses a second press', async () => {
+        const { rename, sent } = server();
+        renderAs('owner');
+        const user = userEvent.setup();
+
+        await user.click(await screen.findByRole('button', { name: 'Rename connection' }));
+        await user.clear(field());
+        await user.keyboard('Feed B{Enter}');
+
+        expect(rename).toHaveBeenCalledTimes(1);
+        expect(rename).toHaveBeenCalledWith(LEDGER_ID, 'conn-1', { name: 'Feed B' });
+        const pending = pencil();
+        expect(within(row()).getByText('Feed B')).toBeInTheDocument();
+        expect(screen.queryByText('Feed A')).toBeNull();
+        expect(pending).toHaveFocus();
+        expect(pending).toHaveAttribute('aria-busy', 'true');
+
+        await user.keyboard('{Enter}');
+        await user.click(pending);
+        expect(within(row()).queryByRole('textbox', { name: 'Connection name' })).toBeNull();
+        expect(rename).toHaveBeenCalledTimes(1);
+
+        sent[0]!.settle('ok');
+        await waitFor(() => expect(pencil()).not.toHaveAttribute('aria-busy'));
+        expect(pencil()).toHaveFocus();
+        expect(within(row()).getByText('Feed B')).toBeInTheDocument();
+        // No success notice: the name is the confirmation.
+        expect(within(row()).queryByRole('alert')).toBeNull();
+    });
+
+    it('saves on blur, and leaves focus where the reader went', async () => {
+        const { rename } = server();
+        renderAs('owner');
+        const user = userEvent.setup();
+
+        await user.click(await screen.findByRole('button', { name: 'Rename connection' }));
+        await user.clear(field());
+        await user.keyboard('Feed B');
+        await user.tab();
+
+        expect(rename).toHaveBeenCalledTimes(1);
+        expect(rename).toHaveBeenCalledWith(LEDGER_ID, 'conn-1', { name: 'Feed B' });
+        expect(within(row()).getByText('Feed B')).toBeInTheDocument();
+        expect(within(row()).getByRole('button', { name: 'Sync now' })).toHaveFocus();
+        expect(pencil()).not.toHaveFocus();
+    });
+
+    it('cancels on Escape and gives focus back to the pencil', async () => {
+        const { rename } = server();
+        renderAs('owner');
+        const user = userEvent.setup();
+
+        await user.click(await screen.findByRole('button', { name: 'Rename connection' }));
+        await user.clear(field());
+        await user.keyboard('Feed B{Escape}');
+
+        expect(rename).not.toHaveBeenCalled();
+        expect(within(row()).getByText('Feed A')).toBeInTheDocument();
+        expect(pencil()).toHaveFocus();
+    });
+
+    it('cancels a blank name: on Enter focus goes back to the pencil, on blur it stays where it went', async () => {
+        const { rename } = server();
+        renderAs('owner');
+        const user = userEvent.setup();
+
+        await user.click(await screen.findByRole('button', { name: 'Rename connection' }));
+        await user.clear(field());
+        await user.keyboard('   {Enter}');
+        expect(within(row()).getByText('Feed A')).toBeInTheDocument();
+        expect(pencil()).toHaveFocus();
+
+        await user.click(pencil());
+        await user.clear(field());
+        await user.tab();
+        expect(within(row()).getByText('Feed A')).toBeInTheDocument();
+        expect(within(row()).getByRole('button', { name: 'Sync now' })).toHaveFocus();
+
+        expect(rename).not.toHaveBeenCalled();
+    });
+
+    it('puts the old name back when the save is refused, and says why under the row', async () => {
+        const { sent } = server();
+        renderAs('owner');
+        const user = userEvent.setup();
+
+        await user.click(await screen.findByRole('button', { name: 'Rename connection' }));
+        await user.clear(field());
+        await user.keyboard('Feed B{Enter}');
+        expect(within(row()).getByText('Feed B')).toBeInTheDocument();
+
+        sent[0]!.settle(new ApiError(
+            422, "A connection's name is limited to 80 characters.", 'feed-connection-name-too-long'));
+
+        expect(await within(row()).findByRole('alert')).toHaveTextContent(
+            "Could not rename the connection. A connection's name is limited to 80 characters.");
+        expect(within(row()).getByText('Feed A')).toBeInTheDocument();
+        expect(within(row()).queryByText('Feed B')).toBeNull();
+        expect(pencil()).not.toHaveAttribute('aria-busy');
+    });
+
+    it('names the connection by its new name in the Disconnect dialog', async () => {
+        const { sent } = server();
+        renderAs('owner');
+        const user = userEvent.setup();
+
+        await user.click(await screen.findByRole('button', { name: 'Rename connection' }));
+        await user.clear(field());
+        await user.keyboard('Feed B{Enter}');
+        sent[0]!.settle('ok');
+        await waitFor(() => expect(pencil()).not.toHaveAttribute('aria-busy'));
+
+        await user.click(within(row()).getByRole('button', { name: 'Disconnect' }));
+        expect(await screen.findByRole('dialog')).toHaveTextContent('Disconnect Feed B?');
     });
 });

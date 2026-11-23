@@ -42,11 +42,11 @@ function emptyDraft(): InvestmentTxnDraft {
 }
 
 describe('tax date — payload builders', () => {
-    // These builders had NO coverage, which is how a real data-loss bug lived
-    // here: the draft carried no tax date at all, so every PATCH omitted it, and
-    // the investment PATCH is wholesale-replace — an omitted field CLEARS the
+    // A draft that carries no tax date makes every PATCH omit it, and the
+    // investment PATCH is wholesale-replace — an omitted field CLEARS the
     // stored value. Editing an unrelated field on a transaction with a distinct
-    // tax date silently destroyed that tax date.
+    // tax date would silently destroy that tax date, so these pin that the
+    // builders carry it.
     const buy = (): InvestmentTxnDraft => ({
         ...emptyDraft(),
         action: 'buy',
@@ -67,12 +67,60 @@ describe('tax date — payload builders', () => {
 
     it('PATCH always carries a tax date, so an unrelated edit cannot erase it', () => {
         // The regression guard. A null/absent transactedAt here is the bug.
-        const req = draftToPatchRequest({ ...buy(), transactedAt: '2026-05-18' });
+        const opened = { memo: '', tags: [] };
+        const req = draftToPatchRequest({ ...buy(), transactedAt: '2026-05-18' }, opened);
         expect(req.transactedAt).toBe(new Date('2026-05-18').toISOString());
 
-        const blank = draftToPatchRequest(buy());
+        const blank = draftToPatchRequest(buy(), opened);
         expect(blank.transactedAt).toBe(new Date('2026-05-21').toISOString());
         expect(blank.transactedAt).not.toBeNull();
+    });
+});
+
+describe('memo and tags on a PATCH follow presence', () => {
+    const buy = (over: Partial<InvestmentTxnDraft> = {}): InvestmentTxnDraft => ({
+        ...emptyDraft(),
+        action: 'buy',
+        securityId: SECURITY,
+        shares: 10,
+        price: 100,
+        ...over,
+    });
+
+    it('omits both when nothing changed, so an untouched save writes neither', () => {
+        const req = draftToPatchRequest(
+            buy({ memo: 'Quarterly rebalance', tags: ['Retirement'] }),
+            { memo: 'Quarterly rebalance', tags: ['Retirement'] },
+        );
+        expect('memo' in req).toBe(false);
+        expect('tags' in req).toBe(false);
+        // Everything else is still the wholesale new state.
+        expect(req.action).toBe('buy');
+    });
+
+    it('omits them for a brokerage left inheriting the other side\'s value', () => {
+        const req = draftToPatchRequest(buy(), { memo: '', tags: [] });
+        expect('memo' in req).toBe(false);
+        expect('tags' in req).toBe(false);
+    });
+
+    it('sends a changed memo trimmed, and a cleared one as null', () => {
+        expect(draftToPatchRequest(buy({ memo: '  Monthly ' }), { memo: '', tags: [] }).memo)
+            .toBe('Monthly');
+        const cleared = draftToPatchRequest(buy({ memo: '' }), { memo: 'Monthly', tags: [] });
+        expect('memo' in cleared).toBe(true);
+        expect(cleared.memo).toBeNull();
+    });
+
+    it('sends changed tags, an emptied set as []', () => {
+        expect(draftToPatchRequest(buy({ tags: ['a'] }), { memo: '', tags: [] }).tags).toEqual(['a']);
+        expect(draftToPatchRequest(buy({ tags: [] }), { memo: '', tags: ['a'] }).tags).toEqual([]);
+    });
+
+    it('a create still sends what the draft holds', () => {
+        const req = draftToCreateRequest(buy({ memo: ' Monthly ', tags: ['a'] }));
+        expect(req.memo).toBe('Monthly');
+        expect(req.tags).toEqual(['a']);
     });
 });
 

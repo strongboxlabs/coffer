@@ -3,10 +3,10 @@
 -- =============================================================================
 --
 -- WHY. A parent category's register is empty. All of the money is on its
--- children, so opening "Taxes" shows nothing while every other screen says it
--- holds five figures. That is not a budget-screen problem: it is true from the
+-- children, so opening the parent shows nothing while every other screen shows
+-- its children's totals. That is not a budget-screen problem: it is true from the
 -- Categories tree, from the sidebar, from anywhere that links a category to its
--- register, and it has been true since categories got registers.
+-- register.
 --
 -- The fix is to let the register scope to a category AND its descendants, which
 -- means the one thing the two functions could not express: more than one
@@ -28,8 +28,7 @@
 -- sort whitelist, the visibility fallback and all of the filters are untouched
 -- — the bodies below are the LIVE definitions with those single lines changed,
 -- extracted with pg_get_functiondef rather than copied from an older migration
--- so that nothing silently reverts (migration 205 did exactly that once, and
--- 209 exists only to undo it).
+-- so that nothing silently reverts.
 --
 --     SELECT pg_get_functiondef('register_entry_keys'::regproc);
 --

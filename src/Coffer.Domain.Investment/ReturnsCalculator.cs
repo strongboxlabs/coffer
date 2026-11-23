@@ -86,14 +86,13 @@ public static class ReturnsCalculator
         // Every flow at the same instant: all discount exponents are zero, so NPV
         // is the constant Σ amount and NO rate is more correct than any other — the
         // IRR is undetermined, exactly as an annualized rate over a zero-length
-        // window must be. Twr has always refused this (totalDays <= 0 below); Xirr
-        // did not, and the consequence was not a wrong number but a FABRICATED one:
-        // with a start value that equals the end value the constant is 0, the
-        // Newton loop breaks on a zero derivative, and bisection's first iteration
-        // finds |NPV(mid)| < 1e-7 and returns mid — the untouched midpoint of the
-        // initial bracket, halfway between the bisection's lo and hi below. That
-        // surfaced as a confident "4950%/yr" on any account whose flows all shared
-        // one instant.
+        // window must be. Twr refuses this too (totalDays <= 0 below). Without this
+        // guard the result is not a wrong number but a FABRICATED one: with a start
+        // value that equals the end value the constant is 0, the Newton loop breaks
+        // on a zero derivative, and bisection's first iteration finds
+        // |NPV(mid)| < 1e-7 and returns mid — the untouched midpoint of the initial
+        // bracket, halfway between the bisection's lo and hi below, which reads as a
+        // confident "4950%/yr" on any account whose flows all share one instant.
         if ((tLast - t0).TotalDays <= 0) return new(null, XirrOutcome.ZeroLengthWindow);
 
         double Npv(double rate)
@@ -151,7 +150,8 @@ public static class ReturnsCalculator
         }
         // 300 halvings of a 101-wide bracket leaves an interval far below double
         // precision, so this midpoint IS the root — a converged answer, not the
-        // untouched bracket centre that the degenerate cases above used to return.
+        // untouched bracket centre that the degenerate cases above would return
+        // without their own exits.
         return new((lo + hi) / 2.0, XirrOutcome.Solved);
     }
 
@@ -217,11 +217,9 @@ public static class ReturnsCalculator
     /// which the account holds nothing has no return to contribute — its growth
     /// factor is 1 and its elapsed time is not investment time — so discarding the
     /// whole chain over one such stretch throws away a perfectly well-defined
-    /// answer. That is what the previous "return null on any non-positive base"
-    /// did, and on a real ledger it blanked the figure for every account funded
-    /// after the window opened and every account emptied before it closed: most of
-    /// the accounts on the ledger this was found against, including both sides of
-    /// every rollover. The rate is annualized over the covered time only, and the
+    /// answer: "return null on any non-positive base" would blank the figure for
+    /// every account funded after the window opened and every account emptied
+    /// before it closed, including both sides of every rollover. The rate is annualized over the covered time only, and the
     /// caller is handed that span so a ten-month figure can never be presented in a
     /// column headed five years.
     /// </para>
@@ -231,32 +229,11 @@ public static class ReturnsCalculator
         ArgumentNullException.ThrowIfNull(boundaries);
         if (boundaries.Count < 2) return new(null, TwrOutcome.TooFewBoundaries, null, null, 0.0);
 
-        var cumulative = 1.0;
-        var coveredDays = 0.0;
-        DateTime? from = null;
-        DateTime? to = null;
-
-        for (var k = 1; k < boundaries.Count; k++)
-        {
-            // Base = previous value adjusted for the flow that happened at the
-            // previous boundary (money-in lowers the investor flow sign, so the
-            // invested base = prevValue − prevFlow).
-            var baseValue = (double)(boundaries[k - 1].ValueBeforeFlow - boundaries[k - 1].Flow);
-
-            // Nothing invested across this stretch: no return, and its calendar time
-            // is not investment time. An account emptied by a withdrawal lands here
-            // on the sub-period AFTER the withdrawal — the withdrawal's own
-            // sub-period still has the pre-flow value as its base, so the return it
-            // earned is kept. Note that a total market wipeout does NOT land here:
-            // there the base stays positive and the ending value is 0, which is a
-            // real −100% factor and is chained as one.
-            if (baseValue <= 0) continue;
-
-            cumulative *= (double)boundaries[k].ValueBeforeFlow / baseValue;
-            coveredDays += Math.Max(0.0, (boundaries[k].Date - boundaries[k - 1].Date).TotalDays);
-            from ??= boundaries[k - 1].Date;
-            to = boundaries[k].Date;
-        }
+        var chain = TwrChain.Build(boundaries);
+        var cumulative = chain.FinalFactor;
+        var coveredDays = chain.FinalCoveredDays;
+        var from = chain.CoveredFrom;
+        var to = chain.CoveredTo;
 
         if (from is null) return new(null, TwrOutcome.NoInvestedSubPeriod, null, null, 0.0);
         if (coveredDays <= 0) return new(null, TwrOutcome.ZeroLengthCoverage, from, to, 0.0);
@@ -276,5 +253,209 @@ public static class ReturnsCalculator
             from,
             to,
             coveredDays / 365.0);
+    }
+
+    /// <summary>What a <see cref="TwrChain"/> says about one instant.</summary>
+    public enum TwrReadState
+    {
+        /// <summary>The account was invested, and the reading carries a growth factor.</summary>
+        Value = 0,
+
+        /// <summary>Nothing has been invested yet: no sub-period at or before the
+        /// instant had a positive base.</summary>
+        BeforeFirstFunding,
+
+        /// <summary>Something was invested earlier, but the stretch the instant sits
+        /// in has no positive base (the account was emptied and is not funded again
+        /// yet). Its calendar time is not investment time and its factor is 1, so
+        /// there is no value to report, and the last one is not carried over it.</summary>
+        NoInvestedBase,
+
+        /// <summary>The cumulative growth is below zero (the holdings were worth less
+        /// than nothing), which is not a growth factor.</summary>
+        NegativeCumulativeGrowth,
+    }
+
+    /// <summary>
+    /// A reading of a <see cref="TwrChain"/>: the cumulative growth factor and the
+    /// invested days up to the instant, when <see cref="State"/> is
+    /// <see cref="TwrReadState.Value"/>. For any other state the factor and the days
+    /// are what the chain holds there and are not a result.
+    /// </summary>
+    public readonly record struct TwrReading(TwrReadState State, double Factor, double CoveredDays);
+
+    /// <summary>
+    /// The time-weighted chain behind <see cref="Twr"/>, kept at every boundary: the
+    /// running cumulative growth factor and invested days after each one, so the
+    /// factor can be READ at any instant without changing it.
+    /// </summary>
+    /// <remarks>
+    /// <para>The chain runs on the boundaries it is given, which are the instants money
+    /// crossed the scope's edge (plus the window's own ends) and nowhere else: a
+    /// sub-period's return is its end value over its base, and between flows the value
+    /// moves only by the holdings' own return, so no other instant needs valuing to
+    /// chain. <see cref="ReadAt"/> reads the factor at an instant without making it a
+    /// boundary, from the last boundary at or before it and the portfolio's value at the
+    /// instant. A reader that samples more or fewer instants therefore cannot change any
+    /// number the others read, which sampling the chain itself would.</para>
+    /// <para><see cref="Twr"/> is this chain's final factor annualized over its invested
+    /// days: one implementation of the chaining rule, with the skipped sub-periods
+    /// (a non-positive base) and the real zero of a total wipeout defined once.</para>
+    /// </remarks>
+    public sealed class TwrChain
+    {
+        private readonly Boundary[] _boundaries;
+        private readonly double[] _factor;
+        private readonly double[] _covered;
+        private readonly bool[] _started;
+        private readonly bool[] _arrivedInvested;
+
+        private TwrChain(Boundary[] boundaries)
+        {
+            _boundaries = boundaries;
+            _factor = new double[boundaries.Length];
+            _covered = new double[boundaries.Length];
+            _started = new bool[boundaries.Length];
+            _arrivedInvested = new bool[boundaries.Length];
+        }
+
+        /// <summary>The cumulative growth factor after the last boundary: 1 when no
+        /// sub-period was invested, 0 after a total wipeout.</summary>
+        public double FinalFactor => _factor.Length == 0 ? 1.0 : _factor[^1];
+
+        /// <summary>The days the chain was invested, summed over its invested
+        /// sub-periods.</summary>
+        public double FinalCoveredDays => _covered.Length == 0 ? 0.0 : _covered[^1];
+
+        /// <summary>The start of the first invested sub-period; null when none was.</summary>
+        public DateTime? CoveredFrom { get; private set; }
+
+        /// <summary>The end of the last invested sub-period; null when none was.</summary>
+        public DateTime? CoveredTo { get; private set; }
+
+        /// <summary>
+        /// Every invested sub-period, in order: from one boundary to the next, where the
+        /// base the first left is positive. The stretches between them, before the first
+        /// funding and wherever nothing was invested, are not investment time.
+        /// </summary>
+        /// <remarks>Another series chained over the same invested time (a benchmark) takes
+        /// its growth over each of these and over the open one <see cref="OpenSpanFrom"/>
+        /// names, and nowhere else, so it pauses where this chain pauses.</remarks>
+        public IReadOnlyList<(DateTime From, DateTime To)> InvestedSpans => _investedSpans;
+
+        private readonly List<(DateTime From, DateTime To)> _investedSpans = [];
+
+        /// <summary>
+        /// Where the invested sub-period that <paramref name="instant"/> sits inside began,
+        /// as <see cref="ReadAt"/> grows it: the last boundary before the instant, when the
+        /// base it left is positive. Null at a boundary (the sub-period ending there is one
+        /// of <see cref="InvestedSpans"/>), before the first boundary, and in a stretch with
+        /// no base.
+        /// </summary>
+        public DateTime? OpenSpanFrom(DateTime instant)
+        {
+            var at = LastAtOrBefore(instant);
+            if (at < 0 || _boundaries[at].Date == instant) return null;
+            var baseValue = (double)(_boundaries[at].ValueBeforeFlow - _boundaries[at].Flow);
+            return baseValue > 0 ? _boundaries[at].Date : null;
+        }
+
+        private int LastAtOrBefore(DateTime instant)
+        {
+            int lo = 0, hi = _boundaries.Length - 1, at = -1;
+            while (lo <= hi)
+            {
+                var mid = lo + ((hi - lo) / 2);
+                if (_boundaries[mid].Date <= instant) { at = mid; lo = mid + 1; }
+                else hi = mid - 1;
+            }
+            return at;
+        }
+
+        /// <summary>
+        /// Chains the sub-periods between <paramref name="boundaries"/>, which must be
+        /// in ascending date order, as <see cref="Twr"/> reads them.
+        /// </summary>
+        public static TwrChain Build(IReadOnlyList<Boundary> boundaries)
+        {
+            ArgumentNullException.ThrowIfNull(boundaries);
+            var chain = new TwrChain([.. boundaries]);
+            var b = chain._boundaries;
+            if (b.Length == 0) return chain;
+
+            chain._factor[0] = 1.0;
+            for (var k = 1; k < b.Length; k++)
+            {
+                // Base = previous value adjusted for the flow that happened at the
+                // previous boundary (money-in lowers the investor flow sign, so the
+                // invested base = prevValue − prevFlow).
+                var baseValue = (double)(b[k - 1].ValueBeforeFlow - b[k - 1].Flow);
+
+                chain._factor[k] = chain._factor[k - 1];
+                chain._covered[k] = chain._covered[k - 1];
+                chain._started[k] = chain._started[k - 1];
+
+                // Nothing invested across this stretch: no return, and its calendar
+                // time is not investment time. An account emptied by a withdrawal
+                // lands here on the sub-period AFTER the withdrawal — the
+                // withdrawal's own sub-period still has the pre-flow value as its
+                // base, so the return it earned is kept. Note that a total market
+                // wipeout does NOT land here: there the base stays positive and the
+                // ending value is 0, which is a real −100% factor and is chained as
+                // one.
+                if (baseValue <= 0) continue;
+
+                chain._factor[k] *= (double)b[k].ValueBeforeFlow / baseValue;
+                chain._covered[k] += Math.Max(0.0, (b[k].Date - b[k - 1].Date).TotalDays);
+                chain._started[k] = true;
+                chain._arrivedInvested[k] = true;
+                chain._investedSpans.Add((b[k - 1].Date, b[k].Date));
+                chain.CoveredFrom ??= b[k - 1].Date;
+                chain.CoveredTo = b[k].Date;
+            }
+            return chain;
+        }
+
+        /// <summary>
+        /// The chain's state at <paramref name="instant"/>, given the portfolio's
+        /// <paramref name="valueAtInstant"/> there (the value INCLUDING any flow that
+        /// lands on the instant). Reads only: the chain is not changed, so a reading
+        /// never moves another.
+        /// </summary>
+        /// <remarks>
+        /// At a boundary the reading is the chain as it stands there: the sub-period
+        /// that ends at it earned its return on its own pre-flow value, and the flow at
+        /// the instant earns nothing in no time. Between two boundaries it is the
+        /// earlier boundary's factor grown by the value at the instant over the base
+        /// that boundary left invested, which is the sub-period's return so far.
+        /// </remarks>
+        public TwrReading ReadAt(DateTime instant, decimal valueAtInstant)
+        {
+            // The last boundary at or before the instant.
+            var at = LastAtOrBefore(instant);
+            if (at < 0) return new(TwrReadState.BeforeFirstFunding, 1.0, 0.0);
+
+            if (_boundaries[at].Date == instant)
+            {
+                if (!_started[at]) return new(TwrReadState.BeforeFirstFunding, _factor[at], _covered[at]);
+                if (!_arrivedInvested[at]) return new(TwrReadState.NoInvestedBase, _factor[at], _covered[at]);
+                return Classify(_factor[at], _covered[at]);
+            }
+
+            var baseValue = (double)(_boundaries[at].ValueBeforeFlow - _boundaries[at].Flow);
+            if (baseValue <= 0)
+                return new(
+                    _started[at] ? TwrReadState.NoInvestedBase : TwrReadState.BeforeFirstFunding,
+                    _factor[at], _covered[at]);
+
+            return Classify(
+                _factor[at] * ((double)valueAtInstant / baseValue),
+                _covered[at] + Math.Max(0.0, (instant - _boundaries[at].Date).TotalDays));
+        }
+
+        // A cumulative factor that changes sign through negative holdings reads as
+        // negative growth where it is below zero, the same exposure Twr has.
+        private static TwrReading Classify(double factor, double coveredDays) =>
+            new(factor < 0.0 ? TwrReadState.NegativeCumulativeGrowth : TwrReadState.Value, factor, coveredDays);
     }
 }

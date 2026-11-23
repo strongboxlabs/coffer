@@ -5,7 +5,11 @@
  * ../README.md.
  */
 
+import { usePendingButtonProps } from '@/components/ui/pending';
+import { cn } from '@/lib/cn';
 import type { SimilarPayeeDto } from '@/lib/types';
+
+import { DIALOG_NARROW_HINT_CHIP, DIALOG_NARROW_HINT_STRIP } from './hintChips';
 
 // --------------------------------------------------------------------
 // SimilarPayeesPanel (slice 2c.6c)
@@ -25,13 +29,18 @@ import type { SimilarPayeeDto } from '@/lib/types';
 export function SimilarPayeesPanel({
     suggestions,
     accountPaths,
-    disabled,
+    pending,
+    dialog,
     onApply,
     showsCounterparty = () => true,
 }: {
     suggestions: readonly SimilarPayeeDto[];
     accountPaths: Map<string, string>;
-    disabled: boolean;
+    /** The editor's save is in flight: the chips keep focus and refuse a pick (pending.ts). */
+    pending: boolean;
+    /** The editor is in its dialog layout: on a narrow dialog the chips
+     *  take the touch size (hintChips.ts). False in the register. */
+    dialog: boolean;
     onApply: (suggestion: SimilarPayeeDto) => void;
     /** Whether this chip's counterparty half will actually be APPLIED when the
      *  chip is clicked. A chip that shows "→ X" and then does not set X reads
@@ -47,9 +56,13 @@ export function SimilarPayeesPanel({
      *  second half. */
     showsCounterparty?: (suggestion: SimilarPayeeDto) => boolean;
 }) {
+    const pendingProps = usePendingButtonProps();
     if (suggestions.length === 0) return null;
     return (
-        <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1 pt-0.5 text-[0.625rem]">
+        <div className={cn(
+            'flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1 pt-0.5 text-[0.625rem]',
+            dialog && DIALOG_NARROW_HINT_STRIP,
+        )}>
             <span className="text-text-subtle">Similar:</span>
             {suggestions.map((s) => {
                 const counterpartyLabel =
@@ -59,14 +72,16 @@ export function SimilarPayeesPanel({
                     <button
                         key={`${s.payee}::${s.counterpartyAccountId}`}
                         type="button"
-                        disabled={disabled}
-                        onClick={() => onApply(s)}
+                        {...pendingProps(pending, () => onApply(s))}
                         title={
                             withCounterparty
                                 ? `Apply payee "${s.payee}" → "${counterpartyLabel}" (used ${s.useCount}×)`
                                 : `Apply payee "${s.payee}" (used ${s.useCount}×)`
                         }
-                        className="inline-flex items-baseline gap-1 rounded border border-border bg-surface px-1.5 py-0.5 text-text hover:border-accent hover:bg-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
+                        className={cn(
+                            'inline-flex items-baseline gap-1 rounded border border-border bg-surface px-1.5 py-0.5 text-text hover:border-accent hover:bg-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50',
+                            dialog && DIALOG_NARROW_HINT_CHIP,
+                        )}
                     >
                         <span className="font-medium">{s.payee}</span>
                         {withCounterparty ? (

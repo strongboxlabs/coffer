@@ -1,6 +1,7 @@
 # 0054 — Market-data quote provider + scheduled price refresh
 
-* Status: Accepted
+* Status: Accepted; amended 2026-11-13 by [ADR-0114](0114-benchmarks-and-currency-conversion.md) (a one-time currency lookup is the
+  one exception to quoting held securities only; benchmarks ride the Yahoo adapter)
 * Date: 2026-06-18
 * Related: ADR-0033 (quote-provider family — this extends it), ADR-0031
   (ingest provider pattern), ADR-0020 (multi-ledger row-scoped), ADR-0026
@@ -51,8 +52,8 @@ Prices stored **unadjusted** (splits live in `security_splits` / lots).
 
 **v1 reference adapter: Yahoo Finance** (the unofficial
 `query*.finance.yahoo.com` chart endpoint) — chosen for zero-config (no API
-key) and the broadest free coverage, including the mutual funds /
-money-market funds that dominate real books. Recorded caveat: it is an
+key) and the broadest free coverage, including mutual funds /
+money-market funds. Recorded caveat: it is an
 **unofficial, best-effort** source (Yahoo's ToS gray area; periodic breakage;
 may need cookie/crumb handling). Acceptable here because the family is
 provider-agnostic and the orchestrator already degrades gracefully —
@@ -60,7 +61,7 @@ unresolved securities surface, manual entry remains. For a robust shipped
 story, a **keyed official adapter (e.g. Tiingo or Twelve Data — clean ToS,
 free tier, EOD fund coverage) is planned as a sibling provider**; a deployment
 chooses which provider(s) to register. Fund coverage — not book size — is the
-real variable, validated against a real unresolved set.
+real variable.
 
 ### D2 — Coverage: `quote_symbol` + `auto_price`, source-aware upsert
 
@@ -136,6 +137,25 @@ credential lives in config/secrets (env) per ADR-0033 §4; per-ledger provider
 config + a Connections UI are revisited when a keyed provider lands. The
 per-ledger **schedule** setting (D4) is the first piece of per-ledger quote
 config.
+
+### Amendment, 2026-11-13 — every quote names its currency ([ADR-0114](0114-benchmarks-and-currency-conversion.md))
+
+The refresh still quotes held, auto-priced securities only, with one exception. Every
+price fetched before ADR-0114 was stamped USD, whatever Yahoo quotes the symbol in, so
+the first refresh after the upgrade asks Yahoo once for the currency of every security
+that has fetched prices, held or not: one chart request each, under the run user's
+Yahoo opt-in, storing no price (ADR-0114 D5). A security drops out once a read has
+confirmed its currency (`securities.quote_currency_confirmed_at`, migration 300), so one
+whose lookup failed is asked again on the next refresh. The consistency check's
+`quote_currency` repair runs the same lookup, under the repairing user's opt-in. A
+symbol that is not public is never asked (D2).
+
+The Yahoo adapter gains a second caller: a ledger's benchmark funds, fetched by the same
+refresh under the same opt-in, and stored as daily growth in `benchmark_growth`, not in
+`security_prices` (ADR-0114 D1, D2). Exchange rates come from Frankfurter, a fourth
+egress, opt-in per user and off by default, beside Yahoo, Google Drive
+([0062](0062-google-drive-backup-sync.md)) and the release check
+([0110](0110-upgrade-from-the-app.md)). A bank sync still triggers neither (D1).
 
 ## Consequences
 

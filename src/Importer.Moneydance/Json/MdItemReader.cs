@@ -4,20 +4,19 @@ namespace Coffer.Importer.Moneydance.Json;
 
 /// <summary>
 /// Loads a Moneydance JSON export into in-memory <see cref="MdExport"/>
-/// records. Reads the entire file into a <see cref="JsonDocument"/>; a
-/// large real-world export (tens of MB) parses in well under a second on modern
-/// hardware.
+/// records. Reads the entire file into a <see cref="JsonDocument"/>; parsing
+/// is fast, and memory is the cost that matters (see remarks).
 /// </summary>
 /// <remarks>
-/// This comment used to say memory wasn't worth worrying about for a one-shot
-/// self-hosted import. That was wrong by roughly an order of magnitude, and a
-/// full-sized real export duly OOM'd the 1 GiB API container — not because the
-/// document was large but because every field was <c>Clone()</c>d into its own
-/// <c>JsonDocument</c>: a seven-figure count of them. Each item's fields are now views into ONE
+/// Memory grows with the export's FIELD COUNT, not only its size on disk, if each
+/// field is <c>Clone()</c>d: that allocates an independent <c>JsonDocument</c> per
+/// field of every item, enough to exhaust a memory-capped API container on an
+/// export that is small on disk. So each item's fields are views into ONE
 /// document (see <see cref="MdItem"/>) held in a per-item dictionary, so the
 /// document plus those dictionaries is the whole cost — and the dictionary stays,
-/// because dropping it for <c>TryGetProperty</c> lookups saved memory and made the
-/// same import 15x slower (<see cref="MdItem"/> has the measurements).
+/// because dropping it for <c>TryGetProperty</c> lookups saved memory and made
+/// every field lookup a linear scan (<see cref="MdItem"/> explains why that is
+/// quadratic per item).
 /// Full materialization of the item LIST is still deliberate: <c>ImportAsync</c>
 /// enumerates <c>AllItems</c> end to end nine or ten times, and the order has a
 /// hard cycle — <c>AccountMapper.ComputeInputs</c> must see every <c>txn</c>
@@ -124,8 +123,8 @@ public static class MdItemReader
 
         // One field-name pool for the whole read. An export draws its field names
         // from a small fixed vocabulary, but JsonProperty.Name hands back a freshly
-        // allocated string every time — so without pooling a full-sized export retains
-        // a seven-figure count of name strings that are duplicates of a couple of hundred. Ordinal
+        // allocated string every time — so without pooling an export retains one name
+        // string per field of every item, each a duplicate from that vocabulary. Ordinal
         // because JSON keys are case-sensitive.
         var names = new Dictionary<string, string>(StringComparer.Ordinal);
 
@@ -159,15 +158,15 @@ public static class MdItemReader
     private static MdItem ReadItem(
         JsonElement element, int index, Dictionary<string, string> names)
     {
-        // capacity 24: real MD items average just under that many fields, so this
-        // avoids a rehash per item without over-allocating.
+        // capacity 24: presized so an ordinary MD item's fields fit without a
+        // rehash, without over-allocating.
         var fields = new Dictionary<string, JsonElement>(capacity: 24, StringComparer.Ordinal);
         foreach (var property in element.EnumerateObject())
         {
             // NOT property.Value.Clone(). The element is a view into the document
             // that MdExport owns and keeps alive for the whole import; cloning would
-            // allocate an independent JsonDocument per field — a seven-figure count
-            // of them on a real export, which is what ran the container out of memory.
+            // allocate an independent JsonDocument per field of every item, so memory
+            // would grow with the field count.
             var name = property.Name;
             if (names.TryGetValue(name, out var pooled)) name = pooled;
             else names[name] = name;
@@ -185,7 +184,7 @@ public static class MdItemReader
 
         // Only the obj_types that actually persist provider_raw_payload pay for it.
         // GetRawText allocates the item's whole JSON as UTF-16; doing that for every
-        // item costs about twice the file's size again, and a large share of them
+        // item costs about twice the file's size again, and the other obj_types
         // (csnap especially) never read it.
         // Eager rather than lazy so it is materialized exactly once per item.
         var rawJson = objType is "txn" or "acct" or "reminder"

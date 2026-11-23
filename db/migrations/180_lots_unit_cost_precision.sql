@@ -10,13 +10,12 @@
 -- Impact: recompute_holdings_cost_basis (ADR-0064, mig 148) re-derives every
 -- lot's unit_cost as leg_amount / quantity and stores it truncated to 4dp; it
 -- then costs FIFO sells as consumed_qty * unit_cost. At 4dp the per-lot basis
--- error is up to quantity * 5e-5 -- whole dollars, not cents, on a lot of tens
--- of thousands of shares -- which accumulates
--- across a fund's reinvestment lots. It surfaced most visibly on an in-kind
+-- error is up to quantity * 5e-5 -- whole dollars, not cents, on any lot
+-- large enough for that product to pass one -- which accumulates
+-- across a fund's reinvestment lots. It shows most visibly on an in-kind
 -- transfer: the source side consumes lots at full-precision quantity*unit_cost
 -- while the destination carries round(quantity*unit_cost, 2) per lot, so the
--- carried basis drifted by whole dollars from the source basis on a six-figure
--- position.
+-- carried basis drifts from the source basis.
 --
 -- Fix: widen the column to (25,12) to match the mig-043 family, then re-derive
 -- every lot's unit_cost + rebuild FIFO basis / realized_gains with the same

@@ -1,28 +1,28 @@
 -- 044_drop_vestigial_tables.sql
 --
 -- Drop four tables that no production code reads or writes anymore.
--- Audit run before this migration (dev DB):
+-- What each was, and why nothing reaches it now:
 --
---   pending_transactions   empty, no source-code SQL refs.
+--   pending_transactions   no writer, no source-code SQL refs.
 --       Slice 2c moved bank-feed staging from `pending_transactions`
 --       onto `txn_headers` with is_pending + needs_review directly.
 --       follow-ups.md flagged this for removal after a verification
 --       window; the window has passed (multiple slices shipped since).
 --
---   merge_candidates       empty, no source-code SQL refs.
+--   merge_candidates       no writer, no source-code SQL refs.
 --       Pre-2c.6 auto-merge pipeline staging table. Slice 2c.6d
 --       re-implemented merge candidates as a server-side function
 --       reading `txn_headers` directly (no staging). The DTO name
 --       MergeCandidate in TransactionWriteDtos is unrelated to this
 --       table.
 --
---   merge_rules            only the stale seeded config row, no source-code refs.
+--   merge_rules            only the config row 006_seed wrote, no source-code refs.
 --       Pre-2c.6 auto-merge pipeline config. The slice 2c.6
 --       hand-driven merge flow has no config knobs; if rule-driven
 --       auto-merge returns later it'll get a fresh schema designed
 --       against the new pipeline (txn_headers, not pending_transactions).
 --
---   transaction_rules      empty, no source-code refs.
+--   transaction_rules      no writer, no source-code refs.
 --       Reserved column shape from the original Phase 0 plan for
 --       payee-substring → category auto-categorisation. The
 --       follow-up "Rule-based auto-categorization on sync" is still

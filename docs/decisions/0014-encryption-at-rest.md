@@ -5,7 +5,7 @@
 
 ## Context
 
-Coffer stores years of financial history, OAuth tokens for bank feeds (SimpleFIN, with a major brokerage via MX), and per-account credentials. The data is high-value to its owner and to anyone who steals it. We need a deliberate position on what gets encrypted at rest, where, and against which threats.
+Coffer stores years of financial history, OAuth tokens for bank feeds (SimpleFIN, which reaches brokerages via MX), and per-account credentials. The data is high-value to its owner and to anyone who steals it. We need a deliberate position on what gets encrypted at rest, where, and against which threats.
 
 The realistic threats for a self-hosted single-user deployment, in roughly decreasing likelihood:
 

@@ -18,13 +18,12 @@
 -- through a paid brokerage it understates basis.
 --
 -- The hard part is distinguishing real broker commissions from
--- in-transaction account-fee shortcuts. A probe of a real ledger found
--- three shapes:
---   - Sell-side rows in fee categories — retirement-plan administrative
---     fees deducted by forced sale. Not commissions.
---   - occasional Buy-side option-trading commissions — legitimate broker
---     commissions.
---   - rows with fee = -gross_buy — reconciliation dirt.
+-- in-transaction account-fee shortcuts. A fee-category leg on an
+-- investment transaction can be any of:
+--   - a Sell-side row — e.g. a retirement-plan administrative fee
+--     deducted by forced sale. Not a commission.
+--   - a Buy-side trading commission — a legitimate broker commission.
+--   - a row with fee = -gross_buy — reconciliation dirt.
 -- The data is ambiguous; only the user knows which category is which.
 --
 -- Solution: per-category opt-in. `accounts.is_trade_commission` defaults
@@ -197,8 +196,8 @@ BEGIN
                 -- If v_remaining_sell > 0 after the loop, the user
                 -- sold more shares than they ever acquired (overdraw).
                 -- Same as the basis floor above — defensive no-op
-                -- rather than an exception, since real data may have
-                -- shape drift from partial scrubs.
+                -- rather than an exception, since an imported history
+                -- can record more sold than acquired.
             END IF;
         END LOOP;
 

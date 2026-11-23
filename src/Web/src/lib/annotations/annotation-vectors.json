@@ -1,0 +1,188 @@
+{
+  "$comment": [
+    "Shared test vectors for memo and tags per side. ONE file, read by the .NET tests",
+    "(tests/Api.Tests/Unit/Annotations/AnnotationVectorTests.cs) and by the web tests, so the",
+    "server's write primitive and the editor's pre-join cannot drift apart.",
+    "memoJoin, tagUnion and tagCap are what both sides compute. blankMemo is the one memo",
+    "normalisation (trim; blank after trimming means no memo), shared by the write primitive",
+    "and the header text fields. nameFolding records the keys tag_name_key must produce under",
+    "the shipped collation; only SQL folds tag names, so these are read by the database tests.",
+    "ownership is the planner's originating-account result; accounts and legs are names, and",
+    "a test maps each name to a stable id.",
+    "All values are placeholders."
+  ],
+  "memoJoin": [
+    { "name": "both absent", "header": null, "line": null, "expected": null },
+    { "name": "header only", "header": "trip", "line": null, "expected": "trip" },
+    { "name": "line only", "header": null, "line": "fuel", "expected": "fuel" },
+    { "name": "equal values join to one", "header": "trip", "line": "trip", "expected": "trip" },
+    { "name": "different values join header first", "header": "trip", "line": "fuel", "expected": "trip · fuel" },
+    { "name": "each part is trimmed", "header": "  trip ", "line": "\tfuel\n", "expected": "trip · fuel" },
+    { "name": "equal after trimming", "header": "trip ", "line": " trip", "expected": "trip" },
+    { "name": "a blank part counts as absent", "header": "   ", "line": "fuel", "expected": "fuel" },
+    { "name": "both blank", "header": " ", "line": "　", "expected": null },
+    { "name": "comparison is case-sensitive", "header": "Trip", "line": "trip", "expected": "Trip · trip" },
+    { "name": "an already-joined value is not special", "header": "trip · fuel", "line": "fuel", "expected": "trip · fuel · fuel" }
+  ],
+  "tagUnion": [
+    { "name": "both empty", "first": [], "second": [], "expected": [] },
+    { "name": "first then second, in order", "first": ["b", "a"], "second": ["c"], "expected": ["b", "a", "c"] },
+    { "name": "a shared tag appears once, where it first appears", "first": ["a", "b"], "second": ["b", "c"], "expected": ["a", "b", "c"] },
+    { "name": "duplicates within one set collapse", "first": ["a", "a"], "second": ["a"], "expected": ["a"] },
+    { "name": "names are compared exactly, never folded", "first": ["Work"], "second": ["work"], "expected": ["Work", "work"] }
+  ],
+  "tagCap": [
+    { "name": "twenty from none", "stored": 0, "saved": 20, "limit": "enforce", "accepted": true },
+    { "name": "twenty-one from none", "stored": 0, "saved": 21, "limit": "enforce", "accepted": false },
+    { "name": "twenty-one from twenty", "stored": 20, "saved": 21, "limit": "enforce", "accepted": false },
+    { "name": "over the limit, unchanged", "stored": 25, "saved": 25, "limit": "enforce", "accepted": true },
+    { "name": "over the limit, shrunk", "stored": 25, "saved": 24, "limit": "enforce", "accepted": true },
+    { "name": "over the limit, shrunk to the limit", "stored": 21, "saved": 20, "limit": "enforce", "accepted": true },
+    { "name": "over the limit, grown", "stored": 25, "saved": 26, "limit": "enforce", "accepted": false },
+    { "name": "a system merge is never capped", "stored": 0, "saved": 30, "limit": "systemMerge", "accepted": true }
+  ],
+  "blankMemo": [
+    { "name": "absent", "input": null, "expected": null },
+    { "name": "empty", "input": "", "expected": null },
+    { "name": "spaces", "input": "   ", "expected": null },
+    { "name": "tab and newline", "input": "\t\n", "expected": null },
+    { "name": "no-break space", "input": " ", "expected": null },
+    { "name": "ideographic space", "input": "　", "expected": null },
+    { "name": "next line", "input": "\u0085", "expected": null },
+    { "name": "outer spaces are trimmed", "input": " trip ", "expected": "trip" },
+    { "name": "outer tab, no-break and ideographic spaces are trimmed", "input": "\t trip　", "expected": "trip" },
+    { "name": "inner whitespace is kept", "input": " two  words ", "expected": "two  words" }
+  ],
+  "nameFolding": [
+    { "name": "ASCII case", "covers": "ascii-case", "input": "Work", "key": "work" },
+    { "name": "dotted capital I", "covers": "dotted-capital-i", "input": "İtem", "key": "item" },
+    { "name": "sharp s has no single-character lower case", "covers": "sharp-s", "input": "MAß", "key": "maß" },
+    { "name": "capital sigma lowers to the medial form", "covers": "final-sigma", "input": "ΟΔΟΣ", "key": "οδοσ" },
+    { "name": "leading and trailing tab", "covers": "tab", "input": "\tWork\t", "key": "work" },
+    { "name": "no-break spaces", "covers": "nbsp", "input": " Work ", "key": "work" },
+    { "name": "ideographic spaces", "covers": "ideographic-space", "input": "　Work　", "key": "work" },
+    { "name": "inner whitespace is kept", "covers": "inner-whitespace", "input": "Two  Words", "key": "two  words" }
+  ],
+  "ownership": [
+    {
+      "name": "a split from the side that entered it keeps that side",
+      "before": { "originating": "bank", "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" } ] },
+      "after": { "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" }, { "id": "b1", "posting": 1, "account": "bank" }, { "id": "f1", "posting": 1, "account": "fuel" } ] },
+      "survivors": "byLegId", "side": "bank", "expected": { "originating": "bank" }
+    },
+    {
+      "name": "a split from the other side hands ownership to it",
+      "before": { "originating": "bank", "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" } ] },
+      "after": { "legs": [ { "id": "g0", "posting": 0, "account": "groceries" }, { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g1", "posting": 1, "account": "groceries" }, { "id": "s1", "posting": 1, "account": "savings" } ] },
+      "survivors": "byLegId", "side": "groceries", "expected": { "originating": "groceries" }
+    },
+    {
+      "name": "an edit from the inheriting side of a one-split keeps the owner",
+      "before": { "originating": "bank", "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" } ] },
+      "after": { "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" } ] },
+      "survivors": "byLegId", "side": "groceries", "expected": { "originating": "bank" }
+    },
+    {
+      "name": "an edit that moves the owner's leg to another account hands ownership along with it",
+      "before": { "originating": "bank", "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" } ] },
+      "after": { "legs": [ { "id": "b0", "posting": 0, "account": "savings" }, { "id": "g0", "posting": 0, "account": "groceries" } ] },
+      "survivors": "byLegId", "side": "groceries", "expected": { "originating": "savings" }
+    },
+    {
+      "name": "an edit that replaces the owner's leg hands ownership to the side writing it",
+      "before": { "originating": "bank", "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" } ] },
+      "after": { "legs": [ { "id": "s0", "posting": 0, "account": "savings" }, { "id": "g0", "posting": 0, "account": "groceries" } ] },
+      "survivors": "byLegId", "side": "groceries", "expected": { "originating": "groceries" }
+    },
+    {
+      "name": "collapsing keeps the owner",
+      "before": { "originating": "bank", "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" }, { "id": "b1", "posting": 1, "account": "bank" }, { "id": "f1", "posting": 1, "account": "fuel" } ] },
+      "after": { "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" } ] },
+      "survivors": "byLegId", "side": "bank", "expected": { "originating": "bank" }
+    },
+    {
+      "name": "only the split side may collapse",
+      "before": { "originating": "bank", "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" }, { "id": "b1", "posting": 1, "account": "bank" }, { "id": "f1", "posting": 1, "account": "fuel" } ] },
+      "after": { "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" } ] },
+      "survivors": "byLegId", "side": "groceries", "expected": { "violation": "read-only-row" }
+    },
+    {
+      "name": "removing a line from a multi-split keeps the owner",
+      "before": { "originating": "bank", "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" }, { "id": "b1", "posting": 1, "account": "bank" }, { "id": "f1", "posting": 1, "account": "fuel" }, { "id": "b2", "posting": 2, "account": "bank" }, { "id": "e2", "posting": 2, "account": "fees" } ] },
+      "after": { "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" }, { "id": "b2", "posting": 1, "account": "bank" }, { "id": "e2", "posting": 1, "account": "fees" } ] },
+      "survivors": "byLegId", "side": "bank", "expected": { "originating": "bank" }
+    },
+    {
+      "name": "the opposite side may not reshape a multi-split",
+      "before": { "originating": "bank", "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" }, { "id": "b1", "posting": 1, "account": "bank" }, { "id": "f1", "posting": 1, "account": "fuel" }, { "id": "b2", "posting": 2, "account": "bank" }, { "id": "e2", "posting": 2, "account": "fees" } ] },
+      "after": { "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" }, { "id": "b2", "posting": 1, "account": "bank" }, { "id": "e2", "posting": 1, "account": "fees" } ] },
+      "survivors": "byLegId", "side": "fuel", "expected": { "violation": "read-only-row" }
+    },
+    {
+      "name": "setting an action in the brokerage register hands ownership to the brokerage",
+      "before": { "originating": "bank", "legs": [ { "id": "k0", "posting": 0, "account": "bank" }, { "id": "r0", "posting": 0, "account": "brokerage", "brokerage": true } ] },
+      "after": { "action": "transfer", "legs": [ { "id": "r0", "posting": 0, "account": "brokerage", "brokerage": true, "role": "transfer", "investmentSide": true }, { "id": "k0", "posting": 0, "account": "bank", "role": "transfer" } ] },
+      "survivors": "byAccountAndRole", "side": "brokerage", "expected": { "originating": "brokerage" }
+    },
+    {
+      "name": "turning a one-split into a multi-posting event hands ownership to the brokerage",
+      "before": { "originating": "bank", "legs": [ { "id": "k0", "posting": 0, "account": "bank" }, { "id": "r0", "posting": 0, "account": "brokerage", "brokerage": true } ] },
+      "after": { "action": "buyx", "legs": [ { "id": "r0", "posting": 0, "account": "brokerage", "brokerage": true, "role": "security", "investmentSide": true }, { "id": "h0", "posting": 0, "account": "holdings", "role": "security", "investmentSide": true }, { "id": "r1", "posting": 1, "account": "brokerage", "brokerage": true, "role": "transfer", "investmentSide": true }, { "id": "k1", "posting": 1, "account": "bank", "role": "transfer" } ] },
+      "survivors": "byAccountAndRole", "side": "brokerage", "expected": { "originating": "brokerage" }
+    },
+    {
+      "name": "moving an event to another brokerage hands ownership to it",
+      "before": { "originating": "brokerage", "action": "transfer", "legs": [ { "id": "r0", "posting": 0, "account": "brokerage", "brokerage": true, "role": "transfer", "investmentSide": true }, { "id": "k0", "posting": 0, "account": "bank", "role": "transfer" } ] },
+      "after": { "action": "transfer", "legs": [ { "id": "o0", "posting": 0, "account": "other-brokerage", "brokerage": true, "role": "transfer", "investmentSide": true }, { "id": "k0", "posting": 0, "account": "bank", "role": "transfer" } ] },
+      "survivors": "byAccountAndRole", "side": "other-brokerage", "expected": { "originating": "other-brokerage" }
+    },
+    {
+      "name": "an in-kind transfer stays with its source brokerage",
+      "before": { "originating": "brokerage", "action": "transfer_shares", "legs": [ { "id": "r0", "posting": 0, "account": "brokerage", "brokerage": true, "transferSource": true, "role": "security", "investmentSide": true }, { "id": "h0", "posting": 0, "account": "holdings", "role": "security", "investmentSide": true }, { "id": "o1", "posting": 1, "account": "other-brokerage", "brokerage": true, "role": "security", "investmentSide": true }, { "id": "p1", "posting": 1, "account": "other-holdings", "role": "security", "investmentSide": true } ] },
+      "after": { "action": "transfer_shares", "legs": [ { "id": "r0", "posting": 0, "account": "brokerage", "brokerage": true, "transferSource": true, "role": "security", "investmentSide": true }, { "id": "h0", "posting": 0, "account": "holdings", "role": "security", "investmentSide": true }, { "id": "o1", "posting": 1, "account": "other-brokerage", "brokerage": true, "role": "security", "investmentSide": true }, { "id": "p1", "posting": 1, "account": "other-holdings", "role": "security", "investmentSide": true } ] },
+      "survivors": "byAccountAndRole", "side": "brokerage", "expected": { "originating": "brokerage" }
+    },
+    {
+      "name": "the destination brokerage of an in-kind transfer may not write to it",
+      "before": { "originating": "brokerage", "action": "transfer_shares", "legs": [ { "id": "r0", "posting": 0, "account": "brokerage", "brokerage": true, "transferSource": true, "role": "security", "investmentSide": true }, { "id": "h0", "posting": 0, "account": "holdings", "role": "security", "investmentSide": true }, { "id": "o1", "posting": 1, "account": "other-brokerage", "brokerage": true, "role": "security", "investmentSide": true }, { "id": "p1", "posting": 1, "account": "other-holdings", "role": "security", "investmentSide": true } ] },
+      "after": { "action": "transfer_shares", "legs": [ { "id": "r0", "posting": 0, "account": "brokerage", "brokerage": true, "transferSource": true, "role": "security", "investmentSide": true }, { "id": "h0", "posting": 0, "account": "holdings", "role": "security", "investmentSide": true }, { "id": "o1", "posting": 1, "account": "other-brokerage", "brokerage": true, "role": "security", "investmentSide": true }, { "id": "p1", "posting": 1, "account": "other-holdings", "role": "security", "investmentSide": true } ] },
+      "survivors": "byAccountAndRole", "side": "other-brokerage", "expected": { "violation": "read-only-row" }
+    },
+    {
+      "name": "a holdings account may not write to an event",
+      "before": { "originating": "brokerage", "action": "buy", "legs": [ { "id": "r0", "posting": 0, "account": "brokerage", "brokerage": true, "role": "security", "investmentSide": true }, { "id": "h0", "posting": 0, "account": "holdings", "role": "security", "investmentSide": true } ] },
+      "after": { "action": "buy", "legs": [ { "id": "r0", "posting": 0, "account": "brokerage", "brokerage": true, "role": "security", "investmentSide": true }, { "id": "h0", "posting": 0, "account": "holdings", "role": "security", "investmentSide": true } ] },
+      "survivors": "byAccountAndRole", "side": "holdings", "expected": { "violation": "read-only-row" }
+    },
+    {
+      "name": "a counterpart may not write to an event",
+      "before": { "originating": "brokerage", "action": "transfer", "legs": [ { "id": "r0", "posting": 0, "account": "brokerage", "brokerage": true, "role": "transfer", "investmentSide": true }, { "id": "k0", "posting": 0, "account": "bank", "role": "transfer" } ] },
+      "after": { "action": "transfer", "legs": [ { "id": "r0", "posting": 0, "account": "brokerage", "brokerage": true, "role": "transfer", "investmentSide": true }, { "id": "k0", "posting": 0, "account": "bank", "role": "transfer" } ] },
+      "survivors": "byAccountAndRole", "side": "bank", "expected": { "violation": "read-only-row" }
+    },
+    {
+      "name": "an account that is not on the transaction may not write to it",
+      "before": { "originating": "bank", "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" } ] },
+      "after": { "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" } ] },
+      "survivors": "byLegId", "side": "savings", "expected": { "violation": "side-not-on-transaction" }
+    },
+    {
+      "name": "a repoint that leaves no leg on the owner hands ownership to the target",
+      "before": { "originating": "groceries", "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" } ] },
+      "after": { "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "fuel" } ] },
+      "repointTarget": "fuel", "expected": { "originating": "fuel" }
+    },
+    {
+      "name": "a repoint that leaves a leg on the owner keeps it",
+      "before": { "originating": "bank", "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "groceries" }, { "id": "b1", "posting": 1, "account": "bank" }, { "id": "f1", "posting": 1, "account": "fuel" } ] },
+      "after": { "legs": [ { "id": "b0", "posting": 0, "account": "bank" }, { "id": "g0", "posting": 0, "account": "fees" }, { "id": "b1", "posting": 1, "account": "bank" }, { "id": "f1", "posting": 1, "account": "fuel" } ] },
+      "repointTarget": "fees", "expected": { "originating": "bank" }
+    },
+    {
+      "name": "a move that clears an action hands ownership to the target bank",
+      "before": { "originating": "brokerage", "action": "transfer", "legs": [ { "id": "r0", "posting": 0, "account": "brokerage", "brokerage": true, "role": "transfer", "investmentSide": true }, { "id": "k0", "posting": 0, "account": "bank", "role": "transfer" } ] },
+      "after": { "legs": [ { "id": "r0", "posting": 0, "account": "savings" }, { "id": "k0", "posting": 0, "account": "bank" } ] },
+      "repointTarget": "savings", "expected": { "originating": "savings" }
+    }
+  ]
+}

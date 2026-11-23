@@ -19,9 +19,9 @@ import type { SetupInfoResponse } from '@/lib/auth';
 //
 //   * /info fetches on mount; loading + error states render
 //   * the form renders username + display name + passkey label
-//   * the Demo opt-in is present and OFF by default (ADR-0088) — the
-//     default path must not hand someone a ledger full of sample data
-//   * no ledger picker is offered at all (ADR-0088)
+//   * setup asks nothing about ledgers (ADR-0088, as amended by ADR-0115
+//     D2): no ledger picker, no Sample data fieldset, no Demo box, and
+//     the request carries no Demo flag
 //   * an ApiError from /complete surfaces its `.detail` in the alert
 //   * a DOMException from the WebAuthn ceremony surfaces its message
 //   * the button label transitions Create → Creating → Tap your
@@ -102,16 +102,18 @@ describe('SetupPage', () => {
         expect(screen.getByLabelText(/display name/i)).toBeInTheDocument();
         expect(screen.getByLabelText(/passkey label/i)).toBeInTheDocument();
 
-        // ADR-0088: no ledger picker at all. The old dropdown listed empty
-        // placeholder ledgers and preselected one, which is how a fresh
-        // install ended up owning a ledger with nothing in it.
+        // ADR-0088: no ledger picker at all. A dropdown of empty placeholder
+        // ledgers with one preselected would leave a fresh install owning a
+        // ledger with nothing in it.
         expect(screen.queryByRole('combobox')).not.toBeInTheDocument();
 
-        // The Demo opt-in exists and is OFF by default — someone setting up
-        // their own books must not acquire sample data by accident.
-        const demo = screen.getByRole('checkbox', { name: /demo ledger/i });
-        expect(demo).toBeInTheDocument();
-        expect(demo).not.toBeChecked();
+        // ADR-0115 D2: no ledger question either. The Demo is added from the hub, so
+        // the form has no Sample data fieldset, no box and no ledger copy.
+        expect(screen.queryByRole('group', { name: /sample data/i })).not.toBeInTheDocument();
+        expect(screen.queryByText(/sample data/i)).not.toBeInTheDocument();
+        expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+        expect(screen.queryByText(/demo/i)).not.toBeInTheDocument();
+        expect(screen.queryByText(/ledger/i)).not.toBeInTheDocument();
 
         // No fields filled yet — submit stays disabled.
         expect(
@@ -119,10 +121,9 @@ describe('SetupPage', () => {
         ).toBeDisabled();
     });
 
-    // ADR-0089: an email address is a perfectly good username. This used to be
-    // rejected by a client-only ^[a-z0-9_-]{3,32}$ pattern that neither the API
-    // nor the invite form enforced — so the first user was refused what every
-    // invited user could already register.
+    // ADR-0089: an email address is a perfectly good username. A client-only
+    // ^[a-z0-9_-]{3,32}$ pattern that neither the API nor the invite form
+    // enforces would refuse the first user what every invited user can register.
     it('accepts an email address as the username', async () => {
         await renderSetup();
 
@@ -317,8 +318,6 @@ describe('SetupPage', () => {
             sessionExpiresAt: '2026-06-10T00:00:00Z',
             masterKeyBase64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
             recoveryCodes: codes,
-            ledgerId: '00000000-0000-0000-0000-000000000099',
-            ledgerName: 'Demo',
         });
 
         await renderSetup();
@@ -335,13 +334,12 @@ describe('SetupPage', () => {
             expect(screen.getByText(code)).toBeInTheDocument();
         }
 
-        // The success header names the seeded Demo ledger.
-        expect(screen.getByText(/signed in as/i)).toHaveTextContent(/alice/i);
-        expect(screen.getByText(/signed in as/i)).toHaveTextContent('Demo');
+        // The success header names the user, and no ledger: setup created none.
+        expect(screen.getByText(/signed in as/i)).toHaveTextContent('Signed in as alice.');
+        expect(screen.queryByText(/seeded/i)).not.toBeInTheDocument();
 
         // Continue is initially disabled until the user ticks the
-        // acknowledgement checkbox. Scope the query to the codes panel —
-        // the form's Demo checkbox is gone by now, but be explicit.
+        // acknowledgement checkbox.
         const continueButton = screen.getByRole('button', { name: /continue/i });
         expect(continueButton).toBeDisabled();
 
@@ -362,8 +360,6 @@ describe('SetupPage', () => {
             sessionExpiresAt: '2026-06-10T00:00:00Z',
             masterKeyBase64: masterKey,
             recoveryCodes: ['ABCD-1234'],
-            ledgerId: null,
-            ledgerName: null,
         });
 
         await renderSetup();
@@ -394,7 +390,7 @@ describe('SetupPage', () => {
         expect(screen.getByRole('button', { name: /get started/i })).toBeEnabled();
     });
 
-    it('sends includeDemo=false when the box is left alone', async () => {
+    it('sends the user, display name and passkey label, and no Demo flag', async () => {
         const setupSpy = vi.spyOn(authModule, 'performSetup').mockResolvedValue({
             userId: '00000000-0000-0000-0000-000000000010',
             username: 'alice',
@@ -402,8 +398,6 @@ describe('SetupPage', () => {
             sessionExpiresAt: '2026-06-10T00:00:00Z',
             masterKeyBase64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
             recoveryCodes: ['ABCD-1234'],
-            ledgerId: null,
-            ledgerName: null,
         });
 
         await renderSetup();
@@ -417,37 +411,12 @@ describe('SetupPage', () => {
         await waitFor(() => {
             expect(setupSpy).toHaveBeenCalled();
         });
-        expect(setupSpy.mock.calls[0]![0].includeDemo).toBe(false);
+        const sent = setupSpy.mock.calls[0]![0];
+        expect(sent).toMatchObject({ token: TEST_TOKEN, username: 'alice', displayName: 'Alice', credentialNickname: 'MacBook' });
+        expect(sent).not.toHaveProperty('includeDemo');
     });
 
-    it('sends includeDemo=true once the box is ticked', async () => {
-        const setupSpy = vi.spyOn(authModule, 'performSetup').mockResolvedValue({
-            userId: '00000000-0000-0000-0000-000000000010',
-            username: 'alice',
-            sessionId: '00000000-0000-0000-0000-000000000020',
-            sessionExpiresAt: '2026-06-10T00:00:00Z',
-            masterKeyBase64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-            recoveryCodes: ['ABCD-1234'],
-            ledgerId: '00000000-0000-0000-0000-000000000099',
-            ledgerName: 'Demo',
-        });
-
-        await renderSetup();
-
-        const user = userEvent.setup();
-        await user.type(await screen.findByLabelText(/username/i), 'alice');
-        await user.type(screen.getByLabelText(/display name/i), 'Alice');
-        await user.type(screen.getByLabelText(/passkey label/i), 'MacBook');
-        await user.click(screen.getByRole('checkbox', { name: /demo ledger/i }));
-        await user.click(screen.getByRole('button', { name: /create account/i }));
-
-        await waitFor(() => {
-            expect(setupSpy).toHaveBeenCalled();
-        });
-        expect(setupSpy.mock.calls[0]![0].includeDemo).toBe(true);
-    });
-
-    it('tells the user what is next when no ledger was seeded', async () => {
+    it('tells the user what is next: create, a Demo or an import, from the hub', async () => {
         vi.spyOn(authModule, 'performSetup').mockResolvedValue({
             userId: '00000000-0000-0000-0000-000000000010',
             username: 'alice',
@@ -455,8 +424,6 @@ describe('SetupPage', () => {
             sessionExpiresAt: '2026-06-10T00:00:00Z',
             masterKeyBase64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
             recoveryCodes: ['ABCD-1234'],
-            ledgerId: null,
-            ledgerName: null,
         });
 
         await renderSetup();
@@ -476,7 +443,10 @@ describe('SetupPage', () => {
         await user.click(screen.getByRole('button', { name: /continue/i }));
 
         expect(await screen.findByText(/add your first ledger/i)).toBeInTheDocument();
+        expect(screen.getByText(/add a Demo ledger to look around first/i)).toBeInTheDocument();
         expect(screen.getByText(/import a Moneydance export/i)).toBeInTheDocument();
+        await user.click(screen.getByRole('button', { name: 'Get started' }));
+        expect(await screen.findByText('ledger hub')).toBeInTheDocument();
     });
 
     // --- Create-vs-Restore choice (ADR-0061) ---------------------------

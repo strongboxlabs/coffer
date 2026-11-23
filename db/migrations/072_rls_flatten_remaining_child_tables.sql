@@ -3,8 +3,8 @@
 -- =============================================================================
 --
 -- Migration 071 flattened the 5 hot-path RLS policies (txn_legs,
--- holdings, lots, security_prices, security_splits) that were
--- multiplying recompute cost 180×. This migration applies the same
+-- holdings, lots, security_prices, security_splits) whose recursion
+-- multiplies recompute cost. This migration applies the same
 -- pattern to the 8 remaining child tables whose policies still use
 -- 1-layer parent recursion. The current cost is small (parent uses
 -- ledger_id directly, so each row check evaluates one subquery

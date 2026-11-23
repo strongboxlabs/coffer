@@ -2,7 +2,8 @@
 
 * Status: Accepted — `prune-batch` remediation (D1), soft-delete clears
   `needs_review` (D3), manual-merge audit + `is_merge_winner` reconcile (D4),
-  and the seed-once importer mechanism (D2) all implemented.
+  and the seed-once importer mechanism (D2) all implemented. *Amended
+  2026-10-25:* `prune-batch` is removed (see the amendment at the end).
 * Date: 2026-06-17
 * Related: ADR-0050 (import-once / D10 — MD seeds once, then Coffer owns),
   ADR-0022 (`external_id` at the header level), ADR-0034 (`created_at`
@@ -11,18 +12,16 @@
 
 ## Context
 
-After re-importing a refreshed Moneydance export into the **Default** (real-world)
-ledger, previously **hidden / merged / reconciled** transactions reappeared as
-visible duplicates, and account balances were inflated. The user reported
-"nothing new was reimported" and a SimpleFIN sync that "found no new
-transactions" — yet duplicates appeared.
+Re-importing a newer Moneydance export into a ledger that is already seeded and
+in use brings previously **hidden / merged / reconciled** transactions back as
+visible duplicates and inflates account balances — even when the export holds
+nothing new.
 
-The re-imports had been run against a real-world ledger to exercise other features
-(next-due, parity); testing re-imports belong in the **Demo** ledger, never
-Default. That operational mistake is the trigger, but it exposed a latent
-correctness gap in the importer worth recording.
+Re-imports for testing belong in the **Demo** ledger, never in a ledger in use.
+That rule does not make the importer correct: the duplication is a correctness
+gap in the importer itself.
 
-## Root cause (evidence-backed)
+## Root cause
 
 The importer keys every transaction by Moneydance's `txn.Id`
 (`TransactionMapper` → `ExternalId: txn.Id`; the investment path strips the
@@ -30,21 +29,21 @@ The importer keys every transaction by Moneydance's `txn.Id`
 stable across exports. **It is not.**
 
 `created_at` is preserved on conflict and immutable post-insert (ADR-0034), so
-it is a faithful record of when a row was first written. The histogram showed:
+it is a faithful record of when a row was first written, which makes the fault
+visible:
 
-* the seed import created the whole transaction history in one batch;
-* a later re-import of a newer export created a **batch of brand-new rows**
+* the seed import creates the whole transaction history in one batch;
+* a later re-import of a newer export can create a **batch of brand-new rows**
   (register rows + reminder templates) — genuine INSERTs, not idempotent
   updates.
 
-Those rows were **not** new data: their posted dates fell entirely inside the
-seed's existing coverage. They INSERTed (rather than updated) because their
-`external_id` (`txn.Id`) **differed** from the seed's id for the same logical
-transaction. Most of the affected register rows were **`online_import`** with OFX
-fitids — versus a minority in the seed baseline — confirming the user's hypothesis:
+Those rows are **not** new data: their posted dates fall inside the seed's
+existing coverage. They INSERT (rather than update) because their
+`external_id` (`txn.Id`) **differs** from the seed's id for the same logical
+transaction:
 **Moneydance reassigns a transaction's internal id when it merges a register
 entry with an online (downloaded) transaction.** File-import and manual rows
-re-keyed too, so online-merge is the dominant but not the only trigger.
+can re-key too, so online-merge is not the only trigger.
 
 Because the upsert is `ON CONFLICT (ledger_id, external_id) DO UPDATE`, a changed
 id misses the conflict and INSERTs a fresh header — and the insert path hard-sets
@@ -52,11 +51,14 @@ id misses the conflict and INSERTs a fresh header — and the insert path hard-s
 whatever the user had hidden or merged comes back as a visible, unmerged
 duplicate, double-counting in balances.
 
-The seed rows carry **no fitid** (captured by a later importer version), so the
-existing `uq_txn_headers_online_match` partial-unique index could not catch the
-re-keyed online rows against their seed twins.
+Rows seeded by an importer version that predates fitid capture carry **no
+fitid**, so the existing `uq_txn_headers_online_match` partial-unique index
+cannot catch re-keyed online rows against their seed twins.
 
 ## D1 — Remediation: `prune-batch` (implemented, Accepted)
+
+> *Amended 2026-10-25: removed.* D2 made the batch this command undoes
+> unreachable; see the amendment at the end.
 
 A new importer subcommand, `coffer-import-moneydance prune-batch`, surgically
 removes a transaction batch identified by `(ledger_id, import_source,
@@ -84,11 +86,8 @@ integration test (`PruneImportBatchTests`): seed → inject a re-keyed batch
 template exclusion) → apply (asserts rows gone, legs cascaded, template + prior
 preserved, balance re-derived from inflated to correct).
 
-**Applied to the affected real ledger on 2026-06-17:** the register rows removed, the reminder
-templates kept, affected balances + holding pairs recomputed. Verified: batch gone,
-the duplicate month-end interest on a checking account collapsed to the single
-original feed row, holdings non-negative/non-null, no orphan lots, feed/seed/
-manual rows untouched. A `pg_dump` safety net was taken first.
+Take a `pg_dump` before `--apply`: the delete is a hard delete with cascades, so
+nothing inside Coffer can bring a pruned row back.
 
 This tool is a reusable "undo a bad import batch", not a one-off.
 
@@ -101,12 +100,13 @@ ledger — not a re-import or a sync.** There is no other use for an MD export
 file; ongoing data comes from the live feed (SimpleFIN) and manual entry.
 
 **Guard.** If the target ledger already holds any transactions, the importer
-refuses (exit non-zero, nothing written) and tells the operator to create a new
-ledger or wipe this one first. There is deliberately no "insert new, skip
+refuses (nothing written) and tells the operator to create a new ledger. There is deliberately no "insert new, skip
 existing" mode: MD's re-keying makes "new vs. already-imported" undecidable
 without a stable key, so a partial re-import can't be done safely.
-`ImportCommand` runs the check right after it resolves the ledger
-(`TransactionsRepository.CountTransactionHeadersAsync`).
+`MoneydanceImportService` runs the check right after it resolves the ledger
+(`TransactionsRepository.CountTransactionHeadersAsync`). *Amended 2026-10-25:* the
+import now always creates its ledger, so the check is replaced by that (see the
+amendment at the end).
 
 **Simplification (same change).** Because the importer now only ever writes into
 an empty ledger, all re-import idempotency machinery is dead and is removed in
@@ -121,13 +121,14 @@ the same change — leaving plain inserts:
 
 The within-export FITID dedup stays — it's data-quality for a single export, not
 re-import idempotency. Note the old `ON CONFLICT` upsert was *false* idempotency:
-it caught same-`external_id` re-imports but not the re-keyed ones — exactly how
-the resurrection bug slipped through. The guard is the real safety; the upsert
+it caught same-`external_id` re-imports but not the re-keyed ones, which are the
+ones that resurrect rows. The guard is the real safety; the upsert
 was both dead and misleading.
 
 **Demo / re-seed.** The Demo refresh wipes first, leaving the ledger empty, so it
-re-seeds normally. To re-seed any ledger: wipe it (`prune-batch`) or use a fresh
-one.
+re-seeds normally. To re-seed any other ledger, import into a fresh one.
+*Amended 2026-10-25:* no Demo refresh was built; demo provisioning creates a new
+Demo ledger like any import, and re-seeding is always an import into a new ledger.
 
 **Deferred — (C) fitid hardening.** Back-filling OFX fitids so
 `uq_txn_headers_online_match` rejects online re-keys is unnecessary under total
@@ -140,18 +141,17 @@ real new records or re-introduce duplicates.
 
 ## D3 — Soft-delete clears `needs_review` (implemented, Accepted)
 
-A second anomaly surfaced while untangling the user's "to-be-accepted queue":
-**feed rows that were `is_hidden=true` AND `needs_review=true`** — invisible in the
+A second defect sits in the review queue:
+**feed rows that are `is_hidden=true` AND `needs_review=true`** — invisible in the
 register (the resolved view filters `is_hidden`) yet still counted in the review
-tab. Root-caused: the **only** writer of `is_hidden=true` is the soft-delete path
+tab. The **only** writer of `is_hidden=true` is the soft-delete path
 (`TransactionsRepository.DeleteAsync`, `InvestmentTransactionsRepository`,
-`BulkTransactionsRepository` — confirmed by grep across `src/` and `db/`; no
-migration/trigger/ingest path sets it). Per ADR-0023 / migration 117, deleting a
-row that carries an `external_id` (any feed/import row) **soft-hides** it instead
-of hard-deleting, to keep re-source idempotent. But the soft-delete left
-`needs_review` set — so deleting a not-yet-accepted row stranded it as
-hidden-but-pending: gone from the register, still in the review queue, with no UI
-to resolve it.
+`BulkTransactionsRepository`; no migration/trigger/ingest path sets it). Per
+ADR-0023 / migration 117, deleting a row that carries an `external_id` (any
+feed/import row) **soft-hides** it instead of hard-deleting, to keep re-source
+idempotent. A soft-delete that leaves `needs_review` set strands a
+not-yet-accepted row as hidden-but-pending: gone from the register, still in the
+review queue, with no UI to resolve it.
 
 Decision: **every soft-delete branch now also sets `needs_review = false`.** A
 deleted row is resolved, not awaiting acceptance. Covered by the delete
@@ -164,56 +164,56 @@ is off, and `sync_run_promotions` records promotions only — so "who/when a row
 was soft-deleted" is unrecoverable. Worth adding a `hidden_at`/actor or enabling
 commit-timestamp tracking.
 
-The pre-existing stranded rows are a one-time data cleanup (clear their
-`needs_review`), handled separately from this code change.
+The fix is forward-only. A row soft-deleted before it keeps `needs_review = true`:
+neither the code change nor any migration clears it, so clearing one is a separate
+data fix.
 
 ## D4 — Manual-merge audit + `is_merge_winner` reconcile (implemented, Accepted)
 
-Investigating a cross-source pair (a small deposit visible twice on one bank
-account) raised the **inverse** of D1's concern: could the *merge* path have
-**over-merged** — collapsed two genuinely distinct transactions into one and
-understated a balance? Full audit of **every merge** on a real ledger:
+D1's concern has an **inverse**: can the *merge* path **over-merge** — collapse
+two genuinely distinct transactions into one and understate a balance? An audit
+of the merge path:
 
-**Mechanism — merging is 100% manual; nothing auto-merges.** The only writer of
-`is_merged_into` is `TransactionsRepository.PatchAsync` (runs only when the SPA
-sends an explicit `MergeFromHeaderId`). Ingest (`IngestOrchestrator`) *reads*
+**Mechanism — merging is 100% manual; nothing auto-merges.** The only writers of
+`is_merged_into` are `TransactionsRepository.PatchAsync` and its investment twin
+(each runs a merge only when the merge route, `POST …/{headerId}/merge`, passes the
+candidate the user picked as `MergeFromHeaderId`; a PATCH body cannot carry it).
+Ingest (`IngestOrchestrator`) *reads*
 `is_merged_into` as a dedup guard but only **inserts** new feed rows or **skips**
 already-known ones by `external_id` — it never updates an existing row or creates
 a merge. The MD importer always writes `is_merged_into=null` on fresh rows. So a
 merge never happens behind the user's back; an over-merge can only be a deliberate
 (mis)action, bounding the blast radius accordingly.
 
-**No balance errors found.**
+**What a merge can do to a balance.**
 
-* Nearly all merges are same-magnitude (true dedups / count-neutral folds).
-* The few magnitude-changing merges are all **paychecks** and net-identical on the
-  cash account, by workflow: the user's provisional **scheduled-transaction**
+* A same-magnitude merge (a true dedup, a count-neutral fold) changes no balance.
+* A magnitude-changing merge is net-identical on the cash account when it follows
+  the scheduled-transaction workflow: a provisional **scheduled-transaction**
   entry is edited to match the actual deposit (so the online row surfaces a merge
-  candidate), then post-merge split tweaks (employer match, withholding)
-  rebalance *within* the gross — the net to the bank account is unchanged
-  (verified leg-by-leg: the feed's net-pay deposit folds into the gross paycheck
-  whose bank-account legs net to exactly that same figure).
-* **No investment merges exist** — every merge is bank/credit. The case where a
-  share/amount mismatch *would* corrupt holdings (investment merges must match the
-  brokerage actuals) has **no instances**; investment rows reach final state via
-  accept/un-hide, not merge.
+  candidate), then post-merge split tweaks (on a paycheck, say: employer match,
+  withholding) rebalance *within* the gross — the net to the bank account is
+  unchanged, because the feed's net deposit folds into a header whose bank-account
+  legs net to exactly that same figure.
+* An investment merge is the case where a share/amount mismatch *would* corrupt
+  holdings (it must match the brokerage actuals); investment rows normally reach
+  their final state via accept/un-hide, not merge.
 
-**Detector limit (recorded so we do not re-alarm).** A count-reconciliation check
+**Detector limit.** A count-reconciliation check
 (visible rows vs. the max distinct `external_id` any one feed reported, per
-account/date/net) flagged several clusters as "under-counted." All were **false
+account/date/net) would flag clusters as "under-counted" that are **false
 positives**: feeds legitimately assign one real transaction **multiple ids** —
-SimpleFIN reports each *side* of an internal transfer as its own transaction (e.g.
-an internal transfer between two of the user's own accounts arrived as one MD id
-plus two SimpleFIN ids and was correctly folded to one transfer), plus re-syncs and pending→posted re-keys, plus merges that cross a
+SimpleFIN reports each *side* of an internal transfer as its own transaction (so
+an internal transfer between two of the user's own accounts can arrive as one MD id
+plus two SimpleFIN ids, correctly folded to one transfer), plus re-syncs and pending→posted re-keys, plus merges that cross a
 date boundary. Consequently **a genuine over-merge of two distinct same-amount
 transactions is not detectable from the data alone** — only statement
-reconciliation catches it (exactly how the user surfaced a discrepancy). "0 drift"
+reconciliation catches it. "0 drift"
 cannot catch it either: an over-merge lowers the walked and stored balance
 equally, so they still agree; only the statement disagrees.
 
-**`is_merge_winner` drift (a few rows) — reconciled (mig 128).** A few visible SimpleFIN
-card-payee rows are merge targets yet carried
-`is_merge_winner=false`: residue from the pre-"merge-direction-invert"
+**`is_merge_winner` drift — reconciled (mig 128).** A visible row could be a merge
+target yet carry `is_merge_winner=false`: residue from the pre-"merge-direction-invert"
 code (winner/loser reversed) on rows created after mig 107's backfill
 ran. `is_merged_into` (the truth) is correct — only the denormalized overlay flag
 was stale, so balances/register were never affected. Migration 128 reconciles the
@@ -221,8 +221,8 @@ denorm (sets missing TRUEs from the pointers; idempotent; does not clear monoton
 TRUEs). The active call-site keeps it correct going forward; if drift ever recurs,
 harden via a trigger on `is_merged_into` changes or compute the flag in-view.
 
-**Residual provenance tangles (no balance impact, left as-is):** some chained merges
-(A→B→C) and same-provider folds. The resolved view always lands on the final
+**Residual provenance tangles (no balance impact, left as-is):** chained merges
+(A→B→C) and same-provider folds can exist. The resolved view always lands on the final
 survivor (`is_merged_into IS NULL`), so balances are correct, but a one-hop
 "merged into X" pointer can target a row that is itself merged. **There is no
 unmerge surface today** (mig 107: the flag is monotonic) — undoing a fold needs
@@ -254,16 +254,43 @@ if a standing tool is wanted.
 
 ## Consequences
 
-* The ledger is restored to its pre-re-import state; reconciliation
-  (hidden / merged) preserved.
-* A durable, tested tool exists to undo any future bad import batch.
-* Until D2 lands, the operational rule stands: **never re-import the Default
-  ledger**; testing imports go to Demo.
-* The merge path (D4) is sound: manual-only, no balance error across every merge,
-  no investment merges. The only undetectable risk — a deliberate over-merge of
+* `prune-batch` returned a ledger to its pre-re-import state, with the
+  reconciliation (hidden / merged) on its surviving rows preserved. It is removed
+  (amendment, 2026-10-25).
+* D2 makes the operational rule structural: the importer refuses any ledger that
+  already holds transactions, so a ledger in use cannot be re-imported; testing
+  imports go to Demo. *Amended 2026-10-25:* every import creates its own ledger, so
+  there is no ledger to refuse.
+* The merge path (D4) is sound by construction: manual-only, so nothing merges
+  behind the user's back. The only undetectable risk — a deliberate over-merge of
   two distinct same-amount transactions — is bounded and surfaces only against a
   statement; the worksheet query makes that check fast.
-* Open: agree D2 and implement it (its own slice). Optional future hardening
+* Optional future hardening
   (not scheduled): an unmerge surface; a soft warning on same-source folds; and,
   if `is_merge_winner` drifts again, move it to a trigger-maintained or in-view
   computation.
+
+## Amendment, 2026-10-25 — `prune-batch` is removed
+
+`prune-batch` undid a batch of rows that a re-import inserted into a ledger already
+in use. Under D2 no import writes into a ledger that holds transactions, so no such
+batch can be created, and the command was a hard delete run from a source checkout
+straight against the database, outside the API's permissions and audit. It is removed
+with its data logic (`PruneImportBatch`) and its test.
+
+The import itself now runs only in the app, which creates a new ledger each time
+(ADR-0071, amendment of this date). The command-line tool keeps the two read-only
+diagnostics, `audit` and `reconcile`.
+
+**D2's guard becomes structural.** With the command-line `--ledger-id` gone, the
+import's only way to an existing ledger was the name typed for the new one: the
+service reused any ledger already carrying that name. It runs as `coffer_service`,
+which bypasses row-level security, so the name matched other users' ledgers too: an
+import could write into a ledger its user cannot see, without a grant, or be refused
+with a message giving that ledger's transaction count. The service now takes only a
+name and always creates the ledger, with the owner grant, in the transaction that
+fills it; the name is a label and is never looked up. No ledger it writes can hold
+earlier rows, so the transaction-count check and its refusal are removed rather than
+kept unreachable. A test imports under a name already held by another user's empty
+ledger, then by a populated one and by two at once, and requires a new ledger, owned
+by the importer alone, each time.

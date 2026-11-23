@@ -23,13 +23,11 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// edit), the validation surface and cross-ledger guards.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class PatchTransactionTests
+public sealed class PatchTransactionTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public PatchTransactionTests(PostgresFixture fixture)
+    public PatchTransactionTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -66,7 +64,7 @@ public sealed class PatchTransactionTests
 
     private async Task<Seed> SeedSingleAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
         var toiletries = await ledger.AddCategoryAsync("toiletries");
@@ -92,12 +90,12 @@ public sealed class PatchTransactionTests
     public async Task Patch_header_fields_write_the_canonical_row()
     {
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         DateTime feedPostedAt;
         string? feedPayee;
-        await using (var before = _fixture.NewDbContext())
+        await using (var before = Db.NewDbContext())
         {
             var h = await before.TxnHeaders.AsNoTracking()
                 .SingleAsync(x => x.Id == seed.HeaderId);
@@ -110,16 +108,18 @@ public sealed class PatchTransactionTests
             new PatchTransactionRequest
             {
                 Payee = "Cleaned-up Payee",
-                Memo = "lunch with a friend",
+                Notes = new TransactionNotesRequest { Side = seed.BankId, Memo = "lunch with a friend" },
                 PostedAt = newDate,
             }));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == seed.HeaderId);
         Assert.Equal("Cleaned-up Payee", header.Payee);
-        Assert.Equal("lunch with a friend", header.Memo);
+        // A one-split's memo is the writing side's own, on its leg.
+        Assert.Null(header.Memo);
+        Assert.Equal("lunch with a friend", await LegMemoAsync(seed.BankLegId));
         Assert.Equal(newDate, header.PostedAt);
 
         // ...and the feed's values are still recoverable. This is the half of
@@ -136,48 +136,55 @@ public sealed class PatchTransactionTests
     public async Task Patch_leaves_omitted_header_fields_alone()
     {
         var seed = await SeedSingleAsync();
-        await seed.Ledger.EditHeaderAsync(seed.BankLegId, memo: "first memo");
+        await seed.Ledger.SetSideMemoAsync(seed.BankLegId, seed.BankId, "first memo", seed.BankId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
             new PatchTransactionRequest { Payee = "second payee" }));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == seed.HeaderId);
         Assert.Equal("second payee", header.Payee);
-        Assert.Equal("first memo", header.Memo);
+        Assert.Equal("first memo", await LegMemoAsync(seed.BankLegId));
+    }
+
+    private async Task<string?> LegMemoAsync(Guid legId)
+    {
+        await using var db = Db.NewDbContext();
+        return await db.TxnLegs.AsNoTracking().Where(l => l.Id == legId).Select(l => l.LegMemo).SingleAsync();
     }
 
     [Fact]
     public async Task Patch_clears_a_header_field_sent_as_null()
     {
-        // The reason migration 230 exists. The old override layer stored user
-        // edits in nullable columns with no companion "is overridden" marker, so
-        // NULL had to mean both "not overridden" and "overridden to empty" and
-        // the COALESCE always chose the former: emptying the payee box saved
-        // successfully and handed the old text straight back.
+        // Migration 230. An override layer that stores user edits in nullable
+        // columns with no companion "is overridden" marker makes NULL mean both
+        // "not overridden" and "overridden to empty", and a COALESCE always
+        // chooses the former: emptying the payee box would save successfully
+        // and hand the old text straight back.
         var seed = await SeedSingleAsync();
-        await seed.Ledger.EditHeaderAsync(
-            seed.BankLegId, payee: "Typo Payeee", memo: "wrong memo");
+        await seed.Ledger.EditHeaderAsync(seed.BankLegId, payee: "Typo Payeee");
+        await seed.Ledger.SetSideMemoAsync(seed.BankLegId, seed.BankId, "wrong memo", seed.BankId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         // Sent as raw JSON: the point is the wire shape. An explicit null is a
         // request to clear; a key the body omits (check_number here) is not.
         var response = await client.SendAsync(PatchJson(seed.Ledger.LedgerId, seed.HeaderId,
-            "{\"payee\": null, \"memo\": null}"));
+            $$$"""{"payee": null, "notes": {"side": "{{{seed.BankId}}}", "memo": null}}"""));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == seed.HeaderId);
         Assert.Null(header.Payee);
         Assert.Null(header.Memo);
+        Assert.Null(await LegMemoAsync(seed.BankLegId));
     }
 
     [Fact]
@@ -188,7 +195,7 @@ public sealed class PatchTransactionTests
         // success and changes nothing is the failure 230 set out to remove, and
         // silently honouring four fields out of five would reinstate it.
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(PatchJson(seed.Ledger.LedgerId, seed.HeaderId,
@@ -205,11 +212,11 @@ public sealed class PatchTransactionTests
         // most recent edit. Re-capturing would quietly redefine it and make a
         // reset restore the second-to-last value.
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         string? feedPayee;
-        await using (var before = _fixture.NewDbContext())
+        await using (var before = Db.NewDbContext())
             feedPayee = (await before.TxnHeaders.AsNoTracking()
                 .SingleAsync(x => x.Id == seed.HeaderId)).Payee;
 
@@ -220,7 +227,7 @@ public sealed class PatchTransactionTests
             Assert.Equal(HttpStatusCode.NoContent, r.StatusCode);
         }
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var original = await db.TxnHeaderOriginals.AsNoTracking()
             .SingleAsync(o => o.HeaderId == seed.HeaderId);
         Assert.Equal(feedPayee, original.Payee);
@@ -233,11 +240,12 @@ public sealed class PatchTransactionTests
         // The SPA passes ?account_id=<viewing-account> on PATCH so
         // the server can return the freshly-resolved entry for
         // in-place row swap (mutateEntries) without a window
-        // refresh. Pins the response shape: status 200 + a kind=txn
-        // entry whose `id` is the saved leg id (so the SPA can
-        // round-trip a re-edit without losing identity).
+        // refresh. Pins the response shape: status 200 + the header's
+        // entries in that register, here one kind=txn entry whose `id` is
+        // the saved leg id (so the SPA can round-trip a re-edit without
+        // losing identity).
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(new HttpRequestMessage(
@@ -252,8 +260,9 @@ public sealed class PatchTransactionTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-        Assert.Equal("txn", doc.RootElement.GetProperty("kind").GetString());
-        var txn = doc.RootElement.GetProperty("txn");
+        var entry = Assert.Single(doc.RootElement.GetProperty("entries").EnumerateArray());
+        Assert.Equal("txn", entry.GetProperty("kind").GetString());
+        var txn = entry.GetProperty("txn");
         Assert.Equal(seed.BankLegId, txn.GetProperty("id").GetGuid());
         Assert.Equal("Renamed Payee", txn.GetProperty("payee").GetString());
     }
@@ -267,7 +276,7 @@ public sealed class PatchTransactionTests
         // next re-edit can't reference the new legs by id and the
         // server would treat them as new postings.
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(new HttpRequestMessage(
@@ -299,8 +308,9 @@ public sealed class PatchTransactionTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-        Assert.Equal("group", doc.RootElement.GetProperty("kind").GetString());
-        var legs = doc.RootElement.GetProperty("legs");
+        var entry = Assert.Single(doc.RootElement.GetProperty("entries").EnumerateArray());
+        Assert.Equal("group", entry.GetProperty("kind").GetString());
+        var legs = entry.GetProperty("legs");
         Assert.Equal(2, legs.GetArrayLength());
         // Both legs are on the source account (we asked for the
         // bank-account view) and carry real ids the SPA can echo
@@ -316,14 +326,14 @@ public sealed class PatchTransactionTests
     public async Task Patch_persists_check_number_to_the_header()
     {
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
             new PatchTransactionRequest { CheckNumber = "9981" }));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == seed.HeaderId);
         Assert.Equal("9981", header.CheckNumber);
@@ -335,7 +345,7 @@ public sealed class PatchTransactionTests
     public async Task Patch_with_postings_updates_amounts_canonically_on_txn_legs()
     {
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
@@ -351,30 +361,31 @@ public sealed class PatchTransactionTests
                             LegId = seed.BankLegId,
                             CounterpartyAccountId = seed.GroceriesId,
                             Amount = -12.50m,
-                            LegMemo = "updated",
                         },
                     },
                 },
+                Notes = new TransactionNotesRequest { Side = seed.BankId, Memo = "updated" },
             }));
         // PATCH with postings + an inferred account_id (from
         // postings.SourceAccountId) returns the resolved entry so
         // the SPA can patch the row in-place via mutateEntries.
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == seed.HeaderId)
             .ToListAsync();
         Assert.Equal(2, legs.Count);
         Assert.Equal(-12.50m, legs.Single(l => l.AccountId == seed.BankId).Amount);
         Assert.Equal(12.50m, legs.Single(l => l.AccountId == seed.GroceriesId).Amount);
+        Assert.Equal("updated", legs.Single(l => l.AccountId == seed.BankId).LegMemo);
     }
 
     [Fact]
     public async Task Patch_converts_single_to_split_by_adding_postings()
     {
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         // Convert the original 1-posting transaction into 3 postings
@@ -408,7 +419,7 @@ public sealed class PatchTransactionTests
             }));
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == seed.HeaderId)
             .OrderBy(l => l.PostingIndex)
@@ -425,7 +436,7 @@ public sealed class PatchTransactionTests
     public async Task Patch_converts_split_to_single_by_dropping_all_but_one_posting()
     {
         // Seed a 3-posting transaction directly.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
         var toiletries = await ledger.AddCategoryAsync("toiletries");
@@ -439,7 +450,7 @@ public sealed class PatchTransactionTests
             },
             new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Keep only the first posting; drop the other two.
@@ -462,7 +473,7 @@ public sealed class PatchTransactionTests
             }));
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId)
             .ToListAsync();
@@ -474,7 +485,7 @@ public sealed class PatchTransactionTests
     [Fact]
     public async Task Patch_reorders_postings_by_items_order()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
         var toiletries = await ledger.AddCategoryAsync("toiletries");
@@ -483,7 +494,7 @@ public sealed class PatchTransactionTests
             new[] { (groceries.Id, -4m), (toiletries.Id, -3m) },
             new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Swap the postings: pre-existing index 1 → new index 0,
@@ -513,7 +524,7 @@ public sealed class PatchTransactionTests
             }));
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId)
             .OrderBy(l => l.PostingIndex)
@@ -535,7 +546,7 @@ public sealed class PatchTransactionTests
         // the `posting_index > 0` split detectors and the `posting_index = 0`
         // canonical-leg lookup. Only a malformed client does this, but "malformed
         // client" is not a reason to lose a user's data quietly.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
         var toiletries = await ledger.AddCategoryAsync("toiletries");
@@ -544,7 +555,7 @@ public sealed class PatchTransactionTests
             new[] { (groceries.Id, -4m), (toiletries.Id, -3m) },
             new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.SendAsync(Patch(ledger.LedgerId, headerId,
@@ -578,7 +589,7 @@ public sealed class PatchTransactionTests
 
         // And the transaction is untouched — a rejected reshape must not have
         // partially applied.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId)
             .OrderBy(l => l.PostingIndex)
@@ -598,7 +609,7 @@ public sealed class PatchTransactionTests
         // meaning "split" and `posting_index == 0` meaning "the canonical leg":
         // a hole makes a split render as a single-row transaction, or the
         // reverse. This pins the compaction AND the survivors' relative order.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var alpha = await ledger.AddCategoryAsync("alpha");
         var bravo = await ledger.AddCategoryAsync("bravo");
@@ -608,7 +619,7 @@ public sealed class PatchTransactionTests
             new[] { (alpha.Id, -4m), (bravo.Id, -3m), (charlie.Id, -2m) },
             new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Drop the MIDDLE posting (bravo, index 1); keep alpha then charlie.
@@ -637,7 +648,7 @@ public sealed class PatchTransactionTests
             }));
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId)
             .OrderBy(l => l.PostingIndex)
@@ -667,7 +678,7 @@ public sealed class PatchTransactionTests
     public async Task Patch_returns_422_when_no_header_fields_and_no_postings()
     {
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
@@ -685,7 +696,7 @@ public sealed class PatchTransactionTests
         var seed = await SeedSingleAsync();
         var foreignLeg = Guid.NewGuid(); // not in any header
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
@@ -722,7 +733,7 @@ public sealed class PatchTransactionTests
         // via this endpoint, which we explicitly reject.
         var unrelated = await seed.Ledger.AddBankAccountAsync($"unrelated-{Guid.NewGuid():N}");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
@@ -758,7 +769,7 @@ public sealed class PatchTransactionTests
         // because the editor surfaces paycheck splits with zero-amount
         // placeholder lines (a surtax line, a contribution-cap line).
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
@@ -779,7 +790,6 @@ public sealed class PatchTransactionTests
                         {
                             CounterpartyAccountId = seed.GroceriesId,
                             Amount = 0m,
-                            LegMemo = "placeholder",
                         },
                     },
                 },
@@ -789,7 +799,7 @@ public sealed class PatchTransactionTests
         // a SourceAccountId, so the SPA can patch the row in place.
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == seed.HeaderId)
             .ToListAsync();
@@ -802,9 +812,9 @@ public sealed class PatchTransactionTests
     public async Task Patch_returns_422_ledger_not_visible_when_user_has_no_grant()
     {
         var seed = await SeedSingleAsync();
-        var otherLedger = await SyntheticLedger.CreateAsync(_fixture);
+        var otherLedger = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, otherLedger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
@@ -820,7 +830,7 @@ public sealed class PatchTransactionTests
     public async Task Patch_returns_422_transaction_not_in_ledger_when_header_belongs_elsewhere()
     {
         var seed = await SeedSingleAsync();
-        var otherLedger = await SyntheticLedger.CreateAsync(_fixture);
+        var otherLedger = await SyntheticLedger.CreateAsync(Db);
         var otherBank = await otherLedger.AddBankAccountAsync("checking");
         var otherCategory = await otherLedger.AddCategoryAsync("groceries");
         var (otherLegId, _) = await otherLedger.AddTransactionPairAsync(
@@ -828,7 +838,7 @@ public sealed class PatchTransactionTests
             new DateTime(2026, 3, 1, 12, 0, 0, DateTimeKind.Utc));
         var foreignHeaderId = await otherLedger.ResolveHeaderIdAsync(otherLegId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, foreignHeaderId,
@@ -847,7 +857,7 @@ public sealed class PatchTransactionTests
 
     private async Task SetNeedsReviewAsync(Guid headerId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             UPDATE txn_headers SET needs_review = true WHERE id = {headerId};");
     }
@@ -858,14 +868,14 @@ public sealed class PatchTransactionTests
         var seed = await SeedSingleAsync();
         await SetNeedsReviewAsync(seed.HeaderId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
             new PatchTransactionRequest { Approve = true }));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == seed.HeaderId);
         Assert.False(row.NeedsReview);
     }
@@ -879,7 +889,7 @@ public sealed class PatchTransactionTests
         var seed = await SeedSingleAsync();
         await SetNeedsReviewAsync(seed.HeaderId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
@@ -890,7 +900,7 @@ public sealed class PatchTransactionTests
             }));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == seed.HeaderId);
         Assert.False(header.NeedsReview);
@@ -903,14 +913,14 @@ public sealed class PatchTransactionTests
         var seed = await SeedSingleAsync();
         // Seeded row defaults to needs_review=false. Approving again
         // is a no-op success, not a 422.
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
             new PatchTransactionRequest { Approve = true }));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == seed.HeaderId);
         Assert.False(row.NeedsReview);
     }
@@ -921,7 +931,7 @@ public sealed class PatchTransactionTests
         // Empty-body validation still fires when approve is explicitly
         // false (or absent) AND no other field is supplied.
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
@@ -933,17 +943,26 @@ public sealed class PatchTransactionTests
     }
 
     // -- Tags as first-class (slice 2c.6b) ------------------------------
-    // PATCH gains a `tags: string[]` body field. Replace semantics:
-    // omitted → untouched, [] → all removed, [...] → set matches.
-    // Tag dictionary is per-ledger; unknown names are created on
-    // first use; matching is case-insensitive with first-use casing
-    // preserved.
+    // The body's `notes.tags`, written from `notes.side`. Replace semantics:
+    // omitted → untouched, [] → cleared, [...] → set matches. On a one-split
+    // the set is the writing side's own, on its leg. Tag dictionary is
+    // per-ledger; unknown names are created on first use; names that share a
+    // tag_name_key are one tag, with first-use spelling preserved.
 
+    private static PatchTransactionRequest TagsFromBank(Seed seed, params string[] tags) =>
+        new() { Notes = new TransactionNotesRequest { Side = seed.BankId, Tags = tags } };
+
+    /// <summary>The tags stored on the bank side's leg, and that none sit on the header.</summary>
     private async Task<IReadOnlyList<string>> CurrentTagsForHeaderAsync(Guid headerId)
     {
-        await using var db = _fixture.NewDbContext();
-        return await (from p in db.TxnHeaderTags.AsNoTracking()
-                      where p.HeaderId == headerId
+        await using var db = Db.NewDbContext();
+        Assert.False(await db.TxnHeaderTags.AsNoTracking().AnyAsync(p => p.HeaderId == headerId),
+            "a one-split carries no header tags");
+        return await (from l in db.TxnLegs.AsNoTracking()
+                      where l.HeaderId == headerId
+                      join a in db.Accounts.AsNoTracking() on l.AccountId equals a.Id
+                      where a.AccountType == "bank"
+                      join p in db.TxnLegTags.AsNoTracking() on l.Id equals p.LegId
                       join t in db.Tags.AsNoTracking() on p.TagId equals t.Id
                       orderby t.Name
                       select t.Name)
@@ -954,11 +973,11 @@ public sealed class PatchTransactionTests
     public async Task Patch_with_tags_creates_unknown_tags_and_attaches_them()
     {
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
-            new PatchTransactionRequest { Tags = new[] { "food", "travel" } }));
+            TagsFromBank(seed, "food", "travel")));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
         Assert.Equal(new[] { "food", "travel" }, await CurrentTagsForHeaderAsync(seed.HeaderId));
@@ -974,23 +993,27 @@ public sealed class PatchTransactionTests
         var (otherLegId, _) = await seed.Ledger.AddTransactionPairAsync(
             seed.BankId, seed.GroceriesId, -5m,
             new DateTime(2026, 2, 1, 12, 0, 0, DateTimeKind.Utc));
-        var existingTagId = await seed.Ledger.AddTagAsync(otherLegId, "food");
+        await seed.Ledger.SetSideTagsAsync(otherLegId, seed.BankId, ["food"], seed.BankId);
+        Guid existingTagId;
+        await using (var before = Db.NewDbContext())
+            existingTagId = await before.Tags.Where(t => t.LedgerId == seed.Ledger.LedgerId && t.Name == "food")
+                .Select(t => t.Id).SingleAsync();
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
-            new PatchTransactionRequest { Tags = new[] { "food" } }));
+            TagsFromBank(seed, "food")));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         // Exactly one tag row named "food" in this ledger.
         var foodCount = await db.Tags.AsNoTracking()
             .CountAsync(t => t.LedgerId == seed.Ledger.LedgerId && t.Name == "food");
         Assert.Equal(1, foodCount);
-        // The PATCHed header's pairing uses the pre-existing id.
-        var pairing = await db.TxnHeaderTags.AsNoTracking()
-            .SingleAsync(p => p.HeaderId == seed.HeaderId);
+        // The PATCHed side's pairing uses the pre-existing id.
+        var pairing = await db.TxnLegTags.AsNoTracking()
+            .SingleAsync(p => p.LegId == seed.BankLegId);
         Assert.Equal(existingTagId, pairing.TagId);
     }
 
@@ -999,10 +1022,10 @@ public sealed class PatchTransactionTests
     {
         var seed = await SeedSingleAsync();
         // First PATCH creates "Food" (capitalized).
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
         await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
-            new PatchTransactionRequest { Tags = new[] { "Food" } }));
+            TagsFromBank(seed, "Food")));
 
         // Second PATCH on a different header uses "FOOD". Same tag
         // row reused; the dictionary still has just one entry.
@@ -1011,9 +1034,9 @@ public sealed class PatchTransactionTests
             new DateTime(2026, 2, 1, 12, 0, 0, DateTimeKind.Utc));
         var otherHeaderId = await seed.Ledger.ResolveHeaderIdAsync(otherLegId);
         await client.SendAsync(Patch(seed.Ledger.LedgerId, otherHeaderId,
-            new PatchTransactionRequest { Tags = new[] { "FOOD" } }));
+            TagsFromBank(seed, "FOOD")));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var foodRows = await db.Tags.AsNoTracking()
             .Where(t => t.LedgerId == seed.Ledger.LedgerId)
             .ToListAsync();
@@ -1025,13 +1048,12 @@ public sealed class PatchTransactionTests
     public async Task Patch_with_empty_tags_array_clears_all_tags()
     {
         var seed = await SeedSingleAsync();
-        await seed.Ledger.AddTagAsync(seed.BankLegId, "food");
-        await seed.Ledger.AddTagAsync(seed.BankLegId, "travel");
+        await seed.Ledger.SetSideTagsAsync(seed.BankLegId, seed.BankId, ["food", "travel"], seed.BankId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
-            new PatchTransactionRequest { Tags = Array.Empty<string>() }));
+            TagsFromBank(seed)));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
         Assert.Empty(await CurrentTagsForHeaderAsync(seed.HeaderId));
@@ -1041,14 +1063,13 @@ public sealed class PatchTransactionTests
     public async Task Patch_with_tags_diffs_existing_pairings()
     {
         var seed = await SeedSingleAsync();
-        await seed.Ledger.AddTagAsync(seed.BankLegId, "food");
-        await seed.Ledger.AddTagAsync(seed.BankLegId, "travel");
+        await seed.Ledger.SetSideTagsAsync(seed.BankLegId, seed.BankId, ["food", "travel"], seed.BankId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
-            new PatchTransactionRequest { Tags = new[] { "food", "lunch" } }));
+            TagsFromBank(seed, "food", "lunch")));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
         Assert.Equal(new[] { "food", "lunch" }, await CurrentTagsForHeaderAsync(seed.HeaderId));
@@ -1058,11 +1079,11 @@ public sealed class PatchTransactionTests
     public async Task Patch_with_omitted_tags_leaves_existing_tags_untouched()
     {
         var seed = await SeedSingleAsync();
-        await seed.Ledger.AddTagAsync(seed.BankLegId, "food");
+        await seed.Ledger.SetSideTagsAsync(seed.BankLegId, seed.BankId, ["food"], seed.BankId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
-        // PATCH touches only payee — tags is null, must be left alone.
+        // PATCH touches only payee — no notes, so the tags must be left alone.
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
             new PatchTransactionRequest { Payee = "Updated Payee" }));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
@@ -1074,11 +1095,11 @@ public sealed class PatchTransactionTests
     public async Task Patch_with_duplicate_tag_names_is_deduplicated()
     {
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
-            new PatchTransactionRequest { Tags = new[] { "food", "Food", "FOOD" } }));
+            TagsFromBank(seed, "food", "Food", "FOOD")));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
         Assert.Equal(new[] { "food" }, await CurrentTagsForHeaderAsync(seed.HeaderId));
@@ -1088,11 +1109,11 @@ public sealed class PatchTransactionTests
     public async Task Patch_with_empty_tag_name_returns_422_transaction_tag_empty()
     {
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
-            new PatchTransactionRequest { Tags = new[] { "food", "   " } }));
+            TagsFromBank(seed, "food", "   ")));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal("transaction-tag-empty",
@@ -1103,12 +1124,12 @@ public sealed class PatchTransactionTests
     public async Task Patch_with_too_long_tag_name_returns_422_transaction_tag_too_long()
     {
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var longName = new string('x', 65);
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
-            new PatchTransactionRequest { Tags = new[] { longName } }));
+            TagsFromBank(seed, longName)));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal("transaction-tag-too-long",
@@ -1119,12 +1140,12 @@ public sealed class PatchTransactionTests
     public async Task Patch_with_too_many_tags_returns_422_transaction_tags_too_many()
     {
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var tooMany = Enumerable.Range(0, 21).Select(i => $"tag{i}").ToArray();
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
-            new PatchTransactionRequest { Tags = tooMany }));
+            TagsFromBank(seed, tooMany)));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal("transaction-tags-too-many",
@@ -1135,24 +1156,26 @@ public sealed class PatchTransactionTests
     public async Task Patch_with_tags_and_other_edits_applies_atomically()
     {
         var seed = await SeedSingleAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.SendAsync(Patch(seed.Ledger.LedgerId, seed.HeaderId,
             new PatchTransactionRequest
             {
                 Payee = "Grocery Store",
-                Memo = "weekend grocery run",
-                Tags = new[] { "food", "weekly" },
+                Notes = new TransactionNotesRequest
+                {
+                    Side = seed.BankId, Memo = "weekend grocery run", Tags = ["food", "weekly"],
+                },
                 Approve = true,
             }));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == seed.HeaderId);
         Assert.Equal("Grocery Store", header.Payee);
-        Assert.Equal("weekend grocery run", header.Memo);
+        Assert.Equal("weekend grocery run", await LegMemoAsync(seed.BankLegId));
         Assert.False(header.NeedsReview);
         Assert.Equal(new[] { "food", "weekly" }, await CurrentTagsForHeaderAsync(seed.HeaderId));
     }

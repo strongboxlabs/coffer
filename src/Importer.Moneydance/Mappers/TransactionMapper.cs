@@ -9,30 +9,32 @@ namespace Coffer.Importer.Moneydance.Mappers;
 /// into Coffer's normalised <see cref="TxnHeaderRow"/> + <see cref="TxnLegRow"/>
 /// shape (ADR-0022). Investment transactions (those with a non-null
 /// <see cref="MdTxn.InvestTxnType"/>) are out of scope here and live in
-/// <see cref="InvestmentTransactionMapper"/>.
+/// <see cref="InvestmentTransactionMapper"/>. A brokerage's plain cash moves
+/// still arrive here, and a one-posting one is stamped 'transfer' by
+/// <see cref="BrokerageCashTransfer"/>.
 /// </summary>
 /// <remarks>
 /// <para>One MD txn produces exactly one header. Each MD split produces
 /// two <c>txn_legs</c> rows: an <em>origin</em> leg on the txn's primary
 /// account carrying <c>parent_amount</c> (cash impact on the bank side),
-/// and a <em>counterpart</em> leg on the split's target account carrying
-/// <c>split_amount</c> (sign-flipped). Both legs of one posting share the
+/// and a <em>counterpart</em> leg on the split's target account: a real
+/// account's <c>split_amount</c>, a category's the origin's amount negated
+/// (<see cref="MdAmounts.Posting"/>). Both legs of one posting share the
 /// same <c>PostingIndex</c> (the MD split index) so the pair can be
 /// found structurally — no <c>counterparty_id</c> denormalisation.</para>
 ///
 /// <para>Header fields are populated once from the MD txn-level
-/// metadata. Per-leg memo (<see cref="MdSplit.Description"/>) lives on
-/// both legs of a posting, applied only on multi-split events. On
-/// single-split events MD typically defaults <c>0.desc</c> to the
-/// parent's <c>desc</c> (the payee), so using it as a leg memo there
-/// would echo the payee — the register would render the parent payee
-/// twice. Single-split rows take NULL leg_memo and the view falls back
-/// to the header memo.</para>
+/// metadata. Memos and tags are per side (<see cref="MoneydanceNotes"/>):
+/// a one-split's sit on its two legs, a multi-split's transaction memo on
+/// the header and each line's on its origin leg, whose other side shows it
+/// inherited.</para>
 ///
 /// <para>Sign convention follows Moneydance: <see cref="MdSplit.ParentAmount"/>
 /// is the cash impact on the primary account; <see cref="MdSplit.SplitAmount"/>
 /// is the impact on the target. Their pair-by-pair sum is zero for
-/// same-currency txns. See
+/// same-currency txns and for every posting with a category side. A posting
+/// between two real accounts in different currencies keeps each side's own
+/// figure, a two-amount pair that does not sum to zero (ADR-0114 D13). See
 /// <see href="../decisions/0022-txn-headers-and-legs.md">ADR-0022</see>.</para>
 /// </remarks>
 public static class TransactionMapper
@@ -51,22 +53,19 @@ public static class TransactionMapper
     /// contains origin + counterpart legs in alternating order (origin
     /// first, then counterpart) per posting. The pipeline upserts the
     /// header first, then the legs in one bulk statement.
+    /// <see cref="HeaderTags"/> and <see cref="LegTags"/> are the tag names to
+    /// link to the header and to each leg, as the notes were planned.
     /// </summary>
-    /// <summary>Tags Moneydance recorded on ONE split, bound to the leg it became.</summary>
-    /// <remarks>
-    /// The ORIGIN leg, matching where <c>LegMemo</c> goes and what the API's write
-    /// path does: a posting is one fact with two sides, and recording the tag on
-    /// both would double every count.
-    /// </remarks>
-    public sealed record LegTagSeed(Guid LegId, IReadOnlyList<string> Tags);
-
     public sealed record MapResult(
         TxnHeaderRow? Header,
         IReadOnlyList<TxnLegRow> Legs,
         IReadOnlyList<LegReconSeed> LegRecons,
-        IReadOnlyList<string> Tags,
+        IReadOnlyList<string> HeaderTags,
         IReadOnlyList<LegTagSeed> LegTags,
-        SkipReason? Skip);
+        SkipReason? Skip,
+        // FU-024: the feed's payee/memo when they differ from the curated
+        // ones written on the header; null otherwise (FeedOriginals).
+        HeaderOriginalsSeed? Originals = null);
 
     public static MapResult Map(
         MdTxn txn,
@@ -102,8 +101,9 @@ public static class TransactionMapper
         // / OlOrigMemo are the raw OFX-original values from before any
         // user edits. We want what the user curated; the raw is a
         // fallback only when the curated value is empty.
+        // The memo follows the same precedence (MoneydanceNotes.WrittenMemo) and
+        // is placed per side below.
         var headerPayee   = NullIfEmpty(txn.Description) ?? NullIfEmpty(txn.OlOrigPayee);
-        var headerMemo    = NullIfEmpty(txn.Memo)        ?? NullIfEmpty(txn.OlOrigMemo);
         var (headerStatus, headerIsCleared) = NormalizeMdStatus(txn.Status);
         // cleared_at is required by the DB CHECK whenever status='cleared'.
         // For MD-imported already-cleared rows we don't know the original
@@ -115,8 +115,9 @@ public static class TransactionMapper
         // Filter out self-referential splits (target == primary) before
         // emitting legs — these would emit two legs on the same account
         // for one posting and collide on the (header_id, posting_index,
-        // account_id) unique index. They're vanishingly rare in real
-        // data and were skipped under the prior model too.
+        // account_id) unique index. A split that targets its own account
+        // moves nothing between accounts, and these were skipped under the
+        // prior model too.
         var emittable = new List<MdSplit>(txn.Splits.Count);
         foreach (var split in txn.Splits)
         {
@@ -126,6 +127,11 @@ public static class TransactionMapper
         }
         if (emittable.Count == 0)
             return Skip(SkipReason.NoSplits);
+
+        // A one-posting cash move in or out of a brokerage is a 'transfer',
+        // exactly as the investment route's txntype "bank" writes it; every
+        // other bank-route event has no investment action.
+        var (action, postingRole) = BrokerageCashTransfer.Classify(primaryRef, emittable.Count);
 
         var headerId = Guid.NewGuid();
         // Mig 107 decompose: derive origin + provider_key from MD's
@@ -149,7 +155,8 @@ public static class TransactionMapper
             Origin:              origin,
             ExternalId:          txn.Id,
             Payee:               headerPayee,
-            Memo:                headerMemo,
+            // Planned with the legs below (ImportAnnotations.Stamp).
+            Memo:                null,
             PostedAt:            posted,
             TransactedAt:        transacted,
             Status:              headerStatus,
@@ -168,8 +175,11 @@ public static class TransactionMapper
             // remain available inside ProviderRawPayload below.
             OnlineMatchFitid:    NullIfEmpty(txn.OlFitid),
             OnlineMatchFiId:     NullIfEmpty(txn.OlFiId),
-            // Bank/credit/category txns have no investment action.
-            Action:              null,
+            // Null on bank/credit/category txns; 'transfer' on a one-posting
+            // brokerage cash move (BrokerageCashTransfer).
+            Action:              action,
+            // Mig 263: the home account, stamped with the notes once the legs exist.
+            OriginatingAccountId: null,
             // Mig 107.
             ProviderKey:         providerKey,
             IsMergeWinner:       false,
@@ -189,35 +199,30 @@ public static class TransactionMapper
         // cleared_at proxies to posted for cleared legs (same as the header-era
         // backfill); category legs are dropped at persist.
         var legRecons = new List<LegReconSeed>();
-        var legTags = new List<LegTagSeed>();
-        var isMultiSplit = emittable.Count > 1;
+        var postings = new List<MoneydanceNotes.BankPosting>(emittable.Count);
 
         foreach (var split in emittable)
         {
             var targetRef = accountByMdId[split.AcctId];
-            // Per-leg memo, applied only on multi-split events. MD's
-            // Edit Splits dialog surfaces per-leg memos when there are
-            // multiple legs to differentiate ("Salary", "Federal Tax",
-            // ...). On single-split events MD typically defaults
-            // 0.desc to the parent's description, so a leg memo there
-            // would echo the payee into the memo column. Single-split
-            // rows leave leg_memo NULL and the view falls back to the
-            // header memo.
-            var legMemo = isMultiSplit
-                ? NullIfEmpty(split.Description)
-                : null;
+            postings.Add(new MoneydanceNotes.BankPosting(split, targetRef.Id));
 
+            // Each side in its own currency's decimals; a category side carries the
+            // real side's amount, never the split's samt (MdAmounts.Posting).
+            var (originAmount, counterpartAmount) = MdAmounts.Posting(split, primaryRef, targetRef);
+
+            // Memos are planned below, once the whole shape is known.
             var originLeg = new TxnLegRow(
                 Id:                Guid.NewGuid(),
                 HeaderId:          headerId,
                 LedgerId:          ledgerId,
                 AccountId:         primaryRef.Id,
                 PostingIndex:      split.Index,
-                LegMemo:           legMemo,
-                Amount:            AccountMapper.MinorUnitsToDecimal(split.ParentAmount),
+                LegMemo:           null,
+                Amount:            originAmount,
                 SecurityId:        null,
                 Quantity:          null,
-                UnitPrice:         null);
+                UnitPrice:         null,
+                PostingRole:       postingRole);
 
             var counterpartLeg = new TxnLegRow(
                 Id:                Guid.NewGuid(),
@@ -225,22 +230,15 @@ public static class TransactionMapper
                 LedgerId:          ledgerId,
                 AccountId:         targetRef.Id,
                 PostingIndex:      split.Index,
-                LegMemo:           legMemo,
-                Amount:            AccountMapper.MinorUnitsToDecimal(split.SplitAmount),
+                LegMemo:           null,
+                Amount:            counterpartAmount,
                 SecurityId:        null,
                 Quantity:          null,
-                UnitPrice:         null);
+                UnitPrice:         null,
+                PostingRole:       postingRole);
 
             legs.Add(originLeg);
             legs.Add(counterpartLeg);
-
-            // This split's OWN tags, kept on this split's leg (ADR-0103). Before
-            // migration 243 there was nowhere to put them, so ExtractTags folded
-            // them into the header's set and the attribution was gone — which is
-            // the loss ADR-0009 called "rare in practice and acceptable" and the
-            // rental-property case disproved.
-            var splitTags = SplitTagNames(split.Tags);
-            if (splitTags.Count > 0) legTags.Add(new LegTagSeed(originLeg.Id, splitTags));
 
             // Origin leg ← the parent txn's status; counterparty leg ← this
             // split's own status. Only non-'uncleared' legs need an overlay row.
@@ -254,56 +252,24 @@ public static class TransactionMapper
                     counterpartLeg.Id, splitStatus, splitIsCleared ? posted : (DateTimeOffset?)null));
         }
 
-        return new MapResult(header, legs, legRecons, ExtractTags(txn), legTags, Skip: null);
+        // The memo and tags of each side (MoneydanceNotes), planned through the
+        // write primitive from the home, which is the primary account on every
+        // posting's origin leg and so the originating account.
+        var plan = MoneydanceNotes.PlanBankRoute(
+            ImportAnnotations.ShapeOf(primaryRef, action, legs),
+            primaryRef.Id,
+            MoneydanceNotes.WrittenMemo(txn.Memo, txn.OlOrigMemo),
+            txn.Description,
+            txn.Tags,
+            postings);
+        var stamped = ImportAnnotations.Stamp(plan, header, legs);
+
+        return new MapResult(stamped.Header, stamped.Legs, legRecons, stamped.HeaderTags, stamped.LegTags, Skip: null,
+            Originals: FeedOriginals.SeedFor(txn, stamped.Header, stamped.TransactionMemo, stamped.Legs));
     }
 
     private static MapResult Skip(SkipReason reason) =>
-        new(Header: null, Legs: [], LegRecons: [], Tags: [], LegTags: [], Skip: reason);
-
-    /// <summary>
-    /// The TRANSACTION's own tags — <c>txn.tags</c> and nothing else.
-    /// </summary>
-    /// <remarks>
-    /// This used to union in every split's tags as well, because ADR-0009 put tags
-    /// at header level and a split tag had nowhere else to go. ADR-0103 gave it
-    /// somewhere: split tags now land on the split's leg, so folding them up here
-    /// as well would record each one twice and make the two levels indistinguishable
-    /// — which is the distinction the whole change exists to draw.
-    /// <para>Nothing is dropped. What the header loses, the leg gains.</para>
-    /// </remarks>
-    public static IReadOnlyList<string> ExtractTags(MdTxn txn)
-    {
-        var collected = new HashSet<string>(StringComparer.Ordinal);
-        AddCommaSeparated(collected, txn.Tags);
-        return [.. collected];
-    }
-
-    /// <summary>One split's tags, normalized the same way the header's are.</summary>
-    private static IReadOnlyList<string> SplitTagNames(string? raw)
-    {
-        var collected = new HashSet<string>(StringComparer.Ordinal);
-        AddCommaSeparated(collected, raw);
-        return [.. collected];
-    }
-
-    /// <remarks>
-    /// Normalization is <see cref="TagName.Normalize"/>'s, not this method's,
-    /// and it happens HERE rather than at the insert. The names this returns
-    /// are the keys the import step later looks tag ids up by
-    /// (<c>tagIdByName.TryGetValue(name, ...)</c>), so truncating at the
-    /// repository instead would key the dictionary by the short name while the
-    /// caller asked for the long one — a miss, swallowed by the <c>if</c>, and
-    /// the tag link silently dropped.
-    /// </remarks>
-    private static void AddCommaSeparated(HashSet<string> bucket, string? raw)
-    {
-        if (string.IsNullOrWhiteSpace(raw)) return;
-        foreach (var piece in raw.Split(','))
-        {
-            if (TagName.Normalize(piece) is { } name)
-                bucket.Add(name);
-        }
-    }
+        new(Header: null, Legs: [], LegRecons: [], HeaderTags: [], LegTags: [], Skip: reason);
 
     public static DateTimeOffset? ParseMdDate(int? yyyymmdd)
     {
@@ -399,9 +365,7 @@ public static class TransactionMapper
         // for online-fetched rows during an earlier era and
         // stopped supporting it later; the rows stayed in MD's
         // database unchanged. They are online_import / mdplus
-        // despite the absent ol_fi_id prefix. (Earlier classifier
-        // draft mis-tagged these as file_import / csv — corrected
-        // during ADR-0035 review against a real-world dataset.)
+        // despite the absent ol_fi_id prefix, not file_import / csv.
         if (fiId is null && fitid is not null && LooksLikeLegacyMdPlusFitid(fitid))
         {
             return ("online_import", "mdplus");
@@ -435,8 +399,8 @@ public static class TransactionMapper
         // synthesized CSV FITID. Could be either:
         //   * Real online OFX server (a real OFX server, pre-MD+ era), OR
         //   * QFX file import where MD didn't preserve the <FI><FID>
-        //     header block (observed in modern QFX files from
-        //     brokerages that omit it).
+        //     header block (modern QFX files from brokerages that
+        //     omit it).
         // Discriminate via the row's account config — same as the
         // `ofx:` prefix branch above. If the account has
         // `ofx_import_acct_num` set, this is a QFX file import even

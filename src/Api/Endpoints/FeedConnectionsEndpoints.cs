@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Routing;
 using Coffer.Api.Auth;
 using Coffer.Api.Contracts;
 using Coffer.Api.Crypto;
+using Coffer.Api.Db.Entities;
 using Coffer.Api.Db.Repositories;
 using Coffer.Api.Errors;
 using Coffer.Api.Ingest;
@@ -32,8 +33,9 @@ public static class FeedConnectionsEndpoints
         // Connecting a bank and disconnecting it are the owner's (FU-095): the
         // connection holds credentials to the owner's accounts at the bank. Syncing one
         // that exists stays with editors; it uses the credentials and changes nothing
-        // about them.
+        // about them. Renaming one is the owner's too, as disconnecting it is.
         group.MapPost("/", CreateAsync).AsLedgerOwner();
+        group.MapPatch("/{connectionId:guid}", RenameAsync).AsLedgerOwner();
         group.MapDelete("/{connectionId:guid}", DeleteAsync).AsLedgerOwner();
         group.MapPost("/{connectionId:guid}/sync", SyncAsync);
         // Slice 2c.4: per-connection bank-side account directory
@@ -174,12 +176,51 @@ public static class FeedConnectionsEndpoints
 
         var rows = await feedConnections.ListByLedgerAsync(ledgerId, cancellationToken)
                                         .ConfigureAwait(false);
-        var summaries = rows
-            .Select(r => new FeedConnectionSummary(
-                r.Id, r.LedgerId, r.Provider, r.InstitutionName,
-                r.Status, r.LastSyncedAt, r.CreatedAt))
-            .ToList();
+        var summaries = rows.Select(Summary).ToList();
         return Results.Ok(summaries);
+    }
+
+    private static FeedConnectionSummary Summary(FeedConnectionRow r) =>
+        new(r.Id, r.LedgerId, r.Provider, r.InstitutionName, r.Status, r.LastSyncedAt, r.CreatedAt);
+
+    /// <summary>
+    /// <c>PATCH /api/ledgers/{ledgerId}/feed-connections/{connectionId}</c>: rename a
+    /// connection. Owner-only, as Disconnect is. The name is trimmed and must be 1 to 80
+    /// characters (422 <c>feed-connection-name-required</c> / <c>-too-long</c>); two
+    /// connections may share one. Answers the connection's summary.
+    /// </summary>
+    private static async Task<IResult> RenameAsync(
+        Guid ledgerId,
+        Guid connectionId,
+        RenameFeedConnectionRequest request,
+        ICurrentUserAccessor currentUser,
+        LedgersRepository ledgers,
+        FeedConnectionsRepository feedConnections,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        switch (FeedConnectionsRepository.CheckName(request.Name))
+        {
+            case FeedConnectionsRepository.NameCheck.Required:
+                return BusinessError.Problem(BusinessError.Codes.FeedConnectionNameRequired,
+                    "A connection's name is required.");
+            case FeedConnectionsRepository.NameCheck.TooLong:
+                return BusinessError.Problem(BusinessError.Codes.FeedConnectionNameTooLong,
+                    $"A connection's name is limited to {FeedConnectionsRepository.NameMaxLength} characters.");
+        }
+
+        var visible = await ledgers.GetVisibleByIdAsync(
+            currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
+        if (visible is null)
+            return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
+                "Ledger not found or not visible to this user.");
+
+        var row = await feedConnections.RenameAsync(
+            ledgerId, connectionId, request.Name!, cancellationToken).ConfigureAwait(false);
+        return row is null
+            ? BusinessError.Problem(BusinessError.Codes.FeedConnectionNotFound,
+                "Feed connection not found in this ledger.")
+            : Results.Ok(Summary(row));
     }
 
     private static async Task<IResult> DeleteAsync(
@@ -257,10 +298,10 @@ public static class FeedConnectionsEndpoints
                 ex.Message);
         }
 
-        // Best-effort institution-name probe. Never fatal — the
-        // wizard renders "SimpleFIN" as a fallback. Slice 2's first
-        // sync will populate the name reliably from
-        // <c>org.name</c> on each account.
+        // The name the connection starts with: the one institution SimpleFIN lists for it,
+        // or null when it lists several or the probe fails, which the SPA shows as
+        // "SimpleFIN". Never fatal, and nothing later fills it in: syncs never write the
+        // name, and only a rename changes it.
         var institutionName = await simpleFin.GetInstitutionNameAsync(
             accessUrl, cancellationToken).ConfigureAwait(false);
 
@@ -273,8 +314,6 @@ public static class FeedConnectionsEndpoints
 
         return Results.Created(
             $"/api/ledgers/{ledgerId}/feed-connections/{row.Id}",
-            new FeedConnectionSummary(
-                row.Id, row.LedgerId, row.Provider, row.InstitutionName,
-                row.Status, row.LastSyncedAt, row.CreatedAt));
+            Summary(row));
     }
 }

@@ -16,13 +16,11 @@ namespace Coffer.Api.Tests.Integration.Accounts;
 /// per-kind cap, and the system/inactive exclusions.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class FrequentCounterpartiesTests
+public sealed class FrequentCounterpartiesTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public FrequentCounterpartiesTests(PostgresFixture fixture)
+    public FrequentCounterpartiesTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(
@@ -40,7 +38,7 @@ public sealed class FrequentCounterpartiesTests
     [Fact]
     public async Task Ranks_by_use_count_splits_by_kind_caps_at_three_and_excludes_inactive()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddBankAccountAsync("Source Checking");
 
         // Four expense categories used 4 / 3 / 2 / 1 times.
@@ -68,14 +66,14 @@ public sealed class FrequentCounterpartiesTests
         await UseAsync(catHidden.Id, 10);
 
         // Deactivate the heavily-used category.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Accounts
                 .Where(a => a.Id == catHidden.Id)
                 .ExecuteUpdateAsync(s => s.SetProperty(a => a.IsActive, false));
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync(
@@ -110,7 +108,7 @@ public sealed class FrequentCounterpartiesTests
         // the tax / wage legs sit on other postings (paired with
         // Checking, not the source) and must NOT surface as the
         // source's frequents (ADR-0043).
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddBankAccountAsync("401k-ish Source");
         var checking = await ledger.AddBankAccountAsync("Checking");
         var tax = await ledger.AddCategoryAsync("Federal Income Tax", "expense");
@@ -130,7 +128,7 @@ public sealed class FrequentCounterpartiesTests
                 day.AddDays(i));
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync(
@@ -159,7 +157,7 @@ public sealed class FrequentCounterpartiesTests
         // headers. Each transaction contributes ~1 unit of "intent"
         // spread across its counterparties: a 2-way split gives each
         // category 1/2, a singleton gives a full 1 (ADR-0043 dilution).
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddBankAccountAsync("Source Checking");
 
         // Two categories that only ever appear together in a 2-way split.
@@ -184,7 +182,7 @@ public sealed class FrequentCounterpartiesTests
             await ledger.AddTransactionPairAsync(
                 source.Id, single.Id, 10m, day.AddDays(i));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync(
@@ -208,10 +206,10 @@ public sealed class FrequentCounterpartiesTests
     [Fact]
     public async Task Returns_422_when_account_not_in_ledger()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var other = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var other = await SyntheticLedger.CreateAsync(Db);
         var foreign = await other.AddBankAccountAsync("Foreign");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync(

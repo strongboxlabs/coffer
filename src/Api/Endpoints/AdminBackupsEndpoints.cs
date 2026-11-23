@@ -103,7 +103,7 @@ public static class AdminBackupsEndpoints
     /// <c>POST /api/admin/backups/restore</c> (ADR-0071 D3). Restore the whole
     /// database from an uploaded <c>.cofferbak</c>. Reuses the ADR-0061
     /// stage → restart → apply-at-boot machinery: stages the archive + passphrase,
-    /// pre-flights the KEK fingerprint (D4) and the passphrase, then restarts so
+    /// pre-flights the KEK fingerprint (ADR-0071 D4) and the passphrase, then restarts so
     /// the next boot applies the restore before serving. Destructive: replaces
     /// ALL users, ledgers, and data, and signs everyone out — gated by an exact
     /// typed-confirmation phrase.
@@ -119,7 +119,7 @@ public static class AdminBackupsEndpoints
         CancellationToken cancellationToken)
     {
         // A restore replaces every row and can install a master key: a passkey tap, not
-        // just a cookie (2026-10-12 audit, M2) — checked before anything is staged.
+        // just a cookie (ADR-0105 D1) — checked before anything is staged.
         var approval = await stepUp.RequireAsync(StepUpActions.Restore, cancellationToken)
                                    .ConfigureAwait(false);
         if (approval.Failure is not null)
@@ -302,9 +302,9 @@ public static class AdminBackupsEndpoints
 
     /// <summary>
     /// <c>POST /api/admin/backups</c>. Accepts a manual backup and answers 202 with a run
-    /// id; the backup runs on the host, not in this request (FU-065). It used to run inside
-    /// the request and die with it: a proxy cancels a request at its timeout (Cloudflare's is
-    /// 100 seconds), and a backup of a growing ledger outlasts that.
+    /// id; the backup runs on the host, not in this request (FU-065). Run inside the
+    /// request it would die with it: a proxy cancels a request at its timeout (Cloudflare's
+    /// is 100 seconds), and a backup of a growing ledger outlasts that.
     /// </summary>
     private static async Task<IResult> CreateAsync(
         BackupManager manager,
@@ -336,8 +336,9 @@ public static class AdminBackupsEndpoints
         BackupSummary? backup = null;
         if (run.BackupId is { } id && store.List().FirstOrDefault(b => b.Id == id) is { } info)
         {
-            var pinned = await pins.GetPinnedIdsAsync(cancellationToken).ConfigureAwait(false);
-            backup = ToSummary(info, pinned.Contains(id));
+            var pinned = await pins.GetAdminPinnedIdsAsync(cancellationToken).ConfigureAwait(false);
+            var labels = await pins.GetUpgradeLabelsAsync(cancellationToken).ConfigureAwait(false);
+            backup = ToSummary(info, pinned.Contains(id), labels.GetValueOrDefault(id));
         }
         return Results.Ok(new BackupRunResponse(
             run.RunId, run.State, run.StartedAtUtc, run.FinishedAtUtc, backup, run.Error));
@@ -346,8 +347,9 @@ public static class AdminBackupsEndpoints
     private static async Task<IResult> ListAsync(
         BackupStore store, BackupPinsRepository pins, CancellationToken cancellationToken)
     {
-        var pinned = await pins.GetPinnedIdsAsync(cancellationToken).ConfigureAwait(false);
-        return Results.Ok(store.List().Select(b => ToSummary(b, pinned.Contains(b.Id))).ToList());
+        var pinned = await pins.GetAdminPinnedIdsAsync(cancellationToken).ConfigureAwait(false);
+        var labels = await pins.GetUpgradeLabelsAsync(cancellationToken).ConfigureAwait(false);
+        return Results.Ok(store.List().Select(b => ToSummary(b, pinned.Contains(b.Id), labels.GetValueOrDefault(b.Id))).ToList());
     }
 
     private static async Task<IResult> PinAsync(
@@ -382,7 +384,7 @@ public static class AdminBackupsEndpoints
         TimeProvider clock, StepUpGuard stepUp, CancellationToken cancellationToken)
     {
         // Deleting backups is how a stolen session would destroy the recovery points
-        // before damaging the data: a tap, not just a cookie (2026-10-12 audit, M2).
+        // before damaging the data: a tap, not just a cookie (ADR-0105 D1).
         var approval = await stepUp.RequireAsync(StepUpActions.BackupDelete, cancellationToken)
                                    .ConfigureAwait(false);
         if (approval.Failure is not null)
@@ -409,8 +411,8 @@ public static class AdminBackupsEndpoints
         CancellationToken cancellationToken)
     {
         // Setting a passphrase the caller knows, then taking and downloading a backup,
-        // used to get round the tap that guards REVEALING the passphrase (2026-10-12
-        // audit, M2). The old passphrase is not asked for: the tap proves the same
+        // would get round the tap that guards REVEALING the passphrase, so setting one
+        // needs its own tap (ADR-0105 D1). The old passphrase is not asked for: the tap proves the same
         // person, and asking would strand an operator who has forgotten it.
         var approval = await stepUp.RequireAsync(StepUpActions.BackupPassphrase, cancellationToken)
                                    .ConfigureAwait(false);
@@ -641,8 +643,8 @@ public static class AdminBackupsEndpoints
             request.RetentionDaily, request.RetentionWeekly, request.RetentionMonthly));
     }
 
-    private static BackupSummary ToSummary(BackupFileInfo info, bool pinned) =>
-        new(info.Id, info.SizeBytes, info.CreatedAtUtc, pinned);
+    private static BackupSummary ToSummary(BackupFileInfo info, bool pinned, string? upgradeLabel = null) =>
+        new(info.Id, info.SizeBytes, info.CreatedAtUtc, pinned, upgradeLabel);
 
     // Named, for the reason ScheduleDto's projection is: this record now has optional
     // trailing parameters, and positional construction would map the wrong values the

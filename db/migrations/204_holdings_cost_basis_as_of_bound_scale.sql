@@ -1,6 +1,6 @@
 -- 204 — bound the scale of holdings_cost_basis_as_of so it fits System.Decimal
 --
--- THE BUG. holdings_snapshot threw for every account whose cost basis carried a
+-- THE BUG. holdings_snapshot throws for every account whose cost basis carries a
 -- long fractional scale:
 --
 --   System.OverflowException: Numeric value does not fit in a System.Decimal
@@ -13,21 +13,20 @@
 --
 -- Scale gets in through the sell branch. A buy adds its leg AMOUNT, which is exact,
 -- but a sell subtracts take x unit_cost where unit_cost = amount / quantity — a
--- division that rarely terminates. One partial sale of a position is enough: a
--- basis found on a real ledger ran to 34 digits.
+-- division that rarely terminates. One partial sale of a position is enough: the
+-- basis then carries every digit the division produced, well past 28.
 --
--- Whether it threw therefore depended on MAGNITUDE, which is why it looked
--- data-random on a real ledger: an account whose basis divided evenly was fine, one
--- whose basis ran to 28 digits squeaked under, and a seven-figure one went over.
--- The whole-ledger call failed because any one account failing fails the read.
+-- Whether it throws therefore depends on MAGNITUDE: an account whose basis divides
+-- evenly is fine, one whose total digits stay within 28 squeaks under, and one with
+-- more integer digits goes over.
+-- A whole-ledger call fails if any one account fails, because that fails the read.
 --
--- THE FIX, and where it should have been from the start. Round at the boundary the
--- client reads, exactly as the sibling feeders already do — mig 172 and mig 200 both
--- ROUND their outputs and say why: "Bound scales so the NUMERICs fit System.Decimal".
--- The writer never hit this because holdings.cost_basis is NUMERIC(19,4) and the
--- column rounds on INSERT; only a function RETURNING raw values was exposed. That is
--- the "unconstrained NUMERIC in RETURNS TABLE" blind spot recorded in closed-work.md
--- — documented, then reintroduced by the migration that added this function.
+-- THE FIX. Round at the boundary the client reads, exactly as the sibling feeders
+-- already do — mig 172 and mig 200 both ROUND their outputs and say why: "Bound
+-- scales so the NUMERICs fit System.Decimal". The writer is not exposed because
+-- holdings.cost_basis is NUMERIC(19,4) and the column rounds on INSERT; only a
+-- function RETURNING raw values is. That is the "unconstrained NUMERIC in RETURNS
+-- TABLE" class recorded in closed-work.md.
 --
 -- Money is 4dp (matching holdings.cost_basis NUMERIC(19,4)); shares are 12dp
 -- (matching NUMERIC(25,12) and mig 200's quantity rounding).

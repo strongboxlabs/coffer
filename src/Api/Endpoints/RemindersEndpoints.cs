@@ -14,7 +14,9 @@ namespace Coffer.Api.Endpoints;
 /// <summary>
 /// Endpoint group for recurring-reminder series (ADR-0047). Read surface
 /// (list + upcoming + detail), manual authoring (create/edit per shape +
-/// disable + skip), and fire. Series are managed here; the live
+/// disable + skip), and posting an occurrence by hand, per shape. Copying a
+/// template as it stands is the auto-post job's alone and has no route: the UI
+/// always posts the occurrence as its dialog shows it. Series are managed here; the live
 /// register/balances never see their templates (live_txn_headers view +
 /// recompute exclusion, mig 124 / ADR-0048). Create/edit fork by transaction
 /// shape (bank vs investment), mirroring the live /transactions vs
@@ -39,7 +41,6 @@ public static class RemindersEndpoints
         group.MapPatch("/{reminderId:guid}/active", SetActiveAsync);
         group.MapPost("/{reminderId:guid}/skip", SkipAsync);
         group.MapDelete("/{reminderId:guid}/skip", UnskipAsync);
-        group.MapPost("/{reminderId:guid}/fire", FireAsync);
         group.MapPost("/{reminderId:guid}/fire/bank", FireBankAsync);
         group.MapPost("/{reminderId:guid}/fire/investment", FireInvestmentAsync);
 
@@ -94,56 +95,6 @@ public static class RemindersEndpoints
     }
 
     /// <summary>
-    /// <c>POST /api/ledgers/{ledgerId}/reminders/{reminderId}/fire</c> —
-    /// materialize the occurrence as a committed transaction (idempotent).
-    /// </summary>
-    private static async Task<IResult> FireAsync(
-        Guid ledgerId,
-        Guid reminderId,
-        Contracts.FireReminderRequest request,
-        ICurrentUserAccessor currentUser,
-        LedgersRepository ledgers,
-        RemindersRepository reminders,
-        CancellationToken cancellationToken)
-    {
-        ArgumentNullException.ThrowIfNull(request);
-
-        var visible = await ledgers.GetVisibleByIdAsync(
-            currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
-        if (visible is null)
-            return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
-                "Ledger not found or not visible to this user.");
-
-        // Clone the template verbatim (no edits). Adjust-at-post goes through
-        // /fire/bank or /fire/investment.
-        var result = await reminders.FireAsync(
-                ledgerId, reminderId, request.OccurrenceDate, currentUser.UserId,
-                Coffer.Api.Reminders.ReminderCatchUp.SkipEarlierUnacted, cancellationToken)
-            .ConfigureAwait(false);
-
-        return result.Outcome switch
-        {
-            RemindersRepository.FireOutcome.Ok =>
-                Results.Ok(new Contracts.FireReminderResponse(
-                    result.HeaderId!.Value, result.SkippedEarlierCount, result.SkippedEarlierFrom)),
-            RemindersRepository.FireOutcome.NotFound =>
-                BusinessError.Problem(BusinessError.Codes.ReminderNotInLedger,
-                    "Reminder not found in this ledger."),
-            RemindersRepository.FireOutcome.NotMaterialized =>
-                BusinessError.Problem(BusinessError.Codes.ReminderNotMaterialized,
-                    "Reminder has no template yet — re-import it from Moneydance."),
-            RemindersRepository.FireOutcome.OccurrenceSkipped =>
-                BusinessError.Problem(BusinessError.Codes.ReminderOccurrenceSkipped,
-                    "That occurrence was skipped; un-skip it before firing."),
-            RemindersRepository.FireOutcome.EstimateUnavailableForFire =>
-                BusinessError.Problem(BusinessError.Codes.ReminderEstimateNotEligible,
-                    "This reminder estimates its amount and there is nothing to estimate "
-                    + "from yet. Post it with an explicit amount, or turn the estimate off."),
-            _ => Results.StatusCode(500),
-        };
-    }
-
-    /// <summary>
     /// <c>POST /api/ledgers/{ledgerId}/reminders/{reminderId}/fire/bank</c> —
     /// adjust-at-post for a BANK series: commit the edited transaction (incl.
     /// splits) as the occurrence, reusing the live bank create (ADR-0049).
@@ -156,12 +107,19 @@ public static class RemindersEndpoints
         LedgersRepository ledgers,
         AccountsRepository accounts,
         RemindersRepository reminders,
+        Quotes.MarketSeries.MarketSeriesBackfill backfill,
+        Db.AppDbContext db,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        // Validate the EDITED postings exactly like a bank create (shape first).
+        // Validate the EDITED postings exactly like a bank create (shape first). A fire is a
+        // new write, so every amount it posts is checked at its currency's places, one equal
+        // to the template's line included (ADR-0114 D15): nothing posts a figure that does
+        // not fit.
         if (PostingValidation.ValidatePostings(request.Postings, request.SourceAccountId) is { } pr) return pr;
+        if (request.Notes is { } notes && TagValidation.ValidateTags(notes.AllTagNames()) is { } tagsRejection)
+            return tagsRejection;
 
         if (await NotVisibleAsync(ledgers, currentUser, ledgerId, cancellationToken).ConfigureAwait(false) is { } gate)
             return gate;
@@ -175,9 +133,15 @@ public static class RemindersEndpoints
                 .ConfigureAwait(false) is { } ar)
             return ar;
 
+        // ADR-0114 D11: an occurrence posted before the ledger's earliest day moves the
+        // starts earlier, as a bank create does; read before the write that can move them.
+        var before = await NeededFxPairs.StartsAsync(db, ledgerId, cancellationToken).ConfigureAwait(false);
         var result = await reminders.FireBankAsync(
             ledgerId, reminderId, request.OccurrenceDate, request, currentUser.UserId, cancellationToken)
             .ConfigureAwait(false);
+        if (result.Outcome == RemindersRepository.FireOutcome.Ok)
+            await backfill.StartIfEarlierAsync(db, ledgerId, currentUser.UserId, before, cancellationToken)
+                .ConfigureAwait(false);
 
         return result.Outcome switch
         {
@@ -195,13 +159,35 @@ public static class RemindersEndpoints
             RemindersRepository.FireOutcome.ShapeMismatch =>
                 BusinessError.Problem(BusinessError.Codes.ReminderShapeMismatch,
                     "This is an investment reminder; use the investment fire route."),
+            RemindersRepository.FireOutcome.NotesRefused => AnnotationProblem.Of(result.Refusal!),
+            RemindersRepository.FireOutcome.PostingRefused => PostingProblem(result.PostingRefusal!),
             RemindersRepository.FireOutcome.EstimateUnavailableForFire =>
                 BusinessError.Problem(BusinessError.Codes.ReminderEstimateNotEligible,
                     "This reminder estimates its amount and there is nothing to estimate "
                     + "from yet. Post it with an explicit amount, or turn the estimate off."),
+            RemindersRepository.FireOutcome.TemplateHasNoLines =>
+                BusinessError.Problem(BusinessError.Codes.ReminderTemplateHasNoLines,
+                    "This reminder has no lines, so it names no account to post from. "
+                    + "Edit the reminder to give it its lines, or delete it."),
+            RemindersRepository.FireOutcome.LoanAcrossCurrencies =>
+                LoanAcrossCurrenciesProblem(result.LoanCurrencies!),
             _ => Results.StatusCode(500),
         };
     }
+
+    /// <summary>The 422 for a managed loan payment that would cross currencies
+    /// (ADR-0114 D13), at setup or at fire: both currencies, and how such a payment is
+    /// entered instead (ADR-0078 D2).</summary>
+    internal static IResult LoanAcrossCurrenciesProblem(RemindersRepository.LoanPaymentCurrencies currencies) =>
+        BusinessError.Problem(BusinessError.Codes.PaymentReminderCurrencyMismatch,
+            $"This loan is in {currencies.LoanCurrency} and the payment would use an account in "
+            + $"{currencies.OtherCurrency}. A scheduled loan payment stays in the loan's currency: pay it "
+            + $"from an account in {currencies.LoanCurrency}, or enter it as a transfer with both amounts.");
+
+    /// <summary>The 422 for a posting the leg-pair builder refused (ADR-0114 D13): its
+    /// code, and a detail naming the posting.</summary>
+    private static IResult PostingProblem(PostingLegPair.Refusal refusal) =>
+        BusinessError.Problem(refusal.Code, refusal.Detail);
 
     /// <summary>
     /// <c>POST /api/ledgers/{ledgerId}/reminders/{reminderId}/fire/investment</c>
@@ -216,6 +202,8 @@ public static class RemindersEndpoints
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         RemindersRepository reminders,
+        Quotes.MarketSeries.MarketSeriesBackfill backfill,
+        Db.AppDbContext db,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -223,9 +211,14 @@ public static class RemindersEndpoints
         if (await NotVisibleAsync(ledgers, currentUser, ledgerId, cancellationToken).ConfigureAwait(false) is { } gate)
             return gate;
 
+        // ADR-0114 D11: as the bank fire, read before the write that can move the starts.
+        var before = await NeededFxPairs.StartsAsync(db, ledgerId, cancellationToken).ConfigureAwait(false);
         var result = await reminders.FireInvestmentAsync(
             ledgerId, reminderId, request.OccurrenceDate, request.Transaction, currentUser.UserId, cancellationToken)
             .ConfigureAwait(false);
+        if (result.Outcome == RemindersRepository.FireOutcome.Ok)
+            await backfill.StartIfEarlierAsync(db, ledgerId, currentUser.UserId, before, cancellationToken)
+                .ConfigureAwait(false);
 
         return result.Outcome switch
         {
@@ -244,22 +237,27 @@ public static class RemindersEndpoints
                 BusinessError.Problem(BusinessError.Codes.ReminderShapeMismatch,
                     "This is a bank reminder; use the bank fire route."),
             RemindersRepository.FireOutcome.ShapeFailure =>
-                InvestmentFailureProblem(result.InvestmentFailure!.Value),
+                InvestmentFailureProblem(result.InvestmentFailure!.Value, result.InvestmentFailureDetail),
+            RemindersRepository.FireOutcome.NotesRefused => AnnotationProblem.Of(result.Refusal!),
             RemindersRepository.FireOutcome.EstimateUnavailableForFire =>
                 BusinessError.Problem(BusinessError.Codes.ReminderEstimateNotEligible,
                     "This reminder estimates its amount and there is nothing to estimate "
                     + "from yet. Post it with an explicit amount, or turn the estimate off."),
+            RemindersRepository.FireOutcome.TemplateHasNoLines =>
+                BusinessError.Problem(BusinessError.Codes.ReminderTemplateHasNoLines,
+                    "This reminder has no lines, so it names no account to post from. "
+                    + "Edit the reminder to give it its lines, or delete it."),
             _ => Results.StatusCode(500),
         };
     }
 
-    /// <summary>Map an investment validation failure to its 422 (shared with the
-    /// investment create endpoint's vocabulary).</summary>
-    private static IResult InvestmentFailureProblem(InvestmentTransactionsRepository.CreateFailure failure)
-    {
-        var (code, message) = InvestmentTransactionsEndpoints.MapFailure(failure);
-        return BusinessError.Problem(code, message);
-    }
+    /// <summary>Map an investment validation failure to its 422, as the investment
+    /// create endpoint does: with <paramref name="detail"/>, a places refusal names the
+    /// currency, its places and the field (ADR-0114 D15).</summary>
+    private static IResult InvestmentFailureProblem(
+        InvestmentTransactionsRepository.CreateFailure failure,
+        InvestmentTransactionsRepository.FailureDetail? detail) =>
+        InvestmentTransactionsEndpoints.MapFailureProblem(failure, detail);
 
     /// <summary>
     /// <c>GET /api/ledgers/{ledgerId}/reminders/{reminderId}</c> — series detail
@@ -268,6 +266,10 @@ public static class RemindersEndpoints
     private static async Task<IResult> GetByIdAsync(
         Guid ledgerId,
         Guid reminderId,
+        // ?occurrenceDate= (as on the unskip route): the occurrence a loan series' split
+        // legs are priced for, as of that payment's own date (ADR-0078, 2026-10-21);
+        // absent, the next due one.
+        DateOnly? occurrenceDate,
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         RemindersRepository reminders,
@@ -276,7 +278,8 @@ public static class RemindersEndpoints
         if (await NotVisibleAsync(ledgers, currentUser, ledgerId, cancellationToken).ConfigureAwait(false) is { } gate)
             return gate;
 
-        var detail = await reminders.GetDetailAsync(ledgerId, reminderId, cancellationToken).ConfigureAwait(false);
+        var detail = await reminders.GetDetailAsync(ledgerId, reminderId, occurrenceDate, cancellationToken)
+            .ConfigureAwait(false);
         return detail is null
             ? BusinessError.Problem(BusinessError.Codes.ReminderNotInLedger,
                 "Reminder not found in this ledger.")
@@ -314,6 +317,8 @@ public static class RemindersEndpoints
                 request.EstimateSampleCount, request.Postings.Count, isLoanReminder: false)
             is { } estimateRejection)
             return estimateRejection;
+        if (request.Notes is { } notes && TagValidation.ValidateTags(notes.AllTagNames()) is { } tagsRejection)
+            return tagsRejection;
 
         if (await NotVisibleAsync(ledgers, currentUser, ledgerId, cancellationToken).ConfigureAwait(false) is { } gate)
             return gate;
@@ -330,6 +335,9 @@ public static class RemindersEndpoints
             return accountsRejection;
 
         var result = await reminders.CreateBankAsync(ledgerId, request, cancellationToken).ConfigureAwait(false);
+        if (result.Refusal is { } refusal) return AnnotationProblem.Of(refusal);
+        // Nothing was written, so the auto-post schedule is left as it is too.
+        if (result.PostingRefusal is { } posting) return PostingProblem(posting);
         await EnableAutoPostIfRequestedAsync(
                 ledgerId, request.AutoCommitDaysBefore, currentUser.UserId, schedules,
                 clock, cancellationToken)
@@ -363,16 +371,18 @@ public static class RemindersEndpoints
         if (await NotVisibleAsync(ledgers, currentUser, ledgerId, cancellationToken).ConfigureAwait(false) is { } gate)
             return gate;
 
+        if (request.Transaction.Tags is { } investmentTags
+            && TagValidation.ValidateTags(investmentTags) is { } tagsRejection)
+            return tagsRejection;
+
         var result = await reminders.CreateInvestmentAsync(ledgerId, request, cancellationToken).ConfigureAwait(false);
+        if (result.Refusal is { } refusal) return AnnotationProblem.Of(refusal);
+        if (result.Outcome == RemindersRepository.CreateOutcome.ShapeFailure)
+            return InvestmentFailureProblem(result.InvestmentFailure!.Value, result.InvestmentFailureDetail);
         await EnableAutoPostIfRequestedAsync(
                 ledgerId, request.AutoCommitDaysBefore, currentUser.UserId, schedules,
                 clock, cancellationToken)
             .ConfigureAwait(false);
-        if (result.Outcome == RemindersRepository.CreateOutcome.ShapeFailure)
-        {
-            var (code, message) = InvestmentTransactionsEndpoints.MapFailure(result.InvestmentFailure!.Value);
-            return BusinessError.Problem(code, message);
-        }
         return await CreatedDetailAsync(ledgerId, result.ReminderId!.Value, reminders, cancellationToken)
             .ConfigureAwait(false);
     }
@@ -396,30 +406,14 @@ public static class RemindersEndpoints
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var hasField = request.Rrule is not null || request.StartDate is not null
-            || request.ClearEndDate || request.EndDate is not null
-            || request.ClearAutoCommit || request.AutoCommitDaysBefore is not null
-            // Mig 220. Omitting these made a PATCH that only enables estimation read as
-            // an EMPTY patch and get rejected — the field existed on the DTO and was
-            // unreachable through the endpoint.
-            || request.ClearEstimate || request.EstimateSampleCount is not null
-            || request.Payee is not null || request.Memo is not null
-            || request.CheckNumber is not null || request.Postings is not null;
-        if (!hasField)
-            return BusinessError.Problem(BusinessError.Codes.ReminderPatchEmpty,
-                "Supply at least one recurrence field, a header field, or postings.");
-
-        if (request.Rrule is { } rrule && !expander.IsValidRrule(rrule))
-            return BusinessError.Problem(BusinessError.Codes.ReminderRruleInvalid, "rrule is not a valid RFC-5545 rule.");
-        if (request.EndDate is { } end && request.StartDate is { } start && end < start)
-            return BusinessError.Problem(BusinessError.Codes.ReminderEndBeforeStart, "endDate must be on or after startDate.");
-        if (request.AutoCommitDaysBefore is { } ac && ac < 0)
-            return BusinessError.Problem(BusinessError.Codes.ReminderAutoCommitNegative, "autoCommitDaysBefore must be >= 0.");
+        if (ValidateBankEdit(expander, request) is { } editRejection) return editRejection;
 
         if (request.Postings is { } postings)
         {
             if (PostingValidation.ValidatePostings(postings.Items, postings.SourceAccountId) is { } pr) return pr;
         }
+        if (request.Notes is { } notes && TagValidation.ValidateTags(notes.AllTagNames()) is { } tagsRejection)
+            return tagsRejection;
 
         if (await NotVisibleAsync(ledgers, currentUser, ledgerId, cancellationToken).ConfigureAwait(false) is { } gate)
             return gate;
@@ -430,15 +424,28 @@ public static class RemindersEndpoints
                     .ConfigureAwait(false))
                 return BusinessError.Problem(BusinessError.Codes.TransactionAccountIsInvestment,
                     "sourceAccountId is not a bank-shape account.");
+            // What the template ALREADY sits on, as the transaction PATCH passes its
+            // header's: an inactive account left where it is stays editable, one
+            // newly chosen is refused.
+            var alreadyReferenced = await reminders
+                .TemplateLegAccountIdsAsync(ledgerId, reminderId, cancellationToken)
+                .ConfigureAwait(false);
+            // The template's lines as stored, read before the save rebuilds them with new
+            // ids: a line resent as stored passes the places rule even when it does not fit
+            // its currency (ADR-0114 D15).
+            var stored = await reminders
+                .TemplateStoredPairsAsync(ledgerId, reminderId, postings2.SourceAccountId, cancellationToken)
+                .ConfigureAwait(false);
             if (await PostingValidation.ValidatePostingAccountsAsync(
-                    ledgerId, postings2.SourceAccountId, postings2.Items, accounts, cancellationToken)
+                    ledgerId, postings2.SourceAccountId, postings2.Items, accounts,
+                    cancellationToken, alreadyReferenced, stored, "postings.items")
                     .ConfigureAwait(false) is { } ar)
                 return ar;
         }
 
         var result = await reminders.EditBankAsync(ledgerId, reminderId, request, cancellationToken).ConfigureAwait(false);
-        await EnableAutoPostIfRequestedAsync(
-                ledgerId, request.AutoCommitDaysBefore, currentUser.UserId, schedules,
+        await EnableAutoPostIfSavedAsync(
+                ledgerId, result, request.AutoCommitDaysBefore, currentUser.UserId, schedules,
                 clock, cancellationToken)
             .ConfigureAwait(false);
         return await EditOutcomeResultAsync(ledgerId, reminderId, result, reminders, cancellationToken)
@@ -478,19 +485,20 @@ public static class RemindersEndpoints
         if (request.AutoCommitDaysBefore is { } ac && ac < 0)
             return BusinessError.Problem(BusinessError.Codes.ReminderAutoCommitNegative, "autoCommitDaysBefore must be >= 0.");
 
+        if (request.Transaction?.Tags is { } investmentTags
+            && TagValidation.ValidateTags(investmentTags) is { } tagsRejection)
+            return tagsRejection;
+
         if (await NotVisibleAsync(ledgers, currentUser, ledgerId, cancellationToken).ConfigureAwait(false) is { } gate)
             return gate;
 
         var result = await reminders.EditInvestmentAsync(ledgerId, reminderId, request, cancellationToken).ConfigureAwait(false);
-        await EnableAutoPostIfRequestedAsync(
-                ledgerId, request.AutoCommitDaysBefore, currentUser.UserId, schedules,
+        await EnableAutoPostIfSavedAsync(
+                ledgerId, result, request.AutoCommitDaysBefore, currentUser.UserId, schedules,
                 clock, cancellationToken)
             .ConfigureAwait(false);
         if (result.Outcome == RemindersRepository.EditOutcome.ShapeFailure)
-        {
-            var (code, message) = InvestmentTransactionsEndpoints.MapFailure(result.InvestmentFailure!.Value);
-            return BusinessError.Problem(code, message);
-        }
+            return InvestmentFailureProblem(result.InvestmentFailure!.Value, result.InvestmentFailureDetail);
         return await EditOutcomeResultAsync(ledgerId, reminderId, result, reminders, cancellationToken)
             .ConfigureAwait(false);
     }
@@ -608,9 +616,42 @@ public static class RemindersEndpoints
             : null;
     }
 
+    /// <summary>
+    /// The bank edit's request-shape checks, before anything is read: at least one field,
+    /// a valid rule, an end on or after a start sent with it, and auto-post days of zero or
+    /// more. Shared with the Demo's examples phase, which edits a reminder it created.
+    /// </summary>
+    internal static IResult? ValidateBankEdit(RecurrenceExpander expander, EditReminderRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(expander);
+        ArgumentNullException.ThrowIfNull(request);
+
+        var hasField = request.Rrule is not null || request.StartDate is not null
+            || request.ClearEndDate || request.EndDate is not null
+            || request.ClearAutoCommit || request.AutoCommitDaysBefore is not null
+            // Mig 220. Omitting these made a PATCH that only enables estimation read as
+            // an EMPTY patch and get rejected — the field existed on the DTO and was
+            // unreachable through the endpoint.
+            || request.ClearEstimate || request.EstimateSampleCount is not null
+            || request.Payee is not null || request.Notes is not null
+            || request.CheckNumber is not null || request.Postings is not null;
+        if (!hasField)
+            return BusinessError.Problem(BusinessError.Codes.ReminderPatchEmpty,
+                "Supply at least one recurrence field, a header field, or postings.");
+
+        if (request.Rrule is { } rrule && !expander.IsValidRrule(rrule))
+            return BusinessError.Problem(BusinessError.Codes.ReminderRruleInvalid, "rrule is not a valid RFC-5545 rule.");
+        if (request.EndDate is { } end && request.StartDate is { } start && end < start)
+            return BusinessError.Problem(BusinessError.Codes.ReminderEndBeforeStart, "endDate must be on or after startDate.");
+        if (request.AutoCommitDaysBefore is { } ac && ac < 0)
+            return BusinessError.Problem(BusinessError.Codes.ReminderAutoCommitNegative, "autoCommitDaysBefore must be >= 0.");
+        return null;
+    }
+
     /// <summary>Shared recurrence-field shape validation for the two create
-    /// paths (rrule valid + start present + end ≥ start + autocommit ≥ 0).</summary>
-    private static IResult? ValidateRecurrence(
+    /// paths (rrule valid + start present + end ≥ start + autocommit ≥ 0), and for the
+    /// Demo's examples phase, which creates a reminder as the bank create does.</summary>
+    internal static IResult? ValidateRecurrence(
         RecurrenceExpander expander, string rrule, DateOnly startDate, DateOnly? endDate, int? autoCommitDaysBefore)
     {
         if (!expander.IsValidRrule(rrule))
@@ -625,8 +666,82 @@ public static class RemindersEndpoints
     }
 
     /// <summary>
+    /// Reject an estimate the series cannot honour (migration 220). Shared with the Demo's
+    /// examples phase, which creates a reminder as the bank create does.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Server-side on every write path, not hidden in the UI.</b> The SPA hides the
+    /// control too, but a hidden control is a courtesy and this is the invariant: the
+    /// resolver refuses to produce an estimate for these shapes, so storing the flag
+    /// would leave a reminder configured to estimate and permanently unable to.
+    /// </para>
+    /// <para>
+    /// <b>Two exclusions, one predicate.</b> A SPLIT has no single amount to estimate —
+    /// distributing one averaged number across several postings would need an invented
+    /// rule for which leg absorbs the difference. A LOAN payment is computed from its
+    /// terms and balance, which is real information; letting an average of the
+    /// last three override it is a straight downgrade, and two overrides racing for one
+    /// field is how one silently wins.
+    /// </para>
+    /// <para>
+    /// Rejected rather than silently dropped, for the reason auto-post had to be fixed: a
+    /// control that accepts input and does nothing with it is worse than one that refuses.
+    /// </para>
+    /// </remarks>
+    /// <param name="postingCount">
+    /// Null when the request does not touch postings — on a PATCH that means the stored
+    /// template stands, so the caller supplies its posting count instead.
+    /// </param>
+    internal static IResult? RejectIneligibleEstimate(
+        int? estimateSampleCount, int? postingCount, bool isLoanReminder)
+    {
+        if (estimateSampleCount is not { } n) return null;
+
+        if (n is < 1 or > 24)
+        {
+            return BusinessError.Problem(
+                BusinessError.Codes.ReminderEstimateRangeInvalid,
+                "estimateSampleCount must be between 1 and 24.");
+        }
+
+        if (isLoanReminder)
+        {
+            return BusinessError.Problem(
+                BusinessError.Codes.ReminderEstimateNotEligible,
+                "A loan reminder's amount is computed from the loan's terms and balance, "
+                + "so it cannot be estimated from past occurrences.");
+        }
+
+        if (postingCount is { } count && count > 1)
+        {
+            return BusinessError.Problem(
+                BusinessError.Codes.ReminderEstimateNotEligible,
+                "A reminder with a split has no single amount to estimate. Remove the "
+                + "split, or set the amount manually.");
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Enables the auto-post job for an edit that was saved. A refused edit writes
+    /// nothing: the job is saved through the request's database context, which still
+    /// tracks what the refused edit had changed before it was refused, so enabling it
+    /// then would save those changes too.
+    /// </summary>
+    private static Task EnableAutoPostIfSavedAsync(
+        Guid ledgerId, RemindersRepository.EditReminderResult result, int? autoCommitDaysBefore,
+        Guid configuredByUserId, SchedulesRepository schedules, TimeProvider clock,
+        CancellationToken cancellationToken) =>
+        result.Outcome == RemindersRepository.EditOutcome.Ok
+            ? EnableAutoPostIfRequestedAsync(
+                ledgerId, autoCommitDaysBefore, configuredByUserId, schedules, clock, cancellationToken)
+            : Task.CompletedTask;
+
+    /// <summary>
     /// A reminder asking to be auto-posted turns the ledger's auto-post job ON, if it is
-    /// not configured yet.
+    /// not configured yet. Called only once the reminder's own write has been saved.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -643,88 +758,27 @@ public static class RemindersEndpoints
     /// <para>
     /// Called on the four write paths that can set the field (bank/investment ×
     /// create/edit) rather than inside the repository, so the coupling from reminders to
-    /// scheduling is visible at the call site instead of buried in a write.
+    /// scheduling is visible at the call site instead of buried in a write. A Moneydance
+    /// import that brings such a reminder does the same, inside its own transaction
+    /// (<see cref="Import.ReminderAutoPostOnImport"/>), and so does the Demo's examples
+    /// phase after the reminder it creates.
     /// </para>
     /// </remarks>
-    /// <summary>
-    /// Reject an estimate the series cannot honour (migration 220).
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// <b>Server-side on every write path, not hidden in the UI.</b> The SPA hides the
-    /// control too, but a hidden control is a courtesy and this is the invariant: the
-    /// resolver refuses to produce an estimate for these shapes, so storing the flag
-    /// would leave a reminder configured to estimate and permanently unable to.
-    /// </para>
-    /// <para>
-    /// <b>Two exclusions, one predicate.</b> A SPLIT has no single amount to estimate —
-    /// distributing one averaged number across several postings would need an invented
-    /// rule for which leg absorbs the difference. A LOAN payment is computed from its
-    /// terms and current balance, which is real information; letting an average of the
-    /// last three override it is a straight downgrade, and two overrides racing for one
-    /// field is how one silently wins.
-    /// </para>
-    /// <para>
-    /// Rejected rather than silently dropped, for the reason auto-post had to be fixed: a
-    /// control that accepts input and does nothing with it is worse than one that refuses.
-    /// </para>
-    /// </remarks>
-    /// <param name="postingCount">
-    /// Null when the request does not touch postings — on a PATCH that means the stored
-    /// template stands, so the caller supplies its posting count instead.
-    /// </param>
-    private static IResult? RejectIneligibleEstimate(
-        int? estimateSampleCount, int? postingCount, bool isLoanReminder)
-    {
-        if (estimateSampleCount is not { } n) return null;
-
-        if (n is < 1 or > 24)
-        {
-            return BusinessError.Problem(
-                BusinessError.Codes.ReminderEstimateRangeInvalid,
-                "estimateSampleCount must be between 1 and 24.");
-        }
-
-        if (isLoanReminder)
-        {
-            return BusinessError.Problem(
-                BusinessError.Codes.ReminderEstimateNotEligible,
-                "A loan reminder's amount is computed from the loan's terms and current "
-                + "balance, so it cannot be estimated from past occurrences.");
-        }
-
-        if (postingCount is { } count && count > 1)
-        {
-            return BusinessError.Problem(
-                BusinessError.Codes.ReminderEstimateNotEligible,
-                "A reminder with a split has no single amount to estimate. Remove the "
-                + "split, or set the amount manually.");
-        }
-
-        return null;
-    }
-
-    private static Task EnableAutoPostIfRequestedAsync(
+    internal static Task EnableAutoPostIfRequestedAsync(
         Guid ledgerId, int? autoCommitDaysBefore, Guid configuredByUserId,
         SchedulesRepository schedules, TimeProvider clock,
         CancellationToken cancellationToken) =>
         autoCommitDaysBefore is null
             ? Task.CompletedTask
             : schedules.EnsureCreatedEnabledAsync(
-                ledgerId, JobTypes.ReminderAutoPost, AutoPostDefaultHour,
+                ledgerId, JobTypes.ReminderAutoPost, ScheduleDefaults.ReminderAutoPostHour,
                 configuredByUserId, clock.GetUtcNow().UtcDateTime, cancellationToken);
-
-    /// <summary>
-    /// 05:00 local. After the 03:00 snapshot, so that is a stable pre-dawn picture taken
-    /// before the day's reminders land, and before the 06:00 feed sync, so the day's
-    /// reminders exist before bank data arrives or anyone looks at a balance.
-    /// </summary>
-    private const int AutoPostDefaultHour = 5;
 
     private static async Task<IResult> CreatedDetailAsync(
         Guid ledgerId, Guid reminderId, RemindersRepository reminders, CancellationToken ct)
     {
-        var detail = await reminders.GetDetailAsync(ledgerId, reminderId, ct).ConfigureAwait(false);
+        // A write's echo: a loan split, if any, is priced for the next due occurrence.
+        var detail = await reminders.GetDetailAsync(ledgerId, reminderId, occurrenceDate: null, ct).ConfigureAwait(false);
         return Results.Created($"/api/ledgers/{ledgerId}/reminders/{reminderId}", detail);
     }
 
@@ -732,8 +786,10 @@ public static class RemindersEndpoints
         Guid ledgerId, Guid reminderId, RemindersRepository.EditReminderResult result,
         RemindersRepository reminders, CancellationToken ct) => result.Outcome switch
     {
+        RemindersRepository.EditOutcome.NotesRefused => AnnotationProblem.Of(result.Refusal!),
+        RemindersRepository.EditOutcome.PostingRefused => PostingProblem(result.PostingRefusal!),
         RemindersRepository.EditOutcome.Ok =>
-            Results.Ok(await reminders.GetDetailAsync(ledgerId, reminderId, ct).ConfigureAwait(false)),
+            Results.Ok(await reminders.GetDetailAsync(ledgerId, reminderId, occurrenceDate: null, ct).ConfigureAwait(false)),
         RemindersRepository.EditOutcome.NotFound =>
             BusinessError.Problem(BusinessError.Codes.ReminderNotInLedger, "Reminder not found in this ledger."),
         RemindersRepository.EditOutcome.NotMaterialized =>
@@ -745,11 +801,21 @@ public static class RemindersEndpoints
         RemindersRepository.EditOutcome.EndBeforeStart =>
             BusinessError.Problem(BusinessError.Codes.ReminderEndBeforeStart,
                 "The resulting endDate would be before startDate."),
+        RemindersRepository.EditOutcome.PostingLegNotInTemplate =>
+            BusinessError.Problem(BusinessError.Codes.TransactionPostingLegNotInHeader,
+                "A posting's legId is not the id of a line's leg on this reminder's source account."),
+        RemindersRepository.EditOutcome.PostingLegIdDuplicated =>
+            BusinessError.Problem(BusinessError.Codes.TransactionPostingLegIdDuplicated,
+                "Two postings carry the same legId. Each posting must name a distinct line, or omit legId to add a new one."),
+        RemindersRepository.EditOutcome.SourceImmutable =>
+            BusinessError.Problem(BusinessError.Codes.ReminderSourceImmutable,
+                "A reminder's source account is set when the reminder is created and cannot be "
+                + "changed by an edit."),
         RemindersRepository.EditOutcome.EstimateNotEligible =>
             BusinessError.Problem(BusinessError.Codes.ReminderEstimateNotEligible,
                 "Only a single-posting, non-loan reminder can estimate its amount. A "
                 + "split has no single amount to estimate, and a loan payment is computed "
-                + "from its terms and current balance."),
+                + "from its terms and balance."),
         _ => Results.StatusCode(500),
     };
 }

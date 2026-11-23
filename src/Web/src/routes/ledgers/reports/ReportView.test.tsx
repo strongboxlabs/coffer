@@ -1,10 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 import type { ReportSpec } from '@/types/report';
 
-import { periodsOf, pivot, specFromSearch } from './ReportView';
+import { chartRowsOf, periodsOf, pivot, specFromSearch } from './ReportView';
 import { RangePicker, describeRange } from './RangePicker';
 
 describe('specFromSearch', () => {
@@ -60,6 +60,25 @@ describe('describeRange', () => {
 
         expect(aligned).toBe('Last 3 months');
         expect(rolling).not.toBe(aligned);
+    });
+
+    it.each([
+        // Aligned: whole periods, the current one to date among them.
+        [6, 'Month', true, 'Last 6 months'],
+        [2, 'Quarter', true, 'Last 2 quarters'],
+        [5, 'Year', true, 'Last 5 years'],
+        [1, 'Month', true, 'Month to date'],
+        [1, 'Quarter', true, 'Quarter to date'],
+        // Rolling: back from this instant, to the day.
+        [6, 'Month', false, 'Last 6 months (to the day)'],
+        [2, 'Year', false, 'Last 2 years (to the day)'],
+        [1, 'Month', false, 'Last 1 month (to the day)'],
+        // In days the two are one window.
+        [7, 'Day', true, 'Last 7 days'],
+        [7, 'Day', false, 'Last 7 days'],
+        [1, 'Day', true, 'Today'],
+    ] as const)('reads %i %s, aligned %s, as "%s"', (windowCount, windowUnit, windowAlign, expected) => {
+        expect(describeRange({ ...base, windowCount, windowUnit, windowAlign })).toBe(expected);
     });
 
     it('reads out a fixed range as its dates', () => {
@@ -124,18 +143,118 @@ describe('RangePicker', () => {
             to: `${year + 1}-01-01T00:00:00Z`,
         }));
     });
+
+    // Esc dismisses it (ADR-0023 §L), marked and stopped as a list's is (§F),
+    // so a dialog or page around it never acts on the same Esc; and focus goes
+    // back to its button however it closes.
+    describe('on Escape', () => {
+        function renderInside() {
+            const parentEscapes: boolean[] = [];
+            render(
+                <div onKeyDown={(e) => { if (e.key === 'Escape') parentEscapes.push(e.defaultPrevented); }}>
+                    <RangePicker spec={spec} onChange={vi.fn()} />
+                </div>,
+            );
+            return {
+                parentEscapes,
+                toggle: () => screen.getByRole('button', { name: /last 12 months/i }),
+                isOpen: () => screen.queryByText('Fixed') !== null,
+            };
+        }
+
+        it('closes from its button, stopped, and lets the next Escape go on unmarked', async () => {
+            const user = userEvent.setup();
+            const { parentEscapes, toggle, isOpen } = renderInside();
+            await user.click(toggle());
+            expect(isOpen()).toBe(true);
+
+            await user.keyboard('{Escape}');
+
+            expect(isOpen()).toBe(false);
+            expect(parentEscapes).toEqual([]);
+            expect(toggle()).toHaveFocus();
+
+            await user.keyboard('{Escape}');
+            expect(parentEscapes).toEqual([false]);
+        });
+
+        it('closes from inside, stopped, and gives focus back to its button', async () => {
+            const user = userEvent.setup();
+            const { parentEscapes, toggle, isOpen } = renderInside();
+            await user.click(toggle());
+            act(() => screen.getByRole('button', { name: 'Last 3 months' }).focus());
+
+            await user.keyboard('{Escape}');
+
+            expect(isOpen()).toBe(false);
+            expect(parentEscapes).toEqual([]);
+            expect(toggle()).toHaveFocus();
+        });
+
+        it('closes on an Escape pressed with focus on the page', async () => {
+            const user = userEvent.setup();
+            const { toggle, isOpen } = renderInside();
+            await user.click(toggle());
+            act(() => (document.activeElement as HTMLElement | null)?.blur());
+
+            await user.keyboard('{Escape}');
+
+            expect(isOpen()).toBe(false);
+        });
+
+        it('gives focus back to its button when a range is picked', async () => {
+            const user = userEvent.setup();
+            const { toggle, isOpen } = renderInside();
+            await user.click(toggle());
+
+            await user.click(screen.getByRole('button', { name: 'Last 3 months' }));
+
+            expect(isOpen()).toBe(false);
+            expect(toggle()).toHaveFocus();
+        });
+    });
+
+    // "Custom dates…" gives way to the two date fields. The button that held
+    // focus goes with it, so focus goes on to the first date (ADR-0023 §L), and
+    // the next Escape is still the popover's.
+    describe('Custom dates…', () => {
+        it.each([
+            { how: 'Enter', press: (user: ReturnType<typeof userEvent.setup>, button: HTMLElement) => {
+                act(() => button.focus());
+                return user.keyboard('{Enter}');
+            } },
+            { how: 'a click', press: (user: ReturnType<typeof userEvent.setup>, button: HTMLElement) =>
+                user.click(button) },
+        ])('moves focus to the first date on $how, and Escape there gives it back to the button', async ({ press }) => {
+            const user = userEvent.setup();
+            render(<RangePicker spec={spec} onChange={vi.fn()} />);
+            const toggle = screen.getByRole('button', { name: /last 12 months/i });
+            await user.click(toggle);
+
+            await press(user, screen.getByRole('button', { name: 'Custom dates…' }));
+
+            expect(screen.getByLabelText('Range from')).toHaveFocus();
+
+            await user.keyboard('{Escape}');
+
+            expect(screen.queryByLabelText('Range from')).toBeNull();
+            expect(toggle).toHaveFocus();
+        });
+    });
 });
 
 describe('pivot', () => {
+    // Nesting comes from parentId; the path only orders. A group's path is its own
+    // name unless a test gives it one.
     const cell = (
         groupId: string, groupName: string, parentId: string | null, amount: number,
-    ) => ({ period: null, groupId, groupName, parentId, amount });
+        groupPath: string[] = [groupName],
+    ) => ({ period: null, groupId, groupName, groupPath, parentId, amount, currencyCode: 'USD' });
 
     it('nests to any depth, not just two levels', () => {
-        // The bug this exists for: the walk handled roots and their direct
-        // children, and everything deeper was appended at the END with child
-        // styling — so on a real ledger many unrelated categories appeared
-        // beneath whichever parent happened to be last.
+        // A walk that handles only roots and their direct children appends
+        // everything deeper at the END with child styling — so unrelated
+        // categories appear beneath whichever parent happens to be last.
         const rows = pivot([
             cell('leaf', 'Hotels', 'mid', 10),
             cell('root', 'Personal', null, 100),
@@ -150,9 +269,9 @@ describe('pivot', () => {
     });
 
     it('treats a row whose parent is absent as top level', () => {
-        // Ordering and indentation used to disagree here: this function
-        // called it a root, the renderer checked parentId === null and drew
-        // it indented, so it looked like a child of the row above.
+        // Ordering and indentation must agree here: if this function calls it
+        // a root while the renderer checks parentId === null and draws it
+        // indented, it looks like a child of the row above.
         const rows = pivot([
             cell('a', 'Alpha', null, 1),
             cell('orphan', 'Zeta', 'not-in-result', 2),
@@ -171,6 +290,33 @@ describe('pivot', () => {
         expect(rows.map((r) => r.name)).toEqual(['Parent', 'Alpha', 'Beta']);
     });
 
+    it('sorts the top level by the whole path, which is what a top-level subcategory shows', () => {
+        // Flat, a subcategory whose parent has no row is at the top level, named
+        // "Name B/Name Z". By its own name it would sort after "Name C".
+        const rows = pivot([
+            cell('c', 'Name C', null, 1),
+            cell('z', 'Name Z', 'b', 1, ['Name B', 'Name Z']),
+            cell('a', 'Name A', null, 1),
+        ]);
+
+        expect(rows.map((r) => r.path.join('/'))).toEqual(['Name A', 'Name B/Name Z', 'Name C']);
+    });
+
+    it('never adds a figure with a missing rate as zero, and gives a chart no rows from it', () => {
+        const missing = { fromCurrency: 'EUR', toCurrency: 'USD', date: '2026-01-30', reason: 'rate_unavailable' as const };
+        const rows = pivot([
+            { period: '2026-01', groupId: 'a', groupName: 'Alpha', groupPath: ['Alpha'], parentId: null, currencyCode: 'USD', amount: 10 },
+            { period: '2026-02', groupId: 'a', groupName: 'Alpha', groupPath: ['Alpha'], parentId: null, currencyCode: 'USD', amount: null, rateUnavailable: [missing] },
+        ]);
+
+        expect(rows[0]!.total).toBeNull();
+        expect(rows[0]!.byPeriod.get('2026-01')).toBe(10);
+        expect(rows[0]!.byPeriod.get('2026-02')).toBeNull();
+        expect(rows[0]!.rateUnavailable).toEqual([missing]);
+        expect(chartRowsOf(rows)).toBeNull();
+        expect(chartRowsOf(pivot([cell('b', 'Beta', null, 3)]))).toHaveLength(1);
+    });
+
     it('still shows a row caught in a cycle rather than dropping it', () => {
         // A cycle cannot be reached from the root walk. Dropping those rows
         // would leave a report whose total counts money no line accounts for.
@@ -186,13 +332,13 @@ describe('pivot', () => {
 
 describe('periodsOf', () => {
     const row = (period: string, amount: number) => ({
-        period, groupId: 'g', groupName: 'G', parentId: null, amount,
+        period, groupId: 'g', groupName: 'G', groupPath: ['G'], parentId: null, amount, currencyCode: 'USD',
     });
 
     it('keeps a month with no activity as a column', () => {
-        // The bug: the axis came from the rows, so a quiet month produced no
-        // column at all — the gap read as "no column" rather than as zero, and
-        // the months either side of it then looked adjacent when they are not.
+        // An axis taken from the rows gives a quiet month no column at all —
+        // the gap reads as "no column" rather than as zero, and the months
+        // either side of it then look adjacent when they are not.
         const periods = periodsOf(
             [row('2026-01', 10), row('2026-03', 20)],
             'Month',
@@ -217,11 +363,15 @@ describe('periodsOf', () => {
         expect(periods).toEqual(['2026-01', '2026-02', '2026-03', '2026-04']);
     });
 
-    it('labels quarters and years the way the server does', () => {
+    it('labels quarters and years the way the server does, the end exclusive', () => {
+        // A window ending at the first instant of Q3 holds no Q3, as the server's
+        // own per-period totals say.
         expect(periodsOf([], 'Quarter', '2026-01-01T00:00:00Z', '2026-07-01T00:00:00Z'))
-            .toEqual(['2026-Q1', '2026-Q2', '2026-Q3']);
+            .toEqual(['2026-Q1', '2026-Q2']);
         expect(periodsOf([], 'Year', '2024-01-01T00:00:00Z', '2026-01-01T00:00:00Z'))
-            .toEqual(['2024', '2025', '2026']);
+            .toEqual(['2024', '2025']);
+        expect(periodsOf([], 'Month', '2026-01-01T00:00:00Z', '2026-03-12T00:00:00Z'))
+            .toEqual(['2026-01', '2026-02', '2026-03']);
     });
 
     it('falls back to the periods present when the range is open-ended', () => {

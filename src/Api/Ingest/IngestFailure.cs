@@ -28,14 +28,22 @@ public enum IngestFailureReason
     /// </summary>
     /// <remarks>
     /// Returned rather than thrown, and that is the whole point of this member. A
-    /// <c>SimpleFinException</c> used to escape <c>RunPullAsync</c> — so a single sync
-    /// answered 500 (the orchestrator's own comment claimed 422; nothing mapped it), and
-    /// worse, sync-all aborted its entire loop on the first unreachable bank, silently
-    /// skipping every other connection on the ledger. That contradicted
-    /// <c>SyncAllAsync</c>'s own documented promise that "per-connection failures
+    /// <c>SimpleFinException</c> escaping <c>RunPullAsync</c> would answer a single sync
+    /// with 500, and worse, abort sync-all's entire loop on the first unreachable bank,
+    /// silently skipping every other connection on the ledger — against
+    /// <c>SyncAllAsync</c>'s documented promise that "per-connection failures
     /// shouldn't cascade".
     /// </remarks>
     ProviderFault,
+    /// <summary>
+    /// Another write to the ledger held its write lock (migration 275) past the wait, so
+    /// the run's save was refused: nothing it fetched was saved, the run is closed as
+    /// failed, and no account's watermark moved, so the next sync fetches the same window
+    /// again.
+    /// </summary>
+    /// <remarks>Returned rather than thrown, as <see cref="ProviderFault"/> is, so sync-all
+    /// and the scheduled sync carry on to the next connection.</remarks>
+    LedgerBusy,
 }
 
 /// <summary>

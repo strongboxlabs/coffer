@@ -46,8 +46,21 @@ public static class NotificationTopics
     public const string Consistency = "consistency";
     public const string Scheduler = "scheduler";
 
+    /// <summary>
+    /// An available release (migration 272, ADR-0110). Deployment scope only, and the one
+    /// topic a destination must NAME to receive: see <see cref="OptIn"/>.
+    /// </summary>
+    public const string Upgrade = "upgrade";
+
     public static readonly IReadOnlyList<string> All =
-        [Backup, Snapshot, Sync, Quotes, Consistency, Scheduler];
+        [Backup, Snapshot, Sync, Quotes, Consistency, Scheduler, Upgrade];
+
+    /// <summary>
+    /// Topics a destination receives only by choosing them. A destination with no topic
+    /// filter means "every topic" everywhere else, so a new warning-level topic would reach
+    /// every existing webhook and monitor unasked. These are excluded from "every topic".
+    /// </summary>
+    public static readonly IReadOnlyList<string> OptIn = [Upgrade];
 }
 
 /// <summary>
@@ -79,10 +92,8 @@ public static class NotificationTopics
 /// </param>
 /// <remarks>
 /// <para>
-/// Used by BOTH scopes. This remark previously said ledger-scope events were not this
-/// type and belonged to <c>ledger_operations</c>; migration 208 created
-/// <c>ledger_events</c> and <c>PublishLedgerAsync</c> publishes exactly this record to
-/// it, so the note described the design before the split rather than after it.
+/// Used by BOTH scopes: <c>PublishLedgerAsync</c> publishes exactly this record to
+/// <c>ledger_events</c> (migration 208), not to <c>ledger_operations</c>.
 /// </para>
 /// <para>
 /// What IS still true is that the two scopes never share a TABLE (ADR-0096 D1): a
@@ -129,9 +140,9 @@ public enum MonitorSignal
 /// A closed list rather than free text, because coverage is a QUESTION ASKED OF IT:
 /// "which of these has somebody watching for its absence, and which is silently
 /// unmonitored?" Free-text keys would make an unmonitored job indistinguishable from a
-/// typo, and the old code asked something weaker and wrong — whether ANY heartbeat
-/// subscriber existed at all, then reported absence detection as covered. One URL bound
-/// to backups says nothing about snapshots.
+/// typo, and the weaker question — whether ANY heartbeat subscriber exists at all —
+/// reports absence detection as covered when it is not. One URL bound to backups says
+/// nothing about snapshots.
 /// </remarks>
 public static class NotificationMonitors
 {
@@ -185,21 +196,19 @@ public static class NotificationMonitors
     /// watches would need a mapping table nobody would keep in step.
     /// </para>
     /// <para>
-    /// <see cref="Consistency"/> is the exception, and the exception is the point. An
-    /// earlier version of this list was asserted to equal <c>JobTypes.All</c> exactly,
-    /// which was right while every monitor was a job and wrong as soon as something worth
-    /// watching was not one. The invariant is now one-directional — every job type has a
-    /// monitor — plus this explicitly declared non-job monitor, which is weaker and
-    /// honest rather than tidy and false.
+    /// <see cref="Consistency"/> is the exception, and the exception is the point.
+    /// Asserting this list equal to <c>JobTypes.All</c> holds only while every monitor
+    /// is a job, and fails as soon as something worth watching is not one. The invariant
+    /// is one-directional — every job type has a monitor — plus this explicitly declared
+    /// non-job monitor, which is weaker and honest rather than tidy and false.
     /// </para>
     /// <para>
     /// Declared as an ordered array rather than derived from <c>JobTypes.All</c>, which
     /// is an unordered <c>HashSet</c> — deriving it would give a nondeterministically
     /// ordered dropdown and coverage map. <c>MonitorScopeTests</c> pins the invariant the
     /// paragraph above describes: every job type appears here, and the monitors that are
-    /// NOT jobs are an explicit allow-list. (This sentence used to claim the test asserted
-    /// set EQUALITY, which flatly contradicted the paragraph above it once the consistency
-    /// monitor arrived.) So adding a job type without a monitor fails loudly instead of
+    /// NOT jobs are an explicit allow-list — not set equality. So adding a job type without
+    /// a monitor fails loudly instead of
     /// shipping a job nothing can watch.
     /// </para>
     /// </remarks>

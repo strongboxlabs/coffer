@@ -8,11 +8,10 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// Grouping by category KIND — the cash-flow dimension (FU-008 #3).
 /// </summary>
 /// <remarks>
-/// <para>Money in against money out, per period. It needed a dimension of its
-/// own because the kind was computed and then discarded: every cell already
-/// carried it, since the MEASURE is an allow-list over it, but nothing could
-/// group BY it. The first attempt shipped as "Cash flow" grouped by CATEGORY —
-/// which is net-per-category under a familiar name — and was withdrawn.</para>
+/// <para>Money in against money out, per period. It needs a dimension of its
+/// own: every cell carries the kind, since the MEASURE is an allow-list over it,
+/// but grouping BY it is a separate dimension. "Cash flow" grouped by CATEGORY
+/// would be net-per-category under a familiar name.</para>
 ///
 /// <para>The tests that matter here are about SIGNS. Income legs are stored
 /// negative and expense legs positive, and <c>Net</c> negates uniformly without
@@ -20,17 +19,18 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// and expenses with the same sign and be useless, or worse, plausible.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class CashFlowDimensionTests
+public sealed class CashFlowDimensionTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public CashFlowDimensionTests(PostgresFixture fixture) => _fixture = fixture;
+    public CashFlowDimensionTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static readonly DateTime May = new(2026, 5, 15, 12, 0, 0, DateTimeKind.Utc);
 
     private async Task<Guid> SeedAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var salary = await ledger.AddCategoryAsync("Salary", "income");
         var bonus = await ledger.AddCategoryAsync("Bonus", "income");
@@ -50,7 +50,7 @@ public sealed class CashFlowDimensionTests
 
     private Task<ReportResult> RunAsync(Guid ledgerId, ReportMeasure measure,
         ReportTimeBucket bucket = ReportTimeBucket.None) =>
-        new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System).SummarizeAsync(new ReportSpec
+        new ReportingRepository(Db.NewDbContext(), TimeProvider.System).SummarizeAsync(new ReportSpec
         {
             LedgerId = ledgerId,
             Measure = measure,

@@ -58,19 +58,26 @@ public sealed record PayeeSuggestion(
 /// A transaction is a list of these — single-row when N=1, split
 /// when N>1. Sign convention matches the register's signed Amount
 /// column: <see cref="Amount"/> is on the source-side leg (the
-/// account being viewed); the server writes the paired counterparty
-/// leg's amount as <c>-Amount</c> so each posting sums to zero per
-/// ADR-0019.
+/// account being viewed). The counterparty leg's amount is
+/// <c>-Amount</c>, so the posting sums to zero (ADR-0019), except on a
+/// posting between two real accounts in different currencies, whose
+/// counterparty leg is <see cref="CounterpartyAmount"/> in its own
+/// account's currency (ADR-0114 D13).
 /// </summary>
 public sealed class TransactionPosting
 {
     /// <summary>
     /// PATCH only: the existing source-side leg id this posting
     /// preserves. When the value matches an existing leg on the
-    /// header, that posting is kept (counterparty / amount /
-    /// memo updated as supplied). When <c>null</c> or unmatched,
-    /// a new posting is created. On <c>POST</c> this is always
-    /// ignored.
+    /// header, that posting is kept (counterparty and amount updated
+    /// as supplied). When <c>null</c>, a new posting is created. An id
+    /// that matches no source-side leg of the header, or that two
+    /// postings share, is refused with 422 and nothing is written.
+    /// On <c>POST</c> this is always ignored. A bank reminder edit
+    /// reads it the same way for the template's lines
+    /// (<see cref="EditReminderRequest.Postings"/>), with one
+    /// difference: each reminder save rebuilds the template's legs
+    /// with new ids, so an id read before a save is refused after it.
     /// </summary>
     public Guid? LegId { get; init; }
     /// <summary>
@@ -81,29 +88,31 @@ public sealed class TransactionPosting
     /// </summary>
     public Guid CounterpartyAccountId { get; init; }
     /// <summary>
-    /// Signed amount on the source-side leg. Negative = outflow.
-    /// Zero rejected (silently meaningless posting).
+    /// Signed amount on the source-side leg, in the source account's currency (a
+    /// category's leg in the real side's). Negative = outflow. Checked at that
+    /// currency's places (ADR-0114 D15): a typed figure with more is refused with
+    /// <c>amount-places-exceed-currency</c>, and one resent equal to its stored leg passes.
     /// </summary>
     public decimal Amount { get; init; }
+
     /// <summary>
-    /// Optional per-posting memo (MD's <c>split.desc</c>).
-    /// Distinct from the header memo.
+    /// The counterparty leg's own amount, signed, in the counterparty account's currency,
+    /// on a posting between two real accounts in different currencies (ADR-0114 D13). It
+    /// is required there, nonzero and opposite in sign to <see cref="Amount"/>
+    /// (<c>transaction-posting-counterparty-amount-required</c>,
+    /// <c>transaction-posting-two-amounts-nonzero</c>,
+    /// <c>transaction-posting-two-amounts-sign</c>), and checked at the counterparty's
+    /// places. Like the places rule, the nonzero and sign rules check only a pair the
+    /// write changes: a pair resent equal to its two stored legs, on the same accounts,
+    /// passes them, so a mirrored zero pair a move or a currency edit left across
+    /// currencies can still be edited. On a posting with a category, or between accounts
+    /// in one currency, it is dropped: that leg is <c>-Amount</c>.
     /// </summary>
-    public string? LegMemo { get; init; }
-    /// <summary>
-    /// Tags on THIS posting (ADR-0103). Distinct from the header's
-    /// <c>tags</c>, and not a subset of them: a header tag is a claim
-    /// about the transaction (<i>Holiday</i>), this is a claim about one
-    /// posting (<i>Property B</i>). Same case-insensitive
-    /// create-on-first-use semantics, resolved against the same ledger
-    /// dictionary.
-    /// <para>Omitted / null leaves this posting's tags ALONE on PATCH;
-    /// <c>[]</c> clears them. That split matters because the postings list
-    /// is replaced wholesale — a client that does not know about leg tags
-    /// must not silently strip them by echoing back the postings it
-    /// read.</para>
-    /// </summary>
-    public IReadOnlyList<string>? Tags { get; init; }
+    public decimal? CounterpartyAmount { get; init; }
+
+    // A posting carries shape only. Its memo and tags are a line's notes, sent in the
+    // body's `notes.lines` by index, so a client that echoes back the postings it read
+    // cannot strip or overwrite them by omission.
 }
 
 /// <summary>
@@ -120,7 +129,6 @@ public sealed class CreateTransactionRequest
 {
     public DateTime PostedAt { get; init; }
     public string? Payee { get; init; }
-    public string? Memo { get; init; }
     /// <summary>
     /// Optional check number — short free-text matching what MD writes
     /// to <c>txn.chk</c>. Persisted on the new header.
@@ -135,22 +143,23 @@ public sealed class CreateTransactionRequest
     /// </summary>
     public Guid SourceAccountId { get; init; }
     /// <summary>
-    /// One or more postings. The schema's sum-to-zero invariant is
-    /// per-posting (each <c>(source, counterparty)</c> pair sums
-    /// to zero), not across the transaction; the total of the
-    /// transaction is whatever the postings sum to.
+    /// One or more postings. Each <c>(source, counterparty)</c> pair
+    /// sums to zero, except a pair between real accounts in different
+    /// currencies, which sums to zero within neither and carries both
+    /// amounts (ADR-0114 D13). The total of the transaction is whatever
+    /// the source-side amounts sum to.
     /// </summary>
     public IReadOnlyList<TransactionPosting> Postings { get; init; }
         = Array.Empty<TransactionPosting>();
 
     /// <summary>
-    /// Slice 2c.6b: tags to attach to the new header. Same
-    /// case-insensitive create-on-first-use semantics as the PATCH
-    /// surface. Omitted / null / <c>[]</c> all produce a no-tags
-    /// transaction (the editor sends an empty list when the user
-    /// added no tags, never the omitted form).
+    /// The memo and tags, written from <see cref="TransactionNotesRequest.Side"/>,
+    /// which must be <see cref="SourceAccountId"/>. On one posting they are that side's
+    /// own; on several, the whole transaction's, with per-line notes in
+    /// <c>lines</c>. Omitted: a transaction with no notes.
     /// </summary>
-    public IReadOnlyList<string>? Tags { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public TransactionNotesRequest? Notes { get; init; }
 }
 
 /// <summary>
@@ -192,10 +201,10 @@ public sealed class PatchTransactionRequest
     // ------------------------------------------------------------------
     // Header fields: PRESENCE decides, not nullness (migration 230).
     //
-    // These used to mean "null = leave this column alone", which made a
-    // CLEARED field unreachable: the editor sends null for an emptied payee
-    // and the server read it as "no change", so the old text came straight
-    // back. You could not clear a payee, memo or check number on a bank row.
+    // "null = leave this column alone" would make a CLEARED field
+    // unreachable: the editor sends null for an emptied payee and the server
+    // would read it as "no change", so the old text comes straight back and a
+    // payee, memo or check number on a bank row cannot be cleared.
     //
     // System.Text.Json calls a property's setter only when the JSON carries
     // the key, so the setter itself is the presence signal — an omitted key
@@ -207,16 +216,18 @@ public sealed class PatchTransactionRequest
     // caller that names one field keeps working unchanged, and no caller has
     // to send a whole header block to edit one column.
     // ------------------------------------------------------------------
-    // WhenWritingNull on each of the five: the server only ever DESERIALIZES
+    // WhenWritingNull on each of the four: the server only ever DESERIALIZES
     // this type, but tests and any .NET client serialize it, and
     // System.Text.Json writes nulls by default — so `new
-    // PatchTransactionRequest { Payee = "x" }` would go over the wire with four
+    // PatchTransactionRequest { Payee = "x" }` would go over the wire with three
     // explicit nulls and clear the other fields. The condition affects writing
     // only, so it cannot weaken the presence detection on the read side. The
     // cost is that a serialized DTO can no longer SAY "clear this"; a caller
     // that means it writes the JSON (see the tests' PatchJson helper).
+    //
+    // The memo is not a header field: it is a side's, or the whole transaction's,
+    // and travels in Notes.
     private readonly string? _payee;
-    private readonly string? _memo;
     private readonly string? _checkNumber;
     private readonly DateTime? _postedAt;
     private readonly DateTime? _transactedAt;
@@ -226,12 +237,6 @@ public sealed class PatchTransactionRequest
     {
         get => _payee;
         init { _payee = value; HasPayee = true; }
-    }
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? Memo
-    {
-        get => _memo;
-        init { _memo = value; HasMemo = true; }
     }
     /// <summary>
     /// Check number. Since migration 230 this lands on
@@ -272,8 +277,6 @@ public sealed class PatchTransactionRequest
     /// <summary>True when the request CARRIED <c>payee</c>, whatever its value.</summary>
     [JsonIgnore] public bool HasPayee { get; private init; }
     /// <inheritdoc cref="HasPayee"/>
-    [JsonIgnore] public bool HasMemo { get; private init; }
-    /// <inheritdoc cref="HasPayee"/>
     [JsonIgnore] public bool HasCheckNumber { get; private init; }
     /// <inheritdoc cref="HasPayee"/>
     [JsonIgnore] public bool HasPostedAt { get; private init; }
@@ -296,19 +299,16 @@ public sealed class PatchTransactionRequest
     public bool? Approve { get; init; }
 
     /// <summary>
-    /// Slice 2c.6b: replace the tag set on this header in the same
-    /// PATCH. When supplied, the resulting <c>txn_header_tags</c>
-    /// pairings match exactly <see cref="Tags"/>: tag names not in
-    /// the list lose their pairing, names not yet in the ledger's
-    /// <c>tags</c> dictionary are created on first use.
-    /// <list type="bullet">
-    ///   <item><c>null</c> / omitted → tags untouched.</item>
-    ///   <item><c>[]</c> → all tags removed.</item>
-    /// </list>
-    /// Matching against the ledger dictionary is case-insensitive;
-    /// the first user-supplied casing wins on insert.
+    /// The memo and tags, written from <see cref="TransactionNotesRequest.Side"/>
+    /// (which must be <see cref="PatchTransactionPostings.SourceAccountId"/> when
+    /// postings are sent): that side's own on a one-posting result, the whole
+    /// transaction's on a multi-posting one, with per-line notes in <c>lines</c>.
+    /// Each field follows the presence rule: omitted leaves it, null or empty clears it.
+    /// Omitted entirely: no note changes, and a reshape is made from the postings'
+    /// source account.
     /// </summary>
-    public IReadOnlyList<string>? Tags { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public TransactionNotesRequest? Notes { get; init; }
 
     /// <summary>
     /// Fold this PATCH's target into the header named here. Direction is
@@ -319,15 +319,16 @@ public sealed class PatchTransactionRequest
     /// <c>is_merge_winner=true</c>, adopting the loser's posted date). The user
     /// picked the canonical row in the candidates panel; the fresh needs_review
     /// editor row vanishes from the register (its <c>external_id</c> is kept so
-    /// future syncs dedup against it). A merge-only PATCH carries just this field
-    /// (+ optional <c>approve</c>); no postings — the loser is tombstoned, not
-    /// reshaped.
+    /// future syncs dedup against it). Only the merge route sets it, on a
+    /// request carrying nothing else; no postings — the loser is tombstoned,
+    /// not reshaped.
     ///
     /// <para>Validation (all → 422 <c>merge-source-invalid</c>): the editor row
     /// must still be a fresh <c>needs_review</c>, un-merged, visible row; the
     /// candidate must exist in the same ledger and be settled
-    /// (<c>!needs_review</c>), un-merged, and visible (a prior merge WINNER is
-    /// allowed — one-hop collapse); and the two must differ. Origin is NOT
+    /// (<c>!needs_review</c>), un-merged, visible (a prior merge WINNER is
+    /// allowed — one-hop collapse), and not a reminder's template; and the two
+    /// must differ. Origin is NOT
     /// constrained — a candidate may be manual, bank-fed, or imported.</para>
     /// </summary>
     /// <remarks>
@@ -415,11 +416,12 @@ public sealed class SelectionRequest
     public IReadOnlyList<Guid> HeaderIds { get; init; } = Array.Empty<Guid>();
 
     /// <summary>
-    /// Account scope. In <c>"all"</c> mode it narrows the predicate to one
-    /// account in the ledger (null = every account). In <c>"explicit"</c> mode
-    /// the bulk-apply query ignores it (it acts on <see cref="HeaderIds"/>), but
-    /// the summary still uses it to compute the account-scoped Σ shown in the
-    /// footer.
+    /// The register's account, required in both modes: a selection is made on
+    /// one register (a missing one is <c>account-not-in-ledger</c>). In
+    /// <c>"all"</c> mode it scopes the predicate to that account's rows. In
+    /// <c>"explicit"</c> mode the bulk-apply query ignores it (it acts on
+    /// <see cref="HeaderIds"/>), but the summary still uses it to compute the
+    /// account-scoped Σ shown in the footer.
     /// </summary>
     public Guid? AccountId { get; init; }
 
@@ -428,7 +430,7 @@ public sealed class SelectionRequest
     /// <c>"cleared"</c>, <c>"uncleared"</c>, <c>"scheduled"</c>,
     /// <c>"reconciling"</c>, <c>"needs_review"</c>, <c>"hidden"</c>.
     /// The recon-status views and <c>"scheduled"</c> are the register's own
-    /// rule, evaluated by its own SQL (<c>register_filtered_entries</c>):
+    /// rule, evaluated by its own filter (<c>RegisterQuery.Filtered</c>):
     /// scheduled is a posted date after <see cref="Today"/>; the recon views
     /// exclude scheduled and pending rows.
     /// <c>"needs_review"</c> matches the bank-feed review flag
@@ -483,10 +485,11 @@ public sealed class SelectionRequest
     /// <remarks>
     /// This is the fourth consumer of the shared register filter (ADR-0076),
     /// and the one that must not drift: the other three only DISPLAY. A
-    /// select-all that ignored this would show the reader 6000 rows from a
+    /// select-all that ignored this would show the reader every row from a
     /// category's sub-categories and then hand a bulk delete a different,
     /// nearly-empty set — the parent's own postings, of which a rollup parent
-    /// has none.
+    /// has none. In <c>"explicit"</c> mode it is the scope the read-only refusal
+    /// (<c>selection-includes-read-only</c>) judges the rows in.
     /// </remarks>
     public bool IncludeSubcategories { get; init; }
 }
@@ -494,17 +497,40 @@ public sealed class SelectionRequest
 /// <summary>
 /// Response body for
 /// <c>POST /api/ledgers/{ledgerId}/transactions/selection-summary</c>.
-/// Drives the bulk-action footer's "N selected · Σ $X.XX" readout in
+/// Drives the bulk-action footer's "N selected · M read-only · Σ $X.XX" readout in
 /// both selection modes — server is the source of truth so the SPA
 /// doesn't need to keep parallel state and stays correct even when
 /// some selected rows have been evicted from the windowed register.
 /// </summary>
-/// <param name="Count">Number of headers matching the selection.</param>
-/// <param name="SumOnAccount">Signed sum of header amounts as observed
-/// on the source account leg. For ledger-wide selections (no
-/// <c>AccountId</c>) this is null — sum across mixed-currency accounts
-/// is not well-defined.</param>
-public sealed record SelectionSummary(int Count, decimal? SumOnAccount);
+/// <param name="Count">Number of headers a bulk change acts on: a select-all's
+/// editable rows, or every row an explicit selection names. The delete and move
+/// confirmations state it.</param>
+/// <param name="TotalCount">Number of headers the selection covers, read-only rows
+/// included — the footer's "N selected".</param>
+/// <param name="ReadOnlyCount">How many of <paramref name="TotalCount"/> the
+/// register shows read-only — the footer's "· M read-only".</param>
+/// <param name="SumOnAccount">Signed sum of the selected rows' own legs in the
+/// register's scope, over every row <paramref name="TotalCount"/> counts, read-only
+/// rows included, in both selection modes, in <paramref name="CurrencyCode"/>. On a
+/// real account's register it is the native sum. A category's legs are each in the
+/// currency of the real account on the other side of their posting, so on a category's
+/// register whose selected legs are in more than one currency each leg converts at its
+/// transaction's date into the ledger's reporting currency and the sum is rounded once,
+/// as the register's Balance converts (ADR-0114 D7). Null when one of those rates is
+/// missing, with <paramref name="RateUnavailable"/> naming each (ADR-0114 D9).</param>
+/// <param name="CurrencyCode">The currency <paramref name="SumOnAccount"/> is in: the
+/// account's own on a real account's register; on a category's, the one currency its
+/// selected legs are in, or the reporting currency when they are in several.</param>
+/// <param name="RateUnavailable">Every missing rate the sum needed; absent from the
+/// JSON when nothing is missing.</param>
+public sealed record SelectionSummary(
+    int Count,
+    int TotalCount,
+    int ReadOnlyCount,
+    decimal? SumOnAccount,
+    string CurrencyCode,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    IReadOnlyList<RateUnavailable>? RateUnavailable = null);
 
 /// <summary>
 /// Request body for
@@ -564,8 +590,10 @@ public sealed record BulkDeleteResponse(int HardDeleted, int SoftHidden);
 
 /// <summary>
 /// Request body for <c>POST /api/ledgers/{ledgerId}/transactions/bulk-unhide</c>
-/// (ADR-0072 D2). The selection carries <c>StatusFilter = "hidden"</c> (the
-/// Hidden view), so it scopes to soft-hidden rows.
+/// (ADR-0072 D2). The selection is an explicit list of ids (a restore of one row
+/// is a selection of one) or a select-all over its view, usually the Hidden view.
+/// Only the selected rows that are soft-hidden are restored; a visible, unknown or
+/// merged-away id is left as it is.
 /// </summary>
 public sealed class BulkUnhideRequest
 {
@@ -577,21 +605,9 @@ public sealed record BulkUnhideResponse(int Unhidden);
 
 /// <summary>
 /// Request body for
-/// <c>POST /api/ledgers/{ledgerId}/transactions/{headerId}/move-account</c>
-/// (ADR-0072 D3). Repoints the transaction's leg(s) on
-/// <see cref="SourceAccountId"/> to <see cref="TargetAccountId"/>.
-/// </summary>
-public sealed class MoveAccountRequest
-{
-    public Guid SourceAccountId { get; init; }
-    public Guid TargetAccountId { get; init; }
-}
-
-/// <summary>
-/// Request body for
 /// <c>POST /api/ledgers/{ledgerId}/transactions/bulk-move-account</c>
 /// (ADR-0072 D3). The selection is account-scoped — its <c>AccountId</c> is the
-/// source account.
+/// source account. A move of one transaction is an explicit selection of one.
 /// </summary>
 public sealed class BulkMoveAccountRequest
 {
@@ -599,8 +615,17 @@ public sealed class BulkMoveAccountRequest
     public Guid TargetAccountId { get; init; }
 }
 
-/// <summary>Response for bulk-move-account: number of transactions moved.</summary>
-public sealed record BulkMoveAccountResponse(int Moved);
+/// <summary>Response for bulk-move-account: how many legs moved onto the target. A move
+/// relabels: every stored figure is kept and reads in the target's currency
+/// (ADR-0114 D13).</summary>
+/// <param name="Moved">Legs moved from the source account onto the target: one per
+/// transaction unless a transaction has more than one leg on the source. Zero when the
+/// selection named nothing movable, such as an id not in the ledger or one merged into
+/// another, which the selection ignores rather than refuses.</param>
+/// <param name="BecameTwoAmount">How many mirrored pairs the move left across currencies,
+/// so each now carries two amounts, equal in magnitude and opposite in sign. Zero when the
+/// target is in the source's currency.</param>
+public sealed record BulkMoveAccountResponse(int Moved, int BecameTwoAmount = 0);
 
 /// <summary>
 /// One similar-payee suggestion (slice 2c.6c — Tier 1 recall). Backs
@@ -652,47 +677,50 @@ public sealed record SimilarPayeeDto(
 /// One merge-candidate suggestion (slice 2c.6d). Backs
 /// <c>GET /api/ledgers/{ledgerId}/transactions/{headerId}/merge-candidates</c>.
 ///
-/// <para>The "Possible matches" panel in the editor renders a chip
-/// per candidate. Clicking a chip pre-fills the editor with the
-/// candidate's header-level fields (<see cref="Payee"/>,
-/// <see cref="Memo"/>, <see cref="Tags"/>) and posting structure
-/// (<see cref="Postings"/>) so the user can adopt the candidate
-/// row's data wholesale and save in one PATCH. On submit, the same
-/// PATCH carries <c>mergeFromHeaderId = HeaderId</c> so the server
-/// stamps <c>is_merged_into</c> on the candidate row in the same
-/// Postgres transaction as the target row's edits.</para>
+/// <para>The editor's "Merge candidates" strip renders a chip per
+/// candidate. Picking one arms the merge for the next save, which goes
+/// through <c>POST /api/ledgers/{ledgerId}/transactions/{headerId}/merge</c>
+/// with <c>fromHeaderId = HeaderId</c>: the edited feed row is folded
+/// into the candidate (stamped <c>is_merged_into</c>, it leaves the
+/// register) and the candidate survives with its own payee, postings and
+/// notes, taking the feed row's posted date. Nothing is copied into the
+/// editor. The chip shows <see cref="PostedAt"/>, <see cref="Payee"/> and
+/// the counterparty account of the one posting in <see cref="Postings"/>,
+/// or their count on a split; <see cref="Origin"/> names the row in its
+/// tooltip. The response carries nothing else, since nothing else is
+/// shown.</para>
 ///
 /// <para>Match rule the server enforced: same ledger, posted
 /// within ±7 days of the target, and the candidate's aggregated
 /// amount on the target's source account exactly matches the
 /// target's source-account amount. Candidate state must be
 /// "settled" — <c>needs_review=false</c>, <c>is_merged_into IS
-/// NULL</c>, <c>is_merge_winner=false</c>, and not hidden. Manual
-/// and previously-accepted bank-fed rows both qualify; pending
-/// feed rows and already-won rows do not.</para>
+/// NULL</c>, and not hidden. A prior merge winner qualifies (the graph
+/// stays one hop), and so does any origin: a manual row, or a feed or
+/// imported row already accepted. Pending rows and folded-away rows do
+/// not.</para>
 /// </summary>
 public sealed record MergeCandidateDto(
     Guid HeaderId,
     string? Payee,
-    string? Memo,
     DateTime PostedAt,
-    /// <summary>Signed delta: <c>candidate.posted_at - target.posted_at</c>
-    /// in whole days. Negative when the candidate is older than the
-    /// target. UI shows this as "3d ago" / "in 2d" etc.</summary>
-    int DaysDelta,
-    IReadOnlyList<string> Tags,
-    IReadOnlyList<MergeCandidatePostingDto> Postings);
+    IReadOnlyList<MergeCandidatePostingDto> Postings,
+    /// <summary>How the candidate came into the ledger, the value its
+    /// register row's <c>origin</c> carries: <c>manual</c>,
+    /// <c>online_import</c> or <c>file_import</c>. The chip's tooltip
+    /// names the row a merge keeps by it: the person's own entry, or a
+    /// row imported earlier.</summary>
+    string Origin);
 
 /// <summary>
-/// One leg of a merge candidate's posting list. Mirrors the shape
-/// the editor uses for its own posting drafts so the SPA can copy
-/// the candidate's postings into the editor's state directly.
+/// One leg of a merge candidate's posting list: the candidate's
+/// counterparty side, the account the merge chip names. The merge keeps the
+/// candidate's postings as they are; nothing here is copied into the
+/// editor.
 /// </summary>
 public sealed record MergeCandidatePostingDto(
     Guid CounterpartyAccountId,
-    string CounterpartyAccountName,
-    decimal Amount,
-    string? LegMemo);
+    string CounterpartyAccountName);
 
 /// <summary>
 /// Outcome of undoing one import (mig 221).
@@ -700,22 +728,23 @@ public sealed record MergeCandidatePostingDto(
 /// <param name="Found">Transactions still carrying this import's stamp.</param>
 ///
 /// <remarks>
-/// NO "Edited" COUNT, deliberately. This used to carry one — how many of the
-/// found rows had a <c>txn_header_originals</c> row — so the confirm dialog
-/// could say "N of them have been edited". Removed 2026-09-25.
+/// NO "Edited" COUNT, deliberately — how many of the found rows have a
+/// <c>txn_header_originals</c> row, so the confirm dialog could say "N of them
+/// have been edited".
 ///
 /// <para>Undo is offered in a modal immediately after the import that created
-/// the rows. Nobody has edited them yet, so the warning answered a question
-/// nobody was in a position to have: it was reliably zero, and the one thing
-/// that made it non-zero was a merge stamping the winner's date. Wipe the
-/// import out; that is what undo is for.</para>
+/// the rows. Nobody has edited them yet, so the warning would answer a question
+/// nobody is in a position to have: it is reliably zero, and the one thing that
+/// makes it non-zero is a merge stamping the winner's date. Wipe the import out;
+/// that is what undo is for.</para>
 ///
-/// <para>It also made <c>txn_header_originals</c> mean two things at once —
+/// <para>It would also make <c>txn_header_originals</c> mean two things at once —
 /// "the feed's value before the user changed it", which is its ADR-0100
-/// purpose, and "the user edited this in Coffer", which is what the count read
-/// it as. Those diverge the moment an importer seeds originals it already has
-/// (Moneydance keeps the bank's string beside the user's cleaned one), and the
-/// count would then report every imported row as edited.</para>
+/// purpose, and "the user edited this in Coffer", which is what the count reads
+/// it as. Those diverge because the Moneydance importer seeds the originals it
+/// already has (it keeps the bank's string beside the user's cleaned one;
+/// ADR-0100, 2026-10-21 amendment), so the count would report every imported
+/// row whose feed text differs as edited.</para>
 /// </remarks>
 /// <param name="Deleted">
 /// Rows removed outright. An undo does NOT hide: a hidden row keeps its

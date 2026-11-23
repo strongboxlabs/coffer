@@ -10,6 +10,7 @@ import type {
     HeaderBalanceDto,
     IndexBucketDto,
     InvestmentRow,
+    LedgerEntriesPage,
     RegisterPage,
     SetReconStatusRequest,
 } from '../types/register';
@@ -25,10 +26,10 @@ export type RegisterServerStatus =
 
 /**
  * Server-side register filter (mig 164). Mirror of the API's `RegisterFilter`
- * query params. Every field optional; omitted ⇒ no-op. Pushed into
- * `register_entry_keys` so the windowed keyset cursor walks only matching
- * entries — the reason filtering can't be client-side (it only sees the loaded
- * window). Dates are `YYYY-MM-DD`.
+ * query params. Every field optional; omitted ⇒ no-op. Applied by the server's
+ * register filter (`RegisterQuery.Filtered`) so the windowed keyset cursor
+ * walks only matching entries — the reason filtering can't be client-side (it
+ * only sees the loaded window). Dates are `YYYY-MM-DD`.
  */
 export interface RegisterFilterArgs {
     search?: string;
@@ -80,6 +81,19 @@ export function isRegisterFilterActive(f: RegisterFilterArgs): boolean {
     );
 }
 
+/** True when two filters ask for the same rows: every dimension equal, and a
+ *  dimension left out the same as one set to undefined. The register's readers
+ *  key on the filter object (a new one re-reads the window and resets the
+ *  selection, ADR-0024), so a control whose edit leaves every dimension as it
+ *  was hands up no new object; this is the test it makes. */
+export function sameRegisterFilter(a: RegisterFilterArgs, b: RegisterFilterArgs): boolean {
+    const keys = new Set([...Object.keys(a), ...Object.keys(b)]) as Set<keyof RegisterFilterArgs>;
+    for (const key of keys) {
+        if (a[key] !== b[key]) return false;
+    }
+    return true;
+}
+
 /** Per-status entry counts (mig 165) for the status dropdown's badges. Mirror
  *  of the API's `RegisterStatusCounts`. Every count respects the active
  *  NON-status filter; `needsReview` overlaps the recon buckets (separate
@@ -115,8 +129,12 @@ function appendFilterParams(params: URLSearchParams, filter?: RegisterFilterArgs
 
 export interface FetchRegisterArgs {
     ledgerId: string;
-    /** Optional account scope. Omit for ledger-wide reads. */
-    accountId?: string;
+    /** The register's account (a category id works too). Required: what a row
+     *  shows depends on whose register it is in, so this read has no ledger-wide
+     *  form (the server refuses one with a 422). The ledger-wide list is its own
+     *  read, {@link fetchTransactionEntries}, which draws each entry as its own
+     *  account's register does. */
+    accountId: string;
     /** Opaque continuation token from a prior page's
      *  `cursorForOlder` (when direction='before') or
      *  `cursorForNewer` (when direction='after'). Omitted on the
@@ -157,13 +175,13 @@ export interface FetchRegisterArgs {
  *
  * Surfaces the API's 422 codes verbatim via `ApiError`:
  *   * `ledger-not-visible`         — caller has no grant on this ledger.
- *   * `account-not-in-ledger`      — supplied accountId is in another ledger.
+ *   * `account-not-in-ledger`      — accountId missing, or in another ledger.
  *   * `register-limit-invalid`     — supplied limit outside [1, 500].
  *   * `register-direction-invalid` — direction is neither 'before' nor 'after'.
  */
 export function fetchRegister(args: FetchRegisterArgs): Promise<RegisterPage> {
     const params = new URLSearchParams();
-    if (args.accountId !== undefined) params.set('account_id', args.accountId);
+    params.set('account_id', args.accountId);
     if (args.cursor !== undefined) params.set('cursor', args.cursor);
     if (args.direction !== undefined) params.set('direction', args.direction);
     if (args.startingAtHeaderId !== undefined)
@@ -179,6 +197,49 @@ export function fetchRegister(args: FetchRegisterArgs): Promise<RegisterPage> {
     const suffix = query.length > 0 ? `?${query}` : '';
     return request<RegisterPage>(
         `/api/ledgers/${encodeURIComponent(args.ledgerId)}/transactions${suffix}`,
+    );
+}
+
+/**
+ * The cash-flow direction `GET /transactions/entries` filters by: the sign of the
+ * amount each entry's row shows on its account (zero is neither). Not
+ * {@link RegisterDirection}, the register's cursor direction.
+ */
+export type EntriesDirection = 'all' | 'inflow' | 'outflow';
+
+export interface FetchTransactionEntriesArgs {
+    /** `true`: only the entries awaiting review, the register's Needs review view.
+     *  Omitted: every entry. */
+    needsReview?: boolean;
+    /** Omitted: the server's default, `all`. */
+    direction?: EntriesDirection;
+    /** The caller's local date (`YYYY-MM-DD`). When sent, entries dated after it
+     *  (the register's Scheduled) are left out. */
+    today?: string;
+    /** Page size, 1 to 50; the server refuses anything else with 422
+     *  `register-limit-invalid`, as the register page does. */
+    limit: number;
+}
+
+/**
+ * GET /api/ledgers/{ledgerId}/transactions/entries — the newest register entries
+ * across the ledger, each drawn exactly as its own account's register draws it, with
+ * that account's id and currency. One first page; it pages no further.
+ *
+ * 422 codes: `ledger-not-visible`, `register-limit-invalid`,
+ * `transaction-entries-direction-invalid`.
+ */
+export function fetchTransactionEntries(
+    ledgerId: string,
+    args: FetchTransactionEntriesArgs,
+): Promise<LedgerEntriesPage> {
+    const params = new URLSearchParams();
+    if (args.needsReview) params.set('needs_review', 'true');
+    if (args.direction !== undefined) params.set('direction', args.direction);
+    if (args.today !== undefined) params.set('today', args.today);
+    params.set('limit', String(args.limit));
+    return request<LedgerEntriesPage>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/transactions/entries?${params.toString()}`,
     );
 }
 
@@ -223,49 +284,6 @@ export function deleteTransaction(
     return request<DeleteTransactionResponse>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/transactions/${encodeURIComponent(headerId)}`,
         { method: 'DELETE' },
-    );
-}
-
-/**
- * POST /api/ledgers/{ledgerId}/transactions/{headerId}/unhide (ADR-0072
- * D2) — un-hide a single soft-hidden transaction so it returns to the
- * register. Idempotent (204 whether or not it was hidden).
- *
- * 422 codes: `transaction-not-in-ledger`.
- */
-export function unhideTransaction(
-    ledgerId: string,
-    headerId: string,
-): Promise<void> {
-    return request<void>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/transactions/${encodeURIComponent(headerId)}/unhide`,
-        { method: 'POST' },
-    );
-}
-
-/**
- * POST /api/ledgers/{ledgerId}/transactions/{headerId}/move-account
- * (ADR-0072 D3) — move one transaction's leg from its source account to
- * another. Same rule as {@link bulkMoveToAccount}. Surfaces the guard codes
- * verbatim:
- *   * `transaction-not-in-ledger`, `transaction-header-is-investment`,
- *     `transaction-source-account-mismatch`,
- *     `transaction-move-target-invalid`,
- *     `transaction-move-target-same-as-source`,
- *     `transaction-move-domain-crossed`, `account-inactive`,
- *     `transaction-move-split-to-investment`,
- *     `transaction-move-split-from-investment`,
- *     `transaction-move-collision`.
- */
-export function moveTransactionToAccount(
-    ledgerId: string,
-    headerId: string,
-    sourceAccountId: string,
-    targetAccountId: string,
-): Promise<void> {
-    return request<void>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/transactions/${encodeURIComponent(headerId)}/move-account`,
-        { method: 'POST', body: { sourceAccountId, targetAccountId } },
     );
 }
 

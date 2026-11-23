@@ -19,13 +19,11 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// and a transfer destination are both recallable.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class SimilarPayeesTests
+public sealed class SimilarPayeesTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SimilarPayeesTests(PostgresFixture fixture)
+    public SimilarPayeesTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -69,17 +67,18 @@ public sealed class SimilarPayeesTests
         var headerId = Guid.NewGuid();
         var bankLegId = Guid.NewGuid();
         var counterpartyLegId = Guid.NewGuid();
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         // external_id required for SimpleFIN-origin rows (mig 105 CHECK);
         // file_import rows also keep an external_id for provider dedup.
         // Mig 107: origin/provider_key are two columns; SimilarPayees
         // dedup scopes by the anchor row's provider_key.
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             INSERT INTO txn_headers
-                (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, created_at, needs_review)
+                (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, created_at, needs_review,
+                 originating_account_id)
             VALUES
                 ({headerId}, {ledger.LedgerId}, {origin}, {providerKey}, {headerId.ToString()}, {curatedPayee ?? bankPayee},
-                 {postedAt},{postedAt}, {postedAt}, {needsReview});
+                 {postedAt},{postedAt}, {postedAt}, {needsReview}, {bankAccountId});
             INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount)
             VALUES
                 ({bankLegId},          {headerId}, {ledger.LedgerId}, {bankAccountId},          0, {amount}),
@@ -93,10 +92,15 @@ public sealed class SimilarPayeesTests
             // fixture is where the flip is easiest to get backwards. Seeding the
             // curated name into BOTH would make every assertion here pass while
             // the endpoint matched on the wrong column.
+            // As the first edit's capture writes it, the amount as it stood and no rounded
+            // mark (ADR-0114 D15).
             await db.Database.ExecuteSqlInterpolatedAsync($@"
-                INSERT INTO txn_header_originals (header_id, ledger_id, payee, posted_at, transacted_at)
-                VALUES ({headerId}, {ledger.LedgerId}, {bankPayee}, {postedAt}, {postedAt});");
+                INSERT INTO txn_header_originals
+                    (header_id, ledger_id, payee, posted_at, transacted_at, amount, rounded_at_import)
+                VALUES ({headerId}, {ledger.LedgerId}, {bankPayee}, {postedAt}, {postedAt}, {amount}, false);");
         }
+        // Raw SQL reaches no writer: store the presentation as the upgrade's backfill does.
+        await ledger.RecomputeNotesAsync(headerId);
         return headerId;
     }
 
@@ -120,7 +124,7 @@ public sealed class SimilarPayeesTests
     /// leg" is the Holdings sub-account. That is structural (ADR-0019), not a
     /// counterparty anyone chooses, and it was briefly excluded here for that
     /// reason. Excluding it dropped the row's PAYEE too, which is the half worth
-    /// recalling and is very often carried by exactly that buy: with the exclusion,
+    /// recalling and can be carried by exactly that buy: with the exclusion,
     /// a curated name sitting on a settled buy left recall silent. So the row is
     /// returned, and the caller decides which half it can apply — the investment
     /// editor takes the payee always and the counterparty only into a category
@@ -129,7 +133,7 @@ public sealed class SimilarPayeesTests
     [Fact]
     public async Task Recall_on_a_brokerage_offers_both_the_category_and_the_holdings_row()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var dividends = await ledger.AddCategoryAsync("Dividend Income", kind: "income");
         // Where a feed row's second leg sits before anyone classifies it.
@@ -156,7 +160,7 @@ public sealed class SimilarPayeesTests
             new DateTime(2026, 4, 5, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "ACME CORP DIVIDEND", needsReview: true);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var suggestions = await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
@@ -176,7 +180,7 @@ public sealed class SimilarPayeesTests
     [Fact]
     public async Task Returns_payee_and_category_from_a_single_prior_approved_match()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var coffee = await ledger.AddCategoryAsync("Coffee");
 
@@ -194,7 +198,7 @@ public sealed class SimilarPayeesTests
             new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "CAFE PURCHASE", needsReview: true);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.GetAsync(Url(ledger.LedgerId, currentId));
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -210,13 +214,13 @@ public sealed class SimilarPayeesTests
     [Fact]
     public async Task Recalls_a_transfer_counterparty_when_prior_rows_have_no_category_leg()
     {
-        // Regression: recall used to require the prior row to carry an
+        // Recall must not require the prior row to carry an
         // `account_type = 'category'` leg. A recurring charge the user
         // always settles as a TRANSFER (checking → FSA) has two
-        // real-account legs and no category leg at all, so every prior
-        // row was filtered out and the chip row silently never
-        // rendered — exactly the case where recall is most useful.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // real-account legs and no category leg at all, so such a filter
+        // would drop every prior row and the chip row would silently never
+        // render — exactly the case where recall is most useful.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("checking");
         var fsa = await ledger.AddBankAccountAsync("FSA");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -235,7 +239,7 @@ public sealed class SimilarPayeesTests
             new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "BENEFITS-ADMIN", needsReview: true);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
             Url(ledger.LedgerId, currentId)))!;
@@ -253,7 +257,7 @@ public sealed class SimilarPayeesTests
         // Transfers and categories are the same kind of suggestion to
         // the editor's AccountCategoryPicker, so they compete in one
         // use-count ordering rather than living in separate tiers.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("checking");
         var fsa = await ledger.AddBankAccountAsync("FSA");
         var medical = await ledger.AddCategoryAsync("Medical");
@@ -279,7 +283,7 @@ public sealed class SimilarPayeesTests
             new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "BENEFITS-ADMIN", needsReview: true);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
             Url(ledger.LedgerId, currentId)))!;
@@ -299,7 +303,7 @@ public sealed class SimilarPayeesTests
         // the same payee on a DIFFERENT account would otherwise
         // suggest a pairing the user never made on this one — and on a
         // transfer it could even suggest the anchor's own account.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("checking");
         var otherCard = await ledger.AddBankAccountAsync("other card");
         var coffee = await ledger.AddCategoryAsync("Coffee");
@@ -316,7 +320,7 @@ public sealed class SimilarPayeesTests
             new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "CAFE PURCHASE", needsReview: true);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
             Url(ledger.LedgerId, currentId)))!;
@@ -326,7 +330,7 @@ public sealed class SimilarPayeesTests
     [Fact]
     public async Task Aggregates_use_count_across_multiple_prior_matches()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var coffee = await ledger.AddCategoryAsync("Coffee");
 
@@ -344,7 +348,7 @@ public sealed class SimilarPayeesTests
             new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "CAFE PURCHASE", needsReview: true);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
             Url(ledger.LedgerId, currentId)))!;
@@ -355,7 +359,7 @@ public sealed class SimilarPayeesTests
     [Fact]
     public async Task Orders_by_use_count_descending_then_recency()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var coffee = await ledger.AddCategoryAsync("Coffee");
         var bills = await ledger.AddCategoryAsync("Bills");
@@ -380,7 +384,7 @@ public sealed class SimilarPayeesTests
             new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "CAFE PURCHASE", needsReview: true);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
             Url(ledger.LedgerId, currentId)))!;
@@ -394,7 +398,7 @@ public sealed class SimilarPayeesTests
     [Fact]
     public async Task Excludes_prior_rows_with_needs_review_true()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var coffee = await ledger.AddCategoryAsync("Coffee");
 
@@ -410,7 +414,7 @@ public sealed class SimilarPayeesTests
             new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "CAFE PURCHASE", needsReview: true);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
             Url(ledger.LedgerId, currentId)))!;
@@ -423,7 +427,7 @@ public sealed class SimilarPayeesTests
         // Manual rows have null provider_key (mig 107 CHECK) and so
         // cannot anchor Tier 1 — recall is a feed-row concern. Manual
         // candidates are likewise excluded by the same scope rule.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var coffee = await ledger.AddCategoryAsync("Coffee");
 
@@ -440,7 +444,7 @@ public sealed class SimilarPayeesTests
             payee: "CAFE PURCHASE");
         var currentId = await ledger.ResolveHeaderIdAsync(currentLegId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
             Url(ledger.LedgerId, currentId)))!;
@@ -457,7 +461,7 @@ public sealed class SimilarPayeesTests
         // differently in practice, so cross-provider recall would
         // suggest (payee, category) pairs the user never chose in
         // this feed's vocabulary.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var coffee = await ledger.AddCategoryAsync("Coffee");
 
@@ -489,7 +493,7 @@ public sealed class SimilarPayeesTests
             new DateTime(2026, 5, 2, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "CAFE PURCHASE", needsReview: true);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var ofxSuggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
@@ -510,7 +514,7 @@ public sealed class SimilarPayeesTests
         // The repo's anchor read filters on (id, ledger_id), so the
         // anchor lookup returns null → empty list. Cross-ledger
         // probes are indistinguishable from "no suggestions."
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
         var aliceBank = await alice.AddBankAccountAsync("alice");
         var aliceCoffee = await alice.AddCategoryAsync("Coffee");
         var aliceHeaderId = await SeedBankFeedAsync(
@@ -518,8 +522,8 @@ public sealed class SimilarPayeesTests
             new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "CAFE PURCHASE", needsReview: true);
 
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var bob = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var suggestions = (await bobClient.GetFromJsonAsync<List<SimilarPayeeDto>>(
@@ -539,7 +543,7 @@ public sealed class SimilarPayeesTests
         // Two ledgers have the same "CAFE PURCHASE" online payee. Bob's
         // suggestions must only surface bob's prior choices, never
         // alice's.
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
         var aliceBank = await alice.AddBankAccountAsync("checking");
         var aliceCoffee = await alice.AddCategoryAsync("Alice Coffee");
         await SeedBankFeedAsync(
@@ -548,7 +552,7 @@ public sealed class SimilarPayeesTests
             bankPayee: "CAFE PURCHASE", needsReview: false,
             curatedPayee: "Alice Corner Cafe");
 
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var bobBank = await bob.AddBankAccountAsync("checking");
         var bobCoffee = await bob.AddCategoryAsync("Bob Coffee");
         // Bob has no prior rows.
@@ -557,7 +561,7 @@ public sealed class SimilarPayeesTests
             new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "CAFE PURCHASE", needsReview: true);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
         var suggestions = (await bobClient.GetFromJsonAsync<List<SimilarPayeeDto>>(
             Url(bob.LedgerId, currentId)))!;
@@ -567,7 +571,7 @@ public sealed class SimilarPayeesTests
     [Fact]
     public async Task Excludes_prior_merged_or_hidden_rows()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var coffee = await ledger.AddCategoryAsync("Coffee");
 
@@ -590,7 +594,7 @@ public sealed class SimilarPayeesTests
 
         // Hide one prior row + merge another into the winner. Only
         // the unhidden, unmerged prior should count toward use_count.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 UPDATE txn_headers SET is_hidden = true WHERE id = {hiddenId};
@@ -602,7 +606,7 @@ public sealed class SimilarPayeesTests
             new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "CAFE PURCHASE", needsReview: true);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
             Url(ledger.LedgerId, currentId)))!;
@@ -613,10 +617,10 @@ public sealed class SimilarPayeesTests
     [Fact]
     public async Task Returns_422_when_ledger_is_not_visible_to_caller()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var response = await bobClient.GetAsync(Url(alice.LedgerId, Guid.NewGuid()));
@@ -630,7 +634,7 @@ public sealed class SimilarPayeesTests
         // row is accepted there's nothing to apply. API layer
         // enforces independent of the SPA per the
         // server-side-concurrency principle.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var coffee = await ledger.AddCategoryAsync("Coffee");
 
@@ -645,7 +649,7 @@ public sealed class SimilarPayeesTests
             new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "CAFE PURCHASE", needsReview: false);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
             Url(ledger.LedgerId, currentId)))!;
@@ -655,7 +659,7 @@ public sealed class SimilarPayeesTests
     [Fact]
     public async Task Returns_empty_when_target_hidden_or_merged()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var coffee = await ledger.AddCategoryAsync("Coffee");
 
@@ -678,14 +682,14 @@ public sealed class SimilarPayeesTests
             new DateTime(2026, 5, 3, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "CAFE PURCHASE", needsReview: true);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 UPDATE txn_headers SET is_hidden = true WHERE id = {hiddenId};
                 UPDATE txn_headers SET is_merged_into = {winnerId} WHERE id = {mergedAwayId};");
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var hiddenSuggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
             Url(ledger.LedgerId, hiddenId)))!;
@@ -704,7 +708,7 @@ public sealed class SimilarPayeesTests
         // Coffee). The current row is opened with that exact pair
         // already saved → the suggestion dedupes against itself and
         // the response is empty.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var coffee = await ledger.AddCategoryAsync("Coffee");
 
@@ -726,7 +730,7 @@ public sealed class SimilarPayeesTests
             bankPayee: "CAFE PURCHASE", needsReview: true,
             curatedPayee: "Corner Cafe");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
             Url(ledger.LedgerId, currentId)))!;
@@ -745,17 +749,17 @@ public sealed class SimilarPayeesTests
     /// name instead would match only rows nobody renamed, and the panel would go
     /// quietly empty rather than fail.</para>
     ///
-    /// <para>The cleared case is the sharper one, and it is new: the gate that
-    /// asks "does this row have a payee to search by" used to read the header's
-    /// column, which before 230 was always the bank's. Now a cleared payee makes
-    /// that column NULL while the bank's text sits in the sidecar with recall
+    /// <para>The cleared case is the sharper one: a gate that asks "does this row
+    /// have a payee to search by" must not read only the header's column. Since
+    /// migration 230 a cleared payee makes that column NULL while the bank's text
+    /// sits in the sidecar with recall
     /// perfectly possible. Reachable through MCP or a direct PATCH — the SPA
     /// always pairs a save with approve, which takes the row out of scope.</para>
     /// </remarks>
     [Fact]
     public async Task Anchors_on_the_bank_payee_when_the_anchor_row_was_itself_renamed()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var coffee = await ledger.AddCategoryAsync("Coffee");
 
@@ -773,7 +777,7 @@ public sealed class SimilarPayeesTests
             bankPayee: "CAFE PURCHASE", needsReview: true,
             curatedPayee: "a name nothing else uses");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var suggestions = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
@@ -786,7 +790,7 @@ public sealed class SimilarPayeesTests
     [Fact]
     public async Task Anchors_on_the_bank_payee_when_the_anchor_rows_payee_was_cleared()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var coffee = await ledger.AddCategoryAsync("Coffee");
 
@@ -802,7 +806,7 @@ public sealed class SimilarPayeesTests
             bankPayee: "CAFE PURCHASE", needsReview: true);
         // Clear it through the endpoint, which is the behaviour migration 230
         // made possible in the first place — presence, not nullness.
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var clear = await client.SendAsync(new HttpRequestMessage(
             HttpMethod.Patch, $"/api/ledgers/{ledger.LedgerId}/transactions/{cleared}")
@@ -816,5 +820,124 @@ public sealed class SimilarPayeesTests
             Url(ledger.LedgerId, cleared)))!;
         var single = Assert.Single(suggestions);
         Assert.Equal("Corner Cafe", single.Payee);
+    }
+
+    /// <summary>
+    /// A feed row synced before the feed sent payees, recategorized while it awaited
+    /// review, and then given its payee by the SimpleFIN pre-split backfill: its originals
+    /// are restated with the new payee (ADR-0114 D15), so recall answers for it as it does
+    /// for a row synced with the payee and never edited.
+    /// </summary>
+    /// <remarks>Every row is written by the sync and the PATCH endpoint.</remarks>
+    [Fact]
+    public async Task A_row_the_pre_split_backfill_restated_recalls_as_a_row_with_no_originals()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var keys = Db.NewLedgerKeyService();
+        await using (var seed = Db.NewDbContext())
+        {
+            var row = await seed.Ledgers.SingleAsync(l => l.Id == ledger.LedgerId);
+            row.WrappedLek = keys.CreateWrappedLek();
+            row.LekKekId = keys.CurrentKekId;
+            row.LekCreatedAt = DateTime.UtcNow;
+            await seed.SaveChangesAsync();
+        }
+        var withPayees = false;
+        string Transaction(string id, int posted, string description) => withPayees
+            ? $$"""{"id":"{{id}}","posted":{{posted}},"amount":"-4.50","payee":"Corner Cafe","description":"{{description}}"}"""
+            : $$"""{"id":"{{id}}","posted":{{posted}},"amount":"-4.50","description":"{{description}}"}""";
+        string Body() => $$"""
+            {"connections":[
+              {"conn_id":"c-S","name":"Bank S","org_id":"banks","sfin_url":"https://sfin/banks"}
+            ],"errlist":[],"accounts":[
+              {"id":"sf-s","conn_id":"c-S","name":"Checking","currency":"USD","balance":"0","transactions":[
+                {{string.Join(",", withPayees
+                    ? new[] { Transaction("t-1", 1715000000, "CAFE RAW 1"), Transaction("t-2", 1715100000, "CAFE RAW 2"),
+                              Transaction("t-3", 1715200000, "CAFE RAW 3") }
+                    : new[] { Transaction("t-1", 1715000000, "CAFE RAW 1") })}}
+              ]}
+            ]}
+            """;
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
+            .WithService<Coffer.Api.Sync.SimpleFin.SimpleFinClient>(_ => new Coffer.Api.Sync.SimpleFin.SimpleFinClient(
+                new HttpClient(new StubHandler(req => req.Method == HttpMethod.Post
+                    ? new HttpResponseMessage(HttpStatusCode.OK)
+                        { Content = new StringContent("https://u:p@bridge.simplefin.org/simplefin/access/abc") }
+                    : new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(Body()) })),
+                TimeProvider.System));
+        using var client = await AuthedClientAsync(factory, ledger);
+        var connection = (await (await client.PostAsJsonAsync(
+                $"/api/ledgers/{ledger.LedgerId}/feed-connections",
+                new CreateFeedConnectionRequest { SetupToken = SetupToken("https://x/c") }))
+            .Content.ReadFromJsonAsync<FeedConnectionSummary>())!;
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var coffee = await ledger.AddCategoryAsync("Coffee");
+        var snacks = await ledger.AddCategoryAsync("Snacks");
+        Assert.Equal(HttpStatusCode.NoContent, (await client.SendAsync(new HttpRequestMessage(
+            HttpMethod.Patch, $"/api/ledgers/{ledger.LedgerId}/accounts/{bank.Id}/feed-mapping")
+        {
+            Content = JsonContent.Create(new PatchAccountFeedMappingRequest
+            {
+                FeedConnectionId = connection.Id,
+                SimpleFinAccountId = "sf-s",
+            }),
+        })).StatusCode);
+        var syncUrl = $"/api/ledgers/{ledger.LedgerId}/feed-connections/{connection.Id}/sync";
+        Assert.Equal(HttpStatusCode.OK, (await client.PostAsync(syncUrl, content: null)).StatusCode);
+
+        async Task<(Guid Header, Guid BankLeg)> RowAsync(string externalId)
+        {
+            await using var db = Db.NewDbContext();
+            var header = await db.TxnHeaders.AsNoTracking()
+                .SingleAsync(h => h.LedgerId == ledger.LedgerId && h.ExternalId == externalId);
+            var leg = await db.TxnLegs.AsNoTracking().SingleAsync(l => l.HeaderId == header.Id && l.AccountId == bank.Id);
+            return (header.Id, leg.Id);
+        }
+        async Task CategorizeAsync(string externalId, Guid category, bool approve)
+        {
+            var (header, bankLeg) = await RowAsync(externalId);
+            var resp = await client.PatchAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/transactions/{header}",
+                new PatchTransactionRequest
+                {
+                    Approve = approve ? true : null,
+                    Postings = new PatchTransactionPostings
+                    {
+                        SourceAccountId = bank.Id,
+                        Items = [new TransactionPosting { LegId = bankLeg, CounterpartyAccountId = category, Amount = -4.50m }],
+                    },
+                });
+            Assert.True(resp.IsSuccessStatusCode, await resp.Content.ReadAsStringAsync());
+        }
+
+        // Edited before the payee arrives: its originals keep the description as payee.
+        await CategorizeAsync("t-1", snacks.Id, approve: false);
+        withPayees = true;
+        Assert.Equal(HttpStatusCode.OK, (await client.PostAsync(syncUrl, content: null)).StatusCode);
+        // A prior row, synced with the payee, approved under a category.
+        await CategorizeAsync("t-2", coffee.Id, approve: true);
+
+        var restated = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
+            Url(ledger.LedgerId, (await RowAsync("t-1")).Header)))!;
+        var neverEdited = (await client.GetFromJsonAsync<List<SimilarPayeeDto>>(
+            Url(ledger.LedgerId, (await RowAsync("t-3")).Header)))!;
+
+        var single = Assert.Single(neverEdited);
+        Assert.Equal(("Corner Cafe", coffee.Id), (single.Payee, single.CounterpartyAccountId));
+        Assert.Equal(
+            neverEdited.Select(s => (s.Payee, s.CounterpartyAccountId)),
+            restated.Select(s => (s.Payee, s.CounterpartyAccountId)));
+    }
+
+    private static string SetupToken(string claimUrl) =>
+        Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(claimUrl))
+            .Replace('+', '-').Replace('/', '_').TrimEnd('=');
+
+    private sealed class StubHandler : HttpMessageHandler
+    {
+        private readonly Func<HttpRequestMessage, HttpResponseMessage> _impl;
+        public StubHandler(Func<HttpRequestMessage, HttpResponseMessage> impl) { _impl = impl; }
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(_impl(request));
     }
 }

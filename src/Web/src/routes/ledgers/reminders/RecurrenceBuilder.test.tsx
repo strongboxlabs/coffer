@@ -63,7 +63,14 @@ describe('RecurrenceBuilder', () => {
         await userEvent.click(lastDay);
 
         expect(seen.value.recurrence.monthDay).toBe('last');
-        expect(screen.getByLabelText('Day of month')).toBeDisabled();
+        const dayOfMonth = screen.getByLabelText('Day of month');
+        expect(dayOfMonth).toBeDisabled();
+        // Disabled, it looks as it does pending with the save: one look for
+        // both (pending.ts, HOW IT LOOKS).
+        expect(dayOfMonth).toHaveClass(
+            'disabled:cursor-not-allowed', 'disabled:opacity-50',
+            'aria-disabled:cursor-not-allowed', 'aria-disabled:opacity-50',
+        );
     });
 
     it('clicking "On" seeds a default end date one year out (was a dead control)', async () => {
@@ -72,8 +79,8 @@ describe('RecurrenceBuilder', () => {
 
         await userEvent.click(screen.getByRole('radio', { name: 'On' }));
 
-        // The radio used to be a no-op; now it seeds a concrete date so the
-        // choice registers and the date field is populated.
+        // The radio seeds a concrete date so the choice registers and the
+        // date field is populated, rather than being a no-op.
         expect(seen.value.endDate).toBe('2027-06-16');
         expect(screen.getByRole('radio', { name: 'On' })).toBeChecked();
     });
@@ -167,7 +174,7 @@ describe('RecurrenceBuilder — estimated amounts (mig 220)', () => {
     });
 
     /*
-     * 3 is the default the maintainer specified: enough to smooth a variable bill, short
+     * 3 is the default: enough to smooth a variable bill, short
      * enough to follow a real change in it. Asserted because a default that silently
      * became 1 would turn "average of recent occurrences" into "repeat the last one".
      */
@@ -206,5 +213,71 @@ describe('RecurrenceBuilder — estimated amounts (mig 220)', () => {
         await userEvent.type(input, '99');
 
         expect(seen.at(-1)!.estimateSampleCount).toBeLessThanOrEqual(24);
+    });
+});
+
+// Board OT-4 (ADR-0114 D13): an estimating transfer between currencies sets its other side
+// from each due date's rate, and one muted line under the choice says so.
+describe('RecurrenceBuilder — an estimate on a transfer between currencies', () => {
+    const transfer = { accountName: 'Test EUR Bank', fromCurrency: 'USD', toCurrency: 'EUR', direction: 'received' as const };
+    const LINE = 'The amount received in Test EUR Bank is set from the stored USD to EUR rate on each due date. '
+        + 'With no stored rate for that date, the occurrence is not posted until you enter that amount.';
+    const SENT_LINE = 'The amount sent from Account A is set from the stored USD to EUR rate on each due date. '
+        + 'With no stored rate for that date, the occurrence is not posted until you enter that amount.';
+
+    it('names the account and both codes under the chosen estimate', () => {
+        render(
+            <RecurrenceBuilder
+                value={{ ...defaultSchedule('2026-06-16'), estimateSampleCount: 3 }}
+                onChange={() => {}}
+                estimateEligible
+                transferAcrossCurrencies={transfer}
+            />,
+        );
+        const estimate = screen.getByRole('radio', { name: /estimate from history/i });
+        expect(estimate).toBeChecked();
+        expect(screen.getByText(LINE)).toHaveAttribute('id', estimate.getAttribute('aria-describedby'));
+    });
+
+    it('names the money sent from the other account when it comes in from there', () => {
+        render(
+            <RecurrenceBuilder
+                value={{ ...defaultSchedule('2026-06-16'), estimateSampleCount: 3 }}
+                onChange={() => {}}
+                estimateEligible
+                transferAcrossCurrencies={{ ...transfer, accountName: 'Account A', direction: 'sent' }}
+            />,
+        );
+        const estimate = screen.getByRole('radio', { name: /estimate from history/i });
+        expect(estimate).toBeChecked();
+        expect(screen.getByText(SENT_LINE)).toHaveAttribute('id', estimate.getAttribute('aria-describedby'));
+        expect(screen.queryByText(/amount received in/)).toBeNull();
+    });
+
+    it('shows no line for a same-currency transfer or a category', () => {
+        render(
+            <RecurrenceBuilder
+                value={{ ...defaultSchedule('2026-06-16'), estimateSampleCount: 3 }}
+                onChange={() => {}}
+                estimateEligible
+                transferAcrossCurrencies={null}
+            />,
+        );
+        // Anchor: the estimate is the chosen amount.
+        expect(screen.getByRole('radio', { name: /estimate from history/i })).toBeChecked();
+        expect(screen.queryByText(/is set from the stored/)).toBeNull();
+    });
+
+    it('shows no line while the amount is as entered', () => {
+        render(
+            <RecurrenceBuilder
+                value={{ ...defaultSchedule('2026-06-16'), estimateSampleCount: null }}
+                onChange={() => {}}
+                estimateEligible
+                transferAcrossCurrencies={transfer}
+            />,
+        );
+        expect(screen.getByRole('radio', { name: /as entered/i })).toBeChecked();
+        expect(screen.queryByText(/is set from the stored/)).toBeNull();
     });
 });

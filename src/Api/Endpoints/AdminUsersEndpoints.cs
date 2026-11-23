@@ -15,12 +15,12 @@ namespace Coffer.Api.Endpoints;
 /// administrator out. Inviting a NEW user is the invite flow (ADR-0083 slice B), not here.
 /// </summary>
 /// <remarks>
-/// <para><b>Disabling ends access</b> (2026-10-12 audit, H2). It used to block new logins
-/// only: open sessions, MCP tokens and OAuth grants all kept working, and a disabled
-/// admin could re-enable themselves. Disabling now revokes all of them, and re-enabling
+/// <para><b>Disabling ends access</b> (ADR-0105 D3). A disable that blocks new logins
+/// only leaves open sessions, MCP tokens and OAuth grants working, and lets a disabled
+/// admin re-enable themselves. So disabling revokes all of them, and re-enabling
 /// restores none: the user signs in again and reconnects their apps.</para>
 ///
-/// <para><b>Granting admin needs a passkey tap</b> (M2): it is the widest grant there is.
+/// <para><b>Granting admin needs a passkey tap</b> (ADR-0105 D1): it is the widest grant there is.
 /// Revoking admin, disabling, and signing out are protective and need only the session.</para>
 /// </remarks>
 public static class AdminUsersEndpoints

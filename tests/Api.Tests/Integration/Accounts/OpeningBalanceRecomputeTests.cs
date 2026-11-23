@@ -19,29 +19,30 @@ namespace Coffer.Api.Tests.Integration.Accounts;
 /// else <c>accounts.opening_balance</c>). Change it and every stored row is stale.
 /// </para>
 /// <para>
-/// Nothing noticed. <c>UpdateAsync</c> writes the column with
+/// Nothing recomputes it implicitly. <c>UpdateAsync</c> writes the column with
 /// <c>ExecuteUpdateAsync</c>, which bypasses the ChangeTracker, so
 /// <c>LegDerivedRecomputeInterceptor</c> never fires — and its switch matches only
 /// TxnLegRow / TxnHeaderRow and the two override rows, never AccountRow, so a
-/// SaveChanges path would not have helped either. Migration 088 dropped the last
-/// trigger on <c>accounts</c>. The result was wrong balances in the register, on the
-/// dashboard and in net-worth history, and they did NOT self-heal: the incremental
-/// recompute seeds from the last stored row before its anchor, so it inherits the
-/// stale figure. Only a manual repair cleared it.
+/// SaveChanges path would not help either. Migration 088 dropped the last trigger on
+/// <c>accounts</c>. Without the explicit recompute <c>UpdateAsync</c> runs on a changed
+/// opening balance, the register, dashboard and net-worth history show wrong balances
+/// that do NOT self-heal: the incremental recompute seeds from the last stored row
+/// before its anchor, so it inherits the stale figure, and only a manual repair clears it.
 /// </para>
 /// <para>
-/// No test covered this. <c>LedgerBalanceRecomputeEquivalenceTests</c> sets the column
-/// with raw SQL and rebuilds by hand, which sidesteps the write path entirely, and the
-/// accounts mutation tests only round-trip the DTO. So this asserts the property the
-/// bug violated: PATCH the opening balance, then READ what is stored.
+/// <c>LedgerBalanceRecomputeEquivalenceTests</c> sets the column with raw SQL and
+/// rebuilds by hand, which sidesteps the write path entirely, and the accounts mutation
+/// tests only round-trip the DTO. So this asserts the property directly: PATCH the
+/// opening balance, then READ what is stored.
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class OpeningBalanceRecomputeTests
+public sealed class OpeningBalanceRecomputeTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public OpeningBalanceRecomputeTests(PostgresFixture fixture) => _fixture = fixture;
+    public OpeningBalanceRecomputeTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -54,7 +55,7 @@ public sealed class OpeningBalanceRecomputeTests
     [Fact]
     public async Task Changing_the_opening_balance_reseeds_every_stored_running_balance()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("Checking", openingBalance: 250.75m);
         var expense = await ledger.AddCategoryAsync("Groceries", "expense");
 
@@ -69,18 +70,18 @@ public sealed class OpeningBalanceRecomputeTests
         var before = await StoredBalancesAsync(ledger, checking.Id);
         Assert.Equal([230.75m, 200.75m, 160.75m], before);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // The correction a user makes when they realise the account started elsewhere.
         var patch = await client.PatchAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/accounts/{checking.Id}",
             new UpdateAccountRequest { OpeningBalance = 1250.75m });
-        Assert.Equal(HttpStatusCode.NoContent, patch.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, patch.StatusCode);
 
         // Every row shifts by the delta between the new and old opening balance, in
-        // order. Before the fix these stayed at the old figures indefinitely — each one
-        // short by exactly that delta.
+        // order. Without the recompute they would stay at the old figures indefinitely —
+        // each one short by exactly that delta.
         var after = await StoredBalancesAsync(ledger, checking.Id);
         Assert.Equal([1230.75m, 1200.75m, 1160.75m], after);
     }
@@ -91,19 +92,19 @@ public sealed class OpeningBalanceRecomputeTests
         // The recompute is conditional, so the cheap path stays cheap: renaming an
         // account must not trigger a full-account rewalk. Asserting the balances are
         // untouched is the observable half of that.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("Checking", openingBalance: 100m);
         var expense = await ledger.AddCategoryAsync("Groceries", "expense");
         await ledger.AddTransactionPairAsync(
             checking.Id, expense.Id, -25m, new DateTime(2026, 1, 5, 12, 0, 0, DateTimeKind.Utc));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var patch = await client.PatchAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/accounts/{checking.Id}",
             new UpdateAccountRequest { Name = "Main Checking" });
-        Assert.Equal(HttpStatusCode.NoContent, patch.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, patch.StatusCode);
 
         Assert.Equal([75m], await StoredBalancesAsync(ledger, checking.Id));
     }
@@ -111,7 +112,7 @@ public sealed class OpeningBalanceRecomputeTests
     /// <summary>Stored <c>balance_after</c> for the account, in posted order.</summary>
     private async Task<List<decimal>> StoredBalancesAsync(SyntheticLedger ledger, Guid accountId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.TxnHeaderAccountBalances.AsNoTracking()
             .Where(b => b.AccountId == accountId)
             .Join(db.TxnHeaders.AsNoTracking(), b => b.HeaderId, h => h.Id, (b, h) => new { b, h })

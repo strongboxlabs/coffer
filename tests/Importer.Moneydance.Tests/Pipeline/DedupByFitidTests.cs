@@ -38,6 +38,8 @@ public sealed class DedupByFitidTests
         Assert.Single(result.Legs);
         Assert.Equal(firstId, result.Legs[0].HeaderId);
         Assert.Equal(1, result.SkippedDuplicates);
+        // The dropped header is named by its Moneydance id, so the step can list it.
+        Assert.Equal([$"md-{secondId:N}"], result.DroppedMdIds);
     }
 
     [Fact]
@@ -151,7 +153,9 @@ public sealed class DedupByFitidTests
             ClearedByUserId:     null,
             OnlineMatchFitid:    fitid,
             OnlineMatchFiId:     fiId,
-            Action:              null);
+            Action:              null,
+            // In memory only: dedup never reads the owner.
+            OriginatingAccountId: null);
 
     private static TxnLegRow MakeLeg(Guid headerId) =>
         new(

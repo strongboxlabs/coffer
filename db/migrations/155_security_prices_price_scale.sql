@@ -1,10 +1,11 @@
 -- 155_security_prices_price_scale.sql
 -- ADR-0070 D8. security_prices.price was NUMERIC(25,12) while its own high / low
--- columns are NUMERIC(19,4). That 12dp scale let single-precision FLOAT noise be
--- stored — e.g. a two-decimal price written with a float tail out to the twelfth place — in
--- historical `fetch` (pre-0.12.0 SimpleFIN) and `import` (MD seed) rows; the true
--- values are clean prices, the tail is representation noise from a producer that
--- went through a 32-bit float. (Current producers already round to 4dp.)
+-- columns are NUMERIC(19,4). That 12dp scale lets single-precision FLOAT noise be
+-- stored — e.g. a two-decimal price written with a float tail out to the twelfth
+-- place — by any producer that goes through a 32-bit float (`fetch` rows from
+-- SimpleFIN before 0.12.0, `import` rows from the MD seed); the true values are
+-- clean prices, the tail is representation noise. (Current producers already
+-- round to 4dp.)
 --
 -- Constrain price to NUMERIC(19,4), matching high / low: the numeric->numeric
 -- cast ROUNDS every existing value to 4dp (scrubbing the noise in one shot), and

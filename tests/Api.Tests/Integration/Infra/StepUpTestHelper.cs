@@ -13,7 +13,7 @@ using Coffer.Api.Auth.Webauthn;
 namespace Coffer.Api.Tests.Integration.Infra;
 
 /// <summary>
-/// Drives the step-up tap a sensitive action needs (2026-10-12 security audit, M2) the
+/// Drives the step-up tap a sensitive action needs (ADR-0105 D1) the
 /// way the SPA does: begin a ceremony for the action, then send the assertion in the
 /// <see cref="StepUpGuard.HeaderName"/> header of the request it approves.
 /// </summary>

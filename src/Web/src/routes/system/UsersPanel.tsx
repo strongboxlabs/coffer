@@ -1,5 +1,6 @@
-import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import {
     fetchAdminUsers,
@@ -28,8 +29,8 @@ const INVITES_KEY = ['admin-invites'] as const;
  * endpoints are the boundary.
  *
  * Disabling ends the user's sessions and app connections, not just future sign-ins
- * (2026-10-12 security audit, H2); "Sign out" does the same without disabling.
- * Making someone an admin, and an invite that does, ask for a passkey tap (M2).
+ * (ADR-0105 D3); "Sign out" does the same without disabling.
+ * Making someone an admin, and an invite that does, ask for a passkey tap (ADR-0105 D1).
  */
 export function UsersPanel() {
     const queryClient = useQueryClient();
@@ -55,8 +56,9 @@ export function UsersPanel() {
         },
     });
 
-    // Invites.
+    // Invites. Create invite link is where focus goes when the last one is revoked.
     const invitesQuery = useQuery({ queryKey: INVITES_KEY, queryFn: fetchAdminInvites, retry: false });
+    const createInviteRef = useRef<HTMLButtonElement | null>(null);
     const invalidateInvites = () => queryClient.invalidateQueries({ queryKey: INVITES_KEY });
     const [grantAdmin, setGrantAdmin] = useState(false);
     const [createdToken, setCreatedToken] = useState<string | null>(null);
@@ -128,7 +130,7 @@ export function UsersPanel() {
                                                 <Button
                                                     variant="secondary"
                                                     size="sm"
-                                                    disabled={busy}
+                                                    pending={busy}
                                                     title="End every session and app connection this user has"
                                                     onClick={() => signOut.mutate({ userId: u.id, name: u.displayName })}
                                                 >
@@ -138,7 +140,8 @@ export function UsersPanel() {
                                             <Button
                                                 variant="secondary"
                                                 size="sm"
-                                                disabled={busy || isSoleEnabledAdmin}
+                                                disabled={isSoleEnabledAdmin}
+                                                pending={busy}
                                                 title={lockNote}
                                                 onClick={() => admin.mutate({ userId: u.id, isAdmin: !u.isAdmin })}
                                             >
@@ -147,7 +150,8 @@ export function UsersPanel() {
                                             <Button
                                                 variant={u.isDisabled ? 'secondary' : 'danger'}
                                                 size="sm"
-                                                disabled={busy || isSoleEnabledAdmin}
+                                                disabled={isSoleEnabledAdmin}
+                                                pending={busy}
                                                 title={lockNote}
                                                 onClick={() => disabled.mutate({ userId: u.id, disabled: !u.isDisabled })}
                                             >
@@ -190,12 +194,14 @@ export function UsersPanel() {
                                 onChange={(e) => setGrantAdmin(e.target.checked)}
                             />
                             <Button
+                                ref={createInviteRef}
                                 variant="secondary"
                                 size="sm"
-                                disabled={createInvite.isPending}
+                                pending={createInvite.isPending}
+                                pendingLabel="Creating…"
                                 onClick={() => createInvite.mutate()}
                             >
-                                {createInvite.isPending ? 'Creating…' : 'Create invite link'}
+                                Create invite link
                             </Button>
                         </div>
                         {createInvite.isError ? (
@@ -223,6 +229,7 @@ export function UsersPanel() {
                                 invites={invitesQuery.data}
                                 onRevoke={(id) => revokeInvite.mutate(id)}
                                 revoking={revokeInvite.isPending}
+                                addRef={createInviteRef}
                                 showLedger
                             />
                         ) : (

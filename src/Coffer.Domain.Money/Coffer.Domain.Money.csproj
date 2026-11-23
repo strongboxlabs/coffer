@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>Coffer.Domain.Money</RootNamespace>
+    <AssemblyName>Coffer.Domain.Money</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- ADR-0114 D15: each currency's ISO 4217 minor units. One checked-in table, which the
+       SPA imports and this assembly embeds, so the API and the SPA read the same places.
+       It lives here, not in the API, so the Moneydance importer reads it too (the API
+       references the importer, so the importer cannot reference the API). The image's API
+       stage copies all of src/, so the file is in the build context there. -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\Web\src\lib\currencyMinorUnits.json"
+                      LogicalName="Coffer.Domain.Money.currency-minor-units.json" />
+  </ItemGroup>
+
+</Project>

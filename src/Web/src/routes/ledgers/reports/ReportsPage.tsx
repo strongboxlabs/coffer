@@ -1,19 +1,26 @@
-import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 import { Link, useParams } from '@tanstack/react-router';
 
 import { deleteSavedReport, fetchSavedReports, fetchVisibleLedgers } from '@/lib/api';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { IconButton } from '@/components/ui/IconButton';
+import { useRowRemovalFocus } from '@/components/ui/rowRemovalFocus';
 import { Trash2 } from 'lucide-react';
 import { Breadcrumb } from '@/components/ui/Breadcrumb';
 import { MainArea, MainPane, TopBar } from '@/components/ui/SidebarLayout';
-import type { SavedReport } from '@/types/report';
+import type { ReportSpec, SavedReport } from '@/types/report';
 
 import { CATALOG } from './catalog';
 import { ReportPinToggle } from './PinToggle';
 import { describeRange } from './RangePicker';
 import { specFromSearch } from './ReportView';
+import { describeReturnsSpec, returnsSpecFromSearch } from './returnsModel';
+
+function describeAggregationSpec(spec: ReportSpec): string {
+    return `${spec.measure} · ${spec.groupBy.toLowerCase()} · ${describeRange(spec).toLowerCase()}`;
+}
 
 /**
  * `/ledgers/:ledgerId/reports` — the Reports destination (ADR-0104 D1).
@@ -40,6 +47,12 @@ export function ReportsPage() {
         queryFn: () => fetchSavedReports(ledgerId),
     });
     const saved = savedQuery.data ?? [];
+    // A deleted report takes its card's Delete with it: focus goes to the next
+    // card's Delete, else the previous card's, else the saved reports' own
+    // region, which stays on the page when the last card goes: the list has no
+    // add control (ADR-0023 §L).
+    const savedRef = useRef<HTMLDivElement | null>(null);
+    const deleteControl = useRowRemovalFocus(saved.map((r) => r.id), savedRef);
 
     // Creating something you cannot remove is a trap, so delete ships with
     // Save rather than after it.
@@ -73,6 +86,13 @@ export function ReportsPage() {
             <MainPane>
                 <div className="mx-auto max-w-5xl space-y-4 p-5">
                 <h1 className="text-xl font-semibold tracking-tight">Reports</h1>
+                <div
+                    ref={savedRef}
+                    role="group"
+                    aria-label="Saved reports"
+                    tabIndex={-1}
+                    className="focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                >
                 <p className="mb-4 text-sm text-text-muted">
                     {saved.length === 0
                         ? 'Open a report, adjust it, and save it to keep it.'
@@ -87,10 +107,12 @@ export function ReportsPage() {
                                 ledgerId={ledgerId}
                                 report={report}
                                 onDelete={() => setPendingDelete(report)}
+                                deleteRef={deleteControl(report.id)}
                             />
                         ))}
                     </Section>
                 ) : null}
+                </div>
 
                 <ConfirmDialog
                     open={pendingDelete !== null}
@@ -139,9 +161,9 @@ export function ReportsPage() {
                 </Section>
 
                 <p className="mt-6 max-w-prose text-[0.6875rem] leading-[1.5] text-text-subtle">
-                    Net worth, account balances, asset allocation, cost basis, capital gains and
-                    performance are not here yet — they are served by a different part of the
-                    reporting layer, which has no web surface so far. They will appear when it does.
+                    Net worth, account balances, asset allocation, cost basis and capital gains
+                    are not here yet — they are served by a different part of the reporting
+                    layer, which has no web surface so far. They will appear when it does.
                 </p>
                 </div>
             </MainPane>
@@ -161,13 +183,18 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 }
 
 function SavedCard({
-    ledgerId, report, onDelete,
+    ledgerId, report, onDelete, deleteRef,
 }: {
     ledgerId: string;
     report: SavedReport;
     onDelete: () => void;
+    /** Given the card's Delete, which takes the card away (useRowRemovalFocus). */
+    deleteRef: (el: HTMLElement | null) => void;
 }) {
-    const spec = specFromSearch(report.spec);
+    // A returns row has no measure or group-by to print; it says what it shows.
+    const subtitle = report.spec.kind === 'returns'
+        ? describeReturnsSpec(returnsSpecFromSearch(report.spec))
+        : describeAggregationSpec(specFromSearch(report.spec));
     return (
         <div className="relative">
         <Link
@@ -177,9 +204,7 @@ function SavedCard({
             className="flex min-w-0 flex-col gap-0.5 rounded border border-accent-soft bg-surface px-2.5 py-2 hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
         >
             <span className="truncate text-xs font-semibold text-text">{report.name}</span>
-            <span className="truncate text-[0.6875rem] text-text-subtle">
-                {spec.measure} · {spec.groupBy.toLowerCase()} · {describeRange(spec).toLowerCase()}
-            </span>
+            <span className="truncate text-[0.6875rem] text-text-subtle">{subtitle}</span>
             {/* Whether other people can see it is the only state worth showing
                 before the report is opened — everything else is in the report. */}
             {report.visibility === 'ledger' ? (
@@ -196,7 +221,7 @@ function SavedCard({
                 target={{ kind: 'saved', id: report.id }}
                 name={report.name}
             />
-            <IconButton aria-label={`Delete ${report.name}`} onClick={onDelete}>
+            <IconButton ref={deleteRef} aria-label={`Delete ${report.name}`} onClick={onDelete}>
                 <Trash2 aria-hidden className="size-icon-sm" />
             </IconButton>
         </span>

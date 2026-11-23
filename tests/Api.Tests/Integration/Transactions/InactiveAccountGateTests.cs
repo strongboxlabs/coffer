@@ -10,32 +10,30 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Transactions;
 
 /// <summary>
-/// API integration tests for the inactive-account 422 gate
-/// (PR #132 follow-up). New transactions and reshape PATCHes that
+/// API integration tests for the inactive-account 422 gate.
+/// New transactions and reshape PATCHes that
 /// target an account whose <c>is_active = false</c> must be rejected
 /// with HTTP 422 + a stable error code so the SPA can place the
 /// message next to the right field.
 ///
 /// Each endpoint is exercised once per relevant account role:
 ///   * POST /transactions: source account, posting counterparty
-///   * PATCH /transactions: reshape source, reshape counterparty
 ///   * POST /investment-transactions: brokerage, category,
 ///     transfer, fee account
-///   * PATCH /investment-transactions: same set
 ///
 /// Editing other fields on existing legs whose account is already
 /// inactive (e.g. updating a payee on a historical transaction) is
-/// intentionally allowed — those code paths never reach the gate
-/// because they don't carry an account-id list.
+/// intentionally allowed. A bank header-only PATCH never reaches the
+/// gate; an edit that resends the shape passes the accounts its legs
+/// already sit on, which may stay inactive (investment edits:
+/// <see cref="InvestmentInactiveAccountEditTests"/>).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class InactiveAccountGateTests
+public sealed class InactiveAccountGateTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public InactiveAccountGateTests(PostgresFixture fixture)
+    public InactiveAccountGateTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -60,12 +58,12 @@ public sealed class InactiveAccountGateTests
     [Fact]
     public async Task Post_bank_transaction_rejects_inactive_source_account()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
         await ledger.SetIsActiveAsync(bank.Id, false);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -87,12 +85,12 @@ public sealed class InactiveAccountGateTests
     [Fact]
     public async Task Post_bank_transaction_rejects_inactive_counterparty()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
         await ledger.SetIsActiveAsync(groceries.Id, false);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -116,12 +114,12 @@ public sealed class InactiveAccountGateTests
     [Fact]
     public async Task Post_investment_transaction_rejects_inactive_brokerage()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage A");
         var securityId = await ledger.AddSecurityAsync("Index Fund C", ticker: "IDXC");
         await ledger.SetIsActiveAsync(brokerage.Id, false);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -143,13 +141,13 @@ public sealed class InactiveAccountGateTests
     [Fact]
     public async Task Post_investment_transaction_rejects_inactive_category()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage A");
         var securityId = await ledger.AddSecurityAsync("Index Fund C", ticker: "IDXC");
         var dividends = await ledger.AddCategoryAsync("dividends", kind: "income");
         await ledger.SetIsActiveAsync(dividends.Id, false);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // dividend_cash carries a category posting (income side).
@@ -172,12 +170,12 @@ public sealed class InactiveAccountGateTests
     [Fact]
     public async Task Post_investment_transaction_rejects_inactive_transfer_account()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage A");
         var checking = await ledger.AddBankAccountAsync("Checking");
         await ledger.SetIsActiveAsync(checking.Id, false);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // transfer carries a non-investment target account.
@@ -199,13 +197,13 @@ public sealed class InactiveAccountGateTests
     [Fact]
     public async Task Post_investment_transaction_rejects_inactive_fee_account()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage A");
         var securityId = await ledger.AddSecurityAsync("Index Fund C", ticker: "IDXC");
         var fees = await ledger.AddCategoryAsync("trading fees", kind: "expense");
         await ledger.SetIsActiveAsync(fees.Id, false);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -235,11 +233,11 @@ public sealed class InactiveAccountGateTests
         // changes payee / memo / posted_at MUST be accepted —
         // historical preservation. Only postings-reshape PATCHes
         // that re-target accounts run through the gate.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Create the transaction while everything's active.

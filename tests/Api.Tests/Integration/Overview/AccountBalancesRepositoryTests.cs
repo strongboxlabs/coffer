@@ -10,37 +10,35 @@ namespace Coffer.Api.Tests.Integration.Overview;
 /// active-only filtering — the one definition every consumer reuses.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class AccountBalancesRepositoryTests
+public sealed class AccountBalancesRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AccountBalancesRepositoryTests(PostgresFixture fixture)
+    public AccountBalancesRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     [Fact]
     public async Task Reads_single_all_and_active_only()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var activeId = await AddAccountAsync(ledger, "Active", 100m, isActive: true);
         var inactiveId = await AddAccountAsync(ledger, "Inactive", 50m, isActive: false);
 
-        await using var db = _fixture.NewDbContext();
-        var repo = new AccountBalancesRepository(db);
+        await using var db = Db.NewDbContext();
+        var repo = new AccountBalancesRepository(db, TimeProvider.System);
 
-        // Single account — the view's opening-balance fallback (no txns).
-        Assert.Equal(100m, await repo.GetCurrentBalanceAsync(ledger.LedgerId, activeId));
+        // Single account — the opening-balance fallback (no txns).
+        Assert.Equal(100m, await repo.GetCurrentBalanceAsync(ledger.LedgerId, activeId, today: null));
         // Unknown account → null (not zero).
-        Assert.Null(await repo.GetCurrentBalanceAsync(ledger.LedgerId, Guid.NewGuid()));
+        Assert.Null(await repo.GetCurrentBalanceAsync(ledger.LedgerId, Guid.NewGuid(), today: null));
 
-        // Active-only (default) excludes the archived account.
-        var active = await repo.GetCurrentBalancesAsync(ledger.LedgerId, activeOnly: true);
+        // Active-only excludes the archived account.
+        var active = await repo.GetCurrentBalancesAsync(ledger.LedgerId, activeOnly: true, today: null);
         Assert.True(active.ContainsKey(activeId));
         Assert.False(active.ContainsKey(inactiveId));
 
         // activeOnly:false includes both.
-        var all = await repo.GetCurrentBalancesAsync(ledger.LedgerId, activeOnly: false);
+        var all = await repo.GetCurrentBalancesAsync(ledger.LedgerId, activeOnly: false, today: null);
         Assert.Equal(100m, all[activeId]);
         Assert.Equal(50m, all[inactiveId]);
     }

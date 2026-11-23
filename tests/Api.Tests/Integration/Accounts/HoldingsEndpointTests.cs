@@ -5,6 +5,7 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Mvc.Testing;
 
 using Coffer.Api.Contracts;
+using Coffer.Api.Db.Entities;
 using Coffer.Api.Tests.Integration.Infra;
 
 namespace Coffer.Api.Tests.Integration.Accounts;
@@ -18,13 +19,11 @@ namespace Coffer.Api.Tests.Integration.Accounts;
 /// the response so the per-position math is exercised end-to-end.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class HoldingsEndpointTests
+public sealed class HoldingsEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public HoldingsEndpointTests(PostgresFixture fixture)
+    public HoldingsEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -41,7 +40,7 @@ public sealed class HoldingsEndpointTests
     [Fact]
     public async Task Returns_positions_with_latest_price_joined()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Test Brokerage");
         var idxa = await ledger.AddSecurityAsync(
             name: "Index Fund A",
@@ -56,7 +55,7 @@ public sealed class HoldingsEndpointTests
         await ledger.AddSecurityPriceAsync(idxa, 200m, new DateTime(2026, 4, 1));
         await ledger.AddSecurityPriceAsync(idxa, 250.00m, new DateTime(2026, 5, 17));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.GetAsync(
             $"/api/ledgers/{ledger.LedgerId}/accounts/{brokerage.Id}/holdings");
@@ -87,6 +86,152 @@ public sealed class HoldingsEndpointTests
         Assert.Equal(25000m, view.Summary.Total);
     }
 
+    // ---- a position priced in another currency (ADR-0114 D5, D7, D9) ------------------
+
+    private static DateOnly ServerToday => DateOnly.FromDateTime(DateTime.UtcNow);
+
+    /// <summary>
+    /// A USD brokerage holding a fund priced in EUR (its cost basis in dollars) and one
+    /// priced in USD. With <paramref name="eurRate"/>, EUR to USD is
+    /// stored for yesterday and covered through it, as the rate fetcher writes it.
+    /// </summary>
+    private async Task<(SyntheticLedger Ledger, AccountRow Brokerage, Guid Euro, Guid Dollar)> SeedForeignPricedAsync(
+        decimal? eurRate)
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage A");
+        var euro = await ledger.AddSecurityAsync(name: "Fund One", ticker: "EURF");
+        var dollar = await ledger.AddSecurityAsync(name: "Fund Two", ticker: "USDF");
+        await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, euro, 10m, 1000m);
+        await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, dollar, 5m, 900m);
+        await ledger.AddSecurityPriceAsync(euro, 120m, new DateTime(2026, 5, 17), currencyCode: "EUR");
+        await ledger.AddSecurityPriceAsync(dollar, 200m, new DateTime(2026, 5, 17));
+        if (eurRate is { } rate)
+        {
+            await using var owner = Db.NewAppDbContextAsUser(ledger.UserId);
+            owner.FxRates.Add(new Coffer.Api.Db.Entities.FxRateRow
+            {
+                Id = Guid.NewGuid(), LedgerId = ledger.LedgerId, FromCurrency = "EUR", ToCurrency = "USD",
+                RateDate = ServerToday.AddDays(-1), Rate = rate,
+                Source = Coffer.Api.Db.Entities.FxRateSource.Frankfurter, Upstream = "Source A",
+            });
+            owner.FxPairCoverage.Add(new Coffer.Api.Db.Entities.FxPairCoverageRow
+            {
+                LedgerId = ledger.LedgerId, FromCurrency = "EUR", ToCurrency = "USD",
+                FetchedThroughDate = ServerToday.AddDays(-1),
+            });
+            await owner.SaveChangesAsync();
+        }
+        return (ledger, brokerage, euro, dollar);
+    }
+
+    private async Task<(HoldingsViewDto View, JsonElement Json)> HoldingsAsync(SyntheticLedger ledger, Guid brokerageId)
+    {
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+        using var response = await client.GetAsync($"/api/ledgers/{ledger.LedgerId}/accounts/{brokerageId}/holdings");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        return (JsonSerializer.Deserialize<HoldingsViewDto>(body, JsonSerializerOptions.Web)!,
+            JsonDocument.Parse(body).RootElement.Clone());
+    }
+
+    /// <summary>
+    /// The position priced in EUR keeps its price and value in EUR and names the currency;
+    /// its value in the account's USD is converted at the latest rate, and its gain and the
+    /// summary read that, never the EUR figure.
+    /// </summary>
+    [Fact]
+    public async Task A_position_priced_in_another_currency_converts_into_the_accounts_at_the_latest_rate()
+    {
+        var (ledger, brokerage, euro, dollar) = await SeedForeignPricedAsync(eurRate: 1.5m);
+
+        var (view, json) = await HoldingsAsync(ledger, brokerage.Id);
+
+        Assert.Equal("USD", view.CurrencyCode);
+        var e = view.Positions.Single(p => p.SecurityId == euro);
+        Assert.Equal(120m, e.CurrentPrice);
+        Assert.Equal(1200m, e.CurrentValue);            // native, in EUR
+        Assert.Equal("EUR", e.PriceCurrencyCode);
+        Assert.Equal(1800m, e.AccountValue);            // the EUR value at the rate
+        Assert.Equal(800m, e.UnrealizedGain);           // against the USD cost basis
+        Assert.Equal(80m, e.PercentChange);
+        Assert.Null(e.RateUnavailable);
+        var d = view.Positions.Single(p => p.SecurityId == dollar);
+        Assert.Equal((1000m, 100m), (d.CurrentValue!.Value, d.UnrealizedGain!.Value));
+        Assert.Null(d.PriceCurrencyCode);
+
+        Assert.Equal(1800m + 1000m, view.Summary.PortfolioValue);
+        Assert.Equal(1900m, view.Summary.CostBasis);
+        Assert.Equal(900m, view.Summary.UnrealizedGain);
+        Assert.Equal(2800m, view.Summary.Total);
+        Assert.Null(view.Summary.RateUnavailable);
+        Assert.False(json.GetProperty("summary").TryGetProperty("rateUnavailable", out _));
+    }
+
+    /// <summary>
+    /// With no EUR rate the EUR-priced position has no value in the account's currency and
+    /// no gain, naming the missing rate, and the summary's value, gain and total are null
+    /// and name it too (ADR-0114 D9): never the EUR figure added as dollars, never a sum of
+    /// the positions that converted.
+    /// </summary>
+    [Fact]
+    public async Task A_position_whose_rate_is_missing_fails_closed()
+    {
+        var (ledger, brokerage, euro, dollar) = await SeedForeignPricedAsync(eurRate: null);
+
+        var (view, json) = await HoldingsAsync(ledger, brokerage.Id);
+
+        var missing = new RateUnavailable("EUR", "USD", ServerToday);
+        var e = view.Positions.Single(p => p.SecurityId == euro);
+        Assert.Equal(1200m, e.CurrentValue);
+        Assert.Equal("EUR", e.PriceCurrencyCode);
+        Assert.Null(e.AccountValue);
+        Assert.Null(e.UnrealizedGain);
+        Assert.Null(e.PercentChange);
+        Assert.Equal([missing], e.RateUnavailable!);
+        Assert.Equal(100m, view.Positions.Single(p => p.SecurityId == dollar).UnrealizedGain);
+
+        Assert.Null(view.Summary.PortfolioValue);
+        Assert.Null(view.Summary.UnrealizedGain);
+        Assert.Null(view.Summary.PercentChange);
+        Assert.Null(view.Summary.Total);
+        Assert.Equal(1900m, view.Summary.CostBasis);
+        Assert.Equal(0m, view.Summary.CashBalance);
+        Assert.Equal([missing], view.Summary.RateUnavailable!);
+        var wire = json.GetProperty("summary");
+        Assert.Equal(JsonValueKind.Null, wire.GetProperty("portfolioValue").ValueKind);
+        Assert.Equal("EUR", wire.GetProperty("rateUnavailable")[0].GetProperty("fromCurrency").GetString());
+    }
+
+    /// <summary>
+    /// A brokerage whose positions are all priced in its own currency answers exactly as it
+    /// did before conversion: the same properties, none of the conversion ones, and no rate
+    /// read.
+    /// </summary>
+    [Fact]
+    public async Task A_single_currency_brokerage_answers_with_the_same_properties_as_before()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage A");
+        var fund = await ledger.AddSecurityAsync(name: "Fund One", ticker: "USDF");
+        await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, fund, 5m, 900m);
+        await ledger.AddSecurityPriceAsync(fund, 200m, new DateTime(2026, 5, 17));
+
+        var (_, json) = await HoldingsAsync(ledger, brokerage.Id);
+
+        static string[] Names(JsonElement e) => [.. e.EnumerateObject().Select(p => p.Name)];
+        Assert.Equal(
+            ["portfolioValue", "costBasis", "unrealizedGain", "percentChange", "cashBalance", "total"],
+            Names(json.GetProperty("summary")));
+        Assert.Equal(
+            ["securityId", "ticker", "name", "assetClass", "quantity", "costBasis", "costPerShare",
+             "currentPrice", "priceAsOf", "currentValue", "unrealizedGain", "percentChange"],
+            Names(json.GetProperty("positions")[0]));
+        Assert.Equal(1000m, json.GetProperty("summary").GetProperty("portfolioValue").GetDecimal());
+        Assert.Equal(1000m, json.GetProperty("summary").GetProperty("total").GetDecimal());
+    }
+
     [Fact]
     public async Task Filters_out_zero_quantity_positions()
     {
@@ -94,7 +239,7 @@ public sealed class HoldingsEndpointTests
         // is fully sold (ADR-0018 Rule 4 — no lot closing). The Portfolio
         // View must hide those rows; surfacing them would clutter the
         // table with empty entries that have no current meaning.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var open = await ledger.AddSecurityAsync(name: "Open Position", ticker: "AAA");
         var sold = await ledger.AddSecurityAsync(name: "Sold Out", ticker: "BBB");
@@ -102,7 +247,7 @@ public sealed class HoldingsEndpointTests
         await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, sold, 0m, 0m);
         await ledger.AddSecurityPriceAsync(open, 120m, new DateTime(2026, 5, 17));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.GetAsync(
             $"/api/ledgers/{ledger.LedgerId}/accounts/{brokerage.Id}/holdings");
@@ -120,12 +265,12 @@ public sealed class HoldingsEndpointTests
         // no price snapshot has null Current* fields, but the summary's
         // PortfolioValue treats it as held-at-cost so the total doesn't
         // silently drop to zero for un-priced holdings.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var unpriced = await ledger.AddSecurityAsync(name: "No Price Yet", ticker: "ZZZ");
         await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, unpriced, 5m, 500m);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.GetAsync(
             $"/api/ledgers/{ledger.LedgerId}/accounts/{brokerage.Id}/holdings");
@@ -147,10 +292,10 @@ public sealed class HoldingsEndpointTests
     [Fact]
     public async Task Empty_brokerage_returns_zero_summary_with_no_positions()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Empty Brokerage");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.GetAsync(
             $"/api/ledgers/{ledger.LedgerId}/accounts/{brokerage.Id}/holdings");
@@ -167,7 +312,7 @@ public sealed class HoldingsEndpointTests
     [Fact]
     public async Task Positions_sorted_by_ticker_ascending()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var zzz = await ledger.AddSecurityAsync(name: "Zzz", ticker: "ZZZ");
         var aaa = await ledger.AddSecurityAsync(name: "Aaa", ticker: "AAA");
@@ -176,7 +321,7 @@ public sealed class HoldingsEndpointTests
         await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, aaa, 1m, 100m);
         await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, mid, 1m, 100m);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.GetAsync(
             $"/api/ledgers/{ledger.LedgerId}/accounts/{brokerage.Id}/holdings");
@@ -189,10 +334,10 @@ public sealed class HoldingsEndpointTests
     [Fact]
     public async Task Returns_422_when_account_is_not_investment_type()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.GetAsync(
             $"/api/ledgers/{ledger.LedgerId}/accounts/{bank.Id}/holdings");
@@ -205,10 +350,10 @@ public sealed class HoldingsEndpointTests
     [Fact]
     public async Task Returns_422_when_account_not_in_ledger()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var stranger = Guid.NewGuid();
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.GetAsync(
             $"/api/ledgers/{ledger.LedgerId}/accounts/{stranger}/holdings");
@@ -221,11 +366,11 @@ public sealed class HoldingsEndpointTests
     [Fact]
     public async Task Returns_422_ledger_not_visible_when_user_has_no_grant()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
         var aliceBrokerage = await alice.AddInvestmentAccountAsync("Alice Brokerage");
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var bob = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
         var response = await bobClient.GetAsync(
             $"/api/ledgers/{alice.LedgerId}/accounts/{aliceBrokerage.Id}/holdings");

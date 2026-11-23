@@ -29,13 +29,12 @@ const statusBadgeVariants = cva(
                 // Cleared and Reconciling share one treatment on purpose: the
                 // glyph is what tells them apart (check vs dot), so the colour
                 // is free to be the app's own tone instead of a second hue.
-                // The check used to be Tailwind green — hue 142, the only thing
-                // in the app at that hue next to an accent at 172 — which is
-                // what made it read as a foreign green.
+                // Not Tailwind green: hue 142 would be the only thing in the
+                // app at that hue, next to an accent at 172, and so reads as a
+                // foreign green.
                 cleared: 'bg-accent-soft text-accent-soft-text',
                 // Reconciling: the accent-toned dot. This is the tone the
-                // rest of the column is tuned AGAINST — the check was the
-                // outlier, not this.
+                // rest of the column is tuned AGAINST.
                 reconciling: 'bg-accent-soft text-accent-soft-text border border-accent',
                 pending: 'bg-state-warning-soft text-state-warning',
                 scheduled: 'bg-accent-soft text-accent-soft-text',

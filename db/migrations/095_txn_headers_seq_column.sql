@@ -5,7 +5,7 @@
 -- THE PROBLEM (continued)
 --
 -- ADR-0034 elevated `(posted_at, created_at, id)` to the canonical
--- ordering. Real data exposed a gap: the importer batch-INSERTs all
+-- ordering. That has a gap: the importer batch-INSERTs all
 -- headers in one statement, so every header in the batch gets the
 -- IDENTICAL `created_at` (now() is evaluated once per statement).
 -- Ordering then falls through to `id`, a random UUID.

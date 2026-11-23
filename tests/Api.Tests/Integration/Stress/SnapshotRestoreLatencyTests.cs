@@ -12,8 +12,8 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Stress;
 
 /// <summary>
-/// The scale lane: snapshot create + restore against a ~50k-transaction,
-/// 200-holding ledger. Deliberately OUTSIDE the default test run — the
+/// The scale lane: snapshot create + restore against a ~50k-transaction ledger
+/// holding 200 securities in each of two brokerages. Deliberately OUTSIDE the default test run — the
 /// <c>Integration.Stress</c> namespace is excluded from the sharded suite
 /// (<c>scripts/ci-dotnet-shards.sh</c>), because building the fixture takes minutes
 /// and would dominate every ordinary run. Invoke it explicitly by filtering on this
@@ -21,11 +21,9 @@ namespace Coffer.Api.Tests.Integration.Stress;
 /// <code>dotnet test --filter "FullyQualifiedName~Integration.Stress"</code>
 /// </summary>
 /// <remarks>
-/// <para>This exists because restore latency was completely unmeasured. The restore
-/// time that motivated mig 188 came from real data, and the
-/// representative fixture is far too small to reproduce it (19 headers, 1
-/// holding) — so the payoff of that change was reasoned and unit-tested but never
-/// timed. Nothing here asserts a speedup: it asserts restore stays well inside its
+/// <para>A restore fails when it outruns its command timeout, and the
+/// representative fixture is far too small to approach that (19 headers, 1
+/// holding). Nothing here asserts a speedup: it asserts restore stays well inside its
 /// timeout at scale, and prints the timings so a regression is visible.</para>
 /// <para>Parameterised over <see cref="Boundary.Positions"/> like every other
 /// financial suite: the money comparison across the restore is only as good as
@@ -35,25 +33,24 @@ namespace Coffer.Api.Tests.Integration.Stress;
 /// magnitudes in one SUM.</para>
 /// <para>The thresholds are deliberately loose. This runs on whatever hardware the
 /// lane is invoked on, so a tight bound would be a flake generator. The value is
-/// the printed numbers plus a guard against the failure found on a real install —
+/// the printed numbers plus a guard against the failure this lane exists for —
 /// a restore exceeding its command timeout.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class SnapshotRestoreLatencyTests
+public sealed class SnapshotRestoreLatencyTests : DatabaseTest
 {
     /// <summary>
-    /// The failure found on a real install was a 30s command timeout; the cap is now 600s
-    /// (SnapshotOpTimeoutSeconds). Fail well before that so there is headroom to
+    /// The snapshot command timeout is 600s (SnapshotOpTimeoutSeconds) rather than
+    /// the 30s default. Fail well before that so there is headroom to
     /// diagnose rather than a hard stop at the cap.
     /// </summary>
     private static readonly TimeSpan RestoreBudget = TimeSpan.FromSeconds(120);
 
-    private readonly PostgresFixture _fixture;
     private readonly ITestOutputHelper _output;
 
     public SnapshotRestoreLatencyTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
         _output = output;
     }
 
@@ -61,10 +58,10 @@ public sealed class SnapshotRestoreLatencyTests
     [MemberData(nameof(Boundary.Positions), MemberType = typeof(Boundary))]
     public async Task Snapshot_create_and_restore_stay_within_budget_at_scale(Boundary.Position p)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var scale = StressLedger.Scale.Default;
 
-        var seedElapsed = await StressLedger.SeedAsync(_fixture, ledger, scale);
+        var seedElapsed = await StressLedger.SeedAsync(Db, ledger, scale);
         _output.WriteLine($"seed:    {seedElapsed.TotalSeconds,7:F1}s  (target {scale.TotalTxns:N0} txns)");
 
         // Prove the scale actually materialised — a silently-small ledger would
@@ -75,8 +72,8 @@ public sealed class SnapshotRestoreLatencyTests
             $"{counts.Holdings:N0} holdings, {counts.Lots:N0} lots, {counts.Gains:N0} realized gains");
 
         Assert.Equal(scale.TotalTxns, counts.Headers);
-        Assert.Equal(scale.Holdings, counts.Holdings);
-        Assert.Equal(scale.Holdings * scale.BuysPerHolding, counts.Lots);
+        Assert.Equal(scale.TotalHoldings, counts.Holdings);
+        Assert.Equal(scale.TotalLots, counts.Lots);
         // Sells must have produced realized gains, or the FIFO path went unexercised.
         Assert.True(counts.Gains > 0, "no realized_gains rows — the disposals did not close any lots");
 
@@ -89,7 +86,7 @@ public sealed class SnapshotRestoreLatencyTests
         // covers the matrix in isolation and runs on every push; what this adds
         // is the interaction with scale, which is the only thing the stress lane
         // can say that the cheap lane cannot.
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var brokerage = await ledger.AddInvestmentAccountAsync($"Boundary {p.Name}");
@@ -140,7 +137,7 @@ public sealed class SnapshotRestoreLatencyTests
         var snap = (await createResp.Content.ReadFromJsonAsync<CreateSnapshotResponse>())!.Snapshot!;
         _output.WriteLine(
             $"create:  {createWatch.Elapsed.TotalSeconds,7:F1}s  " +
-            $"({snap.ContentSizeUncompressed / (1024.0 * 1024.0):F1} MB payload)");
+            $"({snap.ContentSizeStored / (1024.0 * 1024.0):F1} MB stored)");
 
         var restoreWatch = Stopwatch.StartNew();
         var restoreResp = await client.PostAsync(
@@ -163,12 +160,10 @@ public sealed class SnapshotRestoreLatencyTests
             $"qty {moneyAfter.Quantity:N6}  gains {moneyAfter.RealizedGain:N2}");
         Assert.Equal(moneyBefore, moneyAfter);
 
-        // Measure, don't assert: how long the FIFO recompute that mig 188 removed
-        // from restore actually takes at this scale. Two reasons to keep this here
-        // rather than reason about it — it quantifies what mig 188 saved (restore
-        // used to pay this on top of the number above), and it is the baseline for
-        // the follow-up that optimises the walk itself, which still runs on EVERY
-        // transaction write via the interceptors.
+        // Measure, don't assert: how long the FIFO recompute takes at this scale.
+        // Restore does not run it (mig 188), but it is the baseline for any
+        // optimisation of the walk itself, which still runs on EVERY transaction
+        // write via the interceptors.
         var fifoElapsed = await TimeFifoRecomputeAsync(ledger.LedgerId);
         _output.WriteLine(
             $"fifo:    {fifoElapsed.TotalSeconds,7:F1}s  " +
@@ -181,7 +176,7 @@ public sealed class SnapshotRestoreLatencyTests
 
     private async Task<TimeSpan> TimeFifoRecomputeAsync(Guid ledgerId)
     {
-        await using var db = _fixture.NewServiceFactory().Create();
+        await using var db = Db.NewServiceFactory().Create();
         // This is the operation whose cost is in question — it must not be cut off
         // by the 30s Npgsql default while we are trying to measure it.
         db.Database.SetCommandTimeout(600);
@@ -203,7 +198,7 @@ public sealed class SnapshotRestoreLatencyTests
     /// <summary>Every money aggregate a restore could silently corrupt.</summary>
     private async Task<Money> ReadMoneyAsync(Guid ledgerId)
     {
-        await using var db = _fixture.NewServiceFactory().Create();
+        await using var db = Db.NewServiceFactory().Create();
         db.Database.SetCommandTimeout(600);
         return await db.Database.SqlQuery<Money>($"""
             SELECT
@@ -221,7 +216,7 @@ public sealed class SnapshotRestoreLatencyTests
 
     private async Task<Counts> ReadCountsAsync(Guid ledgerId)
     {
-        await using var db = _fixture.NewServiceFactory().Create();
+        await using var db = Db.NewServiceFactory().Create();
         return new Counts(
             await db.TxnHeaders.CountAsync(h => h.LedgerId == ledgerId),
             await db.TxnLegs.CountAsync(l => l.LedgerId == ledgerId),
@@ -239,7 +234,7 @@ public sealed class SnapshotRestoreLatencyTests
     /// </summary>
     private async Task AssertLedgerIsConsistentAsync(Guid ledgerId)
     {
-        await using var db = _fixture.NewServiceFactory().Create();
+        await using var db = Db.NewServiceFactory().Create();
 
         var unbalanced = await db.Database.SqlQuery<int>($"""
             SELECT count(*)::int AS "Value" FROM (

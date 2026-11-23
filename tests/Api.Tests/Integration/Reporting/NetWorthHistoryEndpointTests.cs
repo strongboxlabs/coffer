@@ -22,11 +22,12 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// daily interval is a 400 rather than a plausible monthly answer.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class NetWorthHistoryEndpointTests
+public sealed class NetWorthHistoryEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public NetWorthHistoryEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public NetWorthHistoryEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> ClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -44,13 +45,13 @@ public sealed class NetWorthHistoryEndpointTests
     [Fact]
     public async Task It_returns_a_point_per_period_with_the_opening_balance_carried()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         // Untouched on purpose: a net-worth series has to value an account
         // from its opening balance when no posting has ever moved it, which is
         // the same property UntouchedAccountTests pins one layer down.
         await ledger.AddBankAccountAsync("Savings", openingBalance: 2_500m);
 
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = await ClientAsync(factory, ledger);
 
         var response = await client.GetAsync(Url(ledger.LedgerId, $"{Window}&interval=Month"));
@@ -70,8 +71,8 @@ public sealed class NetWorthHistoryEndpointTests
         // walker, so it fell through to the month default and the caller got
         // monthly points under a daily label, with nothing in the response
         // saying so. A 400 is the honest answer; the quiet one was months.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db);
         using var client = await ClientAsync(factory, ledger);
 
         var response = await client.GetAsync(Url(ledger.LedgerId, $"{Window}&interval=Day"));
@@ -89,8 +90,8 @@ public sealed class NetWorthHistoryEndpointTests
         // /summary treats an absent window as "everything", which is a real
         // report. An unbounded net-worth SERIES would have to invent its own
         // bounds, and the point cap over an invented range is a coin toss.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db);
         using var client = await ClientAsync(factory, ledger);
 
         var response = await client.GetAsync(Url(ledger.LedgerId, query));
@@ -102,8 +103,8 @@ public sealed class NetWorthHistoryEndpointTests
     {
         // The repository throws for its own good reasons; an unhandled throw
         // here would present a caller's over-wide range as a server fault.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db);
         using var client = await ClientAsync(factory, ledger);
 
         var response = await client.GetAsync(Url(ledger.LedgerId,
@@ -115,8 +116,8 @@ public sealed class NetWorthHistoryEndpointTests
     [Fact]
     public async Task A_bad_interval_names_what_is_accepted()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db);
         using var client = await ClientAsync(factory, ledger);
 
         var response = await client.GetAsync(Url(ledger.LedgerId, $"{Window}&interval=Fortnightly"));

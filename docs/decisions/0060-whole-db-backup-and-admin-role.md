@@ -18,8 +18,8 @@ ADR **reframes the backup track to whole-database** (ADR-0037's per-ledger
 backup design is superseded; its snapshot design stands unchanged).
 
 A whole-DB backup crosses every user and ledger, so it can't be a per-user
-action — it needs an **admin role** to gate it. The user wants it surfaced like
-the Snapshots panel and, eventually, synced to Google Drive.
+action — it needs an **admin role** to gate it. It is surfaced like the
+Snapshots panel and, eventually, synced to Google Drive.
 
 ## Decision
 
@@ -133,9 +133,11 @@ later.
 
 ## Amendment — 2026-10-15: a backup is written whole, read back, then listed
 
-Every backup taken while a snapshot existed was unrestorable for two months (the chunk
-table's data without its parents) and every scheduled run reported success, because the
-only check after `pg_dump` was the file's size. The write path now has three guarantees:
+A backup can be unrestorable while its run reports success when the only check after
+`pg_dump` is the file's size: a dump can hold a table's data without its parents. Backups
+taken while a snapshot existed by releases 0.54.0 to 0.115.x have that shape (the chunk
+table's data without its parents); from 0.116.0 backups exclude both tables and a restore
+skips both, so those archives restore too. The write path has three guarantees:
 
 - **Atomic.** The artifact is written to `<name>.cofferbak.partial`, flushed to disk,
   verified, and only then renamed to its listed name. The `.partial` never matches the
@@ -153,8 +155,8 @@ only check after `pg_dump` was the file's size. The write path now has three gua
   goes through the same write, verify, rename steps.
 - **Retention keeps the newest.** `SelectForDeletion` never selects the newest backup,
   whatever the tiers say, and the daily tier is at least one day (migration 250 raises a
-  stored 0 to 1). Previously 0/0/0 deleted each new backup right after writing it while the
-  create answered 201.
+  stored 0 to 1). Without both, 0/0/0 deletes each new backup right after writing it while
+  the create answers 201.
 
 What verification does not prove: that the data restores. That is the restore drill's job
 (FU-059).
@@ -165,17 +167,16 @@ Four ways a backup's own report was wrong, closed together (FU-063, FU-065, FU-0
 
 - **A manual backup no longer runs inside its request.** `POST /api/admin/backups` answers
   **202** with a run id, the backup runs on the host's lifetime (`BackupRunCoordinator`),
-  and the browser polls `GET /api/admin/backups/runs/{runId}`. It used to answer 201 at the
-  end, so a proxy's request timeout (Cloudflare's is 100 seconds) cancelled the backup with
-  it. The run's state is in memory: after a restart the run is unknown (404) and the list is
+  and the browser polls `GET /api/admin/backups/runs/{runId}`. Answering 201 at the end
+  lets a proxy's request timeout (Cloudflare's is 100 seconds) cancel the backup with it. The run's state is in memory: after a restart the run is unknown (404) and the list is
   where to look.
 - **One backup at a time.** Nothing serialised a manual and a scheduled backup. Every backup
   now takes one gate: a scheduled run waits for a manual one; a manual start while another
   runs is refused (422 `backup-in-progress`).
-- **An interrupted backup leaves a trace.** A run cut short by a stop or deploy was claimed
-  and then left with no outcome; only the 48-hour age alert noticed. The scheduler now
+- **An interrupted backup leaves a trace.** A run cut short by a stop or deploy is claimed
+  and then left with no outcome, and only the 48-hour age alert would notice. The scheduler
   records it as a failure with the reason "Interrupted" — counted toward the five-failure
-  auto-disable like any other failure, by the maintainer's choice — and both the scheduled
+  auto-disable like any other failure — and both the scheduled
   and the manual path publish `backup.failed`, on a token of their own.
 - **A good backup is never announced as failed.** The success heartbeat was published inside
   the `try` that announces failures, so a failed event write turned a written, verified,
@@ -191,19 +192,32 @@ Four ways a backup's own report was wrong, closed together (FU-063, FU-065, FU-0
 
 ## Amendment — 2026-10-16: archive format v3, and a header that is checked before it is used
 
-Two weaknesses in the `.cofferbak` header (FU-072, audit R1 and R2):
+Two weaknesses in the `.cofferbak` header (FU-072):
 
 - **Nothing authenticated it.** The per-chunk tags covered the sequence and the final flag,
   not the header, so its version could be downgraded and its KEK fingerprint swapped or
-  stripped — which is what let an edited archive steer key adoption. **v3** has v2's layout
+  stripped, and an edited archive could steer key adoption. **v3** has v2's layout
   and binds the whole header into every chunk's associated data: any change to it fails every
   tag, so the passphrase check every restore runs before committing now also proves the header
   is the one the backup was written with. Writers emit v3; v1 and v2 still read. An earlier
   Coffer cannot read a v3 backup and says so by version, which is the same answer a backup
   from a newer schema already got.
 - **Its KDF parameters were used as read.** Argon2 runs to completion and cannot be
-  cancelled, so a crafted header asking for terabytes of memory or a billion passes pinned
+  cancelled, so a crafted header asking for terabytes of memory or a billion passes pins
   the process — on the restore endpoints, one of which a setup-token holder can reach.
   Parameters are now bounded before anything is derived: memory at most four times, and
   passes and lanes a small multiple of, the 64 MiB / 3 / 1 every writer has used. A header
   outside them is refused from the header alone, by the pre-flight read as well.
+
+## Amendment — 2026-10-25: a restore knows the C# migration steps as well as the SQL files
+
+A restore refuses a backup whose journal names a migration this build does not ship, because
+DbUp ignores journal rows it has no script for and the database would come up half-working
+and be reported restored. "Shipped" was the set of `*.sql` files. Since migration 264 the
+migration run also journals C# steps between the SQL files (the stored memo-and-tags backfill,
+and any later recompute step), so every backup taken after the upgrade carries their rows and
+that set would refuse it as coming from a newer build. The known set is now the SQL file names
+plus every C# step name, taken from `MigrationRunner.CSharpSteps`, the one list the runner
+registers from, so the two cannot drift. `PostUpgradeBackupRestoreTests` brings a database
+migrated by this build, holding data, through the restore's migration step, and checks that a
+journal row from a newer build is still refused.

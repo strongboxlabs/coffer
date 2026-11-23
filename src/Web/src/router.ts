@@ -15,18 +15,23 @@ import { AccountSecurityPage } from '@/routes/account/AccountSecurityPage';
 import { LandingPage } from '@/routes/landing/LandingPage';
 import { ImportLedgerPage } from '@/routes/imports/ImportLedgerPage';
 import { ConsentPage } from '@/routes/oauth/ConsentPage';
-import { LedgerDetailPage } from '@/routes/ledgers/LedgerDetailPage';
+import { HomePage } from '@/routes/ledgers/home/HomePage';
 import { AccountsManagementPage } from '@/routes/ledgers/accounts/AccountsManagementPage';
 import { RegisterRouter } from '@/routes/ledgers/register/RegisterRouter';
+import { arrivalStatusOf, type RegisterArrivalStatus } from '@/routes/ledgers/register/shell/registerStatus';
 import { SecuritiesCatalogPage } from '@/routes/ledgers/SecuritiesCatalogPage';
-import { CategoriesPage } from '@/routes/ledgers/CategoriesPage';
-import { TagsPage } from '@/routes/ledgers/TagsPage';
+import { StructureLayout } from '@/routes/ledgers/structure/StructureLayout';
+import { CategoriesTab } from '@/routes/ledgers/structure/CategoriesTab';
+import { TagsTab } from '@/routes/ledgers/structure/TagsTab';
+import { TaggedTransactionsPage } from '@/routes/ledgers/structure/TaggedTransactionsPage';
 import { BudgetPage } from './routes/ledgers/BudgetPage';
 import { ReportsPage } from './routes/ledgers/reports/ReportsPage';
 import { ReportView, type ReportSearch } from './routes/ledgers/reports/ReportView';
 import { SecurityDetailPage } from '@/routes/ledgers/SecurityDetailPage';
 import { SettingsPage } from '@/routes/ledgers/settings/SettingsPage';
 import { RemindersPage } from '@/routes/ledgers/reminders/RemindersPage';
+import { validateRemindersSearch } from '@/routes/ledgers/reminders/remindersSearch';
+import { validateAccountsSearch } from '@/routes/ledgers/accounts/accountsSearch';
 import { coerceSettingsTab, type SettingsTab } from '@/routes/ledgers/settings/settingsTabs';
 import {
     SystemSettingsPage,
@@ -34,6 +39,7 @@ import {
     type SystemTab,
 } from '@/routes/system/SystemSettingsPage';
 import { StyleGuidePage } from '@/routes/__styleguide/StyleGuidePage';
+import { benchmarkSymbol } from '@/routes/ledgers/reports/returnsModel';
 import { fetchCurrentUser } from '@/lib/api';
 
 // Code-based route tree. Every route declaration lives here in
@@ -141,26 +147,37 @@ const importLedgerRoute = createRoute({
     component: ImportLedgerPage,
 });
 
-// (/welcome was removed in ADR-0088. It existed to confirm the ledger setup
-// had just created and point at the CLI importer — both obsolete: setup no
-// longer creates a ledger, the in-app importer shipped, and the ledger hub at
-// `/` is the post-setup landing.)
+// (No /welcome route, per ADR-0088: setup creates no ledger, the importer is
+// in-app, and the ledger hub at `/` is the post-setup landing.)
 
-// /ledgers/$ledgerId — per-ledger detail (accounts list).
+// /ledgers/$ledgerId — the ledger's home screen, the Overview (ADR-0056 as amended).
 const ledgerDetailRoute = createRoute({
     getParentRoute: () => authedRoute,
     path: '/ledgers/$ledgerId',
-    component: LedgerDetailPage,
+    component: HomePage,
 });
 
-// /ledgers/$ledgerId/accounts — accounts management (ADR-0050). The Ledger
-// Hub's "Manage accounts →" links here for create / edit across all account
-// types. Distinct from the /accounts/$accountId register route below (that
-// one carries the id segment); the router matches by specificity.
-const accountsManagementRoute = createRoute({
+// Structure (ADR-0111) — the three lists that describe a ledger, one page with a
+// tab for each: Accounts, Categories and Tags. A layout with no path of its own: it
+// owns the trail, the heading and the tab strip, and each tab keeps the URL it had
+// before the three pages were joined, so every existing link still lands where it did.
+const structureRoute = createRoute({
     getParentRoute: () => authedRoute,
+    id: '_structure',
+    component: StructureLayout,
+});
+
+// /ledgers/$ledgerId/accounts — the Accounts tab: accounts management (ADR-0050),
+// create / edit across the real account types. Distinct from the
+// /accounts/$accountId register route below (that one carries the id segment);
+// the router matches by specificity.
+const accountsManagementRoute = createRoute({
+    getParentRoute: () => structureRoute,
     path: '/ledgers/$ledgerId/accounts',
     component: AccountsManagementPage,
+    // `edit=<id>` opens that account's editor on arrival: the consistency check's
+    // advisories link an opening balance, a loan's terms or a currency there.
+    validateSearch: validateAccountsSearch,
 });
 
 // /ledgers/$ledgerId/accounts/$accountId — per-account register
@@ -218,37 +235,47 @@ const remindersRoute = createRoute({
     getParentRoute: () => authedRoute,
     path: '/ledgers/$ledgerId/reminders',
     component: RemindersPage,
+    validateSearch: validateRemindersSearch,
 });
 
-// /ledgers/$ledgerId/categories — Categories destination (ADR-0069 nav swap:
-// promoted from a Settings tab to a top-level nav surface). Manage the income /
-// expense hierarchy; each category links to its register. Activity moved the
-// other way — into a Settings tab (?tab=activity).
+// /ledgers/$ledgerId/categories — the Categories tab (ADR-0069 nav swap: promoted
+// from a Settings tab to a top-level nav surface, now one tab of Structure). Manage
+// the income / expense hierarchy; each category links to its register. Activity
+// moved the other way — into a Settings tab (?tab=activity).
 const categoriesRoute = createRoute({
-    getParentRoute: () => authedRoute,
+    getParentRoute: () => structureRoute,
     path: '/ledgers/$ledgerId/categories',
-    component: CategoriesPage,
+    component: CategoriesTab,
 });
 
-// /ledgers/$ledgerId/tags — Tags destination (Tags v1). Manage the tag
-// dictionary (rename / recolour / merge / delete / cleanup); mirrors the
-// Categories destination above.
+// /ledgers/$ledgerId/tags — the Tags tab (Tags v1). Manage the tag dictionary
+// (rename / recolour / merge / delete / cleanup).
 const tagsRoute = createRoute({
-    getParentRoute: () => authedRoute,
+    getParentRoute: () => structureRoute,
     path: '/ledgers/$ledgerId/tags',
-    component: TagsPage,
+    component: TagsTab,
+});
+
+// /ledgers/$ledgerId/tags/$tagId — what one tag labels, across every account (ADR-0111 D6).
+// Opened from a tag's name. A page of its own rather than a child of the Structure layout,
+// because it has its own heading and trail: the Tags tab is where it is reached from, not where
+// it lives. The rail still lights Structure for it (the entry names the /tags prefix).
+const taggedTransactionsRoute = createRoute({
+    getParentRoute: () => authedRoute,
+    path: '/ledgers/$ledgerId/tags/$tagId',
+    component: TaggedTransactionsPage,
 });
 
 // /ledgers/$ledgerId/budget — spend this month against what is typical per
-// category. A sibling of Categories / Tags rather than a Settings tab: a budget
+// category. A sibling of Structure (Accounts / Categories / Tags) rather than a Settings tab: a budget
 // is checked, not configured.
 const budgetRoute = createRoute({
     getParentRoute: () => authedRoute,
     path: '/ledgers/$ledgerId/budget',
     component: BudgetPage,
-    // The month lives in the URL, not in component state. It was state, and
-    // that made the page un-linkable and lost the month on every round trip:
-    // open a category's register, press Back, and you landed on the CURRENT
+    // The month lives in the URL, not in component state. As state it would
+    // make the page un-linkable and lose the month on every round trip:
+    // open a category's register, press Back, and you land on the CURRENT
     // month having forgotten which one you were reading. Omitted means "this
     // month", so the bare path keeps working and stays the canonical entry.
     validateSearch: (search: Record<string, unknown>): { month?: string } =>
@@ -288,18 +315,27 @@ const registerRoute = createRoute({
     // its descendants — which is why it belongs in the URL rather than in
     // component state: the budget links here with it ON (its rows are
     // rollups), and Back has to bring you back to what you were reading.
+    // `status` is an ARRIVAL instruction, like settings' `check`: it opens the
+    // register on its Needs review view, which is how the home screen's review counts
+    // land on the rows they count, or on its Hidden view, which is how a link to a
+    // hidden row lands on the one view that shows it (ADR-0072 D1). Only those values
+    // (`arrivalStatusOf`); the view is the register's own state after arrival.
     validateSearch: (
         search: Record<string, unknown>,
-    ): { focus?: string; subcategories?: true } => ({
-        ...(typeof search.focus === 'string' ? { focus: search.focus } : {}),
-        // Accept the string forms too — a hand-typed or copied URL carries
-        // `subcategories=true`, not a JSON boolean.
-        ...(search.subcategories === true
-            || search.subcategories === 'true'
-            || search.subcategories === '1'
-            ? { subcategories: true as const }
-            : {}),
-    }),
+    ): { focus?: string; subcategories?: true; status?: RegisterArrivalStatus } => {
+        const status = arrivalStatusOf(search.status);
+        return {
+            ...(typeof search.focus === 'string' ? { focus: search.focus } : {}),
+            ...(status !== undefined ? { status } : {}),
+            // Accept the string forms too — a hand-typed or copied URL carries
+            // `subcategories=true`, not a JSON boolean.
+            ...(search.subcategories === true
+                || search.subcategories === 'true'
+                || search.subcategories === '1'
+                ? { subcategories: true as const }
+                : {}),
+        };
+    },
 });
 
 // /system — deployment-wide (non-ledger) settings (ADR-0060): About (everyone)
@@ -315,9 +351,9 @@ const systemRoute = createRoute({
     // sidebar's System section links straight to them. Absent/invalid → About,
     // carried as a clean URL with no ?tab.
     //
-    // Previously the tab was component state seeded ONLY from ?tab=backups (for
-    // the Drive OAuth callback), so ?tab=mcp silently rendered About and
-    // switching tabs left the URL stale.
+    // Component state seeded ONLY from ?tab=backups (the Drive OAuth callback)
+    // would make ?tab=mcp silently render About and leave the URL stale when
+    // switching tabs.
     validateSearch: (search: Record<string, unknown>): { tab?: SystemTab } => {
         const tab = coerceSystemTab(search.tab);
         return tab === 'about' ? {} : { tab };
@@ -400,7 +436,7 @@ const reportViewRoute = createRoute({
         };
         return {
             measure: oneOf('measure', ['Spending', 'Income', 'Net'] as const),
-            groupBy: oneOf('groupBy', ['Category', 'Account', 'Payee', 'Tag'] as const),
+            groupBy: oneOf('groupBy', ['Category', 'Account', 'Payee', 'Tag', 'CategoryKind'] as const),
             bucket: oneOf('bucket', ['None', 'Day', 'Month', 'Quarter', 'Year'] as const),
             dateMode: oneOf('dateMode', ['Static', 'Sliding'] as const),
             windowUnit: oneOf('windowUnit', ['Day', 'Month', 'Quarter', 'Year'] as const),
@@ -411,6 +447,19 @@ const reportViewRoute = createRoute({
             from: str('from'),
             to: str('to'),
             tagId: str('tagId'),
+            // Which report: only `returns` is marked, and no marker is the
+            // aggregation, so an older saved row or link reads as it always did.
+            kind: oneOf('kind', ['returns'] as const),
+            returnsShow: oneOf('returnsShow', ['index', 'gain'] as const),
+            accountId: str('accountId'),
+            includeAccounts: bool('includeAccounts'),
+            // A symbol's shape only, as the server checks it (ADR-0114 D1): one the
+            // ledger no longer holds still reads, and its footnote says so.
+            benchmark: benchmarkSymbol(str('benchmark')),
+            // The table/chart choice (and the bar shape) ride in the URL too;
+            // the Returns view opens as a chart and needs the choice to survive.
+            view: oneOf('view', ['table', 'chart'] as const),
+            chartStack: oneOf('chartStack', ['stacked', 'grouped'] as const),
             saved: str('saved'),
             name: str('name'),
         };
@@ -426,13 +475,12 @@ const routeTree = rootRoute.addChildren([
         landingRoute,
         importLedgerRoute,
         ledgerDetailRoute,
-        accountsManagementRoute,
+        structureRoute.addChildren([accountsManagementRoute, categoriesRoute, tagsRoute]),
+        taggedTransactionsRoute,
         securitiesCatalogRoute,
         securityDetailRoute,
         settingsRoute,
         remindersRoute,
-        categoriesRoute,
-        tagsRoute,
     budgetRoute,
     reportsRoute,
     reportViewRoute,

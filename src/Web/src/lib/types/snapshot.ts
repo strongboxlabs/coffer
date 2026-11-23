@@ -19,9 +19,10 @@ export interface SnapshotSummary {
     /** DB schema version at snapshot time (e.g. "111_ledger_snapshots.sql").
      *  Restore refuses on mismatch (Phase 1). */
     schemaVersion: string;
-    /** Uncompressed JSON size in bytes. Rendered as "<n> MB before
-     *  compression" on the snapshots panel. */
-    contentSizeUncompressed: number;
+    /** Bytes the snapshot occupies as stored, compression included. Shown
+     *  on the snapshots panel; the length of the payload's JSON text is not
+     *  what a snapshot costs and is not sent. */
+    contentSizeStored: number;
     /** Whether a restore could succeed right now — `schemaVersion` still
      *  matches the live schema.
      *

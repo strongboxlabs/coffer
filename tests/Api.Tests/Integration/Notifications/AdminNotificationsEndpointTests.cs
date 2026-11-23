@@ -13,11 +13,12 @@ namespace Coffer.Api.Tests.Integration.Notifications;
 /// Configuring where notifications go, and being told honestly what is covered.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class AdminNotificationsEndpointTests
+public sealed class AdminNotificationsEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AdminNotificationsEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public AdminNotificationsEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
 
     /// <summary>
@@ -44,7 +45,7 @@ public sealed class AdminNotificationsEndpointTests
         var userId = Guid.NewGuid();
         var (plaintext, hash) = Coffer.Api.Auth.Webauthn.SessionService.GenerateCookieValue();
 
-        await using (var db = _fixture.NewServiceDbContext())
+        await using (var db = Db.NewServiceDbContext())
         {
             db.Users.Add(new Coffer.Api.Db.Entities.UserRow
             {
@@ -72,17 +73,10 @@ public sealed class AdminNotificationsEndpointTests
         return client;
     }
 
-    private async Task ResetAsync()
-    {
-        // Deployment-scope tables: a per-test ledger isolates nothing here.
-        await using var db = _fixture.NewDbContext();
-        await db.Database.ExecuteSqlRawAsync("TRUNCATE notification_subscribers;");
-    }
-
     [Fact]
     public async Task Providers_declare_whether_they_can_detect_absence()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AdminClientAsync(factory);
 
         var providers = await client.GetFromJsonAsync<List<NotificationProviderDto>>(
@@ -102,8 +96,7 @@ public sealed class AdminNotificationsEndpointTests
     [Fact]
     public async Task Adding_only_a_message_provider_reports_no_absence_detection()
     {
-        await ResetAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AdminClientAsync(factory);
 
         var created = await client.PostAsJsonAsync("/api/admin/notifications/subscribers",
@@ -122,9 +115,9 @@ public sealed class AdminNotificationsEndpointTests
 
         // The honest answer: a webhook is configured and the install still cannot
         // notice its own silence.
-        // Per MONITOR, because one healthchecks URL is one check. The old boolean
-        // claimed "absence detection covered" from the mere existence of a heartbeat
-        // target, which said nothing about whether any given job was watched.
+        // Per MONITOR, because one healthchecks URL is one check. A single boolean
+        // claiming "absence detection covered" from the mere existence of a heartbeat
+        // target would say nothing about whether any given job is watched.
         Assert.False(listed.MonitorCoverage[NotificationMonitors.Backup]);
 
         // Adding a heartbeat target changes the answer.
@@ -147,8 +140,7 @@ public sealed class AdminNotificationsEndpointTests
     [Fact]
     public async Task The_listing_never_returns_the_delivery_url()
     {
-        await ResetAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AdminClientAsync(factory);
 
         const string secretUrl = "https://hc.invalid/super-secret-token-in-the-path";
@@ -170,7 +162,7 @@ public sealed class AdminNotificationsEndpointTests
     [Fact]
     public async Task An_unknown_provider_is_rejected()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AdminClientAsync(factory);
 
         var response = await client.PostAsJsonAsync("/api/admin/notifications/subscribers",
@@ -192,7 +184,7 @@ public sealed class AdminNotificationsEndpointTests
         // the silent shape this whole subsystem exists to remove. So the binding is
         // required for that capability, and rejected for a message target, which is
         // bound to nothing.
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AdminClientAsync(factory);
 
         var unbound = await client.PostAsJsonAsync(

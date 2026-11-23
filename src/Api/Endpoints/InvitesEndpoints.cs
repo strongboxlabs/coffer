@@ -120,7 +120,7 @@ public static class InvitesEndpoints
         CancellationToken ct)
     {
         // An invite that makes its holder an admin is the widest grant there is: a tap,
-        // not just a cookie (2026-10-12 audit, M2).
+        // not just a cookie (ADR-0105 D1).
         if (request.GrantsAdmin)
         {
             var approval = await stepUp.RequireAsync(StepUpActions.GrantAdmin, ct).ConfigureAwait(false);
@@ -190,10 +190,9 @@ public static class InvitesEndpoints
             return BusinessError.Problem(BusinessError.Codes.InviteFieldRequired,
                 "username and displayName are required.");
 
-        // Same policy as setup (ADR-0089). This flow previously accepted ANY
-        // non-empty username — including whitespace and bidi-override characters —
-        // while setup enforced a client-side handle pattern. One rule now, applied
-        // server-side, so the two entry points can't drift again.
+        // Same policy as setup (ADR-0089). Without it this flow would accept ANY
+        // non-empty username — including whitespace and bidi-override characters.
+        // One rule, applied server-side, so the two entry points can't drift.
         var username = Auth.UsernamePolicy.Normalize(request.Username);
         if (!Auth.UsernamePolicy.IsValid(username, out var usernameError))
             return BusinessError.Problem(BusinessError.Codes.InviteFieldRequired, usernameError!);

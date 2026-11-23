@@ -1,19 +1,17 @@
-import { useId, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type Ref } from 'react';
 
 import { cn } from '@/lib/cn';
 import type { TagDto } from '@/lib/types';
 
 // Shared single-tag autocomplete (Tags v1). One text input plus a
 // suggestion dropdown listing matching ledger tags (colour swatch + name
-// + usage count) and — when `allowCreate` and the draft doesn't match an
+// + transaction count) and — when `allowCreate` and the draft doesn't match an
 // existing tag — a "Create '<draft>'" row. Emits ONE chosen name via
 // `onCommit`; the caller decides what to do with it (append to a chip
 // list in the transaction editor, or set the single register filter).
 // It owns no chips and no border, so it embeds either as the trailing
 // field inside the editor's chip box or as a standalone filter field —
 // styling comes in via `inputClassName`.
-
-const MAX_SUGGESTIONS = 8;
 
 export interface TagComboboxProps {
     /** The ledger's tag dictionary (caller fetches — usually the shared
@@ -40,6 +38,8 @@ export interface TagComboboxProps {
     inputClassName?: string;
     /** Max chars accepted before commit (mirrors the server cap). */
     maxLength?: number;
+    /** The <input>, for a host that moves focus to it. */
+    inputRef?: Ref<HTMLInputElement>;
 }
 
 export function TagCombobox({
@@ -54,12 +54,12 @@ export function TagCombobox({
     'aria-label': ariaLabel,
     inputClassName,
     maxLength = 64,
+    inputRef,
 }: TagComboboxProps) {
     const listId = useId();
     const [draft, setDraft] = useState('');
     const [open, setOpen] = useState(false);
     const [highlight, setHighlight] = useState(0);
-    const inputRef = useRef<HTMLInputElement>(null);
 
     const excludeLower = useMemo(
         () => new Set((excludeNames ?? []).map((n) => n.toLowerCase())),
@@ -69,14 +69,16 @@ export function TagCombobox({
     const trimmed = draft.trim();
     const draftLower = trimmed.toLowerCase();
 
-    const matches = useMemo(() => {
-        const filtered = tags.filter((t) => {
+    // Every match is listed: the dropdown scrolls (max-h + overflow-auto), so
+    // a cap would only hide tags the user could not reach by scrolling.
+    const matches = useMemo(
+        () => tags.filter((t) => {
             const lower = t.name.toLowerCase();
             if (excludeLower.has(lower)) return false;
             return draftLower === '' || lower.includes(draftLower);
-        });
-        return filtered.slice(0, MAX_SUGGESTIONS);
-    }, [tags, excludeLower, draftLower]);
+        }),
+        [tags, excludeLower, draftLower],
+    );
 
     // A Create row only when the draft is non-empty, creation is allowed,
     // and no existing tag matches it exactly (case-insensitive).
@@ -92,6 +94,19 @@ export function TagCombobox({
         () => (showCreate ? [...matches, null] : matches),
         [matches, showCreate],
     );
+
+    // The suggestions are on screen only while open with something to show.
+    const listShown = open && options.length > 0;
+
+    // Arrow-key navigation keeps the highlighted row inside the scroll box.
+    const listRef = useRef<HTMLUListElement>(null);
+    useEffect(() => {
+        if (!listShown) return;
+        const row = listRef.current?.children[highlight];
+        if (row instanceof HTMLElement && typeof row.scrollIntoView === 'function') {
+            row.scrollIntoView({ block: 'nearest' });
+        }
+    }, [highlight, listShown]);
 
     const commit = (name: string) => {
         const value = name.trim();
@@ -130,6 +145,14 @@ export function TagCombobox({
             return;
         }
         if (e.key === 'Escape') {
+            // With the suggestions showing, this Escape closes them and nothing
+            // else, the rule every list follows (ADR-0023 §F): marked handled
+            // and stopped, so nothing further out acts on it. With none
+            // showing it is not this control's, and goes on unmarked.
+            if (listShown) {
+                e.preventDefault();
+                e.stopPropagation();
+            }
             setOpen(false);
             return;
         }
@@ -163,8 +186,9 @@ export function TagCombobox({
                 onKeyDown={handleKeyDown}
                 className={inputClassName}
             />
-            {open && options.length > 0 ? (
+            {listShown ? (
                 <ul
+                    ref={listRef}
                     id={listId}
                     role="listbox"
                     className="absolute left-0 top-full z-40 mt-1 max-h-fixed-224px w-fixed-224px max-w-[16rem] overflow-auto rounded border border-border bg-surface py-1 text-xs shadow-lg"
@@ -204,7 +228,7 @@ export function TagCombobox({
                                                 {opt.name}
                                             </span>
                                             <span className="shrink-0 tabular-nums text-text-subtle">
-                                                {opt.usageCount}
+                                                {opt.transactionCount}
                                             </span>
                                         </>
                                     )}

@@ -20,12 +20,11 @@ public sealed record MdAcct(
     /// recorded neither source field.
     /// </summary>
     /// <remarks>
-    /// MD records this two ways and is inconsistent about which: on a real
-    /// export, <c>creation_date</c> (epoch millis) appears on a minority of
-    /// accounts but on EVERY investment account, while <c>date_created</c>
-    /// (yyyyMMdd) appears on far fewer still. Reading just the tidier integer would have
-    /// left most accounts NULL, so take it when present and fall back to the
-    /// epoch field — the two agree wherever both exist.
+    /// MD records this two ways and is inconsistent about which: an account can
+    /// carry <c>creation_date</c> (epoch millis), <c>date_created</c> (yyyyMMdd),
+    /// both, or neither. Reading just the tidier integer would have left every
+    /// account with only the epoch field NULL, so take it when present and fall
+    /// back to the epoch field — the two agree wherever both exist.
     /// </remarks>
     DateOnly? OpenedOn,
     string? Comment,
@@ -65,8 +64,28 @@ public sealed record MdAcct(
     /// accounts (<c>type="o"</c>); the importer seeds them into
     /// <c>loan_terms</c>.
     /// </summary>
-    MdLoanFields? Loan = null)
+    MdLoanFields? Loan = null,
+    /// <summary>
+    /// The security-type parameters (<c>sec_type</c>, <c>sec_subtype</c>,
+    /// <c>sec_exchange</c>) — non-null only for security sub-accounts
+    /// (<c>type="s"</c>), where Moneydance writes them (ADR-0016, amendment of
+    /// 2026-11-18). The securities step classifies the held security from them.
+    /// </summary>
+    MdSecurityFields? Security = null,
+    /// <summary>
+    /// Coffer's own <c>coffer_category_kind</c> key, verbatim, or null when the
+    /// row does not carry it. Moneydance has no third category kind, so an
+    /// export Coffer writes marks an adjustment category as a type <c>e</c> row
+    /// with this key set to <c>"adjustment"</c> (ADR-0091, amendment of
+    /// 2026-11-18). A value that is not a JSON string is kept as its raw text,
+    /// so <see cref="Mappers.AccountMapper.Map"/> refuses it instead of the
+    /// key being read as absent.
+    /// </summary>
+    string? CofferCategoryKind = null)
 {
+    /// <summary>The key that carries <see cref="CofferCategoryKind"/>.</summary>
+    public const string CofferCategoryKindKey = "coffer_category_kind";
+
     /// <summary>
     /// Construct a typed account view from a generic <see cref="MdItem"/>.
     /// Throws if the item's <c>obj_type</c> is not <c>"acct"</c> or required
@@ -100,7 +119,11 @@ public sealed record MdAcct(
             OlbFi: item.GetString("olbfi"),
             OfxImportAcctNum: item.GetString("ofx_import_acct_num"),
             RawJson: item.RawJson,
-            Loan: item.GetString("type") == "o" ? MdLoanFields.From(item) : null);
+            Loan: item.GetString("type") == "o" ? MdLoanFields.From(item) : null,
+            Security: item.GetString("type") == "s" ? MdSecurityFields.From(item) : null,
+            CofferCategoryKind: item.Fields.TryGetValue(CofferCategoryKindKey, out var kind)
+                ? (kind.ValueKind == System.Text.Json.JsonValueKind.String ? kind.GetString() : kind.GetRawText())
+                : null);
     }
 
     /// <summary>True if this account is a per-security position holder

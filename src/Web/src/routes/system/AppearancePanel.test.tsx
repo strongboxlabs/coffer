@@ -55,8 +55,8 @@ describe('AppearancePanel', () => {
     });
 
     it('does NOT apply on selection', async () => {
-        // The behaviour this panel exists to avoid: selecting used to repaint
-        // the whole app, so clicking down a list of four themes strobed it.
+        // The behaviour this panel exists to avoid: if selecting repainted the
+        // whole app, clicking down a list of four themes would strobe it.
         const user = userEvent.setup();
         localStorage.setItem(THEME_STORAGE_KEY, 'light');
         render(<AppearancePanel />);
@@ -119,8 +119,8 @@ describe('AppearancePanel', () => {
         // The stylesheet's colour selectors are compound —
         // [data-theme="dark"][data-accent="rust"] — so splitting the two across
         // a parent and a child matches nothing and every preview silently
-        // renders the default palette. That shipped, and made all three colour
-        // previews look identical. Density rides the same element: it needs no
+        // renders the default palette, so all three colour previews would look
+        // identical. Density rides the same element: it needs no
         // pairing, but a preview that inherited the page's spacing instead of
         // showing its own would be the same class of lie.
         const { container } = render(<AppearancePanel />);
@@ -134,11 +134,9 @@ describe('AppearancePanel', () => {
     });
 
     it('moves NOTHING on the page or in any other preview when you select', async () => {
-        // The reported bug, and the reason it is worth a test rather than a
-        // comment. Nothing was ever SAVED on selection — the root attributes
-        // were always correct. What made it read as "applied on the fly" was
-        // that every preview followed every draft, so one density click
-        // repainted 7 of the 10 cards and one theme click darkened 6 of them.
+        // Selection saves nothing — the root attributes stay correct. If every
+        // preview follows every draft, one density or theme click repaints most
+        // of the cards and the panel reads as "applied on the fly".
         // Staged means staged: a click moves the radio and nothing else.
         const user = userEvent.setup();
         const { container } = render(<AppearancePanel />);

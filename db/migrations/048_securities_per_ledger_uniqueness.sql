@@ -2,7 +2,7 @@
 -- 048 — securities: per-ledger uniqueness for cusip + ticker
 -- =============================================================================
 --
--- Slice A3 audit surfaced two latent multi-tenant gaps on `securities`:
+-- Two latent multi-tenant gaps on `securities`:
 --
 --   1. `uq_securities_cusip` (migration 002) was GLOBALLY unique, even
 --      though every other identifier became per-ledger in migration 014's

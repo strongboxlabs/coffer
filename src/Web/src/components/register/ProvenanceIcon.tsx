@@ -79,8 +79,10 @@ function pickIcon(origin: string, providerKey: string | null): {
                 label: providerKey
                     ? `File import · ${providerLabel(providerKey)}`
                     : 'File import',
-                // Muted amber — file/document association.
-                hue: 'text-state-warning/80',
+                // Muted text, as a manual row's: amber only ever means a
+                // warning, and a file import is not one (ADR-0035 as
+                // amended 2026-11-03). The icon's shape tells it apart.
+                hue: 'text-text-subtle',
             };
         case 'manual':
         default:
@@ -101,6 +103,9 @@ function providerLabel(providerKey: string): string {
         case 'ofx':       return 'OFX';
         case 'qif':       return 'QIF';
         case 'csv':       return 'CSV';
+        // A CSV file import's rows carry their reader's key (IngestOrchestrator's origin map).
+        case 'csv-generic':  return 'CSV';
+        case 'csv-fidelity': return 'Fidelity CSV';
         default:          return providerKey;
     }
 }

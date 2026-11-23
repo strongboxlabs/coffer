@@ -12,10 +12,10 @@
 -- destination for several ledgers is served by pointing them at the same URL, which now
 -- works because the delivered payload names its ledger.
 --
--- THE HAZARD THIS MIGRATION EXISTS TO AVOID: every ledger in the field is 'inherit', and
--- almost none have their own targets. Retiring the mode without moving anything would
--- mute ledger scope on every existing install — reproducing ADR-0096's founding incident
--- inside the subsystem built to end it. So the targets move first, in the same
+-- THE HAZARD THIS MIGRATION EXISTS TO AVOID: 'inherit' is every ledger's default, and a
+-- ledger left on it needs no targets of its own. Retiring the mode without moving anything would
+-- mute ledger scope on every existing install — reproducing the silent failure ADR-0096
+-- exists to end, inside the subsystem built to end it. So the targets move first, in the same
 -- transaction, and an install that was reporting somewhere keeps reporting there.
 --
 -- WHY THIS IS PURE SQL: both tables' config_ciphertext are sealed with the same master

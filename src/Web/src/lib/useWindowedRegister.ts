@@ -26,13 +26,12 @@ import type { RegisterEntry } from '@/lib/types';
 //     boundary cursor becomes the new outer cursor — no need to
 //     synthesize cursors client-side.
 //
-//   * There is deliberately NO `firstItemIndex` here. This hook
-//     used to track the logical index of `entries[0]` and hand it
-//     to virtuoso's prop of the same name. That was wrong: this
-//     counts ENTRIES, while virtuoso's is a property of the
+//   * There is deliberately NO `firstItemIndex` here. A logical
+//     index of `entries[0]` cannot feed virtuoso's prop of the
+//     same name: this hook counts ENTRIES, while virtuoso's is a property of the
 //     RENDERED array — and every register renders rows only after
-//     regrouping target splits, filtering by status and expanding
-//     groups, so the two counts differ. `RegisterVirtualList`
+//     filtering by status and expanding groups, so the two counts
+//     differ. `RegisterVirtualList`
 //     derives its own from the rows it is handed, the only place
 //     that can see them.
 //
@@ -40,10 +39,10 @@ import type { RegisterEntry } from '@/lib/types';
 //     separate `useState` slots. Eviction needs `entries` and
 //     `pages` to update atomically (counts must stay consistent
 //     with cursor metadata). Separate `useState` updaters defer
-//     their work until React's batched flush; trying to coordinate
-//     them via a shared `let` in the calling scope is fragile and
-//     was the root cause of the visible "count drops to 930" jolt
-//     during eviction at the timeline tail.
+//     their work until React's batched flush; coordinating them
+//     via a shared `let` in the calling scope is fragile: the two
+//     fall out of step mid-eviction and the visible count jumps
+//     at the timeline tail.
 //
 //   * Three load shapes:
 //       (a) Initial load: most-recent K entries, no anchor.
@@ -107,6 +106,96 @@ const EMPTY_STATE: WindowState = {
     pages: [],
 };
 
+/** The posted date an entry sorts by. A group's legs share their header's. */
+export function entryPostedAt(entry: RegisterEntry): string {
+    return entry.kind === 'txn' ? entry.txn.postedAt : entry.legs[0]!.postedAt;
+}
+
+/** A row's identity in the window: its leg id, or its split group's id. */
+function entryIdentity(entry: RegisterEntry): string {
+    return entry.kind === 'txn' ? `t:${entry.txn.id}` : `g:${entry.groupId}`;
+}
+
+/**
+ * Swap in what a save answered with: every entry `headerId` has in this
+ * register, in register order. Several rows can share a header (each line of a
+ * split seen from its other side is its own row), so this is many-to-many.
+ *
+ * A row the answer still has is replaced in its own slot, so a column sort
+ * that put other rows between two lines of one header keeps them there. A row
+ * the answer no longer has is dropped. A row the answer gained goes right
+ * after the row it follows in the answer, or into the header's first slot.
+ * Page lengths follow the rows, so the edge cursors stay where they were.
+ *
+ * A header with no row in the window is left alone: the save moved nothing
+ * the user can see here.
+ */
+export function replaceHeaderEntriesInWindow(
+    prev: WindowState,
+    headerId: string,
+    replacement: readonly RegisterEntry[],
+): WindowState {
+    if (!prev.entries.some((e) => entryHasHeader(e, headerId))) return prev;
+
+    const kept = new Set(
+        prev.entries.filter((e) => entryHasHeader(e, headerId)).map(entryIdentity),
+    );
+    // What each row the answer keeps brings in after it; `leading` is what
+    // comes before the first kept row.
+    const leading: RegisterEntry[] = [];
+    const after = new Map<string, RegisterEntry[]>();
+    let anchor: RegisterEntry[] = leading;
+    const byIdentity = new Map<string, RegisterEntry>();
+    for (const e of replacement) {
+        const id = entryIdentity(e);
+        if (kept.has(id) && !byIdentity.has(id)) {
+            byIdentity.set(id, e);
+            anchor = [];
+            after.set(id, anchor);
+        } else {
+            anchor.push(e);
+        }
+    }
+
+    const entries: RegisterEntry[] = [];
+    const lengths: number[] = [];
+    let seenHeader = false;
+    let index = 0;
+    const pageCount = Math.max(prev.pages.length, 1);
+    for (let p = 0; p < pageCount; p++) {
+        const length = prev.pages[p]?.length ?? prev.entries.length;
+        const end = p === pageCount - 1 ? prev.entries.length : index + length;
+        let out = 0;
+        for (; index < end; index++) {
+            const e = prev.entries[index]!;
+            if (!entryHasHeader(e, headerId)) {
+                entries.push(e);
+                out++;
+                continue;
+            }
+            if (!seenHeader) {
+                seenHeader = true;
+                entries.push(...leading);
+                out += leading.length;
+            }
+            const id = entryIdentity(e);
+            const swapped = byIdentity.get(id);
+            if (swapped !== undefined) {
+                byIdentity.delete(id);
+                const following = after.get(id) ?? [];
+                entries.push(swapped, ...following);
+                out += 1 + following.length;
+            }
+        }
+        lengths.push(out);
+    }
+
+    return {
+        entries,
+        pages: prev.pages.map((page, p) => ({ ...page, length: lengths[p] ?? page.length })),
+    };
+}
+
 export interface UseWindowedRegisterArgs {
     ledgerId: string;
     accountId: string;
@@ -144,11 +233,9 @@ export interface UseWindowedRegisterResult {
     /** Error from the initial fetch, if it threw. Null on success
      *  or while in-flight. */
     initialError: unknown;
-    /** True when a `loadOlder` is in-flight; the caller can use
-     *  this to render a skeleton at the bottom edge. */
+    /** True while a `loadOlder` is in flight. */
     loadingOlder: boolean;
-    /** True when a `loadNewer` is in-flight; render skeleton at
-     *  the top edge. */
+    /** True while a `loadNewer` is in flight. */
     loadingNewer: boolean;
     /** True when the window's newer edge is the absolute timeline
      *  head — no more rows exist past `entries[0]`. Drives the
@@ -187,18 +274,17 @@ export interface UseWindowedRegisterResult {
     /**
      * The anchor header the server ACTUALLY placed in the window, or null.
      *
-     * This used to be a logical index, fixed at 0 whenever an anchor was
-     * requested — a guarantee the server does not make. `RegisterRepository`
-     * pins an anchor only if it matches the active filter and otherwise
-     * silently returns the ordinary most-recent page, and `RegisterPage`
-     * carries no field saying which happened. So "anchor requested" was being
-     * read as "anchor is at position 0", and with a status tab active, saving a
-     * row OUT of that tab focused and scrolled to whatever sat at index 0
-     * instead.
+     * Not a logical index fixed at 0 whenever an anchor is requested: that
+     * is a guarantee the server does not make. `RegisterRepository` pins an
+     * anchor only if it matches the active filter and otherwise silently
+     * returns the ordinary most-recent page, and `RegisterPage` carries no
+     * field saying which happened. Reading "anchor requested" as "anchor is
+     * at position 0" means that, with a status tab active, saving a row OUT of
+     * that tab focuses and scrolls to whatever sits at index 0 instead.
      *
      * An id rather than an index also ends a second confusion. Indices here
      * come in two spaces — entry-space (what this hook counts) and row-space
-     * (what a page renders after regrouping, filtering and expanding) — and
+     * (what a page renders after filtering and expanding) — and
      * they are not equal on either register. A consumer resolves this id
      * against its own rendered rows, so the question cannot be got wrong.
      */
@@ -212,6 +298,12 @@ export interface UseWindowedRegisterResult {
     /** Drop an entry by predicate. Used by the delete flow. */
     removeEntries: (
         predicate: (entry: RegisterEntry) => boolean,
+    ) => void;
+    /** Swap in a save's answer: every entry the header has in this register
+     *  replaces that header's rows (see `replaceHeaderEntriesInWindow`). */
+    replaceHeaderEntries: (
+        headerId: string,
+        entries: readonly RegisterEntry[],
     ) => void;
 }
 
@@ -456,6 +548,13 @@ export function useWindowedRegister(
         [],
     );
 
+    const replaceHeaderEntries = useCallback(
+        (headerId: string, replacement: readonly RegisterEntry[]) => {
+            setWindowState((prev) => replaceHeaderEntriesInWindow(prev, headerId, replacement));
+        },
+        [],
+    );
+
     // Edge predicates — derived from the page metadata. `initialLoaded`
     // gates them so an empty pre-fetch window doesn't claim "at head
     // and tail" before the first response.
@@ -477,6 +576,7 @@ export function useWindowedRegister(
         focusAnchorHeaderId,
         mutateEntries,
         removeEntries,
+        replaceHeaderEntries,
     };
 }
 

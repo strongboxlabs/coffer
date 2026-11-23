@@ -5,8 +5,9 @@
 -- Migration 065's DEFERRED constraint trigger fn_validate_posting_completeness
 -- did a full-table scan + GROUP BY on every invocation. Constraint triggers
 -- in PostgreSQL fire per-row at COMMIT, so on a full-ledger import the
--- function ran once per leg, each run doing a full scan — the import timed
--- out before the constraint check could finish.
+-- function runs once per leg, each run doing a full scan, so the check
+-- grows with the square of the leg count and can outrun the import's
+-- statement timeout.
 --
 -- This migration replaces the function with a per-row indexed lookup that
 -- only examines the leg's own (header_id, posting_index). The composite

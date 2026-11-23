@@ -16,7 +16,7 @@ namespace Coffer.Api.Scheduling;
 /// <remarks>
 /// Runs over the <b>service-role (BYPASSRLS)</b> context — a background tick has
 /// no request user, so the RLS app role would be fail-closed and see no
-/// ledgers. (This is the fix for the original auto-snapshot no-op.) Single
+/// ledgers, and an auto-snapshot would silently do nothing. Single
 /// instance assumed; multi-instance would add a per-ledger advisory lock.
 /// </remarks>
 public sealed class SchedulerService : BackgroundService
@@ -139,9 +139,25 @@ public sealed class SchedulerService : BackgroundService
             _logger.LogError(ex, "Drive-sync monitor failed; will retry next tick.");
         }
 
-        // Expired and spent WebAuthn challenges. Nothing removed them before (2026-10-12
-        // audit, S5), and the anonymous /login/begin adds one per call, so the table only
-        // grew — into every backup with it. Housekeeping, not a job: there is nothing to
+        // An available release announced earlier is cleared once the install has reached it
+        // (ADR-0110). Nothing is fetched: this is the all-clear for an install that upgraded while
+        // the automatic check was off, which would otherwise keep its dot until someone pressed
+        // Check now, and the one opted-in destinations hear.
+        try
+        {
+            await scope.ServiceProvider
+                .GetRequiredService<Upgrades.UpgradeNotices>()
+                .ClearIfInstalledAsync(Meta.VersionInfo.Semver, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Upgrade-notice clearing failed; will retry next tick.");
+        }
+
+        // Expired and spent WebAuthn challenges (ADR-0105 D8). The anonymous
+        // /login/begin adds one per call, so without this sweep the table only grows —
+        // into every backup with it. Housekeeping, not a job: there is nothing to
         // configure or switch off.
         try
         {

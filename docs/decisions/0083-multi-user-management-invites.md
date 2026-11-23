@@ -1,7 +1,7 @@
 # 0083 — Multi-user: role enforcement, per-ledger sharing, invite links, ledger lifecycle
 
-* Status: Accepted — **fully shipped in 0.34.0.** Both of the slices this line once listed as "to follow" are done: the members UI (`MembersPanel`) and invite links (`InvitesEndpoints`, `InvitesRepository`, the `invites` table, `InviteLinkModal`, `InvitePage`).
-* Amended by: [ADR-0105](0105-a-cookie-alone-is-not-enough.md) (disable revokes everything held; an invite needs its issuer's authority at redemption; setup completes once)
+* Status: Accepted — **fully shipped in 0.34.0**, including the members UI (`MembersPanel`) and invite links (`InvitesEndpoints`, `InvitesRepository`, the `invites` table, `InviteLinkModal`, `InvitePage`).
+* Amended by: [ADR-0105](0105-a-cookie-alone-is-not-enough.md) (disable revokes everything held; an invite needs its issuer's authority at redemption; setup completes once); [ADR-0108](0108-memo-and-tags-per-side.md) (a tag merge's saved-report repoint checks ledger access itself); [ADR-0006](0006-simplefin-over-plaid.md) (renaming a bank connection is the owner's, at the API only); [ADR-0114](0114-benchmarks-and-currency-conversion.md) (2026-11-14: binding a SimpleFIN account in another currency than the Coffer account's is refused)
 * Date: 2026-07-23
 * Related: ADR-0013 (WebAuthn auth + bootstrap ceremony — invites generalize its
   token), ADR-0020 (multi-ledger RLS + the owner/editor/viewer role matrix this
@@ -27,8 +27,8 @@ and under-enforced:
 - The "≥1 owner" invariant's DB trigger was dropped (ADR-0032) in favor of API-side
   enforcement that was never built.
 
-The owner wants real multi-user: invite people (e.g. a spouse) to specific ledgers
-with a role, manage users, and manage the ledgers themselves.
+The goal is real multi-user: invite people (e.g. another household member) to
+specific ledgers with a role, manage users, and manage the ledgers themselves.
 
 ## Decisions
 
@@ -53,7 +53,8 @@ No open registration; the only way in is an invite (or the first-user bootstrap)
   INSERT/UPDATE/DELETE satisfy only `_write` (owner/editor). Applied uniformly by a
   PL/pgSQL loop over the table list, reusing the current inlined-subquery predicate shape
   for planner parity. Identity/self tables (`users`, `auth_*`, `webauthn_*`,
-  `recovery_codes`, `user_preferences`, `user_account_groups`) are user-scoped, not
+  `recovery_codes`, `user_preferences`, `user_account_groups` (dropped 2026-10-20,
+  ADR-0106; its replacement, `account_folders`, is ledger data and role-gated)) are user-scoped, not
   ledger-role-scoped, and are untouched; `ledgers` + `user_ledger_grants` stay
   SELECT-only for `coffer_app` (grant/lifecycle writes go through the service role, gated
   by the API authority checks). A missing API check can never grant a viewer a write.
@@ -151,9 +152,8 @@ transfer endpoint. Wires the existing General-settings rename/delete stubs.
 
 D2 made RLS the backstop, and nothing checked that the backstop stood. Migration 017's
 `ALTER DEFAULT PRIVILEGES` gave `coffer_app` full rights on every later table, so a table
-that shipped without RLS was open to every request, and that happened at least four
-times. The API's checks hid each one. An audit found five standing gaps, all unreachable
-through the API and all open at the database:
+that ships without RLS is open to every request while the API's checks hide it. Five such
+gaps stood, all unreachable through the API and all open at the database:
 - `txn_leg_tags` (created after 174) let a viewer write;
 - `user_account_group_members` had lost its group-owner check in 072;
 - `saved_reports` let any member delete a shared report, since its read rule was its
@@ -179,8 +179,8 @@ Migration 254 closes them and changes the rule for every table after it:
 
 ## Amendment, 2026-10-19 — D4's last-owner rule cannot be raced (FU-090)
 
-D4 counted owners, then demoted, in two statements under READ COMMITTED, so two owners
-demoting each other at once each counted two and left the ledger with none. The same held
+Counting owners, then demoting, in two statements under READ COMMITTED lets two owners
+demoting each other at once each count two and leave the ledger with none. The same holds
 for the last admin. Role changes, removals, disabling a user and revoking admin now count
 and change in one SERIALIZABLE transaction (`SerializableTransaction`), retried on a
 serialization failure: Postgres aborts one of the two, and the retry finds the last owner
@@ -192,7 +192,7 @@ no-op is not audited.
 
 ## Amendment, 2026-10-19 — a ledger's members, bank and notification targets are its owners' (FU-095)
 
-Two of the audit's findings were decisions, and both narrow what D1 and D2 gave out.
+Two decisions narrow what D1 and D2 gave out.
 
 **Only an owner grants access to a ledger, admins included.** D1 let an admin issue an
 invite into any ledger through `POST /api/admin/invites`, and the owners were not told.
@@ -230,3 +230,30 @@ also writes `last_simplefin_sync_at`. Nothing outside those two owner-only route
 the mapping. An editor who maps an account wrongly does harm of the same kind they could
 already do by editing its transactions; the credentials stay out of reach either way.
 `OwnerOnlyAccessTests` holds both layers.
+
+*(Amended 2026-11-14, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D13.)* Binding a SimpleFIN account
+(`BindFeedMappingAsync`) whose currency differs from the Coffer account's is refused.
+
+## Amendment, 2026-10-27 — a second ledger-access check, for tag merges (ADR-0108)
+
+A tag merge has to repoint every member's saved reports that filter on the merged-away
+tag (ADR-0108 D12), and saved-report writes are owner-only under RLS. So the repoint runs
+in one narrow `SECURITY DEFINER` function, `saved_reports_repoint_tag` (migration 263),
+the one place a write reaches past RLS. It checks the caller's owner or editor grant on
+the ledger itself before writing, requires the two tags to be distinct tags of that
+ledger, and rewrites only the tag reference inside `saved_reports.spec`; everything else
+in the merge stays under RLS. That is a second place that decides ledger write access
+beside D2's policies, so it has to follow any change to the write-role predicate.
+`RlsCatalogTests` lists it as the only writing definer, which must not be executable by
+PUBLIC, and `SavedReportsRepointTagTests` holds the grant check, including a caller with
+no owner or editor grant on the ledger, who is refused and changes nothing.
+
+## Amendment, 2026-11-06 — renaming a bank connection is the owner's (ADR-0006)
+
+ADR-0006's 2026-11-06 amendment adds a rename of a bank connection. It is a fourth thing
+only an owner does, beside the three of the 2026-10-19 amendment: it sits with
+disconnecting, so the route carries `AsLedgerOwner()` and the settings panel draws its
+pencil only where it draws Disconnect. Like the account mapping, it is enforced at the API
+only: the name is a column of `feed_connections`, whose UPDATE policy lets editors write
+the row because a sync records its status there. `OwnerOnlyAccessTests` and
+`FeedConnectionRenameTests` hold it.

@@ -25,8 +25,6 @@ public sealed class MdCurrTests
               "currid":"^OEFQ","type":"s",
               "ticker":"IDXE",
               "curr_id.CUSIP":"999888666",
-              "sec_type":"Mutual Fund","sec_subtype":"International",
-              "sec_exchange":"NYSE",
               "dec":"5",
               "rate":"0.04051863857374392","rrate":"0.04051863857374392"
             }
@@ -37,11 +35,35 @@ public sealed class MdCurrTests
         Assert.True(curr.IsSecurity);
         Assert.Equal("IDXE", curr.Ticker);
         Assert.Equal("999888666", curr.Cusip);
-        Assert.Equal("Mutual Fund", curr.SecType);
-        Assert.Equal("International", curr.SecSubtype);
-        Assert.Equal("NYSE", curr.SecExchange);
         Assert.Equal(5, curr.Decimals);
         Assert.Equal(0.04051863857374392m, curr.Rate);
+    }
+
+    [Fact]
+    public void Security_type_fields_are_read_from_the_security_account_not_the_curr()
+    {
+        // Moneydance writes sec_type, sec_subtype and sec_exchange on the type-s
+        // security ACCOUNT (ADR-0016, amendment of 2026-11-18). The curr view has no
+        // such fields; the account view carries them, and only for a type-s account.
+        Assert.DoesNotContain(typeof(MdCurr).GetProperties(), p => p.Name.StartsWith("Sec", StringComparison.Ordinal));
+
+        var acct = MdAcct.From(ReadOnlyCurr("""
+            {
+              "obj_type":"acct","id":"s-1","name":"Fund A","type":"s","currid":"sec-1",
+              "sec_type":"2","sec_subtype":"International","sec_exchange":"NYSE"
+            }
+            """));
+        Assert.Equal(new MdSecurityFields("2", "International", "NYSE"), acct.Security);
+
+        var bank = MdAcct.From(ReadOnlyCurr("""
+            {"obj_type":"acct","id":"b-1","name":"Checking","type":"b","currid":"USD","sec_type":"2"}
+            """));
+        Assert.Null(bank.Security);
+
+        var blank = MdAcct.From(ReadOnlyCurr("""
+            {"obj_type":"acct","id":"s-2","name":"Fund B","type":"s","currid":"sec-2","sec_type":"","sec_exchange":""}
+            """));
+        Assert.Equal(MdSecurityFields.None, blank.Security);
     }
 
     [Fact]
@@ -52,7 +74,7 @@ public sealed class MdCurrTests
               "obj_type":"curr","id":"sec-2","name":"Old Fund","currid":"^Old",
               "type":"s","ticker":"OLD",
               "curr_id.CUSIP-broken":"OEFQ",
-              "sec_type":"Mutual Fund","dec":"4"
+              "dec":"4"
             }
             """);
 
@@ -76,7 +98,6 @@ public sealed class MdCurrTests
         Assert.False(curr.IsSecurity);
         Assert.Null(curr.Ticker);
         Assert.Null(curr.Cusip);
-        Assert.Null(curr.SecType);
         Assert.True(curr.IsHidden);
         Assert.False(curr.IsBase);
         Assert.Equal(0, curr.Decimals);

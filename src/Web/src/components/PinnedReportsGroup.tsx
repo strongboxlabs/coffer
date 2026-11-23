@@ -33,10 +33,8 @@ import type { PinnedReport, ReportSpec } from '@/types/report';
  * entry, which the indent cannot say.
  *
  * Renders nothing when there are no pins, so a ledger with none shows no
- * arrow at all rather than an empty disclosure.
- * Persisting it is the same work as FU-007 (remember the last-active sidebar
- * tab), which already has the `user_preferences` argument written out; a
- * second, private version here is what that entry exists to prevent.
+ * arrow at all rather than an empty disclosure. The caller remembers the open
+ * state per browser, as it does the rest of the rail's state (ADR-0057).
  */
 export function PinnedReportsGroup({
     ledgerId, pathname,
@@ -117,10 +115,15 @@ function RailLink({
     // report's identity in `saved`, so the path alone cannot tell two pinned
     // entries apart.
     const onView = pathname.startsWith(`/ledgers/${ledgerId}/reports/view`);
-    const current = typeof window === 'undefined'
-        ? null
-        : new URLSearchParams(window.location.search).get('saved');
-    const active = onView && (savedId === undefined ? current === null : current === savedId);
+    const query = typeof window === 'undefined' ? null : new URLSearchParams(window.location.search);
+    const current = query?.get('saved') ?? null;
+    // A canned report is also told apart by its kind: two catalog pins are both
+    // "no saved id", and only the one whose report is open is the current one.
+    // No `kind` in the URL is the aggregation.
+    const openKind = query?.get('kind') ?? null;
+    const active = onView && (savedId === undefined
+        ? current === null && openKind === (spec.kind ?? null)
+        : current === savedId);
 
     return (
         <Link
@@ -146,11 +149,16 @@ function RailLink({
  * Whether this ledger has any pins the rail could show. Lets the Reports row
  * draw its disclosure arrow only when there is something behind it — an arrow
  * that opens nothing is worse than no arrow.
+ *
+ * The rail has no ledger yet on a page outside one until the ledger list
+ * arrives, and none at all when there are no ledgers; it then asks nothing,
+ * since a request without a ledger id is one the server can only refuse.
  */
-export function useHasReportPins(ledgerId: string): boolean {
+export function useHasReportPins(ledgerId: string | undefined): boolean {
     const pins = useQuery({
         queryKey: ['report-pins', ledgerId],
-        queryFn: () => fetchReportPins(ledgerId),
+        queryFn: () => fetchReportPins(ledgerId!),
+        enabled: ledgerId !== undefined,
     });
     return (pins.data ?? []).length > 0;
 }

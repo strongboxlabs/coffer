@@ -1,12 +1,12 @@
 -- Phase 2 PR 2.6.6: capture metadata the importer was parsing but silently
--- dropping. Two real bugs and a batch of "would be nice" account metadata
--- the user wants persisted before the UI surfaces.
+-- dropping: two bugs, and a batch of account metadata persisted ahead of the
+-- UI that will show it.
 --
 -- Bugs:
 --   1. `securities.share_decimals` — Moneydance assigns a per-security
 --      decimal precision (`dec`) for share quantities. The importer's
 --      `MdCurr.Decimals` was extracted but discarded; the investment mapper
---      hardcoded a divisor of 10^4. Mutual funds with `dec=5` had their
+--      hardcoded a divisor of 10^4, so a security with `dec=5` gets its
 --      share counts silently 10× wrong. Per-security precision now lives
 --      on the row and the mapper looks it up.
 --   2. `transactions.check_number` — paper-check transactions in MD carry

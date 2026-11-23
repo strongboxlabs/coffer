@@ -16,11 +16,12 @@ namespace Coffer.Api.Tests.Integration.Auth;
 /// here with the reason.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class EndpointAuthorizationCatalogTests
+public sealed class EndpointAuthorizationCatalogTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public EndpointAuthorizationCatalogTests(PostgresFixture fixture) => _fixture = fixture;
+    public EndpointAuthorizationCatalogTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     /// <summary>Routes anyone may call, by pattern prefix, and why.</summary>
     private static readonly Dictionary<string, string> Anonymous = new()
@@ -47,7 +48,7 @@ public sealed class EndpointAuthorizationCatalogTests
     [Fact]
     public async Task Every_endpoint_declares_who_may_call_it()
     {
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled();
         using var _ = factory.CreateClient();
         var endpoints = factory.Services.GetRequiredService<EndpointDataSource>()
             .Endpoints.OfType<RouteEndpoint>().ToList();
@@ -74,10 +75,38 @@ public sealed class EndpointAuthorizationCatalogTests
     }
 
     [Fact]
+    public async Task Every_upgrade_route_is_admin_only_on_the_cookie_session_and_never_a_connected_app()
+    {
+        // An upgrade runs a new release on this install (ADR-0110): no bearer token reaches it,
+        // so a connected app cannot start one, whatever it was granted.
+        await using var factory = new ApiFactory(Db).WithMcpEnabled();
+        using var _ = factory.CreateClient();
+        var routes = factory.Services.GetRequiredService<EndpointDataSource>()
+            .Endpoints.OfType<RouteEndpoint>()
+            .Where(e => (e.RoutePattern.RawText ?? "").StartsWith("/api/admin/upgrade", StringComparison.Ordinal))
+            .ToList();
+
+        // Fail closed: if the prefix stopped matching, every check below would pass.
+        Assert.True(routes.Count >= 6, $"Expected the six upgrade routes, found {routes.Count}.");
+        foreach (var route in routes)
+        {
+            Assert.Null(route.Metadata.GetMetadata<IAllowAnonymous>());
+            var policies = route.Metadata.GetOrderedMetadata<IAuthorizeData>().Select(a => a.Policy).ToList();
+            Assert.Contains(Coffer.Api.Auth.AuthPolicies.RequireAdmin, policies);
+        }
+
+        var policy = await factory.Services.GetRequiredService<IAuthorizationPolicyProvider>()
+            .GetPolicyAsync(Coffer.Api.Auth.AuthPolicies.RequireAdmin);
+        Assert.NotNull(policy);
+        Assert.DoesNotContain(Coffer.Api.Auth.AuthSchemes.Mcp, policy.AuthenticationSchemes);
+        Assert.Contains(Coffer.Api.Auth.AuthSchemes.Cookie, policy.AuthenticationSchemes);
+    }
+
+    [Fact]
     public async Task A_route_that_declares_nothing_requires_a_signed_in_user()
     {
         // The fallback policy is what an undeclared endpoint gets.
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var _ = factory.CreateClient();
         var fallback = await factory.Services.GetRequiredService<IAuthorizationPolicyProvider>()
             .GetFallbackPolicyAsync();
@@ -93,7 +122,7 @@ public sealed class EndpointAuthorizationCatalogTests
         // The login page is a client route: the fallback serves it to someone with no
         // session. Tests carry no built shell, so the fallback's answer is its 404; a 401
         // would mean the fallback policy caught it.
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = factory.CreateClient();
 
         Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync("/login")).StatusCode);
@@ -103,7 +132,7 @@ public sealed class EndpointAuthorizationCatalogTests
     [Fact]
     public async Task The_api_description_is_not_served_outside_development()
     {
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithEnvironment("Production");
         using var client = factory.CreateClient();
 

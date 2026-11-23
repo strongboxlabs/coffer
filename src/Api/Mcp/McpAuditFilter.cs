@@ -8,7 +8,9 @@ using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 
 using Coffer.Api.Auth;
+using Coffer.Api.Db;
 using Coffer.Api.Db.Entities;
+using Coffer.Api.Errors;
 
 namespace Coffer.Api.Mcp;
 
@@ -81,6 +83,21 @@ public static class McpAuditFilter
                 logger?.LogWarning("MCP tool {Tool} cancelled after {ElapsedMs}ms", toolName, ElapsedMs());
                 throw;
             }
+            catch (Exception ex) when (LedgerWriteLock.IsBusy(ex))
+            {
+                // The ledger write lock's busy refusal (migration 275) is a business answer,
+                // not a fault: nothing was written, and the same call succeeds once the other
+                // write has committed. Answered here as an error result that names it, in the
+                // words the HTTP surface's 422 uses (LedgerWriteBusyExceptionHandler); left
+                // to the SDK it would say only that an error occurred.
+                var refused = BusyRefusal();
+                await FinalizeSafeAsync(services, logger, auditId, InvocationStatus.Error, Summarize(refused, logger))
+                    .ConfigureAwait(false);
+                logger?.LogWarning(ex,
+                    "MCP tool {Tool} refused after {ElapsedMs}ms: another write held the ledger's write lock past the wait",
+                    toolName, ElapsedMs());
+                return refused;
+            }
             catch (Exception ex)
             {
                 // Log the exception HERE, before the SDK swallows it into an IsError result.
@@ -105,6 +122,16 @@ public static class McpAuditFilter
 
             return result;
         };
+
+    /// <summary>
+    /// What a tool call refused by the ledger write lock's busy refusal answers: an error
+    /// result whose text is the refusal's code and the sentence every busy refusal reads.
+    /// </summary>
+    internal static CallToolResult BusyRefusal() => new()
+    {
+        IsError = true,
+        Content = [new TextContentBlock { Text = $"{BusinessError.Codes.LedgerWriteBusy}: {LedgerWriteLock.BusyDetail}" }],
+    };
 
     private static async Task<Guid?> TryRecordAttemptAsync(
         IServiceProvider services, ILogger? logger, Guid userId, string toolName,

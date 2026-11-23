@@ -74,7 +74,7 @@ describe('tag chips are legible for any colour a user can pick', () => {
         // The point of the solid fill: the pair is the hex and its own label,
         // so no surface participates and the theme/direction matrix cannot
         // affect it. A tinted fill composited over the surface could not make
-        // this claim — which is exactly how the old treatment failed.
+        // this claim.
         const style = tagChipStyle('#3b82f6')!;
         expect(style.backgroundColor).toBe('#3b82f6');
         expect(style.color).toBe(readableOn('#3b82f6'));
@@ -87,9 +87,9 @@ describe('tag chips are legible for any colour a user can pick', () => {
     });
 
     it('would catch a treatment that stops clearing AA', () => {
-        // The guard's own guard. This is the OLD formula — hex over a 13% tint
-        // of itself on white — and it must read as a failure, or the sweep
-        // above proves nothing.
+        // The guard's own guard. A tinted treatment — hex over a 13% tint of
+        // itself on white — must read as a failure, or the sweep above proves
+        // nothing.
         const tinted = mix('#f59e0b', '#ffffff', 0.13);
         expect(contrastRatio('#f59e0b', tinted)).toBeLessThan(AA);
     });

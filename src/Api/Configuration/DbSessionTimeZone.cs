@@ -14,19 +14,20 @@ namespace Coffer.Api.Configuration;
 /// <c>timestamptz</c> in the SESSION timezone. Every reporting aggregation
 /// groups by <c>EXTRACT(YEAR/MONTH/DAY FROM posted_at)</c>, so the session
 /// timezone silently decides which month — and, once a daily bucket exists,
-/// which DAY — a transaction is counted in. Nothing set it. The app agreed with
-/// its own UTC convention only because <c>postgres:16</c> happens to default to
-/// UTC, and that is a coincidence the deployment could change without anyone
-/// noticing: a container with <c>TZ</c> set, a managed Postgres with a regional
-/// default, an <c>ALTER ROLE … SET TimeZone</c>, or a future base image. The
-/// symptom would be a month's spending totals quietly shifted by the
-/// transactions near each boundary, with nothing red anywhere.
+/// which DAY — a transaction is counted in. A session that does not set it
+/// takes whatever zone the server or role defaults to, and that default is
+/// outside the app's control: a container with <c>TZ</c> set, a managed
+/// Postgres with a regional default, an <c>ALTER ROLE … SET TimeZone</c>, or a
+/// different base image. A non-UTC default shifts the transactions near each
+/// boundary into the neighbouring bucket, so a month's totals move with no
+/// error raised. Every connection string therefore names the zone explicitly,
+/// and the session matches the app's UTC convention whatever the server
+/// default is.
 /// </para>
 /// <para>
-/// WHY THE CONNECTION STRING AND NOT A <c>SET</c>. The first cut of this issued
-/// <c>set_config('TimeZone', 'UTC', false)</c> from the connection interceptor,
-/// which meant raw SQL in <c>src/Api</c> — banned by ADR-0005, and the audit
-/// correctly refused it. Npgsql's <c>Timezone</c> keyword expresses the same
+/// WHY THE CONNECTION STRING AND NOT A <c>SET</c>. Issuing
+/// <c>set_config('TimeZone', 'UTC', false)</c> from the connection interceptor
+/// would be raw SQL in <c>src/Api</c>, which ADR-0005 bans. Npgsql's <c>Timezone</c> keyword expresses the same
 /// intent declaratively: it travels in the startup packet, so the parameter is
 /// set before the connection can run anything at all. That is strictly stronger
 /// than an interceptor hook, which fires per logical open and therefore has to

@@ -61,6 +61,12 @@ public sealed record TxnHeaderRow(
     //   'dividend_cash', 'dividend_reinvest', 'divx',
     //   'transfer', 'misc'.
     string? Action,
+    // Migration 263: the account the transaction was entered from — for an import,
+    // the Moneydance home account (acctid), literally. NULL only for a
+    // header with no legs. Positional and REQUIRED so every construction says what
+    // it is; ImportAnnotations.Stamp sets it, with the planned notes, from the home
+    // and the legs.
+    Guid? OriginatingAccountId,
     // Mig 107: register provenance and audit signals.
     //   ProviderKey   — per-provider tag (mdplus / ofx / qif / csv).
     //                   NULL when Origin = 'manual'.

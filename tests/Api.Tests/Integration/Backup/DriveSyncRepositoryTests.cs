@@ -14,24 +14,18 @@ namespace Coffer.Api.Tests.Integration.Backup;
 /// test resets it first (ApiCollection runs sequentially).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class DriveSyncRepositoryTests
+public sealed class DriveSyncRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public DriveSyncRepositoryTests(PostgresFixture fixture) => _fixture = fixture;
-
-    private DriveSyncRepository NewRepo() => new(_fixture.NewServiceFactory());
-
-    private async Task ResetAsync()
+    public DriveSyncRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        await using var db = _fixture.NewDbContext();   // service role
-        await db.Database.ExecuteSqlRawAsync("DELETE FROM drive_sync;");
     }
+
+    private DriveSyncRepository NewRepo() => new(Db.NewServiceFactory());
 
     [Fact]
     public async Task Missing_row_reads_as_not_configured()
     {
-        await ResetAsync();
         var status = await NewRepo().GetStatusAsync();
 
         Assert.False(status.Connected);
@@ -42,7 +36,6 @@ public sealed class DriveSyncRepositoryTests
     [Fact]
     public async Task Connect_then_status_reports_connected_without_leaking_token()
     {
-        await ResetAsync();
         var repo = NewRepo();
         var actor = await NewAdminUserAsync();
         var token = Encoding.UTF8.GetBytes("sealed-oauth-blob");
@@ -68,7 +61,6 @@ public sealed class DriveSyncRepositoryTests
     [Fact]
     public async Task Disconnect_clears_token_and_folder()
     {
-        await ResetAsync();
         var repo = NewRepo();
         var actor = await NewAdminUserAsync();
         await repo.ConnectAsync(
@@ -87,7 +79,6 @@ public sealed class DriveSyncRepositoryTests
     [Fact]
     public async Task Record_outcome_surfaces_in_status()
     {
-        await ResetAsync();
         var repo = NewRepo();
         var actor = await NewAdminUserAsync();
         await repo.ConnectAsync(
@@ -105,7 +96,6 @@ public sealed class DriveSyncRepositoryTests
     [Fact]
     public async Task Replace_ciphertext_swaps_only_when_connected()
     {
-        await ResetAsync();
         var repo = NewRepo();
         var actor = await NewAdminUserAsync();
 
@@ -123,7 +113,6 @@ public sealed class DriveSyncRepositoryTests
     [Fact]
     public async Task Install_id_is_stable_and_survives_disconnect()
     {
-        await ResetAsync();
         var repo = NewRepo();
         var actor = await NewAdminUserAsync();
 
@@ -148,7 +137,7 @@ public sealed class DriveSyncRepositoryTests
     /// <summary>The <c>configured_by_user_id</c> FK requires a real user row.</summary>
     private async Task<Guid> NewAdminUserAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         return ledger.UserId;
     }
 }

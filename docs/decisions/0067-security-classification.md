@@ -10,13 +10,12 @@
 
 ## Context
 
-`securities.asset_class` is overloaded: it stores the **vehicle** (`mutual_fund`,
-`cash_equivalent`) on many rows, conflating two orthogonal things. The single
-field can't express true exposure, so allocation/performance analysis can't slice
-by what a holding actually is. The dominant remediation is moving a vehicle value
-out of `asset_class`, plus filling nulls and correcting the occasional mis-class
-(e.g. a commodity fund stored as equity). Producer is the importer (writes the MD
-fund type into `asset_class`).
+`securities.asset_class` is overloaded: it can hold the **vehicle** (`mutual_fund`,
+`cash_equivalent`) instead of an economic class, conflating two orthogonal things.
+The single field can't express true exposure, so allocation/performance analysis
+can't slice by what a holding actually is. Remediation means moving vehicle values
+out of `asset_class`, filling nulls and correcting mis-classes. Producer is the
+importer (writes the MD fund type into `asset_class`).
 
 ## Decisions
 
@@ -59,8 +58,9 @@ entered. The sleeve editor lives in the security edit dialog, shown only when
 asset class = multi-asset. Population is manual now (provider-assisted later).
 
 ### D4 — Sourcing: manual-first
-Classification is set in the security editor; a per-ledger classified catalog
-seeds existing rows in the remediation migration. Auto-classify from the
+Classification is set in the security editor. The remediation migration (150)
+maps existing values best-effort and leaves a row whose old value was only a
+vehicle with `asset_class` NULL (unknown), to be set in the editor. Auto-classify from the
 market-data provider (ADR-0054) is a later, opt-in enhancement — not this slice.
 
 ### D5 — Producer fix + remediation
@@ -74,5 +74,5 @@ existing rows (vehicle values → `vehicle_type`, infer `asset_class`).
   performance attribution by those dimensions — the `allocation` tool + Overview
   stop bucketing by the vehicle-polluted field.
 - Sparse but clean style columns (4 nullable, one vocabulary each).
-- A securities-dedup pass is a separate follow-up (the catalog also surfaced
-  duplicate definitions).
+- A securities-dedup pass is a separate follow-up (an imported catalog can
+  hold duplicate definitions).

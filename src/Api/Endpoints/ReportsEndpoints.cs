@@ -12,11 +12,10 @@ namespace Coffer.Api.Endpoints;
 /// The transaction-aggregation report over HTTP (FU-008, ADR-0104).
 /// </summary>
 /// <remarks>
-/// <para><see cref="ReportingRepository"/> shipped with the MCP server
-/// (ADR-0063) and had exactly one REST caller — budget progress — so the SPA
-/// had nothing general to call. This is that surface, and deliberately the SAME
-/// repository rather than a parallel query path, which is the thing FU-008 asks
-/// for in as many words.</para>
+/// <para>The SPA's general report surface over <see cref="ReportingRepository"/>
+/// (ADR-0063), deliberately the SAME repository the MCP server and budget progress
+/// use rather than a parallel query path, which is the thing FU-008 asks for in as
+/// many words.</para>
 ///
 /// <para>A GET with query parameters, not a POST with a spec body. Every
 /// <see cref="ReportSpec"/> field is a scalar, so the whole spec fits in a
@@ -39,6 +38,7 @@ public static class ReportsEndpoints
         group.MapGet("/net-worth-history", NetWorthHistoryAsync);
         group.MapGet("/allocation", AllocationAsync);
         group.MapGet("/returns", ReturnsAsync);
+        group.MapGet("/returns-series", ReturnsSeriesAsync);
 
         return routes;
     }
@@ -51,43 +51,15 @@ public static class ReportsEndpoints
     {
         var q = http.Query;
 
-        if (!TryEnum<ReportMeasure>(q["measure"], ReportMeasure.Spending, out var measure))
-            return Bad("measure", "Spending, Income or Net");
-        if (!TryEnum<ReportGroupBy>(q["groupBy"], ReportGroupBy.Category, out var groupBy))
-            return Bad("groupBy", "Category, Account, Payee, Tag or CategoryKind");
-        if (!TryEnum<ReportTimeBucket>(q["bucket"], ReportTimeBucket.None, out var bucket))
-            return Bad("bucket", "None, Day, Month, Quarter or Year");
-        if (!TryEnum<ReportDateMode>(q["dateMode"], ReportDateMode.Static, out var dateMode))
-            return Bad("dateMode", "Static or Sliding");
-        if (!TryEnum<ReportWindowUnit>(q["windowUnit"], ReportWindowUnit.Month, out var windowUnit))
-            return Bad("windowUnit", "Day, Month, Quarter or Year");
-
-        if (!TryInt(q["windowCount"], out var windowCount)) return Bad("windowCount", "a whole number");
-        if (!TryInt(q["topN"], out var topN)) return Bad("topN", "a whole number");
-        if (!TryGuid(q["tagId"], out var tagId)) return Bad("tagId", "a GUID");
-        if (!TryDate(q["from"], out var fromUtc)) return Bad("from", "an ISO-8601 instant");
-        if (!TryDate(q["to"], out var toUtc)) return Bad("to", "an ISO-8601 instant");
-
-        var spec = new ReportSpec
-        {
-            LedgerId = ledgerId,
-            Measure = measure,
-            GroupBy = groupBy,
-            TimeBucket = bucket,
-            DateMode = dateMode,
-            WindowCount = windowCount,
-            WindowUnit = windowUnit,
-            WindowAlignToPeriod = IsTrue(q["windowAlign"]),
-            FromUtc = fromUtc,
-            ToUtc = toUtc,
-            TagId = tagId,
-            Rollup = IsTrue(q["rollup"]),
-            TopN = topN,
-        };
+        if (ReadSummarySpec(ledgerId, name => q[name], out var spec) is { } problem) return problem;
+        // The caller's local date: a sliding window then ends where the register's
+        // Scheduled begins. A request parameter, never part of the spec a saved
+        // report persists.
+        if (!TryDay(q["today"], out var today)) return Bad("today", "a yyyy-MM-dd date");
 
         try
         {
-            return Results.Ok(await reporting.SummarizeAsync(spec, cancellationToken).ConfigureAwait(false));
+            return Results.Ok(await reporting.SummaryAsync(spec!, today, cancellationToken).ConfigureAwait(false));
         }
         catch (ReportRequestException ex)
         {
@@ -103,10 +75,9 @@ public static class ReportsEndpoints
 
     /// <summary>
     /// <c>GET /reports/net-worth-history</c> — net worth at the end of each
-    /// period in a window (FU-008). The first of the three surfaces that
-    /// <see cref="AccountsReportingRepository"/> and
-    /// <see cref="InvestmentReportingRepository"/> were missing, which is why
-    /// the catalog could not list net worth at all.
+    /// period in a window (FU-008). The REST surface over
+    /// <see cref="AccountsReportingRepository"/>'s series, which the MCP tool
+    /// also reads; without it the catalog cannot list net worth.
     /// </summary>
     /// <remarks>
     /// <para>`from` and `to` are REQUIRED here, unlike on <c>/summary</c>. A
@@ -130,11 +101,13 @@ public static class ReportsEndpoints
         if (!TryDate(q["to"], out var toUtc)) return Bad("to", "an ISO-8601 instant");
         if (fromUtc is null) return Bad("from", "supplied — a net-worth series needs a window");
         if (toUtc is null) return Bad("to", "supplied — a net-worth series needs a window");
+        // The caller's local date: the series then ends where the overview's "now" does.
+        if (!TryDay(q["today"], out var today)) return Bad("today", "a yyyy-MM-dd date");
 
         try
         {
             return Results.Ok(await accounts
-                .NetWorthHistoryAsync(ledgerId, fromUtc.Value, toUtc.Value, interval, cancellationToken)
+                .NetWorthHistoryAsync(ledgerId, fromUtc.Value, toUtc.Value, interval, today, cancellationToken)
                 .ConfigureAwait(false));
         }
         catch (ReportRequestException ex)
@@ -158,9 +131,8 @@ public static class ReportsEndpoints
     /// <list type="bullet">
     ///   <item><c>undecomposedMultiAssets</c> — a multi-asset fund with no
     ///   component weights sits entirely in one opaque bucket and understates
-    ///   every other one. The DTO records the measured case: one such fund
-    ///   holding most of a portfolio made equity read as a small fraction of
-    ///   its true share. A pie drawn over that is confidently wrong, so the caller gets the flag.</item>
+    ///   every other one: the more of a portfolio such a fund holds, the
+    ///   further below its true share equity reads. A pie drawn over that is confidently wrong, so the caller gets the flag.</item>
     ///   <item><c>excludedBrokerageCash</c> — <c>totalMarketValue</c> is
     ///   SECURITIES ONLY. Uninvested cash has no asset class, so a chart that
     ///   treats the buckets as the whole portfolio is short by this.</item>
@@ -182,9 +154,12 @@ public static class ReportsEndpoints
         if (!TryAllocationDimension(q["dimension"], out var dimension))
             return Bad("dimension", "asset_class, region, vehicle, security or account");
         if (!TryDate(q["asOf"], out var asOfUtc)) return Bad("asOf", "an ISO-8601 instant");
+        // The caller's local date places "now" when no instant is asked for, as it
+        // does for returns, so the two value the same instant.
+        if (!TryDay(q["today"], out var today)) return Bad("today", "a yyyy-MM-dd date");
 
         return Results.Ok(await investments
-            .AllocationAsync(ledgerId, dimension, asOfUtc, cancellationToken)
+            .AllocationAsync(ledgerId, dimension, asOfUtc, today, cancellationToken)
             .ConfigureAwait(false));
     }
 
@@ -216,11 +191,14 @@ public static class ReportsEndpoints
     /// </summary>
     /// <remarks>
     /// <para><b>This is a number, not a curve.</b> The result is TWR and MWR
-    /// for ONE window, plus start value, end value and net contributions. An
-    /// indexed performance line of the kind a dashboard draws needs a SERIES
-    /// of returns, which nothing in the reporting layer computes — so it is a
-    /// missing calculation, not a missing endpoint, and this surface does not
-    /// pretend otherwise by returning a two-point line.</para>
+    /// for ONE window, plus start value, end value, net contributions and gain:
+    /// the window's change in value that contributions and withdrawals do not
+    /// explain (price movement, realized or not, plus dividends and interest, less
+    /// fees and investment expenses; not annualized; for the whole scope). A
+    /// performance line over time is a different calculation with its own
+    /// endpoint, <c>/reports/returns-series</c>, which chains the same
+    /// time-weighted return and reads each period end as a mark on it; this
+    /// surface does not pretend otherwise by returning a two-point line.</para>
     ///
     /// <para>Passed through whole, for the same reason allocation is. Either
     /// rate can be null with a reason beside it (too short a window, a gap in
@@ -235,7 +213,6 @@ public static class ReportsEndpoints
         Guid ledgerId,
         HttpRequest http,
         InvestmentReportingRepository investments,
-        TimeProvider clock,
         CancellationToken cancellationToken)
     {
         var q = http.Query;
@@ -243,18 +220,157 @@ public static class ReportsEndpoints
         if (!TryGuid(q["accountId"], out var accountId)) return Bad("accountId", "a GUID");
         if (!TryDate(q["from"], out var fromUtc)) return Bad("from", "an ISO-8601 instant");
         if (!TryDate(q["to"], out var toUtc)) return Bad("to", "an ISO-8601 instant");
+        // The caller's local date: "now" is then the end of their today as the
+        // register counts it, the instant the overview values investments at.
+        if (!TryDay(q["today"], out var today)) return Bad("today", "a yyyy-MM-dd date");
 
         // Both optional, unlike net-worth history: omitted means
         // since-inception to now, which is exact here rather than invented —
         // the scope resolver derives the start from the ledger's own first
         // flow.
-        return Results.Ok(await investments
-            .ReturnsAsync(ledgerId, accountId, fromUtc, toUtc, clock.GetUtcNow().UtcDateTime, cancellationToken)
-            .ConfigureAwait(false));
+        try
+        {
+            return Results.Ok(await investments
+                .ReturnsAsync(ledgerId, accountId, fromUtc, toUtc, today, cancellationToken)
+                .ConfigureAwait(false));
+        }
+        catch (ReportRequestException ex)
+        {
+            // An accountId that is not one of the ledger's brokerages.
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// <c>GET /reports/returns-series</c> — the time-weighted index, cumulative gain and
+    /// money-weighted return of the 12 months ending there, at the end of each period
+    /// (ADR-0104 D6).
+    /// </summary>
+    /// <remarks>
+    /// <para>The window is optional. With no <c>from</c> (and no sliding window) the series
+    /// starts at the scope's own inception, and with no <c>to</c> it ends at the caller's
+    /// today. <c>dateMode=Sliding</c> with <c>windowCount</c>, <c>windowUnit</c> and
+    /// <c>windowAlign</c> resolves exactly as on <c>/summary</c>, so a saved report slides.</para>
+    /// <para>The result is passed through whole: a point's rate is null with its reason beside
+    /// it. The ledger series is converted into the reporting currency, each brokerage's own
+    /// stays in its currency, and a point that needs a missing rate is null with the
+    /// <c>rate_unavailable</c> reason and names it (ADR-0114 D7, D9).</para>
+    /// <para><c>benchmark</c> names one of the ledger's benchmark symbols, and every point then
+    /// carries its value (ADR-0114 D3). A value that is not a symbol is a 400. A symbol that
+    /// is not one of the ledger's is answered, not refused: a saved report keeps its pick
+    /// after the symbol is removed, and the result says <c>benchmark_not_in_ledger</c>
+    /// (ADR-0114 D1).</para>
+    /// </remarks>
+    private static async Task<IResult> ReturnsSeriesAsync(
+        Guid ledgerId,
+        HttpRequest http,
+        InvestmentReportingRepository investments,
+        TimeProvider clock,
+        CancellationToken cancellationToken)
+    {
+        var q = http.Query;
+
+        if (!TryGuid(q["accountId"], out var accountId)) return Bad("accountId", "a GUID");
+        if (!TryEnum<ReportTimeBucket>(q["interval"], ReportTimeBucket.Month, out var interval)
+            || interval == ReportTimeBucket.None)
+            return Bad("interval", "Month, Quarter or Year");
+        if (!TryEnum<ReportDateMode>(q["dateMode"], ReportDateMode.Static, out var dateMode))
+            return Bad("dateMode", "Static or Sliding");
+        if (!TryEnum<ReportWindowUnit>(q["windowUnit"], ReportWindowUnit.Month, out var windowUnit))
+            return Bad("windowUnit", "Day, Month, Quarter or Year");
+        if (!TryInt(q["windowCount"], out var windowCount)) return Bad("windowCount", "a whole number");
+        if (!TryDate(q["from"], out var fromUtc)) return Bad("from", "an ISO-8601 instant");
+        if (!TryDate(q["to"], out var toUtc)) return Bad("to", "an ISO-8601 instant");
+        if (!TryDay(q["today"], out var today)) return Bad("today", "a yyyy-MM-dd date");
+        string? benchmark = q["benchmark"];
+        if (string.IsNullOrEmpty(benchmark)) benchmark = null;
+        else if (!BenchmarkSymbol.IsValid(benchmark)) return Bad("benchmark", "a benchmark symbol, such as VT");
+
+        var spec = new ReportSpec
+        {
+            LedgerId = ledgerId,
+            DateMode = dateMode,
+            WindowCount = windowCount,
+            WindowUnit = windowUnit,
+            WindowAlignToPeriod = IsTrue(q["windowAlign"]),
+            FromUtc = fromUtc,
+            ToUtc = toUtc,
+        };
+
+        try
+        {
+            // Resolved here, against the caller's day, as /summary does.
+            var (from, to) = today is null
+                ? spec.ResolveWindow(clock.GetUtcNow().UtcDateTime)
+                : spec.ResolveWindow(
+                    ScheduledBoundary.LastCountedInstant(today, clock),
+                    ScheduledBoundary.ScheduledFrom(today, clock));
+
+            return Results.Ok(await investments
+                .ReturnsSeriesAsync(
+                    ledgerId, accountId, IsTrue(q["includeAccounts"]), from, to, interval, today,
+                    cancellationToken, benchmark)
+                .ConfigureAwait(false));
+        }
+        catch (ReportRequestException ex)
+        {
+            // A daily interval, a range past the period cap, a sliding window with no count.
+            return Results.BadRequest(new { error = ex.Message });
+        }
     }
 
     private static IResult Bad(string field, string expected) =>
         Results.BadRequest(new { error = $"{field} must be {expected}." });
+
+    /// <summary>
+    /// The aggregation report's question, read from the parameters a report spec is sent
+    /// as: <paramref name="parameter"/> gives each one's value by name, or null when it is
+    /// absent. A saved report stores its spec under these same names, so this is also how
+    /// a stored spec reads as a <see cref="ReportSpec"/>.
+    /// </summary>
+    /// <returns>The 400 a malformed parameter gets, with <paramref name="spec"/> null; or
+    /// null, with the spec.</returns>
+    /// <remarks>Shared with the Demo's examples phase, which reads each saved report it
+    /// writes back through it before writing (ADR-0115).</remarks>
+    internal static IResult? ReadSummarySpec(Guid ledgerId, Func<string, string?> parameter, out ReportSpec? spec)
+    {
+        ArgumentNullException.ThrowIfNull(parameter);
+        spec = null;
+        if (!TryEnum<ReportMeasure>(parameter("measure"), ReportMeasure.Spending, out var measure))
+            return Bad("measure", "Spending, Income or Net");
+        if (!TryEnum<ReportGroupBy>(parameter("groupBy"), ReportGroupBy.Category, out var groupBy))
+            return Bad("groupBy", "Category, Account, Payee, Tag or CategoryKind");
+        if (!TryEnum<ReportTimeBucket>(parameter("bucket"), ReportTimeBucket.None, out var bucket))
+            return Bad("bucket", "None, Day, Month, Quarter or Year");
+        if (!TryEnum<ReportDateMode>(parameter("dateMode"), ReportDateMode.Static, out var dateMode))
+            return Bad("dateMode", "Static or Sliding");
+        if (!TryEnum<ReportWindowUnit>(parameter("windowUnit"), ReportWindowUnit.Month, out var windowUnit))
+            return Bad("windowUnit", "Day, Month, Quarter or Year");
+
+        if (!TryInt(parameter("windowCount"), out var windowCount)) return Bad("windowCount", "a whole number");
+        if (!TryInt(parameter("topN"), out var topN)) return Bad("topN", "a whole number");
+        if (!TryGuid(parameter("tagId"), out var tagId)) return Bad("tagId", "a GUID");
+        if (!TryDate(parameter("from"), out var fromUtc)) return Bad("from", "an ISO-8601 instant");
+        if (!TryDate(parameter("to"), out var toUtc)) return Bad("to", "an ISO-8601 instant");
+
+        spec = new ReportSpec
+        {
+            LedgerId = ledgerId,
+            Measure = measure,
+            GroupBy = groupBy,
+            TimeBucket = bucket,
+            DateMode = dateMode,
+            WindowCount = windowCount,
+            WindowUnit = windowUnit,
+            WindowAlignToPeriod = IsTrue(parameter("windowAlign")),
+            FromUtc = fromUtc,
+            ToUtc = toUtc,
+            TagId = tagId,
+            Rollup = IsTrue(parameter("rollup")),
+            TopN = topN,
+        };
+        return null;
+    }
 
     private static bool TryEnum<T>(string? raw, T fallback, out T value) where T : struct, Enum
     {
@@ -276,6 +392,17 @@ public static class ReportsEndpoints
         value = null;
         if (string.IsNullOrEmpty(raw)) return true;
         if (!Guid.TryParse(raw, out var parsed)) return false;
+        value = parsed;
+        return true;
+    }
+
+    private static bool TryDay(string? raw, out DateOnly? value)
+    {
+        value = null;
+        if (string.IsNullOrEmpty(raw)) return true;
+        if (!DateOnly.TryParseExact(raw, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None, out var parsed))
+            return false;
         value = parsed;
         return true;
     }

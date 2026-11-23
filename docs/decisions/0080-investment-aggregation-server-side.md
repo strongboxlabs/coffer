@@ -1,6 +1,6 @@
 # 0080 — Investment-transaction aggregation moves server-side (single source)
 
-* Status: Accepted
+* Status: Accepted (amended 2026-10-27 by ADR-0108: target splits are no longer regrouped on the opposite side)
 * Date: 2026-07-17
 * Relates to: [0063](0063-mcp-server.md) (MCP), [0036](0036-originating-vs-target-register-entries.md) (target splits), [0065](0065-transfer-shares-in-kind.md), [0064](0064-fifo-cost-basis.md) (FIFO)
 
@@ -15,7 +15,7 @@ target-split regrouping). The server has **no** per-transaction investment view.
 Exposing an investment `activity` MCP tool needs a server-side per-transaction
 view. Building one *next to* the SPA aggregator would duplicate subtle, error-prone
 domain logic (two `security` legs per posting, security-id-on-the-cash-leg for
-Div/DivXfr/Misc, the single fee leg, transfers/conversions). TS (SPA) and C#
+Dividend/DividendXfr/Misc, the single fee leg, transfers/conversions). TS (SPA) and C#
 (server) can't literally share code, so "one copy" means **the server owns it and
 the SPA consumes its output.**
 
@@ -28,7 +28,7 @@ Move the aggregation server-side as the single source:
    security, qty@price, amount, fee, category, transfer). The one copy of the
    collapse logic, anchored on the holdings-sibling / raw-`security_id NOT NULL`
    leg to avoid the two-legs double-count; the qty=0 security-on-cash-leg fallback
-   for Div/DivXfr/Misc; the single `fee` leg; `hidden`/`merged` guards matching the
+   for Dividend/DividendXfr/Misc; the single `fee` leg; `hidden`/`merged` guards matching the
    FIFO tables. Port `investmentAggregator.ts`'s cases + its test suite to C#.
 2. **Register read migrates onto it** — `RegisterRepository`, for investment
    accounts, runs the projector on each already-assembled entry's legs and returns
@@ -47,7 +47,11 @@ Move the aggregation server-side as the single source:
    come from the **existing shared helpers** — `groupAmount` (which reads the
    server-computed `headerAccountNetAmount`, not a client sum), `groupBalanceAfter`,
    `canonicalLeg` — so investment target-splits are derived identically to bank
-   splits and honor overrides.
+   splits and honor overrides. *(Superseded 2026-10-27, ADR-0108 D14: the opposite
+   side never groups. Each line of a split is its own read-only row in the other
+   account's register, on both registers, and `regroupTargetSplits` is deleted;
+   `lib/splitCollapse.ts` keeps `buildDisplayRows` and the shared helpers, for the
+   splits an account owns.)*
 4. **MCP `activity`** rides directly on the projector; **`allocation`** gains
    `account` + `security` dimensions (small: 2 enum values + 2 switch arms on the
    existing per-security / per-account `HoldingsSnapshot`).
@@ -67,7 +71,8 @@ regression.
   ONE shared, server-backed mechanism: `buildDisplayRows` + `groupAmount` /
   `groupBalanceAfter` / `canonicalLeg`, with the parent net from the server's
   `headerAccountNetAmount`. Both registers use it, for both originating groups and
-  (now) the regrouped target-split clusters.
+  (now) the regrouped target-split clusters. *(2026-10-27: originating groups only;
+  the target-split clusters are gone, see item 3.)*
 - **Composite-event projection** (structural legs of one economic act → one flat
   row with slots) is deliberately investment-only. A bank split is N *independent*
   categorizations the user expands to see; a Buy+Fee is one act shown as a single
@@ -90,7 +95,8 @@ bank + investment** before merge.
   entries per page).
 - The **bank** register now clusters ADR-0036 target-splits into expandable
   parents too (previously investment-only) — a deliberate consistency change, so
-  bank rendering is in the dev-validation scope.
+  bank rendering is in the dev-validation scope. *(2026-10-27, ADR-0108 D14:
+  neither register clusters them any more.)*
 - Raw per-leg detail leaves the register response; the edit / Duplicate / raw-data
   consumers move to the all-accounts `/legs` endpoint (`GetAllLegsForHeaderAsync`)
   and `legsByHeaderId` is deleted.

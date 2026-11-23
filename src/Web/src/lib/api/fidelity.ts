@@ -9,14 +9,18 @@ import { buildFormData } from './upload';
  * Its own routes rather than the generic CSV ones, because the generic path takes a
  * mapping document per request and this path needs none — the format knowledge lives in
  * the server-side shim. Responses are shape-compatible with OFX's, as QIF's are.
+ *
+ * `accountId` on the preview is the account the file will go into, so the server
+ * reads the file under that account's currency as the import will (ADR-0114 D15).
  */
 export async function previewFidelity(
     ledgerId: string,
     file: Blob,
+    accountId?: string,
 ): Promise<OfxPreviewResponse> {
     return requestMultipart<OfxPreviewResponse>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/ingest/fidelity/preview`,
-        buildFormData({ file }, 'upload.csv'),
+        buildFormData({ file, accountId }, 'upload.csv'),
     );
 }
 

@@ -11,16 +11,14 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Transactions;
 
 /// <summary>
-/// Targeted reproduction harness for the "stale balance after
-/// merge/hide/sync" class of bugs. Reproduces a reported scenario
-/// where a savings-account balance was off by exactly the
-/// duplicate-row amount after merging an MD-imported row into a
-/// SimpleFIN-imported row; `fn_recompute_balances_for_account`
-/// produced the correct value when re-run manually, which means
-/// SOME write path failed to invoke the interceptor's recompute
-/// when the merge happened.
+/// Coverage for the "stale balance after merge/hide/sync" class of
+/// bugs: a downstream balance left over by exactly the duplicate-row
+/// amount after a merge, while `fn_recompute_balances_for_account`
+/// re-run by hand produces the correct value. That signature means a
+/// write path changed balance-relevant state without invoking the
+/// interceptor's recompute.
 ///
-/// These tests pin down which path. Each scenario:
+/// Each scenario drives one write path:
 ///   1. Sets up a chain of transactions with known balances.
 ///   2. Performs a merge / hide / sync-shape mutation through the
 ///      HTTP surface (not raw SQL — to exercise the real
@@ -31,11 +29,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// A test FAILING here is the bug, not the test.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class BalanceMergeHideSyncTests
+public sealed class BalanceMergeHideSyncTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public BalanceMergeHideSyncTests(PostgresFixture fixture) => _fixture = fixture;
+    public BalanceMergeHideSyncTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -57,10 +56,10 @@ public sealed class BalanceMergeHideSyncTests
 
     private async Task<Scenario> SetUpAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
-        var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var factory = new ApiFactory(Db).WithoutDevAuth();
         var client = await AuthedClientAsync(factory, ledger);
         return new Scenario(ledger, bank, groceries, client, factory);
     }
@@ -87,7 +86,7 @@ public sealed class BalanceMergeHideSyncTests
 
     private async Task<decimal?> ReadBalanceAsync(Scenario s, Guid headerId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.TxnHeaderAccountBalances.AsNoTracking()
             .Where(r => r.HeaderId == headerId && r.AccountId == s.Bank.Id)
             .Select(r => (decimal?)r.BalanceAfter)
@@ -121,7 +120,7 @@ public sealed class BalanceMergeHideSyncTests
         // Merge dup into A via PATCH on A with mergeFromHeaderId=dup.
         // To merge, A must be needs_review (the existing gate). Flip
         // it tracked-side so the merge gate accepts.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnHeaders.Where(h => h.Id == a)
                 .ExecuteUpdateAsync(s2 => s2.SetProperty(h => h.NeedsReview, true));
@@ -156,7 +155,7 @@ public sealed class BalanceMergeHideSyncTests
 
         var dup = await PostTxnAsync(s, 10, -10m, payee: "anchor-a-dup");
         // Stamp external_id on the dup (mimics an imported row).
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnHeaders.Where(h => h.Id == dup)
                 .ExecuteUpdateAsync(s2 => s2.SetProperty(h => h.ExternalId, "md-import-1"));
@@ -175,8 +174,7 @@ public sealed class BalanceMergeHideSyncTests
     }
 
     // ===================================================================
-    // Scenario 3 — closest reproduction of the reported case: BOTH rows
-    // have an external_id (loser was MD-imported, winner was
+    // Scenario 3 — BOTH rows have an external_id (loser was MD-imported, winner was
     // SimpleFIN-imported). The merge should still trigger correct
     // recompute regardless of provenance.
     // ===================================================================
@@ -191,7 +189,7 @@ public sealed class BalanceMergeHideSyncTests
         Assert.Equal(-40m, await ReadBalanceAsync(s, c));
 
         var dup = await PostTxnAsync(s, 10, -10m, payee: "Test Bank");
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnHeaders.Where(h => h.Id == dup)
                 .ExecuteUpdateAsync(s2 => s2.SetProperty(h => h.ExternalId, "md-import-1"));
@@ -233,7 +231,7 @@ public sealed class BalanceMergeHideSyncTests
         Assert.Equal(-40m, await ReadBalanceAsync(s, c));
 
         var dup = await PostTxnAsync(s, 10, -10m, payee: "anchor-a-dup");
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnHeaders.Where(h => h.Id == a)
                 .ExecuteUpdateAsync(s2 => s2.SetProperty(h => h.NeedsReview, true));
@@ -256,8 +254,8 @@ public sealed class BalanceMergeHideSyncTests
                     },
                 },
             });
-        // Then fold, as a command. It used to ride on the PATCH above;
-        // a merge is not a field edit and no longer can.
+        // Then fold, as a command: a merge is not a field edit, so it
+        // cannot ride on the PATCH above.
         patch = await s.Client.PostAsJsonAsync(
             $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{a}/merge",
             new MergeTransactionRequest { FromHeaderId = dup });
@@ -271,13 +269,11 @@ public sealed class BalanceMergeHideSyncTests
     }
 
     // ===================================================================
-    // Scenario 5 — removed. The hide-via-header-override path isn't
-    // exercised by any production code today (DELETE soft-hide
-    // mutates the raw `txn_headers.is_hidden` column, not the
-    // override layer). The test that previously sat here used the
-    // bare service DbContext which bypasses the interceptor — so
-    // it was testing the wrong invariant. Coverage for the raw
-    // is_hidden path is in BalanceConsistencyTests.
+    // Scenario 5 — none. No code path hides a row through a
+    // header-override layer (DELETE soft-hide mutates the raw
+    // `txn_headers.is_hidden` column), and a test through the bare
+    // service DbContext would bypass the interceptor. Coverage for
+    // the raw is_hidden path is in BalanceConsistencyTests.
     // ===================================================================
 
     // ===================================================================
@@ -296,7 +292,7 @@ public sealed class BalanceMergeHideSyncTests
         Assert.Equal(-30m, await ReadBalanceAsync(s, b));
 
         // External_id stamp so DELETE takes soft-hide branch.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnHeaders.Where(h => h.Id == b)
                 .ExecuteUpdateAsync(s2 => s2.SetProperty(h => h.ExternalId, "feed-x"));
@@ -314,7 +310,7 @@ public sealed class BalanceMergeHideSyncTests
     }
 
     // ===================================================================
-    // Scenario 7 — closest reproduction of a representative sequence:
+    // Scenario 7 — import, sync duplicate, merge:
     //   * Existing MD-imported row on the bank (loser-to-be).
     //   * Later "SimpleFIN sync" inserts a duplicate row on the same
     //     date + amount (winner). At this point balance(C) is
@@ -323,11 +319,10 @@ public sealed class BalanceMergeHideSyncTests
     //   * After merge: balance(C) should be back to correct.
     //
     // Insertion is via the HTTP POST endpoint (not raw `db.Add`) so
-    // the BalanceRecomputeInterceptor actually fires — the previous
-    // version of this test used the bare service DbContext, which
-    // doesn't have interceptors and so didn't reproduce production.
-    // external_id is stamped afterwards via ExecuteUpdate to mark
-    // the rows as "imported" (mirrors the data shape of the reported case).
+    // the BalanceRecomputeInterceptor actually fires; the bare service
+    // DbContext has no interceptors and would not exercise the
+    // recompute. external_id is stamped afterwards via ExecuteUpdate
+    // to mark the rows as imported on both sides.
     // ===================================================================
     [Fact]
     public async Task Sync_style_insert_then_merge_balance_correct()
@@ -349,7 +344,7 @@ public sealed class BalanceMergeHideSyncTests
         // (loser side) to mimic the post-sync state. external_id alone
         // shouldn't change balance — we're checking the merge path
         // still works for imported-on-both-sides rows.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             // Mig 107: origin/provider_key are now two columns —
             // origin is icon-level (manual/online_import/file_import),
@@ -381,7 +376,7 @@ public sealed class BalanceMergeHideSyncTests
     }
 
     // ===================================================================
-    // Scenario 8 — a representative sequence:
+    // Scenario 8 — sync junk rows, soft-delete, then merge:
     //   * Existing MD-imported row on bank.
     //   * SimpleFIN sync inserts MULTIPLE "weird balance" rows on the
     //     bank account.
@@ -410,7 +405,7 @@ public sealed class BalanceMergeHideSyncTests
 
         // Stamp external_ids + needs_review so DELETE takes
         // the soft-hide branch (external_id != null).
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnHeaders.Where(h => h.Id == loser)
                 .ExecuteUpdateAsync(s2 => s2.SetProperty(h => h.ExternalId, "md-1"));
@@ -473,16 +468,17 @@ public sealed class BalanceMergeHideSyncTests
         var loserId = Guid.NewGuid();
         var loserCashLeg = Guid.NewGuid();
         var loserCatLeg = Guid.NewGuid();
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             // Mig 107: origin='file_import' + provider_key='qif'
             // covers what an MD-imported QIF row looks like today.
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 INSERT INTO txn_headers
-                    (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, created_at)
+                    (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, created_at,
+                     originating_account_id)
                 VALUES ({loserId}, {s.Ledger.LedgerId}, 'file_import', 'qif', 'md-1',
                         'Test Bank', '2026-04-30 00:00:00+00'::timestamptz,'2026-04-30 00:00:00+00'::timestamptz,
-                        '2026-04-22 12:00:00+00'::timestamptz);
+                        '2026-04-22 12:00:00+00'::timestamptz, {s.Bank.Id});
                 INSERT INTO txn_legs
                     (id, header_id, ledger_id, account_id, posting_index, amount)
                 VALUES
@@ -498,6 +494,9 @@ public sealed class BalanceMergeHideSyncTests
                 "SELECT fn_recompute_balances_for_account({0}, '0001-01-01'::timestamptz);",
                 s.Category.Id);
         }
+        // And its stored memo-and-tags presentation, which the import computes in its
+        // own transaction.
+        await s.Ledger.RecomputeNotesAsync(loserId);
 
         // 2. POST C (May 31) — interceptor fires, balance(C) reflects
         //    loser-only state: loser + C.
@@ -529,7 +528,7 @@ public sealed class BalanceMergeHideSyncTests
 
         // Stamp external_id + needs_review on the winner via raw
         // (these aren't balance-affecting).
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnHeaders.Where(h => h.Id == winnerId)
                 .ExecuteUpdateAsync(s2 => s2.SetProperty(h => h.ExternalId, "sf-1")
@@ -545,11 +544,11 @@ public sealed class BalanceMergeHideSyncTests
             new PatchTransactionRequest
             {
                 Payee = "Test Bank",
-                Memo = "Sample interest memo",
+                Notes = new TransactionNotesRequest { Side = s.Bank.Id, Memo = "Sample interest memo" },
                 PostedAt = new DateTime(2026, 4, 30, 0, 0, 0, DateTimeKind.Utc),
             });
-        // Then fold, as a command. It used to ride on the PATCH above;
-        // a merge is not a field edit and no longer can.
+        // Then fold, as a command: a merge is not a field edit, so it
+        // cannot ride on the PATCH above.
         patchResp = await s.Client.PostAsJsonAsync(
             $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winnerId}/merge",
             new MergeTransactionRequest { FromHeaderId = loserId });
@@ -561,16 +560,16 @@ public sealed class BalanceMergeHideSyncTests
     }
 
     // ===================================================================
-    // Scenario 10 — reproduction of a reported sequence. The PATCH had
-    // BOTH `mergeFromHeaderId` AND `postedAt` override AND
-    // `payee`/`memo` override AND the winner's raw posted_at
-    // differs from the override posted_at. This is what the actual
-    // SPA merge-from-candidate-with-prefill flow sends.
+    // Scenario 10 — merge with a full header override. The edit
+    // carries `postedAt` AND `payee`/`memo` overrides, then the merge
+    // folds the loser in, and the winner's raw posted_at differs from
+    // the override posted_at. This is what the SPA
+    // merge-from-candidate-with-prefill flow sends.
     //
-    // The winner had raw posted_at = noon UTC (SimpleFIN insertion);
-    // user merged with prefill from loser → override posted_at =
-    // midnight UTC (matches loser). Both are still "April 30" but
-    // they're distinct TIMESTAMPTZ values.
+    // The winner's raw posted_at is noon UTC (sync insertion); the
+    // prefill from the loser sets override posted_at = midnight UTC
+    // (matches loser). Both are "April 30" but distinct TIMESTAMPTZ
+    // values.
     // ===================================================================
     [Fact]
     public async Task Merge_with_header_override_and_offset_posted_at_correct()
@@ -603,8 +602,7 @@ public sealed class BalanceMergeHideSyncTests
         Assert.Equal(-40m, await ReadBalanceAsync(s, c));
 
         // Winner at noon UTC, Apr 30 (different timestamptz than loser
-        // but same calendar day — exactly mirrors the reported data
-        // shape).
+        // but same calendar day).
         var winner = await s.Client.PostAsJsonAsync(
             $"/api/ledgers/{s.Ledger.LedgerId}/transactions",
             new CreateTransactionRequest
@@ -618,7 +616,7 @@ public sealed class BalanceMergeHideSyncTests
         Assert.Equal(-50m, await ReadBalanceAsync(s, c));
 
         // Stamp external_ids + needs_review.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnHeaders.Where(h => h.Id == loserId)
                 .ExecuteUpdateAsync(s2 => s2.SetProperty(h => h.ExternalId, "md-1"));
@@ -629,17 +627,17 @@ public sealed class BalanceMergeHideSyncTests
 
         // PATCH winner with: payee/memo override (prefill from loser),
         // postedAt override (midnight UTC, matching loser),
-        // mergeFromHeaderId = loser. This is the full real-world shape.
+        // mergeFromHeaderId = loser. This is the fully-populated shape.
         var patchResp = await s.Client.PatchAsJsonAsync(
             $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winnerId}",
             new PatchTransactionRequest
             {
                 Payee = "Test Bank",
-                Memo = "Sample interest memo",
+                Notes = new TransactionNotesRequest { Side = s.Bank.Id, Memo = "Sample interest memo" },
                 PostedAt = new DateTime(2026, 4, 30, 0, 0, 0, DateTimeKind.Utc),
             });
-        // Then fold, as a command. It used to ride on the PATCH above;
-        // a merge is not a field edit and no longer can.
+        // Then fold, as a command: a merge is not a field edit, so it
+        // cannot ride on the PATCH above.
         patchResp = await s.Client.PostAsJsonAsync(
             $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winnerId}/merge",
             new MergeTransactionRequest { FromHeaderId = loserId });
@@ -651,16 +649,14 @@ public sealed class BalanceMergeHideSyncTests
     }
 
     // ===================================================================
-    // Scenario 12 — a reported sequence: merge PATCH at t0 (winner +
-    // mergeFromHeaderId), then a SECOND PATCH at t1 on a DOWNSTREAM
-    // row that just adds a payee/memo/postedAt override (no merge,
-    // no postings reshape). In the reported case the two override rows
-    // were written well under a minute apart — this is exactly that
-    // pattern.
+    // Scenario 12 — merge at t0 (winner override + merge), then a
+    // SECOND PATCH at t1 on a DOWNSTREAM row that only adds a
+    // payee/memo/postedAt override (no merge, no postings reshape),
+    // back to back.
     //
     // If the second PATCH's recompute reads a stale v_starting from
     // a balance row that wasn't fully refreshed by the first PATCH,
-    // we'd see balance drift.
+    // the balance drifts.
     // ===================================================================
     [Fact]
     public async Task Merge_then_downstream_override_balance_correct()
@@ -715,7 +711,7 @@ public sealed class BalanceMergeHideSyncTests
         // Pre-merge: loser + winner + b10 + may31 — the duplicated amount counted twice.
         Assert.Equal(1481.46m, await ReadBalanceAsync(s, may31));
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnHeaders.Where(h => h.Id == loserId)
                 .ExecuteUpdateAsync(s2 => s2.SetProperty(h => h.ExternalId, "md-1"));
@@ -724,17 +720,17 @@ public sealed class BalanceMergeHideSyncTests
                                               .SetProperty(h => h.NeedsReview, true));
         }
 
-        // PATCH 1: merge + override on winner (the actual user flow).
+        // PATCH 1: merge + override on winner (the SPA's merge flow).
         var p1 = await s.Client.PatchAsJsonAsync(
             $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winnerId}",
             new PatchTransactionRequest
             {
                 Payee = "Test Bank",
-                Memo = "Sample interest memo",
+                Notes = new TransactionNotesRequest { Side = s.Bank.Id, Memo = "Sample interest memo" },
                 PostedAt = new DateTime(2026, 4, 30, 0, 0, 0, DateTimeKind.Utc),
             });
-        // Then fold, as a command. It used to ride on the PATCH above;
-        // a merge is not a field edit and no longer can.
+        // Then fold, as a command: a merge is not a field edit, so it
+        // cannot ride on the PATCH above.
         p1 = await s.Client.PostAsJsonAsync(
             $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winnerId}/merge",
             new MergeTransactionRequest { FromHeaderId = loserId });
@@ -745,14 +741,12 @@ public sealed class BalanceMergeHideSyncTests
         Assert.Equal(1358.01m, await ReadBalanceAsync(s, may31));
 
         // PATCH 2: override on may31 (payee/memo/postedAt). NO merge.
-        // This exact pattern can occur shortly after
-        // PATCH 1.
         var p2 = await s.Client.PatchAsJsonAsync(
             $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{may31}",
             new PatchTransactionRequest
             {
                 Payee = "Test Bank",
-                Memo = "Interest Paid Balance: $1,358.01",
+                Notes = new TransactionNotesRequest { Side = s.Bank.Id, Memo = "Interest Paid Balance: $1,358.01" },
                 PostedAt = new DateTime(2026, 5, 31, 0, 0, 0, DateTimeKind.Utc),
                 Approve = true,
             });
@@ -764,15 +758,15 @@ public sealed class BalanceMergeHideSyncTests
     }
 
     // ===================================================================
-    // Scenario 13 — a reported sequence, in its sync_runs order:
+    // Scenario 13 — merge, downstream override, then a re-sync:
     //   * Merge PATCH on winner
-    //   * Downstream override PATCH on May 31, under a minute later
-    //   * THIRD: a SimpleFIN sync re-runs a few minutes after that,
-    //     reporting alreadyKnown rows — existing rows that matched on
-    //     FITID. If one of those was the post-merged winner or the
-    //     post-override may31, the orchestrator's alreadyKnown branch
-    //     could mutate fields in a way that, on the final
-    //     SaveChangesAsync, lets a stale balance row survive.
+    //   * Downstream override PATCH on May 31
+    //   * THIRD: a SimpleFIN sync re-runs and reports alreadyKnown
+    //     rows — existing rows that matched on FITID. If one of those
+    //     is the post-merged winner or the post-override may31, the
+    //     orchestrator's alreadyKnown branch could mutate fields in a
+    //     way that, on the final SaveChangesAsync, lets a stale
+    //     balance row survive.
     //
     // Simulate by manually invoking the alreadyKnown-shape state
     // change (a TxnHeaderRow Modified with payee + provider_raw_payload)
@@ -830,7 +824,7 @@ public sealed class BalanceMergeHideSyncTests
         // origin into (origin, provider_key); SimpleFIN dedup scopes
         // by provider_key, so set both columns here to line rows up
         // with the alreadyKnown branch.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnHeaders.Where(h => h.Id == loserId)
                 .ExecuteUpdateAsync(s2 => s2.SetProperty(h => h.ExternalId, "md-1"));
@@ -851,11 +845,11 @@ public sealed class BalanceMergeHideSyncTests
             new PatchTransactionRequest
             {
                 Payee = "Test Bank",
-                Memo = "Interest Paid USD",
+                Notes = new TransactionNotesRequest { Side = s.Bank.Id, Memo = "Interest Paid USD" },
                 PostedAt = new DateTime(2026, 4, 30, 0, 0, 0, DateTimeKind.Utc),
             });
-        // Then fold, as a command. It used to ride on the PATCH above;
-        // a merge is not a field edit and no longer can.
+        // Then fold, as a command: a merge is not a field edit, so it
+        // cannot ride on the PATCH above.
         p1 = await s.Client.PostAsJsonAsync(
             $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winnerId}/merge",
             new MergeTransactionRequest { FromHeaderId = loserId });
@@ -867,7 +861,7 @@ public sealed class BalanceMergeHideSyncTests
             new PatchTransactionRequest
             {
                 Payee = "Test Bank",
-                Memo = "Interest Paid Balance: $1,358.01",
+                Notes = new TransactionNotesRequest { Side = s.Bank.Id, Memo = "Interest Paid Balance: $1,358.01" },
                 PostedAt = new DateTime(2026, 5, 31, 0, 0, 0, DateTimeKind.Utc),
                 Approve = true,
             });
@@ -879,7 +873,7 @@ public sealed class BalanceMergeHideSyncTests
         // SIMULATE the alreadyKnown sync branch hitting may31 + winner.
         // The orchestrator does: load existing tracked → backfill
         // provider_raw_payload + maybe payee/memo → SaveChanges.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var existingMay31 = await db.TxnHeaders.SingleAsync(h => h.Id == may31);
             existingMay31.ProviderRawPayload = "{\"id\":\"sf-may31\",\"amount\":234.56}";
@@ -918,7 +912,7 @@ public sealed class BalanceMergeHideSyncTests
         var loser = await PostTxnAsync(s, 1, -5m, payee: "dup-earlier");
         Assert.Equal(-30m, await ReadBalanceAsync(s, c));
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnHeaders.Where(h => h.Id == winner)
                 .ExecuteUpdateAsync(s2 => s2.SetProperty(h => h.NeedsReview, true));
@@ -932,10 +926,22 @@ public sealed class BalanceMergeHideSyncTests
         Assert.Equal(-25m, await ReadBalanceAsync(s, c));
     }
 
+    /// <summary>The balances projection of the consistency check, through its endpoint.</summary>
+    private static async Task<ProjectionConsistency> CheckBalancesAsync(Scenario s)
+    {
+        var resp = await s.Client.PostAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/balances/consistency", content: null);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var report = await resp.Content.ReadFromJsonAsync<LedgerConsistencyReport>();
+        Assert.NotNull(report);
+        return Assert.Single(report!.Projections, p => p.Projection == ConsistencyProjections.Balances);
+    }
+
     // ===================================================================
-    // Health endpoint — healthy path. Post normal transactions; the
-    // interceptor wires every balance row. /balances/health should
-    // report `healthy: true` with zero drift.
+    // Balance check — healthy path. Post normal transactions; the
+    // interceptor wires every balance row. The balance check should
+    // report healthy with zero drift. Through the repository, which also
+    // answers how many accounts it walked.
     // ===================================================================
     [Fact]
     public async Task BalancesHealth_reports_healthy_when_no_drift()
@@ -947,13 +953,11 @@ public sealed class BalanceMergeHideSyncTests
         await PostTxnAsync(s, 20, -20m);
         await PostTxnAsync(s, 30, -30m);
 
-        var resp = await s.Client.GetAsync(
-            $"/api/ledgers/{s.Ledger.LedgerId}/balances/health");
-        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        await using var db = Db.NewDbContext();
+        var report = await new Coffer.Api.Db.Repositories.RegisterRepository(db, TimeProvider.System)
+            .CheckBalancesAsync(s.Ledger.LedgerId);
 
-        var report = await resp.Content.ReadFromJsonAsync<BalanceHealthReport>();
-        Assert.NotNull(report);
-        Assert.True(report!.Healthy);
+        Assert.True(report.Healthy);
         Assert.Equal(0, report.DriftedCount);
         Assert.Empty(report.Drifted);
         Assert.True(report.RowsChecked >= 3);
@@ -964,13 +968,13 @@ public sealed class BalanceMergeHideSyncTests
     // Drift detection, then repair — two deliberate steps since mig 206.
     // Corrupt a balance row by writing directly to the DB (bypassing the
     // interceptor — this simulates a writer that skipped the recompute,
-    // which IS the bug class these endpoints exist to catch).
+    // which IS the bug class the balances projection exists to catch).
     //
-    // GET /balances/health must REPORT the drift and leave it in place;
-    // POST /balances/repair is what fixes it. Before mig 206 the check
-    // healed as a side effect, so there was no way to see drift without
-    // erasing it — on a real ledger that meant a diagnostic silently
-    // rewriting a great many rows.
+    // POST /balances/consistency must REPORT the drift and leave it in
+    // place; POST /balances/consistency/balances/repair is what fixes it.
+    // Before mig 206 the check healed as a side effect, so there was no
+    // way to see drift without erasing it — that meant a diagnostic
+    // silently rewriting every balance row it walked.
     // ===================================================================
     [Fact]
     public async Task BalancesHealth_detects_drift_then_repair_heals_row()
@@ -985,7 +989,7 @@ public sealed class BalanceMergeHideSyncTests
         // the kind of drift that would appear if some writer mutated a
         // balance-relevant column via ExecuteUpdate / raw SQL without
         // a follow-up recompute call.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnHeaderAccountBalances
                 .Where(r => r.HeaderId == headerId && r.AccountId == s.Bank.Id)
@@ -993,20 +997,15 @@ public sealed class BalanceMergeHideSyncTests
         }
         Assert.Equal(989m, await ReadBalanceAsync(s, headerId));
 
-        var resp = await s.Client.GetAsync(
-            $"/api/ledgers/{s.Ledger.LedgerId}/balances/health");
-        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var report = await CheckBalancesAsync(s);
+        Assert.False(report.Healthy);
+        Assert.Equal(1, report.MismatchedCount);
 
-        var report = await resp.Content.ReadFromJsonAsync<BalanceHealthReport>();
-        Assert.NotNull(report);
-        Assert.False(report!.Healthy);
-        Assert.Equal(1, report.DriftedCount);
-
-        var drift = Assert.Single(report.Drifted);
+        var drift = Assert.Single(report.Mismatches);
         Assert.Equal(headerId, drift.HeaderId);
         Assert.Equal(s.Bank.Id, drift.AccountId);
-        Assert.Equal(989m, drift.StoredBefore);
-        Assert.Equal(-10m, drift.RecomputedAfter);
+        Assert.Equal(989m, drift.Stored);
+        Assert.Equal(-10m, drift.Expected);
         Assert.Equal(-999m, drift.Diff);
 
         // The check REPORTED the drift and left it alone.
@@ -1014,15 +1013,184 @@ public sealed class BalanceMergeHideSyncTests
 
         // Repair is the separate, deliberate step that fixes it.
         var repair = await s.Client.PostAsync(
-            $"/api/ledgers/{s.Ledger.LedgerId}/balances/repair", content: null);
+            $"/api/ledgers/{s.Ledger.LedgerId}/balances/consistency/{ConsistencyProjections.Balances}/repair",
+            content: null);
         Assert.Equal(HttpStatusCode.OK, repair.StatusCode);
         Assert.Equal(-10m, await ReadBalanceAsync(s, headerId));
 
         // And a re-check agrees there is nothing left, which only holds
         // because both share one implementation of the rules.
-        var after = await (await s.Client.GetAsync(
-            $"/api/ledgers/{s.Ledger.LedgerId}/balances/health"))
-            .Content.ReadFromJsonAsync<BalanceHealthReport>();
-        Assert.True(after!.Healthy);
+        Assert.True((await CheckBalancesAsync(s)).Healthy);
+    }
+
+    // ===================================================================
+    // Deleting a merge winner. A manual row is a valid winner, and the
+    // database un-merges its losers when it is deleted (ON DELETE SET
+    // NULL): each loser is back in the register and in the walk of every
+    // account it has a line on, the category leg of a feed row included,
+    // which no line of the deleted winner sat on.
+    // ===================================================================
+
+    /// <summary>
+    /// A feed row folded into the manual row it duplicates, then the manual row deleted:
+    /// the feed row is back in the register, and the consistency check is healthy, its
+    /// category's balances included.
+    /// </summary>
+    [Fact]
+    public async Task Deleting_a_merge_winner_restores_its_loser_with_every_balance()
+    {
+        var s = await SetUpAsync();
+        await using var _ = s.Factory;
+        var (winner, loser) = await MergeFeedRowIntoManualRowAsync(s);
+
+        var delete = await s.Client.DeleteAsync($"/api/ledgers/{s.Ledger.LedgerId}/transactions/{winner}");
+        Assert.True(delete.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
+            $"delete failed: {(int)delete.StatusCode} {await delete.Content.ReadAsStringAsync()}");
+
+        await AssertLoserRestoredAsync(s, winner, loser);
+    }
+
+    /// <summary>The same through the bulk delete, which bypasses the change tracker.</summary>
+    [Fact]
+    public async Task Bulk_deleting_a_merge_winner_restores_its_loser_with_every_balance()
+    {
+        var s = await SetUpAsync();
+        await using var _ = s.Factory;
+        var (winner, loser) = await MergeFeedRowIntoManualRowAsync(s);
+
+        var delete = await s.Client.PostAsJsonAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/bulk-delete",
+            new BulkDeleteRequest
+            {
+                Selection = new SelectionRequest { Kind = "explicit", AccountId = s.Bank.Id, HeaderIds = [winner] },
+            });
+        Assert.Equal(HttpStatusCode.OK, delete.StatusCode);
+        Assert.Equal(1, (await delete.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("hardDeleted").GetInt32());
+
+        await AssertLoserRestoredAsync(s, winner, loser);
+    }
+
+    /// <summary>
+    /// A manual row, the feed row a statement import writes for it, and the feed row
+    /// folded into the manual one; the ledger checks clean before and after the merge.
+    /// </summary>
+    private async Task<(Guid Winner, Guid Loser)> MergeFeedRowIntoManualRowAsync(Scenario s)
+    {
+        var winner = await PostTxnAsync(s, 10, -9m, payee: "Corner Shop");
+        await PostTxnAsync(s, 20, -20m);
+        var loser = await ImportFeedRowAsync(s);
+        await AssertConsistentAsync(s, "before the merge");
+
+        var merge = await s.Client.PostAsJsonAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/transactions/{loser}/merge",
+            new MergeTransactionRequest { FromHeaderId = winner });
+        Assert.True(merge.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
+            $"merge failed: {(int)merge.StatusCode} {await merge.Content.ReadAsStringAsync()}");
+        await using (var db = Db.NewDbContext())
+            Assert.Equal(winner, (await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == loser)).IsMergedInto);
+        await AssertConsistentAsync(s, "after the merge");
+        return (winner, loser);
+    }
+
+    /// <summary>The winner is gone, the loser merged into nothing and listed on the bank's
+    /// register, and the whole consistency check healthy.</summary>
+    private async Task AssertLoserRestoredAsync(Scenario s, Guid winner, Guid loser)
+    {
+        await using (var db = Db.NewDbContext())
+        {
+            Assert.False(await db.TxnHeaders.AsNoTracking().AnyAsync(h => h.Id == winner));
+            Assert.Null((await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == loser)).IsMergedInto);
+        }
+        var page = (await s.Client.GetFromJsonAsync<RegisterPage>(
+            $"/api/ledgers/{s.Ledger.LedgerId}/transactions?account_id={s.Bank.Id}&limit=100"))!;
+        Assert.Single(page.Entries, e => e.Txn is not null && e.Txn.HeaderId == loser);
+        await AssertConsistentAsync(s, "after the winner was deleted");
+    }
+
+    /// <summary>
+    /// Import a one-debit bank statement into the scenario's bank, as a person does, and
+    /// return the feed row it writes: awaiting review, its other line on the ledger's
+    /// Uncategorized category.
+    /// </summary>
+    private async Task<Guid> ImportFeedRowAsync(Scenario s)
+    {
+        var content = new MultipartFormDataContent();
+        var body = new ByteArrayContent(System.Text.Encoding.UTF8.GetBytes(OfxOneDebit));
+        body.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+        content.Add(body, "file", "statement.qfx");
+        content.Add(new StringContent(s.Bank.Id.ToString()), "accountId");
+        content.Add(new StringContent("999999999:12345"), "providerAccountId");
+        var resp = await s.Client.PostAsync($"/api/ledgers/{s.Ledger.LedgerId}/ingest/ofx/import", content);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        await using var db = Db.NewDbContext();
+        var row = await db.TxnHeaders.AsNoTracking()
+            .SingleAsync(h => h.LedgerId == s.Ledger.LedgerId && h.ExternalId == "MERGE-WINNER-DELETE-1");
+        Assert.True(row.NeedsReview);
+        return row.Id;
+    }
+
+    /// <summary>One debit on the scenario's first row's day, of its amount.</summary>
+    private const string OfxOneDebit = """
+        OFXHEADER:100
+        DATA:OFXSGML
+        VERSION:102
+        SECURITY:NONE
+        ENCODING:USASCII
+
+        <OFX>
+        <SIGNONMSGSRSV1>
+        <SONRS>
+        <STATUS><CODE>0<SEVERITY>INFO</STATUS>
+        <DTSERVER>20260501120000
+        <LANGUAGE>ENG
+        </SONRS>
+        </SIGNONMSGSRSV1>
+        <BANKMSGSRSV1>
+        <STMTTRNRS>
+        <TRNUID>0
+        <STATUS><CODE>0<SEVERITY>INFO</STATUS>
+        <STMTRS>
+        <CURDEF>USD
+        <BANKACCTFROM>
+        <BANKID>999999999
+        <ACCTID>12345
+        <ACCTTYPE>CHECKING
+        </BANKACCTFROM>
+        <BANKTRANLIST>
+        <DTSTART>20260401
+        <DTEND>20260430
+        <STMTTRN>
+        <TRNTYPE>DEBIT
+        <DTPOSTED>20260410
+        <TRNAMT>-9.00
+        <FITID>MERGE-WINNER-DELETE-1
+        <NAME>CORNER SHOP
+        </STMTTRN>
+        </BANKTRANLIST>
+        </STMTRS>
+        </STMTTRNRS>
+        </BANKMSGSRSV1>
+        </OFX>
+        """;
+
+    /// <summary>The consistency check, through its endpoint, reports every projection
+    /// healthy; otherwise the failure names each disagreeing figure.</summary>
+    private async Task AssertConsistentAsync(Scenario s, string when)
+    {
+        using var doc = JsonDocument.Parse(await (await s.Client.PostAsync(
+            $"/api/ledgers/{s.Ledger.LedgerId}/balances/consistency", null)).EnsureSuccessStatusCode()
+            .Content.ReadAsStringAsync());
+        var report = doc.RootElement;
+        var failing = report.GetProperty("projections").EnumerateArray()
+            .Where(p => !p.GetProperty("healthy").GetBoolean())
+            .Select(p => p.GetProperty("projection").GetString() + ": "
+                         + string.Join("; ", p.GetProperty("mismatches").EnumerateArray().Select(m =>
+                             $"{m.GetProperty("scope").GetString()} {m.GetProperty("field").GetString()}"
+                             + $" stored {m.GetProperty("stored").GetDecimal()} expected {m.GetProperty("expected").GetDecimal()}")))
+            .ToList();
+        Assert.True(report.GetProperty("healthy").GetBoolean(),
+            $"{when}, the consistency check is unhealthy: "
+            + (failing.Count > 0 ? string.Join(" | ", failing) : "oversold positions listed"));
     }
 }

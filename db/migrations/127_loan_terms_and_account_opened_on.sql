@@ -1,7 +1,5 @@
 -- =============================================================================
 -- 127 — loan_terms (amortization parameters) + accounts.opened_on (ADR-0050)
--- (renumbered from 126: a parallel branch independently used 126 for the
---  recurring-transactions source-account catchup; both were cut at main=125.)
 -- =============================================================================
 --
 -- A loan account (account_type='loan') carries amortization parameters that

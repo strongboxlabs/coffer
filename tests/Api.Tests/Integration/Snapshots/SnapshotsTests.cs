@@ -24,13 +24,11 @@ namespace Coffer.Api.Tests.Integration.Snapshots;
 /// exercised the same way.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class SnapshotsTests
+public sealed class SnapshotsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SnapshotsTests(PostgresFixture fixture)
+    public SnapshotsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     /// <summary>
@@ -48,7 +46,7 @@ public sealed class SnapshotsTests
     {
         for (var attempt = 0; attempt < 100; attempt++)
         {
-            await using (var svc = _fixture.NewServiceDbContext())
+            await using (var svc = Db.NewServiceDbContext())
             {
                 if (await svc.LedgerConsistencyStates.AsNoTracking()
                         .AnyAsync(r => r.LedgerId == ledger.LedgerId && r.LastCheckedAt != null))
@@ -82,26 +80,21 @@ public sealed class SnapshotsTests
     /// service-role context the scheduler hands to <c>SnapshotJobHandler</c>.
     /// </summary>
     /// <remarks>
-    /// These two tests previously resolved the repository out of
-    /// <c>factory.Services.CreateScope()</c>. That is the app-role context with no
-    /// request behind it, so <c>ICurrentUserAccessor.IsAuthenticated</c> is false,
-    /// <c>app.user_id</c> is never set, and RLS is fail-closed on every scoped table
-    /// — the exact shape that made
-    /// <c>Snapshot_payload_is_captured_server_side_in_content_json</c> capture
-    /// nothing and assert that it had captured something. It happens to work here
-    /// only because the snapshot tables do not carry RLS policies YET (see
-    /// "RLS on the snapshot tables" in follow-ups), so the pattern is a latent break
-    /// as well as a wrong mirror of production: the auto-snap path is the scheduler,
-    /// which runs service-role precisely because the app role would see no ledgers.
+    /// Not resolved out of <c>factory.Services.CreateScope()</c>: that is the app-role
+    /// context with no request behind it, so <c>ICurrentUserAccessor.IsAuthenticated</c>
+    /// is false, <c>app.user_id</c> is never set, and RLS is fail-closed on every scoped
+    /// table — a capture over it sees nothing. It would also be a wrong mirror of
+    /// production: the auto-snap path is the scheduler, which runs service-role
+    /// precisely because the app role would see no ledgers.
     /// </remarks>
     private LedgerSnapshotsRepository AutoSnapshotRepo() =>
-        new(_fixture.NewDbContext(),
+        new(Db.NewDbContext(),
             NullLogger<LedgerSnapshotsRepository>.Instance, TimeProvider.System);
 
     [Fact]
     public async Task Create_then_restore_round_trips_the_ledger_state()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         await ledger.AddTransactionPairAsync(
@@ -113,7 +106,7 @@ public sealed class SnapshotsTests
             new DateTime(2026, 5, 6, 12, 0, 0, DateTimeKind.Utc),
             payee: "coffee");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Snapshot the current state.
@@ -132,7 +125,7 @@ public sealed class SnapshotsTests
             new DateTime(2026, 5, 7, 12, 0, 0, DateTimeKind.Utc),
             payee: "post-snapshot row");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var preCount = await db.TxnHeaders.AsNoTracking()
                 .CountAsync(h => h.LedgerId == ledger.LedgerId);
@@ -145,7 +138,7 @@ public sealed class SnapshotsTests
             content: null);
         Assert.Equal(HttpStatusCode.NoContent, restoreResp.StatusCode);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var postCount = await db.TxnHeaders.AsNoTracking()
                 .CountAsync(h => h.LedgerId == ledger.LedgerId);
@@ -164,17 +157,16 @@ public sealed class SnapshotsTests
     {
         // ADR-0055/0086: a restore replaces the ledger's data in place, so it
         // earns a durable ledger_operations row visible in the Activity timeline
-        // (family 'snapshot', provider 'snapshot-restore'). Previously restore left
-        // no durable trace. Asserted through the public timeline endpoint (the
+        // (family 'snapshot', provider 'snapshot-restore'). Asserted through the public timeline endpoint (the
         // read path the SPA uses), not the internal table.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         await ledger.AddTransactionPairAsync(
             bank.Id, dining.Id, -25m,
             new DateTime(2026, 5, 5, 12, 0, 0, DateTimeKind.Utc), payee: "lunch");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var createResp = await client.PostAsJsonAsync(
@@ -206,19 +198,18 @@ public sealed class SnapshotsTests
         // (mig 242). Nulling last_checked_at is also what makes the ledger due on
         // the monitor's next tick.
         //
-        // The cadence is what gives this teeth. The monitor used to re-verify every
-        // fifteen minutes, so a restored ledger was re-checked almost at once; at
-        // twice a day a snapshot captured WHILE drifted would otherwise sit behind
+        // The cadence is what gives this teeth. At twice a day a snapshot captured
+        // WHILE drifted would otherwise sit behind
         // a stale green for half a day — the failure direction that matters, since
         // a green mark is read as "nothing to do here".
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         await ledger.AddTransactionPairAsync(
             bank.Id, dining.Id, -25m,
             new DateTime(2026, 5, 5, 12, 0, 0, DateTimeKind.Utc), payee: "lunch");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var createResp = await client.PostAsJsonAsync(
@@ -232,7 +223,7 @@ public sealed class SnapshotsTests
         // around.
         var checkedAt = new DateTime(2026, 5, 6, 9, 0, 0, DateTimeKind.Utc);
         await WaitForBootCheckAsync(ledger);
-        await using (var svc = _fixture.NewServiceDbContext())
+        await using (var svc = Db.NewServiceDbContext())
         {
             var seeded = await svc.LedgerConsistencyStates
                 .SingleAsync(r => r.LedgerId == ledger.LedgerId);
@@ -247,7 +238,7 @@ public sealed class SnapshotsTests
             $"/api/ledgers/{ledger.LedgerId}/snapshots/{snap.Id}/restore", content: null);
         Assert.Equal(HttpStatusCode.NoContent, restoreResp.StatusCode);
 
-        await using (var svc = _fixture.NewServiceDbContext())
+        await using (var svc = Db.NewServiceDbContext())
         {
             var state = await svc.LedgerConsistencyStates.AsNoTracking()
                 .SingleAsync(r => r.LedgerId == ledger.LedgerId);
@@ -270,16 +261,16 @@ public sealed class SnapshotsTests
         // here would manufacture a row for every ledger anyone ever restores.
         //
         // RESTORED TWICE ON PURPOSE. "No row afterwards" is satisfied by an
-        // endpoint that does nothing at all — the first version of this test
-        // passed with the whole invalidation block deleted, which is the failure
-        // mode of every assertion whose subject is an absence. The first restore
+        // endpoint that does nothing at all — a single restore would pass with
+        // the whole invalidation block deleted, which is the failure mode of
+        // every assertion whose subject is an absence. The first restore
         // is the anchor: it proves the mechanism is live by watching it null a
         // verdict that was there. Only then does the absence after the second
         // restore mean what it claims.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await ledger.AddBankAccountAsync("checking");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var createResp = await client.PostAsJsonAsync(
@@ -288,7 +279,7 @@ public sealed class SnapshotsTests
 
         // Anchor: a settled verdict, then a restore, then no verdict.
         await WaitForBootCheckAsync(ledger);
-        await using (var seedCtx = _fixture.NewServiceDbContext())
+        await using (var seedCtx = Db.NewServiceDbContext())
         {
             var seeded = await seedCtx.LedgerConsistencyStates
                 .SingleAsync(r => r.LedgerId == ledger.LedgerId);
@@ -301,7 +292,7 @@ public sealed class SnapshotsTests
         Assert.Equal(HttpStatusCode.NoContent, (await client.PostAsync(
             $"/api/ledgers/{ledger.LedgerId}/snapshots/{snap.Id}/restore", content: null)).StatusCode);
 
-        await using (var afterFirst = _fixture.NewServiceDbContext())
+        await using (var afterFirst = Db.NewServiceDbContext())
         {
             var state = await afterFirst.LedgerConsistencyStates.AsNoTracking()
                 .SingleAsync(r => r.LedgerId == ledger.LedgerId);
@@ -309,7 +300,7 @@ public sealed class SnapshotsTests
         }
 
         // Now the case under test: nothing recorded, and a restore on top of it.
-        await using (var cleanup = _fixture.NewServiceDbContext())
+        await using (var cleanup = Db.NewServiceDbContext())
         {
             await cleanup.LedgerConsistencyStates
                 .Where(r => r.LedgerId == ledger.LedgerId)
@@ -319,7 +310,7 @@ public sealed class SnapshotsTests
         Assert.Equal(HttpStatusCode.NoContent, (await client.PostAsync(
             $"/api/ledgers/{ledger.LedgerId}/snapshots/{snap.Id}/restore", content: null)).StatusCode);
 
-        await using var svc = _fixture.NewServiceDbContext();
+        await using var svc = Db.NewServiceDbContext();
         Assert.False(await svc.LedgerConsistencyStates.AsNoTracking()
             .AnyAsync(r => r.LedgerId == ledger.LedgerId));
     }
@@ -328,16 +319,16 @@ public sealed class SnapshotsTests
     public async Task Snapshot_payload_is_captured_server_side_in_chunked_parts()
     {
         // mig 179 captured the in-scope graph into content_json (jsonb) so it never
-        // entered managed memory. That fixed an API-side OOM and left a Postgres-side
-        // one: the whole document was still built as one value, measured at more than
-        // ten times the finished artifact's size in backend anon memory, which the
-        // kernel OOM-killed.
+        // entered managed memory. That removes the API-side peak but not the
+        // Postgres-side one: the whole document is still built as one value in
+        // backend anon memory, far larger than the finished artifact and growing
+        // with the ledger, until a large enough ledger draws the kernel OOM killer.
         //
         // mig 193 (v3): rows are captured per table in chunks into
         // ledger_snapshot_parts, so peak memory tracks chunk size rather than ledger
         // size. content_json is left NULL and the legacy gzip `content` stays empty —
         // presence of parts rows is the v3 gate.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         await ledger.AddTransactionPairAsync(
@@ -352,7 +343,7 @@ public sealed class SnapshotsTests
         // that and still passed, because it only asserted the "accounts" KEY was
         // present, which is equally true of "accounts": []. It would have passed
         // against an entirely empty snapshot.
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var createResp = await client.PostAsJsonAsync(
@@ -360,7 +351,7 @@ public sealed class SnapshotsTests
         Assert.Equal(HttpStatusCode.OK, createResp.StatusCode);
         var created = (await createResp.Content.ReadFromJsonAsync<CreateSnapshotResponse>())!.Snapshot!;
 
-        await using var db = _fixture.NewDbContext();   // service role: sees past RLS
+        await using var db = Db.NewDbContext();   // service role: sees past RLS
         var row = await db.LedgerSnapshots.AsNoTracking()
             .Where(s => s.Id == created.Id)
             .Select(s => new { s.ContentJson, s.Content, s.ContentSizeUncompressed })
@@ -408,23 +399,22 @@ public sealed class SnapshotsTests
     [Fact]
     public async Task A_pre_migration_v2_snapshot_still_restores()
     {
-        // Migration 193 made capture produce v3 (chunked parts), which means every
-        // other test in this file exercises the v3 path and NOTHING exercises v2 —
-        // even though 193 also modified the v2 restore function, extracting its
-        // delete block into fn_ledger_snapshot_clear so both paths share one FK
-        // ordering. Preflight passed with the v2 branch at zero coverage.
+        // Since migration 193 capture produces v3 (chunked parts), so every other
+        // test in this file exercises the v3 path and none exercises v2 — although
+        // 193 also modified the v2 restore function, extracting its delete block
+        // into fn_ledger_snapshot_clear so both paths share one FK ordering.
         //
         // That matters because an install upgrading to 193 keeps its existing v2
         // snapshots (nothing is rewritten in place), and those restore through the
-        // refactored function. The snapshot you would reach for if an upgrade went
-        // badly is exactly the one whose path was untested.
+        // refactored function. A pre-upgrade snapshot is the one an operator
+        // restores to undo an upgrade, so its path needs its own test.
         //
         // So: capture normally (v3), convert the row to a genuine v2 snapshot, and
         // restore it through the real endpoint. fn_ledger_snapshot_parts_payload is
         // the reassembly helper 193 added for diagnostics; here it manufactures the
         // single content_json document v2 stored, byte-order-identical to what mig
         // 179's capture would have written.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         await ledger.AddTransactionPairAsync(
@@ -434,7 +424,7 @@ public sealed class SnapshotsTests
             bank.Id, dining.Id, -12m,
             new DateTime(2026, 5, 6, 12, 0, 0, DateTimeKind.Utc), payee: "coffee");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var createResp = await client.PostAsJsonAsync(
@@ -443,7 +433,7 @@ public sealed class SnapshotsTests
         var snap = (await createResp.Content.ReadFromJsonAsync<CreateSnapshotResponse>())!.Snapshot!;
 
         // Rewrite it into the v2 format: payload in content_json, no parts rows.
-        await using (var svc = _fixture.NewDbContext())
+        await using (var svc = Db.NewDbContext())
         {
             await svc.Database.ExecuteSqlRawAsync(
                 """
@@ -467,7 +457,7 @@ public sealed class SnapshotsTests
         await ledger.AddTransactionPairAsync(
             bank.Id, dining.Id, -100m,
             new DateTime(2026, 5, 7, 12, 0, 0, DateTimeKind.Utc), payee: "post-snapshot row");
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.Equal(3, await db.TxnHeaders.AsNoTracking()
                 .CountAsync(h => h.LedgerId == ledger.LedgerId));
@@ -477,7 +467,7 @@ public sealed class SnapshotsTests
             $"/api/ledgers/{ledger.LedgerId}/snapshots/{snap.Id}/restore", content: null);
         Assert.Equal(HttpStatusCode.NoContent, restoreResp.StatusCode);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.Equal(2, await db.TxnHeaders.AsNoTracking()
                 .CountAsync(h => h.LedgerId == ledger.LedgerId));
@@ -499,7 +489,7 @@ public sealed class SnapshotsTests
         //
         // Asserting set equality here is what closes that gap. Order deliberately
         // is not compared: the two orders differing is the entire point.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var mismatched = await db.Database.SqlQueryRaw<string>(
             """
             SELECT t AS "Value" FROM (
@@ -521,23 +511,20 @@ public sealed class SnapshotsTests
     [Fact]
     public async Task Restore_leaves_realized_gains_matching_the_snapshot_not_later_sales()
     {
-        // Regression for mig 181, mechanism updated by mig 188. Originally
-        // realized_gains was neither captured nor rebuilt, so after a restore the
-        // realized-gains report still reflected the discarded post-snapshot sales
-        // even though the transactions themselves rolled back. Mig 181 fixed that
-        // by recomputing the whole ledger's derived investment state; mig 188
-        // captures realized_gains in the payload and restores it directly, because
-        // the recompute was the slow part of a restore on a real ledger and its only
-        // unique output was this table (it otherwise overwrote the holdings/lots the
-        // payload already carried).
+        // If realized_gains were neither captured nor rebuilt, the realized-gains
+        // report would still reflect the discarded post-snapshot sales after a
+        // restore even though the transactions themselves rolled back. Since mig
+        // 188 the payload captures realized_gains and the restore writes it back
+        // directly, rather than recomputing the whole ledger's derived investment
+        // state, whose only unique output is this table.
         //
-        // The guarantee asserted here is unchanged and mechanism-independent:
-        // after a restore, realized gains reflect the SNAPSHOT, not later sales.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // The guarantee asserted here is mechanism-independent: after a restore,
+        // realized gains reflect the SNAPSHOT, not later sales.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var broker = await ledger.AddInvestmentAccountAsync("Brokerage");
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task PostInv(object req) =>
@@ -550,7 +537,7 @@ public sealed class SnapshotsTests
         await PostInv(new CreateInvestmentTransactionRequest { BrokerageAccountId = broker.Id, Action = "buy", SecurityId = security, Shares = 10m, Price = 100m, PostedAt = new DateTime(2020, 1, 1, 12, 0, 0, DateTimeKind.Utc) });
         await PostInv(new CreateInvestmentTransactionRequest { BrokerageAccountId = broker.Id, Action = "sell", SecurityId = security, Shares = -5m, Price = 200m, PostedAt = new DateTime(2021, 1, 1, 12, 0, 0, DateTimeKind.Utc) });
 
-        var atSnapshot = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var atSnapshot = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
         Assert.Equal(500m, atSnapshot.TotalRealizedGain);
 
@@ -564,7 +551,7 @@ public sealed class SnapshotsTests
         // Sell the remaining half at three times the price (2022) → a SECOND, larger
         // gain (the realized total triples).
         await PostInv(new CreateInvestmentTransactionRequest { BrokerageAccountId = broker.Id, Action = "sell", SecurityId = security, Shares = -5m, Price = 300m, PostedAt = new DateTime(2022, 1, 1, 12, 0, 0, DateTimeKind.Utc) });
-        var afterSecondSale = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var afterSecondSale = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
         Assert.Equal(1500m, afterSecondSale.TotalRealizedGain);
 
@@ -576,13 +563,13 @@ public sealed class SnapshotsTests
         // realized_gains must reflect ONLY the snapshot state (the first sale's gain)
         // — not the discarded second sale. Pre-mig-181 this read the two-sale total
         // (stale).
-        var afterRestore = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var afterRestore = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
         Assert.Equal(500m, afterRestore.TotalRealizedGain);
         Assert.Single(afterRestore.Rows);
 
         // And holdings are back to the unsold half at its original per-share cost.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var holding = await db.Holdings.AsNoTracking()
             .SingleAsync(h => h.AccountId == broker.HoldingsAccountId!.Value && h.SecurityId == security);
         Assert.Equal(5m, holding.Quantity);
@@ -592,11 +579,11 @@ public sealed class SnapshotsTests
     [Fact]
     public async Task Restore_round_trips_reconciliation_status()
     {
-        // Regression for mig 181. txn_leg_recon (ADR-0082 per-leg reconciliation)
-        // has ON DELETE CASCADE off txn_legs, so restore's `DELETE FROM txn_legs`
-        // wiped it; it was not in the payload, so it could not come back. Recon is
-        // user judgment (not derivable), so it must round-trip through the snapshot.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // Mig 181. txn_leg_recon (ADR-0082 per-leg reconciliation) has ON DELETE
+        // CASCADE off txn_legs, so restore's `DELETE FROM txn_legs` wipes it, and
+        // only the payload can bring it back. Recon is user judgment (not
+        // derivable), so it must round-trip through the snapshot.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("Groceries");
         await ledger.AddTransactionPairAsync(
@@ -605,7 +592,7 @@ public sealed class SnapshotsTests
 
         // Mark the bank leg reconciled (cleared).
         Guid legId;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             legId = await db.TxnLegs.AsNoTracking()
                 .Where(l => l.LedgerId == ledger.LedgerId && l.AccountId == bank.Id)
@@ -622,7 +609,7 @@ public sealed class SnapshotsTests
             await db.SaveChangesAsync();
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Snapshot the reconciled state.
@@ -633,7 +620,7 @@ public sealed class SnapshotsTests
         var snap = (await createResp.Content.ReadFromJsonAsync<CreateSnapshotResponse>())!.Snapshot!;
 
         // Un-reconcile (simulate a later change to be rolled back).
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnLegRecon.Where(r => r.LegId == legId).ExecuteDeleteAsync();
         }
@@ -643,11 +630,11 @@ public sealed class SnapshotsTests
             $"/api/ledgers/{ledger.LedgerId}/snapshots/{snap.Id}/restore", content: null);
         Assert.Equal(HttpStatusCode.NoContent, restoreResp.StatusCode);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var recon = await db.TxnLegRecon.AsNoTracking()
                 .SingleOrDefaultAsync(r => r.LegId == legId && r.LedgerId == ledger.LedgerId);
-            Assert.NotNull(recon);                       // pre-fix: null (cascade-wiped, not captured)
+            Assert.NotNull(recon);                       // null if cascade-wiped and not captured
             Assert.Equal("cleared", recon!.Status);
         }
     }
@@ -655,45 +642,64 @@ public sealed class SnapshotsTests
     [Fact]
     public async Task Restore_round_trips_a_ledger_with_recurring_linked_transactions()
     {
-        // Regression for mig 183 — the shape, found on a real ledger, that broke
-        // restore. A committed occurrence header carries recurring_transaction_id.
+        // Mig 183. A committed occurrence header carries recurring_transaction_id.
         // fn_ledger_snapshot_restore deletes recurring_transactions while that
-        // header still exists; the composite FK (recurring_transaction_id,
-        // ledger_id) -> recurring_transactions was ON DELETE SET NULL with NO
-        // column list, so it tried to null BOTH columns — including the NOT NULL
-        // ledger_id — throwing 23502 and failing the whole restore. mig 183 makes
-        // it SET NULL (recurring_transaction_id) only. The prior round-trip tests
-        // passed because their fixtures had no recurring-linked header.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // header still exists; a composite FK (recurring_transaction_id,
+        // ledger_id) -> recurring_transactions declared ON DELETE SET NULL with NO
+        // column list would null BOTH columns — including the NOT NULL ledger_id —
+        // throwing 23502 and failing the whole restore. mig 183 makes it SET NULL
+        // (recurring_transaction_id) only. A round-trip fixture without a
+        // recurring-linked header cannot reach this, hence this test.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("Account A");
+        var category = await ledger.AddCategoryAsync("Category A");
 
         var templateId = Guid.NewGuid();
         var seriesId = Guid.NewGuid();
         var occurrenceId = Guid.NewGuid();
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
-            db.TxnHeaders.Add(new TxnHeaderRow
-            {
-                Id = templateId, LedgerId = ledger.LedgerId, Origin = "manual",
-                Payee = "Rent", PostedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),
-                IsRecurringTemplate = true,
-            });
+            // Both owned by the bank, the source of their one posting (mig 263), so the
+            // round trip below also carries the originating account.
+            var template = TxnHeaderRow.NewTemplate(templateId, ledger.LedgerId, bank.Id);
+            template.Payee = "Rent";
+            template.PostedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            template.TransactedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            db.TxnHeaders.Add(template);
             db.RecurringTransactions.Add(new RecurringTransactionRow
             {
                 Id = seriesId, LedgerId = ledger.LedgerId, ExternalId = $"rem-{ledger.LedgerId}",
                 Rrule = "FREQ=MONTHLY;BYMONTHDAY=1", TemplateHeaderId = templateId,
                 StartDate = new DateOnly(2026, 1, 1), IsActive = true, Origin = "manual",
+                SourceAccountId = bank.Id,
             });
             // The committed occurrence — a real transaction stamped with the series id.
-            db.TxnHeaders.Add(new TxnHeaderRow
+            var occurrence = TxnHeaderRow.NewOccurrence(occurrenceId, ledger.LedgerId, bank.Id);
+            occurrence.Payee = "Rent";
+            occurrence.PostedAt = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc);
+            occurrence.TransactedAt = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc);
+            occurrence.RecurringTransactionId = seriesId;
+            db.TxnHeaders.Add(occurrence);
+            foreach (var headerId in new[] { templateId, occurrenceId })
             {
-                Id = occurrenceId, LedgerId = ledger.LedgerId, Origin = "manual",
-                Payee = "Rent", PostedAt = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc),
-                IsRecurringTemplate = false, RecurringTransactionId = seriesId,
-            });
+                db.TxnLegs.AddRange(
+                    new TxnLegRow
+                    {
+                        Id = Guid.NewGuid(), HeaderId = headerId, LedgerId = ledger.LedgerId,
+                        AccountId = bank.Id, PostingIndex = 0, Amount = -700m,
+                    },
+                    new TxnLegRow
+                    {
+                        Id = Guid.NewGuid(), HeaderId = headerId, LedgerId = ledger.LedgerId,
+                        AccountId = category.Id, PostingIndex = 0, Amount = 700m,
+                    });
+            }
             await db.SaveChangesAsync();
         }
+        // Written past every writer: store the presentation as the upgrade's backfill does.
+        await ledger.RecomputeAllNotesAsync();
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var createResp = await client.PostAsJsonAsync(
@@ -707,12 +713,17 @@ public sealed class SnapshotsTests
         Assert.Equal(HttpStatusCode.NoContent, restoreResp.StatusCode);
 
         // The occurrence survived with its series link intact.
-        await using var db2 = _fixture.NewDbContext();
+        await using var db2 = Db.NewDbContext();
         var occ = await db2.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == occurrenceId && h.LedgerId == ledger.LedgerId);
         Assert.Equal(seriesId, occ.RecurringTransactionId);
         Assert.True(await db2.RecurringTransactions.AsNoTracking()
             .AnyAsync(r => r.Id == seriesId && r.LedgerId == ledger.LedgerId));
+        // And the stored owner of both (mig 263): the restore re-inserts accounts
+        // before headers, so the reference lands.
+        Assert.Equal(bank.Id, occ.OriginatingAccountId);
+        Assert.Equal(bank.Id, (await db2.TxnHeaders.AsNoTracking()
+            .SingleAsync(h => h.Id == templateId)).OriginatingAccountId);
     }
 
     [Fact]
@@ -722,14 +733,14 @@ public sealed class SnapshotsTests
         // one ledger could both see four and both insert — six snapshots, the oldest
         // hidden by the list's Take(5) and never evicted. Creates for a ledger now
         // take a per-ledger lock before the check (migration 247).
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         for (var i = 0; i < 40; i++)
             await ledger.AddTransactionPairAsync(
                 bank.Id, dining.Id, -1m - i, new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc).AddDays(i));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var responses = await Task.WhenAll(Enumerable.Range(0, 12).Select(i =>
@@ -740,7 +751,7 @@ public sealed class SnapshotsTests
             responses.Count(r => r.StatusCode == HttpStatusCode.OK));
         Assert.All(responses.Where(r => r.StatusCode != HttpStatusCode.OK),
             r => Assert.Equal(HttpStatusCode.UnprocessableEntity, r.StatusCode));
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Equal(LedgerSnapshotsRepository.SnapshotCap,
             await db.LedgerSnapshots.CountAsync(s => s.LedgerId == ledger.LedgerId));
     }
@@ -752,8 +763,8 @@ public sealed class SnapshotsTests
         // write landing between the headers and the legs gives a snapshot holding
         // legs without their header — unrestorable, and silent until needed. The
         // functions refuse rather than trust every caller to remember (mig 247).
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
         var snapshotId = Guid.NewGuid();
 
         var capture = await Assert.ThrowsAnyAsync<Npgsql.PostgresException>(() =>
@@ -774,9 +785,9 @@ public sealed class SnapshotsTests
         // the snapshot does, per table, or the restore rolls back. Driven directly,
         // because a restore that reaches it with a difference is a bug this exists
         // to catch, not a state a test can produce honestly.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await ledger.AddBankAccountAsync("checking");
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
 
         var ex = await Assert.ThrowsAnyAsync<Npgsql.PostgresException>(() =>
             db.Database.ExecuteSqlInterpolatedAsync(
@@ -794,10 +805,10 @@ public sealed class SnapshotsTests
         // FK violation and the restore failed; the snapshot was unrestorable for
         // as long as it existed. The restore now does what deleting the connection
         // did to the live row — unlinks it — and keeps everything else.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var connectionId = Guid.NewGuid();
         var accountId = Guid.NewGuid();
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             db.FeedConnections.Add(new FeedConnectionRow
             {
@@ -813,7 +824,7 @@ public sealed class SnapshotsTests
             await db.SaveChangesAsync();
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var createResp = await client.PostAsJsonAsync(
@@ -829,10 +840,301 @@ public sealed class SnapshotsTests
             $"/api/ledgers/{ledger.LedgerId}/snapshots/{snap.Id}/restore", content: null);
         Assert.Equal(HttpStatusCode.NoContent, restoreResp.StatusCode);
 
-        await using var db2 = _fixture.NewDbContext();
+        await using var db2 = Db.NewDbContext();
         var restored = await db2.Accounts.AsNoTracking().SingleAsync(a => a.Id == accountId);
         Assert.Null(restored.FeedConnectionId);
         Assert.Equal("linked checking", restored.Name);
+    }
+
+    // -----------------------------------------------------------------
+    // Runs pruned by audit retention after the snapshot was taken
+    // -----------------------------------------------------------------
+
+    // A real file import: two buys into an investment account. Synthesised.
+    private const string TwoBuysQif = """
+        !Type:Invst
+        D01/05/2024
+        NBuy
+        YGROWTH FUND(AAAA)
+        I100.00000
+        Q5.000
+        U500.00
+        T500.00
+        ^
+        D01/06/2024
+        NBuy
+        YGROWTH FUND(AAAA)
+        I110.00000
+        Q2.000
+        U220.00
+        T220.00
+        ^
+        """;
+
+    private const int RetentionDays = 180;
+
+    /// <summary>
+    /// One pass of the real retention prune, with the clock standing exactly one
+    /// retention window after <paramref name="cutoffUtc"/>: every run that started
+    /// before it is deleted, and a run that started at it is kept (the prune's
+    /// comparison is strict). The event knob is off so only the run log is in play.
+    /// </summary>
+    private async Task PruneRunsStartedBeforeAsync(DateTime cutoffUtc)
+    {
+        var opts = Microsoft.Extensions.Options.Options.Create(new Coffer.Api.Configuration.ApiOptions
+        {
+            ServiceConnectionString = Db.ServiceConnectionString,
+            AuditRetentionDays = RetentionDays,
+            EventRetentionDays = 0,
+        });
+        var clock = new Coffer.Api.Tests.Support.TestClock(
+            new DateTimeOffset(DateTime.SpecifyKind(cutoffUtc, DateTimeKind.Utc)).AddDays(RetentionDays));
+        await new Coffer.Api.Audit.AuditRetentionService(
+            PostgresFixture.ServiceFactoryFor(opts), opts,
+            NullLogger<Coffer.Api.Audit.AuditRetentionService>.Instance, clock).PruneAsync(default);
+    }
+
+    /// <summary>The prune as if the window had passed for every run written so far.</summary>
+    private Task PruneEveryRunAsync() => PruneRunsStartedBeforeAsync(DateTime.UtcNow.AddDays(1));
+
+    private async Task<DateTime> RunStartedAtAsync(Guid runId)
+    {
+        await using var db = Db.NewDbContext();
+        return (await db.LedgerOperations.AsNoTracking().SingleAsync(r => r.Id == runId)).StartedAt;
+    }
+
+    private async Task<bool> RunExistsAsync(Guid runId)
+    {
+        await using var db = Db.NewDbContext();
+        return await db.LedgerOperations.AsNoTracking().AnyAsync(r => r.Id == runId);
+    }
+
+    private static async Task AssertConsistencyHealthyAsync(HttpClient client, Guid ledgerId)
+    {
+        var check = await client.PostAsync($"/api/ledgers/{ledgerId}/balances/consistency", content: null);
+        var body = await check.Content.ReadAsStringAsync();
+        Assert.True(check.StatusCode == HttpStatusCode.OK, $"{(int)check.StatusCode}: {body}");
+        Assert.True((await check.Content.ReadFromJsonAsync<LedgerConsistencyReport>())!.Healthy, body);
+    }
+
+    [Fact]
+    public async Task Restore_unstamps_only_the_imported_rows_whose_import_run_was_pruned_after_the_snapshot()
+    {
+        // An import stamps every row it writes with its run (mig 221), and audit
+        // retention deletes runs past its window, unstamping the live rows (SET NULL).
+        // A snapshot taken before the prune still holds the stamp. The restore does
+        // what the prune did to the live row — clears the stamp — and keeps the row.
+        // A run the prune kept keeps its stamps, so its import can still be undone.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        async Task<(Guid Run, List<Guid> Headers)> ImportAsync(string qif)
+        {
+            var upload = new MultipartFormDataContent();
+            var file = new ByteArrayContent(System.Text.Encoding.UTF8.GetBytes(qif));
+            file.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+            upload.Add(file, "file", "export.qif");
+            upload.Add(new StringContent(brokerage.Id.ToString()), "accountId");
+            upload.Add(new StringContent("qif"), "providerAccountId");
+            var resp = await client.PostAsync($"/api/ledgers/{ledger.LedgerId}/ingest/qif/import", upload);
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+            var run = (await resp.Content.ReadFromJsonAsync<FileIngestImportResponse>())!.SyncRunId;
+            await using var db = Db.NewDbContext();
+            var headers = await db.TxnHeaders.AsNoTracking()
+                .Where(h => h.LedgerId == ledger.LedgerId && h.LedgerOperationId == run)
+                .Select(h => h.Id).ToListAsync();
+            Assert.Equal(2, headers.Count);
+            return (run, headers);
+        }
+
+        var older = await ImportAsync(TwoBuysQif);
+        var newer = await ImportAsync(TwoBuysQif.Replace("2024", "2025").Replace("500.00", "510.00"));
+
+        var createResp = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots", new CreateSnapshotRequest("after imports"));
+        Assert.Equal(HttpStatusCode.OK, createResp.StatusCode);
+        var snap = (await createResp.Content.ReadFromJsonAsync<CreateSnapshotResponse>())!.Snapshot!;
+
+        await PruneRunsStartedBeforeAsync(await RunStartedAtAsync(newer.Run));
+        Assert.False(await RunExistsAsync(older.Run), "the retention prune did not delete the older import's run");
+        Assert.True(await RunExistsAsync(newer.Run), "the retention prune deleted the newer import's run");
+
+        var restoreResp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots/{snap.Id}/restore", content: null);
+        Assert.True(restoreResp.StatusCode == HttpStatusCode.NoContent,
+            $"{(int)restoreResp.StatusCode}: {await restoreResp.Content.ReadAsStringAsync()}");
+
+        await using (var after = Db.NewDbContext())
+        {
+            var stamps = await after.TxnHeaders.AsNoTracking()
+                .Where(h => older.Headers.Contains(h.Id) || newer.Headers.Contains(h.Id))
+                .ToDictionaryAsync(h => h.Id, h => h.LedgerOperationId);
+            Assert.Equal(4, stamps.Count);
+            Assert.All(older.Headers, id => Assert.Null(stamps[id]));
+            Assert.All(newer.Headers, id => Assert.Equal(newer.Run, stamps[id]));
+        }
+
+        await AssertConsistencyHealthyAsync(client, ledger.LedgerId);
+
+        var undo = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ledger-operations/{newer.Run}/undo-import", content: null);
+        var undoBody = await undo.Content.ReadAsStringAsync();
+        Assert.True(undo.StatusCode == HttpStatusCode.OK, $"{(int)undo.StatusCode}: {undoBody}");
+        var undone = (await undo.Content.ReadFromJsonAsync<UndoImportResult>())!;
+        Assert.Equal(2, undone.Found);
+        Assert.Equal(2, undone.Deleted);
+
+        await using var final = Db.NewDbContext();
+        var left = await final.TxnHeaders.AsNoTracking()
+            .Where(h => older.Headers.Contains(h.Id) || newer.Headers.Contains(h.Id))
+            .Select(h => h.Id).ToListAsync();
+        Assert.Equal(older.Headers.Order(), left.Order());
+    }
+
+    [Fact]
+    public async Task Restore_drops_only_the_promotions_whose_sync_run_was_pruned_after_the_snapshot()
+    {
+        // A promotion (pending -> cleared) belongs to the sync run that saw it clear,
+        // and is deleted with that run (CASCADE) when audit retention prunes it. A
+        // snapshot taken before the prune still holds the promotion. The restore does
+        // what the prune did to the live row — drops it — and keeps the transaction.
+        // A promotion whose run the prune kept is restored as it was.
+        //
+        // The rows' own stamps are pruned BEFORE the snapshot (the first prune), so
+        // the snapshot holds unstamped headers and the promotions are the only
+        // references to runs: this fact is about the promotion's FKs alone.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var keys = Db.NewLedgerKeyService();
+        await using (var seed = Db.NewDbContext())
+        {
+            var row = await seed.Ledgers.SingleAsync(l => l.Id == ledger.LedgerId);
+            row.WrappedLek = keys.CreateWrappedLek();
+            row.LekKekId = keys.CurrentKekId;
+            row.LekCreatedAt = DateTime.UtcNow;
+            await seed.SaveChangesAsync();
+        }
+
+        // Two holds, each clearing at a different amount in a later sync of its own.
+        var firstAmount = "-42.50";
+        var firstPending = true;
+        var secondAmount = "-18.00";
+        var secondPending = true;
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
+            .WithService<Coffer.Api.Sync.SimpleFin.SimpleFinClient>(_ => StubSimpleFin(() => $$"""
+                {"connections":[
+                  {"conn_id":"c-P","name":"Bank P","org_id":"bankp","sfin_url":"https://sfin/bankp"}
+                ],"errlist":[],"accounts":[
+                  {"id":"sf-p","conn_id":"c-P","name":"Checking","currency":"USD","balance":"100.00","transactions":[
+                    {"id":"pending-1","posted":1715000000,"amount":"{{firstAmount}}","payee":"Corner Cafe","description":"CORNER CAFE 0042","pending":{{(firstPending ? "true" : "false")}}},
+                    {"id":"pending-2","posted":1715100000,"amount":"{{secondAmount}}","payee":"Fuel Stop","description":"FUEL STOP 0007","pending":{{(secondPending ? "true" : "false")}}}
+                  ]}
+                ]}
+                """));
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var claimUrl = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("https://x/c"))
+            .Replace('+', '-').Replace('/', '_').TrimEnd('=');
+        var connection = (await (await client.PostAsJsonAsync(
+                $"/api/ledgers/{ledger.LedgerId}/feed-connections",
+                new CreateFeedConnectionRequest { SetupToken = claimUrl }))
+            .Content.ReadFromJsonAsync<FeedConnectionSummary>())!;
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var mapped = await client.SendAsync(new HttpRequestMessage(
+            HttpMethod.Patch, $"/api/ledgers/{ledger.LedgerId}/accounts/{bank.Id}/feed-mapping")
+        {
+            Content = JsonContent.Create(new PatchAccountFeedMappingRequest
+            {
+                FeedConnectionId = connection.Id,
+                SimpleFinAccountId = "sf-p",
+            }),
+        });
+        Assert.Equal(HttpStatusCode.NoContent, mapped.StatusCode);
+
+        async Task SyncAsync()
+        {
+            var resp = await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/feed-connections/{connection.Id}/sync", content: null);
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        }
+
+        // The feed row's external_id carries the provider's id as its suffix.
+        async Task<LedgerOperationPromotionRow> PromotionOfAsync(string providerId)
+        {
+            await using var db = Db.NewDbContext();
+            var header = await db.TxnHeaders.AsNoTracking()
+                .SingleAsync(h => h.LedgerId == ledger.LedgerId
+                    && h.ExternalId != null && h.ExternalId.EndsWith(providerId));
+            Assert.Null(header.LedgerOperationId);
+            return await db.LedgerOperationPromotions.AsNoTracking().SingleAsync(p => p.HeaderId == header.Id);
+        }
+
+        await SyncAsync();
+        await PruneEveryRunAsync();
+
+        firstPending = false;
+        firstAmount = "-45.00";
+        await SyncAsync();
+        var older = await PromotionOfAsync("pending-1");
+
+        secondPending = false;
+        secondAmount = "-20.00";
+        await SyncAsync();
+        var newer = await PromotionOfAsync("pending-2");
+        Assert.NotEqual(older.LedgerOperationId, newer.LedgerOperationId);
+
+        var createResp = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots", new CreateSnapshotRequest("after promotions"));
+        Assert.Equal(HttpStatusCode.OK, createResp.StatusCode);
+        var snap = (await createResp.Content.ReadFromJsonAsync<CreateSnapshotResponse>())!.Snapshot!;
+
+        await PruneRunsStartedBeforeAsync(await RunStartedAtAsync(newer.LedgerOperationId));
+        Assert.False(await RunExistsAsync(older.LedgerOperationId),
+            "the retention prune did not delete the older promoting run");
+        Assert.True(await RunExistsAsync(newer.LedgerOperationId),
+            "the retention prune deleted the newer promoting run");
+
+        var restoreResp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots/{snap.Id}/restore", content: null);
+        Assert.True(restoreResp.StatusCode == HttpStatusCode.NoContent,
+            $"{(int)restoreResp.StatusCode}: {await restoreResp.Content.ReadAsStringAsync()}");
+
+        await using (var after = Db.NewDbContext())
+        {
+            var kept = await after.LedgerOperationPromotions.AsNoTracking()
+                .SingleAsync(p => p.LedgerId == ledger.LedgerId);
+            Assert.Equal(
+                (newer.Id, newer.LedgerOperationId, newer.HeaderId, newer.WasAmount, newer.BecameAmount, newer.PromotedAt),
+                (kept.Id, kept.LedgerOperationId, kept.HeaderId, kept.WasAmount, kept.BecameAmount, kept.PromotedAt));
+
+            foreach (var (headerId, cleared) in new[] { (older.HeaderId, -45.00m), (newer.HeaderId, -20.00m) })
+            {
+                var header = await after.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == headerId);
+                Assert.False(header.IsPending);
+                var bankLeg = await after.TxnLegs.AsNoTracking()
+                    .SingleAsync(l => l.HeaderId == headerId && l.AccountId == bank.Id);
+                Assert.Equal(cleared, bankLeg.Amount);
+            }
+        }
+
+        await AssertConsistencyHealthyAsync(client, ledger.LedgerId);
+    }
+
+    private static Coffer.Api.Sync.SimpleFin.SimpleFinClient StubSimpleFin(Func<string> body)
+    {
+        const string accessUrl = "https://u:p@bridge.simplefin.org/simplefin/access/abc";
+        return new Coffer.Api.Sync.SimpleFin.SimpleFinClient(new HttpClient(new StubHandler(req =>
+            req.Method == HttpMethod.Post
+                ? new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(accessUrl) }
+                : new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(body()) })), TimeProvider.System);
+    }
+
+    private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> impl) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(impl(request));
     }
 
     // -----------------------------------------------------------------
@@ -842,9 +1144,9 @@ public sealed class SnapshotsTests
     [Fact]
     public async Task Manual_snapshot_at_cap_returns_422_snapshot_manual_at_cap()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Fill the pool with 5 manual snaps.
@@ -866,7 +1168,7 @@ public sealed class SnapshotsTests
             doc.RootElement.GetProperty("code").GetString());
 
         // Pool still 5.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var count = await db.LedgerSnapshots.AsNoTracking()
             .CountAsync(s => s.LedgerId == ledger.LedgerId);
         Assert.Equal(5, count);
@@ -875,7 +1177,7 @@ public sealed class SnapshotsTests
     [Fact]
     public async Task Auto_snapshot_at_cap_evicts_oldest_auto_then_inserts()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
         // Seed 5 auto-snaps via the repo directly (the HTTP endpoint
         // only creates kind=manual; auto-creation is the scheduler's
@@ -901,7 +1203,7 @@ public sealed class SnapshotsTests
             ledger.LedgerId, "auto", UserRow.SystemUserId, description: null);
         Assert.Equal(LedgerSnapshotsRepository.CreateOutcome.Created, sixthAuto.Outcome);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var rows = await db.LedgerSnapshots.AsNoTracking()
             .Where(s => s.LedgerId == ledger.LedgerId)
             .OrderBy(s => s.CreatedAt)
@@ -915,8 +1217,8 @@ public sealed class SnapshotsTests
     [Fact]
     public async Task Auto_snapshot_skips_when_pool_full_of_manual_snaps()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // 5 manual snaps fill the pool.
@@ -938,7 +1240,7 @@ public sealed class SnapshotsTests
             result.Outcome);
 
         // Pool unchanged.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var count = await db.LedgerSnapshots.AsNoTracking()
             .CountAsync(s => s.LedgerId == ledger.LedgerId);
         Assert.Equal(5, count);
@@ -947,8 +1249,8 @@ public sealed class SnapshotsTests
     [Fact]
     public async Task List_returns_at_most_cap_snapshots_newest_first()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         for (var i = 0; i < 3; i++)
@@ -978,8 +1280,8 @@ public sealed class SnapshotsTests
     [Fact]
     public async Task Restore_refuses_with_schema_version_mismatch_when_snapshot_is_stale()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var createResp = await client.PostAsJsonAsync(
@@ -992,7 +1294,7 @@ public sealed class SnapshotsTests
         // a backup taken on an older schema version (Phase 1 of
         // ADR-0037 refuses cross-version restore — forward-migration
         // is its own ADR).
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.LedgerSnapshots
                 .Where(s => s.Id == snap.Id)
@@ -1019,8 +1321,8 @@ public sealed class SnapshotsTests
         //
         // Both snapshots are created through the API, then one is forged stale
         // the same way the refusal test above does it.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var freshResp = await client.PostAsJsonAsync(
@@ -1041,7 +1343,7 @@ public sealed class SnapshotsTests
         Assert.True(fresh.Restorable);
         Assert.True(stale.Restorable);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.LedgerSnapshots
                 .Where(s => s.Id == stale.Id)
@@ -1075,10 +1377,10 @@ public sealed class SnapshotsTests
     [Fact]
     public async Task Restore_returns_snapshot_not_found_when_snapshot_belongs_to_another_ledger()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var aliceClient = await AuthedClientAsync(factory, alice);
 
         var aliceSnap = await aliceClient.PostAsJsonAsync(
@@ -1099,10 +1401,94 @@ public sealed class SnapshotsTests
     }
 
     [Fact]
+    public async Task A_snapshots_size_is_what_is_stored_and_the_create_response_and_the_list_agree()
+    {
+        // Enough repetitive rows for Postgres to compress the chunks it stores: a chunk under
+        // the TOAST threshold is kept as it is, and says nothing about compression.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var dining = await ledger.AddCategoryAsync("Dining");
+        for (var i = 0; i < 300; i++)
+        {
+            await ledger.AddTransactionPairAsync(
+                bank.Id, dining.Id, -(10m + i % 7),
+                new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc).AddDays(i % 200),
+                payee: $"the corner cafe, order number {i}, with the usual extra shot");
+        }
+
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var createResp = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots", new CreateSnapshotRequest("sized"));
+        Assert.Equal(HttpStatusCode.OK, createResp.StatusCode);
+        var created = (await createResp.Content.ReadFromJsonAsync<CreateSnapshotResponse>())!.Snapshot!;
+
+        var listed = (await client.GetFromJsonAsync<List<SnapshotSummaryDto>>(
+            $"/api/ledgers/{ledger.LedgerId}/snapshots"))!;
+        var fromList = Assert.Single(listed, s => s.Id == created.Id);
+
+        await using var db = Db.NewDbContext();
+        var capturedTextLength = await db.LedgerSnapshots.AsNoTracking()
+            .Where(s => s.Id == created.Id)
+            .Select(s => s.ContentSizeUncompressed)
+            .SingleAsync();
+        var storedInDb = await db.Database.SqlQueryRaw<long>(
+            """
+            SELECT COALESCE(sum(pg_column_size(content)), 0)::bigint AS "Value"
+              FROM ledger_snapshot_parts WHERE snapshot_id = {0}
+            """, created.Id).SingleAsync();
+
+        Assert.True(created.ContentSizeStored > 0);
+        Assert.Equal(created.ContentSizeStored, fromList.ContentSizeStored);
+        // The figure is the database's own measure of what it holds, not a second computation of it.
+        Assert.Equal(storedInDb, created.ContentSizeStored);
+        // And it is the compressed figure: well under the length of the JSON text captured.
+        Assert.True(created.ContentSizeStored < capturedTextLength,
+            $"stored {created.ContentSizeStored} B should be under the {capturedTextLength} B of JSON text");
+    }
+
+    [Fact]
+    public async Task Stored_size_covers_the_two_older_snapshot_formats()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+
+        // v1 (gzip bytes) and v2 (a jsonb value) predate the chunk table, so nothing new creates
+        // them; they are seeded directly, as the RLS tests seed theirs.
+        async Task<Guid> SeedAsync(byte[] content, string? contentJson)
+        {
+            await using var svc = Db.NewDbContext();
+            var snap = new LedgerSnapshotRow
+            {
+                Id = Guid.NewGuid(),
+                LedgerId = ledger.LedgerId,
+                CreatedAt = DateTime.UtcNow,
+                CreatedByUserId = ledger.UserId,
+                Kind = "manual",
+                SchemaVersion = "111_ledger_snapshots.sql",
+                Content = content,
+                ContentJson = contentJson,
+                ContentSizeUncompressed = 0,
+            };
+            svc.LedgerSnapshots.Add(snap);
+            await svc.SaveChangesAsync();
+            return snap.Id;
+        }
+
+        var v1 = await SeedAsync(new byte[1234], contentJson: null);
+        var v2 = await SeedAsync([], contentJson: """{"accounts":[{"id":1},{"id":2}]}""");
+
+        var sizes = await AutoSnapshotRepo().StoredSizesAsync(ledger.LedgerId);
+
+        Assert.Equal(1234, sizes[v1]);            // the gzip bytes themselves
+        Assert.True(sizes[v2] > 0);               // the jsonb value as stored
+    }
+
+    [Fact]
     public async Task Delete_removes_the_snapshot_and_is_idempotent()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var createResp = await client.PostAsJsonAsync(
@@ -1119,7 +1505,7 @@ public sealed class SnapshotsTests
             $"/api/ledgers/{ledger.LedgerId}/snapshots/{snap.Id}");
         Assert.Equal(HttpStatusCode.NoContent, del2.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var count = await db.LedgerSnapshots.AsNoTracking()
             .CountAsync(s => s.LedgerId == ledger.LedgerId);
         Assert.Equal(0, count);

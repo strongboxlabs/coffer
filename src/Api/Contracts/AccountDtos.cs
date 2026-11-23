@@ -10,18 +10,20 @@ namespace Coffer.Api.Contracts;
 /// SimpleFIN connection (slice 2c.2). The feed-mapping wizard filters
 /// these out so the user can't double-map a Coffer account to two
 /// SimpleFIN accounts.</param>
-/// <param name="NeedsReviewCount">Count of DISTINCT <c>txn_headers</c>
-/// rows touching this account where <c>needs_review = true</c>
-/// (slice 2c.2), excluding effectively-hidden and MERGED rows.
-/// Drives the sidebar review-dot per ADR-0021: present-vs-absent
-/// signal, not a number on the UI — though the dot's tooltip and
-/// aria-label do read the number, which is why it counts headers and
-/// not the per-leg view rows underneath (a split row counted once per
-/// posting). Merged rows are excluded because a merge stamps
-/// <c>is_merged_into</c> and deliberately leaves <c>needs_review</c>
-/// standing, so a folded-away duplicate otherwise kept the dot lit
-/// with nothing left in the register to review. Always 0 for
-/// categories + system rows.</param>
+/// <param name="NeedsReviewCount">How many of this account's register
+/// entries await review: the rows its register lists under
+/// <c>status=needs_review</c>, counted as that register counts them, the
+/// same number as its needs-review status count
+/// (<c>GET /transactions/status-counts</c>). An entry is what the register
+/// shows as one row (ADR-0108 D14): a split on its own account is one, and
+/// each of its lines on another account is one there, so one transaction
+/// can count more than once on an account it reaches by several lines.
+/// Hidden and merged rows never count; a merge and a delete clear the row's
+/// flag. Every account type is counted, categories included: the
+/// Uncategorized category counts the line an imported row carries until it
+/// is categorized, so a ledger-wide total sums the non-category accounts
+/// only, as the home screen's To review does. Drives the sidebar review
+/// mark (ADR-0021), whose tooltip and aria-label read the number.</param>
 /// <param name="HoldingsAccountId">For brokerage (investment) accounts:
 /// the id of the system-managed Holdings sibling sub-account that
 /// carries security positions per ADR-0019. Surfaced so the SPA can
@@ -81,7 +83,9 @@ public sealed class CreateAccountRequest
     /// <c>category</c>, and the parent must itself be a category in this
     /// ledger.</summary>
     public Guid? ParentId { get; init; }
-    /// <summary>ISO currency code; defaults to <c>USD</c> when null/blank.</summary>
+    /// <summary>ISO currency code; defaults to <c>USD</c> when null/blank. A real
+    /// account's must be one an account can take (ADR-0114 D15), else
+    /// <c>account-currency-invalid</c>; a category's is the reporting currency.</summary>
     public string? CurrencyCode { get; init; }
     public string? InstitutionName { get; init; }
     /// <summary>Free-form metadata (ADR-0050). Blank → null.</summary>
@@ -90,7 +94,10 @@ public sealed class CreateAccountRequest
     public string? AccountUrl { get; init; }
     public string? Notes { get; init; }
     public bool IsActive { get; init; } = true;
-    /// <summary>Starting balance (ADR-0050). Must be 0 for categories (DB CHECK).</summary>
+    /// <summary>Starting balance (ADR-0050), in <see cref="CurrencyCode"/> and at its places
+    /// (ADR-0114 D15): a figure with more places is refused with
+    /// <c>amount-places-exceed-currency</c>, <c>field</c> <c>openingBalance</c>. Must be 0
+    /// for categories (DB CHECK).</summary>
     public decimal OpeningBalance { get; init; }
     /// <summary>The account's "Start Date" — the as-of date of the opening
     /// balance (mig 127). Optional.</summary>
@@ -109,6 +116,14 @@ public sealed class CreateAccountRequest
 /// <see cref="OriginalPrincipal"/> &gt; 0, <see cref="AnnualInterestRate"/> ≥ 0,
 /// <see cref="PaymentCount"/> &gt; 0, <see cref="PaymentsPerYear"/> &gt; 0,
 /// <see cref="Points"/> ≥ 0.
+/// <para>The money terms, <see cref="OriginalPrincipal"/>, <see cref="EscrowAmount"/> and
+/// <see cref="FixedPayment"/>, are in the loan account's currency and at its places
+/// (ADR-0114 D15): a figure with more places is refused with
+/// <c>amount-places-exceed-currency</c>, its <c>field</c> naming the term
+/// (<c>loanTerms.originalPrincipal</c>, <c>loanTerms.escrowAmount</c>,
+/// <c>loanTerms.fixedPayment</c>), and on an edit a term resent equal to its stored value
+/// passes. Escrow takes the loan's currency, whatever the escrow account's. The rate,
+/// the points and the counts are not money.</para>
 /// </summary>
 public sealed class LoanTermsDto
 {
@@ -127,7 +142,9 @@ public sealed class LoanTermsDto
     /// this ledger when set.</summary>
     public Guid? InterestAccountId { get; init; }
     /// <summary>Account/category the escrow portion posts to. Must be an account
-    /// in this ledger when set.</summary>
+    /// in this ledger when set. A real account in another currency than the loan's
+    /// cannot be the escrow of a managed payment (<c>payment-reminder-currency-mismatch</c>,
+    /// ADR-0114 D13); a category mirrors as usual.</summary>
     public Guid? EscrowAccountId { get; init; }
     /// <summary>TRUE = derive the fixed payment via amortization; FALSE = use
     /// <see cref="FixedPayment"/>.</summary>
@@ -151,6 +168,23 @@ public sealed class UpdateAccountRequest
     // editor sends the full current value of each field it manages, so it
     // clears by sending "" rather than needing a per-field clear flag.
     public string? Name { get; init; }
+    /// <summary>
+    /// A new currency relabels (ADR-0114 D13, ADR-0050 D8): every stored figure on the
+    /// account, and on a brokerage's Holdings sibling, is kept and reads in the new
+    /// currency. The code must be one an account can take (ADR-0114 D15); resending the
+    /// stored code is not a change, so a code stored before that rule keeps working. A
+    /// change is refused, with nothing written, when a two-amount pair would end up in one
+    /// currency with magnitudes that differ (<c>relabel-pair-not-representable</c>:
+    /// <c>count</c> pairs, and <c>mergedInto</c>, each <see cref="RelabelMergedInto"/>, when
+    /// any of them is on a transaction merged into another), or when
+    /// stored figures carry more places than the new currency allows
+    /// (<c>relabel-places-exceed-currency</c>: <c>count</c> transactions with a leg that
+    /// does not fit, a transaction merged into another left out (ADR-0114 D15), and
+    /// <c>accountFigures</c> naming <c>opening_balance</c> and
+    /// <c>loan_terms</c> when those do not). The response
+    /// (<see cref="UpdateAccountResponse"/>) says how many mirrored pairs now carry two
+    /// amounts.
+    /// </summary>
     public string? CurrencyCode { get; init; }
     public string? InstitutionName { get; init; }
     public string? AccountNumber { get; init; }
@@ -162,7 +196,10 @@ public sealed class UpdateAccountRequest
     /// rejected on non-category accounts.</summary>
     public string? CategoryKind { get; init; }
     /// <summary>Starting balance (null = unchanged). Editing it on an account
-    /// with history retroactively shifts its running balance (ADR-0050).</summary>
+    /// with history retroactively shifts its running balance (ADR-0050). Checked at the
+    /// places of the currency the edit leaves the account in (ADR-0114 D15): a figure
+    /// with more is refused with <c>amount-places-exceed-currency</c>, <c>field</c>
+    /// <c>openingBalance</c>, and one resent equal to the stored balance passes.</summary>
     public decimal? OpeningBalance { get; init; }
     /// <summary>Start date (null = unchanged). Use <see cref="ClearOpenedOn"/> to
     /// set it back to null.</summary>
@@ -177,6 +214,39 @@ public sealed class UpdateAccountRequest
     /// | "other". null = unchanged; "" clears (→ null).</summary>
     public string? TaxStatus { get; init; }
 }
+
+/// <summary>
+/// Response for <c>PATCH /api/ledgers/{ledgerId}/accounts/{accountId}</c> (ADR-0050). A
+/// currency change relabels (ADR-0114 D13), and this says what it did to the pairs.
+/// </summary>
+/// <param name="BecameTwoAmount">How many mirrored pairs the edit left across currencies,
+/// so each now carries two amounts, equal in magnitude and opposite in sign: transfers
+/// between this account (or its Holdings sibling) and an account in the old currency.
+/// Zero when the currency did not change.</param>
+public sealed record UpdateAccountResponse(int BecameTwoAmount);
+
+/// <summary>
+/// One entry of a <c>relabel-pair-not-representable</c> refusal's <c>mergedInto</c>
+/// (ADR-0114 D13, decided by the owner, 2026-11-18): a transaction that a refused pair's
+/// transaction was merged into. The merged row is in no register; this one is, so the
+/// refusal links to it. Followed to the end of a chain: a transaction since merged into
+/// another names the row a register shows (settled by Claude, 2026-11-18).
+/// </summary>
+/// <param name="HeaderId">The transaction to open.</param>
+/// <param name="AccountId">The account whose register opens at it: the account the
+/// transaction was entered from.</param>
+/// <param name="Account">That account's name.</param>
+/// <param name="Date">The transaction's posted date.</param>
+/// <param name="Payee">Its payee, or null.</param>
+/// <param name="Hidden">Whether it is hidden, so its register shows it only in the Hidden
+/// view (ADR-0072 D1).</param>
+public sealed record RelabelMergedInto(
+    Guid HeaderId,
+    Guid AccountId,
+    string Account,
+    DateOnly Date,
+    string? Payee,
+    bool Hidden);
 
 /// <summary>
 /// Full editable shape of one account (ADR-0050), returned by
@@ -234,6 +304,14 @@ public sealed record SetupPaymentReminderRequest(Guid SourceAccountId, DateOnly 
 /// </summary>
 public sealed class LoanPaymentPreviewRequest
 {
+    /// <summary>The loan account's currency, as the editor's Currency field holds it
+    /// (ADR-0114 D15): the payment rounds up to one of its minor units, and its split
+    /// rounds at its places. Required: a missing code, or one that is not three
+    /// characters once trimmed, is refused with <c>account-currency-invalid</c>, never
+    /// defaulted. Any other three-character code previews at the places <c>CurrencyMinorUnits.PlacesOf</c> gives
+    /// it, so a code an account kept from before the rule previews at 2 places, as the
+    /// account keeps working (ADR-0114 D15).</summary>
+    public string? CurrencyCode { get; init; }
     public decimal OriginalPrincipal { get; init; }
     public decimal AnnualInterestRate { get; init; }
     public int PaymentCount { get; init; }

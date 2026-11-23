@@ -29,11 +29,12 @@ namespace Coffer.Api.Tests.Integration.Backup;
 /// test resets it first (ApiCollection runs sequentially).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class AdminBackupsEndpointsTests
+public sealed class AdminBackupsEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AdminBackupsEndpointsTests(PostgresFixture fixture) => _fixture = fixture;
+    public AdminBackupsEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     // Dev-auth is stamped admin (ADR-0060 ③a), so the default factory's client
     // is an admin client — the simplest way to reach the gated routes.
@@ -47,15 +48,9 @@ public sealed class AdminBackupsEndpointsTests
         return client;
     }
 
-    private async Task ResetBackupRowAsync()
-    {
-        await using var db = _fixture.NewDbContext();   // service role
-        await db.Database.ExecuteSqlRawAsync("DELETE FROM global_scheduled_jobs;");
-    }
-
     private async Task PromoteToAdminAsync(SyntheticLedger ledger)
     {
-        await using var db = _fixture.NewDbContext();   // only the service role may set is_admin
+        await using var db = Db.NewDbContext();   // only the service role may set is_admin
         await db.Database.ExecuteSqlRawAsync(
             "UPDATE users SET is_admin = true WHERE id = {0}", ledger.UserId);
     }
@@ -69,8 +64,8 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Non_admin_cookie_is_forbidden()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);   // not an admin
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);   // not an admin
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await CookieClientAsync(factory, alice);
 
         var resp = await client.GetAsync("/api/admin/backups");
@@ -80,7 +75,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Anonymous_is_unauthorized()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
 
         var resp = await client.GetAsync("/api/admin/backups");
@@ -90,10 +85,9 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Admin_cookie_can_list()
     {
-        await ResetBackupRowAsync();
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
         await PromoteToAdminAsync(alice);          // real cookie + is_admin claim path
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await CookieClientAsync(factory, alice);
 
         var resp = await client.GetAsync("/api/admin/backups");
@@ -107,8 +101,8 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Passphrase_reveal_is_admin_gated()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);   // not an admin
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);   // not an admin
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await CookieClientAsync(factory, alice);
 
         Assert.Equal(HttpStatusCode.Forbidden,
@@ -125,8 +119,7 @@ public sealed class AdminBackupsEndpointsTests
     {
         // Fail early rather than making the operator tap their authenticator only to
         // be told there was nothing to show.
-        await ResetBackupRowAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         var resp = await client.PostAsync("/api/admin/backups/passphrase/reveal/begin", null);
@@ -138,8 +131,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Passphrase_reveal_needs_an_assertion_and_is_not_reachable_by_GET()
     {
-        await ResetBackupRowAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
         await client.PutAsJsonAsync("/api/admin/backups/passphrase",
             new SetBackupPassphraseRequest("correct-horse"));
@@ -162,18 +154,17 @@ public sealed class AdminBackupsEndpointsTests
         // The two step-ups have separate flows so a challenge is good for exactly the
         // ceremony it was minted for — even though cross-redemption between two admin
         // step-ups would gain an attacker nothing.
-        await ResetBackupRowAsync();
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
         await PromoteToAdminAsync(alice);
         var credential = await alice.AddCredentialAsync();
 
-        var challenges = new ChallengeStore(_fixture.NewServiceFactory(), TimeProvider.System);
+        var challenges = new ChallengeStore(Db.NewServiceFactory(), TimeProvider.System);
         var masterKeyChallenge = await challenges.SaveAsync(
             ChallengeStore.MasterKeyRevealFlow, alice.UserId,
             new AssertionOptions { Challenge = new byte[32] }.ToJson(),
             null, TimeSpan.FromMinutes(2));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await CookieClientAsync(factory, alice);
         await client.PutAsJsonAsync("/api/admin/backups/passphrase",
             new SetBackupPassphraseRequest("correct-horse"));
@@ -204,8 +195,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Set_passphrase_too_short_is_422()
     {
-        await ResetBackupRowAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         var resp = await client.PutAsJsonAsync(
@@ -217,8 +207,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Set_passphrase_then_schedule_reports_configured()
     {
-        await ResetBackupRowAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         var set = await client.PutAsJsonAsync(
@@ -235,8 +224,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Create_without_passphrase_is_422()
     {
-        await ResetBackupRowAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         // No passphrase configured → rejected BEFORE any pg_dump runs.
@@ -248,8 +236,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Enable_schedule_without_passphrase_is_422()
     {
-        await ResetBackupRowAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         var resp = await client.PutAsJsonAsync(
@@ -262,8 +249,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Enable_schedule_with_passphrase_succeeds()
     {
-        await ResetBackupRowAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         await client.PutAsJsonAsync(
@@ -283,8 +269,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Schedule_rejects_out_of_range_time()
     {
-        await ResetBackupRowAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         var resp = await client.PutAsJsonAsync(
@@ -297,7 +282,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Download_unknown_id_is_404()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         var resp = await client.GetAsync("/api/admin/backups/coffer-20260623T031500000Z-0a1b2c3d");
@@ -307,7 +292,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Pin_unknown_id_is_404()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         // Valid id shape but no such artifact on disk → 404 (no orphan pin).
@@ -319,7 +304,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Retention_roundtrips_via_get_and_put()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         var put = await client.PutAsJsonAsync(
@@ -338,7 +323,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Retention_out_of_range_is_422()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         var resp = await client.PutAsJsonAsync(
@@ -351,7 +336,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Retention_must_keep_at_least_one_daily_backup()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         // 0/0/0 deleted every new backup right after writing it, and said it worked.
@@ -377,8 +362,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Create_is_accepted_at_once_and_its_outcome_is_read_by_polling_the_run()
     {
-        await ResetBackupRowAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
         await SetPassphraseAsync(client);
 
@@ -413,8 +397,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task A_second_backup_is_refused_while_one_is_running()
     {
-        await ResetBackupRowAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
         await SetPassphraseAsync(client);
         var coordinator = factory.Services.GetRequiredService<BackupRunCoordinator>();
@@ -429,7 +412,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task A_run_the_server_does_not_know_is_404()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         var resp = await client.GetAsync($"/api/admin/backups/runs/{Guid.NewGuid()}");
@@ -443,12 +426,10 @@ public sealed class AdminBackupsEndpointsTests
         // FU-064: an explicit delete is the one thing that lets the mirror remove a Drive copy
         // without waiting for retention. Wired here, not only in the repository: a mark that no
         // endpoint writes would leave the whole rule inert.
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
         var id = "coffer-20260101T000000000Z-0a0b0c0d";
-        var repo = new DriveSyncRepository(_fixture.NewServiceFactory());
-        await using (var db = _fixture.NewDbContext())
-            await db.Database.ExecuteSqlRawAsync("DELETE FROM drive_mirrored_backups;");
+        var repo = new DriveSyncRepository(Db.NewServiceFactory());
         await repo.RecordMirroredAsync([id]);
         Assert.False((await repo.GetMirroredAsync())[id]);
 
@@ -461,7 +442,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Validate_reports_compatible_for_this_installs_kek()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         // ApiFactory pins the host Master KEK to 32 zero bytes.
@@ -479,7 +460,7 @@ public sealed class AdminBackupsEndpointsTests
     [Fact]
     public async Task Validate_reports_incompatible_for_a_different_kek()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = AdminClient(factory);
 
         var archive = await MakeBackupHeaderAsync(

@@ -10,9 +10,9 @@ namespace Coffer.Api.Backup;
 /// </summary>
 /// <remarks>
 /// A push failure NEVER fails the backup: the local artifact is already safe, and the
-/// destination records its own last-sync error. But "the backup succeeded" is then the whole
-/// of what is reported, so a revoked Google token stops the off-site copies indefinitely and
-/// the only trace is a status line on a settings page. Each failure is now announced as
+/// destination records its own last-sync error. If "the backup succeeded" were then the whole
+/// of what is reported, a revoked Google token would stop the off-site copies indefinitely
+/// with a status line on a settings page as the only trace. So each failure is announced as
 /// <c>drive.push-failed</c>; <see cref="DriveSyncMonitor"/> escalates when it keeps being true.
 /// Its own class so that the behaviour can be tested without a pg_dump.
 /// </remarks>

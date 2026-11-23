@@ -34,7 +34,7 @@ public static class MasterKeyLoader
     // environment.
 
     /// <summary>Outcome of <see cref="Resolve"/> — which source supplied the key,
-    /// so the caller can log a deprecation, run the D3 gate, or hand off to the
+    /// so the caller can log a deprecation, run the ADR-0092 D3 gate, or hand off to the
     /// setup ceremony.</summary>
     public enum KeySource
     {
@@ -56,24 +56,21 @@ public static class MasterKeyLoader
     /// Resolve the master KEK per ADR-0092 D1: <b>the key file is the only source.</b>
     /// </summary>
     /// <remarks>
-    /// <para>It used to also honour a <c>COFFER_MASTER_KEK_BASE64</c> environment
-    /// variable, migrating it into the file on first boot (ADR-0092 D6) so installs
-    /// predating the file upgraded without an <c>.env</c> edit. That was scoped to one
-    /// release and is gone: an environment variable is readable via
+    /// <para>No environment variable is read. An environment variable is readable via
     /// <c>docker inspect</c>, <c>/proc/&lt;pid&gt;/environ</c>, child environments and
-    /// crash dumps, and keeping a second source alive meant a value in <c>.env</c> that
-    /// looked authoritative, was silently ignored once the file existed, and went stale
-    /// the moment anyone rotated.</para>
+    /// crash dumps, and a second source means a value in <c>.env</c> that looks
+    /// authoritative, is silently ignored once the file exists, and goes stale the
+    /// moment anyone rotates.</para>
     ///
     /// <para>Nothing needs to feed a key in on a fresh install: the caller mints one
     /// when the database holds no wrapped material (ADR-0092 D3). An install whose key
     /// only ever lived in <c>.env</c> is not stranded either — it refuses to boot and
     /// names both remedies: write that key to the key file (losing nothing), or
-    /// <c>--adopt-new-kek</c> to mint a fresh one and re-establish the three sealed
+    /// <c>--adopt-new-kek</c> to mint a fresh one and re-establish the sealed
     /// secrets.</para>
     ///
     /// <para>A malformed value in the file throws rather than falling through to "no
-    /// key configured", which D3 could otherwise resolve by minting a fresh key over
+    /// key configured", which ADR-0092 D3 could otherwise resolve by minting a fresh key over
     /// live wrapped material.</para>
     /// </remarks>
     /// <exception cref="FormatException">Stored value is not valid base64.</exception>

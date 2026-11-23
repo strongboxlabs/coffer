@@ -12,25 +12,25 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// Editing a transaction whose account has since been deactivated.
 /// </summary>
 /// <remarks>
-/// <para>The rule has been written down since PR #132: "new transactions and
-/// re-targeting PATCHes cannot land on accounts that have been deactivated.
-/// Editing other fields on existing legs whose account is already inactive is
-/// still allowed (historical preservation)."</para>
+/// <para>The rule: "new transactions and re-targeting PATCHes cannot land on
+/// accounts that have been deactivated. Editing other fields on existing legs
+/// whose account is already inactive is still allowed (historical
+/// preservation)."</para>
 ///
-/// <para>The implementation did the opposite of its own second sentence. The
-/// PATCH path validated every account in the payload and a memo edit resends
-/// the unchanged counterparty, so the validator saw an inactive account and
-/// refused — meaning deactivating an account FROZE its entire history and a
-/// typo in a ten-year-old memo became uncorrectable. It could not tell
-/// "re-targeting onto a deactivated account" from "leaving one where it
-/// already was", because it only ever saw the payload.</para>
+/// <para>A memo edit resends the unchanged counterparty, so a PATCH path that
+/// validates every account in the payload sees an inactive account and refuses —
+/// deactivating an account would FREEZE its entire history and a typo in a
+/// ten-year-old memo would become uncorrectable. A validator that sees only the
+/// payload cannot tell "re-targeting onto a deactivated account" from "leaving
+/// one where it already was".</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class InactiveAccountEditTests
+public sealed class InactiveAccountEditTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public InactiveAccountEditTests(PostgresFixture fixture) => _fixture = fixture;
+    public InactiveAccountEditTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static readonly DateTime May = new(2026, 5, 15, 12, 0, 0, DateTimeKind.Utc);
 
@@ -69,7 +69,7 @@ public sealed class InactiveAccountEditTests
 
     private static object PatchBody(Guid sourceAccountId, Guid counterpartyId, string memo) => new
     {
-        memo,
+        notes = new { side = sourceAccountId, memo },
         postings = new
         {
             sourceAccountId,
@@ -81,8 +81,8 @@ public sealed class InactiveAccountEditTests
     public async Task A_memo_edit_survives_the_counterparty_being_deactivated()
     {
         // THE ONE THIS EXISTS FOR, and the behaviour the rule always claimed.
-        var ledger0 = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger0 = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger0);
         var (ledger, headerId, bankId, retiredId, _) = await SeedAsync(client, ledger0);
 
@@ -92,9 +92,11 @@ public sealed class InactiveAccountEditTests
 
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
-        var header = await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == headerId);
-        Assert.Equal("corrected memo", header.Memo);
+        // The writing side's own memo, on its leg.
+        await using var db = Db.NewDbContext();
+        Assert.Equal("corrected memo", await db.TxnLegs.AsNoTracking()
+            .Where(l => l.HeaderId == headerId && l.AccountId == bankId)
+            .Select(l => l.LegMemo).SingleAsync());
     }
 
     [Fact]
@@ -105,8 +107,8 @@ public sealed class InactiveAccountEditTests
         // allow exactly what the gate exists to stop.
         // Start from the LIVE category so the move is genuinely onto the
         // retired one rather than a no-op.
-        var ledger0 = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger0 = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger0);
         var (ledger, headerId, bankId, retiredId, liveId) = await SeedAsync(client, ledger0);
 
@@ -131,8 +133,8 @@ public sealed class InactiveAccountEditTests
         // Only the picker enforced this, so MCP — or any caller that is not
         // the SPA — could move rows onto an account the user had retired,
         // which is the one direction the rule exists to prevent.
-        var ledger0 = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger0 = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger0);
         var (ledger, _, bankId, retiredId, _) = await SeedAsync(client, ledger0);
 
@@ -162,8 +164,8 @@ public sealed class InactiveAccountEditTests
     {
         // Deliberately not symmetric. Moving rows off a retired account is how
         // one is cleaned up; refusing it would strand them there forever.
-        var ledger0 = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger0 = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger0);
         var (ledger, _, _, retiredId, liveId) = await SeedAsync(client, ledger0);
 

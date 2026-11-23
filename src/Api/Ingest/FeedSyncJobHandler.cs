@@ -23,6 +23,13 @@ namespace Coffer.Api.Ingest;
 /// computed from a per-account watermark with a seven-day overlap, and errored accounts
 /// do not advance their watermark. So running it a second time changes nothing.
 /// </para>
+/// <para>
+/// A connection whose save is refused because another write held the ledger's write
+/// lock past the wait (<see cref="IngestFailureReason.LedgerBusy"/>) is a fault like a
+/// bank that did not answer: the run is degraded, not thrown, and nothing is lost. The
+/// refused run saved none of what it fetched and moved no watermark, so the next run
+/// fetches the same window again.
+/// </para>
 /// </remarks>
 public sealed class FeedSyncJobHandler : IScheduledJobHandler
 {

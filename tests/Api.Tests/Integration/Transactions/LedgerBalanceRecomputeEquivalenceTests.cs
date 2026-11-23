@@ -9,22 +9,19 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// </summary>
 /// <remarks>
 /// <para>
-/// This file used to compare <c>fn_recompute_balances_for_ledger</c> against a loop over
-/// <c>fn_recompute_balances_for_account</c>, calling the latter "the reference
-/// implementation". Migration 211 made that comparison a TAUTOLOGY on purpose: both are
-/// now thin persists over one <c>balance_walk</c>, so there is no second implementation
-/// left to disagree.
+/// <c>fn_recompute_balances_for_ledger</c> and <c>fn_recompute_balances_for_account</c>
+/// are both thin persists over one <c>balance_walk</c> (migration 211), so comparing
+/// them with each other is a tautology.
 /// </para>
 /// <para>
-/// Which is the point. A test that watches two copies of an algorithm agree makes the
-/// duplication permanent and only alarms after they drift — and migration 206 rewrote
-/// one copy while this test was the sole guard. So the assertion moved to the property
-/// that survives refactoring: what the WRITER stored equals what the READ-ONLY walk
-/// says, which is also exactly what the consistency checker compares. Both entry points
-/// are still exercised, so re-forking them would still be caught.
+/// A test that watches two copies of an algorithm agree makes the duplication
+/// permanent and only alarms after they drift. So the assertion is the property that
+/// survives refactoring: what the WRITER stored equals what the READ-ONLY walk says,
+/// which is also exactly what the consistency checker compares. Both entry points are
+/// exercised, so re-forking them would be caught.
 /// </para>
 /// <para>
-/// The fixture is unchanged and is the valuable part: a non-zero and per-account
+/// The fixture is the valuable part: a non-zero and per-account
 /// opening balance, an override that moves a header EARLIER so the running total must
 /// re-order, a hidden header and a merged-away one (both excluded), a multi-split
 /// touching one account twice on a single header, and an account with no legs at all.
@@ -32,11 +29,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class LedgerBalanceRecomputeEquivalenceTests
+public sealed class LedgerBalanceRecomputeEquivalenceTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public LedgerBalanceRecomputeEquivalenceTests(PostgresFixture fixture) => _fixture = fixture;
+    public LedgerBalanceRecomputeEquivalenceTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     /// <summary>
     /// Init-only properties (not positional parameters) so EF's
@@ -54,14 +52,14 @@ public sealed class LedgerBalanceRecomputeEquivalenceTests
     [Fact]
     public async Task Stored_balances_equal_what_the_walk_derives_by_either_route()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
         var checking = await ledger.AddBankAccountAsync("checking");
         var savings = await ledger.AddBankAccountAsync("savings");
         var groceries = await ledger.AddCategoryAsync("groceries");
         var rent = await ledger.AddCategoryAsync("rent");
-        // Deliberately unused: no leg ever references it. The old loop iterated it
-        // and produced zero rows; the new pass must also produce zero rows.
+        // Deliberately unused: no leg ever references it, so the pass must produce
+        // zero rows for it.
         await ledger.AddCategoryAsync("never-used");
 
         // Non-zero, and different per account: the running total starts from
@@ -134,7 +132,7 @@ public sealed class LedgerBalanceRecomputeEquivalenceTests
 
     private async Task SetOpeningBalanceAsync(Guid accountId, decimal openingBalance)
     {
-        await using var db = _fixture.NewServiceFactory().Create();
+        await using var db = Db.NewServiceFactory().Create();
         await db.Database.ExecuteSqlInterpolatedAsync(
             $"UPDATE accounts SET opening_balance = {openingBalance} WHERE id = {accountId}");
     }
@@ -145,7 +143,7 @@ public sealed class LedgerBalanceRecomputeEquivalenceTests
     /// </summary>
     private async Task<List<BalanceRow>> WalkAsync(Guid ledgerId)
     {
-        await using var db = _fixture.NewServiceFactory().Create();
+        await using var db = Db.NewServiceFactory().Create();
         return await db.Database
             .SqlQuery<BalanceRow>($@"
                 SELECT w.header_id     AS ""HeaderId"",
@@ -163,7 +161,7 @@ public sealed class LedgerBalanceRecomputeEquivalenceTests
     /// </summary>
     private async Task<List<BalanceRow>> RebuildAndReadAsync(Guid ledgerId, bool useSetBased)
     {
-        await using var db = _fixture.NewServiceFactory().Create();
+        await using var db = Db.NewServiceFactory().Create();
 
         await db.Database.ExecuteSqlInterpolatedAsync(
             $"DELETE FROM txn_header_account_balances WHERE ledger_id = {ledgerId}");

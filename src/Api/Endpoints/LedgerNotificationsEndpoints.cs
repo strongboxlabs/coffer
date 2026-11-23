@@ -59,6 +59,10 @@ public static class LedgerNotificationsEndpoints
         // for a week is being kept from the one fact the ledger most needs them to know.
         group.MapGet("/events", ListEventsAsync).AsLedgerRead();
 
+        // What is still wrong, one row per subject: the rows behind this ledger's count
+        // on the navigation indicator. Read-level for the same reason as /events.
+        group.MapGet("/outstanding", ListOutstandingAsync).AsLedgerRead();
+
         // CROSS-ledger, so it hangs off /api/ledgers rather than the group above —
         // the question it answers is "which of my ledgers needs me", which no
         // per-ledger route can be asked. No RequireLedgerAccess for the same reason:
@@ -226,7 +230,7 @@ public static class LedgerNotificationsEndpoints
 
     /// <summary>
     /// <c>GET /api/ledgers/{ledgerId}/notifications/events</c> — what has gone wrong on
-    /// this ledger recently. The in-app surface ADR-0096 D5 promised and never built.
+    /// this ledger recently. This is the in-app notification surface of ADR-0096 D5.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -255,7 +259,7 @@ public static class LedgerNotificationsEndpoints
     /// <para>
     /// Fetches exactly what it renders. The deployment panel asks for the server's default
     /// 50 and then renders <c>.slice(0, 20)</c>, throwing away 30 rows while offering no
-    /// way to reach row 51; copying that shape would import the bug.
+    /// way to reach row 51; copying that shape would copy that defect.
     /// </para>
     /// </remarks>
     private static async Task<IResult> ListEventsAsync(
@@ -348,11 +352,11 @@ public static class LedgerNotificationsEndpoints
     /// Which of the caller's ledgers has something outstanding, and how badly.
     /// </summary>
     /// <remarks>
-    /// <para>The question behind every navigation indicator. Until this existed a
-    /// problem was only visible if you were already looking at the screen that shows
-    /// it: the consistency verdict on Settings → General, notifications on Settings →
-    /// Notifications, both inside a ledger you had to have chosen first. So "which of
-    /// my ledgers needs me" had no answer anywhere.</para>
+    /// <para>The question behind every navigation indicator. Without it a problem is
+    /// only visible if you are already looking at the screen that shows it: the
+    /// consistency verdict on Settings → General, notifications on Settings →
+    /// Notifications, both inside a ledger you have to have chosen first. So "which of
+    /// my ledgers needs me" would have no answer anywhere.</para>
     ///
     /// <para><b>Sourced from outstanding NOTIFICATIONS, not the consistency
     /// verdict.</b> An indicator that lit only for drift would lie by omission the
@@ -394,87 +398,90 @@ public static class LedgerNotificationsEndpoints
 
         var visibleIds = visible.Select(l => l.Id).ToArray();
 
-        // Same floor as the panel: warning and above. Every enabled job records an
-        // `info` success on every run, so anything laxer would report "attention
-        // needed" for a ledger where nothing has gone wrong.
-        var wanted = NotificationSeverity.Ascending
-            .Where(sev => NotificationSeverity.MeetsFloor(sev, NotificationSeverity.Warning))
-            .ToArray();
-
-        // The newest problem per ledger / subject / severity. Severity is in the key
-        // rather than aggregated because the two cannot be picked apart afterwards:
-        // MAX(occurred_at) tells you WHEN, and it is the row AT that instant whose
-        // severity is the subject's current state.
-        var problems = await db.LedgerEvents.AsNoTracking()
-            .Where(e => visibleIds.Contains(e.LedgerId) && wanted.Contains(e.Severity))
-            // The same subject rule as EventSubjects.Of, written so the DATABASE can
-            // evaluate it: substring(event_key, 1, strpos(event_key, '.')). Spelled out
-            // here rather than called, because EF translates an expression tree and not
-            // a method body — a helper would either fail to translate or quietly
-            // evaluate on the client over every row in the table.
-            //
-            // EventSubjectTests runs both spellings over the same keys against a real
-            // Postgres and fails if they disagree. A comment asking the next reader to
-            // keep them in step would not.
-            .GroupBy(e => new
-            {
-                e.LedgerId,
-                Subject = e.EventKey.Substring(0, e.EventKey.IndexOf(".") + 1),
-                e.Severity,
-            })
-            .Select(g => new
-            {
-                g.Key.LedgerId,
-                g.Key.Subject,
-                g.Key.Severity,
-                OccurredAt = g.Max(e => e.OccurredAt),
-            })
-            .ToListAsync(cancellationToken)
+        // The shared outstanding-subjects query, so the count here is the number of
+        // rows a ledger's outstanding list shows.
+        var outstanding = await OutstandingSubjects.ListAsync(db, visibleIds, cancellationToken)
             .ConfigureAwait(false);
-
-        if (problems.Count == 0) return Results.Ok(Array.Empty<LedgerAttentionDto>());
-
-        // The newest all-clear per ledger / subject. Only the newest is needed: a
-        // subject is fine iff SOMETHING later than its last problem said so.
-        var clears = await db.LedgerEvents.AsNoTracking()
-            .Where(e => visibleIds.Contains(e.LedgerId)
-                        && e.Severity == NotificationSeverity.Info)
-            .GroupBy(e => new
-            {
-                e.LedgerId,
-                Subject = e.EventKey.Substring(0, e.EventKey.IndexOf(".") + 1),
-            })
-            .Select(g => new
-            {
-                g.Key.LedgerId,
-                g.Key.Subject,
-                OccurredAt = g.Max(e => e.OccurredAt),
-            })
-            .ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
-
-        var clearedAt = clears.ToDictionary(
-            c => (c.LedgerId, c.Subject), c => c.OccurredAt);
-
-        var outstanding = problems
-            .GroupBy(p => (p.LedgerId, p.Subject))
-            // Within a subject, the latest event is its current state.
-            .Select(g => g.OrderByDescending(p => p.OccurredAt).First())
-            .Where(p => !clearedAt.TryGetValue((p.LedgerId, p.Subject), out var cleared)
-                        || cleared <= p.OccurredAt)
-            .ToList();
 
         var result = outstanding
             .GroupBy(p => p.LedgerId)
             .Select(g => new LedgerAttentionDto(
                 g.Key,
-                // Highest wins, by the declared order rather than by string compare:
-                // "warning" sorts after "critical" alphabetically, which would invert
-                // the whole point of the indicator.
-                g.OrderByDescending(p => Array.IndexOf(NotificationSeverity.Ascending, p.Severity))
-                 .First().Severity,
+                // Highest wins, by the declared order rather than by string compare.
+                g.OrderByDescending(p => OutstandingSubjects.Rank(p.Severity)).First().Severity,
                 g.Count()))
             .OrderBy(a => a.LedgerId)
+            .ToList();
+
+        return Results.Ok(result);
+    }
+
+    /// <summary>
+    /// This ledger's outstanding problems, one row per subject.
+    /// </summary>
+    /// <remarks>
+    /// <para>The same outstanding-subjects query as <see cref="ListAttentionAsync"/>, for
+    /// one ledger, so its row count is the attention count and its highest severity the
+    /// attention severity. <c>/events</c> cannot serve this: its newest-N window lets a
+    /// chatty subject push an older unresolved one out. No limit: the rows are bounded
+    /// by subjects, not by history.</para>
+    /// <para>Each row adds its latest problem's topic, key and summary, and when it first
+    /// went wrong: the earliest problem after the subject's last all-clear.</para>
+    /// </remarks>
+    private static async Task<IResult> ListOutstandingAsync(
+        Guid ledgerId,
+        ICurrentUserAccessor currentUser,
+        LedgersRepository ledgers,
+        AppDbContext db,
+        CancellationToken cancellationToken)
+    {
+        var visible = await ledgers.GetVisibleByIdAsync(
+            currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
+        if (visible is null)
+            return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
+                "Ledger not found or not visible to this user.");
+
+        var subjects = await OutstandingSubjects.ListAsync(db, [ledgerId], cancellationToken)
+            .ConfigureAwait(false);
+        if (subjects.Count == 0) return Results.Ok(Array.Empty<OutstandingProblemDto>());
+
+        // The problems since each subject's last all-clear, in one read bounded below by
+        // the earliest of those all-clears; a subject that never cleared reads its whole
+        // retained history.
+        var names = subjects.Select(s => s.Subject).ToArray();
+        var query = db.LedgerEvents.AsNoTracking()
+            .Where(e => e.LedgerId == ledgerId && OutstandingSubjects.ProblemSeverities.Contains(e.Severity));
+        if (subjects.All(s => s.LastClearAt is not null))
+        {
+            var floor = subjects.Min(s => s.LastClearAt!.Value);
+            query = query.Where(e => e.OccurredAt > floor);
+        }
+        var rows = await query
+            .WithSubject()
+            .Where(e => names.Contains(e.Subject))
+            .Select(e => new { e.Subject, e.Severity, e.OccurredAt, e.Topic, e.EventKey, e.Summary })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var result = subjects
+            .Select(s =>
+            {
+                var unresolved = rows
+                    .Where(r => string.Equals(r.Subject, s.Subject, StringComparison.Ordinal)
+                                && (s.LastClearAt is not { } cleared || r.OccurredAt > cleared))
+                    .ToList();
+                // The row the subject's current state comes from: at its latest instant,
+                // with its latest severity.
+                var latest = unresolved
+                    .Where(r => r.OccurredAt == s.LatestAt)
+                    .OrderByDescending(r => string.Equals(r.Severity, s.Severity, StringComparison.Ordinal))
+                    .First();
+                return new OutstandingProblemDto(
+                    s.Subject, latest.Topic, latest.EventKey, s.Severity, latest.Summary,
+                    s.LatestAt, unresolved.Min(r => r.OccurredAt));
+            })
+            .OrderByDescending(p => OutstandingSubjects.Rank(p.Severity))
+            .ThenByDescending(p => p.LatestAt)
             .ToList();
 
         return Results.Ok(result);

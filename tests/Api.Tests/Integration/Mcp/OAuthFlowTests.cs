@@ -22,11 +22,12 @@ namespace Coffer.Api.Tests.Integration.Mcp;
 /// validation.)
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class OAuthFlowTests
+public sealed class OAuthFlowTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public OAuthFlowTests(PostgresFixture fixture) => _fixture = fixture;
+    public OAuthFlowTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private const string RedirectUri = "https://example.com/callback";
     // A syntactically valid S256 PKCE challenge (43-char base64url).
@@ -83,7 +84,7 @@ public sealed class OAuthFlowTests
     [Fact]
     public async Task Anonymous_authorize_for_a_valid_client_redirects_to_login()
     {
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled().WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled().WithoutDevAuth();
         await SeedClientAsync(factory, "test-client-login");
 
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
@@ -115,7 +116,7 @@ public sealed class OAuthFlowTests
         // MCP clients send a `resource` parameter (the MCP server URI). OpenIddict
         // rejects unknown resources (ID2190 invalid_target); we strip it, so the
         // request proceeds to login rather than erroring.
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled().WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled().WithoutDevAuth();
         await SeedClientAsync(factory, "test-client-resource");
 
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
@@ -139,7 +140,7 @@ public sealed class OAuthFlowTests
     [Fact]
     public async Task Authorize_for_an_unknown_client_is_rejected()
     {
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled().WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled().WithoutDevAuth();
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
         {
             AllowAutoRedirect = false,
@@ -162,9 +163,9 @@ public sealed class OAuthFlowTests
     {
         // ADR-0081 D4 — limit 2/min: registrations 1+2 are created, the 3rd is
         // rejected by the per-IP limiter (429) before it reaches the handler. The
-        // client cap is lifted so the count ceiling can't shadow the 429 in the
-        // shared test DB.
-        await using var factory = new ApiFactory(_fixture)
+        // client cap is lifted so the rate limiter is the only limit the third
+        // registration can meet.
+        await using var factory = new ApiFactory(Db)
             .WithMcpEnabled()
             .WithConfig("Api:Mcp:DcrRateLimitPerMinute", "2")
             .WithConfig("Api:Mcp:MaxDynamicClients", "1000");
@@ -189,7 +190,7 @@ public sealed class OAuthFlowTests
     [Fact]
     public async Task Dynamic_client_registration_creates_a_usable_client()
     {
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled().WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled().WithoutDevAuth();
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
         {
             AllowAutoRedirect = false,
@@ -235,7 +236,7 @@ public sealed class OAuthFlowTests
         // offline_access is permitted via the refresh-token grant alone.
         // RequireHttps=false so the session cookie (Secure by default) rides on the
         // plain-HTTP test server — otherwise /oauth/authorize never sees the session.
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled()
+        await using var factory = new ApiFactory(Db).WithMcpEnabled()
             .WithConfig("Api:Cookie:RequireHttps", "false");
         await SeedClientAsync(factory, "test-client-refresh");
 
@@ -252,7 +253,7 @@ public sealed class OAuthFlowTests
 
         // Consent + issue, as the browser does it: the GET finds no prior consent and
         // sends the user to the consent page with a single-use ticket; Allow posts the
-        // same request back WITH that ticket (2026-10-12 audit, M1). RFC 7636 example
+        // same request back WITH that ticket (ADR-0105 D5). RFC 7636 example
         // verifier ↔ the CodeChallenge constant.
         const string codeVerifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         var ticket = await ConsentTicketAsync(client, "test-client-refresh");
@@ -309,7 +310,7 @@ public sealed class OAuthFlowTests
     [Fact]
     public async Task Dynamic_client_registration_rejects_an_insecure_redirect_uri()
     {
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled().WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled().WithoutDevAuth();
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
         {
             HandleCookies = false,

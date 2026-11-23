@@ -12,9 +12,9 @@ namespace Coffer.Api.Endpoints;
 /// Payee suggestions for the register's payee-edit typeahead. One
 /// route, one shape: the SPA caches the list aggressively (TanStack
 /// Query staleTime ~30 s) and filters client-side. No prefix-search
-/// endpoint — for a personal-finance ledger this is a few hundred
-/// strings, which fits comfortably in memory and dodges per-keystroke
-/// roundtrips.
+/// endpoint — the design bound is one personal-finance ledger's distinct
+/// payees, a list of short strings that fits comfortably in memory and
+/// dodges per-keystroke roundtrips.
 /// </summary>
 public static class PayeesEndpoints
 {

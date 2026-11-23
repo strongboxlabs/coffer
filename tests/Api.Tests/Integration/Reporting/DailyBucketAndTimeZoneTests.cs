@@ -26,11 +26,12 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// way.</para>
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class DailyBucketAndTimeZoneTests
+public sealed class DailyBucketAndTimeZoneTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public DailyBucketAndTimeZoneTests(PostgresFixture fixture) => _fixture = fixture;
+    public DailyBucketAndTimeZoneTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     [Fact]
     public async Task The_session_timezone_is_UTC()
@@ -45,7 +46,7 @@ public sealed class DailyBucketAndTimeZoneTests
         // the same zone, spelled differently, as are "Z" and "+00". What
         // actually has to hold is that date-part extraction agrees with the
         // C# UTC convention, and zero offset is that property stated directly.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var offsetSeconds = await db.Database
             .SqlQuery<double>($"SELECT EXTRACT(timezone FROM now())::float8 AS \"Value\"")
             .SingleAsync();
@@ -61,7 +62,7 @@ public sealed class DailyBucketAndTimeZoneTests
         // 23:30 spend slides into the following day and the 00:15 one slides
         // back — so a passing assertion here is a real statement about the
         // session zone, not just about the GROUP BY.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var cat = await ledger.AddCategoryAsync("Groceries", "expense");
 
@@ -72,7 +73,7 @@ public sealed class DailyBucketAndTimeZoneTests
         await ledger.AddTransactionPairAsync(cat.Id, bank.Id, 40m,
             new DateTime(2026, 9, 11, 23, 30, 0, DateTimeKind.Utc));
 
-        var repo = new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System);
+        var repo = new ReportingRepository(Db.NewDbContext(), TimeProvider.System);
         var result = await repo.SummarizeAsync(new ReportSpec
         {
             LedgerId = ledger.LedgerId,
@@ -98,8 +99,8 @@ public sealed class DailyBucketAndTimeZoneTests
         // Those two never put the day in their SQL key, so honouring the request
         // would return MONTHLY buckets wearing daily labels — the failure mode
         // where every number is plausible and the axis is a lie.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var repo = new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var repo = new ReportingRepository(Db.NewDbContext(), TimeProvider.System);
 
         foreach (var dimension in new[] { ReportGroupBy.Account, ReportGroupBy.Payee })
         {
@@ -121,7 +122,7 @@ public sealed class DailyBucketAndTimeZoneTests
         // non-daily path leaked a real day into the grouping key, a month with
         // spending on two dates would split into two rows — so this is the
         // regression guard for the change that added Day, not a test of Month.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var cat = await ledger.AddCategoryAsync("Groceries", "expense");
 
@@ -130,7 +131,7 @@ public sealed class DailyBucketAndTimeZoneTests
         await ledger.AddTransactionPairAsync(cat.Id, bank.Id, 25m,
             new DateTime(2026, 9, 21, 12, 0, 0, DateTimeKind.Utc));
 
-        var repo = new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System);
+        var repo = new ReportingRepository(Db.NewDbContext(), TimeProvider.System);
         var result = await repo.SummarizeAsync(new ReportSpec
         {
             LedgerId = ledger.LedgerId,

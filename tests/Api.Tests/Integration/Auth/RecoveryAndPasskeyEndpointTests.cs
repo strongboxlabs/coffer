@@ -25,11 +25,12 @@ namespace Coffer.Api.Tests.Integration.Auth;
 /// code consumption, the rate limiter — without forging real ceremonies.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class RecoveryAndPasskeyEndpointTests
+public sealed class RecoveryAndPasskeyEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public RecoveryAndPasskeyEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public RecoveryAndPasskeyEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static byte[] RandomBytes(int length)
     {
@@ -92,7 +93,7 @@ public sealed class RecoveryAndPasskeyEndpointTests
     private async Task<IReadOnlyList<string>> SeedRecoveryCodesAsync(Guid userId)
     {
         var (plaintext, hashes) = RecoveryCodes.Generate();
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         foreach (var hash in hashes)
             db.RecoveryCodes.Add(new RecoveryCodeRow { Id = Guid.NewGuid(), UserId = userId, CodeHash = hash });
         await db.SaveChangesAsync();
@@ -107,13 +108,13 @@ public sealed class RecoveryAndPasskeyEndpointTests
         return client;
     }
 
-    /// <summary>register/begin with a tap from <paramref name="existingCredentialId"/> (audit, M2).</summary>
+    /// <summary>register/begin with a tap from <paramref name="existingCredentialId"/> (ADR-0105 D1).</summary>
     private static Task<HttpResponseMessage> RegisterBeginAsync(HttpClient client, byte[] existingCredentialId) =>
         StepUpTestHelper.SendWithStepUpAsync(client,
             new HttpRequestMessage(HttpMethod.Post, "/api/auth/register/begin"),
             StepUpActions.PasskeyAdd, existingCredentialId);
 
-    /// <summary>Delete passkey <paramref name="id"/> with a tap from <paramref name="tapWith"/> (audit, M2).</summary>
+    /// <summary>Delete passkey <paramref name="id"/> with a tap from <paramref name="tapWith"/> (ADR-0105 D1).</summary>
     private static Task<HttpResponseMessage> DeleteCredentialAsync(HttpClient client, Guid id, byte[] tapWith) =>
         StepUpTestHelper.SendWithStepUpAsync(client,
             new HttpRequestMessage(HttpMethod.Delete, $"/api/auth/credentials/{id}"),
@@ -121,7 +122,7 @@ public sealed class RecoveryAndPasskeyEndpointTests
 
     private async Task<int> UnusedCodeCountAsync(Guid userId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.RecoveryCodes.CountAsync(c => c.UserId == userId && c.UsedAt == null);
     }
 
@@ -129,7 +130,7 @@ public sealed class RecoveryAndPasskeyEndpointTests
     private async Task<byte[]> SeedCredentialAsync(Guid userId, string? rpId, string nickname)
     {
         var credId = RandomBytes(64);
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         db.WebAuthnCredentials.Add(new WebAuthnCredentialRow
         {
             Id = Guid.NewGuid(),
@@ -151,10 +152,10 @@ public sealed class RecoveryAndPasskeyEndpointTests
     [Fact]
     public async Task Recovery_login_with_a_valid_code_issues_a_cookie_and_consumes_only_that_code()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var codes = await SeedRecoveryCodesAsync(ledger.UserId);
 
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var resp = await client.PostAsJsonAsync("/api/auth/login/recovery",
@@ -175,10 +176,10 @@ public sealed class RecoveryAndPasskeyEndpointTests
     [Fact]
     public async Task Recovery_login_rejects_reuse_of_a_consumed_code()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var codes = await SeedRecoveryCodesAsync(ledger.UserId);
 
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var first = await client.PostAsJsonAsync("/api/auth/login/recovery",
@@ -193,10 +194,10 @@ public sealed class RecoveryAndPasskeyEndpointTests
     [Fact]
     public async Task Recovery_login_rejects_a_wrong_code_without_consuming_anything()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedRecoveryCodesAsync(ledger.UserId);
 
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var resp = await client.PostAsJsonAsync("/api/auth/login/recovery",
@@ -209,7 +210,7 @@ public sealed class RecoveryAndPasskeyEndpointTests
     [Fact]
     public async Task Recovery_login_rejects_an_unknown_username_with_401()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var resp = await client.PostAsJsonAsync("/api/auth/login/recovery",
@@ -221,9 +222,9 @@ public sealed class RecoveryAndPasskeyEndpointTests
     [Fact]
     public async Task Recovery_login_rejects_a_missing_code_with_422()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var resp = await client.PostAsJsonAsync("/api/auth/login/recovery",
@@ -239,7 +240,7 @@ public sealed class RecoveryAndPasskeyEndpointTests
     {
         // Limit of 2/min: requests 1+2 pass through to the handler (401 for an
         // unknown user), request 3 is rejected by the limiter (429).
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithConfig("Api:Auth:RecoveryRateLimitPerMinute", "2");
         using var client = factory.CreateClient();
 
@@ -265,10 +266,10 @@ public sealed class RecoveryAndPasskeyEndpointTests
     [Fact]
     public async Task Register_begin_persists_a_register_challenge_bound_to_the_user()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var existing = await ledger.AddCredentialAsync(nickname: "existing");
         var sub = StepUpTestHelper.AcceptAssertions(NewRegistrationSubstitute(RandomBytes(64)));
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth().WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth().WithService(_ => sub);
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await RegisterBeginAsync(client, existing.CredentialId);
@@ -277,7 +278,7 @@ public sealed class RecoveryAndPasskeyEndpointTests
         var challengeId = JsonDocument.Parse(await resp.Content.ReadAsStringAsync())
             .RootElement.GetProperty("challengeId").GetGuid();
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.PendingChallenges.AsNoTracking()
             .Where(c => c.Id == challengeId)
             .Select(c => new { c.Flow, c.UserId })
@@ -289,11 +290,11 @@ public sealed class RecoveryAndPasskeyEndpointTests
     [Fact]
     public async Task Register_complete_adds_a_passkey_that_then_appears_in_the_list()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var newCredentialId = RandomBytes(64);
         var existing = await ledger.AddCredentialAsync(nickname: "existing");
         var sub = StepUpTestHelper.AcceptAssertions(NewRegistrationSubstitute(newCredentialId));
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth().WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth().WithService(_ => sub);
         using var client = await AuthedClientAsync(factory, ledger);
 
         var begin = await RegisterBeginAsync(client, existing.CredentialId);
@@ -319,12 +320,12 @@ public sealed class RecoveryAndPasskeyEndpointTests
     {
         // Alice begins a register ceremony; Bob (different cookie) tries to
         // complete it. The user-bound challenge must reject Bob.
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var credId = RandomBytes(64);
         var alicesKey = await alice.AddCredentialAsync(nickname: "alice-key");
         var sub = StepUpTestHelper.AcceptAssertions(NewRegistrationSubstitute(credId));
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth().WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth().WithService(_ => sub);
 
         using var aliceClient = await AuthedClientAsync(factory, alice);
         var begin = await RegisterBeginAsync(aliceClient, alicesKey.CredentialId);
@@ -345,12 +346,12 @@ public sealed class RecoveryAndPasskeyEndpointTests
     [Fact]
     public async Task Credentials_list_is_scoped_to_the_current_user()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var aliceCred = await alice.AddCredentialAsync(nickname: "alice-key");
         await bob.AddCredentialAsync(nickname: "bob-key");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, alice);
 
         var list = await client.GetFromJsonAsync<List<CredentialSummary>>("/api/auth/credentials");
@@ -363,18 +364,18 @@ public sealed class RecoveryAndPasskeyEndpointTests
     [Fact]
     public async Task Delete_removes_one_of_several_passkeys()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var keep = await ledger.AddCredentialAsync(nickname: "keep");
         var drop = await ledger.AddCredentialAsync(nickname: "drop");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService(_ => StepUpTestHelper.AcceptingWebAuthn());
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await DeleteCredentialAsync(client, drop.Id, keep.CredentialId);
         Assert.Equal(HttpStatusCode.NoContent, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var remaining = await db.WebAuthnCredentials
             .Where(c => c.UserId == ledger.UserId).Select(c => c.Id).ToListAsync();
         Assert.Equal(new[] { keep.Id }, remaining);
@@ -383,10 +384,10 @@ public sealed class RecoveryAndPasskeyEndpointTests
     [Fact]
     public async Task Delete_refuses_to_remove_the_last_passkey()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var only = await ledger.AddCredentialAsync(nickname: "only");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService(_ => StepUpTestHelper.AcceptingWebAuthn());
         using var client = await AuthedClientAsync(factory, ledger);
 
@@ -395,19 +396,19 @@ public sealed class RecoveryAndPasskeyEndpointTests
         var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
         Assert.Equal("credential-last-remaining", doc.RootElement.GetProperty("code").GetString());
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.True(await db.WebAuthnCredentials.AnyAsync(c => c.Id == only.Id));
     }
 
     [Fact]
     public async Task Delete_of_another_users_credential_reports_not_found()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var aliceCred = await alice.AddCredentialAsync(nickname: "alice-only");
         var bobCred = await bob.AddCredentialAsync(nickname: "bob-only");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService(_ => StepUpTestHelper.AcceptingWebAuthn());
         using var client = await AuthedClientAsync(factory, alice);
 
@@ -417,7 +418,7 @@ public sealed class RecoveryAndPasskeyEndpointTests
         Assert.Equal("credential-not-found", doc.RootElement.GetProperty("code").GetString());
 
         // Bob's credential untouched.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.True(await db.WebAuthnCredentials.AnyAsync(c => c.Id == bobCred.Id));
     }
 
@@ -428,7 +429,7 @@ public sealed class RecoveryAndPasskeyEndpointTests
         // can't enrol twice for one account); one left over from a PREVIOUS RP
         // (domain rename / ADR-0061 restore) must NOT be — else the same
         // authenticator wrongly refuses re-enrolment. Test RpId is "localhost".
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var currentRpCred = await SeedCredentialAsync(ledger.UserId, "localhost", "current-rp");
         var staleRpCred = await SeedCredentialAsync(ledger.UserId, "old.example.com", "stale-rp");
 
@@ -440,7 +441,7 @@ public sealed class RecoveryAndPasskeyEndpointTests
            .Returns(_ => BuildFakeCreateOptions());
         StepUpTestHelper.AcceptAssertions(sub);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth().WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth().WithService(_ => sub);
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await RegisterBeginAsync(client, currentRpCred);
@@ -458,25 +459,25 @@ public sealed class RecoveryAndPasskeyEndpointTests
         // recovery codes) — this is what lets a user clear a now-dead passkey
         // (e.g. left from a previous RP) without locking themselves out.
         // Contrast Delete_refuses_to_remove_the_last_passkey (no recovery codes).
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var only = await ledger.AddCredentialAsync(nickname: "only");
         await SeedRecoveryCodesAsync(ledger.UserId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService(_ => StepUpTestHelper.AcceptingWebAuthn());
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await DeleteCredentialAsync(client, only.Id, only.CredentialId);
         Assert.Equal(HttpStatusCode.NoContent, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.False(await db.WebAuthnCredentials.AnyAsync(c => c.Id == only.Id));
     }
 
     [Fact]
     public async Task Account_endpoints_require_authentication()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = factory.CreateClient(); // no cookie
 
         var list = await client.GetAsync("/api/auth/credentials");
@@ -496,17 +497,17 @@ public sealed class RecoveryAndPasskeyEndpointTests
     [Fact]
     public async Task Recovery_codes_status_reports_remaining_count()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedRecoveryCodesAsync(ledger.UserId);
         // Consume one directly so remaining != total.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var one = await db.RecoveryCodes.FirstAsync(c => c.UserId == ledger.UserId);
             await db.RecoveryCodes.Where(c => c.Id == one.Id)
                 .ExecuteUpdateAsync(s => s.SetProperty(c => c.UsedAt, _ => (DateTime?)DateTime.UtcNow));
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var status = await client.GetFromJsonAsync<RecoveryCodesStatusResponse>("/api/auth/recovery-codes");
@@ -518,10 +519,10 @@ public sealed class RecoveryAndPasskeyEndpointTests
     [Fact]
     public async Task Regenerate_replaces_the_set_and_invalidates_old_codes()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var oldCodes = await SeedRecoveryCodesAsync(ledger.UserId);
         // Burn one old code so we can prove regenerate wipes used + unused alike.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var one = await db.RecoveryCodes.FirstAsync(c => c.UserId == ledger.UserId);
             await db.RecoveryCodes.Where(c => c.Id == one.Id)
@@ -530,7 +531,7 @@ public sealed class RecoveryAndPasskeyEndpointTests
 
         var key = await ledger.AddCredentialAsync(nickname: "key");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService(_ => StepUpTestHelper.AcceptingWebAuthn());
         using var client = await AuthedClientAsync(factory, ledger);
 

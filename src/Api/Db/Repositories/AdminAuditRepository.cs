@@ -22,6 +22,13 @@ public static class AdminAuditActions
     public const string MasterKeyAdopted = "master-key.adopted";
 
     /// <summary>
+    /// A <c>--adopt-new-kek</c> start minted a new master KEK and cleared everything the lost
+    /// one sealed (ADR-0092 D3). Its own action, not <see cref="MasterKeyAdopted"/>: that one
+    /// keeps a key's secrets, this one abandons them. Written in the clearing's transaction.
+    /// </summary>
+    public const string MasterKeyAdoptedNew = "master-key.adopted-new";
+
+    /// <summary>
     /// The master KEK was shown during first-run setup. Distinct from
     /// <see cref="MasterKeyRevealed"/> so an auditor can tell the unavoidable
     /// bootstrap disclosure apart from a deliberate later one — the first has no
@@ -64,6 +71,21 @@ public static class AdminAuditActions
 
     /// <summary>A pending invite was revoked.</summary>
     public const string InviteRevoked = "invite.revoked";
+
+    /// <summary>An admin revoked another person's MCP connection (a token or an OAuth sign-in).
+    /// Detail names the kind and the owner's id, never the token.</summary>
+    public const string McpConnectionRevoked = "mcp.connection-revoked";
+
+    // In-app upgrade (ADR-0110). Detail names versions and the request id, never a token.
+
+    /// <summary>An admin started an upgrade from the app, after a fresh passkey tap and a verified backup.</summary>
+    public const string UpgradeStarted = "upgrade.started";
+
+    /// <summary>An admin changed the in-app upgrade settings (switch, automatic check, private fork).</summary>
+    public const string UpgradeSettingsChanged = "upgrade.settings-changed";
+
+    /// <summary>An admin stored or removed the private-repository release token.</summary>
+    public const string UpgradeTokenChanged = "upgrade.token-changed";
 }
 
 /// <summary>
@@ -127,6 +149,7 @@ public sealed class AdminAuditRepository
         await using var db = _factory.Create();
         return await db.AdminAuditEvents.AsNoTracking()
             .OrderByDescending(e => e.OccurredAt)
+            .ThenByDescending(e => e.Id)
             .Take(limit)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
     }

@@ -5,8 +5,6 @@ import { Button } from '@/components/ui/Button';
 interface WelcomePanelProps {
     /** The install's master key, base64, from the one-time setup response. */
     keyBase64: string;
-    /** True when setup seeded a Demo ledger, so the next step differs (ADR-0088). */
-    hasLedger: boolean;
     /** Leave the welcome screen for the ledger hub. */
     onContinue: () => void;
 }
@@ -14,22 +12,25 @@ interface WelcomePanelProps {
 /**
  * Post-setup welcome screen (ADR-0095, amending ADR-0092 D2).
  *
- * The master key used to be the last **step of setup**, behind its own
- * acknowledgement checkbox and a "Finish setup" button. That put it in the wrong
- * place for two reasons. It cannot be *explained* at that moment — there are no
- * sealed secrets yet, no bank feed, no backup passphrase, no Drive connection, and
- * no backup to restore anywhere, so the operator is asked to file away a secret that
- * currently protects nothing. And gating progress on it ranked it alongside the
- * recovery codes, which are one-time and genuinely unrecoverable, when losing this
- * key costs three re-establishable secrets and no data at all.
+ * The master key does not belong as the last **step of setup**, behind its own
+ * acknowledgement checkbox and a "Finish setup" button, for two reasons. It cannot
+ * be *explained* at that moment — there are no sealed secrets yet, no bank feed, no
+ * backup passphrase, no Drive connection, and no backup to restore anywhere, so the
+ * operator would be asked to file away a secret that currently protects nothing. And
+ * gating progress on it ranks it alongside the recovery codes, which are one-time and
+ * genuinely unrecoverable, when losing this key costs three re-establishable secrets
+ * and no data at all.
  *
- * So setup now ends at the recovery codes — one thing to save, the one that cannot
+ * So setup ends at the recovery codes — one thing to save, the one that cannot
  * be recovered — and this screen follows it. Here the key comes with the reason it
  * exists and next to the thing that actually makes recovery work: a backup and its
  * passphrase. No checkbox: this is advice at the moment it is true, and the key stays
  * viewable under System → Encryption, so a gate would be theatre.
+ *
+ * Setup creates no ledger (ADR-0115 D2), so the last next step is always the
+ * same: create, add a Demo, or import, from the hub.
  */
-export function WelcomePanel({ keyBase64, hasLedger, onContinue }: WelcomePanelProps) {
+export function WelcomePanel({ keyBase64, onContinue }: WelcomePanelProps) {
     const [copyState, setCopyState] = useState<'idle' | 'copied' | 'unsupported'>('idle');
 
     async function handleCopy() {
@@ -119,28 +120,16 @@ export function WelcomePanel({ keyBase64, hasLedger, onContinue }: WelcomePanelP
             </div>
 
             <div className="space-y-2 border-t border-border pt-4">
-                <h3 className="text-sm font-semibold">
-                    {hasLedger ? 'Have a look around' : 'Add your first ledger'}
-                </h3>
+                <h3 className="text-sm font-semibold">Add your first ledger</h3>
                 <p className="text-sm text-text-muted">
-                    {hasLedger ? (
-                        <>
-                            The Demo ledger is populated with a worked example — open a
-                            register or the investments view to see the shape of things.
-                            Delete it whenever you like.
-                        </>
-                    ) : (
-                        <>
-                            Create an empty ledger, or import a Moneydance export to
-                            bring your history across with accounts, splits, investment
-                            lots and cost basis intact.
-                        </>
-                    )}
+                    Create an empty ledger, add a Demo ledger to look around first, or
+                    import a Moneydance export to bring your history across with
+                    accounts, splits, investment lots and cost basis intact.
                 </p>
             </div>
 
             <Button type="button" onClick={onContinue}>
-                {hasLedger ? 'Go to my ledgers' : 'Get started'}
+                Get started
             </Button>
         </section>
     );

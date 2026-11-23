@@ -4,8 +4,7 @@
 --
 -- accounts.opened_on has existed since migration 127 (ADR-0050) and the account
 -- editor has always been able to set it, but the Moneydance importer never wrote
--- it. Every account bootstrapped from MD therefore has opened_on NULL, and the
--- schema doc claimed otherwise the whole time.
+-- it. Every account bootstrapped from MD therefore has opened_on NULL.
 --
 -- Teaching the importer to read the field (same change as this migration) fixes
 -- FUTURE ledgers only. MD import is a one-shot bootstrap of a NEW ledger — there
@@ -18,21 +17,23 @@
 -- the importer did not model at the time, in SQL, without the source file. The
 -- creation stamp is already sitting in every imported row.
 --
--- MD writes that stamp two ways and is inconsistent about which. Measured on a
--- real export:
+-- MD writes that stamp two ways and is inconsistent about which:
 --
---   date_created   yyyyMMdd int     the smaller set   (only some investment accounts)
---   creation_date  epoch millis     the larger set    (every investment account)
+--   date_created   yyyyMMdd int
+--   creation_date  epoch millis
 --
--- So prefer the int and fall back to the epoch value — taking either alone leaves
--- most accounts NULL.
+-- An account can carry either, both or neither. So prefer the int and fall back
+-- to the epoch value — taking either alone leaves NULL every account that carries
+-- only the other.
 --
 -- WHY THE EPOCH VALUE CONVERTS AT UTC rather than a local zone: MD stamps it at
 -- local NOON (so the UTC hour varies with the file's zone and DST), the usual
--- convention for keeping a calendar day stable under conversion. On the accounts
--- carrying BOTH fields the UTC date equals date_created in every case, and still
--- does at every offset from UTC-12 to UTC+2. No local timezone is needed, and
--- assuming one would be the riskier choice.
+-- convention for keeping a calendar day stable under conversion. Local noon at
+-- offset h is 12:00 - h UTC, which stays on the same calendar day for every
+-- offset after UTC-12 up to and including UTC+12. Within that band no local
+-- timezone is needed to land on the right day, and assuming one would be the
+-- riskier choice. Outside it the UTC date is one day off: a day late at exactly
+-- UTC-12, a day early at UTC+13 and UTC+14.
 --
 -- Idempotent and non-destructive: only rows where opened_on IS NULL are touched,
 -- so a value the user has set in the editor is never overwritten and re-running

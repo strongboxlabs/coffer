@@ -96,8 +96,8 @@ public sealed class JobMonitorSignalTests
     {
         // The same message is capped at 500 on its way into scheduled_jobs.last_error,
         // whose comment explains why: "A message, never a stack trace — the column is
-        // surfaced in the SPA." The published summary had no cap, which made the stricter
-        // of the two paths the one nobody looks at.
+        // surfaced in the SPA." The published summary needs the same cap, or the stricter
+        // of the two paths is the one nobody looks at.
         //
         // And this one travels further: it is DELIVERED to whatever URL a ledger holder
         // configured, and ledger_events_read grants SELECT to every grant holder with no

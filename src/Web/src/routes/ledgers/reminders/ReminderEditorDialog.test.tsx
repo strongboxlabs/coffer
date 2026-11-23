@@ -107,19 +107,21 @@ const accounts: AccountSummary[] = [
 ];
 
 const bankDetail: ReminderDetail = {
-    id: 'r1', kind: 'bank', payee: 'Rent', memo: null, checkNumber: null, action: null,
+    id: 'r1', kind: 'bank', payee: 'Rent', memo: null, tags: [], checkNumber: null, action: null,
     rrule: 'FREQ=MONTHLY;BYMONTHDAY=1', startDate: '2026-01-01', endDate: null,
     nextDueDate: '2026-07-01', autoCommitDaysBefore: null, isActive: true,
     isLoanReminder: false, origin: 'manual', sourceAccountId: 'acct-bank',
     legs: [
         {
+            legId: 'l-bank-0',
             accountId: 'acct-bank', accountName: 'Checking', postingIndex: 0, amount: -50,
-            legMemo: null, securityId: null, securityTicker: null, quantity: null,
+            legMemo: null, legTags: [], securityId: null, securityTicker: null, quantity: null,
             unitPrice: null, postingRole: null,
         },
         {
+            legId: 'l-rent-0',
             accountId: 'cat-1', accountName: 'Rent', postingIndex: 0, amount: 50,
-            legMemo: null, securityId: null, securityTicker: null, quantity: null,
+            legMemo: null, legTags: [], securityId: null, securityTicker: null, quantity: null,
             unitPrice: null, postingRole: null,
         },
     ],
@@ -191,6 +193,22 @@ describe('ReminderEditorDialog', () => {
 
         await waitFor(() => expect(onSaved).toHaveBeenCalled());
         expect(updateReminderBank).not.toHaveBeenCalled();
+    });
+
+    it('edit: saves a monthly rule that names no day on the series\' start day, unchanged', async () => {
+        // The rule recurs on the start's day (RFC 5545, as the server expands it).
+        // Read as the 1st, a save would move the reminder.
+        fetchReminderDetail.mockResolvedValue({ ...bankDetail, rrule: 'FREQ=MONTHLY', startDate: '2026-03-18' });
+        renderDialog({ reminderId: 'r1' });
+
+        await userEvent.click(await screen.findByTestId('bank-editor-save'));
+
+        await waitFor(() => expect(updateReminderBank).toHaveBeenCalledTimes(1));
+        const body = updateReminderBank.mock.calls[0]![2];
+        expect(body.rrule).toBe('FREQ=MONTHLY;BYMONTHDAY=18');
+        expect(body.startDate).toBe('2026-03-18');
+        // Not flagged as a schedule the builder cannot hold.
+        expect(screen.queryByText(/can.t represent|custom schedule/i)).toBeNull();
     });
 
     it('edit: fetches the detail, shows the edit title + account, and Save patches (not creates)', async () => {

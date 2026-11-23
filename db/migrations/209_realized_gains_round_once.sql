@@ -5,31 +5,29 @@
 -- lands a cent away from the correctly single-rounded value whenever the tail sits in
 -- the band where the two orders disagree.
 --
--- OBSERVED, not theoretical. On a real ledger, a small fraction of its disposal
--- rows disagreed with a fresh walk, each by exactly one cent, the stored value
--- sitting one cent further from zero than the single-rounded one (gains and
--- losses alike),
+-- What that does: every disposal row whose tail falls in that band disagrees with a
+-- fresh walk by exactly one cent, the stored value sitting one cent further from
+-- zero than the single-rounded one (gains and losses alike),
 --
--- and the consistency report pinned realized_gains permanently unhealthy, because the
--- repair routes back through this same writer and re-stored the same wrong values.
+-- and the consistency report pins realized_gains permanently unhealthy, because the
+-- repair routes back through this same writer and re-stores the same wrong values.
 --
--- HOW IT HAPPENED, because the reasoning was careful and still wrong. 205 states the
--- convention as "Money 4dp, shares 12dp — the convention of holdings.cost_basis
--- NUMERIC(19,4), lots.unit_cost NUMERIC(25,12)". That convention is real. It just is
--- not this table's: mig 182 had already narrowed every realized_gains money column to
--- NUMERIC(19,2), three migrations earlier, and its own header says so ("realized_gains
--- money columns were unconstrained `numeric` (no scale)").
+-- WHY 205 IS WRONG. 205 states the convention as "Money 4dp, shares 12dp — the
+-- convention of holdings.cost_basis NUMERIC(19,4), lots.unit_cost NUMERIC(25,12)".
+-- That convention is real, but it is not this table's: mig 182 narrowed every
+-- realized_gains money column to NUMERIC(19,2), and its own header says so
+-- ("realized_gains money columns were unconstrained `numeric` (no scale)").
 --
--- So 205's stated premise — that these columns are "unbounded NUMERIC" and an
--- unbounded value there would overflow System.Decimal on read — was already false when
--- it was written. mig 182 bounds them. mig 202 wrote them UNROUNDED and the column's
--- own scale did the single, correct rounding. 205 added a redundant round, at a finer
--- scale than the destination, and that redundancy is the entire bug. Rounding to a
--- COARSER scale than a column is harmless; to a FINER scale it is a second rounding.
+-- So 205's premise — that these columns are "unbounded NUMERIC" and an unbounded
+-- value there would overflow System.Decimal on read — is false: mig 182 bounds them.
+-- mig 202 wrote them UNROUNDED and the column's own scale did the single, correct
+-- rounding. 205's round is redundant, at a finer scale than the destination, and that
+-- redundancy is the entire bug. Rounding to a COARSER scale than a column is
+-- harmless; to a FINER scale it is a second rounding.
 --
--- 205's fixtures could not have caught it: its header notes they "all produced clean
--- 2dp values", so none of them had a tail in the disagreement band. Real data supplies
--- such tails steadily, a small fraction of all disposals.
+-- A fixture whose values are all clean 2dp has no tail in the disagreement band and
+-- cannot detect this. Any disposal whose unit cost does not divide evenly can
+-- produce one.
 --
 -- WHAT CHANGED HERE. Six scale digits, 4 -> 2, in the INSERT. Nothing else. 205 warned
 -- that redefining this body in a later migration risks "starting from a superseded
@@ -138,8 +136,7 @@ COMMENT ON FUNCTION recompute_holdings_cost_basis(UUID, UUID, UUID) IS
     'ADR-0064 FIFO basis writer. Since mig 202 a thin persist over holdings_fifo_walk, '
     'so the algorithm is shared with the as-of read path and the two cannot drift. '
     'Bounds what it stores at each column''s OWN scale (money 2dp per mig 182, shares '
-    '12dp) — mig 205 rounded money to 4dp believing these columns were unbounded, but '
-    'mig 182 had already narrowed them to NUMERIC(19,2), so that rounded twice and '
-    'shifted some disposals by a cent (mig 209).';
+    '12dp). Rounding money to 4dp first, as mig 205 did, rounds twice against these '
+    'NUMERIC(19,2) columns and can shift a disposal by a cent (fixed in mig 209).';
 
 COMMIT;

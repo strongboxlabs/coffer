@@ -1,22 +1,32 @@
 import { useMemo } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { Link, useNavigate, useParams, useSearch } from '@tanstack/react-router';
 
 import { fetchReportSummary, specToQuery } from '@/lib/api';
 import { Checkbox } from '@/components/ui/Checkbox';
-import { FieldLabel } from '@/components/ui/FieldLabel';
+import { SegmentedControl, type SegmentedOption } from '@/components/ui/SegmentedControl';
 import { MainArea, MainPane, TopBar } from '@/components/ui/SidebarLayout';
 import { Breadcrumb } from '@/components/ui/Breadcrumb';
-import { cn } from '@/lib/cn';
-import { formatCurrency } from '@/lib/money';
 import type {
-    ReportGroupBy, ReportMeasure, ReportResult, ReportRow, ReportSpec, ReportTimeBucket,
+    ReportChartStack, ReportGroupBy, ReportMeasure, ReportResult, ReportRow, ReportSpec,
+    ReportTimeBucket, ReportViewMode,
 } from '@/types/report';
 
+import { ExchangeRatesLink, MissingRateNote } from '@/components/ConversionNote';
+import { LedgerConversionNote } from '@/components/LedgerConversionNote';
+import type { RateUnavailable } from '@/lib/types';
+
 import { ReportChart } from './ReportChart';
+import { chartTopN, groupKey } from './chartSeries';
+import { GROUP_LABELS } from './groupLabel';
 import { AGGREGATION_REPORT_NAME } from './catalog';
 import { RangePicker, describeRange } from './RangePicker';
+import { crossCurrencyChartText, currencyRules } from './reportCurrency';
+import { Select } from './ReportSelect';
+import { ReportTable } from './ReportTable';
+import { ReturnsReportView } from './ReturnsReportView';
 import { SaveReportControl } from './SaveReportControl';
+import { NO_SYSTEM_IDS, useChartSystemIds } from './useChartSystemIds';
 
 /**
  * One report, as a table (FU-008, ADR-0104 D4).
@@ -73,15 +83,16 @@ const TOP_N: readonly { value: string; label: string; n?: number }[] = [
 ];
 const GROUPS: readonly ReportGroupBy[] = ['Category', 'Account', 'Payee', 'Tag', 'CategoryKind'];
 
-/**
- * The group-by names a reader would use. Only CategoryKind needs one: the enum
- * value is a type name and "Income vs expense" is the question people actually
- * ask of it — which is the whole of what a cash-flow report is.
- */
-const GROUP_LABELS: Readonly<Partial<Record<ReportGroupBy, string>>> = {
-    CategoryKind: 'Income vs expense',
-};
 const BUCKETS: readonly ReportTimeBucket[] = ['None', 'Month', 'Quarter', 'Year'];
+
+const VIEW_OPTIONS: readonly SegmentedOption<ReportViewMode>[] = [
+    { value: 'table', label: 'Table' },
+    { value: 'chart', label: 'Chart' },
+];
+const STACK_OPTIONS: readonly SegmentedOption<ReportChartStack>[] = [
+    { value: 'stacked', label: 'Stacked' },
+    { value: 'grouped', label: 'Grouped' },
+];
 
 /** Fill the gaps so the page always has a complete, runnable spec. */
 export function specFromSearch(search: ReportSearch): ReportSpec {
@@ -111,7 +122,7 @@ export function specFromSearch(search: ReportSearch): ReportSpec {
 /**
  * Whether this report has a second view worth offering.
  *
- * D4: "Reports with only one sensible view do not render the toggle." A chart
+ * ADR-0104 D4: "Reports with only one sensible view do not render the toggle." A chart
  * of nothing is not a view, so an empty result keeps the toggle away rather
  * than offering a blank frame.
  */
@@ -149,7 +160,9 @@ export function periodsOf(
     const cursor = new Date(fromUtc);
     // Guarded: a malformed range must not spin. 3660 is ten years of days,
     // which is past any axis a person reads.
-    for (let i = 0; cursor <= end && i < 3660; i++) {
+    // The end is exclusive: a window ending at midnight on the 1st has no
+    // column for that month.
+    for (let i = 0; cursor < end && i < 3660; i++) {
         out.push(labelFor(cursor, bucket));
         advance(cursor, bucket);
     }
@@ -181,18 +194,54 @@ function advance(at: Date, bucket: ReportTimeBucket): void {
 export interface PivotRow {
     key: string;
     name: string;
+    /** The server's `groupPath`: the group's full name, top-level category first. */
+    path: readonly string[];
+    /** The group's id: null for the payee dimension and the untagged bucket. */
+    groupId: string | null;
     parentId: string | null;
     /** 0 = top level. Carried so ordering and indentation cannot disagree. */
     depth: number;
-    byPeriod: Map<string, number>;
-    total: number;
+    /** The currency the row's figures are in: an account's own, else the reporting one. */
+    currencyCode: string;
+    /** Null where a posting of the period needs a missing rate (ADR-0114 D9). */
+    byPeriod: Map<string, number | null>;
+    /** Null when a posting needs a missing rate. */
+    total: number | null;
+    /** Every missing rate the row's figures needed. */
+    rateUnavailable: RateUnavailable[];
+    /** Whether a chart draws it; undefined when the server did not say (no `topN`). */
+    drawn?: boolean;
 }
 
-/** Indent per depth. A lookup, because Tailwind cannot see a computed class. */
-const DEPTH_PAD = ['', 'pl-3', 'pl-6', 'pl-8', 'pl-10'] as const;
+/** A row a chart can draw: every figure present. */
+export type ChartRow = Omit<PivotRow, 'byPeriod' | 'total'> & {
+    byPeriod: Map<string, number>;
+    total: number;
+};
 
-function padFor(depth: number): string {
-    return DEPTH_PAD[Math.min(depth, DEPTH_PAD.length - 1)];
+/** The rows, when every figure is present; null when one needs a missing rate. */
+export function chartRowsOf(rows: readonly PivotRow[]): ChartRow[] | null {
+    const out: ChartRow[] = [];
+    for (const r of rows) {
+        if (r.total === null || [...r.byPeriod.values()].some((v) => v === null)) return null;
+        out.push(r as ChartRow);
+    }
+    return out;
+}
+
+/** Part by part, so a longer path sorts after its own prefix and the separator never competes with letters. */
+function byPath(a: PivotRow, b: PivotRow): number {
+    const n = Math.min(a.path.length, b.path.length);
+    for (let i = 0; i < n; i++) {
+        const c = a.path[i]!.localeCompare(b.path[i]!);
+        if (c !== 0) return c;
+    }
+    return a.path.length - b.path.length || a.name.localeCompare(b.name);
+}
+
+/** A sum that is null when either side is: a missing rate is never added as zero. */
+function plus(a: number | null, b: number | null): number | null {
+    return a === null || b === null ? null : a + b;
 }
 
 /**
@@ -200,32 +249,33 @@ function padFor(depth: number): string {
  *
  * ARBITRARY DEPTH. This walked exactly two levels — roots, then their direct
  * children — and everything deeper fell through to a catch-all that appended
- * it at the END, styled as a child. On a real ledger that put many
- * unrelated categories under whichever parent happened to be last, which is
+ * it at the END, styled as a child. That put every deeper category under
+ * whichever parent happened to be last, which is
  * what it looked like: one category with a run of categories from entirely
  * different branches beneath it. The server rolls up the whole ancestor chain,
  * so the client has no business assuming two levels.
  *
- * DEPTH IS COMPUTED HERE AND ONLY HERE. The old code had two definitions of
- * "top level" — this function treated a row whose parent is absent as a root,
- * while the renderer checked `parentId === null` — so a category whose parent
- * had no postings was ordered at the top and drawn as a child. One number on
- * the row makes that impossible.
+ * DEPTH IS COMPUTED HERE AND ONLY HERE. Two definitions of "top level" — this
+ * function treating a row whose parent is absent as a root, a renderer checking
+ * `parentId === null` — would order a category whose parent has no postings at
+ * the top and draw it as a child. One number on the row makes that impossible.
  */
 export function pivot(rows: readonly ReportRow[]): PivotRow[] {
     const byKey = new Map<string, PivotRow>();
     for (const r of rows) {
-        const key = r.groupId ?? `name:${r.groupName}`;
+        const key = groupKey(r.groupId, r.groupName);
         let row = byKey.get(key);
         if (!row) {
             row = {
-                key, name: r.groupName, parentId: r.parentId,
-                depth: 0, byPeriod: new Map(), total: 0,
+                key, name: r.groupName, path: r.groupPath, groupId: r.groupId, parentId: r.parentId,
+                depth: 0, currencyCode: r.currencyCode, byPeriod: new Map(), total: 0, rateUnavailable: [],
             };
             byKey.set(key, row);
         }
-        if (r.period) row.byPeriod.set(r.period, (row.byPeriod.get(r.period) ?? 0) + r.amount);
-        row.total += r.amount;
+        if (typeof r.drawn === 'boolean') row.drawn = (row.drawn ?? false) || r.drawn;
+        if (r.period) row.byPeriod.set(r.period, plus(row.byPeriod.has(r.period) ? row.byPeriod.get(r.period)! : 0, r.amount));
+        row.total = plus(row.total, r.amount);
+        if (r.rateUnavailable) row.rateUnavailable.push(...r.rateUnavailable);
     }
 
     // A parent outside the result set is not a parent HERE: its child is the
@@ -237,7 +287,11 @@ export function pivot(rows: readonly ReportRow[]): PivotRow[] {
         if (bucket) bucket.push(row);
         else children.set(parent, [row]);
     }
-    for (const bucket of children.values()) bucket.sort((a, b) => a.name.localeCompare(b.name));
+    // By the whole path, which is what a top-level subcategory shows: by its own
+    // name it would sort among the roots by a word the reader does not see first.
+    // Siblings under one parent share every part but the last, so for them this is
+    // their own names' order.
+    for (const bucket of children.values()) bucket.sort(byPath);
 
     const ordered: PivotRow[] = [];
     const seen = new Set<string>();
@@ -265,7 +319,19 @@ export function pivot(rows: readonly ReportRow[]): PivotRow[] {
     return ordered;
 }
 
+/**
+ * The one `/reports/view` route, sending a spec to its report's view.
+ *
+ * A spec with no `kind` is the aggregation, so a saved row or a link written
+ * before a second report existed opens exactly as it always did; only the
+ * marker routes elsewhere.
+ */
 export function ReportView() {
+    const search = useSearch({ strict: false }) as ReportSearch;
+    return search.kind === 'returns' ? <ReturnsReportView /> : <AggregationReportView />;
+}
+
+function AggregationReportView() {
     const { ledgerId } = useParams({ strict: false }) as { ledgerId: string };
     const search = useSearch({ strict: false }) as ReportSearch;
     const navigate = useNavigate();
@@ -285,16 +351,46 @@ export function ReportView() {
         });
     };
 
+    // A chart always sends a cut (every group over All) so the server marks the
+    // rows it draws; the table sends the spec's own cap, none over All. The
+    // colour count never lowers it. Two requests for two views, never one
+    // result trimmed in the browser.
+    const chart = spec.view === 'chart';
+    const request = useMemo(
+        // Roll-up is a table's subtotals; a chart draws groups side by side and
+        // would count a parent twice, so it is always flat there.
+        () => (chart ? { ...spec, topN: chartTopN(spec), rollup: false } : spec),
+        [chart, spec],
+    );
     const query = useQuery({
-        queryKey: ['report-summary', ledgerId, specToQuery(spec)],
-        queryFn: () => fetchReportSummary(ledgerId, spec),
+        queryKey: ['report-summary', ledgerId, specToQuery(request)],
+        queryFn: () => fetchReportSummary(ledgerId, request),
+        // Switching view can change the request. The previous result keeps the
+        // controls in place, the View toggle the reader just pressed among them,
+        // while the body says Running.
+        placeholderData: keepPreviousData,
     });
+    // A category chart waits for the ledger's Uncategorized, and never recolours a
+    // series once drawn (useChartSystemIds).
+    const categoryChart = chart && spec.groupBy === 'Category';
+    const systemIds = useChartSystemIds(ledgerId, categoryChart);
 
     const result: ReportResult | undefined = query.data;
+    const running = query.isPending || query.isPlaceholderData
+        || (categoryChart && systemIds === null && !query.isError);
+    // The result's own currency. Nothing is drawn before the result arrives, so no
+    // figure is ever printed in a currency the report did not name.
+    const currency = result?.currencyCode ?? null;
     const periods = result
         ? periodsOf(result.rows, spec.bucket, result.fromUtc, result.toUtc)
         : [];
-    const rows = result ? pivot(result.rows) : [];
+    // A rolled-up parent's own postings come as a row of their own under a cap;
+    // the table lists groups, so it leaves them out.
+    const rows = result ? pivot(result.rows.filter((r) => r.isDirect !== true)) : [];
+    // Rows in several currencies, or a figure with a missing rate (ADR-0114 D7, D9):
+    // currencyRules.
+    const { missing, crossCurrency, chartWithheld } = currencyRules(result, spec);
+    const chartRows = (result && chart && !chartWithheld ? chartRowsOf(pivot(result.rows)) : null) ?? [];
 
     return (
         <MainArea>
@@ -342,12 +438,16 @@ export function ReportView() {
                     />
                     </div>
                 </div>
-                <p className="mb-3 text-sm text-text-muted">
-                    {MEASURE_LABELS[spec.measure]} · by{' '}
-                    {(GROUP_LABELS[spec.groupBy] ?? spec.groupBy).toLowerCase()}
-                    {spec.bucket === 'None' ? '' : ` · ${spec.bucket.toLowerCase()}ly`}
-                    {' · '}{describeRange(spec).toLowerCase()}
-                </p>
+                <div className="mb-3 space-y-1">
+                    <p className="text-sm text-text-muted">
+                        {MEASURE_LABELS[spec.measure]} · by{' '}
+                        {(GROUP_LABELS[spec.groupBy] ?? spec.groupBy).toLowerCase()}
+                        {spec.bucket === 'None' ? '' : ` · ${spec.bucket.toLowerCase()}ly`}
+                        {' · '}{describeRange(spec).toLowerCase()}
+                    </p>
+                    {/* The one ledger-level note on converted totals (ADR-0114 D7). */}
+                    <LedgerConversionNote ledgerId={ledgerId} />
+                </div>
 
                 <div className="mb-3 flex flex-wrap items-end gap-1.5">
                     <Select label="Measure" value={spec.measure} options={MEASURES}
@@ -367,56 +467,24 @@ export function ReportView() {
                         onChange={(v) => patch({ topN: TOP_N.find((t) => t.value === v)?.n })}
                     />
                     {hasChartView(rows) ? (
-                        <div
-                            role="group"
-                            aria-label="View"
-                            className="flex items-center gap-0.5 rounded border border-border p-0.5 pb-0.5"
-                        >
-                            {(['table', 'chart'] as const).map((v) => (
-                                <button
-                                    key={v}
-                                    type="button"
-                                    aria-pressed={spec.view === v}
-                                    onClick={() => patch({ view: v })}
-                                    className={cn(
-                                        'rounded px-2 py-0.5 text-xs capitalize',
-                                        spec.view === v
-                                            ? 'bg-surface-muted font-medium text-text'
-                                            : 'text-text-muted hover:text-text',
-                                    )}
-                                >
-                                    {v}
-                                </button>
-                            ))}
-                        </div>
+                        <SegmentedControl
+                            label="View"
+                            options={VIEW_OPTIONS}
+                            value={spec.view ?? 'table'}
+                            onChange={(v) => patch({ view: v })}
+                        />
                     ) : null}
                     {/* Only where a real choice exists: a ranking has no
                         second shape to offer, and a table has no bars. */}
-                    {spec.view === 'chart' && spec.bucket !== 'None' && hasChartView(rows) ? (
-                        <div
-                            role="group"
-                            aria-label="Bars"
-                            className="flex items-center gap-0.5 rounded border border-border p-0.5 pb-0.5"
-                        >
-                            {(['stacked', 'grouped'] as const).map((v) => (
-                                <button
-                                    key={v}
-                                    type="button"
-                                    aria-pressed={(spec.chartStack ?? 'stacked') === v}
-                                    onClick={() => patch({ chartStack: v })}
-                                    className={cn(
-                                        'rounded px-2 py-0.5 text-xs capitalize',
-                                        (spec.chartStack ?? 'stacked') === v
-                                            ? 'bg-surface-muted font-medium text-text'
-                                            : 'text-text-muted hover:text-text',
-                                    )}
-                                >
-                                    {v}
-                                </button>
-                            ))}
-                        </div>
+                    {spec.view === 'chart' && spec.bucket !== 'None' && hasChartView(rows) && !chartWithheld ? (
+                        <SegmentedControl
+                            label="Bars"
+                            options={STACK_OPTIONS}
+                            value={spec.chartStack ?? 'stacked'}
+                            onChange={(v) => patch({ chartStack: v })}
+                        />
                     ) : null}
-                    {spec.groupBy === 'Category' ? (
+                    {spec.groupBy === 'Category' && !chart ? (
                         <Checkbox
                             label="Roll up"
                             checked={spec.rollup ?? false}
@@ -426,7 +494,7 @@ export function ReportView() {
                     ) : null}
                 </div>
 
-                {query.isPending ? (
+                {running ? (
                     <p className="text-xs text-text-muted">Running…</p>
                 ) : query.isError ? (
                     <p role="alert" className="text-xs text-state-danger">
@@ -436,92 +504,31 @@ export function ReportView() {
                     <p className="text-xs text-text-muted">
                         Nothing in this range. Widen the range, or change the measure.
                     </p>
-                ) : spec.view === 'chart' ? (
+                ) : spec.view === 'chart' && crossCurrency !== null && currency !== null ? (
+                    <p className="text-xs text-text-muted">{crossCurrencyChartText(crossCurrency, currency)}</p>
+                ) : spec.view === 'chart' && chartWithheld ? (
+                    <MissingRateNote missing={missing} ratesLink={<ExchangeRatesLink ledgerId={ledgerId} />} />
+                ) : spec.view === 'chart' && currency !== null ? (
                     <div className="flex min-h-0 flex-1 flex-col pb-2">
                         <ReportChart
-                            rows={rows}
+                            rows={chartRows}
                             periods={periods}
                             bucketed={spec.bucket !== 'None'}
                             stack={spec.chartStack ?? 'stacked'}
+                            currency={currency}
+                            groupBy={spec.groupBy}
+                            rest={result!.rest ?? null}
+                            systemCategoryIds={systemIds ?? NO_SYSTEM_IDS}
                         />
                     </div>
                 ) : (
-                    <>
-                        <div className="min-h-0 flex-1 overflow-auto">
-                            <table className="w-full border-collapse text-xs">
-                                <thead>
-                                    <tr>
-                                        {/* The corner: sticky both ways, so it
-                                            never slides under either neighbour. */}
-                                        <th className="sticky top-0 left-0 z-20 border-b border-border bg-surface-muted py-1 pr-2 text-left text-[0.625rem] font-semibold uppercase leading-[1.5] tracking-wider text-text-muted">
-                                            {spec.groupBy}
-                                        </th>
-                                        {periods.map((p) => (
-                                            <th key={p} className="sticky top-0 z-10 border-b border-border bg-surface-muted px-2 py-1 text-right text-[0.625rem] font-semibold uppercase leading-[1.5] tracking-wider text-text-muted">
-                                                {p}
-                                            </th>
-                                        ))}
-                                        <th className="sticky top-0 z-10 border-b border-border bg-surface-muted px-2 py-1 text-right text-[0.625rem] font-semibold uppercase leading-[1.5] tracking-wider text-text-muted">
-                                            Total
-                                        </th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {rows.map((row) => (
-                                        <tr key={row.key}>
-                                            <td className={cn(
-                                                'sticky left-0 z-10 border-b border-border bg-surface-muted py-1 pr-2',
-                                                padFor(row.depth),
-                                                row.depth === 0 ? 'font-medium text-text' : 'text-text-muted',
-                                            )}>
-                                                {row.name}
-                                            </td>
-                                            {periods.map((p) => (
-                                                <td key={p} className="border-b border-border px-2 py-1 text-right font-mono tabular-nums text-text">
-                                                    {row.byPeriod.has(p) ? formatCurrency(row.byPeriod.get(p)!, 'USD') : '—'}
-                                                </td>
-                                            ))}
-                                            <td className="border-b border-border px-2 py-1 text-right font-mono tabular-nums text-text">
-                                                {formatCurrency(row.total, 'USD')}
-                                            </td>
-                                        </tr>
-                                    ))}
-                                    <tr>
-                                        <td className="sticky left-0 z-10 border-t border-border-strong bg-surface-muted py-1 pr-2 font-semibold text-text">Total</td>
-                                        {periods.map((p) => (
-                                            <td key={p} className="border-t border-border-strong px-2 py-1 text-right font-mono tabular-nums text-text" />
-                                        ))}
-                                        <td className="border-t border-border-strong px-2 py-1 text-right font-mono font-semibold tabular-nums text-text">
-                                            {formatCurrency(result!.total, 'USD')}
-                                        </td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
-
-                        <div className="shrink-0">
-                        {spec.topN !== undefined ? (
-                            <p className="mt-2 text-[0.6875rem] leading-[1.4] text-text-muted">
-                                Showing the top {spec.topN} by size. The total is every row in
-                                range, including the ones not listed — so these rows add up to
-                                less than it.
-                            </p>
-                        ) : null}
-                        {spec.rollup && spec.groupBy === 'Category' ? (
-                            <p className="mt-2 text-[0.6875rem] leading-[1.4] text-text-muted">
-                                Roll-up is on: a parent row already includes its children, so the rows
-                                are subtotals. The total is the true sum of postings, not the sum of
-                                the rows above it.
-                            </p>
-                        ) : null}
-                        {spec.groupBy === 'Tag' ? (
-                            <p className="mt-2 text-[0.6875rem] leading-[1.4] text-text-muted">
-                                A transaction tagged more than once appears under each of its tags, so
-                                these rows can add up to more than the total.
-                            </p>
-                        ) : null}
-                        </div>
-                    </>
+                    <ReportTable
+                        spec={spec}
+                        result={result!}
+                        rows={rows}
+                        periods={periods}
+                        scrollClassName="min-h-0 flex-1 overflow-auto"
+                    />
                 )}
                 </div>
             </MainPane>
@@ -529,28 +536,3 @@ export function ReportView() {
     );
 }
 
-function Select({
-    label, value, options, onChange, labels,
-}: {
-    label: string;
-    value: string;
-    options: readonly string[];
-    onChange: (value: string) => void;
-    /** Display text per value, where the UI's word differs from the API's. */
-    labels?: Readonly<Record<string, string>>;
-}) {
-    const id = `report-${label.replace(/\s+/g, '-').toLowerCase()}`;
-    return (
-        <div className="flex min-w-0 flex-col gap-1">
-            <FieldLabel htmlFor={id}>{label}</FieldLabel>
-            <select
-                id={id}
-                value={value}
-                onChange={(e) => onChange(e.target.value)}
-                className="h-control-28px rounded border border-border bg-surface px-2 text-xs text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-            >
-                {options.map((o) => <option key={o} value={o}>{labels?.[o] ?? o}</option>)}
-            </select>
-        </div>
-    );
-}

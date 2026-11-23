@@ -5,7 +5,9 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 import { TxnRowEdit, type TxnRowMode } from './TxnRowEdit';
 import * as apiModule from '@/lib/api';
-import type { AccountSummary, CreateTransactionRequest, PatchTransactionRequest } from '@/lib/types';
+import type {
+    AccountSummary, CreateTransactionRequest, PatchTransactionRequest, PayeeSuggestion,
+} from '@/lib/types';
 
 /**
  * CHARACTERISATION tests — written BEFORE decomposing this file, to make
@@ -53,6 +55,7 @@ const LEDGER_ID = '00000000-0000-0000-0000-000000000010';
 const BANK_ID = '00000000-0000-0000-0000-000000000100';
 const CATEGORY_ID = '00000000-0000-0000-0000-000000000300';
 const OTHER_CATEGORY_ID = '00000000-0000-0000-0000-000000000301';
+const SAVINGS_ID = '00000000-0000-0000-0000-000000000101';
 const HEADER_ID = '00000000-0000-0000-0000-000000000aaa';
 const LEG_ID = '00000000-0000-0000-0000-000000000bbb';
 const LEG_ID_2 = '00000000-0000-0000-0000-000000000ccc';
@@ -86,16 +89,25 @@ interface Spies {
     onCancel?: () => void;
 }
 
-function renderEditor(mode: TxnRowMode, spies: Spies = {}, over: { cancelOnOutsideClick?: boolean } = {}) {
+function renderEditor(
+    mode: TxnRowMode,
+    spies: Spies = {},
+    over: {
+        cancelOnOutsideClick?: boolean;
+        payees?: PayeeSuggestion[];
+        accounts?: AccountSummary[];
+    } = {},
+) {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const accounts = over.accounts ?? ACCOUNTS;
     return render(
         <QueryClientProvider client={client}>
             <TxnRowEdit
                 ledgerId={LEDGER_ID}
                 mode={mode}
-                payees={[]}
-                accounts={ACCOUNTS}
-                accountPaths={new Map(ACCOUNTS.map((a) => [a.id, a.name]))}
+                payees={over.payees ?? []}
+                accounts={accounts}
+                accountPaths={new Map(accounts.map((a) => [a.id, a.name]))}
                 currency="USD"
                 cols="repeat(8, minmax(0, 1fr))"
                 onCancel={spies.onCancel ?? (() => {})}
@@ -129,7 +141,9 @@ function splitMode(count: number, over: Partial<Extract<TxnRowMode, { kind: 'edi
         postedAt: '2026-01-02T00:00:00.000Z',
         transactedAt: null,
         balanceAfter: 100,
-        tags: ['rental'],
+        balanceCurrencyCode: 'USD',
+        tags: ['work'],
+        inherited: null,
         needsReview: false,
         ...over,
     } satisfies TxnRowMode;
@@ -154,8 +168,7 @@ describe('the split branch renders at all', () => {
             expect(screen.getByLabelText(`Posting ${n} amount`)).toBeInTheDocument();
             expect(screen.getByLabelText(`Posting ${n} tags`)).toBeInTheDocument();
             expect(screen.getByLabelText(`Reorder posting ${n}`)).toBeInTheDocument();
-            // Remove used to be a bare "−" on every row; the splits redesign
-            // moved it into the row menu, where Move up / Move down live too.
+            // Remove lives in the row menu, with Move up / Move down.
             // The visible path is the kebab (ADR-0021 Rule 10).
             expect(screen.getByLabelText(`Actions for posting ${n}`)).toBeInTheDocument();
         }
@@ -165,28 +178,38 @@ describe('the split branch renders at all', () => {
         expect(screen.getByLabelText('Add another posting')).toBeInTheDocument();
     });
 
-    it('tells the header tags apart from every posting row', async () => {
+    it('tells the transaction tags apart from every posting row', async () => {
         // The single-posting branch labels the control 'Tags'; the split branch
-        // relabels it 'Header-level tags'. A field extraction that hardcoded
-        // either label would silently change the accessible name.
+        // names it after its visible caption, 'Tags (whole transaction)', so
+        // the accessible name contains the text a voice user reads off the
+        // screen. A field extraction that hardcoded either label would
+        // silently change the accessible name.
         //
-        // This used to assert that NOTHING in the split branch answered to
-        // plain 'Tags'. That stopped being the invariant twice over: FU-004
-        // gave postings their own tags, so "keeps them out of the leg rows" was
-        // already false, and the header control now carries a visible TAGS
-        // caption associated with it, so 'Tags' legitimately matches. What must
-        // not blur is that the three controls are told APART — which is what
-        // this now pins, on all three rather than on the header alone.
+        // Postings carry their own tags (FU-004), and the header control
+        // carries a visible caption associated with it, so 'Tags'
+        // legitimately matches more than one control. What must not blur is
+        // that the three controls are told APART — which is what this pins, on
+        // all three rather than on the header alone.
         renderEditor(splitMode(2));
-        expect(await screen.findByLabelText('Header-level tags')).toBeInTheDocument();
+        expect(await screen.findByLabelText('Tags (whole transaction)', { selector: 'span' })).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'Edit Tags (whole transaction)' })).toBeInTheDocument();
         expect(screen.getByLabelText('Posting 1 tags')).toBeInTheDocument();
         expect(screen.getByLabelText('Posting 2 tags')).toBeInTheDocument();
     });
 
+    it('captions the two levels as the whole transaction\'s', async () => {
+        renderEditor(splitMode(2));
+        expect(await screen.findByText('Memo (whole transaction)')).toBeInTheDocument();
+        expect(screen.getByText('Tags (whole transaction)')).toBeInTheDocument();
+        // The labels they replaced are gone.
+        expect(screen.queryByText('Memo (umbrella)')).toBeNull();
+        expect(screen.queryByLabelText('Header-level tags')).toBeNull();
+    });
+
     it('never lets the last posting be removed', async () => {
         renderEditor(splitMode(2));
-        // Two clicks now, not one: the redesign moved Remove into the row menu
-        // so the actions column could carry Move up / Move down as well.
+        // Two clicks, not one: Remove lives in the row menu so the actions
+        // column can carry Move up / Move down as well.
         await userEvent.click(await screen.findByLabelText('Actions for posting 1'));
         await userEvent.click(await screen.findByRole('menuitem', { name: /remove split/i }));
         // Down to one posting: the editor swaps to the single-row branch, which
@@ -194,10 +217,24 @@ describe('the split branch renders at all', () => {
         await waitFor(() => expect(screen.queryByLabelText('Posting 1 amount')).toBeNull());
         expect(screen.getByLabelText('Amount')).toBeInTheDocument();
     });
+
+    it('gives focus to "Split this transaction →" when removing a posting collapses the split', async () => {
+        // The collapse takes the whole grid away, every leg's kebab and Add
+        // split with it; the one-posting layout's add control takes the focus
+        // (ADR-0023 §L), never the page.
+        const user = userEvent.setup();
+        renderEditor(splitMode(2));
+        (await screen.findByLabelText('Actions for posting 2')).focus();
+        await user.keyboard('{Enter}');
+        await user.keyboard('{ArrowUp}{Enter}');
+
+        await waitFor(() => expect(screen.queryByLabelText('Posting 1 amount')).toBeNull());
+        expect(screen.getByRole('button', { name: 'Split this transaction →' })).toHaveFocus();
+    });
 });
 
 describe('the save payload carries every field, not just the two the gate checks', () => {
-    it('sends payee, memo, check number, tags and postings on a patch', async () => {
+    it('sends payee, check number and postings on a patch, and notes only as changed', async () => {
         const onSavePatch = vi.fn();
         renderEditor(splitMode(2), { onSavePatch });
 
@@ -207,21 +244,40 @@ describe('the save payload carries every field, not just the two the gate checks
         const body = onSavePatch.mock.calls[0]![0] as PatchTransactionRequest;
         // Every one of these is invisible to the existing gate.
         expect(body.payee).toBe('Corner Shop');
-        expect(body.memo).toBe('umbrella memo');
         expect(body.checkNumber).toBe('4471');
-        expect(body.tags).toEqual(['rental']);
+        // An untouched save carries the side and nothing else: memo and tags
+        // are sent only when they changed.
+        expect(body.notes).toEqual({ side: BANK_ID });
         // `postings` is NOT an array — it is { sourceAccountId, items }, and the
-        // source account rides inside it. Nothing in the repo guarded that, so a
-        // refactor could drop it and only the server would notice.
+        // source account rides inside it. Unguarded, a refactor could drop it and
+        // only the server would notice.
         expect(body.postings?.sourceAccountId).toBe(BANK_ID);
         expect(body.postings?.items).toHaveLength(2);
-        expect(body.postings?.items?.[0]).toMatchObject({
+        // A posting carries shape only.
+        expect(body.postings?.items?.[0]).toEqual({
             legId: LEG_ID,
             counterpartyAccountId: CATEGORY_ID,
             amount: -10,
-            legMemo: 'leg 1',
         });
         expect(body.postings?.items?.[1]).toMatchObject({ legId: LEG_ID_2, amount: -11 });
+    });
+
+    it('sends the transaction memo and a line memo when the user changed them', async () => {
+        const onSavePatch = vi.fn();
+        renderEditor(splitMode(2), { onSavePatch });
+
+        const memo = await screen.findByLabelText('Memo (whole transaction)');
+        fireEvent.change(memo, { target: { value: 'weekly shop' } });
+        fireEvent.change(screen.getByLabelText('Posting 2 memo'), { target: { value: 'soap' } });
+        await userEvent.click(screen.getByRole('button', { name: /save/i }));
+
+        await waitFor(() => expect(onSavePatch).toHaveBeenCalledTimes(1));
+        const body = onSavePatch.mock.calls[0]![0] as PatchTransactionRequest;
+        expect(body.notes).toEqual({
+            side: BANK_ID,
+            memo: 'weekly shop',
+            lines: [{ index: 1, memo: 'soap' }],
+        });
     });
 
     it('sets approve only when the transaction needed review', async () => {
@@ -242,7 +298,7 @@ describe('the save payload carries every field, not just the two the gate checks
 
 describe('amounts', () => {
     it('accepts a zero amount — paycheque splits carry zero lines', async () => {
-        // Deliberately legal on both client and server; no test pinned it.
+        // Deliberately legal on both client and server.
         const onSavePatch = vi.fn();
         renderEditor(splitMode(2), { onSavePatch });
 
@@ -265,13 +321,13 @@ describe('amounts', () => {
 
         const save = screen.getByRole('button', { name: /save/i });
         await waitFor(() => expect(save).toBeDisabled());
-        // The split branch used to print the index-prefixed sentence verbatim
-        // ("Posting 2: amount is required."). The redesign groups defects by
-        // KIND and renders each offending row number as a button that focuses
-        // the field — eight blank amounts were eight clauses wrapping to three
-        // lines, over rows that carried no visible number to match them to.
+        // The split branch groups defects by KIND and renders each offending row
+        // number as a button that focuses the field — printing each
+        // index-prefixed sentence verbatim would turn eight blank amounts into
+        // eight clauses wrapping to three lines, over rows that carry no visible
+        // number to match them to.
         //
-        // The sentence itself has not changed and is still what the Save
+        // The sentence ("Posting 2: amount is required.") is still what the Save
         // button's tooltip shows; it is the accessible name of the button
         // below, which is why this asserts on the name and not on text.
         expect(
@@ -297,8 +353,9 @@ describe('amounts', () => {
 
 describe('the outside-pointerdown handler', () => {
     // The gate turns this off, so nothing in the repo exercises it. If the ref
-    // and the effect are ever separated, `containerRef.current?.contains(...)`
-    // yields undefined and the editor cancels on its OWN Save click.
+    // and the effect are ever separated, the ref is empty when the effect asks
+    // whether the press happened inside, and the editor cancels on its OWN
+    // Save click.
     it('does not cancel when the click is inside the editor', async () => {
         const onCancel = vi.fn();
         const onSavePatch = vi.fn();
@@ -396,6 +453,176 @@ describe('Escape, and what it must not throw away', () => {
         renderEditor(splitMode(2), { onCancel });
 
         await userEvent.click(await screen.findByLabelText('Posting 1 amount'));
+        await userEvent.keyboard('{Escape}');
+        expect(onCancel).toHaveBeenCalledTimes(1);
+    });
+
+    // The payee's suggestions follow the category picker's rule: the first
+    // Escape closes the list and the edit stays open with what was typed; the
+    // second, with no list open, cancels.
+    const PAYEES: PayeeSuggestion[] = [
+        { name: 'Payee A', count: 2, lastUsedAt: '2026-01-01T00:00:00Z' },
+        { name: 'Payee B', count: 1, lastUsedAt: '2026-01-01T00:00:00Z' },
+    ];
+
+    it('closes an open payee list on Escape and keeps the edit, with the typed text', async () => {
+        const onCancel = vi.fn();
+        renderEditor(splitMode(1), { onCancel }, { payees: PAYEES });
+
+        const payee = await screen.findByRole('combobox', { name: 'Payee' });
+        await userEvent.clear(payee);
+        await userEvent.type(payee, 'Pay');
+        expect(screen.getByRole('option', { name: 'Payee B' })).toBeInTheDocument();
+
+        await userEvent.keyboard('{Escape}');
+
+        expect(screen.queryByRole('listbox')).toBeNull();
+        expect(onCancel).not.toHaveBeenCalled();
+        expect(payee).toHaveFocus();
+        expect(payee).toHaveValue('Pay');
+    });
+
+    it('cancels on the second Escape, once the payee list is closed', async () => {
+        const onCancel = vi.fn();
+        renderEditor(splitMode(1), { onCancel }, { payees: PAYEES });
+
+        const payee = await screen.findByRole('combobox', { name: 'Payee' });
+        await userEvent.clear(payee);
+        await userEvent.type(payee, 'Pay');
+        expect(screen.getByRole('option', { name: 'Payee A' })).toBeInTheDocument();
+        await userEvent.keyboard('{Escape}');
+        expect(onCancel).not.toHaveBeenCalled();
+
+        await userEvent.keyboard('{Escape}');
+        expect(onCancel).toHaveBeenCalledTimes(1);
+    });
+
+    it('cancels from the payee field when nothing it suggests is on screen', async () => {
+        // No list, nothing to close: the first Escape is the edit's.
+        const onCancel = vi.fn();
+        renderEditor(splitMode(1), { onCancel }, { payees: PAYEES });
+
+        const payee = await screen.findByRole('combobox', { name: 'Payee' });
+        await userEvent.clear(payee);
+        await userEvent.type(payee, 'zzz');
+        expect(payee).toHaveValue('zzz');
+        expect(screen.queryByRole('listbox')).toBeNull();
+
+        await userEvent.keyboard('{Escape}');
+        expect(onCancel).toHaveBeenCalledTimes(1);
+    });
+
+    it('closes an open tags list on Escape, then cancels on the next one', async () => {
+        // The same rule for the tags list. Its filter field goes away with the
+        // list, so focus returns to the button that opened it: left on the
+        // page, the second Escape would never reach the editor.
+        const onCancel = vi.fn();
+        renderEditor(splitMode(1), { onCancel });
+
+        const button = await screen.findByLabelText('Edit Tags');
+        await userEvent.click(button);
+        const filter = await screen.findByLabelText('Filter tags');
+        await userEvent.type(filter, 'wo');
+        expect(filter).toHaveFocus();
+
+        await userEvent.keyboard('{Escape}');
+        expect(screen.queryByLabelText('Filter tags')).toBeNull();
+        expect(onCancel).not.toHaveBeenCalled();
+        expect(button).toHaveFocus();
+
+        await userEvent.keyboard('{Escape}');
+        expect(onCancel).toHaveBeenCalledTimes(1);
+    });
+
+    it('closes the tags list when Shift+Tab leaves it for the memo', async () => {
+        // A list still on screen with focus in another field would take an
+        // Escape meant for it to the editor. Leaving the control closes it,
+        // so no list is showing when the Escape there cancels.
+        const onCancel = vi.fn();
+        renderEditor(splitMode(1), { onCancel });
+
+        const button = await screen.findByLabelText('Edit Tags');
+        await userEvent.click(button);
+        expect(await screen.findByLabelText('Filter tags')).toHaveFocus();
+
+        await userEvent.tab({ shift: true });
+        expect(button).toHaveFocus();
+        expect(screen.getByLabelText('Filter tags')).toBeInTheDocument();
+
+        await userEvent.tab({ shift: true });
+        expect(screen.getByDisplayValue('umbrella memo')).toHaveFocus();
+        expect(screen.queryByLabelText('Filter tags')).toBeNull();
+
+        await userEvent.keyboard('{Escape}');
+        expect(onCancel).toHaveBeenCalledTimes(1);
+    });
+
+    it('closes the category list when Tab leaves it for the amount', async () => {
+        // The list opens on focus. Still on screen with focus in the amount,
+        // it would take the Escape meant for it to the editor. Leaving the
+        // control closes it, so no list is showing when the Escape there
+        // cancels.
+        const onCancel = vi.fn();
+        renderEditor(splitMode(1), { onCancel });
+
+        const picker = await screen.findByRole('combobox', { name: 'Category' });
+        await userEvent.click(picker);
+        expect(await screen.findByRole('listbox')).toBeInTheDocument();
+        expect(picker).toHaveAttribute('aria-expanded', 'true');
+
+        await userEvent.tab();
+        expect(screen.getByLabelText('Amount')).toHaveFocus();
+        expect(picker).toHaveAttribute('aria-expanded', 'false');
+        expect(screen.queryByRole('listbox')).toBeNull();
+
+        await userEvent.keyboard('{Escape}');
+        expect(onCancel).toHaveBeenCalledTimes(1);
+    });
+
+    it('closes the category list on Escape from its filter buttons, then cancels on the next one', async () => {
+        // With a money account to transfer to, the list carries
+        // All · Accounts · Categories, and Tab from Category reaches them
+        // before Amount. An Escape there is the list's, as it is in the input:
+        // it closes the list, gives focus back to the input and keeps the edit.
+        const onCancel = vi.fn();
+        renderEditor(splitMode(1), { onCancel }, {
+            accounts: [...ACCOUNTS, account({ id: SAVINGS_ID, name: 'Savings' })],
+        });
+
+        const picker = await screen.findByRole('combobox', { name: 'Category' });
+        await userEvent.click(picker);
+        expect(await screen.findByRole('listbox')).toBeInTheDocument();
+
+        await userEvent.tab();
+        expect(screen.getByRole('button', { name: /^All/ })).toHaveFocus();
+        expect(screen.getByRole('listbox')).toBeInTheDocument();
+
+        await userEvent.keyboard('{Escape}');
+        expect(screen.queryByRole('listbox')).toBeNull();
+        expect(onCancel).not.toHaveBeenCalled();
+        expect(picker).toHaveFocus();
+        expect(picker).toHaveAttribute('aria-expanded', 'false');
+
+        await userEvent.keyboard('{Escape}');
+        expect(onCancel).toHaveBeenCalledTimes(1);
+    });
+
+    it('closes a split\'s actions menu on Escape, then cancels on the next one', async () => {
+        // The menu holds focus while open. Closing it hands focus back to the
+        // button that opened it; dropped on the page instead, the second
+        // Escape would never reach the editor.
+        const onCancel = vi.fn();
+        renderEditor(splitMode(2), { onCancel });
+
+        const opener = await screen.findByLabelText('Actions for posting 1');
+        await userEvent.click(opener);
+        expect(screen.getByRole('menu')).toHaveFocus();
+
+        await userEvent.keyboard('{Escape}');
+        expect(screen.queryByRole('menu')).toBeNull();
+        expect(onCancel).not.toHaveBeenCalled();
+        expect(opener).toHaveFocus();
+
         await userEvent.keyboard('{Escape}');
         expect(onCancel).toHaveBeenCalledTimes(1);
     });

@@ -21,7 +21,7 @@ public sealed class OutboundPolicyTests
     [InlineData("10.1.2.3")]
     [InlineData("172.17.0.1")]          // Docker's bridge
     [InlineData("172.18.0.2")]          // a compose network: postgres resolves here
-    [InlineData("192.168.1.38")]
+    [InlineData("192.168.0.25")]
     [InlineData("169.254.169.254")]     // cloud metadata
     [InlineData("100.64.0.1")]          // carrier-grade NAT
     [InlineData("0.0.0.0")]

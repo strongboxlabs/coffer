@@ -7,7 +7,7 @@
 
 ## Context
 
-Two problems surfaced while using the registers as a daily workhorse:
+Two problems with the registers as a daily workhorse:
 
 1. **Divergent chrome from duplicated code.** The bank and investment
    registers each hand-rolled their list chrome (surface, column-header
@@ -56,7 +56,9 @@ render through these; the chrome can no longer drift.
 - The redundant "All ledgers" and duplicate ledger-name nav rows are
   removed (the picker carries ledger context + switching; the landing
   page stays reachable via the main-pane breadcrumb). The top now reads
-  picker → account-filter tabs → accounts.
+  picker → account-filter tabs → accounts. (The tabs were removed on
+  2026-10-20, ADR-0106: picker → destinations → accounts by type, with
+  folders.)
 - Account categories are offset under a faint left rail and the rows are
   denser.
 
@@ -65,7 +67,7 @@ render through these; the chrome can no longer drift.
 ### Positive
 - The two registers are visually identical by construction; new fields
   inherit the chrome.
-- The reported grey-rows bug is fixed structurally (shared white
+- The grey-rows defect is fixed structurally (shared white
   surface), not patched per-page.
 - Secondary text clears WCAG AA; the focused/selected/review states read
   at a glance in a dense grid.

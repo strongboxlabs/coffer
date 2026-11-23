@@ -43,7 +43,7 @@ public static class MembersEndpoints
         if (result == LedgersRepository.MemberChangeResult.Ok)
         {
             // An owner demoted here can no longer invite to this ledger, so the invites
-            // they sent stop being theirs to hand out (2026-10-12 audit, M6).
+            // they sent stop being theirs to hand out (ADR-0105 D4).
             await invites.DeleteUnauthorizedIssuedByAsync(userId, cancellationToken).ConfigureAwait(false);
             await audit.AppendAsync(AdminAuditActions.MemberRoleChanged, currentUser.UserId,
                 $"ledger {ledgerId}: user {userId} is now {role}", cancellationToken).ConfigureAwait(false);
@@ -59,8 +59,8 @@ public static class MembersEndpoints
         var result = await ledgers.RemoveMemberAsync(ledgerId, userId, cancellationToken).ConfigureAwait(false);
         if (result == LedgersRepository.MemberChangeResult.Ok)
         {
-            // Without this a removed owner kept any owner invite they had sent as a way
-            // back in (M6).
+            // Without this a removed owner keeps any owner invite they have sent as a way
+            // back in (ADR-0105 D4).
             await invites.DeleteUnauthorizedIssuedByAsync(userId, cancellationToken).ConfigureAwait(false);
             await audit.AppendAsync(AdminAuditActions.MemberRemoved, currentUser.UserId,
                 $"ledger {ledgerId}: user {userId}", cancellationToken).ConfigureAwait(false);

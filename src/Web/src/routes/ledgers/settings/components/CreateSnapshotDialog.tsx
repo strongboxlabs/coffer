@@ -1,7 +1,8 @@
-import { useState } from 'react';
-import { useMutation } from '@tanstack/react-query';
+import { useState, type RefObject } from 'react';
+import { useMutation } from '@/lib/mutation';
 
 import { ApiError, createSnapshot } from '@/lib/api';
+import type { SnapshotSummary } from '@/lib/types';
 import { Button } from '@/components/ui/Button';
 import { FieldLabel } from '@/components/ui/FieldLabel';
 import { Modal } from '@/components/ui/Modal';
@@ -19,10 +20,17 @@ export function CreateSnapshotDialog({
     ledgerId,
     onClose,
     onCreated,
+    fallbackFocusRef,
 }: {
     ledgerId: string;
     onClose: () => void;
-    onCreated: () => void;
+    /** The snapshot was made. The create stays pending until what this
+     *  returns has settled: the host refetches its list there, then closes. */
+    onCreated: (snapshot: SnapshotSummary) => Promise<void> | void;
+    /** Where focus goes on close when the control that opened the dialog can
+     *  no longer take it (Modal): at the cap, '+ Create snapshot' is disabled
+     *  by the snapshot just made. */
+    fallbackFocusRef?: RefObject<HTMLElement | null>;
 }) {
     const [description, setDescription] = useState('');
 
@@ -33,7 +41,8 @@ export function CreateSnapshotDialog({
                     ? null
                     : description.trim(),
             }),
-        onSuccess: () => onCreated(),
+        // Returned, so the create stays pending while the host refetches.
+        onSuccess: (response) => onCreated(response.snapshot),
     });
 
     function handleSubmit(e: React.FormEvent) {
@@ -52,6 +61,7 @@ export function CreateSnapshotDialog({
             onClose={onClose}
             titleId="create-snapshot-title"
             className="max-w-md"
+            fallbackFocusRef={fallbackFocusRef}
         >
             <form onSubmit={handleSubmit}>
                 <header className="border-b border-border px-4 py-3">
@@ -95,7 +105,7 @@ export function CreateSnapshotDialog({
                         variant="secondary"
                         size="sm"
                         onClick={onClose}
-                        disabled={createMutation.isPending}
+                        pending={createMutation.isPending}
                     >
                         Cancel
                     </Button>
@@ -103,9 +113,10 @@ export function CreateSnapshotDialog({
                         type="submit"
                         variant="primary"
                         size="sm"
-                        disabled={createMutation.isPending}
+                        pending={createMutation.isPending}
+                        pendingLabel="Creating…"
                     >
-                        {createMutation.isPending ? 'Creating…' : 'Create'}
+                        Create
                     </Button>
                 </footer>
             </form>

@@ -1,25 +1,25 @@
 -- ---------------------------------------------------------------------------
 -- 238 — only an EXECUTION prices a day. The rule stops being a blacklist.
 --
--- Third correction to one principle (ADR-0084 D6: a share movement is not a
--- price), and the reason there was a third is structural, not a missed case.
+-- One principle (ADR-0084 D6: a share movement is not a price), and a gap whose
+-- cause is structural, not a missed case.
 --
--- 235 excluded a Moneydance ShrsIn/ShrsOut priced at the importer's nominal.
--- 237 widened that to those actions whatever figure they carry. Both keyed on
+-- 235 excludes a Moneydance ShrsIn/ShrsOut priced at the importer's nominal.
+-- 237 widens that to those actions whatever figure they carry. Both key on
 -- `provider_raw_payload->>'qif_invst_action'` — the MONEYDANCE spelling — and
--- so neither could see Coffer's own: `convert_in_kind_transfer` deletes the
+-- so neither sees Coffer's own: `convert_in_kind_transfer` deletes the
 -- imported pair and recreates it natively, giving a header with
 -- `action = 'transfer_shares'` and no provider payload at all. Its legs are
 -- priced by the FIFO plan at each lot's carried basis; LedgerActions says so in
 -- as many words ("moves FIFO lots + cost basis source -> destination with zero
 -- realized gain").
 --
--- Each fix was a new entry on a blacklist, found in production. A blacklist
--- FAILS OPEN: an action nobody enumerated prices days by default, so the next
--- unconsidered one is the next incident. Inverting it is the actual fix.
+-- Each such fix is a new entry on a blacklist. A blacklist FAILS OPEN: an action
+-- nobody enumerated prices days by default. Inverting it is the actual fix.
 --
 -- WHAT PRICES A DAY. Enumerated from every (action, provider_action) pair that
--- carries a priced security leg on a real ledger:
+-- the importer's QIF-action mapping (InvestmentTransactionMapper) or a native
+-- Coffer write can put on a priced security leg:
 --
 --   buy   / (native), Buy                      a purchase
 --   buyx  / (native), Buy, BuyX                a purchase that also moved cash
@@ -37,19 +37,17 @@
 --   transfer_shares/*              in-kind move, legs carry lot basis
 --
 -- Note `buyx` appears on both sides: it is the mapping target for a real BuyX
--- AND for ShrsIn, both common. The Coffer action alone cannot decide, which
+-- AND for ShrsIn. The Coffer action alone cannot decide, which
 -- is why both fields are arguments.
 --
 -- A new action now prices nothing until someone says it should. That is the
 -- safe direction: a missing price shows as a stale valuation, a wrong one
--- silently mis-values a holding and — as this sequence proved — the consistency
--- check cannot see it, because the checker shares the rule.
+-- silently mis-values a holding and the consistency check cannot see it,
+-- because the checker shares the rule.
 --
--- WHY THE IN-KIND CASE WAS NOT CAUGHT BEFORE SHIPPING TWICE. The dev dataset
--- carries no `transfer_shares` legs; its in-kind transfers were never
--- converted. No measurement against dev could show it. It is covered
--- synthetically in db/test/verify_share_movements_are_not_prices.sql, which is
--- the only place it can be exercised here.
+-- TESTING THE IN-KIND CASE. A ledger whose in-kind transfers were never
+-- converted carries no `transfer_shares` legs, so only converted data exercises
+-- it. db/test/verify_share_movements_are_not_prices.sql covers it synthetically.
 --
 -- `p_amount` goes: 237 removed the arithmetic that used it, and keeping a
 -- parameter "for a future provider" was speculation.

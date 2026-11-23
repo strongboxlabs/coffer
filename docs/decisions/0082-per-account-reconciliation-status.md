@@ -140,11 +140,11 @@ upserting the winner leg's `txn_leg_recon` row.
 
 ### It applies to INVESTMENT merges too (amendment)
 
-This section was written in bank vocabulary and the investment merge branch was
-built without it, so for a while a brokerage merge stamped the loser, adopted
-the date and recomputed holdings — and left the survivor `uncleared`.
+This section is written in bank vocabulary, but the investment merge branch
+follows it too: a brokerage merge stamps the loser, adopts the date, recomputes
+holdings and bumps the survivor, rather than leaving it `uncleared`.
 
-That was an oversight, not a decision. The rule's reasoning is that a feed match
+The rule's reasoning is that a feed match
 is the **institution acknowledging the transaction**, and nothing in it depends
 on the institution being a bank: a brokerage confirming a trade is the same
 evidence in the same shape, arriving through the same import path. Read

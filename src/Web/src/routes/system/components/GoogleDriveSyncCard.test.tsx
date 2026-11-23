@@ -99,6 +99,16 @@ describe('GoogleDriveSyncCard', () => {
         expect(screen.getByRole('button', { name: /connect google drive/i })).toBeInTheDocument();
         expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     });
+
+    // ADR-0023 §L: the confirm gives focus back to Disconnect, which the landed
+    // disconnect then swaps for Connect Google Drive; focus goes with it, never
+    // to the page.
+    it('hands focus to Connect Google Drive once the disconnect lands', async () => {
+        await disconnectAnswering(true);
+
+        expect(screen.queryByRole('dialog')).toBeNull();
+        expect(screen.getByRole('button', { name: /connect google drive/i })).toHaveFocus();
+    });
 });
 
 function json(body: unknown): Response {

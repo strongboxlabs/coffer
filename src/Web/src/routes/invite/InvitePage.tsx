@@ -1,5 +1,6 @@
 import { useId, useState, type FormEvent } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 import { useNavigate, useParams } from '@tanstack/react-router';
 
 import {
@@ -15,6 +16,7 @@ import { usernameProblem } from '@/lib/username';
 import { BrandHeader } from '@/components/ui/BrandHeader';
 import { Panel, PanelBody } from '@/components/ui/Panel';
 import { Button } from '@/components/ui/Button';
+import { PendingLabel } from '@/components/ui/PendingLabel';
 import { Input } from '@/components/ui/Input';
 import { FieldLabel } from '@/components/ui/FieldLabel';
 import { RecoveryCodes } from '@/components/RecoveryCodes';
@@ -117,10 +119,11 @@ function AcceptInvite({ token, preview }: { token: string; preview: InvitePrevie
                     ) : null}
                     <Button
                         className="w-full"
-                        disabled={accept.isPending}
+                        pending={accept.isPending}
+                        pendingLabel="Accepting…"
                         onClick={() => accept.mutate()}
                     >
-                        {accept.isPending ? 'Accepting…' : 'Accept invitation'}
+                        Accept invitation
                     </Button>
                 </PanelBody>
             </Panel>
@@ -214,10 +217,9 @@ function RedeemInvite({ token, preview }: { token: string; preview: InvitePrevie
                                         : `${usernameId}-hint`
                                 }
                             />
-                            {/* Same rule and same wording as setup (ADR-0089).
-                                This form used to accept anything non-empty and
-                                surface the server's refusal only after the
-                                WebAuthn ceremony. */}
+                            {/* Same rule and same wording as setup (ADR-0089),
+                                checked here so the server's refusal does not
+                                arrive only after the WebAuthn ceremony. */}
                             {usernameShowsError ? (
                                 <p
                                     id={`${usernameId}-error`}
@@ -263,17 +265,14 @@ function RedeemInvite({ token, preview }: { token: string; preview: InvitePrevie
                         <Button
                             type="submit"
                             className="w-full"
-                            disabled={
-                                redeem.isPending ||
-                                usernameError !== null ||
-                                !displayNameValid
-                            }
+                            disabled={usernameError !== null || !displayNameValid}
+                            pending={redeem.isPending}
+                            // Two stages, both laid out from the first render (PendingLabel).
+                            pendingLabel={(
+                                <PendingLabel pending={ceremony} label="Creating account…" pendingLabel="Tap your authenticator…" />
+                            )}
                         >
-                            {ceremony
-                                ? 'Tap your authenticator…'
-                                : redeem.isPending
-                                    ? 'Creating account…'
-                                    : 'Create account'}
+                            Create account
                         </Button>
                     </form>
                 </PanelBody>

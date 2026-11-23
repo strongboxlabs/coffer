@@ -9,7 +9,7 @@
 -- the same primitive the backup passphrase uses, ADR-0060) — never plaintext —
 -- and is re-wrapped by `rotate-kek` alongside the LEKs + passphrase (ADR-0062
 -- D3). Only the encrypted `.cofferbak` is ever uploaded; the passphrase + KEK
--- never leave the host (D1).
+-- never leave the host (ADR-0062 D1).
 --
 -- Single-row by construction (id = 1). Service-role only, same posture as
 -- global_scheduled_jobs (mig 139): RLS deny-all for coffer_app, the scheduler

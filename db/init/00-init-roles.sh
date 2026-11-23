@@ -118,30 +118,31 @@ BEGIN
     END IF;
 END \$Init\$;
 
--- Disable JIT for the runtime API role. DELIBERATE, measured-optimal
--- configuration for this OLTP workload — NOT an interim stopgap (see
--- ADR-0046 close-out + docs/follow-ups.md "View join cost").
+-- Disable JIT for the runtime API role. A DELIBERATE configuration for
+-- this OLTP workload, NOT an interim stopgap (ADR-0046).
 --
 -- The register read path goes through resolved_transactions, which
--- under ADR-0022 joins txn_headers + txn_legs + txn_header_overrides +
--- txn_leg_overrides + a self-LEFT-JOIN on txn_legs for the
--- counterparty, plus accounts and the recursive account_path()
--- function. A full-account / report scan over a large account crosses
--- jit_above_cost and Postgres compiles ~282 functions per query.
+-- joins txn_legs + live_txn_headers + accounts, LEFT JOINs
+-- txn_header_originals, txn_leg_recon, a self-join on txn_legs for the
+-- counterparty (and its account), securities,
+-- txn_header_account_balances and provider_security_mappings, and
+-- calls the recursive account_path() function plus a per-row tags
+-- array subquery. A full-account / report scan over a large account crosses
+-- jit_above_cost, and Postgres then compiles every expression in that
+-- wide plan before the query starts.
 --
--- Re-measured on real data after the ADR-0046 work removed every
--- per-row correlated subquery (posting counts mig 120; txn_group_id
--- EXISTS mig 122) — on a large, long-history account, as coffer_app with RLS on:
+-- With every per-row correlated subquery gone (ADR-0046: posting counts
+-- mig 120; txn_group_id EXISTS mig 122), as coffer_app with RLS on:
 --
---   Windowed page (LIMIT 50, the SPA's fetch):  ~102ms off / ~118ms on
+--   Windowed page (LIMIT 50, the SPA's fetch)
 --       — does NOT trip JIT either way (below jit_above_cost), so the
 --         role setting is a no-op on the path users actually hit.
---   Full-account scan (reports/aggregation):    ~1653ms off / ~1755ms on
---       — STILL trips JIT (282 functions, ~70-100ms compile) with ZERO
---         execution benefit. JIT amortises compile over long compute-
---         bound execution; a row-returning OLTP read just pays the cost.
+--   Full-account scan (reports/aggregation)
+--       — trips JIT and gains nothing from it. JIT amortises compile
+--         over long compute-bound execution; a row-returning OLTP read
+--         does little computation per row, so it just pays the compile.
 --
--- So jit=off is neutral on the page and a ~70-100ms win on heavy scans.
+-- So jit=off is neutral on the page and saves the whole compile on heavy scans.
 -- Lifting it would only REGRESS reports. coffer_service keeps JIT default
 -- so genuinely compute-heavy batch jobs (importer, balance
 -- reconciliation) can still benefit; per-statement SET LOCAL jit

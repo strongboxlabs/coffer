@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { InvestmentRow } from '@/lib/types';
+import { NO_NOTES } from '@/lib/annotations/rowNotesFixture';
 import { legsToDraft } from './legsToDraft';
 
 const BROKERAGE = '11111111-1111-1111-1111-111111111111';
@@ -23,8 +24,8 @@ function mkLeg(
     },
 ): InvestmentRow {
     return {
+        ...NO_NOTES,
         kind: 'investment',
-        legTags: [],
         id: crypto.randomUUID(),
         payee: header.payee,
         memo: header.memo,
@@ -32,8 +33,9 @@ function mkLeg(
         transactedAt: null,
         status: 'uncleared',
         isHidden: false,
-        hasOverrides: false,
         balanceAfter: null,
+        currencyCode: 'USD',
+        balanceCurrencyCode: 'USD',
         origin: 'manual',
         isPending: false,
         investmentAction: 'buy',
@@ -50,8 +52,6 @@ function mkLeg(
         clearedAt: null,
         clearedByUserId: null,
         createdAt: '2026-05-15T00:00:00Z',
-        legMemo: null,
-        headerMemo: null,
         onlineMatchFitid: null,
         onlineMatchFiId: null,
         needsReview: false,
@@ -181,7 +181,7 @@ describe('legsToDraft', () => {
         expect(draft.categoryAccountId).toBeNull();
     });
 
-    it('recovers a DivXfr (income + transfer)', () => {
+    it('recovers a DividendXfr (income + transfer)', () => {
         const legs = [
             mkLeg({ accountId: BROKERAGE, amount: 100, postingRole: 'income' }),
             mkLeg({
@@ -211,5 +211,39 @@ describe('legsToDraft', () => {
         expect(draft.payee).toBe('');
         expect(draft.memo).toBe('');
         expect(draft.checkNumber).toBe('');
+    });
+});
+
+// ADR-0114 D14: a saved transaction is never refilled. The transfer account's own leg
+// seeds the second amount as its magnitude, fixed, so a transfer between currencies opens
+// with both stored amounts.
+describe('legsToDraft — the second amount', () => {
+    it('seeds a transfer\'s other leg as stored, fixed', () => {
+        const draft = legsToDraft('transfer', BROKERAGE, header, [
+            mkLeg({ accountId: BROKERAGE, amount: 90, postingRole: 'transfer' }),
+            mkLeg({ accountId: XFER_DEST, amount: -100.25, postingRole: 'transfer' }),
+        ]);
+        expect(draft).toMatchObject({ amount: 90, transferAmount: 100.25, transferAmountFixed: true });
+    });
+
+    it('seeds a BuyXfr\'s transfer leg, the trade amount\'s pair, not the fee', () => {
+        const draft = legsToDraft('buyx', BROKERAGE, header, [
+            mkLeg({ accountId: SIBLING, amount: 90, postingRole: 'security', securityId: SECURITY, quantity: 10, unitPrice: 9 }),
+            mkLeg({ accountId: BROKERAGE, amount: -90, postingRole: 'security' }),
+            mkLeg({ accountId: BROKERAGE, amount: 90, postingRole: 'transfer' }),
+            mkLeg({ accountId: XFER_DEST, amount: -100, postingRole: 'transfer' }),
+            mkLeg({ accountId: FEE_CAT, amount: 5, postingRole: 'fee' }),
+            mkLeg({ accountId: BROKERAGE, amount: -5, postingRole: 'fee' }),
+        ]);
+        expect(draft.transferAmount).toBe(100);
+    });
+
+    it('seeds nothing on an action that carries no second amount', () => {
+        const draft = legsToDraft('dividend_cash', BROKERAGE, header, [
+            mkLeg({ accountId: BROKERAGE, amount: 12, postingRole: 'income', securityId: SECURITY }),
+            mkLeg({ accountId: CASH_CAT, amount: -12, postingRole: 'income', securityId: SECURITY }),
+        ]);
+        expect(draft.amount).toBe(12);
+        expect(draft).not.toHaveProperty('transferAmount');
     });
 });

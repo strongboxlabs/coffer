@@ -1,9 +1,9 @@
 import { useEffect, useId, useState, type FormEvent } from 'react';
 import {
-    useMutation,
     useQuery,
     useQueryClient,
 } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 import { useNavigate, useParams } from '@tanstack/react-router';
 
 import {
@@ -33,6 +33,8 @@ import { Button } from '@/components/ui/Button';
 import { FieldLabel } from '@/components/ui/FieldLabel';
 import { Input } from '@/components/ui/Input';
 import { Panel, PanelBody } from '@/components/ui/Panel';
+import { pendingChoiceProps, usePendingButtonProps } from '@/components/ui/pending';
+import { PendingLabel } from '@/components/ui/PendingLabel';
 import { BrandHeader } from '@/components/ui/BrandHeader';
 
 // Username rules live in @/lib/username so this form and the invite form can't
@@ -49,24 +51,23 @@ import { BrandHeader } from '@/components/ui/BrandHeader';
  * After /complete returns, the recovery-codes panel takes over and
  * (acknowledgement gate) routes onward to the ledger hub.
  *
- * Setup does NOT choose a ledger (ADR-0088). It creates the user and passkey,
- * plus a Demo ledger if the box is ticked; the hub is the post-setup home and
- * carries both "New ledger" and "Import from Moneydance". Zero ledgers is a
- * supported landing — the hub renders an empty state with both CTAs.
+ * Setup asks nothing about ledgers and creates none (ADR-0088, as amended by
+ * ADR-0115 D2). It creates the user and passkey; the hub is the post-setup home
+ * and carries "Import from Moneydance", "Demo ledger" and "New ledger". Zero
+ * ledgers is the normal landing — the hub renders an empty state offering a new
+ * ledger or a Demo.
  *
  * Flow (drawn in ADR-0013, expanded by ADR-0022 follow-up, ADR-0088):
  *   1. Operator finds the bootstrap token in API logs — or in the
  *      dev-up-docker.sh output — and opens `/setup/{token}`.
  *   2. Page mounts; GET /info validates the token.
- *   3. User fills username, display name, passkey label; optionally
- *      ticks "Include a Demo ledger".
+ *   3. User fills username, display name, passkey label.
  *   4. performSetup() runs /begin → WebAuthn ceremony → /complete.
  *      The page shows "Tap or insert your authenticator…" once /begin
  *      has returned so the user knows the prompt is imminent (a USB
  *      security key is inserted then tapped; a platform one just tapped).
- *   5. /complete sets the cookie + returns recovery codes, and the Demo
- *      ledger if one was seeded. RecoveryCodes panel gates onward
- *      navigation behind explicit user acknowledgement.
+ *   5. /complete sets the cookie + returns recovery codes. RecoveryCodes
+ *      panel gates onward navigation behind explicit user acknowledgement.
  *   6. After acknowledgement, the WelcomePanel shows the master key and points at
  *      backups (ADR-0095). Setup itself ends at the codes: they are the one secret
  *      that cannot be recovered, so they are the only one it gates on.
@@ -179,11 +180,10 @@ function SetupChooser({ token, partSizeBytes }: { token: string; partSizeBytes: 
                             <span className="block text-sm font-medium text-text">
                                 Set up a new install
                             </span>
-                            {/* No ledger here: ADR-0088 took ledger creation out of setup
-                                ("zero ledgers is a supported landing"), leaving a Demo
-                                ledger as an opt-in box on the form. The old copy still
-                                promised "the first user + ledger", which is a promise the
-                                flow stopped keeping. */}
+                            {/* No ledger here: setup creates none (ADR-0088, as amended
+                                by ADR-0115 D2), and the Demo is added from the hub. So
+                                the copy promises the first user and a passkey, not a
+                                ledger. */}
                             <span className="block text-[0.6875rem] text-text-muted">
                                 Create the first user and register a passkey.
                             </span>
@@ -215,6 +215,7 @@ interface SetupFormProps {
 }
 
 function SetupForm({ token, onBack }: SetupFormProps) {
+    const pendingProps = usePendingButtonProps();
     const navigate = useNavigate();
     const queryClient = useQueryClient();
 
@@ -225,10 +226,6 @@ function SetupForm({ token, onBack }: SetupFormProps) {
     const [username, setUsername] = useState('');
     const [displayName, setDisplayName] = useState('');
     const [credentialNickname, setCredentialNickname] = useState('');
-
-    // Demo opt-in (ADR-0088). Unchecked by default: someone setting up their
-    // own books shouldn't acquire a ledger full of sample data by accident.
-    const [includeDemo, setIncludeDemo] = useState(false);
 
     const [ceremonyStarted, setCeremonyStarted] = useState(false);
     const [result, setResult] = useState<SetupCompleteResponse | null>(null);
@@ -273,16 +270,13 @@ function SetupForm({ token, onBack }: SetupFormProps) {
             username: username.trim(),
             displayName: displayName.trim(),
             credentialNickname: credentialNickname.trim(),
-            includeDemo,
             onCeremonyStart: () => setCeremonyStarted(true),
         });
     }
 
     // Result + acknowledgement path
     // `!= null`, not `!== null`: an undefined response would slip past a
-    // null-only check and throw on `result.username` while rendering. Now that
-    // ledgerId/ledgerName are legitimately nullable (ADR-0088), the success
-    // screen has to be defensive about the payload rather than assume it.
+    // null-only check and throw on `result.username` while rendering.
     if (result != null) {
         return (
             <main className="mx-auto max-w-xl px-6 py-12">
@@ -298,16 +292,7 @@ function SetupForm({ token, onBack }: SetupFormProps) {
                                 <span className="font-medium text-text">
                                     {result.username}
                                 </span>
-                                .{' '}
-                                {result.ledgerName !== null ? (
-                                    <>
-                                        Seeded the{' '}
-                                        <span className="font-medium text-text">
-                                            {result.ledgerName}
-                                        </span>{' '}
-                                        ledger.
-                                    </>
-                                ) : null}
+                                .
                             </p>
                         </header>
                         {/* Setup gates on ONE secret: the recovery codes, which are
@@ -319,7 +304,6 @@ function SetupForm({ token, onBack }: SetupFormProps) {
                         {savedRecoveryCodes ? (
                             <WelcomePanel
                                 keyBase64={result.masterKeyBase64}
-                                hasLedger={result.ledgerName !== null}
                                 onContinue={() => navigate({ to: '/' })}
                             />
                         ) : (
@@ -337,17 +321,13 @@ function SetupForm({ token, onBack }: SetupFormProps) {
     const setupError = setupMutation.error
         ? errorMessage(setupMutation.error, 'Account setup failed.')
         : null;
-    const submitDisabled =
-        setupMutation.isPending ||
-        !usernameValid ||
-        !displayNameValid ||
-        !credentialNicknameValid;
+    const submitDisabled = !usernameValid || !displayNameValid || !credentialNicknameValid;
 
-    const buttonLabel = setupMutation.isPending
-        ? ceremonyStarted
-            ? 'Tap or insert your authenticator…'
-            : 'Creating account…'
-        : 'Create account';
+    // What Create account reads while pending, in two stages, both laid out from
+    // the first render so the button never changes size (PendingLabel).
+    const submittingLabel = (
+        <PendingLabel pending={ceremonyStarted} label="Creating account…" pendingLabel="Tap or insert your authenticator…" />
+    );
 
     return (
         <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center px-6 py-12">
@@ -357,9 +337,8 @@ function SetupForm({ token, onBack }: SetupFormProps) {
                     <header className="space-y-1">
                         <button
                             type="button"
-                            onClick={onBack}
-                            disabled={setupMutation.isPending}
-                            className="text-[0.6875rem] text-text-muted hover:text-text disabled:opacity-50"
+                            {...pendingProps(setupMutation.isPending, onBack)}
+                            className="text-[0.6875rem] text-text-muted hover:text-text disabled:opacity-50 aria-disabled:opacity-50"
                         >
                             ← Back
                         </button>
@@ -387,7 +366,7 @@ function SetupForm({ token, onBack }: SetupFormProps) {
                                 autoCorrect="off"
                                 spellCheck={false}
                                 required
-                                disabled={setupMutation.isPending}
+                                pending={setupMutation.isPending}
                                 value={username}
                                 onChange={(event) =>
                                     setUsername(event.target.value)
@@ -430,7 +409,7 @@ function SetupForm({ token, onBack }: SetupFormProps) {
                                 type="text"
                                 autoComplete="name"
                                 required
-                                disabled={setupMutation.isPending}
+                                pending={setupMutation.isPending}
                                 value={displayName}
                                 onChange={(event) =>
                                     setDisplayName(event.target.value)
@@ -456,7 +435,7 @@ function SetupForm({ token, onBack }: SetupFormProps) {
                                 autoComplete="off"
                                 placeholder="e.g. MacBook Touch ID"
                                 required
-                                disabled={setupMutation.isPending}
+                                pending={setupMutation.isPending}
                                 value={credentialNickname}
                                 onChange={(event) =>
                                     setCredentialNickname(event.target.value)
@@ -472,41 +451,6 @@ function SetupForm({ token, onBack }: SetupFormProps) {
                             </p>
                         </div>
 
-                        <fieldset
-                            className="space-y-2"
-                            disabled={setupMutation.isPending}
-                        >
-                            <legend className="text-sm font-medium">
-                                Sample data
-                            </legend>
-                            <label className="flex items-start gap-2 text-sm">
-                                <input
-                                    type="checkbox"
-                                    checked={includeDemo}
-                                    onChange={(event) =>
-                                        setIncludeDemo(event.target.checked)
-                                    }
-                                    className="mt-1 size-icon-md accent-accent"
-                                />
-                                <span className="flex-1 space-y-1">
-                                    <span className="block">
-                                        Include a Demo ledger
-                                    </span>
-                                    <span className="block text-[0.6875rem] text-text-muted">
-                                        A worked example with accounts,
-                                        categories and transactions, to explore
-                                        before you commit your own data. You can
-                                        delete it any time.
-                                    </span>
-                                </span>
-                            </label>
-                            <p className="text-[0.6875rem] text-text-muted">
-                                Either way, you'll land on your ledger list next,
-                                where you can create a ledger or import one from
-                                Moneydance.
-                            </p>
-                        </fieldset>
-
                         {setupError ? (
                             <p
                                 role="alert"
@@ -519,9 +463,11 @@ function SetupForm({ token, onBack }: SetupFormProps) {
                         <Button
                             type="submit"
                             disabled={submitDisabled}
+                            pending={setupMutation.isPending}
+                            pendingLabel={submittingLabel}
                             className="w-full"
                         >
-                            {buttonLabel}
+                            Create account
                         </Button>
                     </form>
                 </PanelBody>
@@ -546,6 +492,7 @@ function RestoreFlow({
     partSizeBytes: number;
     onBack: () => void;
 }) {
+    const pendingProps = usePendingButtonProps();
     const fileId = useId();
     const passphraseId = useId();
     const sourceKeyId = useId();
@@ -631,8 +578,7 @@ function RestoreFlow({
         sentBytes === null
             ? null
             : `Uploading — ${formatBytes(sentBytes)} of ${formatBytes(totalBytes)} sent.`;
-    const submitDisabled =
-        restoreMutation.isPending || source === null || passphrase.length === 0;
+    const submitDisabled = source === null || passphrase.length === 0;
 
     return (
         <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center px-6 py-12">
@@ -642,9 +588,8 @@ function RestoreFlow({
                     <header className="space-y-1">
                         <button
                             type="button"
-                            onClick={onBack}
-                            disabled={restoreMutation.isPending}
-                            className="text-[0.6875rem] text-text-muted hover:text-text disabled:opacity-50"
+                            {...pendingProps(restoreMutation.isPending, onBack)}
+                            className="text-[0.6875rem] text-text-muted hover:text-text disabled:opacity-50 aria-disabled:opacity-50"
                         >
                             ← Back
                         </button>
@@ -661,7 +606,7 @@ function RestoreFlow({
                     <form
                         onSubmit={(event) => {
                             event.preventDefault();
-                            if (!submitDisabled) restoreMutation.mutate();
+                            if (!submitDisabled && !restoreMutation.isPending) restoreMutation.mutate();
                         }}
                         className="space-y-4"
                         noValidate
@@ -676,9 +621,10 @@ function RestoreFlow({
                                 id={fileId}
                                 type="file"
                                 multiple
-                                disabled={restoreMutation.isPending}
-                                onChange={(event) => pickFiles(event.target.files)}
-                                className="block w-full text-sm text-text file:mr-3 file:rounded file:border file:border-border file:bg-surface-muted file:px-3 file:py-1.5 file:text-sm"
+                                className="block w-full text-sm text-text file:mr-3 file:rounded file:border file:border-border file:bg-surface-muted file:px-3 file:py-1.5 file:text-sm aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
+                                {...pendingChoiceProps<HTMLInputElement>(restoreMutation.isPending, {
+                                    onChange: (event) => pickFiles(event.target.files),
+                                })}
                             />
                             {source !== null && 'parts' in source ? (
                                 <p className="text-[0.6875rem] text-text-muted">
@@ -712,7 +658,7 @@ function RestoreFlow({
                                 type="password"
                                 autoComplete="off"
                                 required
-                                disabled={restoreMutation.isPending}
+                                pending={restoreMutation.isPending}
                                 value={passphrase}
                                 onChange={(event) => setPassphrase(event.target.value)}
                             />
@@ -735,7 +681,7 @@ function RestoreFlow({
                             <Input
                                 id={sourceKeyId}
                                 value={sourceKey}
-                                disabled={restoreMutation.isPending}
+                                pending={restoreMutation.isPending}
                                 onChange={(event) => setSourceKey(event.target.value)}
                                 placeholder="44-character base64, ending in ="
                                 autoComplete="off"
@@ -768,8 +714,9 @@ function RestoreFlow({
                             </p>
                         ) : null}
 
-                        <Button type="submit" disabled={submitDisabled} className="w-full">
-                            {restoreMutation.isPending ? 'Uploading…' : 'Restore'}
+                        <Button type="submit" disabled={submitDisabled} pending={restoreMutation.isPending}
+                            pendingLabel="Uploading…" className="w-full">
+                            Restore
                         </Button>
                     </form>
                 </PanelBody>

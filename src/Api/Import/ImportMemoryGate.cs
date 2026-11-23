@@ -4,8 +4,9 @@ namespace Coffer.Api.Import;
 /// One parsed Moneydance export in memory at a time, across every user (FU-092). Singleton.
 /// </summary>
 /// <remarks>
-/// A parsed export holds about 6.5 times its file size (measured on a large real export) until
-/// its preview returns or its import finishes. Nothing bounded how many were held at once:
+/// A parsed export holds a multiple of its file size in memory (estimated by
+/// <c>ImportEndpoints.EstimatedParseBytes</c> with a fixed safety factor) until its
+/// preview returns or its import finishes. Nothing bounded how many were held at once:
 /// the one-import-per-user rule ran only after the parse, so two users, or two previews,
 /// each parsed in full, and any user could take the process out of memory for everyone.
 /// The slot is taken before the parse and released when the document is: at the end of a

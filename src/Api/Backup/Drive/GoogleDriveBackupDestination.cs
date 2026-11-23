@@ -151,9 +151,9 @@ public sealed partial class GoogleDriveBackupDestination : IBackupDestination
         {
             // The token doesn't open under the current master KEK — a cross-KEK
             // restore, or a rotation whose new key never reached this process.
-            // Previously this escaped as a raw CryptographicException, unlike the
-            // ingest (IngestOrchestrator) and backup (BackupManager) paths which
-            // both translate it; ADR-0092 D5 closes that gap. Reconciliation
+            // Translated here, as the ingest (IngestOrchestrator) and backup
+            // (BackupManager) paths translate it, rather than escaping as a raw
+            // CryptographicException (ADR-0092 D5). Reconciliation
             // normally clears the blob on restore, so reaching here means the KEK
             // changed some other way.
             throw new DriveOAuthException(
@@ -168,7 +168,7 @@ public sealed partial class GoogleDriveBackupDestination : IBackupDestination
     /// </summary>
     /// <remarks>
     /// A backup over <see cref="BackupStore.PartSizeBytes"/> goes up as several
-    /// files (ADR-0101) rather than one, for the reason it was asked for:
+    /// files (ADR-0101) rather than one, because
     /// one interrupted upload of a large artifact restarts from zero, where one interrupted
     /// part of three costs a third. It also means the copy sitting in Drive is
     /// already in the shape a restore through a body-capped proxy can accept.

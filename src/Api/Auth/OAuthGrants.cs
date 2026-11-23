@@ -9,22 +9,22 @@ namespace Coffer.Api.Auth;
 /// (FU-087).
 /// </summary>
 /// <remarks>
-/// Refresh tokens are sliding: each refresh issues the next, so an app that kept
-/// refreshing kept its access for ever, and nothing listed it for the user to end. A grant
-/// now lasts <see cref="MaxAge"/> from the consent that created it, however often the app
+/// Refresh tokens are sliding: each refresh issues the next, so on their own an app that
+/// keeps refreshing keeps its access for ever. A grant therefore lasts
+/// <see cref="MaxAge"/> from the consent that created it, however often the app
 /// refreshes. After that the token endpoint refuses it, and the next connection is a new
 /// consent. Users see and revoke their grants on Account → Security, beside their MCP
 /// tokens.
 /// </remarks>
 public static class OAuthGrants
 {
-    /// <summary>A grant's longest life, counted from its authorization (decided 2026-10-19).</summary>
+    /// <summary>A grant's longest life, counted from its authorization.</summary>
     public static readonly TimeSpan MaxAge = TimeSpan.FromDays(90);
 
     /// <summary>
     /// How recent a sign-in satisfies <c>prompt=login</c>. The login page sends the user
     /// back to the very authorization request that carried it, so honouring the prompt on
-    /// every visit sent a freshly signed-in user straight back to the login page.
+    /// every visit would send a freshly signed-in user straight back to the login page.
     /// </summary>
     public static readonly TimeSpan PromptLoginFreshness = TimeSpan.FromMinutes(5);
 
@@ -32,6 +32,22 @@ public static class OAuthGrants
     /// One with no recorded creation is treated as past it: nothing vouches for its age.</summary>
     public static bool IsExpired(DateTimeOffset? createdAt, DateTimeOffset now) =>
         createdAt is not { } at || now - at > MaxAge;
+
+    /// <summary>
+    /// Whether an authorization is a live connection: valid and inside <see cref="MaxAge"/>.
+    /// A revoked or past-its-age one can no longer do anything. The one rule for what the
+    /// connection list shows, what a client's connection count counts, and what keeps a
+    /// client from being pruned, so the three cannot disagree.
+    /// </summary>
+    public static async Task<bool> IsLiveAsync(
+        IOpenIddictAuthorizationManager authorizations, object authorization, DateTimeOffset now,
+        CancellationToken ct)
+    {
+        if (!await authorizations.HasStatusAsync(authorization, Statuses.Valid, ct).ConfigureAwait(false))
+            return false;
+        var created = await authorizations.GetCreationDateAsync(authorization, ct).ConfigureAwait(false);
+        return !IsExpired(created, now);
+    }
 
     /// <summary>
     /// End a grant and every token issued under it. Used when a user revokes it, and when

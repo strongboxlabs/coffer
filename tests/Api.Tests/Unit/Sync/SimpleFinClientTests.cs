@@ -102,7 +102,7 @@ public sealed class SimpleFinClientTests
     }
 
     [Fact]
-    public async Task GetInstitutionNameAsync_returns_first_connection_name_and_uses_Basic_auth_header()
+    public async Task GetInstitutionNameAsync_returns_the_one_connection_name_and_uses_Basic_auth_header()
     {
         // SimpleFIN access URL: https://user:pass@host/path
         // The probe must use Authorization: Basic, NOT carry the
@@ -151,12 +151,54 @@ public sealed class SimpleFinClientTests
         Assert.Equal("probe-user:probe-pass", decoded);
     }
 
+    /// <summary>The probe's answer to a connection list naming
+    /// <paramref name="names"/>, one connection per name (null for an
+    /// entry with no <c>name</c>).</summary>
+    private static Task<string?> ProbeAsync(params string?[] names)
+    {
+        var connections = string.Join(",", names.Select((n, i) => n is null
+            ? $$"""{"conn_id":"c-{{i}}","org_id":"org-{{i}}","sfin_url":"https://sfin/{{i}}"}"""
+            : $$"""{"conn_id":"c-{{i}}","name":{{System.Text.Json.JsonSerializer.Serialize(n)}},"org_id":"org-{{i}}","sfin_url":"https://sfin/{{i}}"}"""));
+        var client = ClientFor(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent($$"""{"connections":[{{connections}}],"errlist":[],"accounts":[]}"""),
+        });
+        return client.GetInstitutionNameAsync("https://u:p@bridge.simplefin.org/access/x");
+    }
+
+    [Fact]
+    public async Task GetInstitutionNameAsync_keeps_a_name_every_connection_shares()
+    {
+        // Two connections at one institution: the connection is that
+        // institution's, so it starts with that name, trimmed.
+        Assert.Equal("Institution A", await ProbeAsync(" Institution A ", "Institution A"));
+    }
+
+    [Fact]
+    public async Task GetInstitutionNameAsync_returns_null_when_the_connections_name_several_institutions()
+    {
+        // Named after one of them, the connection would read as that
+        // institution's alone; null shows as "SimpleFIN".
+        Assert.Null(await ProbeAsync("Institution A", "Institution B"));
+        Assert.Null(await ProbeAsync("Institution A", "Institution A", "Institution B"));
+    }
+
+    [Fact]
+    public async Task GetInstitutionNameAsync_ignores_blank_and_missing_names()
+    {
+        // A blank name is no institution's, so it neither names the
+        // connection nor counts as a second institution.
+        Assert.Equal("Institution A", await ProbeAsync("  ", " Institution A", null, ""));
+        Assert.Null(await ProbeAsync("  ", null, ""));
+        Assert.Null(await ProbeAsync());
+    }
+
     [Fact]
     public async Task GetInstitutionNameAsync_returns_null_on_probe_failure()
     {
         // Network failure / 500 / malformed JSON — none of these
-        // should be fatal at connect time. Wizard renders "SimpleFIN"
-        // as the fallback name until first sync fills it in.
+        // should be fatal at connect time. The SPA renders "SimpleFIN"
+        // for a connection with no name, and nothing fills it in later.
         var client = ClientFor(_ =>
             new HttpResponseMessage(HttpStatusCode.InternalServerError));
         var name = await client.GetInstitutionNameAsync(

@@ -21,11 +21,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 ///      can't consume a not-yet-arrived inherited lot.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class InKindTransferTests
+public sealed class InKindTransferTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public InKindTransferTests(PostgresFixture fixture) => _fixture = fixture;
+    public InKindTransferTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -40,14 +41,14 @@ public sealed class InKindTransferTests
     [Fact]
     public async Task Transfer_shares_carries_lots_per_lot_with_zero_realized_gain()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddInvestmentAccountAsync("Source IRA");
         var dest = await ledger.AddInvestmentAccountAsync("Dest IRA");
         var sourceHoldings = source.HoldingsAccountId!.Value;
         var destHoldings = dest.HoldingsAccountId!.Value;
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task Post(CreateInvestmentTransactionRequest req)
@@ -74,7 +75,7 @@ public sealed class InKindTransferTests
             PostedAt = Utc(2025, 1, 1),
         });
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
 
         // Source: the unmoved half of the dear lot is left, at that lot's unit cost
         // (FIFO consumed the cheap lot + the other half of the dear one).
@@ -106,27 +107,28 @@ public sealed class InKindTransferTests
         Assert.Equal(200m, destLots[1].UnitCost);
 
         // Zero realized gain: a transfer is NOT a disposition.
-        var realized = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var realized = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
         Assert.Empty(realized.Rows);
     }
 
     [Fact]
-    public async Task Transfer_shares_rounds_a_fractional_carried_basis_to_2dp()
+    public async Task Transfer_shares_rounds_a_fractional_carried_basis_at_the_brokerages_places()
     {
         // A lot whose basis does not divide evenly by its quantity has a high-
         // precision unit_cost (mig 152 derives unit_cost = amount / quantity), so
-        // quantity × unit_cost is NOT 2dp. The transfer producer must round the
-        // carried basis to 2dp (ADR-0073 / ck_txn_legs_amount_scale_2) — pre-fix
-        // this threw a 23514 check-constraint violation on real (non-round) data;
-        // round-number tests never exercised it.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // quantity × unit_cost does not fit the currency. The transfer producer
+        // rounds the carried basis once at the brokerage's places, a two-place
+        // currency here (ADR-0114 D15); an unrounded basis past the database's
+        // three-place ceiling throws a 23514 check-constraint violation on non-round
+        // values, which round-number tests never exercise.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddInvestmentAccountAsync("Source");
         var dest = await ledger.AddInvestmentAccountAsync("Dest");
         var destHoldings = dest.HoldingsAccountId!.Value;
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task Post(CreateInvestmentTransactionRequest req) =>
@@ -139,11 +141,11 @@ public sealed class InKindTransferTests
         await Post(new() { BrokerageAccountId = source.Id, Action = "buy", SecurityId = security, Shares = 3m, Price = 33.333333m, PostedAt = Utc(2020, 1, 1) });
         // Transfer them all in-kind: carried basis = quantity × that repeating
         // unit_cost, which falls just short of the round total → the producer
-        // rounds it back to the cent rather than violating the 2dp money constraint.
+        // rounds it back to the currency's minor unit.
         await Post(new() { BrokerageAccountId = source.Id, Action = "transfer_shares", SecurityId = security, Shares = 3m, TransferAccountId = dest.Id, PostedAt = Utc(2025, 1, 1) });
 
         // Destination holds every share at the rounded, round-total basis.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var dst = await db.Holdings.AsNoTracking()
             .SingleAsync(h => h.AccountId == destHoldings && h.SecurityId == security);
         Assert.Equal(3m, dst.Quantity);
@@ -153,13 +155,13 @@ public sealed class InKindTransferTests
     [Fact]
     public async Task Inherited_lot_drives_fifo_holding_period_on_later_sale()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddInvestmentAccountAsync("Source");
         var dest = await ledger.AddInvestmentAccountAsync("Dest");
         var destHoldings = dest.HoldingsAccountId!.Value;
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task Post(CreateInvestmentTransactionRequest req) =>
@@ -176,7 +178,7 @@ public sealed class InKindTransferTests
         // The sale's cost basis is the INHERITED unit cost (carried from 2019), not
         // a transfer-date market value: the gain is the proceeds less the original
         // buy's basis.
-        var realized = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var realized = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
         var row = Assert.Single(realized.Rows);
         Assert.Equal(3000m, row.Proceeds);
@@ -184,7 +186,7 @@ public sealed class InKindTransferTests
         Assert.Equal(2000m, row.RealizedGain);
 
         // Destination position fully closed.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var dstHolding = await db.Holdings.AsNoTracking()
             .SingleAsync(h => h.AccountId == destHoldings && h.SecurityId == security);
         Assert.Equal(0m, dstHolding.Quantity);
@@ -198,13 +200,13 @@ public sealed class InKindTransferTests
         // sells some BEFORE an in-kind transfer arrives. That earlier sale must
         // consume the dest's own (already-arrived) lot — NOT the inherited lot,
         // even though the inherited lot's acquired_at is older.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddInvestmentAccountAsync("Source");
         var dest = await ledger.AddInvestmentAccountAsync("Dest");
         var destHoldings = dest.HoldingsAccountId!.Value;
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task Post(CreateInvestmentTransactionRequest req) =>
@@ -224,7 +226,7 @@ public sealed class InKindTransferTests
 
         // Only the 2023 dest sale realizes a gain (the transfer realizes none),
         // so the ledger has exactly one realized_gains row.
-        var realized = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var realized = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
         var row = Assert.Single(realized.Rows);
         // The 2023 sale consumed the dest's OWN cheaper lot (arrived 2021), NOT the
@@ -237,7 +239,7 @@ public sealed class InKindTransferTests
         Assert.Equal(300m, row.RealizedGain);
 
         // After the transfer, the dest holds the inherited lot at its original basis.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var dstHolding = await db.Holdings.AsNoTracking()
             .SingleAsync(h => h.AccountId == destHoldings && h.SecurityId == security);
         Assert.Equal(10m, dstHolding.Quantity);
@@ -247,12 +249,12 @@ public sealed class InKindTransferTests
     [Fact]
     public async Task Transfer_shares_rejects_more_than_held()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddInvestmentAccountAsync("Source");
         var dest = await ledger.AddInvestmentAccountAsync("Dest");
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/investment-transactions",
@@ -275,14 +277,14 @@ public sealed class InKindTransferTests
     [Fact]
     public async Task Scrub_detects_and_converts_a_sell_buy_pair_to_an_in_kind_transfer()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddInvestmentAccountAsync("Source");
         var dest = await ledger.AddInvestmentAccountAsync("Dest");
         var sourceHoldings = source.HoldingsAccountId!.Value;
         var destHoldings = dest.HoldingsAccountId!.Value;
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> Post(CreateInvestmentTransactionRequest req)
@@ -303,12 +305,12 @@ public sealed class InKindTransferTests
 
         // The mis-model fabricates a realized gain in the source (the sale's
         // proceeds less the original basis).
-        var before = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var before = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
         Assert.Equal(500m, before.TotalRealizedGain);
 
         // Detection finds exactly this pair.
-        var candidates = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var candidates = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .FindInKindTransferCandidatesAsync(ledger.LedgerId);
         var candidate = Assert.Single(candidates);
         Assert.Equal(sellId, candidate.SellHeaderId);
@@ -323,10 +325,10 @@ public sealed class InKindTransferTests
             new ConvertInKindTransferRequest { SellHeaderId = sellId, BuyHeaderId = buyId });
         Assert.Equal(HttpStatusCode.Created, convert.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
 
         // The fabricated gain is gone (a transfer realizes nothing).
-        var after = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var after = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
         Assert.Empty(after.Rows);
 
@@ -348,7 +350,7 @@ public sealed class InKindTransferTests
         Assert.Equal(100m, dstLot.UnitCost);
 
         // Re-running detection finds nothing (the pair is gone).
-        var none = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var none = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .FindInKindTransferCandidatesAsync(ledger.LedgerId);
         Assert.Empty(none);
     }
@@ -357,18 +359,18 @@ public sealed class InKindTransferTests
     public async Task Convert_succeeds_when_both_brokerages_are_since_closed()
     {
         // A historical in-kind correction targets transactions on accounts that
-        // are often since closed (e.g. a rolled-over 401k). The PR #132 inactive-
-        // account write gate must NOT block convert — it operates on the already-
+        // can be since closed (e.g. an account emptied by a transfer). The inactive-account
+        // write gate must NOT block convert — it operates on the already-
         // existing sell+buy, not new activity (allowInactiveAccounts, ADR-0085
         // presentation-vs-correctness). A normal create to an inactive brokerage
         // still 422s — proved by InactiveAccountGateTests.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddInvestmentAccountAsync("Old 401k (closed)");
         var dest = await ledger.AddInvestmentAccountAsync("Rollover IRA (closed)");
         var destHoldings = dest.HoldingsAccountId!.Value;
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> Post(CreateInvestmentTransactionRequest req)
@@ -388,7 +390,7 @@ public sealed class InKindTransferTests
         await ledger.SetIsActiveAsync(source.Id, false);
         await ledger.SetIsActiveAsync(dest.Id, false);
 
-        // Convert still succeeds (pre-fix this 422'd with brokerage-inactive).
+        // Convert still succeeds; it is not refused with brokerage-inactive.
         var convert = await client.PostAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/in-kind-transfers/convert",
             new ConvertInKindTransferRequest { SellHeaderId = sellId, BuyHeaderId = buyId });
@@ -396,11 +398,11 @@ public sealed class InKindTransferTests
 
         // The fabricated gain is gone and the carried lot lands at the dest at its
         // original cost.
-        var after = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var after = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
         Assert.Empty(after.Rows);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var dst = await db.Holdings.AsNoTracking()
             .SingleAsync(h => h.AccountId == destHoldings && h.SecurityId == security);
         Assert.Equal(10m, dst.Quantity);
@@ -408,22 +410,22 @@ public sealed class InKindTransferTests
     }
 
     [Fact]
-    public async Task Transfer_carries_basis_penny_perfect_for_a_large_high_precision_lot()
+    public async Task Transfer_carries_basis_exact_to_the_minor_unit_for_a_large_high_precision_lot()
     {
-        // Regression for mig 180. lots.unit_cost was NUMERIC(19,4); the transfer
-        // reconstructs the carried basis as round(quantity × unit_cost, 2). At 4dp
-        // a large lot whose basis doesn't divide evenly by its quantity drifts by
-        // up to quantity × 5e-5 — here a six-figure basis carried whole dollars
-        // short, the same class of drift found on a real in-kind move. Mig 180
-        // widens unit_cost to NUMERIC(25,12), making the carry penny-exact.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // Mig 180. The transfer reconstructs the carried basis as quantity ×
+        // unit_cost, rounded once at the brokerage's places (ADR-0114 D15). At
+        // NUMERIC(19,4) a large lot whose basis doesn't divide evenly by its quantity
+        // drifts by up to quantity × 5e-5 — here a six-figure basis would be carried
+        // whole units of currency short. Mig 180 widens unit_cost to NUMERIC(25,12),
+        // making the carry exact to the minor unit.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddInvestmentAccountAsync("Source");
         var dest = await ledger.AddInvestmentAccountAsync("Dest");
         var sourceHoldings = source.HoldingsAccountId!.Value;
         var destHoldings = dest.HoldingsAccountId!.Value;
         var security = await ledger.AddSecurityAsync("Bond Fund", "BDFA");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task Post(CreateInvestmentTransactionRequest req) =>
@@ -432,13 +434,13 @@ public sealed class InKindTransferTests
                     $"/api/ledgers/{ledger.LedgerId}/investment-transactions", req)).StatusCode);
 
         // A large share count at a per-share cost with more than 4 significant
-        // decimals: basis = quantity × price, rounded to the cent.
+        // decimals: basis = quantity × price, rounded at the brokerage's places.
         await Post(new() { BrokerageAccountId = source.Id, Action = "buy", SecurityId = security, Shares = 90000m, Price = 1.371742111111m, PostedAt = Utc(2015, 1, 1) });
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             // Source basis is the exact buy leg amount (buys fold `amount` directly,
-            // not via unit_cost) — the penny-perfect ground truth to carry.
+            // not via unit_cost) — the exact ground truth to carry.
             var src = await db.Holdings.AsNoTracking()
                 .SingleAsync(h => h.AccountId == sourceHoldings && h.SecurityId == security);
             Assert.Equal(123456.79m, src.CostBasis);
@@ -447,13 +449,13 @@ public sealed class InKindTransferTests
         // Transfer the whole lot in-kind.
         await Post(new() { BrokerageAccountId = source.Id, Action = "transfer_shares", SecurityId = security, Shares = 90000m, TransferAccountId = dest.Id, PostedAt = Utc(2025, 1, 1) });
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var dst = await db.Holdings.AsNoTracking()
                 .SingleAsync(h => h.AccountId == destHoldings && h.SecurityId == security);
             Assert.Equal(90000m, dst.Quantity);
-            // Penny-perfect carry. Pre-mig-180 (19,4) unit_cost this came out whole
-            // dollars short.
+            // Exact carry. Pre-mig-180 (19,4) unit_cost this came out whole units of
+            // currency short.
             Assert.Equal(123456.79m, dst.CostBasis);
         }
     }
@@ -461,11 +463,11 @@ public sealed class InKindTransferTests
     [Fact]
     public async Task Transfer_shares_rejects_same_account()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddInvestmentAccountAsync("Source");
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -485,19 +487,19 @@ public sealed class InKindTransferTests
     [Fact]
     public async Task Convert_carries_basis_with_multilot_source_and_a_later_dest_sale()
     {
-        // A repro of corruption found on a real ledger: a multi-lot source, the
-        // in-kind move mis-recorded as sell(source)+buy(dest) same day/qty, THEN a
-        // later dividend buy in the destination, THEN a destination sale that
-        // disposes MORE than was transferred. A correct convert carries the source's
-        // basis to the destination, so the later sale nets roughly zero realized
-        // gain. The bug carried roughly zero basis, so the later sale showed a huge
-        // phantom gain.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // The shape this pins: a multi-lot source, the in-kind move recorded as
+        // sell(source)+buy(dest) same day/qty, THEN a later dividend buy in the
+        // destination, THEN a destination sale that disposes MORE than was
+        // transferred. A correct convert carries the source's basis to the
+        // destination, so the later sale nets roughly zero realized gain. A convert
+        // that carries roughly zero basis makes the later sale show a large phantom
+        // gain.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddInvestmentAccountAsync("Source");
         var dest = await ledger.AddInvestmentAccountAsync("Dest");
         var security = await ledger.AddSecurityAsync("Conv Fund", "CNV");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> Post(CreateInvestmentTransactionRequest req)
@@ -522,9 +524,9 @@ public sealed class InKindTransferTests
         await Post(new() { BrokerageAccountId = dest.Id, Action = "sell", SecurityId = security, Shares = -5550m, Price = 10m, PostedAt = Utc(2025, 12, 8) });
 
         // Baseline: proceeds == basis on both sales, so realized gain is roughly zero.
-        var before = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var before = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
-        Assert.Equal(0m, Math.Round(before.TotalRealizedGain, 2));
+        Assert.Equal(0m, Math.Round(before.TotalRealizedGain!.Value, 2));
 
         // Convert the mis-recorded pair into a true in-kind transfer.
         var convert = await client.PostAsJsonAsync(
@@ -533,20 +535,57 @@ public sealed class InKindTransferTests
         Assert.Equal(HttpStatusCode.Created, convert.StatusCode);
 
         // A correct convert carries the source's whole basis to the destination, so
-        // the destination sale still nets roughly zero. The bug carried the basis onto
-        // lots but left the destination's FIFO/realized rebuild stale (lots created
-        // after the recompute fired), so the sale oversold and booked a phantom gain
-        // the size of the whole transferred basis.
-        var after = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        // the destination sale still nets roughly zero. Carrying the basis onto lots
+        // but leaving the destination's FIFO/realized rebuild stale (lots created
+        // after the recompute fired) would make the sale oversell and book a phantom
+        // gain the size of the whole transferred basis.
+        var after = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
-        Assert.Equal(0m, Math.Round(after.TotalRealizedGain, 2));
+        Assert.Equal(0m, Math.Round(after.TotalRealizedGain!.Value, 2));
 
         // And the destination is internally consistent (no stranded open lots):
         // fully sold, zero remaining quantity + basis.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var destHolding = await db.Holdings.AsNoTracking()
             .SingleAsync(h => h.AccountId == dest.HoldingsAccountId!.Value && h.SecurityId == security);
         Assert.Equal(0m, destHolding.Quantity);
         Assert.Equal(0m, Math.Round(destHolding.CostBasis, 2));
+    }
+
+    [Fact]
+    public async Task Candidates_leave_out_a_pair_whose_brokerages_are_in_different_currencies()
+    {
+        // ADR-0114 D13, ADR-0065 D4. One sale in a brokerage, and a buy of the same
+        // security, day and quantity in each of two others: one in the sale's currency,
+        // which is offered (the anchor), and one in another currency, which is not.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var source = await ledger.AddInvestmentAccountAsync("Source", currencyCode: "USD");
+        var sameCurrency = await ledger.AddInvestmentAccountAsync("Dest A", currencyCode: "USD");
+        var otherCurrency = await ledger.AddInvestmentAccountAsync("Dest B", currencyCode: "EUR");
+        var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
+
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        async Task<Guid> Post(CreateInvestmentTransactionRequest req)
+        {
+            var resp = await client.PostAsJsonAsync(
+                $"/api/ledgers/{ledger.LedgerId}/investment-transactions", req);
+            Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+            return (await resp.Content.ReadFromJsonAsync<CreateInvestmentTransactionResponse>())!.HeaderId;
+        }
+
+        await Post(new() { BrokerageAccountId = source.Id, Action = "buy", SecurityId = security, Shares = 10m, Price = 100m, PostedAt = Utc(2020, 1, 1) });
+        var sellId = await Post(new() { BrokerageAccountId = source.Id, Action = "sell", SecurityId = security, Shares = -10m, Price = 150m, PostedAt = Utc(2024, 6, 1) });
+        var sameBuyId = await Post(new() { BrokerageAccountId = sameCurrency.Id, Action = "buy", SecurityId = security, Shares = 10m, Price = 150m, PostedAt = Utc(2024, 6, 1) });
+        await Post(new() { BrokerageAccountId = otherCurrency.Id, Action = "buy", SecurityId = security, Shares = 10m, Price = 140m, PostedAt = Utc(2024, 6, 1) });
+
+        var candidates = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
+            .FindInKindTransferCandidatesAsync(ledger.LedgerId);
+
+        var candidate = Assert.Single(candidates);
+        Assert.Equal(sellId, candidate.SellHeaderId);
+        Assert.Equal(sameBuyId, candidate.BuyHeaderId);
+        Assert.Equal(sameCurrency.Id, candidate.DestAccountId);
     }
 }

@@ -26,13 +26,11 @@ namespace Coffer.Api.Tests.Integration.FeedConnections;
 /// endpoint binds an existing Coffer account.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class FeedConnectionsSyncTests
+public sealed class FeedConnectionsSyncTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public FeedConnectionsSyncTests(PostgresFixture fixture)
+    public FeedConnectionsSyncTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -70,12 +68,12 @@ public sealed class FeedConnectionsSyncTests
     private async Task<(ApiFactory Factory, SyntheticLedger Ledger, FeedConnectionSummary Connection)>
         ConnectAsync(string accountsBody)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         // Patch on a wrapped LEK so the seal step in the connect
         // path succeeds (the synthetic-ledger helper doesn't run the
         // API's CreateWithOwnerAsync path).
-        var keys = _fixture.NewLedgerKeyService();
-        await using (var seed = _fixture.NewDbContext())
+        var keys = Db.NewLedgerKeyService();
+        await using (var seed = Db.NewDbContext())
         {
             var row = await seed.Ledgers.SingleAsync(l => l.Id == ledger.LedgerId);
             row.WrappedLek = keys.CreateWrappedLek();
@@ -85,7 +83,7 @@ public sealed class FeedConnectionsSyncTests
         }
 
         const string accessUrl = "https://u:p@bridge.simplefin.org/simplefin/access/abc";
-        var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(req =>
                 req.Method == HttpMethod.Post
                     ? new HttpResponseMessage(HttpStatusCode.OK)
@@ -200,7 +198,7 @@ public sealed class FeedConnectionsSyncTests
         // DB verification: two txn_headers, both flagged for
         // review, neither bank-pending. Symmetric posting wired to
         // Uncategorized (lazy-created on first row).
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var headers = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == setup.Ledger.LedgerId
                         // Mig 107: origin is icon-level; SimpleFIN
@@ -283,7 +281,7 @@ public sealed class FeedConnectionsSyncTests
         Assert.Equal(0, result.TransactionsForReview);
         Assert.Equal(1, result.TransactionsStillPending);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.LedgerId == setup.Ledger.LedgerId
                               && h.ExternalId == "fitid-P");
@@ -336,7 +334,7 @@ public sealed class FeedConnectionsSyncTests
         Assert.Equal(0, secondResult.TransactionsForReview);
         Assert.Equal(1, secondResult.AlreadyKnown);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Equal(1, await db.TxnHeaders
             .CountAsync(h => h.ExternalId == "fitid-A"
                              && h.LedgerId == setup.Ledger.LedgerId));
@@ -345,20 +343,15 @@ public sealed class FeedConnectionsSyncTests
     [Fact]
     public async Task Delete_then_resync_does_not_reinsert_same_FITID()
     {
-        // Regression for mig 105's motivating bug: a user "deletes"
-        // a SimpleFIN-synced row, the very next sync (same FITID)
-        // re-inserts it as a new row.
+        // A user "deletes" a SimpleFIN-synced row; the very next sync
+        // (same FITID) must not re-insert it as a new row.
         //
-        // The hidden chain was:
-        //   1. SimpleFIN ingest used to write the FITID into
-        //      online_match_fitid, leaving external_id NULL.
-        //   2. DeleteAsync picks soft-hide vs hard-delete via
-        //      external_id IS NULL → SimpleFIN rows took the
-        //      hard-delete branch, vanishing from the DB.
-        //   3. Next sync dedup looked at online_match_fitid; the row
-        //      was gone → treated as new → inserted again.
+        // DeleteAsync picks soft-hide vs hard-delete via
+        // external_id IS NULL, so a synced row with no external_id
+        // would take the hard-delete branch and vanish, and the next
+        // sync's dedup would treat it as new.
         //
-        // After mig 105: SimpleFIN id → external_id, dedup keys off
+        // Since mig 105: SimpleFIN id → external_id, dedup keys off
         // external_id scoped by origin, DELETE goes through the
         // soft-hide branch (external_id is NOT NULL), and the
         // re-sync finds the soft-hidden row and alreadyKnowns it.
@@ -396,7 +389,7 @@ public sealed class FeedConnectionsSyncTests
         Assert.Equal(1, (await first.Content.ReadFromJsonAsync<SyncResultDto>())!.TransactionsForReview);
 
         Guid landedId;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var landed = await db.TxnHeaders.AsNoTracking()
                 .SingleAsync(h => h.LedgerId == setup.Ledger.LedgerId
@@ -417,7 +410,7 @@ public sealed class FeedConnectionsSyncTests
         Assert.Equal(HttpStatusCode.OK, del.StatusCode);
         var outcome = await del.Content.ReadFromJsonAsync<DeleteTransactionResponse>();
         Assert.Equal("soft-hidden", outcome!.Kind);
-        await using (var verify = _fixture.NewDbContext())
+        await using (var verify = Db.NewDbContext())
         {
             var hidden = await verify.TxnHeaders.AsNoTracking()
                 .SingleAsync(h => h.Id == landedId);
@@ -435,7 +428,7 @@ public sealed class FeedConnectionsSyncTests
         Assert.Equal(0, secondResult.TransactionsForReview);
         Assert.Equal(1, secondResult.AlreadyKnown);
 
-        await using (var verify = _fixture.NewDbContext())
+        await using (var verify = Db.NewDbContext())
         {
             var count = await verify.TxnHeaders.AsNoTracking()
                 .CountAsync(h => h.LedgerId == setup.Ledger.LedgerId
@@ -486,7 +479,7 @@ public sealed class FeedConnectionsSyncTests
         var firstResult = (await first.Content.ReadFromJsonAsync<SyncResultDto>())!;
         Assert.Equal(1, firstResult.TransactionsStillPending);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var pending = await db.TxnHeaders.AsNoTracking()
                 .SingleAsync(h => h.LedgerId == setup.Ledger.LedgerId
@@ -497,7 +490,7 @@ public sealed class FeedConnectionsSyncTests
         // Second sync — same FITID, now pending=false, amount
         // grown past the pending hold (a tip). Stub a new handler so the
         // second GET returns the cleared payload.
-        await using var promoteFactory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var promoteFactory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(req =>
                 req.Method == HttpMethod.Post
                     ? new HttpResponseMessage(HttpStatusCode.OK)
@@ -525,7 +518,7 @@ public sealed class FeedConnectionsSyncTests
         Assert.Equal(1, secondResult.TransactionsForReview);
         Assert.Equal(0, secondResult.TransactionsStillPending);
 
-        await using var verify = _fixture.NewDbContext();
+        await using var verify = Db.NewDbContext();
         var promoted = await verify.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.LedgerId == setup.Ledger.LedgerId
                               && h.ExternalId == "fitid-X");
@@ -537,6 +530,104 @@ public sealed class FeedConnectionsSyncTests
             .ToListAsync();
         Assert.Equal(-35.00m, legs[0].Amount);
         Assert.Equal(35.00m, legs[1].Amount);
+    }
+
+    /// <summary>
+    /// A pending row the user turned into a transfer clears at another figure (ADR-0114
+    /// D13, "A feed keeps the far leg"). Into a bank in another currency, entered with both
+    /// amounts, only the synced leg takes the cleared figure and the far leg keeps its own;
+    /// into a bank in the same currency, the far leg takes the negation as a category leg
+    /// does. Neither changes the review state the user set.
+    /// </summary>
+    [Theory]
+    [InlineData("EUR", 39.10, 39.10)]
+    [InlineData("USD", 30.00, 35.00)]
+    public async Task Promote_on_clear_keeps_a_far_leg_in_another_currency_as_entered(
+        string farCurrency, double farEntered, double farAfterClear)
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var keys = Db.NewLedgerKeyService();
+        await using (var seed = Db.NewDbContext())
+        {
+            var row = await seed.Ledgers.SingleAsync(l => l.Id == ledger.LedgerId);
+            row.WrappedLek = keys.CreateWrappedLek();
+            row.LekKekId = keys.CurrentKekId;
+            row.LekCreatedAt = DateTime.UtcNow;
+            await seed.SaveChangesAsync();
+        }
+        var pending = true;
+        string Body() => $$"""
+            {"connections":[
+              {"conn_id":"c-A","name":"Bank A","org_id":"banka","sfin_url":"https://sfin/banka"}
+            ],"errlist":[],"accounts":[
+              {"id":"sf-1","conn_id":"c-A","name":"Checking","currency":"USD","balance":"0.00","transactions":[
+                {"id":"fitid-T","posted":1715000000,"amount":"{{(pending ? "-30.00" : "-35.00")}}","description":"TRANSFER","pending":{{(pending ? "true" : "false")}}}
+              ]}
+            ]}
+            """;
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
+            .WithService<SimpleFinClient>(_ => ClientWithStubHandler(req =>
+                req.Method == HttpMethod.Post
+                    ? new HttpResponseMessage(HttpStatusCode.OK)
+                        { Content = new StringContent("https://u:p@bridge.simplefin.org/simplefin/access/abc") }
+                    : new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(Body()) }));
+        using var client = await AuthedClientAsync(factory, ledger);
+        var connection = (await (await client.PostAsJsonAsync(
+                $"/api/ledgers/{ledger.LedgerId}/feed-connections",
+                new CreateFeedConnectionRequest { SetupToken = SetupTokenFor("https://x/c") }))
+            .Content.ReadFromJsonAsync<FeedConnectionSummary>())!;
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var far = await ledger.AddBankAccountAsync("savings", currencyCode: farCurrency);
+        Assert.Equal(HttpStatusCode.NoContent, (await client.SendAsync(new HttpRequestMessage(
+            HttpMethod.Patch, $"/api/ledgers/{ledger.LedgerId}/accounts/{bank.Id}/feed-mapping")
+        {
+            Content = JsonContent.Create(new PatchAccountFeedMappingRequest
+            {
+                FeedConnectionId = connection.Id,
+                SimpleFinAccountId = "sf-1",
+            }),
+        })).StatusCode);
+        var syncUrl = $"/api/ledgers/{ledger.LedgerId}/feed-connections/{connection.Id}/sync";
+        Assert.Equal(HttpStatusCode.OK, (await client.PostAsync(syncUrl, content: null)).StatusCode);
+
+        Guid headerId, bankLeg;
+        await using (var db = Db.NewDbContext())
+        {
+            headerId = (await db.TxnHeaders.AsNoTracking()
+                .SingleAsync(h => h.LedgerId == ledger.LedgerId && h.ExternalId == "fitid-T")).Id;
+            bankLeg = (await db.TxnLegs.AsNoTracking()
+                .SingleAsync(l => l.HeaderId == headerId && l.AccountId == bank.Id)).Id;
+        }
+        var reshape = await client.PatchAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/transactions/{headerId}",
+            new PatchTransactionRequest
+            {
+                Approve = true,
+                Postings = new PatchTransactionPostings
+                {
+                    SourceAccountId = bank.Id,
+                    Items =
+                    [
+                        new TransactionPosting
+                        {
+                            LegId = bankLeg, CounterpartyAccountId = far.Id, Amount = -30.00m,
+                            CounterpartyAmount = (decimal)farEntered,
+                        },
+                    ],
+                },
+            });
+        Assert.True(reshape.IsSuccessStatusCode, await reshape.Content.ReadAsStringAsync());
+
+        pending = false;
+        Assert.Equal(HttpStatusCode.OK, (await client.PostAsync(syncUrl, content: null)).StatusCode);
+
+        await using var verify = Db.NewDbContext();
+        var promoted = await verify.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == headerId);
+        Assert.False(promoted.IsPending);
+        Assert.False(promoted.NeedsReview);
+        var legs = await verify.TxnLegs.AsNoTracking().Where(l => l.HeaderId == headerId).ToListAsync();
+        Assert.Equal(2, legs.Count);
+        Assert.Equal(-35.00m, legs.Single(l => l.AccountId == bank.Id).Amount);
+        Assert.Equal((decimal)farAfterClear, legs.Single(l => l.AccountId == far.Id).Amount);
     }
 
     [Fact]
@@ -576,7 +667,7 @@ public sealed class FeedConnectionsSyncTests
             content: null);
 
         Guid headerId;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var header = await db.TxnHeaders.AsNoTracking()
                 .SingleAsync(h => h.LedgerId == setup.Ledger.LedgerId
@@ -593,7 +684,7 @@ public sealed class FeedConnectionsSyncTests
             });
         Assert.Equal(HttpStatusCode.NoContent, approve.StatusCode);
 
-        await using (var verify = _fixture.NewDbContext())
+        await using (var verify = Db.NewDbContext())
         {
             var header = await verify.TxnHeaders.AsNoTracking()
                 .SingleAsync(h => h.Id == headerId);
@@ -616,8 +707,8 @@ public sealed class FeedConnectionsSyncTests
         // Cross-ledger guard: alice's header id can't be approved
         // through bob's ledger scope (slice 2c.6a — same guard
         // applies via PATCH as the prior POST /approve enforced).
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var aliceBank = await alice.AddBankAccountAsync("alice-checking");
         var aliceCat = await alice.AddCategoryAsync("food");
         var (legId, _) = await alice.AddTransactionPairAsync(
@@ -626,7 +717,7 @@ public sealed class FeedConnectionsSyncTests
             payee: "Coffee");
         var aliceHeaderId = await alice.ResolveHeaderIdAsync(legId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var resp = await bobClient.SendAsync(new HttpRequestMessage(
@@ -663,9 +754,9 @@ public sealed class FeedConnectionsSyncTests
         // feed_connections.status='needs_reauth', and must return
         // a typed SyncResultDto so the SPA can render a re-connect
         // CTA instead of a generic error toast.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var keys = _fixture.NewLedgerKeyService();
-        await using (var seed = _fixture.NewDbContext())
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var keys = Db.NewLedgerKeyService();
+        await using (var seed = Db.NewDbContext())
         {
             var row = await seed.Ledgers.SingleAsync(l => l.Id == ledger.LedgerId);
             row.WrappedLek = keys.CreateWrappedLek();
@@ -678,7 +769,7 @@ public sealed class FeedConnectionsSyncTests
         // /accounts on connect-time probe) and third (GET =
         // /accounts on sync) both return 403.
         const string accessUrl = "https://u:p@bridge.simplefin.org/simplefin/access/abc";
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(req =>
                 req.Method == HttpMethod.Post
                     ? new HttpResponseMessage(HttpStatusCode.OK)
@@ -701,7 +792,7 @@ public sealed class FeedConnectionsSyncTests
         Assert.Equal(0, result.AccountsDiscovered);
 
         // DB verification: the row's status really flipped.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var stored = await db.FeedConnections
             .Where(c => c.Id == summary.Id)
             .Select(c => c.Status)
@@ -750,11 +841,13 @@ public sealed class FeedConnectionsSyncTests
         // alice connects; bob (different ledger) tries to map an
         // account onto alice's connection id. Cross-ledger guard
         // must reject.
-        var alice = (await ConnectAsync("""{"connections":[],"errlist":[],"accounts":[]}""")).Connection;
-        var bobLedger = await SyntheticLedger.CreateAsync(_fixture);
+        var aliceSetup = await ConnectAsync("""{"connections":[],"errlist":[],"accounts":[]}""");
+        await using var aliceFactory = aliceSetup.Factory;
+        var alice = aliceSetup.Connection;
+        var bobLedger = await SyntheticLedger.CreateAsync(Db);
         var bobAccount = await bobLedger.AddBankAccountAsync("bob-checking");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(_ =>
                 new HttpResponseMessage(HttpStatusCode.OK)
                     { Content = new StringContent("""{"connections":[],"errlist":[],"accounts":[]}""") }));
@@ -833,8 +926,8 @@ public sealed class FeedConnectionsSyncTests
     [Fact]
     public async Task Connection_accounts_list_422_for_unknown_connection()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(_ =>
                 new HttpResponseMessage(HttpStatusCode.OK)
                     { Content = new StringContent("{}") }));
@@ -856,10 +949,12 @@ public sealed class FeedConnectionsSyncTests
         // for it via the path that swaps the ledgerId. The
         // BelongsToLedgerAsync guard must reject (RLS already hides
         // the row, but the explicit guard surfaces a typed code).
-        var alice = (await ConnectAsync("""{"connections":[],"errlist":[],"accounts":[]}""")).Connection;
-        var bobLedger = await SyntheticLedger.CreateAsync(_fixture);
+        var aliceSetup = await ConnectAsync("""{"connections":[],"errlist":[],"accounts":[]}""");
+        await using var aliceFactory = aliceSetup.Factory;
+        var alice = aliceSetup.Connection;
+        var bobLedger = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(_ =>
                 new HttpResponseMessage(HttpStatusCode.OK)
                     { Content = new StringContent("{}") }));
@@ -907,7 +1002,7 @@ public sealed class FeedConnectionsSyncTests
             $"/api/ledgers/{setup.Ledger.LedgerId}/accounts/{bank.Id}/feed-mapping");
         Assert.Equal(HttpStatusCode.NoContent, unmap.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.Accounts.AsNoTracking().SingleAsync(a => a.Id == bank.Id);
         Assert.Null(row.FeedConnectionId);
         Assert.Null(row.ExternalId);
@@ -918,9 +1013,9 @@ public sealed class FeedConnectionsSyncTests
     /// mapped one must not touch a sibling account's binding.
     /// </summary>
     /// <remarks>
-    /// This asserted only the 204 from deleting a mapping that never existed. The
-    /// binding columns were never read, and no other account was in play, so an
-    /// unmap that cleared every account in the ledger passed unnoticed.
+    /// The 204 alone proves nothing: with the binding columns unread and no other
+    /// account in play, an unmap that cleared every account in the ledger would
+    /// pass. So a sibling account's binding is asserted too.
     /// </remarks>
     [Fact]
     public async Task Delete_feed_mapping_is_idempotent_on_an_already_unmapped_account()
@@ -975,7 +1070,7 @@ public sealed class FeedConnectionsSyncTests
 
     private async Task AssertMappingAsync(Guid accountId, Guid? connectionId, string? externalId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.Accounts.AsNoTracking().SingleAsync(a => a.Id == accountId);
         Assert.Equal(connectionId, row.FeedConnectionId);
         Assert.Equal(externalId, row.ExternalId);
@@ -984,8 +1079,8 @@ public sealed class FeedConnectionsSyncTests
     [Fact]
     public async Task Delete_feed_mapping_422_for_unknown_account()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.DeleteAsync(
@@ -999,11 +1094,11 @@ public sealed class FeedConnectionsSyncTests
     [Fact]
     public async Task Delete_feed_mapping_422_when_account_belongs_to_another_ledger()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
         var aliceAccount = await alice.AddBankAccountAsync("alice-checking");
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var bob = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var response = await bobClient.DeleteAsync(
@@ -1040,7 +1135,7 @@ public sealed class FeedConnectionsSyncTests
             content: null);
 
         DateTime firstSeen;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var row = await db.FeedConnectionAccounts.AsNoTracking()
                 .SingleAsync(a => a.FeedConnectionId == setup.Connection.Id
@@ -1054,7 +1149,7 @@ public sealed class FeedConnectionsSyncTests
             $"/api/ledgers/{setup.Ledger.LedgerId}/feed-connections/{setup.Connection.Id}/sync",
             content: null);
 
-        await using var db2 = _fixture.NewDbContext();
+        await using var db2 = Db.NewDbContext();
         var rows = await db2.FeedConnectionAccounts.AsNoTracking()
             .Where(a => a.FeedConnectionId == setup.Connection.Id)
             .ToListAsync();
@@ -1107,7 +1202,7 @@ public sealed class FeedConnectionsSyncTests
             content: null);
         Assert.Equal(HttpStatusCode.OK, sync.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var bankRow = await db.Accounts.AsNoTracking().SingleAsync(a => a.Id == bank.Id);
         Assert.NotNull(bankRow.LastSimpleFinSyncAt);
         Assert.True(bankRow.LastSimpleFinSyncAt >= before,
@@ -1158,7 +1253,7 @@ public sealed class FeedConnectionsSyncTests
             $"/api/ledgers/{setup.Ledger.LedgerId}/feed-connections/{setup.Connection.Id}/sync",
             content: null);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var okRow = await db.Accounts.AsNoTracking().SingleAsync(a => a.Id == ok.Id);
         var brokenRow = await db.Accounts.AsNoTracking().SingleAsync(a => a.Id == broken.Id);
         Assert.NotNull(okRow.LastSimpleFinSyncAt);
@@ -1201,7 +1296,7 @@ public sealed class FeedConnectionsSyncTests
         await client.DeleteAsync(
             $"/api/ledgers/{setup.Ledger.LedgerId}/accounts/{bank.Id}/feed-mapping");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.Accounts.AsNoTracking().SingleAsync(a => a.Id == bank.Id);
         Assert.Null(row.FeedConnectionId);
         Assert.Null(row.ExternalId);
@@ -1242,7 +1337,7 @@ public sealed class FeedConnectionsSyncTests
             new PatchAccountSyncFromDateRequest { SyncFromDate = chosen });
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.Accounts.AsNoTracking().SingleAsync(a => a.Id == bank.Id);
         Assert.Equal(chosen, row.LastSimpleFinSyncAt);
     }
@@ -1275,7 +1370,7 @@ public sealed class FeedConnectionsSyncTests
         await client.PostAsync(
             $"/api/ledgers/{setup.Ledger.LedgerId}/feed-connections/{setup.Connection.Id}/sync",
             content: null);
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var pre = await db.Accounts.AsNoTracking().SingleAsync(a => a.Id == bank.Id);
             Assert.NotNull(pre.LastSimpleFinSyncAt);
@@ -1286,7 +1381,7 @@ public sealed class FeedConnectionsSyncTests
             new PatchAccountSyncFromDateRequest { SyncFromDate = null });
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db2 = _fixture.NewDbContext();
+        await using var db2 = Db.NewDbContext();
         var row = await db2.Accounts.AsNoTracking().SingleAsync(a => a.Id == bank.Id);
         Assert.Null(row.LastSimpleFinSyncAt);
     }
@@ -1328,9 +1423,9 @@ public sealed class FeedConnectionsSyncTests
     [Fact]
     public async Task PatchSyncFromDate_422_for_unmapped_account()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.PatchAsJsonAsync(
@@ -1348,11 +1443,11 @@ public sealed class FeedConnectionsSyncTests
     [Fact]
     public async Task PatchSyncFromDate_422_when_account_belongs_to_another_ledger()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
         var aliceAccount = await alice.AddBankAccountAsync("alice-checking");
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var bob = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var response = await bobClient.PatchAsJsonAsync(

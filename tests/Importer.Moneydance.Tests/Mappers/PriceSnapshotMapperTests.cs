@@ -29,9 +29,9 @@ public sealed class PriceSnapshotMapperTests
         new Dictionary<string, SecurityRef>(StringComparer.Ordinal) { [mdId] = new(securityId, decimals) };
 
     [Fact]
-    public void Map_translates_a_real_export_csnap_using_urt()
+    public void Map_translates_a_moneydance_csnap_using_urt()
     {
-        // Real-world exports use `urt` (unadjusted rate) — Moneydance stores
+        // Exports carry `urt` (unadjusted rate) — Moneydance stores
         // securities as currencies, so urt = 1/share_price. This snapshot's
         // urt corresponds to a share price of its reciprocal.
         var securityId = Guid.NewGuid();
@@ -43,13 +43,14 @@ public sealed class PriceSnapshotMapperTests
             }
             """);
 
-        var result = PriceSnapshotMapper.Map(csnap, SecurityMap("sec-1", securityId));
+        var result = PriceSnapshotMapper.Map(csnap, SecurityMap("sec-1", securityId), "USD");
 
         Assert.Null(result.Skip);
         Assert.NotNull(result.Row);
         var row = result.Row!;
         Assert.Equal(securityId, row.SecurityId);
         Assert.Equal(100.0000m,  row.Price);                // 1 / urt
+        Assert.Equal("USD",      row.CurrencyCode);         // the currency the rate is relative to
         Assert.Null(row.High);
         Assert.Null(row.Low);
         Assert.Null(row.Volume);
@@ -72,7 +73,7 @@ public sealed class PriceSnapshotMapperTests
             }
             """);
 
-        var result = PriceSnapshotMapper.Map(csnap, SecurityMap("sec-1", securityId));
+        var result = PriceSnapshotMapper.Map(csnap, SecurityMap("sec-1", securityId), "USD");
 
         Assert.Null(result.Skip);
         var row = result.Row!;
@@ -82,6 +83,39 @@ public sealed class PriceSnapshotMapperTests
         // Bigger urt → smaller price: low price = 1 / hi, at four decimal places
         Assert.Equal(98.0392m,  row.Low);
         Assert.Equal(1234567L,  row.Volume);
+    }
+
+    [Fact]
+    public void Map_stamps_the_price_with_the_currency_its_rate_is_relative_to()
+    {
+        // ADR-0114: a price is in the currency its snapshot's rate is relative to, which
+        // the import step passes (the file's base currency). The inversion is unchanged.
+        var csnap = CsnapFromJson("""
+            {
+              "obj_type":"csnap","id":"snap-eur",
+              "curr":"sec-1","dt":"20240115",
+              "urt":"0.04"
+            }
+            """);
+
+        var row = PriceSnapshotMapper.Map(csnap, SecurityMap("sec-1", Guid.NewGuid()), "EUR").Row!;
+
+        Assert.Equal("EUR",     row.CurrencyCode);
+        Assert.Equal(25.0000m,  row.Price);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("usd")]
+    [InlineData("EURO")]
+    public void Map_refuses_a_currency_that_is_not_a_stored_code(string currencyCode)
+    {
+        var csnap = CsnapFromJson("""
+            {"obj_type":"csnap","id":"snap-bad","curr":"sec-1","dt":"20240115","urt":"0.04"}
+            """);
+
+        Assert.Throws<ArgumentException>(() =>
+            PriceSnapshotMapper.Map(csnap, SecurityMap("sec-1", Guid.NewGuid()), currencyCode));
     }
 
     [Fact]
@@ -97,7 +131,7 @@ public sealed class PriceSnapshotMapperTests
             }
             """);
 
-        var result = PriceSnapshotMapper.Map(csnap, SecurityMap("sec-1", securityId));
+        var result = PriceSnapshotMapper.Map(csnap, SecurityMap("sec-1", securityId), "USD");
 
         Assert.Null(result.Skip);
         Assert.Equal(100.0000m, result.Row!.Price);
@@ -117,7 +151,7 @@ public sealed class PriceSnapshotMapperTests
             }
             """);
 
-        var result = PriceSnapshotMapper.Map(csnap, SecurityMap("sec-1", securityId));
+        var result = PriceSnapshotMapper.Map(csnap, SecurityMap("sec-1", securityId), "USD");
 
         Assert.Null(result.Skip);
         Assert.Equal(2019, result.Row!.PriceDate.Year);
@@ -136,7 +170,7 @@ public sealed class PriceSnapshotMapperTests
             """);
 
         var result = PriceSnapshotMapper.Map(csnap,
-            new Dictionary<string, SecurityRef>(StringComparer.Ordinal));
+            new Dictionary<string, SecurityRef>(StringComparer.Ordinal), "USD");
 
         Assert.Null(result.Row);
         Assert.Equal(PriceSnapshotMapper.SkipReason.UnknownSecurity, result.Skip);
@@ -145,7 +179,7 @@ public sealed class PriceSnapshotMapperTests
     [Fact]
     public void Map_skips_snapshot_with_missing_or_zero_rate()
     {
-        // Real-world exports often emit empty csnaps (id + curr + ts only) when MD
+        // Moneydance can emit empty csnaps (id + curr + ts only) when MD
         // hasn't recorded a rate for that security on that date — those skip
         // cleanly rather than being faked with a zero price.
         var securityId = Guid.NewGuid();
@@ -156,7 +190,7 @@ public sealed class PriceSnapshotMapperTests
             }
             """);
 
-        var result = PriceSnapshotMapper.Map(csnap, SecurityMap("sec-1", securityId));
+        var result = PriceSnapshotMapper.Map(csnap, SecurityMap("sec-1", securityId), "USD");
 
         Assert.Null(result.Row);
         Assert.Equal(PriceSnapshotMapper.SkipReason.MissingPrice, result.Skip);
@@ -173,7 +207,7 @@ public sealed class PriceSnapshotMapperTests
             }
             """);
 
-        var result = PriceSnapshotMapper.Map(csnap, SecurityMap("sec-1", securityId));
+        var result = PriceSnapshotMapper.Map(csnap, SecurityMap("sec-1", securityId), "USD");
 
         Assert.Null(result.Row);
         Assert.Equal(PriceSnapshotMapper.SkipReason.UnparseableDate, result.Skip);

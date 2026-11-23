@@ -22,8 +22,16 @@ namespace Coffer.Importer.Moneydance.Pipeline;
 /// over them on trade days (ADR-0084 D5 — the execution price is the truer
 /// observation), rank-gated so a <c>fetch</c>/<c>manual</c> price is never
 /// clobbered. One row per <c>(security, UTC-day)</c>, taking the last trade of
-/// the day. This is the per-ledger analogue of the one-time migration-177
-/// backfill, scoped to this ledger so every FUTURE import is covered too.</para>
+/// the day by the rule every writer and the consistency check apply
+/// (<c>fn_trade_execution_for_day</c>): only an execution prices a day, never a share
+/// movement (ADR-0084 D6), and a hidden or merged-away row is no trade. This is
+/// the per-ledger analogue of the one-time migration-177 backfill, scoped to this
+/// ledger so every FUTURE import is covered too.</para>
+///
+/// <para>Each price is in the currency of the brokerage that made the picked trade,
+/// read through the rule's own <c>fn_trade_currency</c> (migration 274), so the choice
+/// of currency is stated once. Each imported account is in its own Moneydance currency
+/// (ADR-0114), so a trade's price is in its brokerage's.</para>
 /// </remarks>
 internal sealed class TradePriceSeedStep
 {
@@ -48,22 +56,26 @@ internal sealed class TradePriceSeedStep
                        l.security_id,
                        l.ledger_id,
                        l.unit_price,
-                       'USD',
+                       -- The currency of the brokerage that made the trade (migration
+                       -- 274's fn_trade_currency, the rule's).
+                       c.currency_code,
                        (h.posted_at AT TIME ZONE 'UTC')::date,
                        'trade'
                 FROM txn_legs l
-                JOIN txn_headers h ON h.id = l.header_id
+                JOIN live_txn_headers h ON h.id = l.header_id
+                CROSS JOIN LATERAL fn_trade_currency(l.account_id) c
                 WHERE h.ledger_id = @ledgerId
                   AND l.security_id IS NOT NULL
-                  AND l.quantity   IS NOT NULL
-                  AND l.quantity   <> 0
-                  AND l.unit_price IS NOT NULL
-                  AND l.unit_price > 0
-                  AND h.is_recurring_template = FALSE
-                -- Identical to fn_trade_price_for_day (migration 234). Without the
-                -- last two columns a header carrying several security legs ties on
-                -- seq and Postgres picks arbitrarily, so the importer could seed a
-                -- price the checker would never derive.
+                  -- Identical to fn_trade_execution_for_day (migration 274): an execution
+                  -- (fn_leg_prices_a_day, so never a ShrsIn/ShrsOut share movement), on
+                  -- a header that is no template, not hidden and not merged into another.
+                  AND h.is_hidden = FALSE
+                  AND h.is_merged_into IS NULL
+                  AND fn_leg_prices_a_day(l.quantity, l.unit_price, h.action,
+                                          h.provider_raw_payload->>'qif_invst_action')
+                -- Without the last two columns a header carrying several security legs
+                -- ties on seq and Postgres picks arbitrarily, so the importer could seed
+                -- a price the checker would never derive.
                 ORDER BY l.security_id, (h.posted_at AT TIME ZONE 'UTC')::date,
                          h.seq DESC, abs(l.amount) DESC, l.id DESC
                 ON CONFLICT (security_id, price_date) DO UPDATE

@@ -47,8 +47,8 @@ public sealed class ApiOptions
     /// <remarks>
     /// Exists so the credential isn't an environment variable — see
     /// <see cref="DbPasswordResolver"/> for why that matters. Optional: leave
-    /// unset to keep the password in the connection string (the arrangement
-    /// before this landed, and the simpler one for a bare-metal install).
+    /// unset to keep the password in the connection string (the simpler
+    /// arrangement for a bare-metal install).
     /// </remarks>
     public string AppPasswordFile { get; init; } = string.Empty;
 
@@ -151,6 +151,39 @@ public sealed class ApiOptions
     /// Master-KEK file location (ADR-0092 D1). Bound from <c>Api:MasterKey</c>.
     /// </summary>
     public MasterKeyFileOptions MasterKey { get; init; } = new();
+
+    /// <summary>
+    /// In-app upgrade (ADR-0110). Bound from <c>Api:Upgrade</c>.
+    /// </summary>
+    public UpgradeOptions Upgrade { get; init; } = new();
+}
+
+/// <summary>
+/// In-app upgrade configuration (ADR-0110). All of it is set by compose from the install's
+/// <c>.env</c>; none of it is a secret.
+/// </summary>
+public sealed class UpgradeOptions
+{
+    /// <summary>The GitHub repository releases are read from, <c>owner/name</c>.</summary>
+    public string Repository { get; init; } = "strongboxlabs/coffer";
+
+    /// <summary>
+    /// The install directory on the host, shown in the manual-upgrade command. Empty when the
+    /// install predates it, in which case the screen names the directory generically.
+    /// </summary>
+    public string InstallDir { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Why the host updater cannot run here, written by <c>install.sh</c>: <c>macos</c>, <c>wsl</c>,
+    /// <c>sudo-docker</c> or <c>no-cron</c>. Empty when it can.
+    /// </summary>
+    public string HostNote { get; init; } = string.Empty;
+
+    /// <summary>
+    /// The mailbox directory. Null → <c>mailbox</c> beside the binary, the <c>coffer_mailbox</c>
+    /// volume. Tests set a temp path, as with <c>Api:Backup:Directory</c>.
+    /// </summary>
+    public string? MailboxDir { get; init; }
 }
 
 /// <summary>
@@ -326,8 +359,8 @@ public sealed class BackupOptions
     /// Free space a restore upload must leave on the staging volume, in MB (FU-072).
     /// </summary>
     /// <remarks>
-    /// Staging lives on the data volume, which also holds the stored backups. A part upload
-    /// had no size cap, so it could fill that volume, and a full volume is one where the
+    /// Staging lives on the data volume, which also holds the stored backups. An uncapped
+    /// part upload can fill that volume, and a full volume is one where the
     /// next backup cannot be written. An upload, a part or a copied stored backup that would leave
     /// less than this free is refused before it is written. Not a guess at a backup's size: a
     /// floor under everything else on the volume, so raise it if that volume is shared with
@@ -461,10 +494,10 @@ public sealed class BootstrapOptions
 public sealed class ImportOptions
 {
     /// <summary>
-    /// The largest Moneydance export an upload may be, in MB (FU-092). Default 512, several
-    /// times the size of a large real export. The upload used to have no limit below the 4 GiB
-    /// multipart ceiling, read and buffered before anything looked at its size; this one
-    /// stops the request at the server. Whether the server can then HOLD it is checked
+    /// The largest Moneydance export an upload may be, in MB (FU-092). Default 512, generous
+    /// for an export. Without it the only limit is the 4 GiB multipart ceiling, and the
+    /// upload is read and buffered before anything looks at its size; this one stops
+    /// the request at the server. Whether the server can then HOLD it is checked
     /// separately, against its memory, before parsing.
     /// </summary>
     public int MaxUploadMb { get; init; } = 512;

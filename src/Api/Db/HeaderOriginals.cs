@@ -9,17 +9,17 @@ namespace Coffer.Api.Db;
 /// them — migration 230's half of the flip.
 /// </summary>
 /// <remarks>
-/// <para>Before 230, <c>txn_headers</c> held the feed's values and
-/// <c>txn_header_overrides</c> held the user's, read back as
-/// <c>COALESCE(o.x, h.x)</c>. Three things were wrong with that: a CLEARED
-/// field was unrepresentable (a nullable override column has no companion "is
-/// overridden" marker, so NULL had to mean both "not overridden" and
-/// "overridden to empty", and COALESCE always chose the former); the two write
-/// paths disagreed (investment wrote canonical, underneath the override, where
-/// COALESCE could not see it); and no code ever deleted an override row, so
-/// that disagreement was permanent.</para>
+/// <para>The inverse shape — <c>txn_headers</c> holding the feed's values and
+/// <c>txn_header_overrides</c> the user's, read back as
+/// <c>COALESCE(o.x, h.x)</c> — has three problems: a CLEARED field is
+/// unrepresentable (a nullable override column has no companion "is
+/// overridden" marker, so NULL has to mean both "not overridden" and
+/// "overridden to empty", and COALESCE always chooses the former); a write
+/// path that writes canonical, underneath the override, is invisible to
+/// COALESCE; and an override row that is never deleted makes that
+/// disagreement permanent.</para>
 ///
-/// <para>Now the canonical row always holds the current values and the sidecar
+/// <para>So the canonical row always holds the current values and the sidecar
 /// holds the feed's. This helper is the ONE place either write path captures
 /// that sidecar, which is what makes bank and investment genuinely the same
 /// design rather than two similarly-shaped ones.</para>
@@ -31,7 +31,9 @@ namespace Coffer.Api.Db;
 /// exact ambiguity the flip exists to remove.</para>
 ///
 /// <para>Capture is <i>once per header</i>. A row already on file was written by
-/// an earlier edit and already holds the feed's values; overwriting it with the
+/// an earlier edit, or seeded by the Moneydance importer from the feed's own
+/// strings (ADR-0100, 2026-10-21 amendment), and already holds the feed's
+/// values; overwriting it with the
 /// current ones would quietly redefine "original" as "whatever it was before the
 /// most recent edit" and make a reset restore the wrong thing.</para>
 /// </remarks>
@@ -43,9 +45,22 @@ internal static class HeaderOriginals
     /// transaction as the edit — a crash between the two would leave a mutated
     /// row with no recorded original.
     /// </summary>
+    /// <param name="memo">The transaction's memo as it is now, wherever it sits: a
+    /// one-posting transaction keeps it on its originating side's leg, not on the
+    /// header. Computed by <see cref="AnnotationWriter.CaptureOriginalsAsync"/>, which is
+    /// how every edit path captures.</param>
+    /// <param name="amount">The transaction's amount on its originating account, the sum
+    /// of its legs there, as it is now (ADR-0114 D15): on a first edit the amount from
+    /// before the edit, at an import that rounds the provider's figure before rounding.
+    /// Null when the header has no leg on an originating account.</param>
+    /// <param name="roundedAtImport">True only for an import that rounded
+    /// <paramref name="amount"/> to its account currency's places; false for an edit.</param>
     public static async Task CaptureAsync(
         AppDbContext db,
         TxnHeaderRow header,
+        string? memo,
+        decimal? amount,
+        bool roundedAtImport,
         CancellationToken cancellationToken)
     {
         // The local lookup matters: two edits inside one PatchAsync (header
@@ -65,10 +80,12 @@ internal static class HeaderOriginals
             HeaderId = header.Id,
             LedgerId = header.LedgerId,
             Payee = header.Payee,
-            Memo = header.Memo,
+            Memo = memo,
             PostedAt = header.PostedAt,
             TransactedAt = header.TransactedAt,
             CheckNumber = header.CheckNumber,
+            Amount = amount,
+            RoundedAtImport = roundedAtImport,
         });
     }
 }

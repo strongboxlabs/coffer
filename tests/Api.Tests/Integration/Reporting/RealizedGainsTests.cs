@@ -17,11 +17,12 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// remaining holding basis is the newer lot — the discriminator vs average cost.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class RealizedGainsTests
+public sealed class RealizedGainsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public RealizedGainsTests(PostgresFixture fixture) => _fixture = fixture;
+    public RealizedGainsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -34,12 +35,12 @@ public sealed class RealizedGainsTests
     [Fact]
     public async Task Partial_sale_realizes_fifo_gain_and_leaves_newer_lot_basis()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task Trade(string action, decimal shares, decimal price, DateTime at)
@@ -67,7 +68,7 @@ public sealed class RealizedGainsTests
         // Realized gain: FIFO consumes the cheaper lot 1 → the gain is the proceeds
         // less lot 1's basis. (Average cost would subtract the mean of the two lots'
         // bases and give a smaller gain — this asserts FIFO.)
-        var realized = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var realized = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
         var row = Assert.Single(realized.Rows);
         Assert.Equal(security, row.SecurityId);
@@ -78,7 +79,7 @@ public sealed class RealizedGainsTests
 
         // Remaining holding: lot 2's shares at lot 2's own basis (FIFO), not the
         // average of the two lots' bases.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var holding = await db.Holdings.AsNoTracking()
             .SingleAsync(h => h.AccountId == holdings && h.SecurityId == security);
         Assert.Equal(10m, holding.Quantity);
@@ -89,15 +90,14 @@ public sealed class RealizedGainsTests
     /// Realized gains read back correctly at BOTH magnitudes (<see cref="Boundary"/>).
     /// </summary>
     /// <remarks>
-    /// Regression for mig 182. The FIFO recompute computes
+    /// Mig 182. The FIFO recompute computes
     /// <c>cost_basis_sold = consumed_qty × unit_cost</c>. Both are NUMERIC(25,12)
     /// (quantity always; unit_cost since mig 180), so a FRACTIONAL-share lot times a
     /// 12dp unit_cost yields up to 24 decimal places. At a seven-figure position that
-    /// is around 30 significant digits — past .NET decimal's ceiling — so before mig 182
-    /// (unconstrained numeric columns) the recompute stored the 24dp value and
-    /// RealizedGainsAsync threw System.OverflowException reading it back (the
-    /// `realized_gains` failure found on a real ledger). mig 182 constrains the money columns to
-    /// NUMERIC(19,2), so the value is stored 2dp and reads fine.
+    /// is around 30 significant digits — past .NET decimal's ceiling — so an
+    /// unconstrained numeric column would store the 24dp value and RealizedGainsAsync
+    /// would throw System.OverflowException reading it back. mig 182 constrains the
+    /// money columns to NUMERIC(19,2), so the value is stored 2dp and reads fine.
     /// <para>
     /// The typical case runs the same assertions at whole shares and three-figure
     /// money, so a failure distinguishes "broken at scale" from "broken everywhere".
@@ -107,11 +107,11 @@ public sealed class RealizedGainsTests
     [MemberData(nameof(Boundary.Positions), MemberType = typeof(Boundary))]
     public async Task Realized_gains_read_without_decimal_overflow(Boundary.Position p)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var security = await ledger.AddSecurityAsync("Bond Fund", "BDFA");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task Trade(string action, decimal shares, decimal price, DateTime at)
@@ -131,10 +131,13 @@ public sealed class RealizedGainsTests
         await Trade("buy",   p.Quantity, p.BuyPrice,  new DateTime(2020, 1, 1, 12, 0, 0, DateTimeKind.Utc));
         await Trade("sell", -p.Quantity, p.SellPrice, new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc));
 
-        // The read itself is the regression: pre-mig-182 this line threw OverflowException.
-        var realized = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        // The read itself is the assertion: with unconstrained columns this line throws OverflowException.
+        var realized = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
-        var row = Assert.Single(realized.Rows);
+        var single = Assert.Single(realized.Rows);
+        // A single-currency ledger converts nothing, so every figure is present.
+        var row = (Proceeds: single.Proceeds!.Value, CostBasisSold: single.CostBasisSold!.Value,
+            RealizedGain: single.RealizedGain!.Value);
 
         // Money is stored at MoneyScale (no 24dp noise survived) ...
         Assert.Equal(Math.Round(row.Proceeds, Boundary.MoneyScale), row.Proceeds);
@@ -153,11 +156,11 @@ public sealed class RealizedGainsTests
     [Fact]
     public async Task Sale_straddling_one_year_splits_gain_short_vs_long_term()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task Trade(string action, decimal shares, decimal price, DateTime at)
@@ -184,7 +187,7 @@ public sealed class RealizedGainsTests
         await Trade("buy", 10m, 200m, new DateTime(2026, 2, 1, 12, 0, 0, DateTimeKind.Utc));
         await Trade("sell", -15m, 300m, new DateTime(2026, 3, 1, 12, 0, 0, DateTimeKind.Utc));
 
-        var realized = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var realized = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .RealizedGainsAsync(ledger.LedgerId, null, null, null, null);
         var row = Assert.Single(realized.Rows);
 
@@ -209,14 +212,14 @@ public sealed class RealizedGainsTests
     /// columns are plain NUMERIC — nothing in the schema constrains them — and the
     /// values are products of a division (take x unit_cost, unit_cost = amount /
     /// quantity), a shape Postgres will take past 30 digits. System.Decimal holds
-    /// 28-29 and Npgsql throws rather than truncate, which is precisely how
-    /// holdings_snapshot broke in 0.63.0. Asserted so the property is enforced
-    /// rather than being a lucky feature of the current data.
+    /// 28-29 and Npgsql throws rather than truncate, so an unbounded value is an
+    /// unreadable one. Asserted so the property is enforced rather than being a
+    /// lucky feature of the current data.
     /// </summary>
     [Fact]
     public async Task Stored_realized_gains_are_bounded_to_the_money_scale()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
@@ -232,7 +235,7 @@ public sealed class RealizedGainsTests
             brokerage.Id, holdings, sec, -3.333333333333m, 40_000_000m, new DateTime(2022, 6, 1, 0, 0, 0, DateTimeKind.Utc));
         await ledger.RecomputeHoldingsAsync();
 
-        await using var conn = _fixture.OpenServiceConnection();
+        await using var conn = Db.OpenServiceConnection();
         var rows = (await Dapper.SqlMapper.QueryAsync<string>(conn,
             """
             SELECT unnest(ARRAY[
@@ -247,7 +250,7 @@ public sealed class RealizedGainsTests
             var dot = v.IndexOf('.');
             var scale = dot < 0 ? 0 : v.Length - dot - 1;
             Assert.True(scale <= 4, $"stored money value {v} has scale {scale}, expected <= 4");
-            // And it must round-trip into a decimal, which is the failure that started this.
+            // And it must round-trip into a decimal, which is the failure this guards.
             Assert.True(decimal.TryParse(v, System.Globalization.NumberStyles.Float,
                 System.Globalization.CultureInfo.InvariantCulture, out _),
                 $"stored value {v} does not fit System.Decimal");
@@ -257,16 +260,15 @@ public sealed class RealizedGainsTests
     [Fact]
     public async Task Realized_gain_is_rounded_once_to_the_scale_its_column_has()
     {
-        // Migration 205 rounded realized_gains money to 4dp; mig 182 had already
-        // narrowed those columns to NUMERIC(19,2), so Postgres rounded a SECOND time on
-        // assignment and double rounding shifted the stored value by a cent whenever the
-        // tail sat in the band where the two orders disagree. Mig 209 rounds once, at the
-        // column's own scale.
+        // The realized_gains money columns are NUMERIC(19,2) (mig 182). Rounding to
+        // 4dp first makes Postgres round a SECOND time on assignment, and double
+        // rounding shifts the stored value by a cent whenever the tail sits in the
+        // band where the two orders disagree. Mig 209 rounds once, at the column's
+        // own scale.
         //
-        // On a real ledger this hit only a small fraction of disposals, which is
-        // exactly why mig 205's four fixtures missed it — its own header records that
-        // they "all produced clean 2dp values". So this fixture is built to land IN the
-        // band rather than near it:
+        // Only a disposal whose tail lands in that band is hit, and fixtures that
+        // produce clean 2dp values never reach it. So this fixture is built to land
+        // IN the band rather than near it:
         //
         //   buy  one share at a round price  -> the unit cost is exact
         //   sell a seven-decimal fraction of that share at the same price
@@ -275,15 +277,15 @@ public sealed class RealizedGainsTests
         //           so the gain is a negative tail just UNDER half a cent
         //
         //   ROUND(gain, 4) lifts that tail to exactly half a cent, which the (19,2)
-        //   column then rounds away from zero to minus one cent       (the old bug)
+        //   column then rounds away from zero to minus one cent       (double rounding)
         //   ROUND(gain, 2) gives zero, and zero is what is stored          (correct)
         //
         // The odd share count is the whole point; a round quantity cannot reach the band.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var security = await ledger.AddSecurityAsync("Fractional Fund", "FRAC");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task Trade(string action, decimal shares, decimal price, DateTime at)
@@ -305,7 +307,7 @@ public sealed class RealizedGainsTests
         await Trade("buy", 1m, 100m, new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc));
         await Trade("sell", -0.1000496m, 100m, new DateTime(2026, 2, 1, 12, 0, 0, DateTimeKind.Utc));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var stored = await db.RealizedGains.AsNoTracking()
             .Where(r => r.LedgerId == ledger.LedgerId && r.SecurityId == security)
             .Select(r => r.RealizedGain)

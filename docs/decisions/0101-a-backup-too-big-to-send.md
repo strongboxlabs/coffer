@@ -14,28 +14,27 @@ proxy body cap is the operator's environment to configure:
 > raise `client_max_body_size` or equivalent, or install on localhost with no proxy in
 > front.
 
-That remedy does not exist for the deployment it was written against. **Cloudflare caps
-proxied request bodies at 100 MB on Free and Pro, and it is not a setting.** The
-alternatives are an Enterprise contract or taking the site off the proxy — not a config
-line. A real `.cofferbak` on a modest personal ledger is already over that cap. Restore through the
-front door returned 413 before a byte reached the app; the same request sent directly at
-the API returned 401, which is the app answering. So the app was never the constraint
-and raising `MultipartBodyLengthLimit` to 4 GiB (D2 there) bought nothing.
+That remedy does not exist behind Cloudflare. **Cloudflare caps proxied request bodies
+at 100 MB on Free and Pro, and it is not a setting.** The alternatives are an Enterprise
+contract or taking the site off the proxy — not a config line. A personal ledger's
+`.cofferbak` can be over that cap, and the proxy then answers 413 before a byte reaches
+the app. The app is not the constraint, so raising `MultipartBodyLengthLimit` to 4 GiB
+(D2 there) buys nothing.
 
-Two distinct situations were failing, and they need different answers:
+Two distinct situations need different answers:
 
 | | Where the artifact is | What restore needs |
 |---|---|---|
 | **Roll back this install** | on this server's disk, written by this server | to be told WHICH one |
 | **Disaster recovery** | on a laptop, fetched from Google Drive | to be sent, through the proxy |
 
-The first was a pure round trip: Coffer uploading a file to Coffer, to reach a file
-Coffer was already sitting on. The second genuinely needs a transfer, and that transfer
-is the one the cap refuses.
+The first is a pure round trip: Coffer uploading a file to Coffer, to reach a file
+Coffer already holds. The second genuinely needs a transfer, and that transfer is the
+one the cap refuses.
 
-The Drive copy had a second, independent problem: one artifact was one Drive file, so an
-upload interrupted at 90% restarted from zero, every time, for as long as the connection
-kept dropping.
+The Drive copy has a second, independent problem: one artifact as one Drive file means
+an upload interrupted at 90% restarts from zero, every time, for as long as the
+connection keeps dropping.
 
 ## Decision
 
@@ -73,21 +72,19 @@ completely untouched.
 
 **D5 — The part size is configurable (`Api:Backup:PartSizeMb`), defaulting to 49.**
 
-This ADR was first written with it as a constant, on the reasoning that it exists to
-clear one specific unraisable cap so nobody should have a number to get wrong. Two
-things were wrong with that.
+A constant looks safer — the size exists to clear an unraisable cap, so why give anyone
+a number to get wrong — and is wrong twice.
 
 The caps differ. 49 MB clears Cloudflare's 100 MB *and* the common 50 MB limits, but
 there is no value that clears every proxy, and several of those are no more raisable
 than Cloudflare's. A fixed size answers one deployment and leaves the next one with a
 restore that cannot run and no lever at all.
 
-More decisive: a constant made the feature untestable. On any install whose backup is
-under the threshold — which is most of them, including this project's own development
-one — the split path cannot fire, so nobody sees it work until the day it is needed.
+More decisive: a constant makes the feature untestable. On any install whose backup is
+under the threshold the split path cannot fire, so nobody sees it work until the day it is needed.
 Lowering the setting is how the path gets exercised at all. A feature that cannot be
-tried without recompiling does not get tried, and shipping a green test suite over code
-that has never once run is a failure mode this project has already hit.
+tried without recompiling does not get tried, and a green test suite over code that has
+never once run proves nothing about it.
 
 The setting is safe to change whenever, because nothing reads it back: a part set
 already written off-host carries its own count in its filenames (D2), and an upload in
@@ -147,5 +144,4 @@ makes restore depend on a connected Drive whose OAuth token is sealed under the 
 KEK — which, in the cross-install restore that ADR-0092 D4 exists for, is precisely the
 key you do not have.
 
-**Keep the part size a constant.** Rejected after first accepting it; the reasoning is
-in D5.
+**Keep the part size a constant.** Rejected; the reasoning is in D5.

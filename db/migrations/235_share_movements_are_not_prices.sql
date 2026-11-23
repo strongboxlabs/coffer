@@ -3,22 +3,21 @@
 --
 -- A Moneydance ShrsIn / ShrsOut moves shares with no cash consideration, so MD
 -- has no purchase price to record and stores a NOMINAL amount equal to the
--- share count: a real record's `1.pamt` (cents) carries the same digits as its
+-- share count: the record's `1.pamt` (cents) carries the same digits as its
 -- `1.samt` (shares, at more implied decimals), cut to the cent. The importer
 -- derives `unit_price = amount / quantity` and faithfully produces a price a
 -- hair off one per share — which then becomes a `trade` price in
 -- security_prices and values the holding.
 --
--- ADR-0084 believed these were already excluded: "transfer_shares carries
--- pamt = 0 -> unit_price 0/NULL writes no price". That covers the zero case
--- only. A nominal, NON-zero amount passes `unit_price > 0` untouched.
+-- ADR-0084's exclusion — "transfer_shares carries pamt = 0 -> unit_price
+-- 0/NULL writes no price" — covers the zero case only. A nominal, NON-zero amount passes `unit_price > 0` untouched.
 --
--- Found on a real ledger: dozens of legs priced at the nominal, and many stored
--- `trade` prices within a few percent of one per share for securities that
--- trade far above it. The consistency check called that ledger HEALTHY, because
--- the writer and the checker share the rule and computed the same wrong answer.
+-- Every such leg stores a `trade` price within a hair of one per share, for
+-- securities that may trade far above it. The consistency check calls the ledger
+-- HEALTHY, because the writer and the checker share the rule and compute the
+-- same wrong answer.
 --
--- THE TEST IS NOT THE ACTION. Far more ShrsIn/ShrsOut legs on the same ledger
+-- THE TEST IS NOT THE ACTION. A ShrsIn/ShrsOut leg can also
 -- carry a real price — either MD recorded one or someone corrected it by hand —
 -- and excluding the action wholesale would discard those. The signature of a
 -- placeholder is that the amount still EQUALS the share count, i.e. the price

@@ -94,7 +94,7 @@ public static class AdminSystemSettingsEndpoints
         ArgumentNullException.ThrowIfNull(request);
 
         // Turning writes ON lets every connected app change data: a tap, not just a
-        // cookie (2026-10-12 audit, M2). Turning them off, or leaving them as they are,
+        // cookie (ADR-0105 D1). Turning them off, or leaving them as they are,
         // never needs one — the kill-switch must stay one click.
         if (request.WritesEnabled && !runtime.WritesEnabled)
         {

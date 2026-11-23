@@ -6,10 +6,10 @@ import type {
     CreateFeedConnectionRequest,
     FeedConnectionAccountDto,
     FeedConnectionSummary,
+    RenameFeedConnectionRequest,
     SyncAllResultDto,
     SyncResultDto,
     SyncRunDetail,
-    SyncRunSummary,
 } from '../types/feed';
 import { request } from './_request';
 
@@ -43,6 +43,28 @@ export function createFeedConnection(
     return request<FeedConnectionSummary>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/feed-connections`,
         { method: 'POST', body },
+    );
+}
+
+/**
+ * PATCH /api/ledgers/{ledgerId}/feed-connections/{id} — rename a
+ * connection; the owner's, as disconnecting it is. Returns the
+ * connection's summary with the trimmed name.
+ *
+ * 422 codes:
+ *   * `feed-connection-name-required` / `feed-connection-name-too-long`
+ *      — blank, or longer than 80 characters, once trimmed.
+ *   * `feed-connection-not-found` — no such connection in this ledger.
+ *   * `ledger-not-owner` — the caller is not an owner of the ledger.
+ */
+export function renameFeedConnection(
+    ledgerId: string,
+    connectionId: string,
+    body: RenameFeedConnectionRequest,
+): Promise<FeedConnectionSummary> {
+    return request<FeedConnectionSummary>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/feed-connections/${encodeURIComponent(connectionId)}`,
+        { method: 'PATCH', body },
     );
 }
 
@@ -134,24 +156,6 @@ export function fetchFeedConnectionAccounts(
 ): Promise<FeedConnectionAccountDto[]> {
     return request<FeedConnectionAccountDto[]>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/feed-connections/${encodeURIComponent(connectionId)}/accounts`,
-    );
-}
-
-/**
- * GET /api/ledgers/{ledgerId}/sync-runs?connectionId=... — recent
- * runs for one connection, newest first (slice 2c.1). The SPA's
- * sync-activity panel reads this; default limit caps to the
- * server's per-page maximum.
- */
-export function fetchSyncRuns(
-    ledgerId: string,
-    connectionId: string,
-    limit?: number,
-): Promise<SyncRunSummary[]> {
-    const params = new URLSearchParams({ connectionId });
-    if (limit !== undefined) params.set('limit', String(limit));
-    return request<SyncRunSummary[]>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/sync-runs/?${params.toString()}`,
     );
 }
 

@@ -13,24 +13,24 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// Tags on investment transactions (ADR-0028, 2026-09 refinement).
 /// </summary>
 /// <remarks>
-/// <para>Tags pair to the HEADER — <c>txn_header_tags</c> is keyed
-/// <c>(header_id, tag_id)</c> and there is no leg column anywhere in the schema
-/// — so an investment event's legs are irrelevant to them. The register
-/// nonetheless blanked them on the way out and the write contracts had no
-/// <c>Tags</c> field, which made an investment header the one place a tag could
-/// be written (via the MCP bulk tool, which has no shape gate) and never
-/// read.</para>
+/// <para>An investment event has one tag set, placed like its memo: on the
+/// brokerage leg of a one-posting event (<c>txn_leg_tags</c>, migration 243), on
+/// the header of a multi-posting one (<c>txn_header_tags</c>). A register that
+/// blanked them on the way out, with write contracts lacking a <c>Tags</c>
+/// field, would make an investment event the one place a tag could be written
+/// and never read.</para>
 ///
 /// <para>Every test here asserts what the caller can OBSERVE — the register row,
 /// the shared dictionary, the status code — not which table was written, so
 /// they stay honest if the storage changes.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class InvestmentTagsTests
+public sealed class InvestmentTagsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public InvestmentTagsTests(PostgresFixture fixture) => _fixture = fixture;
+    public InvestmentTagsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Utc(int y, int m, int d) =>
         new(y, m, d, 12, 0, 0, DateTimeKind.Utc);
@@ -75,38 +75,46 @@ public sealed class InvestmentTagsTests
     }
 
     /// <summary>
-    /// The tags the register reports for one header, read the way the SPA reads
-    /// them. Deliberately NOT a direct <c>txn_header_tags</c> query: the bug
-    /// this covers was a header that HAD its pairings and still showed none,
-    /// which a table read would have called passing.
+    /// The tags the brokerage register shows for one header. Deliberately NOT a
+    /// direct pairing query: the bug this covers was a header that HAD its pairings
+    /// and still showed none, which a table read would have called passing. Read
+    /// through the one presentation rule over what is stored, which the register
+    /// reads through once its readers move; the row must be on the register too.
     /// </summary>
     private static async Task<IReadOnlyList<string>> RegisterTagsAsync(
         HttpClient client, SyntheticLedger ledger, Guid brokerageId, Guid headerId)
     {
         var page = (await client.GetFromJsonAsync<RegisterPage>(
             $"/api/ledgers/{ledger.LedgerId}/transactions?account_id={brokerageId}&limit=100"))!;
-        var entry = Assert.Single(
-            page.Entries, e => e.Txn is not null && e.Txn.HeaderId == headerId);
-        return entry.Txn!.Tags;
+        Assert.Single(page.Entries, e => e.Txn is not null && e.Txn.HeaderId == headerId);
+        var shown = await ledger.ShownForAsync(headerId, brokerageId);
+        return Assert.Single(shown.Select(s => s.Tags).Distinct(new TagSetComparer()));
+    }
+
+    private sealed class TagSetComparer : IEqualityComparer<IReadOnlyList<string>>
+    {
+        public bool Equals(IReadOnlyList<string>? x, IReadOnlyList<string>? y) =>
+            x is not null && y is not null && x.SequenceEqual(y);
+
+        public int GetHashCode(IReadOnlyList<string> obj) => obj.Count;
     }
 
     /// <summary>
     /// Tags supplied on create reach the register row.
     /// </summary>
     /// <remarks>
-    /// The whole feature in one assertion. Before it, the create contract had no
-    /// <c>Tags</c> field at all, so this could not be expressed; and even once
-    /// written by another path, <c>ProjectInvestmentEvent</c> replaced the row's
-    /// tags with an empty array before it left the server.
+    /// The whole feature in one assertion: the create contract carries
+    /// <c>Tags</c>, and <c>ProjectInvestmentEvent</c> must not replace the row's
+    /// tags with an empty array before it leaves the server.
     /// </remarks>
     [Fact]
     public async Task Tags_supplied_on_create_show_on_the_register_row()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("TAGX", ticker: "TAGX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var headerId = await BuyAsync(client, ledger, brokerage.Id, securityId,
@@ -122,11 +130,11 @@ public sealed class InvestmentTagsTests
     [Fact]
     public async Task A_patch_replaces_the_tag_set()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("TAGX", ticker: "TAGX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var postedAt = Utc(2026, 5, 4);
@@ -168,11 +176,11 @@ public sealed class InvestmentTagsTests
     [Fact]
     public async Task An_empty_list_clears_tags_and_omitting_the_field_leaves_them()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("TAGX", ticker: "TAGX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var postedAt = Utc(2026, 5, 4);
@@ -215,22 +223,22 @@ public sealed class InvestmentTagsTests
     /// Tags survive the wholesale leg reshape a PATCH performs.
     /// </summary>
     /// <remarks>
-    /// The investment PATCH deletes and rebuilds the header's legs — that is how
-    /// adding a fee works. Anything keyed on a leg dies with it (the reason
-    /// <c>txn_leg_recon</c> needed leg-identity preservation). Tags are keyed on
-    /// the HEADER, whose id is stable across the reshape, so they must not care
-    /// — and this asserts it on the edit that changes the leg count, not on a
-    /// memo-only edit that might not rebuild anything.
+    /// The investment PATCH reshapes the header's legs — that is how adding a fee
+    /// works. Legs keep their identity where the new shape has room for them, the
+    /// header id is stable, and a change of posting count moves the event's tag
+    /// set between the brokerage leg and the header, so the tags must survive —
+    /// and this asserts it on the edit that changes the leg count, not on a
+    /// memo-only edit that might not reshape anything.
     /// </remarks>
     [Fact]
     public async Task Tags_survive_an_edit_that_rebuilds_the_legs()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var fees = await ledger.AddCategoryAsync("Investment Fees");
         var securityId = await ledger.AddSecurityAsync("TAGX", ticker: "TAGX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var postedAt = Utc(2026, 5, 4);
@@ -239,7 +247,7 @@ public sealed class InvestmentTagsTests
 
         int LegCount()
         {
-            using var db = _fixture.NewDbContext();
+            using var db = Db.NewDbContext();
             return db.TxnLegs.AsNoTracking().Count(l => l.HeaderId == headerId);
         }
         var before = LegCount();
@@ -284,7 +292,7 @@ public sealed class InvestmentTagsTests
     [Fact]
     public async Task An_investment_tag_reuses_the_ledgers_dictionary_row()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var checking = await ledger.AddBankAccountAsync("checking");
         var other = await ledger.AddBankAccountAsync("savings");
@@ -293,16 +301,16 @@ public sealed class InvestmentTagsTests
         // The dictionary row is created by the BANK side first, lower-cased.
         var (bankLeg, _) = await ledger.AddTransactionPairAsync(
             checking.Id, other.Id, 25m, Utc(2026, 5, 1), "rent");
-        await ledger.AddTagAsync(bankLeg, "reimbursable");
+        await ledger.SetSideTagsAsync(bankLeg, checking.Id, ["reimbursable"], checking.Id);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // The investment side asks for it in a different casing.
         var headerId = await BuyAsync(client, ledger, brokerage.Id, securityId,
             Utc(2026, 5, 4), ["Reimbursable"]);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var rows = await db.Tags.AsNoTracking()
                 .Where(t => t.LedgerId == ledger.LedgerId
@@ -312,8 +320,9 @@ public sealed class InvestmentTagsTests
             // First casing wins — the bank side got there first.
             Assert.Equal("reimbursable", row.Name);
 
-            var pairings = await db.TxnHeaderTags.AsNoTracking()
-                .CountAsync(p => p.TagId == row.Id);
+            // Both one-posting transactions carry it on their writing side's leg.
+            var pairings = await db.TxnHeaderTags.AsNoTracking().CountAsync(p => p.TagId == row.Id)
+                + await db.TxnLegTags.AsNoTracking().CountAsync(p => p.TagId == row.Id);
             Assert.Equal(2, pairings);
         }
     }
@@ -322,19 +331,18 @@ public sealed class InvestmentTagsTests
     /// The 20-tag cap is enforced on the investment surface too.
     /// </summary>
     /// <remarks>
-    /// The caps lived as private constants on <c>TransactionsEndpoints</c>. Left
-    /// there, the investment surface would have had none — the editor enforces
-    /// the same limits client-side, so the gap would only ever have shown
-    /// through the API.
+    /// Caps held as private constants on <c>TransactionsEndpoints</c> would leave
+    /// the investment surface with none — the editor enforces the same limits
+    /// client-side, so the gap would only ever show through the API.
     /// </remarks>
     [Fact]
     public async Task Too_many_tags_is_rejected_on_the_investment_surface()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("TAGX", ticker: "TAGX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var tooMany = Enumerable.Range(1, 21).Select(i => $"tag-{i}").ToArray();
@@ -359,11 +367,11 @@ public sealed class InvestmentTagsTests
     [Fact]
     public async Task An_empty_tag_name_is_rejected_on_the_investment_surface()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("TAGX", ticker: "TAGX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await PostBuyAsync(client, ledger, brokerage.Id, securityId,
@@ -386,15 +394,28 @@ public sealed class InvestmentTagsTests
     [Fact]
     public async Task Filtering_a_brokerage_register_by_tag_returns_rows_that_show_it()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("TAGX", ticker: "TAGX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
-        var tagged = await BuyAsync(client, ledger, brokerage.Id, securityId,
-            Utc(2026, 5, 4), ["roth"]);
+        // A buy with a fee: several postings, so the event's tags sit on its header.
+        // A one-posting event keeps them on its brokerage leg. The register's filter
+        // reads either through the stored presentation (txn_leg_note_tags).
+        var fees = await ledger.AddCategoryAsync("Investment Fees");
+        var created = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/investment-transactions",
+            new CreateInvestmentTransactionRequest
+            {
+                BrokerageAccountId = brokerage.Id, PostedAt = Utc(2026, 5, 4), Action = "buy",
+                SecurityId = securityId, Shares = 10m, Price = 100m, Amount = 1000m,
+                FeeAccountId = fees.Id, FeeAmount = 4.95m, Tags = ["roth"],
+            });
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        var tagged = (await created.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>())
+            .GetProperty("headerId").GetGuid();
         await BuyAsync(client, ledger, brokerage.Id, securityId,
             Utc(2026, 5, 5), null);
 

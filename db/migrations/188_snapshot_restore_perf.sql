@@ -2,9 +2,8 @@
 -- 188 — snapshot restore performance: capture realized_gains, set-based balances
 -- =============================================================================
 --
--- A full-ledger restore ran ~27s on a real ledger. Reading the restore body, the
--- cost was not where the delete+reinsert is -- it was in the two derived-state
--- rebuilds bolted on after it, and BOTH were avoidable.
+-- A full-ledger restore runs two derived-state rebuilds after the
+-- delete+reinsert, and BOTH are avoidable.
 --
 --  1. The FIFO recompute was rebuilding data the payload already carried.
 --     `holdings` and `lots` are both captured, so restore reinserted them
@@ -14,17 +13,12 @@
 --     live_txn_headers on each event). The only thing that walk produced which the
 --     payload lacked was `realized_gains`.
 --
---     CORRECTION (comment only; the SQL below is unchanged and was never wrong).
---     This header originally asserted that those loops "are the ~27s". The
---     stress lane then measured them, and they are not: whole-ledger recompute is
---     ~0.3s at 200 holdings x 22 events and ~2.3s at 20 holdings x 500 events with
---     8000 lots. Restore at 50k transactions is ~65s, dominated by the
---     delete+reinsert of an ~85 MB payload -- not by either rebuild removed here.
+--     These loops are not where restore's time goes: the stress lane puts it in
+--     the delete+reinsert of the payload, not in either rebuild removed here.
 --     What this migration does is still right (do not re-derive state the payload
 --     already carries; do not run provably dead work; make restore reproduce the
---     snapshot rather than approximate it), and it is a real if modest saving. But
---     the attribution was an assumption dressed as a fact, and the lever for
---     restore latency is the reinsert path. See follow-ups.md.
+--     snapshot rather than approximate it), and it is a modest saving. The lever
+--     for restore latency is the reinsert path. See follow-ups.md.
 --
 --     So: capture realized_gains and drop the recompute. It round-trips 1:1 --
 --     it keys on `sell_leg_id`, a txn_legs row the payload already carries, plus
@@ -51,9 +45,8 @@
 --     which after ADR-0091 means >=103 no-op iterations on every ledger.
 --
 --     Replaced with fn_recompute_balances_for_ledger: one set-based pass with the
---     running total as a window function PARTITION BY account_id. Measured on a
---     small ledger (many accounts, few headers) the loop was ~26ms, so this is a correctness-
---     and-clarity cleanup rather than the perf win -- the win is (1).
+--     running total as a window function PARTITION BY account_id. This is a
+--     correctness-and-clarity cleanup rather than the perf win -- the win is (1).
 --
 -- fn_recompute_balances_for_account is UNCHANGED and still the incremental path
 -- used by the write triggers/interceptors, which narrow by account + posted_at.
@@ -61,9 +54,9 @@
 -- -- switches to the set-based version.
 --
 -- Not addressed here: the payload reinsert, which the stress lane identifies as
--- where restore's time actually goes. Hoisting the FIFO walk's open-lot re-query
--- out of its per-event loop was the expected follow-up, but measurement demoted it
--- (~0.1s for a single position, which is what a transaction write pays).
+-- where restore's time goes. Hoisting the FIFO walk's open-lot re-query out of its
+-- per-event loop is not pursued: a transaction write walks a single position, where
+-- that loop is cheap.
 -- =============================================================================
 
 -- ----- Set-based, whole-ledger balance rebuild --------------------------------
@@ -141,8 +134,8 @@ BEGIN
         'txn_legs',                         (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_legs t WHERE t.ledger_id = p_ledger_id),
         'txn_leg_recon',                    (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_leg_recon t WHERE t.ledger_id = p_ledger_id),
         'lots',                             (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM lots t WHERE t.ledger_id = p_ledger_id),
-        -- mig 188: realized_gains is derived, but re-deriving it on restore cost
-        -- ~27s and overwrote the holdings/lots restored above. Keys on
+        -- mig 188: realized_gains is derived, but re-deriving it on restore walked
+        -- the whole ledger and overwrote the holdings/lots restored above. Keys on
         -- sell_leg_id (a captured txn_legs row) so it round-trips 1:1.
         'realized_gains',                   (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM realized_gains t WHERE t.ledger_id = p_ledger_id),
         'txn_header_overrides',             (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_header_overrides t WHERE t.ledger_id = p_ledger_id),
@@ -257,7 +250,7 @@ BEGIN
 
     -- No FIFO recompute here (mig 188). holdings, lots AND realized_gains all
     -- come from the payload, so recompute_holdings_cost_basis would only spend
-    -- ~27s overwriting them with the same values. See the header for why that is
+    -- a whole-ledger walk overwriting them with the same values. See the header for why that is
     -- safe (schema-version guard) and what it means (restore reproduces the
     -- snapshot rather than re-deriving it).
 END;

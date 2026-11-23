@@ -45,7 +45,7 @@ But persisting it correctly is harder than it looks:
 - The trigger is independently testable. End-to-end test once lived in `db/test/verify_balance_trigger.sql`; retired in mig 102 when the trigger family was dropped — coverage moved to `BalanceConsistencyTests` and per-writer integration tests under `tests/Api.Tests/Integration/Transactions/`.
 
 **Negative**
-- A bulk insert of N rows for one account triggers a recompute over the affected window once. For the Phase 2 import (one large real-world export, many accounts) this is a single batch per account, acceptable. If we ever need to bulk-load millions of rows, we will disable the trigger, populate, then re-enable and run a one-shot recompute.
+- A bulk insert of N rows for one account triggers a recompute over the affected window once. For the Phase 2 import (one bootstrap export, many accounts) this is a single batch per account, acceptable. If we ever need to bulk-load millions of rows, we will disable the trigger, populate, then re-enable and run a one-shot recompute.
 - `balance_after` does not reflect override-amount edits. Documented as a known limitation; override-amount is rare per the spec. If real use exposes this gap, the trigger can be extended to also fire on `transaction_overrides` changes.
 
 ## Alternatives considered

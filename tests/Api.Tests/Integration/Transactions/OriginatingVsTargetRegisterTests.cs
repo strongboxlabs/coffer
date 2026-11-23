@@ -17,13 +17,11 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// projection that fills the Action chip on per-posting target rows.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class OriginatingVsTargetRegisterTests
+public sealed class OriginatingVsTargetRegisterTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public OriginatingVsTargetRegisterTests(PostgresFixture fixture)
+    public OriginatingVsTargetRegisterTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -47,7 +45,7 @@ public sealed class OriginatingVsTargetRegisterTests
         // 3 postings, all of them touch the primary side. The
         // primary account's register sees ONE group entry — the
         // bank register's split-parent affordance.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("checking");
         var brokerageCash = await ledger.AddBankAccountAsync("brokerage-cash");
         var taxes = await ledger.AddCategoryAsync("Taxes");
@@ -63,7 +61,7 @@ public sealed class OriginatingVsTargetRegisterTests
             postedAt: new DateTime(2026, 5, 5, 12, 0, 0, DateTimeKind.Utc),
             payee: "PAYCHECK");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var page = (await client.GetFromJsonAsync<RegisterPage>(
@@ -82,7 +80,7 @@ public sealed class OriginatingVsTargetRegisterTests
         // touched by 2 of the 3 postings (both brokerage-cash legs). Its
         // register sees TWO independent entries, each kind='txn',
         // not one collapsed group.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("checking");
         var brokerageCash = await ledger.AddBankAccountAsync("brokerage-cash");
         var taxes = await ledger.AddCategoryAsync("Taxes");
@@ -98,7 +96,7 @@ public sealed class OriginatingVsTargetRegisterTests
             postedAt: new DateTime(2026, 5, 5, 12, 0, 0, DateTimeKind.Utc),
             payee: "PAYCHECK");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var page = (await client.GetFromJsonAsync<RegisterPage>(
@@ -113,6 +111,7 @@ public sealed class OriginatingVsTargetRegisterTests
             // fires automatically. Editing routes back to the
             // originating account.
             Assert.NotNull(e.Txn!.TxnGroupId);
+            Assert.True(e.Txn!.IsReadOnly);
         });
 
         // The two posting amounts on brokerage-cash are the counters of
@@ -131,7 +130,7 @@ public sealed class OriginatingVsTargetRegisterTests
         // A target account touched by exactly one of the header's
         // postings (Taxes leg in the paycheck). Behaviourally
         // indistinguishable from any other single-leg target row.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("checking");
         var brokerageCash = await ledger.AddBankAccountAsync("brokerage-cash");
         var taxes = await ledger.AddCategoryAsync("Taxes");
@@ -147,7 +146,7 @@ public sealed class OriginatingVsTargetRegisterTests
             postedAt: new DateTime(2026, 5, 5, 12, 0, 0, DateTimeKind.Utc),
             payee: "PAYCHECK");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var page = (await client.GetFromJsonAsync<RegisterPage>(
@@ -166,7 +165,7 @@ public sealed class OriginatingVsTargetRegisterTests
         // asset, liability, credit_card, cash) gets derived_action
         // = 'Xfr'. Drives the investment register's Action chip on
         // per-posting target rows.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("checking");
         var brokerageCash = await ledger.AddBankAccountAsync("brokerage-cash");
         var taxes = await ledger.AddCategoryAsync("Taxes");
@@ -182,7 +181,7 @@ public sealed class OriginatingVsTargetRegisterTests
             postedAt: new DateTime(2026, 5, 5, 12, 0, 0, DateTimeKind.Utc),
             payee: "PAYCHECK");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var brokerageRegister = (await client.GetFromJsonAsync<RegisterPage>(
@@ -194,7 +193,7 @@ public sealed class OriginatingVsTargetRegisterTests
             // which structurally carries no investment action: the
             // discriminated union (ADR-0030 §2) makes "not an
             // investment event" a type-level guarantee, stronger than
-            // the old null-check on a shared field.
+            // a null-check on a shared field.
             Assert.IsType<BankRowDto>(e.Txn);
         });
 
@@ -209,12 +208,12 @@ public sealed class OriginatingVsTargetRegisterTests
     [Fact]
     public async Task Header_action_passes_through_derived_action_unchanged()
     {
-        // True investment events (Buy / Sell / Div / …) have
+        // True investment events (Buy / Sell / Dividend / …) have
         // header.action set; derived_action passes the header value
         // through unchanged regardless of counter account type.
         // Set the action via raw SQL since the manual seeder
         // defaults to NULL.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("Groceries");
 
@@ -225,13 +224,15 @@ public sealed class OriginatingVsTargetRegisterTests
             postedAt: new DateTime(2026, 3, 1, 12, 0, 0, DateTimeKind.Utc));
         var headerId = await ledger.ResolveHeaderIdAsync(legId);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Database.ExecuteSqlInterpolatedAsync(
                 $"UPDATE txn_headers SET action = 'misc' WHERE id = {headerId};");
         }
+        // Raw SQL reaches no writer: store the presentation as the upgrade's backfill does.
+        await ledger.RecomputeNotesAsync(headerId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var page = (await client.GetFromJsonAsync<RegisterPage>(

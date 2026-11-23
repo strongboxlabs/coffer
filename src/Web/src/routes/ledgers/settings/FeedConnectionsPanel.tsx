@@ -1,17 +1,16 @@
-import { useMemo, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronDown, ChevronRight, RefreshCw, Trash2 } from 'lucide-react';
+import { useCallback, useMemo, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
+import { Pencil, RefreshCw, Trash2 } from 'lucide-react';
 
 import {
     createFeedConnection,
     deleteFeedConnection,
+    renameFeedConnection,
     fetchAccounts,
     fetchFeedConnectionAccounts,
     fetchFeedConnections,
-    fetchSyncRunDetail,
     fetchSchedule,
-    fetchSyncRuns,
-    fetchVisibleLedgers,
     mapAccountToFeed,
     saveSchedule,
     syncAllConnections,
@@ -21,7 +20,8 @@ import {
 } from '@/lib/api';
 import { errorMessage } from '@/lib/errorMessage';
 import { formatRelative } from '@/lib/ledgerOperationDisplay';
-import { invalidateLedgerRegister } from '@/lib/registerInvalidation';
+import { invalidateHomeReads, invalidateLedgerRegister } from '@/lib/registerInvalidation';
+import { useLedgerRole } from '@/lib/useLedgerRole';
 import type {
     AccountSummary,
     FeedConnectionAccountDto,
@@ -29,21 +29,22 @@ import type {
     SyncAllResultDto,
     SyncErrorDto,
     SyncResultDto,
-    SyncRunSummary,
 } from '@/lib/types';
 import { Button } from '@/components/ui/Button';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { IconButton } from '@/components/ui/IconButton';
+import { InlineNameInput, type InlineNameEnd } from '@/components/ui/InlineNameInput';
 import { Input } from '@/components/ui/Input';
 import { Panel, PanelBody, PanelHead } from '@/components/ui/Panel';
+import { pendingChoiceProps } from '@/components/ui/pending';
+import { useFocusHandOff, useRowRemovalFocus } from '@/components/ui/rowRemovalFocus';
 import { ScheduleControl } from '@/components/ScheduleControl';
 
 /**
  * Per-ledger SimpleFIN connection management.
  *
- * Slice 2a shipped connect + list + disconnect.
- * Slice 2b adds Sync now + the mapping wizard for SimpleFIN
- * accounts the user hasn't yet bound to a Coffer account.
+ * Connect + list + disconnect, Sync now, and the mapping wizard for
+ * SimpleFIN accounts the user hasn't yet bound to a Coffer account.
  *
  * Daily flow:
  *   1. Click Sync on a connected institution.
@@ -67,11 +68,12 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
         queryKey: ['accounts', ledgerId],
         queryFn: () => fetchAccounts(ledgerId),
     });
-    // Connecting a bank, disconnecting it and choosing what it feeds are the owner's
-    // (FU-095): the connection holds credentials to their accounts at the bank. An editor
-    // still syncs. The API refuses the rest, so the controls are not offered.
-    const ledgersQuery = useQuery({ queryKey: ['ledgers'], queryFn: fetchVisibleLedgers });
-    const isOwner = ledgersQuery.data?.find((l) => l.id === ledgerId)?.role === 'owner';
+    // Connecting a bank, renaming or disconnecting it and choosing what it feeds are the
+    // owner's (FU-095): the connection holds credentials to their accounts at the bank. An editor
+    // still syncs, and keeps the sync schedule (PUT /schedules is an owner's or an
+    // editor's); a viewer reads the connections and syncs nothing. The API refuses
+    // the rest, so the controls are not offered.
+    const { isOwner, canEdit } = useLedgerRole(ledgerId);
 
     const invalidateConnections = () =>
         queryClient.invalidateQueries({ queryKey: ['feed-connections', ledgerId] });
@@ -95,11 +97,9 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
             // surface (rows via the ADR-0079 canonical key) so a mounted register
             // on any of this ledger's accounts reflects them.
             invalidateLedgerRegister(queryClient, ledgerId);
-            // Sync activity panel: a fresh run just landed in
-            // sync_runs; invalidate so the panel re-fetches when
-            // visible (slice 2c.1).
+            // The sync is a new run in Settings → Activity.
             queryClient.invalidateQueries({
-                queryKey: ['sync-runs', ledgerId, connectionId],
+                queryKey: ['ledger-operations', ledgerId],
             });
             // Slice 2c.4: the sync just upserted feed_connection_accounts
             // server-side. Invalidate the directory so the unified
@@ -138,7 +138,7 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
                 for (const entry of aggregate.connections) {
                     if (entry.result) next.set(entry.connectionId, entry.result);
                     queryClient.invalidateQueries({
-                        queryKey: ['sync-runs', ledgerId, entry.connectionId],
+                        queryKey: ['ledger-operations', ledgerId],
                     });
                     // Slice 2c.4: same directory invalidation as the
                     // per-connection sync — every connection in the
@@ -190,8 +190,10 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
         onSuccess: (_, args) => {
             // Slice 2c.4: the unified accounts list is the source of
             // truth; invalidate it + the accounts list so both
-            // re-fetch and the per-row binding flips in place.
+            // re-fetch and the per-row binding flips in place. The home
+            // screen reads the same accounts.
             queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+            invalidateHomeReads(queryClient, ledgerId);
             queryClient.invalidateQueries({
                 queryKey: ['feed-connection-accounts', ledgerId, args.connectionId],
             });
@@ -221,6 +223,7 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
         },
         onSuccess: (_, args) => {
             queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+            invalidateHomeReads(queryClient, ledgerId);
             queryClient.invalidateQueries({
                 queryKey: ['feed-connection-accounts', ledgerId, args.connectionId],
             });
@@ -249,8 +252,18 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
     });
 
     const [setupToken, setSetupToken] = useState('');
+    // A connection made clears the setup token, which leaves Connect disabled
+    // with focus on it; focus goes to the field it waits on (ADR-0023 §L).
+    const setupTokenRef = useRef<HTMLInputElement>(null);
     const [pendingDelete, setPendingDelete] =
         useState<FeedConnectionSummary | null>(null);
+    // A disconnected connection takes its row's Disconnect with it: focus goes to
+    // the next row's Disconnect, the previous row's, or the setup token field
+    // that adds one, as Connect is disabled until a token is pasted (ADR-0023 §L).
+    const disconnectControl = useRowRemovalFocus(
+        (connectionsQuery.data ?? []).map((c) => c.id),
+        setupTokenRef,
+    );
     // Slice 2c.3: keyed by connectionId so the per-connection sync,
     // per-account sync, AND sync-all flows all populate the same
     // inline-summary surface independently.
@@ -258,6 +271,12 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
         () => new Map(),
     );
 
+    // Enter in the setup-token field presses Connect, so the press holds it as
+    // a click does, and Connect refuses it while unavailable or busy. The field
+    // stays enabled while a connect is in flight, so the field it was pressed
+    // in keeps focus, but it is pending (read-only): the connect's success
+    // clears it, which would drop anything typed meanwhile (ADR-0023 §L).
+    const connectRef = useRef<HTMLButtonElement | null>(null);
     function handleConnect() {
         const trimmed = setupToken.trim();
         if (trimmed.length === 0) return;
@@ -290,28 +309,34 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
                 <div className="min-w-0 flex-1">
                     <h2 className="text-base font-semibold">Bank feeds</h2>
                     <p className="mt-1 text-sm text-text-muted">
-                        SimpleFIN connections for this ledger. Generate a
-                        setup token at{' '}
-                        <a
-                            href="https://bridge.simplefin.org/"
-                            target="_blank"
-                            rel="noreferrer"
-                            className="font-medium text-accent hover:underline"
-                        >
-                            bridge.simplefin.org
-                        </a>{' '}
-                        and paste it below to link an institution.
+                        SimpleFIN connections for this ledger.
+                        {/* Connecting is the owner's, so only the owner is told how. */}
+                        {isOwner ? (
+                            <>
+                                {' '}Generate a setup token at{' '}
+                                <a
+                                    href="https://bridge.simplefin.org/"
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="font-medium text-accent hover:underline"
+                                >
+                                    bridge.simplefin.org
+                                </a>{' '}
+                                and paste it below to link an institution.
+                            </>
+                        ) : null}
                     </p>
                 </div>
-                {connections.length > 0 ? (
+                {canEdit && connections.length > 0 ? (
                     <Button
                         type="button"
                         variant="secondary"
                         className="shrink-0"
                         onClick={() => syncAllMutation.mutate()}
-                        disabled={syncAllMutation.isPending}
+                        pending={syncAllMutation.isPending}
+                        pendingLabel="Syncing all…"
                     >
-                        {syncAllMutation.isPending ? 'Syncing all…' : 'Sync all'}
+                        Sync all
                     </Button>
                 ) : null}
             </header>
@@ -327,6 +352,7 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
                 <SyncAllSummary aggregate={syncAllMutation.data} />
             ) : null}
 
+            {canEdit ? (
             <Panel className="mb-6">
                 <PanelHead>
                     <span className="text-sm font-semibold">Sync automatically</span>
@@ -351,6 +377,7 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
                     </p>
                 </PanelBody>
             </Panel>
+            ) : null}
 
             {isOwner ? (
                 <Panel className="mb-6">
@@ -368,31 +395,33 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
                         </label>
                         <div className="flex gap-2">
                             <Input
+                                ref={setupTokenRef}
                                 id="simplefin-setup-token"
                                 autoComplete="off"
                                 spellCheck={false}
+                                pending={createMutation.isPending}
                                 value={setupToken}
                                 onChange={(e) => setSetupToken(e.target.value)}
                                 onKeyDown={(e) => {
                                     if (e.key === 'Enter') {
                                         e.preventDefault();
-                                        handleConnect();
+                                        connectRef.current?.click();
                                     }
                                 }}
-                                disabled={createMutation.isPending}
                                 placeholder="Paste the base64 token from simplefin.org/setup…"
                                 className="font-mono text-xs"
                             />
                             <Button
+                                ref={connectRef}
                                 type="button"
                                 variant="primary"
                                 onClick={handleConnect}
-                                disabled={
-                                    setupToken.trim().length === 0 ||
-                                    createMutation.isPending
-                                }
+                                disabled={setupToken.trim().length === 0}
+                                pending={createMutation.isPending}
+                                pendingLabel="Connecting…"
+                                fallbackFocusRef={setupTokenRef}
                             >
-                                {createMutation.isPending ? 'Connecting…' : 'Connect'}
+                                Connect
                             </Button>
                         </div>
                         {createMutation.isError ? (
@@ -408,7 +437,9 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
             ) : (
                 <p className="mb-6 text-sm text-text-muted">
                     Only an owner of this ledger can connect or disconnect a bank, or choose
-                    which accounts it feeds. You can sync the connections that exist.
+                    which accounts it feeds.
+                    {/* Said only to whoever can: an editor syncs, a viewer does not. */}
+                    {canEdit ? ' You can sync the connections that exist.' : null}
                 </p>
             )}
 
@@ -466,6 +497,7 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
                                         syncMutation.mutate(c.id);
                                     }}
                                     onDelete={() => setPendingDelete(c)}
+                                    disconnectRef={disconnectControl(c.id)}
                                     onMap={(accountId, simpleFinAccountId) =>
                                         mapMutation.mutate({
                                             accountId,
@@ -489,6 +521,7 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
                                     }
                                     mappingInFlight={mappingInFlight}
                                     canConfigure={isOwner}
+                                    canSync={canEdit}
                                 />
                             ))}
                         </ul>
@@ -509,7 +542,7 @@ export function FeedConnectionsPanel({ ledgerId }: { ledgerId: string }) {
                         onSettled: () => setPendingDelete(null),
                     });
                 }}
-                confirmDisabled={deleteMutation.isPending}
+                isConfirming={deleteMutation.isPending}
             />
         </>
     );
@@ -529,12 +562,16 @@ function ConnectionRow({
     mappingInFlight,
     onSync,
     onDelete,
+    disconnectRef,
     onMap,
     onUnmap,
     onSetSyncFrom,
     canConfigure,
+    canSync,
 }: {
     connection: FeedConnectionSummary;
+    /** Given the row's Disconnect, which takes the row away (useRowRemovalFocus). */
+    disconnectRef: (el: HTMLElement | null) => void;
     mappableAccounts: readonly AccountSummary[];
     isSyncing: boolean;
     isDeleting: boolean;
@@ -546,15 +583,63 @@ function ConnectionRow({
     onMap: (accountId: string, simpleFinAccountId: string) => void;
     onUnmap: (ledgerAccountId: string, simpleFinAccountId: string) => void;
     onSetSyncFrom: (ledgerAccountId: string, syncFromDate: string | null) => void;
+    /** An owner: Rename, Disconnect and the account mapping are offered. */
     canConfigure: boolean;
+    /** An owner or editor: Sync now is offered. */
+    canSync: boolean;
 }) {
+    const rename = useConnectionRename(connection);
+    const [editingName, setEditingName] = useState(false);
+    // Enter or Escape ends editing with focus in the field, which goes with it: focus goes
+    // back to the pencil as it returns. A blur leaves focus where the reader put it.
+    const focusPencilOnReturn = useRef(false);
+    const pencilRef = useCallback((el: HTMLButtonElement | null) => {
+        if (el !== null && focusPencilOnReturn.current) {
+            focusPencilOnReturn.current = false;
+            el.focus();
+        }
+    }, []);
+    function stopEditing(how: InlineNameEnd) {
+        if (how === 'key') focusPencilOnReturn.current = true;
+        setEditingName(false);
+    }
+
     return (
         <li className="py-2">
             <div className="flex items-center gap-3">
                 <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-medium">
-                        {connection.institutionName ?? 'SimpleFIN'}
-                    </p>
+                    {editingName ? (
+                        <InlineNameInput
+                            label="Connection name"
+                            initial={rename.name}
+                            maxLength={80}
+                            className="w-full max-w-fixed-344px text-sm font-medium"
+                            onCommit={(name, how) => {
+                                if (name !== rename.name) rename.save(name);
+                                stopEditing(how);
+                            }}
+                            onCancel={stopEditing}
+                        />
+                    ) : (
+                        <div className="flex min-w-0 items-center gap-1">
+                            <p className="min-w-0 truncate text-sm font-medium">
+                                {rename.name}
+                            </p>
+                            {canConfigure ? (
+                                <IconButton
+                                    ref={pencilRef}
+                                    size="sm"
+                                    aria-label="Rename connection"
+                                    title="Rename"
+                                    className="shrink-0"
+                                    onClick={() => setEditingName(true)}
+                                    pending={rename.pending || isDeleting}
+                                >
+                                    <Pencil className="size-icon-xs" aria-hidden />
+                                </IconButton>
+                            ) : null}
+                        </div>
+                    )}
                     <p className="text-[0.6875rem] text-text-subtle">
                         {connection.lastSyncedAt
                             ? `Last synced ${formatRelative(connection.lastSyncedAt)}`
@@ -569,25 +654,28 @@ function ConnectionRow({
                 >
                     {connection.status.replace(/_/g, ' ')}
                 </span>
-                <IconButton
-                    aria-label="Sync now"
-                    title="Sync now"
-                    onClick={onSync}
-                    disabled={isSyncing || isDeleting}
-                >
-                    <RefreshCw
-                        className={
-                            'size-icon-sm ' + (isSyncing ? 'animate-spin' : '')
-                        }
-                        aria-hidden
-                    />
-                </IconButton>
+                {canSync ? (
+                    <IconButton
+                        aria-label="Sync now"
+                        title="Sync now"
+                        onClick={onSync}
+                        pending={isSyncing || isDeleting}
+                    >
+                        <RefreshCw
+                            className={
+                                'size-icon-sm ' + (isSyncing ? 'animate-spin' : '')
+                            }
+                            aria-hidden
+                        />
+                    </IconButton>
+                ) : null}
                 {canConfigure ? (
                     <IconButton
+                        ref={disconnectRef}
                         aria-label="Disconnect"
                         title="Disconnect"
                         onClick={onDelete}
-                        disabled={isDeleting}
+                        pending={isDeleting}
                     >
                         <Trash2 className="size-icon-sm" aria-hidden />
                     </IconButton>
@@ -603,6 +691,15 @@ function ConnectionRow({
                 </p>
             ) : null}
 
+            {rename.error !== null ? (
+                <p
+                    role="alert"
+                    className="mt-2 rounded border border-state-danger/40 bg-state-danger-soft px-2 py-1 text-[0.6875rem] text-state-danger"
+                >
+                    Could not rename the connection. {rename.error}
+                </p>
+            ) : null}
+
             {lastSync ? <SyncSummary result={lastSync} /> : null}
 
             <ConnectionAccountsList
@@ -615,13 +712,64 @@ function ConnectionRow({
                 onSetSyncFrom={onSetSyncFrom}
                 canConfigure={canConfigure}
             />
-
-            <SyncActivityPanel
-                ledgerId={connection.ledgerId}
-                connectionId={connection.id}
-            />
         </li>
     );
+}
+
+/**
+ * Renaming one connection: the name its row shows, a save, and the save's state.
+ *
+ * The new name goes into the list under ['feed-connections', ledgerId] at once. That
+ * list is what this row, the Disconnect dialog, the sidebar and the Overview's Feeds &
+ * checks read, so each shows the new name while the save is in flight. A refusal puts
+ * the old name back there and is said under the row; the save's answer replaces the
+ * connection, and the list is read again either way. There is no success notice: the
+ * name is the confirmation.
+ *
+ * The list's own render reaches the row a moment after the press, so until it does the
+ * row shows the name that was saved, and the old one never flashes back between the
+ * field and the new name. That name is held against the connection it was saved from,
+ * so the first newer connection the list passes in takes over from it.
+ */
+function useConnectionRename(connection: FeedConnectionSummary) {
+    const queryClient = useQueryClient();
+    const key = ['feed-connections', connection.ledgerId];
+    const [sent, setSent] = useState<{ name: string; from: FeedConnectionSummary } | null>(null);
+    const renameIn = (list: FeedConnectionSummary[] | undefined, name: string | null, only?: string) =>
+        list?.map((c) => (c.id === connection.id && (only === undefined || c.institutionName === only)
+            ? { ...c, institutionName: name }
+            : c));
+    const mutation = useMutation({
+        mutationFn: (name: string) =>
+            renameFeedConnection(connection.ledgerId, connection.id, { name }),
+        onMutate: async (name) => {
+            await queryClient.cancelQueries({ queryKey: key });
+            const previous = queryClient.getQueryData<FeedConnectionSummary[]>(key)
+                ?.find((c) => c.id === connection.id)?.institutionName ?? null;
+            queryClient.setQueryData<FeedConnectionSummary[]>(key, (list) => renameIn(list, name));
+            return { previous };
+        },
+        // Only while the list still holds this save's name: a newer read stands.
+        onError: (_error, name, sentFrom) => {
+            queryClient.setQueryData<FeedConnectionSummary[]>(key, (list) =>
+                renameIn(list, sentFrom?.previous ?? null, name));
+        },
+        onSuccess: (updated) => {
+            queryClient.setQueryData<FeedConnectionSummary[]>(key, (list) =>
+                list?.map((c) => (c.id === updated.id ? updated : c)));
+        },
+        onSettled: () => queryClient.invalidateQueries({ queryKey: key }),
+    });
+    const held = sent !== null && sent.from === connection;
+    return {
+        name: held ? sent.name : (connection.institutionName ?? 'SimpleFIN'),
+        pending: mutation.isPending || held,
+        error: mutation.isError ? errorMessage(mutation.error, 'Something went wrong.') : null,
+        save: (name: string) => {
+            setSent({ name, from: connection });
+            mutation.mutate(name);
+        },
+    };
 }
 
 function SyncSummary({
@@ -832,10 +980,9 @@ const STALE_ACCOUNT_DAYS = 7;
 /**
  * Says when the provider last returned this account.
  *
- * The column has been written since the feed work landed and rendered nowhere, so the
- * failure it exists to expose — a bank quietly dropping an account from its listing —
- * presented as transactions that simply stopped arriving, which is the hardest shape to
- * notice in a register that never claimed to be complete.
+ * Unrendered, the failure the column exists to expose — a bank quietly dropping an
+ * account from its listing — presents as transactions that simply stop arriving, which
+ * is the hardest shape to notice in a register that never claims to be complete.
  *
  * DELIBERATELY NOT "this account was removed". A total connection failure returns no
  * accounts at all, so every row on that connection goes stale together and a per-row
@@ -887,6 +1034,13 @@ function ConnectionAccountRow({
     const bound = account.boundLedgerAccountId !== null;
     const [pickerValue, setPickerValue] = useState<string>('');
     const [syncFromOpen, setSyncFromOpen] = useState(false);
+    // A mapping that lands swaps the row's controls: Map gives way to Sync
+    // from… and Unmap, and Unmap to the picker and Map. The first control of
+    // the set that takes the pressed one's place takes its focus (ADR-0023 §L).
+    const pickerEl = useRef<HTMLSelectElement | null>(null);
+    const syncFromEl = useRef<HTMLButtonElement | null>(null);
+    const fromMap = useFocusHandOff(() => syncFromEl.current);
+    const fromUnmap = useFocusHandOff(() => pickerEl.current);
 
     // The picker shows every unbound Coffer account PLUS the currently-
     // bound one (so the row's own binding is visible even though
@@ -925,24 +1079,27 @@ function ConnectionAccountRow({
                         {canConfigure ? (
                             <>
                                 <Button
+                                    ref={syncFromEl}
                                     type="button"
                                     variant="secondary"
                                     size="sm"
                                     onClick={() => setSyncFromOpen((v) => !v)}
-                                    disabled={inFlight}
+                                    pending={inFlight}
                                 >
                                     Sync from…
                                 </Button>
                                 <Button
+                                    ref={fromUnmap}
                                     type="button"
                                     variant="secondary"
                                     size="sm"
                                     onClick={() =>
                                         onUnmap(account.boundLedgerAccountId!, account.simpleFinAccountId)
                                     }
-                                    disabled={inFlight}
+                                    pending={inFlight}
+                                    pendingLabel="Unmapping…"
                                 >
-                                    {inFlight ? 'Unmapping…' : 'Unmap'}
+                                    Unmap
                                 </Button>
                             </>
                         ) : null}
@@ -952,10 +1109,12 @@ function ConnectionAccountRow({
                 ) : (
                     <>
                         <select
+                            ref={pickerEl}
                             value={pickerValue}
-                            onChange={(e) => setPickerValue(e.target.value)}
-                            disabled={inFlight}
-                            className="h-control-28px rounded border border-border bg-surface px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                            className="h-control-28px rounded border border-border bg-surface px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
+                            {...pendingChoiceProps<HTMLSelectElement>(inFlight, {
+                                onChange: (e) => setPickerValue(e.target.value),
+                            })}
                         >
                             <option value="">Pick a Coffer account…</option>
                             {options.map((a) => (
@@ -965,6 +1124,7 @@ function ConnectionAccountRow({
                             ))}
                         </select>
                         <Button
+                            ref={fromMap}
                             type="button"
                             variant="secondary"
                             size="sm"
@@ -972,9 +1132,11 @@ function ConnectionAccountRow({
                                 if (pickerValue.length === 0) return;
                                 onMap(pickerValue, account.simpleFinAccountId);
                             }}
-                            disabled={pickerValue.length === 0 || inFlight}
+                            disabled={pickerValue.length === 0}
+                            pending={inFlight}
+                            pendingLabel="Mapping…"
                         >
-                            {inFlight ? 'Mapping…' : 'Map'}
+                            Map
                         </Button>
                     </>
                 )}
@@ -1097,199 +1259,3 @@ function statusClass(status: string): string {
     }
 }
 
-
-// ---------------------------------------------------------------------------
-// Sync activity panel (slice 2c.1) — per-connection collapsed-by-default
-// strip showing the most recent sync_runs entries. Click a row to expand
-// the per-run errors + promotions detail. Fetches are gated on the
-// `expanded` toggle so we don't burn a round-trip on every page render.
-// ---------------------------------------------------------------------------
-
-function SyncActivityPanel({
-    ledgerId,
-    connectionId,
-}: {
-    ledgerId: string;
-    connectionId: string;
-}) {
-    const [expanded, setExpanded] = useState(false);
-    const runsQuery = useQuery({
-        queryKey: ['sync-runs', ledgerId, connectionId],
-        queryFn: () => fetchSyncRuns(ledgerId, connectionId, 5),
-        enabled: expanded,
-    });
-
-    return (
-        <div className="mt-2 rounded border border-border/60 bg-surface-muted/20 text-[0.6875rem]">
-            <button
-                type="button"
-                onClick={() => setExpanded((v) => !v)}
-                className="flex w-full items-center gap-1.5 px-2 py-1 font-medium text-text-muted hover:text-text"
-                aria-expanded={expanded}
-            >
-                {expanded ? (
-                    <ChevronDown className="size-icon-xs" aria-hidden />
-                ) : (
-                    <ChevronRight className="size-icon-xs" aria-hidden />
-                )}
-                Sync activity
-            </button>
-            {expanded ? (
-                <div className="border-t border-border/60 px-2 py-1.5">
-                    {runsQuery.isPending ? (
-                        <p className="text-text-subtle">Loading…</p>
-                    ) : runsQuery.isError ? (
-                        <p role="alert" className="text-state-danger">
-                            {errorMessage(runsQuery.error, 'Something went wrong.')}
-                        </p>
-                    ) : (runsQuery.data ?? []).length === 0 ? (
-                        <p className="text-text-subtle">
-                            No sync activity yet for this institution.
-                        </p>
-                    ) : (
-                        <ul className="space-y-1.5">
-                            {runsQuery.data!.map((run) => (
-                                <SyncRunListItem
-                                    key={run.id}
-                                    run={run}
-                                    ledgerId={ledgerId}
-                                />
-                            ))}
-                        </ul>
-                    )}
-                </div>
-            ) : null}
-        </div>
-    );
-}
-
-function SyncRunListItem({
-    run,
-    ledgerId,
-}: {
-    run: SyncRunSummary;
-    ledgerId: string;
-}) {
-    const [expanded, setExpanded] = useState(false);
-    const hasDetail = run.errorCount > 0 || run.promotionCount > 0;
-    const detailQuery = useQuery({
-        queryKey: ['sync-run-detail', ledgerId, run.id],
-        queryFn: () => fetchSyncRunDetail(ledgerId, run.id),
-        enabled: expanded && hasDetail,
-    });
-
-    return (
-        <li className="rounded border border-border/60 bg-surface px-2 py-1">
-            <button
-                type="button"
-                onClick={() => hasDetail && setExpanded((v) => !v)}
-                disabled={!hasDetail}
-                className={
-                    'flex w-full items-center gap-2 ' +
-                    (hasDetail ? 'cursor-pointer' : 'cursor-default')
-                }
-                aria-expanded={hasDetail ? expanded : undefined}
-            >
-                <span
-                    className={
-                        'rounded px-1 py-0.5 text-[0.625rem] font-medium uppercase tracking-wider ' +
-                        runStatusClass(run.status)
-                    }
-                >
-                    {run.status.replace(/_/g, ' ')}
-                </span>
-                <span className="text-text-subtle">
-                    {formatRelative(run.startedAt)}
-                </span>
-                <span className="flex-1 truncate text-text-muted">
-                    {runHeadline(run)}
-                </span>
-                {hasDetail ? (
-                    expanded ? (
-                        <ChevronDown className="size-icon-xs" aria-hidden />
-                    ) : (
-                        <ChevronRight className="size-icon-xs" aria-hidden />
-                    )
-                ) : null}
-            </button>
-
-            {expanded && hasDetail ? (
-                <div className="mt-1.5 space-y-1 border-t border-border/60 pt-1.5">
-                    {detailQuery.isPending ? (
-                        <p className="text-text-subtle">Loading…</p>
-                    ) : detailQuery.isError ? (
-                        <p role="alert" className="text-state-danger">
-                            {errorMessage(detailQuery.error, 'Something went wrong.')}
-                        </p>
-                    ) : detailQuery.data ? (
-                        <>
-                            {detailQuery.data.errors.length > 0 ? (
-                                <div>
-                                    <p className="font-medium text-text-muted">
-                                        Errors:
-                                    </p>
-                                    <ul className="ml-3 list-disc">
-                                        {detailQuery.data.errors.map((e, idx) => (
-                                            <li key={`${e.code}-${idx}`}>
-                                                <span className="font-mono">
-                                                    {e.code}
-                                                </span>{' '}
-                                                — {e.message}
-                                            </li>
-                                        ))}
-                                    </ul>
-                                </div>
-                            ) : null}
-                            {detailQuery.data.promotions.length > 0 ? (
-                                <div>
-                                    <p className="font-medium text-text-muted">
-                                        Cleared at different amounts:
-                                    </p>
-                                    <ul className="ml-3 list-disc">
-                                        {detailQuery.data.promotions.map((p) => (
-                                            <li key={p.headerId}>
-                                                Was <strong>{p.wasAmount.toFixed(2)}</strong>,{' '}
-                                                cleared as{' '}
-                                                <strong>{p.becameAmount.toFixed(2)}</strong>
-                                            </li>
-                                        ))}
-                                    </ul>
-                                </div>
-                            ) : null}
-                        </>
-                    ) : null}
-                </div>
-            ) : null}
-        </li>
-    );
-}
-
-function runStatusClass(status: string): string {
-    switch (status) {
-        case 'completed':
-            return 'bg-state-success-soft text-state-success';
-        case 'partial':
-            return 'bg-state-warning-soft text-state-warning';
-        case 'needs_reauth':
-            return 'bg-state-warning-soft text-state-warning';
-        case 'failed':
-            return 'bg-state-danger-soft text-state-danger';
-        case 'running':
-        default:
-            return 'bg-surface-muted text-text-subtle';
-    }
-}
-
-function runHeadline(run: SyncRunSummary): string {
-    if (run.status === 'needs_reauth') return 'Re-connect required';
-    if (run.status === 'failed') return run.errorMessage ?? 'Sync failed';
-    if (run.status === 'running') return 'Sync in progress';
-    const review = run.txnsInserted - run.txnsStillPending + run.txnsPromoted;
-    const parts: string[] = [];
-    parts.push(`${review} new`);
-    if (run.txnsStillPending > 0) parts.push(`${run.txnsStillPending} pending`);
-    if (run.txnsPromoted > 0) parts.push(`${run.txnsPromoted} promoted`);
-    if (run.txnsAlreadyKnown > 0) parts.push(`${run.txnsAlreadyKnown} known`);
-    if (run.errorCount > 0) parts.push(`${run.errorCount} error${run.errorCount === 1 ? '' : 's'}`);
-    return parts.join(' · ');
-}

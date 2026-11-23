@@ -15,18 +15,19 @@ namespace Coffer.Api.Tests.Integration.Backup;
 /// <summary>
 /// The authenticated-admin restore endpoint (ADR-0071 D3):
 /// <c>POST /api/admin/backups/restore</c>. Covers the new guards — RequireAdmin,
-/// the typed-confirmation gate, and the D4 KEK-mismatch check — up to the
+/// the typed-confirmation gate, and the ADR-0071 D4 KEK-mismatch check — up to the
 /// stage → restart request; the over-the-DB apply happens at the next boot and
 /// isn't replayable here. A fake IApplicationRestarter records the restart.
 /// Staging is a shared filesystem singleton, so each test clears it (the
 /// collection runs sequentially).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class AdminRestoreEndpointTests
+public sealed class AdminRestoreEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AdminRestoreEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public AdminRestoreEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private sealed class FakeRestarter : IApplicationRestarter
     {
@@ -81,7 +82,7 @@ public sealed class AdminRestoreEndpointTests
     {
         BootstrapRestoreStaging.Clear();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();   // dev-auth ⇒ admin
 
         using var content = Multipart(MakeArtifact("pw"), "pw", confirm: "not the phrase");
@@ -98,7 +99,7 @@ public sealed class AdminRestoreEndpointTests
     {
         BootstrapRestoreStaging.Clear();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         // A v2 artifact whose fingerprint can't match the test install's KEK.
@@ -117,7 +118,7 @@ public sealed class AdminRestoreEndpointTests
     {
         BootstrapRestoreStaging.Clear();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         // v1 artifact (no fingerprint ⇒ KEK check skipped), correct passphrase + confirm.
@@ -148,7 +149,7 @@ public sealed class AdminRestoreEndpointTests
         try
         {
             var fake = new FakeRestarter();
-            await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+            await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
             using var client = factory.CreateClient();
 
             using var content = Multipart(MakeArtifact("pw"), "pw", confirm: AdminBackupsEndpoints.RestoreConfirmPhrase);
@@ -168,7 +169,7 @@ public sealed class AdminRestoreEndpointTests
 
     private async Task SetCreateDbAsync(bool allowed)
     {
-        await using var su = new Npgsql.NpgsqlConnection(_fixture.SuperuserConnectionString);
+        await using var su = new Npgsql.NpgsqlConnection(Db.SuperuserConnectionString);
         await su.OpenAsync();
         await using var cmd = su.CreateCommand();
         cmd.CommandText = allowed ? "ALTER ROLE coffer_service CREATEDB" : "ALTER ROLE coffer_service NOCREATEDB";
@@ -219,7 +220,7 @@ public sealed class AdminRestoreEndpointTests
         BootstrapRestoreStaging.Clear();
         var fake = new FakeRestarter();
         var dir = NewBackupDir();
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithService<IApplicationRestarter>(_ => fake)
             .WithConfig("Api:Backup:Directory", dir);
         using var client = factory.CreateClient();
@@ -244,7 +245,7 @@ public sealed class AdminRestoreEndpointTests
     public async Task An_unknown_stored_id_is_refused_and_nothing_is_staged()
     {
         BootstrapRestoreStaging.Clear();
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithConfig("Api:Backup:Directory", NewBackupDir());
         using var client = factory.CreateClient();
 
@@ -267,7 +268,7 @@ public sealed class AdminRestoreEndpointTests
     {
         BootstrapRestoreStaging.Clear();
         var dir = NewBackupDir();
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithConfig("Api:Backup:Directory", dir);
         using var client = factory.CreateClient();
 
@@ -292,7 +293,7 @@ public sealed class AdminRestoreEndpointTests
     public async Task The_kek_preflight_reads_a_stored_backup_in_place()
     {
         var dir = NewBackupDir();
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithConfig("Api:Backup:Directory", dir);
         using var client = factory.CreateClient();
 
@@ -325,7 +326,7 @@ public sealed class AdminRestoreEndpointTests
         BootstrapRestoreStaging.Clear();
         BootstrapRestoreStaging.EnsureDir();
         await BootstrapRestoreStaging.StageSourceKeyAsync(Convert.ToBase64String(SourceKeyBytes()));
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithService<IApplicationRestarter>(_ => new FakeRestarter());
         using var client = factory.CreateClient();
 
@@ -363,7 +364,7 @@ public sealed class AdminRestoreEndpointTests
     {
         BootstrapRestoreStaging.Clear();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         using var content = Multipart(MakeArtifact("pw"), "pw",
@@ -382,7 +383,7 @@ public sealed class AdminRestoreEndpointTests
     public async Task A_wrong_length_source_key_is_rejected()
     {
         BootstrapRestoreStaging.Clear();
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithService<IApplicationRestarter>(_ => new FakeRestarter());
         using var client = factory.CreateClient();
 
@@ -404,7 +405,7 @@ public sealed class AdminRestoreEndpointTests
         // install can no longer open its own secrets.
         BootstrapRestoreStaging.Clear();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         // v2 archive fingerprinted for one key; a different key supplied.
@@ -429,7 +430,7 @@ public sealed class AdminRestoreEndpointTests
         // acknowledge losing them.
         BootstrapRestoreStaging.Clear();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         var sourceKey = SourceKeyBytes();
@@ -451,11 +452,11 @@ public sealed class AdminRestoreEndpointTests
     [Fact]
     public async Task An_unfingerprinted_v1_archive_accepts_a_source_key_unverified()
     {
-        // Nothing to check against, so it proceeds — and if the key is wrong, D5's
+        // Nothing to check against, so it proceeds — and if the key is wrong, ADR-0092 D5's
         // reconciliation on the post-adopt boot clears what won't open, which is the
         // same outcome as not supplying one.
         BootstrapRestoreStaging.Clear();
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithService<IApplicationRestarter>(_ => new FakeRestarter());
         using var client = factory.CreateClient();
 
@@ -486,8 +487,8 @@ public sealed class AdminRestoreEndpointTests
     public async Task Non_admin_cookie_is_forbidden()
     {
         BootstrapRestoreStaging.Clear();
-        var alice = await SyntheticLedger.CreateAsync(_fixture);   // not an admin
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);   // not an admin
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var cookie = await alice.IssueSessionCookieAsync();
         using var client = factory.CreateClient(
             new WebApplicationFactoryClientOptions { HandleCookies = false });

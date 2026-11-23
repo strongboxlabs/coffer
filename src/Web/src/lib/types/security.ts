@@ -1,5 +1,7 @@
 // Securities catalog API types (slice A3).
 
+import type { RateUnavailable } from './conversion';
+
 /**
  * Mirror of API `Coffer.Api.Contracts.SecuritySummaryDto` (slice A3).
  * One row of the Securities catalog: the security + the per-security
@@ -17,6 +19,9 @@ export interface SecuritySummary {
     latestPrice: number | null;
     /** ISO-8601 UTC date string; null when no price exists. */
     latestPriceAsOf: string | null;
+    /** The currency `latestPrice` is in, and so the amount beside it (the price
+     *  times `totalQuantity`), by the detail's rule (`SecurityDetail.priceCurrencyCode`). */
+    priceCurrencyCode: string;
 }
 
 /**
@@ -32,7 +37,11 @@ export interface SecurityDetail {
     exchange: string | null;
     isActive: boolean;
     totalQuantity: number;
-    totalCostBasis: number;
+    /** FIFO cost basis of what is held, across the ledger, in `costBasisCurrencyCode`:
+     *  a position kept in another currency converts lot by lot at each lot's
+     *  acquisition date (ADR-0114 D7). Null when a rate is missing, named in
+     *  `costBasisRateUnavailable` (ADR-0114 D9). */
+    totalCostBasis: number | null;
     latestPrice: number | null;
     latestPriceAsOf: string | null;
     recentPrices: readonly SecurityPricePoint[];
@@ -52,6 +61,39 @@ export interface SecurityDetail {
     taxCharacter: string | null;
     classificationSource: string | null;
     classificationConfidence: string | null;
+    /** The currency `latestPrice` is in: the close it was read from; for a last
+     *  trade's price, the security's newest price row's; with no price row,
+     *  `holdingsCurrencyCode`. Only the price is in it: the totals below combine the
+     *  holding accounts, so they are in the reporting currency (ADR-0114 D7). */
+    priceCurrencyCode: string;
+    /** The currency of the accounts that hold the security that day: the one they
+     *  share, or the ordinal first when they span several; the ledger's reporting
+     *  currency when none holds it. Only the fallback for `priceCurrencyCode`: no
+     *  figure here sums in it. */
+    holdingsCurrencyCode: string;
+    /** The currency `totalCostBasis` is in: the ledger's reporting currency, because
+     *  the basis combines every account holding the security. */
+    costBasisCurrencyCode: string;
+    /** Why `totalCostBasis` is null: each missing pair and day. Empty when valued. */
+    costBasisRateUnavailable: RateUnavailable[];
+    /** What is held at `latestPrice`, across the ledger, in `marketValueCurrencyCode`
+     *  (ADR-0114 D7): each position from the price's currency into its brokerage's,
+     *  then into the reporting currency, at the latest rate, rounded once by the server.
+     *  Null with no current price (and no reason), or when a rate is missing, named in
+     *  `marketValueRateUnavailable` (ADR-0114 D9). */
+    marketValue: number | null;
+    /** The ledger's reporting currency: the value combines the holding accounts. */
+    marketValueCurrencyCode: string;
+    /** Why `marketValue` is null when a rate is missing. Empty otherwise. */
+    marketValueRateUnavailable: RateUnavailable[];
+    /** `marketValue` less `totalCostBasis`, in `unrealizedGainCurrencyCode`; null when
+     *  either is. */
+    unrealizedGain: number | null;
+    /** The ledger's reporting currency, as both terms of the gain are. */
+    unrealizedGainCurrencyCode: string;
+    /** Why `unrealizedGain` is null when a rate is missing: the value's and the basis's
+     *  missing rates. Empty otherwise. */
+    unrealizedGainRateUnavailable: RateUnavailable[];
 }
 
 export interface SecurityPricePoint {
@@ -120,6 +162,9 @@ export interface SecurityTransaction {
     quantity: number | null;
     unitPrice: number | null;
     payee: string | null;
+    /** The currency of the account the row names: `amount` and `unitPrice` are in it.
+     *  A closed brokerage's trades carry its own (ADR-0109 D9). */
+    currencyCode: string;
 }
 
 export interface SecurityTransactionsPage {
@@ -154,12 +199,20 @@ export interface SecurityPricesPage {
     items: readonly SecurityPriceRow[];
     cursorForOlder: string | null;
     totalCount: number;
+    /** The currency a new hand-entered price takes when none is given, for the editor
+     *  to prefill (ADR-0114 D5): the latest price's currency, else the one currency
+     *  every account holding the security is in. Null when neither answers. */
+    defaultCurrencyCode: string | null;
 }
 
 /** Body of `POST .../securities/{sid}/prices`. */
 export interface CreateSecurityPriceRequest {
     price: number;
     priceDate: string;
+    /** ISO 4217 (ADR-0114 D5). Omitted or blank, the security's default
+     *  (`SecurityPricesPage.defaultCurrencyCode`), else 422
+     *  `security-price-currency-required`; not three characters once trimmed, 422
+     *  `security-price-currency-invalid`. */
     currencyCode?: string | null;
     high?: number | null;
     low?: number | null;

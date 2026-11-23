@@ -16,13 +16,11 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// count-then-recency sort, and the hidden/merged exclusions.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class PayeesEndpointsTests
+public sealed class PayeesEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public PayeesEndpointsTests(PostgresFixture fixture)
+    public PayeesEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -39,7 +37,7 @@ public sealed class PayeesEndpointsTests
     [Fact]
     public async Task Get_returns_distinct_payees_ranked_by_count_then_recency()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
 
@@ -52,7 +50,7 @@ public sealed class PayeesEndpointsTests
         await ledger.AddTransactionPairAsync(bank.Id, groceries.Id, -14m, baseTime.AddDays(9), payee: "Bulk Mart");
         await ledger.AddTransactionPairAsync(bank.Id, groceries.Id, -15m, baseTime.AddDays(5), payee: "Online Store");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.GetAsync($"/api/ledgers/{ledger.LedgerId}/payees");
@@ -74,7 +72,7 @@ public sealed class PayeesEndpointsTests
     [Fact]
     public async Task Get_uses_the_overridden_payee_when_an_override_row_exists()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
 
@@ -85,7 +83,7 @@ public sealed class PayeesEndpointsTests
         // Overwrite the imported payee with the user's cleaned-up name.
         await ledger.EditHeaderAsync(legId, payee: "Online Store");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.GetAsync($"/api/ledgers/{ledger.LedgerId}/payees");
@@ -100,7 +98,7 @@ public sealed class PayeesEndpointsTests
     [Fact]
     public async Task Get_excludes_hidden_and_merged_headers()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
 
@@ -115,7 +113,7 @@ public sealed class PayeesEndpointsTests
         await ledger.HideTransactionAsync(hiddenLegId);
         await ledger.MarkTransactionMergedAsync(mergedLegId, visibleLegId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.GetAsync($"/api/ledgers/{ledger.LedgerId}/payees");
@@ -129,10 +127,10 @@ public sealed class PayeesEndpointsTests
     [Fact]
     public async Task Get_returns_422_ledger_not_visible_when_user_has_no_grant()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var otherLedger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var otherLedger = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         // Caller is the first ledger's user but probes the second.
         using var client = await AuthedClientAsync(factory, ledger);
 

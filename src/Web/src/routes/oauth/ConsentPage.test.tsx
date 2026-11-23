@@ -10,8 +10,8 @@ import { ApiError } from '@/lib/api/_request';
 
 // ConsentPage (ADR-0063): shows the requesting client + the granted scope (read-only
 // vs full read+write, ADR-0081) — as the SERVER registered them, fetched by the
-// consent ticket (2026-10-12 security audit, H1) — and, on a decision, replays the
-// OAuth request with the ticket as a POST to /oauth/authorize (M1).
+// consent ticket — and, on a decision, replays the OAuth request with the ticket as a
+// POST to /oauth/authorize (ADR-0105 D5).
 
 function renderConsent(query: string) {
     window.history.replaceState({}, '', `/oauth/consent${query}`);

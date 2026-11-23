@@ -6,14 +6,13 @@
 -- every (holdings-account, security), that position's entire leg + split history
 -- from the beginning, then probing for a price. Correct, and the shape is fine for
 -- one instant — but a time-weighted return values the portfolio once per instant
--- money crossed the scope's boundary, and a real multi-year ledger has a great
+-- money crossed the scope's boundary, and a multi-year ledger has a great
 -- many of them. The whole ledger was therefore replayed once per instant, in plpgsql,
 -- row at a time.
 --
 -- That cost is the entire reason MaxReturnsBoundaries existed — a cap that refused
 -- the headline whole-portfolio TWR outright rather than compute it. This function
--- removes the cause so the cap can be deleted rather than retuned again (it was
--- set from a bad measurement three times).
+-- removes the cause so the cap can be deleted rather than retuned.
 --
 -- HOW
 -- ---
@@ -48,15 +47,12 @@
 --    instant sharing a timestamp with several trades takes the last of them —
 --    mig 172's `ORDER BY posted_at DESC, id DESC LIMIT 1`.
 --
--- WHAT THIS COST TO GET RIGHT
--- ---------------------------
--- The first version kept prices as per-row probes and needed TWO of them per row
--- (price, then its timestamp). On a ledger with no feed closes at all — every row
--- falling to tier 2 — that made the batched function SLOWER than the per-instant
--- one it replaced: 11.6 s against 6.6 s for the same instant set. Collapsing to one
--- LATERAL got it to 3.0 s; forward-filling both tiers is what removes the probes
--- altogether. The lesson is the one this follow-up already carried: measure the
--- thing, do not reason about it.
+-- WHY FORWARD-FILL
+-- ----------------
+-- Keeping prices as per-row probes needs TWO of them per row (price, then its
+-- timestamp). On a ledger with no feed closes at all — every row falling to tier
+-- 2 — that makes the batched function SLOWER than the per-instant one it
+-- replaces. Forward-filling both tiers removes the probes altogether.
 --
 -- EQUIVALENCE
 -- -----------

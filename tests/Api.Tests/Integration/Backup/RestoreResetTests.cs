@@ -12,29 +12,31 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Backup;
 
 /// <summary>
-/// What a restore resets in the database it builds (FU-076). It used to bring every
-/// session, MCP token, OAuth grant and pending invite back as it was at backup time, so
-/// restoring a backup from before an incident handed back the access revoked since.
+/// What a restore resets in the database it builds (FU-076). Without the reset, a restore
+/// brings every session, MCP token, OAuth grant and pending invite back as it was at
+/// backup time, so restoring a backup taken before a revocation hands back the access
+/// revoked since.
 /// </summary>
 /// <remarks>
-/// Everything here runs in one transaction that is rolled back: the reset revokes every
-/// session in the database, and the database is shared with the rest of the collection.
+/// Everything here runs in one transaction that is rolled back, so each assertion reads
+/// what the reset itself did and nothing a commit could have added.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class RestoreResetTests
+public sealed class RestoreResetTests : DatabaseTest
 {
     private static readonly DateTime Now = new(2026, 10, 17, 12, 0, 0, DateTimeKind.Utc);
     private static readonly DateTime Earlier = Now.AddDays(-3);
 
-    private readonly PostgresFixture _fixture;
-
-    public RestoreResetTests(PostgresFixture fixture) => _fixture = fixture;
+    public RestoreResetTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     [Fact]
     public async Task A_restore_revokes_every_way_in_and_keeps_who_everyone_is()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
         await using var tx = await db.Database.BeginTransactionAsync();
 
         var liveSession = Session(ledger.UserId, revokedAt: null);
@@ -93,10 +95,9 @@ public sealed class RestoreResetTests
     [Fact]
     public async Task A_restore_disconnects_drive_and_forgets_what_it_mirrored()
     {
-        var actor = (await SyntheticLedger.CreateAsync(_fixture)).UserId;
-        await using var db = _fixture.NewDbContext();
+        var actor = (await SyntheticLedger.CreateAsync(Db)).UserId;
+        await using var db = Db.NewDbContext();
         await using var tx = await db.Database.BeginTransactionAsync();
-        await db.DriveSync.ExecuteDeleteAsync();
         db.DriveSync.Add(new DriveSyncRow
         {
             Enabled = true, OauthCiphertext = [1, 2, 3], FolderId = "folder", FolderName = "Coffer Backups [abc]",

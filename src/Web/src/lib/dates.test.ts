@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
 
+import * as dates from './dates';
 import {
     formatLedgerDate,
     formatLedgerDateCompact,
@@ -51,6 +52,61 @@ describe('formatLedgerDateCompact / formatLedgerDateLong', () => {
         expect(long).toMatch(/\bMay\b/);
         expect(long).toMatch(/\b18\b/);
         expect(long).toMatch(/\b2026\b/);
+    });
+
+    // The investment register prints the long form and the bank register the
+    // default one, so the two registers print a date alike only while the two
+    // formats agree. A day below 10 is where they would part: a padded day.
+    it.each([
+        ['a day below 10', '2026-11-03T00:00:00.000Z'],
+        ['the first of a month', '2026-05-01T12:00:00.000Z'],
+        ['a two-digit day', '2026-05-18T00:00:00.000Z'],
+    ])('long prints %s as the default format does', (_label, iso) => {
+        expect(formatLedgerDateLong(iso)).toBe(formatLedgerDate(iso));
+    });
+});
+
+// Every form lib/dates prints a date in writes the day as the default form does, with no
+// leading zero, so no two screens print one date two ways. Every export of lib/dates is
+// listed here, as a printed form or as a date input's value, so one added later is held
+// to the rule or fails the list.
+describe('the day of every printed date', () => {
+    // Each printed form is given the 5th of a month where it reads the day: a calendar
+    // date at UTC midnight, an instant at 1:10 pm local time, whose hour and minute
+    // cannot read as the day.
+    const FIFTH = {
+        calendar: '2026-11-05T00:00:00.000Z',
+        instant: new Date(2026, 10, 5, 13, 10).toISOString(),
+    };
+    const PRINTED: Record<string, { print: (iso: string) => string; reads: keyof typeof FIFTH }> = {
+        formatLedgerDate: { print: dates.formatLedgerDate, reads: 'calendar' },
+        formatLedgerDateCompact: { print: dates.formatLedgerDateCompact, reads: 'calendar' },
+        formatLedgerDateLong: { print: dates.formatLedgerDateLong, reads: 'calendar' },
+        formatLedgerDateTime: { print: dates.formatLedgerDateTime, reads: 'instant' },
+        formatInstantDateCompact: { print: dates.formatInstantDateCompact, reads: 'instant' },
+    };
+    // A date input's value is YYYY-MM-DD, which pads the day by its format.
+    const INPUT_VALUES = ['shiftDateInputValue', 'toDateInputValue', 'todayInputValue'];
+
+    it('lists every export of lib/dates', () => {
+        expect(Object.keys(dates).sort()).toEqual([...Object.keys(PRINTED), ...INPUT_VALUES].sort());
+    });
+
+    it.each(Object.entries(PRINTED))('%s prints the 5th as the default form does, never 05', (_name, { print, reads }) => {
+        expect(print(FIFTH[reads]).match(/\b0?5\b/g)).toEqual(['5']);
+    });
+});
+
+describe('formatInstantDateCompact', () => {
+    const zone = process.env.TZ;
+    afterEach(() => { process.env.TZ = zone; });
+
+    it('prints an instant\'s day in the reader\'s zone, where the calendar form prints the UTC day', () => {
+        process.env.TZ = 'America/Los_Angeles';
+        // Evening of the 10th on the coast, the 11th in UTC.
+        const evening = '2026-03-11T03:28:00Z';
+        expect(dates.formatInstantDateCompact(evening)).toBe(new Date(2026, 2, 10).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }));
+        expect(dates.formatInstantDateCompact(evening)).not.toBe(dates.formatLedgerDateCompact(evening));
     });
 });
 

@@ -6,14 +6,15 @@
 # =============================================================================
 #
 # Default mode suits ONE capable machine: a CI matrix would make the shards run
-# sequentially there and each job would re-pay `dotnet build` (~90s x 6 ~= 9 min of
+# sequentially there and each job would re-pay `dotnet build` (~90s per shard of
 # redundant building). So: build once, then run the shards in parallel across the
 # machine's cores.
 #
-# The partition is namespace-based and balanced by measured run time. S4 is the
-# COMPLEMENT of the others, which is what makes the partition total: every
-# Api.Tests test runs in exactly one shard, so adding a namespace cannot silently
-# leave tests unrun. Assumes a .NET SDK on PATH and the repo checked out.
+# The partition is by test class and balanced by measured run time
+# (scripts/dotnet-shard-assignment.tsv, written by the maintainer's rebalance script
+# from the CLASS TIMINGS table this script prints). `rest` is the COMPLEMENT of the
+# others, which is what makes the partition total: every Api.Tests test runs in
+# exactly one shard, so adding a test class cannot silently leave tests unrun. Assumes a .NET SDK on PATH and the repo checked out.
 # =============================================================================
 set -uo pipefail
 
@@ -63,9 +64,12 @@ launch() {
 # falls back to the production path when this is unset, which is everywhere
 # except here.
 api_shard() {
+    # The trx is what the per-class timings below are read from; a shard's own
+    # directory keeps one shard's results from overwriting another's.
     COFFER_RESTORE_STAGING_DIR="$logdir/staging-${2:-shard}" \
     dotnet test tests/Api.Tests/Api.Tests.csproj --configuration Release --no-build \
-        --filter "$1" --logger "console;verbosity=minimal"
+        --filter "$1" --logger "console;verbosity=minimal" \
+        --logger "trx;LogFileName=$logdir/${2:-shard}.trx"
 }
 importer_shard() {
     dotnet test tests/Importer.Moneydance.Tests/Importer.Moneydance.Tests.csproj \
@@ -81,9 +85,7 @@ if ! dotnet build Coffer.slnx --configuration Release -p:CofferDevAuth=true >"$l
     exit 1
 fi
 
-# Shard filters live in ONE file, sourced here and by the local pre-push gate. This block
-# used to carry the strings inline, under a comment claiming they were defined
-# "here, once, for both modes" — while the local gate held its own copy. See
+# Shard filters live in ONE file, sourced here and by the local pre-push gate. See
 # scripts/dotnet-shard-filters.sh for the partition and the Stress carve-out.
 filters="$repo_root/scripts/dotnet-shard-filters.sh"
 if [[ ! -f "$filters" ]]; then
@@ -121,6 +123,34 @@ for name in "${failures[@]}"; do
     echo "================ $name.log ================"
     cat "$logdir/$name.log" 2>/dev/null || true
 done
+
+# What each test class cost, from this run: the figures the shard partition is
+# balanced from (scripts/dotnet-shard-filters.sh). Read from the logs by whoever
+# refreshes scripts/test-class-timings.tsv, and the slowest classes go to the job
+# summary. Never fails the run: a report that could not be written is not a test
+# failure.
+shopt -s nullglob
+trx_files=("$logdir"/*.trx)
+shopt -u nullglob
+if [[ "${#trx_files[@]}" -gt 0 ]]; then
+    if timings="$(bash "$repo_root/scripts/test-class-timings.sh" "${trx_files[@]}")"; then
+        echo
+        echo "==== CLASS TIMINGS (seconds, class) ===="
+        printf '%s\n' "$timings"
+        echo "==== END CLASS TIMINGS ===="
+        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            {
+                echo "### Slowest test classes"
+                echo
+                echo "| seconds | class |"
+                echo "|---:|---|"
+                printf '%s\n' "$timings" | awk -F'\t' 'NR <= 25 { printf "| %s | %s |\n", $1, $2 }'
+            } >>"$GITHUB_STEP_SUMMARY"
+        fi
+    else
+        echo "class timings: none read from the trx files (not a test failure)"
+    fi
+fi
 
 echo
 echo "dotnet shards wall-clock: $(( $(date +%s) - wall_start ))s"

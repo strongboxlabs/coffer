@@ -1,6 +1,14 @@
 import type { Schedule } from '../types/schedule';
 import { request } from './_request';
 
+/** GET /schedules — every job type's schedule, keyed by job type, each defaulted as
+ *  the single read defaults it. */
+export function fetchSchedules(ledgerId: string): Promise<Record<string, Schedule>> {
+    return request<Record<string, Schedule>>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/schedules`,
+    );
+}
+
 /** GET /schedules/{jobType} — the per-ledger daily schedule (defaulted). */
 export function fetchSchedule(ledgerId: string, jobType: string): Promise<Schedule> {
     return request<Schedule>(

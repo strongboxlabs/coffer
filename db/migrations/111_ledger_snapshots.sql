@@ -18,7 +18,7 @@
 -- materialisation drifting from txn_legs.
 --
 -- `content_size_uncompressed` is stored for SPA display
--- ("47 MB before compression" on the snapshots list) without
+-- (the size before compression, shown on the snapshots list) without
 -- requiring the API to decompress on every list call.
 --
 -- Auto-snaps carry created_by_user_id = the system user
@@ -86,8 +86,8 @@ COMMENT ON COLUMN ledger_snapshots.schema_version IS
 -- (re-derived on restore).
 --
 -- Bound to EF as the `ledger_snapshot_payload` TVF below; C# calls
--- via LINQ per the no-raw-sql-in-api rule (memory: complex SQL lives
--- in Postgres functions / views, bound via HasDbFunction).
+-- via LINQ per the no-raw-sql-in-api rule (complex SQL lives in
+-- Postgres functions / views, bound via HasDbFunction).
 CREATE OR REPLACE FUNCTION fn_ledger_snapshot_payload(p_ledger_id uuid)
 RETURNS jsonb
 LANGUAGE plpgsql

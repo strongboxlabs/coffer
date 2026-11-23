@@ -323,8 +323,8 @@ ALTER VIEW resolved_transactions SET (security_invoker = true);
 -- one row per header (the entry) rather than aggregating by
 -- COALESCE(txn_group_id, id). RLS short-circuits at the header level
 -- (h.ledger_id direct hop vs the three-hop chain through accounts in
--- the prior model) — measured in EXPLAIN ANALYZE on real data, the
--- new plan should drop the function count well under jit_above_cost.
+-- the prior model), so the new plan should drop the function count
+-- well under jit_above_cost.
 
 CREATE OR REPLACE FUNCTION register_entry_keys(
     p_account_id        UUID,

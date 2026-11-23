@@ -13,7 +13,8 @@ namespace Coffer.Api.Endpoints;
 /// <summary>
 /// Per-ledger daily schedules (mig 136). One generic surface for every
 /// <c>job_type</c>: <c>GET/PUT /api/ledgers/{id}/schedules/{jobType}</c>
-/// (<c>quote-refresh</c> — ADR-0054 B; <c>snapshot</c> — ADR-0037).
+/// (<c>quote-refresh</c> — ADR-0054 B; <c>snapshot</c> — ADR-0037), and
+/// <c>GET /api/ledgers/{id}/schedules</c> for all of them at once.
 /// </summary>
 public static class SchedulesEndpoints
 {
@@ -24,8 +25,45 @@ public static class SchedulesEndpoints
                           .RequireLedgerAccess();
         group.MapGet("/", GetAsync);
         group.MapPut("/", PutAsync);
+
+        // Every job type at once, for a reader that judges the ledger's jobs together.
+        routes.MapGroup("/api/ledgers/{ledgerId:guid}/schedules")
+              .RequireAuthorization()
+              .RequireLedgerAccess()
+              .MapGet("/", ListAsync);
         return routes;
     }
+
+    /// <summary>
+    /// <c>GET /api/ledgers/{ledgerId}/schedules</c> — every known job type's schedule,
+    /// keyed by job type, each defaulted exactly as the single-job GET defaults it.
+    /// </summary>
+    private static async Task<IResult> ListAsync(
+        Guid ledgerId,
+        ICurrentUserAccessor currentUser,
+        LedgersRepository ledgers,
+        SchedulesRepository schedules,
+        CancellationToken cancellationToken)
+    {
+        var visible = await ledgers.GetVisibleByIdAsync(
+            currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
+        if (visible is null)
+            return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
+                "Ledger not found or not visible to this user.");
+
+        var stored = await schedules.ListAsync(ledgerId, cancellationToken).ConfigureAwait(false);
+        var all = JobTypes.All
+            .Order(StringComparer.Ordinal)
+            .ToDictionary(
+                jobType => jobType,
+                jobType => stored.GetValueOrDefault(jobType) ?? Unconfigured(jobType),
+                StringComparer.Ordinal);
+        return Results.Ok(all);
+    }
+
+    // What a job type with no row reads as: off, at its default time.
+    private static ScheduleDto Unconfigured(string jobType) =>
+        new(Enabled: false, HourLocal: DefaultHour(jobType), MinuteLocal: 0);
 
     private static async Task<IResult> GetAsync(
         Guid ledgerId,
@@ -40,7 +78,7 @@ public static class SchedulesEndpoints
         if (gate is not null) return gate;
 
         var dto = await schedules.GetAsync(ledgerId, jobType, cancellationToken).ConfigureAwait(false)
-            ?? new ScheduleDto(Enabled: false, HourLocal: DefaultHour(jobType), MinuteLocal: 0);
+            ?? Unconfigured(jobType);
         return Results.Ok(dto);
     }
 
@@ -94,8 +132,9 @@ public static class SchedulesEndpoints
         // Between the 03:00 snapshot and the 06:00 feed sync: the snapshot is a stable
         // pre-dawn picture taken before the day's reminders land, and the reminders exist
         // before bank data arrives or anyone looks at a balance. Without an arm here it
-        // would silently default to 19:00 and post the day's rent in the evening.
-        JobTypes.ReminderAutoPost => 5,
+        // would silently default to 19:00 and post the day's rent in the evening. Shared
+        // with the paths that create the row, so this reads as what they create.
+        JobTypes.ReminderAutoPost => ScheduleDefaults.ReminderAutoPostHour,
         _ => 19,
     };
 }

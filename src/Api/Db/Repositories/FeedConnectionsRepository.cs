@@ -5,9 +5,9 @@ using Coffer.Api.Db.Entities;
 namespace Coffer.Api.Db.Repositories;
 
 /// <summary>
-/// Write + read gateway for <c>feed_connections</c>. Phase 5 slice 1
-/// surfaces just the create-on-connect path; list / delete / sync-now
-/// land in subsequent slices.
+/// Write + read gateway for <c>feed_connections</c>: connect, list,
+/// rename and delete. A sync's writes to the row (status,
+/// <c>last_synced_at</c>) are the ingest orchestrator's.
 /// </summary>
 public sealed class FeedConnectionsRepository
 {
@@ -64,6 +64,7 @@ public sealed class FeedConnectionsRepository
             .Where(c => c.LedgerId == ledgerId)
             .OrderByDescending(c => c.LastSyncedAt ?? DateTime.MinValue)
             .ThenByDescending(c => c.CreatedAt)
+            .ThenBy(c => c.Id)
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
@@ -73,14 +74,76 @@ public sealed class FeedConnectionsRepository
     /// cascade: <c>accounts.feed_connection_id</c> + <c>sync_runs.feed_connection_id</c>
     /// both ON DELETE SET NULL, so no children block the delete.
     /// </summary>
+    /// <remarks>
+    /// The delete takes the ledger write lock (migration 275) first. A sync's final save
+    /// holds that lock while it updates the mapped accounts' watermark, then inserts rows
+    /// whose foreign key names the connection (a bank account the bank listed for the first
+    /// time); the delete holds the connection row, then its cascade updates those accounts.
+    /// Without the lock each would wait for a row the other holds, and Postgres would cancel
+    /// one. With it, the delete waits for the save to commit, or the save for the delete; a
+    /// wait past the lock's bound throws <see cref="LedgerWriteBusyException"/>, answered as
+    /// the busy refusal, with nothing deleted.
+    /// </remarks>
     public async Task<int> DeleteAsync(
         Guid ledgerId,
         Guid connectionId,
-        CancellationToken cancellationToken = default) =>
-        await _db.FeedConnections
+        CancellationToken cancellationToken = default)
+    {
+        await using var write = await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken).ConfigureAwait(false);
+        var deleted = await _db.FeedConnections
             .Where(c => c.Id == connectionId && c.LedgerId == ledgerId)
             .ExecuteDeleteAsync(cancellationToken)
             .ConfigureAwait(false);
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return deleted;
+    }
+
+    /// <summary>The longest name a connection may have, after trimming.</summary>
+    public const int NameMaxLength = 80;
+
+    public enum NameCheck { Ok, Required, TooLong }
+
+    /// <summary>The rename's rule, on the trimmed name: 1 to <see cref="NameMaxLength"/>
+    /// characters. Two connections may share a name.</summary>
+    public static NameCheck CheckName(string? name)
+    {
+        var trimmed = name?.Trim() ?? string.Empty;
+        if (trimmed.Length == 0) return NameCheck.Required;
+        if (trimmed.Length > NameMaxLength) return NameCheck.TooLong;
+        return NameCheck.Ok;
+    }
+
+    /// <summary>
+    /// Rename a connection: write its trimmed <paramref name="name"/> to
+    /// <c>institution_name</c>, the one column that names it, and return the row as it now
+    /// stands, or null when the ledger has no such connection. The name must already have
+    /// passed <see cref="CheckName"/>. Syncs never write the column, so the name stays
+    /// until the next rename.
+    /// </summary>
+    /// <remarks>
+    /// One statement, with no ledger write lock (ADR-0112 D3). It recomputes nothing and
+    /// holds one row, the connection's, and once it holds that row it waits for nothing: it
+    /// changes no key a foreign key reads, and the table has no trigger. A sync's save or a
+    /// delete that holds the row keeps it waiting while it holds nothing, so no wait between
+    /// them closes a cycle.
+    /// </remarks>
+    public async Task<FeedConnectionRow?> RenameAsync(
+        Guid ledgerId,
+        Guid connectionId,
+        string name,
+        CancellationToken cancellationToken = default)
+    {
+        var trimmed = name.Trim();
+        var updated = await _db.FeedConnections
+            .Where(c => c.Id == connectionId && c.LedgerId == ledgerId)
+            .ExecuteUpdateAsync(s => s.SetProperty(c => c.InstitutionName, trimmed), cancellationToken)
+            .ConfigureAwait(false);
+        if (updated == 0) return null;
+        return await _db.FeedConnections
+            .AsNoTracking()
+            .SingleOrDefaultAsync(c => c.Id == connectionId && c.LedgerId == ledgerId, cancellationToken)
+            .ConfigureAwait(false);
+    }
 
     /// <summary>
     /// Returns true when <paramref name="connectionId"/> exists in

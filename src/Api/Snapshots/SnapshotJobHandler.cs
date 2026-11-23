@@ -28,10 +28,10 @@ public sealed class SnapshotJobHandler : IScheduledJobHandler
     /// Creates the auto snapshot, and reports a skipped one as <c>Degraded</c>.
     /// </summary>
     /// <remarks>
-    /// The result used to be discarded. <c>SkippedDueToFullPool</c> means all five slots
-    /// hold manual snaps, so auto coverage has silently paused — the ledger keeps
-    /// reporting a healthy daily job while its snapshots stop advancing, which is exactly
-    /// the state a dead-man's switch is supposed to catch and would not have.
+    /// The result must not be discarded. <c>SkippedDueToFullPool</c> means all five slots
+    /// hold manual snaps, so auto coverage has silently paused — a discarded result
+    /// leaves the ledger reporting a healthy daily job while its snapshots stop
+    /// advancing, which is exactly the state a dead-man's switch is supposed to catch.
     /// </remarks>
     public async Task<JobRunOutcome> RunAsync(
         AppDbContext db, Guid ledgerId, Guid configuredByUserId, JobRunClock clock, CancellationToken cancellationToken)

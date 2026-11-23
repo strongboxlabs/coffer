@@ -1,11 +1,13 @@
 import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import { fetchReminders, setReminderActive, skipReminder } from '@/lib/api';
 import type { ReminderSummary } from '@/lib/types';
 import { formatLedgerDate } from '@/lib/dates';
 import { formatSignedAmount } from '@/lib/money';
 import { humanizeRrule } from '@/lib/recurrence';
+import { estimateTitle, isEstimating } from '@/lib/reminderEstimate';
 import { errorMessage } from '@/lib/errorMessage';
 import { Button } from '@/components/ui/Button';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
@@ -19,7 +21,12 @@ import { ReminderEditorDialog } from './ReminderEditorDialog';
  * series with the humanized recurrence, next-due, and signed amount (Moneydance
  * agenda parity), plus New / Edit / Skip-next / Disable-Enable.
  */
-export function RemindersListPanel({ ledgerId }: { ledgerId: string }) {
+export function RemindersListPanel({ ledgerId, canEdit }: {
+    ledgerId: string;
+    /** Owner or editor: may create, edit, skip, disable and enable a series. A
+     *  viewer reads the list and is offered none of them. */
+    canEdit: boolean;
+}) {
     const queryClient = useQueryClient();
     const query = useQuery({
         queryKey: ['reminders', ledgerId],
@@ -70,12 +77,14 @@ export function RemindersListPanel({ ledgerId }: { ledgerId: string }) {
             return (
                 <EmptyState
                     message="No reminders yet."
-                    hint="Reminders post recurring transactions on a schedule. Import from Moneydance, or create one."
-                    action={
+                    hint={canEdit
+                        ? 'Reminders post recurring transactions on a schedule. Import from Moneydance, or create one.'
+                        : 'Reminders post recurring transactions on a schedule.'}
+                    action={canEdit ? (
                         <Button type="button" variant="primary" size="sm" onClick={() => setEditor({ id: null })}>
                             New reminder
                         </Button>
-                    }
+                    ) : undefined}
                 />
             );
         }
@@ -85,7 +94,8 @@ export function RemindersListPanel({ ledgerId }: { ledgerId: string }) {
                     <ReminderRow
                         key={r.id}
                         reminder={r}
-                        disabled={busy}
+                        canEdit={canEdit}
+                        pending={busy}
                         onEdit={() => setEditor({ id: r.id })}
                         onToggleActive={() => activeMutation.mutate({ id: r.id, active: !r.isActive })}
                         onSkipNext={() => {
@@ -102,9 +112,11 @@ export function RemindersListPanel({ ledgerId }: { ledgerId: string }) {
         <div className="space-y-2">
             <div className="flex items-center justify-between">
                 <h2 className="text-sm font-semibold text-text">Reminders</h2>
-                <Button type="button" variant="secondary" size="sm" onClick={() => setEditor({ id: null })}>
-                    New reminder
-                </Button>
+                {canEdit ? (
+                    <Button type="button" variant="secondary" size="sm" onClick={() => setEditor({ id: null })}>
+                        New reminder
+                    </Button>
+                ) : null}
             </div>
 
             {actionError !== null ? (
@@ -149,10 +161,14 @@ export function RemindersListPanel({ ledgerId }: { ledgerId: string }) {
 }
 
 function ReminderRow({
-    reminder, disabled, onEdit, onToggleActive, onSkipNext,
+    reminder, canEdit, pending, onEdit, onToggleActive, onSkipNext,
 }: {
     reminder: ReminderSummary;
-    disabled: boolean;
+    /** A viewer's row reads, and offers no action. */
+    canEdit: boolean;
+    /** A change to a reminder is in flight: the row's buttons keep focus and
+     *  refuse to act (pending.ts). */
+    pending: boolean;
     onEdit: () => void;
     onToggleActive: () => void;
     onSkipNext: () => void;
@@ -171,7 +187,7 @@ function ReminderRow({
                         ) : null}
                     </p>
                     <p className="text-xs text-text-muted">
-                        {humanizeRrule(r.rrule)}
+                        {humanizeRrule(r.rrule, r.startDate)}
                         {r.nextDueDate !== null
                             ? <> · next {formatLedgerDate(r.nextDueDate)}</>
                             : null}
@@ -181,25 +197,33 @@ function ReminderRow({
                     </p>
                 </div>
                 <div className="flex shrink-0 items-center gap-3">
-                    <span
-                        className={`font-mono text-sm tabular-nums ${
-                            r.amount < 0 ? 'text-state-danger' : r.amount > 0 ? 'text-state-success' : 'text-text-muted'}`}
-                    >
-                        {(r.estimate?.amount != null ? `≈${formatSignedAmount(r.amount)}` : formatSignedAmount(r.amount))}
+                    {/* An unposted amount is not news: muted, never red or
+                        green (ADR-0023 §H), as on the home screen's Bills. It is in
+                        its source account's currency; a series with no single
+                        source has none, and its amount is a dash, never dollars. */}
+                    <span className="font-mono text-sm tabular-nums text-text-muted">
+                        {r.currencyCode
+                            ? <>
+                                {isEstimating(r) ? <span title={estimateTitle(r.estimate)}>≈</span> : null}
+                                {formatSignedAmount(r.amount, r.currencyCode)}
+                            </>
+                            : '—'}
                     </span>
-                    <div className="flex items-center gap-1.5">
-                        <Button type="button" variant="ghost" size="sm" disabled={disabled} onClick={onEdit}>
-                            Edit
-                        </Button>
-                        {r.isActive && r.nextDueDate !== null ? (
-                            <Button type="button" variant="ghost" size="sm" disabled={disabled} onClick={onSkipNext}>
-                                Skip next
+                    {canEdit ? (
+                        <div className="flex items-center gap-1.5">
+                            <Button type="button" variant="ghost" size="sm" pending={pending} onClick={onEdit}>
+                                Edit
                             </Button>
-                        ) : null}
-                        <Button type="button" variant="ghost" size="sm" disabled={disabled} onClick={onToggleActive}>
-                            {r.isActive ? 'Disable' : 'Enable'}
-                        </Button>
-                    </div>
+                            {r.isActive && r.nextDueDate !== null ? (
+                                <Button type="button" variant="ghost" size="sm" pending={pending} onClick={onSkipNext}>
+                                    Skip next
+                                </Button>
+                            ) : null}
+                            <Button type="button" variant="ghost" size="sm" pending={pending} onClick={onToggleActive}>
+                                {r.isActive ? 'Disable' : 'Enable'}
+                            </Button>
+                        </div>
+                    ) : null}
                 </div>
             </div>
         </li>

@@ -51,8 +51,8 @@ public static class BackupCrypto
     private const int Iterations = 3;
     private const int Parallelism = 1;
 
-    // What a header's KDF parameters may ask for. Every writer so far has emitted exactly
-    // 65536 KiB / 3 / 1; the bounds give a future bump four times the headroom on memory
+    // What a header's KDF parameters may ask for. The writer emits 65536 KiB / 3 / 1;
+    // the bounds give a future bump four times the headroom on memory
     // and more on time, and stop there. They exist because the parameters are read BEFORE
     // anything is authenticated and Argon2 runs to completion uncancellably: a crafted
     // header asking for 4 TiB or a billion passes is a denial of service on the one

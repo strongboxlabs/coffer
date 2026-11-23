@@ -3,9 +3,9 @@
 -- =============================================================================
 --
 -- Mig 111 shipped the snapshot functions with an in-scope list that
--- missed two per-ledger tables. The failure surfaced as a 23503 FK
--- violation on `recurring_transactions_source_account_id_fkey` the
--- first time the user tried to restore — the wipe-delete on
+-- missed two per-ledger tables. A restore of any ledger with a
+-- reminder fails with a 23503 FK violation on
+-- `recurring_transactions_source_account_id_fkey` — the wipe-delete on
 -- accounts can't proceed while recurring rows still reference them.
 --
 -- Two tables to fold into the in-scope graph:
@@ -21,7 +21,7 @@
 -- Both run through the same delete-then-insert pattern as the
 -- existing tables, in FK-safe order.
 --
--- Memory: `LedgerSnapshotPayload.InScopeTables` in C# also gains
+-- Note: `LedgerSnapshotPayload.InScopeTables` in C# also gains
 -- these two entries — keep the two lists aligned.
 --
 -- `user_ledger_grants` is also per-ledger but explicitly OUT of

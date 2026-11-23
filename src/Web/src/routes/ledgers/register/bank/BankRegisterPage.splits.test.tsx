@@ -11,6 +11,7 @@ import {
 } from '@tanstack/react-router';
 
 import { BankRegisterPage } from './BankRegisterPage';
+import { NO_NOTES } from '@/lib/annotations/rowNotesFixture';
 import * as apiModule from '@/lib/api';
 import type {
     AccountSummary,
@@ -22,13 +23,11 @@ import type {
 /**
  * Page-level coverage for SPLIT rows.
  *
- * `BankRegisterPage.test.tsx` next door contained zero occurrences of the word
- * "split" — the whole feature was covered by one pure assertion in
- * `lib/splitCollapse.test.ts` and nothing else. So the collapsed row's
- * contents, the expand toggle, the leg rows it inserts and the keyboard route
- * into the editor were all unasserted, which is how the expand button came to
- * sit on top of the category cell and the toggle's `aria-controls` came to
- * point at an element that has never existed.
+ * `lib/splitCollapse.test.ts` covers the collapse logic as a pure function;
+ * this file asserts the collapsed row's contents, the expand toggle, the leg
+ * rows it inserts and the keyboard route into the editor — where an expand
+ * button can sit on top of the category cell, or a toggle's `aria-controls`
+ * point at an element that does not exist, without any pure test noticing.
  *
  * Kept in its own file rather than appended to the sibling: that file opens
  * with a deliberate statement of what it does and does not cover ("we don't
@@ -45,7 +44,7 @@ const SALARY_ID = '00000000-0000-0000-0000-000000000301';
 const FED_TAX_ID = '00000000-0000-0000-0000-000000000302';
 const HEALTH_ID = '00000000-0000-0000-0000-000000000303';
 
-const TEST_LEDGER: LedgerSummary = { id: LEDGER_ID, name: 'Personal', role: 'owner' };
+const TEST_LEDGER: LedgerSummary = { id: LEDGER_ID, name: 'Personal', role: 'owner', currencyCode: 'USD' };
 
 function account(over: Partial<AccountSummary> & { id: string; name: string }): AccountSummary {
     return {
@@ -76,19 +75,22 @@ const ACCOUNTS: AccountSummary[] = [
 
 function leg(over: Partial<BankRow> & { id: string }): BankRow {
     const defaults: BankRow = {
+        // The account that owns the split: each line shows its own memo and
+        // tags, and the transaction's ride on every line for the parent row.
+        ...NO_NOTES,
+        notesKind: 'splitSide',
         kind: 'bank',
-    legTags: [],
         id: '',
         accountId: ACCOUNT_ID,
         payee: 'Employer',
-        memo: null,
         amount: 0,
         postedAt: '2026-05-01T12:00:00Z',
         transactedAt: null,
         status: 'uncleared',
         isHidden: false,
-        hasOverrides: false,
         balanceAfter: 100,
+        currencyCode: 'USD',
+        balanceCurrencyCode: 'USD',
         origin: 'manual',
         isPending: false,
         externalId: null,
@@ -99,13 +101,10 @@ function leg(over: Partial<BankRow> & { id: string }): BankRow {
         counterpartyAccountId: null,
         counterpartyAccountName: null,
         counterpartyAccountType: 'category',
-        tags: [],
         headerId: HEADER_ID,
         clearedAt: null,
         clearedByUserId: null,
         createdAt: '2026-05-01T12:00:00Z',
-        legMemo: null,
-        headerMemo: null,
         onlineMatchFitid: null,
         onlineMatchFiId: null,
         needsReview: false,
@@ -129,17 +128,17 @@ const PAYCHECK_LEGS: BankRow[] = [
     leg({
         id: 'leg-1', legIndex: 0, amount: 2000,
         counterpartyAccountId: SALARY_ID, counterpartyAccountName: 'Salary',
-        legMemo: 'Gross pay',
+        memo: 'Gross pay',
     }),
     leg({
         id: 'leg-2', legIndex: 1, amount: -150,
         counterpartyAccountId: FED_TAX_ID, counterpartyAccountName: 'Federal Income Tax',
-        legMemo: 'Federal Tax',
+        memo: 'Federal Tax',
     }),
     leg({
         id: 'leg-3', legIndex: 2, amount: -50,
         counterpartyAccountId: HEALTH_ID, counterpartyAccountName: 'Health Insurance',
-        legMemo: 'Medical Insurance',
+        memo: 'Medical Insurance',
     }),
 ];
 
@@ -194,11 +193,11 @@ beforeEach(() => {
 
 describe('a collapsed split row answers the selection modifier', () => {
     it('toggles selection on Cmd-click, as a plain row and both investment rows do', async () => {
-        // The modifier toggled selection on a plain bank row and on BOTH
-        // investment row variants, but fell through to a plain focus here — so
-        // the same gesture on two rows that look alike did two different
-        // things, and the one it did nothing useful on was the row that stands
-        // for a whole multi-leg header.
+        // The modifier toggles selection on a plain bank row and on BOTH
+        // investment row variants. A split row that fell through to a plain
+        // focus would make the same gesture on two rows that look alike do two
+        // different things, and do nothing useful on the row that stands for a
+        // whole multi-leg header.
         const toggle = await openRegister();
         const parent = toggle.closest('[role="row"]') as HTMLElement;
         const box = within(parent).getByRole('checkbox');
@@ -212,13 +211,11 @@ describe('a collapsed split row answers the selection modifier', () => {
 
 describe('a collapsed split row says what it is', () => {
     it('names NO single category, because a split does not have one', async () => {
-        // #547 led this row with "the category that stands for the group" —
-        // the filter-matched leg, else the largest by absolute summed amount.
-        // Removed 2026-09-25: it was never requested, and it read as a claim
-        // rather than a summary. The chip sat at the same left edge as a flat
-        // row's category chip, which is what made the column read straight
-        // down — and what made a heuristic pick look like the definite answer
-        // a flat row gives. This paycheck has three categories; naming one of
+        // A "category that stands for the group" (the filter-matched leg, else
+        // the largest by absolute summed amount) reads as a claim rather than a
+        // summary. A chip at the same left edge as a flat row's category chip
+        // makes the column read straight down, and so makes a heuristic pick
+        // look like the definite answer a flat row gives. This paycheck has three categories; naming one of
         // them there says something untrue.
         //
         // Asserting the ABSENCE of all three, not just one, so a partial
@@ -269,11 +266,10 @@ describe('expanding a split', () => {
 });
 
 describe('the keyboard route into a split', () => {
-    it('opens the editor on Enter, which used to be a dead key', async () => {
-        // Enter on a split parent was a deliberate no-op whose comment said it
-        // stood "until the split-edit slice lands". That slice landed; the
-        // no-op did not. With the context menu also carrying no Edit item, a
-        // keyboard user had NO route to a split's legs at all.
+    it('opens the editor on Enter', async () => {
+        // Enter is a keyboard user's route to a split's legs; if it were a
+        // no-op, and the context menu carried no Edit item, there would be NO
+        // route at all.
         const user = userEvent.setup();
         const btn = await openRegister();
 
@@ -303,10 +299,10 @@ describe('the keyboard route into a split', () => {
 
 describe('ArrowRight / ArrowLeft on a split parent', () => {
     it('expands on ArrowRight and collapses on ArrowLeft', async () => {
-        // These are the conventional treegrid disclosure keys and were unbound
-        // everywhere in the SPA. #547 gave the split parent Enter-to-edit but
-        // left expansion reachable from the keyboard only by Tabbing to the
-        // toggle — which works, and is not what a keyboard user reaches for.
+        // These are the conventional treegrid disclosure keys. With Enter
+        // bound to edit, expansion would otherwise be reachable from the
+        // keyboard only by Tabbing to the toggle — which works, and is not
+        // what a keyboard user reaches for.
         const user = userEvent.setup();
         const btn = await openRegister();
 
@@ -356,9 +352,9 @@ describe('ArrowRight / ArrowLeft on a split parent', () => {
         // id; only then does moving DOM focus to the toggle isolate the BUTTON
         // guard as the thing under test.
         //
-        // Without the click this test passed with the guard deleted, because
-        // the handler bailed on a null focused row instead — green for a reason
-        // that had nothing to do with what it claimed to check.
+        // Without the click this test would pass with the guard deleted,
+        // because the handler would bail on a null focused row instead — green
+        // for a reason that has nothing to do with what it claims to check.
         await user.click(btn.closest('[role="row"]')!);
         btn.focus();
 

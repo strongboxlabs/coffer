@@ -43,8 +43,10 @@ namespace Coffer.Api.Contracts;
 ///     (negative).</description></item>
 /// </list>
 /// </remarks>
-public sealed class CreateInvestmentTransactionRequest
+public sealed class CreateInvestmentTransactionRequest : IInvestmentWriteNotes
 {
+    private readonly string? _memo;
+
     /// <summary>The user-visible brokerage account this txn belongs
     /// to. Must be of <c>account_type='investment'</c> and live in
     /// the ledger named in the URL.</summary>
@@ -64,11 +66,22 @@ public sealed class CreateInvestmentTransactionRequest
     /// transactions endpoint.</summary>
     public string? Payee { get; init; }
 
-    /// <summary>Optional memo at the header level.</summary>
-    public string? Memo { get; init; }
+    /// <summary>The event's memo: one per event, which the server places on the
+    /// brokerage leg of a one-posting event and on the header of a multi-posting one.
+    /// Presence-tracked (<see cref="IInvestmentWriteNotes"/>): omitted leaves it, null
+    /// or blank clears it.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Memo
+    {
+        get => _memo;
+        init { _memo = value; HasMemo = true; }
+    }
+
+    /// <summary>True when the body carried <c>memo</c>, whatever its value.</summary>
+    [JsonIgnore] public bool HasMemo { get; private init; }
 
     /// <summary>Optional check# / external reference. On investment
-    /// txns this commonly carries OFX values like <c>Auto</c> /
+    /// txns this can carry OFX values like <c>Auto</c> /
     /// <c>EXfr</c> / <c>Xfr</c>; manual entry can also leave it
     /// numeric or null.</summary>
     public string? CheckNumber { get; init; }
@@ -95,15 +108,18 @@ public sealed class CreateInvestmentTransactionRequest
     /// buy / buyx / sell / sellx / dividend_reinvest.</summary>
     public decimal? Price { get; init; }
 
-    /// <summary>The trade's money — the actual cash paid/received, at 2
-    /// decimals. AUTHORITATIVE wherever an Amount is carried (ADR-0073):
+    /// <summary>The trade's money — the actual cash paid/received, in the
+    /// brokerage's currency and at its places (ADR-0114 D15): a typed figure
+    /// with more places is refused with <c>amount-places-exceed-currency</c>,
+    /// never rounded. AUTHORITATIVE wherever an Amount is carried (ADR-0073):
     /// on buy / sell / buyx / sellx / dividend_reinvest it is the
     /// principal, and the per-share <c>unit_price</c> is DERIVED from it
     /// (<c>amount ÷ |shares|</c>), not the reverse — so the stored/shown
-    /// price reconciles to the money exactly and no sub-cent amount leaks
-    /// onto a leg. On dividend_cash / transfer / misc it is the direct
-    /// signed cash impact. When omitted on a share-trade action the server
-    /// falls back to <c>round(shares × price, 2)</c>.</summary>
+    /// price reconciles to the money exactly and no amount finer than the
+    /// currency leaks onto a leg. On dividend_cash / transfer / misc it is the
+    /// direct signed cash impact. When omitted on a share-trade action the
+    /// server falls back to shares × price, rounded once at the brokerage's
+    /// places, half away from zero.</summary>
     public decimal? Amount { get; init; }
 
     /// <summary>The income or expense category leg's counterparty.
@@ -117,12 +133,29 @@ public sealed class CreateInvestmentTransactionRequest
     /// Required on buyx / sellx / divx / transfer.</summary>
     public Guid? TransferAccountId { get; init; }
 
+    /// <summary>The transfer account's own leg, signed, in that account's
+    /// currency, when <see cref="TransferAccountId"/> is a real account in
+    /// another currency than the brokerage's (ADR-0114 D13, ADR-0029), on
+    /// <see cref="LedgerActions.Transfer"/>, <see cref="LedgerActions.BuyXfr"/>,
+    /// <see cref="LedgerActions.SellXfr"/> and <see cref="LedgerActions.DivXfr"/>;
+    /// on the last three it pairs with the trade amount, not the fee.
+    /// Required there, nonzero and opposite in sign to the brokerage's leg of
+    /// the transfer pair (<c>investment-txn-transfer-amount-required</c>,
+    /// <c>investment-txn-transfer-amounts-nonzero</c>,
+    /// <c>investment-txn-transfer-amounts-sign</c>), and checked at the transfer
+    /// account's places. Like the places rule, the nonzero and sign rules check
+    /// only a pair the write changes: a pair resent equal to its two stored
+    /// legs, on the same accounts, passes them. Dropped on a category or a
+    /// same-currency transfer, whose leg mirrors the brokerage's.</summary>
+    public decimal? TransferAmount { get; init; }
+
     /// <summary>Optional fee category counterparty. When set,
     /// <see cref="FeeAmount"/> must also be set.</summary>
     public Guid? FeeAccountId { get; init; }
 
-    /// <summary>Positive fee amount. Required when
-    /// <see cref="FeeAccountId"/> is set; rejected otherwise.</summary>
+    /// <summary>Positive fee amount, in the brokerage's currency and at its
+    /// places (ADR-0114 D15). Required when <see cref="FeeAccountId"/> is set;
+    /// rejected otherwise.</summary>
     public decimal? FeeAmount { get; init; }
 
     /// <summary>
@@ -136,19 +169,14 @@ public sealed class CreateInvestmentTransactionRequest
     public ProviderSecurityHint? ProviderSecurityHint { get; init; }
 
     /// <summary>
-    /// Tags to attach to the new header — the same field, semantics and
-    /// dictionary as the bank create surface
+    /// The event's tags — the same dictionary as the bank create surface
     /// (<see cref="CreateTransactionRequest.Tags"/>): case-insensitive
     /// create-on-first-use, first casing wins. Omitted / null / <c>[]</c> all
     /// produce an untagged transaction.
     /// </summary>
     /// <remarks>
-    /// ADR-0009 puts tags on the EVENT, and an investment txn is an event, so
-    /// there was never a shape reason for this to be bank-only — the field
-    /// simply did not exist here, which left the MCP bulk tool as the only way
-    /// to tag an investment header, and the register then dropped the tags on
-    /// the floor when it drew the row. Tags apply to the header regardless of
-    /// how many legs it has, exactly as they do for a bank split.
+    /// One tag set per event, placed like <see cref="Memo"/>: on the brokerage
+    /// leg of a one-posting event, on the header of a multi-posting one.
     /// </remarks>
     public IReadOnlyList<string>? Tags { get; init; }
 }
@@ -180,21 +208,22 @@ public sealed class ConvertInKindTransferRequest
 /// rule — there's no per-leg patch surface. Editing only a Buy's fee
 /// still reshapes the entire legs list under the same header_id.
 /// </remarks>
-public sealed class PatchInvestmentTransactionRequest
+public sealed class PatchInvestmentTransactionRequest : IInvestmentWriteNotes
 {
+    private readonly string? _memo;
+
     /// <summary>
     /// When <c>true</c>, clears <c>needs_review</c> on this transaction in the
     /// same Postgres transaction as the edit — the same contract the bank PATCH
     /// has always had. Idempotent on an already-accepted row.
     /// </summary>
     /// <remarks>
-    /// <para>Until this existed, a successful investment PATCH cleared the flag
-    /// UNCONDITIONALLY, on the reasoning that "the investment editor's only
-    /// Save-pressed exit IS Accept". That was true of the editor and false of
-    /// the endpoint: any other client — MCP, a direct PATCH, a script fixing a
-    /// typo across a ledger — silently accepted every row it touched, and there
-    /// was no way to correct an imported row and leave it queued for review.
-    /// The bank side has always been able to.</para>
+    /// <para>Clearing the flag on every successful PATCH, on the reasoning that
+    /// "the investment editor's only Save-pressed exit IS Accept", is true of the
+    /// editor and false of the endpoint: any other client — MCP, a direct PATCH,
+    /// a script fixing a typo across a ledger — would silently accept every row
+    /// it touched, with no way to correct an imported row and leave it queued for
+    /// review. The field makes acceptance explicit, as it is on the bank side.</para>
     ///
     /// <para>Investment conforms to bank here rather than the reverse. The
     /// alternative — extracting approve into its own endpoint on both sides —
@@ -214,7 +243,23 @@ public sealed class PatchInvestmentTransactionRequest
     public DateTime? PostedAt { get; init; }
     public string? Action { get; init; }
     public string? Payee { get; init; }
-    public string? Memo { get; init; }
+
+    /// <summary>
+    /// The event's memo, PRESENCE-tracked unlike the other fields of this body: an
+    /// omitted memo leaves it as it is, and null or blank clears it. The other
+    /// fields describe the new shape wholesale, but the memo is not part of the
+    /// shape, and clearing it whenever a client left it out lost it.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Memo
+    {
+        get => _memo;
+        init { _memo = value; HasMemo = true; }
+    }
+
+    /// <summary>True when the body carried <c>memo</c>, whatever its value.</summary>
+    [JsonIgnore] public bool HasMemo { get; private init; }
+
     public string? CheckNumber { get; init; }
     public DateTime? TransactedAt { get; init; }
     public Guid? SecurityId { get; init; }
@@ -223,6 +268,12 @@ public sealed class PatchInvestmentTransactionRequest
     public decimal? Amount { get; init; }
     public Guid? CategoryAccountId { get; init; }
     public Guid? TransferAccountId { get; init; }
+    /// <summary>The transfer account's own leg across currencies, as on create
+    /// (<see cref="CreateInvestmentTransactionRequest.TransferAmount"/>). A PATCH
+    /// that resends the stored leg unchanged passes the places check, and one
+    /// that resends the transfer pair equal to its two stored legs, on the same
+    /// accounts, passes the nonzero and sign checks too.</summary>
+    public decimal? TransferAmount { get; init; }
     public Guid? FeeAccountId { get; init; }
     public decimal? FeeAmount { get; init; }
     /// <summary>
@@ -238,14 +289,15 @@ public sealed class PatchInvestmentTransactionRequest
 
     /// <summary>
     /// Investment-side merge (mirrors the bank <c>PatchTransactionRequest
-    /// .MergeFromHeaderId</c>). When set, the row being PATCHed (the URL
-    /// <c>headerId</c>) is the LOSER: it folds into this candidate (the
-    /// WINNER/survivor). The user picked the canonical row from the
-    /// editor's "possible matches" panel; the fresh imported/synced row
-    /// vanishes from the register (its <c>external_id</c> is preserved so
-    /// future syncs dedup against it), and the winner adopts the loser's
-    /// posted date. A merge-only PATCH carries just this field — no other
-    /// fields are read (the loser is tombstoned, not reshaped).
+    /// .MergeFromHeaderId</c>). When set, the URL <c>headerId</c> is the
+    /// LOSER: it folds into this candidate (the WINNER/survivor). The user
+    /// picked the canonical row from the editor's "Merge candidates" strip;
+    /// the fresh imported/synced row vanishes from the register (its
+    /// <c>external_id</c> is preserved so future syncs dedup against it),
+    /// and the winner keeps its own fields, adopting the loser's posted
+    /// date. Only the merge route sets it, on a request carrying nothing
+    /// else: no other field is read (the loser is tombstoned, not
+    /// reshaped).
     /// </summary>
     /// <remarks>
     /// <para><b>Not settable from the wire.</b> Merging is a COMMAND and has its
@@ -259,9 +311,9 @@ public sealed class PatchInvestmentTransactionRequest
     public Guid? MergeFromHeaderId { get; init; }
 
     /// <summary>
-    /// Replace the tag set on this header in the same PATCH — same contract as
-    /// <see cref="PatchTransactionRequest.Tags"/>. When supplied, the resulting
-    /// <c>txn_header_tags</c> pairings match exactly <see cref="Tags"/>.
+    /// Replace the event's tag set in the same PATCH. When supplied, the event's
+    /// pairings match exactly <see cref="Tags"/>, placed like the memo: on the
+    /// brokerage leg of a one-posting event, on the header of a multi-posting one.
     /// <list type="bullet">
     ///   <item><c>null</c> / omitted → tags untouched.</item>
     ///   <item><c>[]</c> → all tags removed.</item>
@@ -270,32 +322,45 @@ public sealed class PatchInvestmentTransactionRequest
     /// user-supplied casing wins on insert.
     /// </summary>
     /// <remarks>
-    /// Tags survive the wholesale posting replacement this PATCH performs: the
-    /// pairing is to the HEADER, and the header id is stable across a reshape.
-    /// Editing a buy's fee does not disturb its tags.
+    /// Tags survive a reshape this PATCH performs: the header id is stable, the
+    /// legs keep their identity where the new shape has room for them, and a
+    /// change of posting count moves the event's set between the brokerage leg and
+    /// the header. Editing a buy's fee does not disturb its tags.
     /// </remarks>
     public IReadOnlyList<string>? Tags { get; init; }
 }
 
 /// <summary>
-/// One "possible match" for an investment merge, returned by
+/// One merge candidate for an investment merge, returned by
 /// <c>GET /api/ledgers/{ledgerId}/investment-transactions/{headerId}/merge-candidates</c>.
-/// Rendered as a chip in the editor's merge panel; picking one folds the
-/// edited row into this candidate. Shaped for the chip's one-line summary
-/// (date · action · ticker · shares · amount), unlike the bank
-/// <c>MergeCandidateDto</c> which carries a posting list.
+/// Rendered as a chip in the editor's "Merge candidates" strip; picking one
+/// folds the edited row into this candidate on save, through the merge route,
+/// and the candidate survives with its own fields. The chip reads like the candidate's row in
+/// the edited brokerage's register (date · action · payee · ticker · shares ·
+/// amount), so the figures it shows are that row's, taken from the register's
+/// own reading of it, not from the candidate's legs.
 /// </summary>
 /// <param name="HeaderId">The candidate (winner-to-be) header id — sent back as
-///   <see cref="PatchInvestmentTransactionRequest.MergeFromHeaderId"/>.</param>
+///   the merge route's <c>fromHeaderId</c>.</param>
 /// <param name="PostedAt">Effective (override-aware) posted date.</param>
 /// <param name="DayDelta">Signed day offset from the edited row (for the chip
 ///   subtitle: "3 days later").</param>
 /// <param name="Action">Catalog action (buy / sell / buyx / …).</param>
 /// <param name="SecurityTicker">The matched security's ticker.</param>
-/// <param name="Shares">Signed share quantity on the candidate's holdings leg.</param>
+/// <param name="Shares">The register row's share quantity, with its sign.</param>
 /// <param name="UnitPrice">Per-share price on the candidate.</param>
-/// <param name="Amount">Signed holdings-leg amount (the trade principal).</param>
+/// <param name="Amount">The register row's amount, with its sign.</param>
 /// <param name="Payee">Effective payee, for disambiguation.</param>
+/// <param name="DerivedAction">The register row's derived action: the
+///   header's action, or <c>Xfr</c> for an action-less row whose other side
+///   is an asset-shaped account. What the row's action chip shows.</param>
+/// <param name="CounterpartyAccountId">The register row's counterparty
+///   account (a cash transfer's other account).</param>
+/// <param name="CounterpartyAccountName">That account's name.</param>
+/// <param name="Origin">How the candidate came into the ledger, its register
+///   row's <c>origin</c>: <c>manual</c>, <c>online_import</c> or
+///   <c>file_import</c>. The chip's tooltip names the row a merge keeps by it:
+///   the person's own entry, or a row imported earlier.</param>
 public sealed record InvestmentMergeCandidateDto(
     Guid HeaderId,
     DateTime PostedAt,
@@ -305,7 +370,11 @@ public sealed record InvestmentMergeCandidateDto(
     decimal? Shares,
     decimal? UnitPrice,
     decimal Amount,
-    string? Payee);
+    string? Payee,
+    string? DerivedAction,
+    Guid? CounterpartyAccountId,
+    string? CounterpartyAccountName,
+    string Origin);
 
 /// <summary>
 /// Optional payload field on the investment create + PATCH endpoints

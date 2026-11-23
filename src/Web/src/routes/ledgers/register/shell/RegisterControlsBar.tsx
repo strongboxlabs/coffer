@@ -1,3 +1,5 @@
+import { useRef } from 'react';
+
 import { Checkbox } from '@/components/ui/Checkbox';
 
 import { RegisterFilterChips } from './RegisterFilterChips';
@@ -45,6 +47,12 @@ export interface RegisterControlsBarProps {
      *  {@link RegisterFilterControls}. A CATEGORY register faces money
      *  accounts, everything else faces categories. */
     counterpartyKind?: CounterpartyKind;
+    /**
+     * The currency the amount-range filter is in, for its inputs' symbol and places
+     * and its chip: the account's on an account register, null on a category
+     * register, whose rows can be in different currencies (ADR-0114 D14).
+     */
+    currency: string | null;
     /** Ledger tags for the Tag filter's autocomplete. */
     tags: readonly TagDto[];
     /** Securities for the Security picker — omit on bank registers. */
@@ -69,10 +77,9 @@ export interface RegisterControlsBarProps {
      *
      * It is a persistent CHECKBOX rather than a one-shot button, because the
      * state it carries has to be visible and reversible from anywhere in the
-     * register. The first version was a button in the empty state alone: it
-     * vanished the moment it worked, leaving rows from several sub-categories
-     * and nothing on screen saying why — and no way back except the browser's
-     * Back button.
+     * register. A button in the empty state alone vanishes the moment it works,
+     * leaving rows from several sub-categories and nothing on screen saying
+     * why — and no way back except the browser's Back button.
      */
     showSubcategoryScope?: boolean;
     /** Disable the New button (e.g. while an editor is already open). */
@@ -91,6 +98,7 @@ export function RegisterControlsBar({
     onFilterChange,
     accounts,
     counterpartyKind,
+    currency,
     tags,
     securities,
     resultCount,
@@ -101,6 +109,9 @@ export function RegisterControlsBar({
     hideNew = false,
     showSubcategoryScope = false,
 }: RegisterControlsBarProps) {
+    // Clear all, or removing the last chip, removes the chips row and the
+    // button that held focus with it: focus goes on to the search box.
+    const searchRef = useRef<HTMLInputElement>(null);
     return (
         <div className="flex flex-col gap-1.5 border-b border-border bg-surface px-3 py-1.5">
             {/* Row 1: status view + search/filter (left), New action (right). */}
@@ -121,8 +132,10 @@ export function RegisterControlsBar({
                     onChange={onFilterChange}
                     accounts={accounts}
                     counterpartyKind={counterpartyKind}
+                    currency={currency}
                     tags={tags}
                     securities={securities}
+                    searchRef={searchRef}
                 />
                 {/* Grouped with the other scope controls on the left, not
                     stranded in the gap the hidden New button leaves on the
@@ -158,8 +171,10 @@ export function RegisterControlsBar({
                 onChange={onFilterChange}
                 accounts={accounts}
                 counterpartyKind={counterpartyKind}
+                currency={currency}
                 securities={securities}
                 resultCount={resultCount}
+                fallbackFocusRef={searchRef}
             />
         </div>
     );

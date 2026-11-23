@@ -34,6 +34,10 @@ In scope:
 - The Docker Compose configuration and any deployment guidance in
   [docs/operations.md](docs/operations.md).
 - Authentication / authorization paths.
+- The upgrade path: the host updater (`scripts/app-upgrades.sh`), the upgrade mailbox
+  volume, the contract in `scripts/install.sh`, and what code running in the API
+  container can ask of the host through them
+  ([ADR-0110](docs/decisions/0110-upgrade-from-the-app.md)).
 
 Out of scope:
 

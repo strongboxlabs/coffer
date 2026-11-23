@@ -15,21 +15,22 @@ namespace Coffer.Api.Tests.Integration.Snapshots;
 /// Row-level security on the snapshot tables (migration 231).
 ///
 /// <para><c>ledger_snapshots</c> holds a complete copy of every row of a ledger —
-/// the same rows its source tables protect with RLS — and had none, nor did
-/// <c>ledger_snapshot_parts</c>. Both were gated only by the API's
-/// <c>LedgerAuthorizer</c>, so anything reaching the database as
-/// <c>coffer_app</c> outside that gate could read any ledger's full contents.</para>
+/// the same rows its source tables protect with RLS — and so does
+/// <c>ledger_snapshot_parts</c>. Gated only by the API's <c>LedgerAuthorizer</c>,
+/// anything reaching the database as <c>coffer_app</c> outside that gate could read
+/// any ledger's full contents, so both carry RLS of their own.</para>
 ///
 /// <para>The isolation test goes UNDER the API deliberately, as
 /// <c>DeploymentScopeRlsTests</c> does: an endpoint test would pass on the
 /// authorizer alone and prove nothing about the policy.</para>
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class SnapshotTablesRlsTests
+public sealed class SnapshotTablesRlsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SnapshotTablesRlsTests(PostgresFixture fixture) => _fixture = fixture;
+    public SnapshotTablesRlsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     // `ledger_snapshot_parts` has no EF mapping — it is written and read by the
     // migration-193 Postgres functions — so it is counted here in SQL. Raw SQL is
@@ -53,12 +54,12 @@ public sealed class SnapshotTablesRlsTests
     [Fact]
     public async Task One_ledgers_snapshots_are_invisible_and_unwritable_to_another_ledgers_owner()
     {
-        var mine = await SyntheticLedger.CreateAsync(_fixture);
-        var theirs = await SyntheticLedger.CreateAsync(_fixture);
+        var mine = await SyntheticLedger.CreateAsync(Db);
+        var theirs = await SyntheticLedger.CreateAsync(Db);
 
         async Task<Guid> SeedAsync(SyntheticLedger ledger)
         {
-            await using var db = _fixture.NewDbContext();   // coffer_service, BYPASSRLS
+            await using var db = Db.NewDbContext();   // coffer_service, BYPASSRLS
             var snap = new LedgerSnapshotRow
             {
                 Id = Guid.NewGuid(),
@@ -78,7 +79,7 @@ public sealed class SnapshotTablesRlsTests
         var mySnapshotId = await SeedAsync(mine);
         var theirSnapshotId = await SeedAsync(theirs);
 
-        await using (var asMe = _fixture.NewAppDbContextAsUser(mine.UserId))
+        await using (var asMe = Db.NewAppDbContextAsUser(mine.UserId))
         {
             // A snapshot IS the ledger, so seeing someone else's row is seeing
             // their data.
@@ -95,7 +96,7 @@ public sealed class SnapshotTablesRlsTests
 
         // Symmetrically, so a policy that happened to favour the first-created
         // ledger would not pass either.
-        await using (var asThem = _fixture.NewAppDbContextAsUser(theirs.UserId))
+        await using (var asThem = Db.NewAppDbContextAsUser(theirs.UserId))
         {
             Assert.True(await asThem.LedgerSnapshots.AnyAsync(s => s.Id == theirSnapshotId));
             Assert.False(await asThem.LedgerSnapshots.AnyAsync(s => s.Id == mySnapshotId));
@@ -113,8 +114,8 @@ public sealed class SnapshotTablesRlsTests
         //
         // So this drives a real capture through the endpoint and then counts the
         // PART ROWS, which is the thing that would silently be zero.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -123,7 +124,7 @@ public sealed class SnapshotTablesRlsTests
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
         var snap = (await resp.Content.ReadFromJsonAsync<CreateSnapshotResponse>())!.Snapshot!;
 
-        await using var asService = _fixture.NewDbContext();
+        await using var asService = Db.NewDbContext();
         Assert.True(await CountPartsAsync(asService, snap.Id) > 0,
             "Capture wrote no ledger_snapshot_parts rows. The endpoint reported success, "
             + "so this is the silent-empty-capture failure the RLS policies risk: the "

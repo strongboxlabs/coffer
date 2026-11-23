@@ -39,8 +39,8 @@ public sealed class LedgerSnapshotsRepository
 
     /// <summary>Command timeout for the heavy snapshot SQL — the server-side
     /// payload CAPTURE (create) and the delete+reinsert (restore). Both scale with
-    /// ledger size and ran well past the 30s Npgsql default, which timed out the
-    /// restore of a large ledger. These are rare, admin-gated operations, so a generous cap is
+    /// ledger size and can run past the 30s Npgsql default on a large ledger, which
+    /// times the operation out. These are rare, admin-gated operations, so a generous cap is
     /// correct and stays as headroom even though mig 188 cut restore's derived-state
     /// work (realized_gains is now captured rather than re-derived, and balances
     /// rebuild in one set-based pass).</summary>
@@ -95,8 +95,8 @@ public sealed class LedgerSnapshotsRepository
         if (kind is not ("auto" or "manual"))
             throw new ArgumentException("kind must be 'auto' or 'manual'", nameof(kind));
 
-        // Server-side payload capture can run tens of seconds on a large ledger —
-        // lift the command timeout off the 30s default (see SnapshotOpTimeoutSeconds).
+        // Server-side payload capture grows with the ledger and can outlast the 30s
+        // default — lift the command timeout off it (see SnapshotOpTimeoutSeconds).
         _db.Database.SetCommandTimeout(SnapshotOpTimeoutSeconds);
 
         // One create per ledger at a time (migration 247). The cap is checked
@@ -207,12 +207,12 @@ public sealed class LedgerSnapshotsRepository
         }
 
         // Insert the metadata row first (empty content; content_json filled
-        // server-side next). The in-scope graph — which can be hundreds of MB — is
+        // server-side next). The in-scope graph — which grows with the ledger — is
         // captured directly into content_json by ledger_snapshot_write (mig 179),
-        // so it NEVER enters managed memory. This is the fix for the OOM that
-        // silently failed nightly auto-snapshots on large ledgers: the old path
-        // read the payload, JsonSerializer-deserialised it into a multi-GB object
-        // graph, re-serialised, and gzipped — all under the container mem_limit.
+        // so it NEVER enters managed memory. Reading the payload into the API,
+        // JsonSerializer-deserialising it into a managed object graph many times its
+        // size, re-serialising and gzipping — all under the container mem_limit — would
+        // silently fail nightly auto-snapshots once a ledger is large enough.
         var row = new LedgerSnapshotRow
         {
             Id = snapshotId,
@@ -282,6 +282,21 @@ public sealed class LedgerSnapshotsRepository
             .ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// The bytes each of the ledger's snapshots occupies as STORED, compression
+    /// included, by snapshot id (migration 271). Not the size recorded at capture,
+    /// which is the length of the payload's JSON text: that is what the snapshot
+    /// would be as a file, not what it costs in the database.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<Guid, long>> StoredSizesAsync(
+        Guid ledgerId,
+        CancellationToken cancellationToken = default)
+    {
+        return await _db.LedgerSnapshotStoredSizes(ledgerId)
+            .ToDictionaryAsync(r => r.SnapshotId, r => r.StoredBytes, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
     /// <summary>Discriminator for restore outcomes.</summary>
     public enum RestoreOutcome
     {
@@ -312,8 +327,8 @@ public sealed class LedgerSnapshotsRepository
         CancellationToken cancellationToken = default)
     {
         // A full-ledger restore (delete + reinsert + a set-based balance rebuild)
-        // scales with ledger size and ran well past the 30s default that timed out
-        // a large ledger's restore. Lift it (see SnapshotOpTimeoutSeconds) before any restore
+        // scales with ledger size and can run past the 30s default on a large
+        // ledger. Lift it (see SnapshotOpTimeoutSeconds) before any restore
         // work begins. Since mig 188 there is no FIFO recompute here — holdings,
         // lots AND realized_gains all come from the payload.
         _db.Database.SetCommandTimeout(SnapshotOpTimeoutSeconds);
@@ -357,6 +372,18 @@ public sealed class LedgerSnapshotsRepository
                 snapshotId, snap.SchemaVersion, liveSchemaVersion);
             return RestoreOutcome.SchemaVersionMismatch;
         }
+
+        // The ledger's write lock (migration 275), so the restore and every writer of the
+        // ledger that can recompute it take turns: the restore rebuilds balances and a
+        // writer's recompute rewrites them. The session form, taken before the transaction
+        // begins and released after it ends (declared first, so disposed last): a lock
+        // taken inside a REPEATABLE READ transaction comes after its snapshot, as
+        // CreateAsync's snapshot lock does for the same reason. A write that holds it past
+        // the wait refuses the restore (LedgerWriteBusyException, a 422) before anything
+        // is rewritten.
+        await using var writeLock = await _db
+            .HoldLedgerWriteSessionAsync(ledgerId, _logger, cancellationToken)
+            .ConfigureAwait(false);
 
         // REPEATABLE READ, for the reason CreateAsync gives; the restore functions
         // refuse to run below it.
@@ -416,6 +443,11 @@ public sealed class LedgerSnapshotsRepository
                     .FirstAsync(cancellationToken)
                     .ConfigureAwait(false);
             }
+
+            // The stored memo-and-tags presentation (txn_legs.notes_* and
+            // txn_leg_note_tags) is captured and has just been copied back as it was,
+            // with no recompute: the schema-version check above means the rule that
+            // computed it is the rule this database runs (migration 264).
 
             if (beforeCommit is not null)
                 await beforeCommit(cancellationToken).ConfigureAwait(false);

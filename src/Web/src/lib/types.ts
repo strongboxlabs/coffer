@@ -17,13 +17,30 @@
 export type { CurrentUser } from './types/auth';
 export type { ApiVersion, DbVersion, VersionResponse } from './types/meta';
 export type {
-    BalanceHealthDriftDto,
-    BalanceHealthReport,
     LedgerConsistencyReport,
+    LedgerConsistencyState,
     ProjectionConsistency,
+    ProjectionRepairResult,
     ConsistencyMismatch,
     LedgerSummary,
+    UnbackedPriceAdvisory,
+    UpdateLedgerRequest,
 } from './types/ledger';
+export type { RateUnavailable } from './types/conversion';
+export type {
+    AddFxRateRequest,
+    Benchmark,
+    BenchmarkAvailability,
+    BenchmarkUnavailableReason,
+    FxPair,
+    FxMissingSpan,
+    FxPairNeed,
+    FxPairSource,
+    FxRate,
+    FxRatePage,
+    FxRateSource,
+    FxRatesView,
+} from './types/marketSeries';
 export type {
     AccountSummary,
     AccountDetail,
@@ -32,17 +49,29 @@ export type {
     LoanTermsInput,
     LoanPaymentPreviewRequest,
     LoanPaymentPreviewResponse,
-    AccountGroupSummary,
-    CreateAccountGroupRequest,
-    PatchAccountGroupRequest,
+    AccountFolder,
+    CreateAccountFolderRequest,
+    RenameAccountFolderRequest,
+    AccountBalance,
+    AccountSubtotals,
+    AccountTypeSubtotal,
+    AccountFolderSubtotal,
+    BalanceForecast,
+    BalanceForecastAccount,
+    BalanceForecastCombined,
+    BalanceForecastExclusion,
+    BalanceForecastLowest,
+    BalanceForecastPoint,
     PatchAccountSyncFromDateRequest,
     PatchAccountFeedMappingRequest,
     FrequentCounterparty,
     FrequentCounterpartiesResponse,
     ManagedReminder,
     SetupPaymentReminderRequest,
+    RelabelMergedInto,
 } from './types/account';
 export type {
+    CategoryList,
     CategoryNode,
     ReparentCategoryRequest,
     MergeCategoryRequest,
@@ -50,6 +79,10 @@ export type {
 } from './types/category';
 export type {
     TagDto,
+    CreateTagRequest,
+    TagTransactionLine,
+    TagTransactionPage,
+    TagTransactionFilter,
     PatchTagRequest,
     MergeTagRequest,
     MergeTagResponse,
@@ -58,6 +91,7 @@ export type {
 export type {
     FeedConnectionSummary,
     CreateFeedConnectionRequest,
+    RenameFeedConnectionRequest,
     FeedConnectionAccountDto,
     SyncErrorDto,
     SyncResultDto,
@@ -69,17 +103,23 @@ export type {
 } from './types/feed';
 export type {
     ReconStatus,
+    NotesKind,
+    RegisterRowNotes,
     RegisterRowBase,
     BankRow,
     InvestmentRow,
     RegisterRow,
     RegisterEntry,
     RegisterPage,
+    LedgerEntry,
+    LedgerEntriesPage,
     SetReconStatusRequest,
     DeleteTransactionResponse,
 } from './types/register';
 export type {
     TransactionPosting,
+    TransactionNotesRequest,
+    TransactionLineNotesRequest,
     CreateTransactionRequest,
     PatchTransactionPostings,
     PatchTransactionRequest,
@@ -116,7 +156,7 @@ export type {
     PositionDto,
 } from './types/holding';
 export type { UndoImportResult } from './types/imports';
-export type { CsvAmountShapeName, CsvMappingShape, CsvDelimiterName, CsvMapping, CsvMappingProblem, CsvMappingVerdict } from './types/csvMapping';
+export type { CsvAmountShapeName, CsvMappingShape, CsvDecimalSeparatorName, CsvDelimiterName, CsvMapping, CsvMappingProblem, CsvMappingVerdict } from './types/csvMapping';
 export type {
     SelectionStatusFilter,
     SelectionRequest,
@@ -131,10 +171,20 @@ export type { QuoteRunOutcome, QuoteError } from './types/quote';
 export type { LedgerOperationSummary } from './types/ledgerOperation';
 export type {
     LedgerOverview,
+    NetWorthHistory,
+    NetWorthHistoryPoint,
     OverviewAccount,
     OverviewAccountGroup,
+    OverviewComparison,
     PortfolioRollup,
 } from './types/overview';
+export type {
+    AllocationDimension,
+    AllocationResult,
+    AllocationRow,
+    ReturnsResult,
+    UndecomposedMultiAsset,
+} from './types/portfolio';
 export type {
     BudgetCategoryRow,
     BudgetDailyCell,
@@ -145,8 +195,11 @@ export type {
 export type {
     QuoteProvider,
     QuotesPrefs,
-    DashboardPrefs,
-    DashboardWidgetPref,
+    DashboardPrefsV1,
+    DashboardPrefsV2,
+    DashboardSettingValue,
+    DashboardWidgetPrefV2,
+    StoredDashboardPrefs,
 } from './types/preference';
 export type { Schedule } from './types/schedule';
 export type {
@@ -167,6 +220,7 @@ export type {
     CreateSnapshotResponse,
 } from './types/snapshot';
 export type { BackupKekCheck, BackupRetention, BackupRun, BackupRunAccepted, BackupSummary, BackupSchedule } from './types/backup';
+export type { UpgradeAttempt, UpgradeHost, UpgradeRelease, UpgradeSettings, UpgradeStatus } from './types/upgrade';
 export type { DriveSyncStatus, DriveConnectStart } from './types/driveSync';
 export type {
     MasterKeyStatus,
@@ -176,6 +230,8 @@ export type {
 export type {
     ReminderSummary,
     UpcomingOccurrence,
+    UpcomingAutoPost,
+    AutoPostExcludedReason,
     UpcomingKind,
     ReminderKind,
     ReminderLegDto,
@@ -183,7 +239,6 @@ export type {
     SetReminderActiveRequest,
     SkipReminderRequest,
     SkipReminderResponse,
-    FireReminderRequest,
     FireReminderResponse,
     CreateReminderRequest,
     CreateInvestmentReminderRequest,
@@ -197,4 +252,8 @@ export type {
     NotificationSubscribersResponse,
     SystemEvent,
     LedgerNotificationSettings,
+    LedgerAttention,
+    OutstandingProblem,
+    SystemAttention,
+    SystemAttentionSubject,
 } from './types/notification';

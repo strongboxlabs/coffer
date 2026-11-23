@@ -1,6 +1,9 @@
 # 0019 — Symmetric postings: every flow is a row, paired by `counterparty_id`
 
-* Status: Superseded by [ADR-0022](0022-txn-headers-and-legs.md) (2026-05-11)
+* Status: Superseded by [ADR-0022](0022-txn-headers-and-legs.md) (2026-05-11); Rule 4 amended 2026-11-14 by
+  [ADR-0114](0114-benchmarks-and-currency-conversion.md) (a currency edit that would leave a two-amount pair in one currency
+  with magnitudes that differ is refused; a mirrored pair that lands across currencies
+  becomes a two-amount pair with equal magnitudes and opposite signs)
 * Date: 2026-05-09
 * Refines: [ADR-0017](0017-account-discriminator.md), [ADR-0018](0018-investment-and-cross-account-translation.md)
 
@@ -38,7 +41,7 @@ row?"* depended on the txn's flavour. Reports, the running-balance
 trigger, and any future reconciliation logic had to encode that branching
 in three places.
 
-The user's product call: switch to a strict double-entry view where every
+The decision is to switch to a strict double-entry view where every
 flow is a `transactions` row, every row pairs with exactly one other row,
 and the question "what's the other side of this posting" has one answer
 schema-wide.
@@ -131,6 +134,35 @@ it by default. The sibling is created on demand by the importer
 (`AccountsRepository.EnsureHoldingsSiblingAsync`) and is idempotent across
 re-runs.
 
+**Amended 2026-11-04: the sibling keeps its brokerage's currency.** The sibling is
+made in its brokerage's currency, by the API's account create and by the importer, but
+an edit of the brokerage's currency changed only the brokerage's row, and the sibling, a
+system account the account edit refuses, kept the old code. Its positions' cost basis,
+named in the holding accounts' currency, was then in a currency the person had replaced.
+The rule: a brokerage's Holdings sibling is in the brokerage's currency.
+
+- The brokerage's edit sets its sibling's currency to the brokerage's in the same
+  transaction (`HoldingsAccountCurrency.AlignAsync`). Nothing converts: the edit
+  relabels. A trade price is in the currency of the brokerage that made the trade, never
+  the sibling's (ADR-0084 D2, 2026-11-04 amendment), so the edit also re-derives the day
+  of every trade on the brokerage and its sibling, under the trade-price lock order
+  (ADR-0084 D2): the brokerage is locked before the sibling's row is written.
+  *(Amended 2026-11-14, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D13: the relabel stands, with two additions. The
+  edit is refused when it would leave a two-amount pair in one currency with magnitudes
+  that differ, which cannot be represented. A mirrored pair that lands across currencies
+  becomes a two-amount pair with equal magnitudes and opposite signs, and the edit's
+  result reports how many did. A currency edit on any other real account is
+  [ADR-0050](0050-account-editor-and-loan-amortization.md) D8's.)*
+- The consistency check's `holdings_currency` projection compares each sibling's
+  currency with its brokerage's, one mismatch per sibling named by its brokerage, and
+  its repair makes the same write, with the brokerages locked first, and writes no
+  price: a sibling that disagrees leaves its trades' prices in the brokerage's currency.
+  When more than one brokerage names one sibling and they disagree, the expected code is
+  the first in ordinal order, as a mixed display currency is named and as the trade
+  price's currency is chosen, so the check, its repair and the trade prices agree.
+- On an existing install no row is rewritten: a sibling an earlier edit left in another
+  currency is reported once, and the repair sets it.
+
 ### Rule 5 — Investment-txn shapes decompose into 1, 2, or 4 paired rows
 
 Security metadata (`security_id`, `quantity`, `unit_price`, `commission`)
@@ -198,14 +230,13 @@ the regression tests.
 - The investment register query is straightforward — `WHERE security_id =
   X` returns dividends, buys, sells, and reinvests in chronological order
   without joining a satellite table.
-- Re-running the importer is fully idempotent. Validated end-to-end against
-  a large real-world MD export: identical counts on re-run, no asymmetric
-  pairs, no dangling FKs.
+- Re-running the importer is fully idempotent: identical counts on re-run,
+  no asymmetric pairs, no dangling FKs.
 
 **Negative**
 - Row count grows. A simple expense becomes 2 rows; a 3-way split becomes
-  6; a divr becomes 4. A large real-world MD export therefore expands to
-  several times as many Coffer rows as it has MD txns.
+  6; a divr becomes 4. An import therefore writes at least twice as many
+  Coffer rows as the export has MD txns, and more for splits and investments.
   Storage and index size scale linearly; the running-balance trigger fires
   once per chunk per affected account regardless.
 - The "split transaction" UI must collapse origin-side rows by
@@ -219,10 +250,8 @@ the regression tests.
 
 - **Keep `splits` for category legs; use shadow rows only for non-category
   transfers.** The pre-ADR-0019 model. Two relational shapes, branching
-  in every consumer. Rejected by the user: *"we have the double-entry
-  model; I thought it was an assumption. What are the gaps assuming we
-  switch to a symmetric view? Don't let supposed UI layouts drive data
-  store decisions."*
+  in every consumer. Rejected: the data is double-entry, and the store
+  follows that model rather than a supposed UI layout.
 - **Place security metadata on the brokerage cash row instead of a
   dedicated Holdings sibling.** Considered. Rejected because it puts
   asset-position state on a cash account, breaking the running-balance
@@ -233,10 +262,9 @@ the regression tests.
   linkage that makes the "other side of this row" query a single join.
   Rejected.
 - **Make `txn_group_id` apply to both origin and counterparty rows of a
-  multi-leg event.** Considered. Rejected by the user: *"the group idea
-  is only applied to the postings from the originating account; the
-  postings in the target account are usually not grouped."* Counterparty
-  rows belong to their target account's register and should stand alone
+  multi-leg event.** Considered. Rejected: a group applies only to the
+  postings from the originating account; the postings in the target
+  account are usually not grouped. Counterparty rows belong to their target account's register and should stand alone
   there.
 - **Store a single `pair_id` UUID once on the origin side, materialise the
   counterparty's reference via a view.** Loses the symmetric-trigger

@@ -13,20 +13,19 @@ discriminators — `account_postings_on_header` and
 `header_total_postings` — with **two correlated
 `COUNT(DISTINCT posting_index)` subqueries that ran once per row**.
 
-Measured against real data (an account with a five-figure leg count):
+The cost is paid once per row returned:
 
 | Query | cost of the two subqueries |
 |---|---|
-| Windowed register page (~100 entries) | ~10–15 ms (negligible) |
-| **Full-account scan** (reports / aggregation) | **~110 ms** (dominant per-row cost) |
+| Windowed register page (~100 entries) | a page's worth of rows (negligible) |
+| **Full-account scan** (reports / aggregation) | **every row of the account** (the dominant per-row cost) |
 
 The windowed register hides this — but a report that aggregates over a
 whole account, or several accounts in a group, scans every row and pays
 it in full. The subqueries also inflate the view's planner cost, which
 is part of what trips Postgres JIT compilation on this view (the
-`resolved_transactions` join graph already compiles ~250 functions/query
-— the reason PR \#45 shipped the `ALTER ROLE coffer_app SET jit = off`
-stopgap, see the open-work backlog and
+`resolved_transactions` join graph already compiles a large number of
+functions per query — the reason `ALTER ROLE coffer_app SET jit = off` exists, see the open-work backlog and
 `db/init/00-init-roles.sh`).
 
 **Principle (the deciding one): optimize each layer independently.** The
@@ -75,42 +74,50 @@ the report workload.
    and `recurring_transactions.source_account_id` — partial (`WHERE … IS
    NOT NULL`).
 
-## Results (real-data, `coffer_app` = the app's JIT-off path)
+## Results (`coffer_app` = the app's JIT-off path)
 
-| Query | before | after |
-|---|---|---|
-| Full-account scan | ~362 ms | **~240 ms** (subquery cost removed) |
-| Register page | ~64 ms | **~49 ms** |
+Neither query runs the correlated subqueries any more: the register page
+stops paying them for a page's worth of rows, and the full-account scan stops
+paying them for every row of the account's history.
 
-Backfill verified exact (0 legs whose stored counts differ from a fresh
-recompute). Secondary effect: the lighter view's planner cost no longer
-trips JIT even with JIT *on* **on the windowed page** (a page dropped
-141 → 62 ms measured as a JIT-enabled superuser, with the `JIT:` plan
-node gone). The heavier full-account scan still trips JIT — see the
-close-out below for why that means `jit = off` stays rather than being
+The backfill (mig 120, step 3) counts `DISTINCT posting_index` per header and
+per (header, account) — the same two counts
+`fn_recompute_posting_counts_for_header` derives — so backfilled and recomputed
+values agree by construction.
+Secondary effect: removing the subqueries lowers the view's planner cost. The
+windowed page's cost is bounded by its page size, so it falls below
+`jit_above_cost` and does not trip JIT even with JIT *on*. The full-account
+scan's cost grows with the account's history, so it can still trip JIT — see
+the close-out below for why that means `jit = off` stays rather than being
 retired.
 
 ## Close-out — the `jit = off` question is settled (keep it)
 
-This ADR originally framed two follow-on steps toward "retiring the
-`jit = off` stopgap." Both were measured and **closed without lifting
-it** — `jit = off` is the deliberate, measured optimum for this OLTP
-workload, not debt:
+Neither of the two follow-on steps toward "retiring the `jit = off` stopgap"
+**lifts it** — `jit = off` is the deliberate optimum for this OLTP workload, not
+debt:
 
 * **Counterparty self-`LEFT JOIN` + `account_path()` — won't denormalize.**
-  Profiled cheap: `account_path()` is `STABLE` (cached per statement) and
-  there are few distinct counterparties, so the self-join is ~2 ms over
-  the base scan. Not the lever; a maintained column + cross-header
-  recompute set for ~2 ms isn't worth the surface.
-* **Final JIT re-measure (real data, the same five-figure-leg account, `coffer_app`, RLS
-  on).** With every correlated subquery gone, the *windowed page* no
-  longer trips JIT (so the role setting is a no-op there: ~102 ms off /
-  ~118 ms on). But the *full-account / report scan* still trips JIT (282
-  functions, ~70-100 ms compile) with **no execution benefit** — ~1653 ms
-  off vs ~1755 ms on. Lifting `jit = off` would only regress reports.
+  Cheap, and the reason is structural: per row, the self-join is
+  one probe of the `txn_legs (header_id, posting_index)` index for the
+  sibling leg, and `account_path()` is a `STABLE` walk up the account's
+  parent chain, bounded by tree depth rather than ledger size — so it adds
+  little over the base scan and does not grow with it. A maintained column
+  would cost more than it saves: the counterparty name changes whenever that
+  account or any ancestor of it is renamed or re-parented, so one rename
+  would fan out to every leg whose sibling sits anywhere beneath it, and
+  every leg write would have to refresh its siblings on the same header.
+  That is a new invalidation surface owing its own drift check, to remove a
+  cost that does not scale with the data.
+* **JIT with the subqueries gone (`coffer_app`, RLS on).** With every correlated
+  subquery gone, the *windowed page* no longer trips JIT (so the role
+  setting is a no-op there). But the *full-account / report scan* can
+  still trip JIT, and gains **no execution benefit** from it — it runs no
+  faster with JIT on than off, so the compile is pure cost.
+  Lifting `jit = off` would only regress reports.
 
 So `jit = off` stays, reclassified from interim stopgap to deliberate
-configuration. Rationale and the measurement table live at the `ALTER ROLE`
+configuration. The rationale lives at the `ALTER ROLE`
 line in `db/init/00-init-roles.sh`. The follow-up entry that tracked this was
 resolved and deleted, per that file's lifecycle.
 
@@ -118,7 +125,9 @@ resolved and deleted, per that file's lifecycle.
 
 * `txn_legs` carries two maintained denormalized columns (NOT NULL
   DEFAULT 1; the interceptor corrects multi-posting headers post-commit,
-  exactly like balances). A drift would surface the same way a balance
+  exactly like balances). *(Amended 2026-10-27, [ADR-0108](0108-memo-and-tags-per-side.md) D6: after the save's
+  statements, inside the save's transaction; the correction commits or rolls
+  back with the save, as the balances do, ADR-0034's amendment of that date.)* A drift would surface the same way a balance
   drift would — via a recompute-and-diff health check.
 * One write path (investment Create/Patch) changed from a bespoke TVF to
   the standard EF insert every other writer uses — less surface, no

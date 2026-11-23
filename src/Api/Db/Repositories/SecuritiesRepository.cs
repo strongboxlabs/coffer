@@ -3,6 +3,7 @@ using Npgsql;
 
 using Coffer.Api.Contracts;
 using Coffer.Api.Db.Entities;
+using Coffer.Api.Quotes;
 
 namespace Coffer.Api.Db.Repositories;
 
@@ -39,19 +40,21 @@ public sealed class SecuritiesRepository
 
     /// <summary>
     /// Catalog list: every security in the ledger, with the per-security
-    /// aggregates the catalog table needs in one round-trip.
+    /// aggregates the catalog table needs in one round-trip. <paramref name="today"/>
+    /// is the caller's local date, as the register takes it (null for its fallback).
     /// </summary>
     public async Task<IReadOnlyList<SecuritySummaryDto>> ListByLedgerAsync(
         Guid ledgerId,
         string? search,
+        DateOnly? today,
         CancellationToken cancellationToken = default)
     {
         var q = _db.Securities.AsNoTracking().Where(s => s.LedgerId == ledgerId);
         if (!string.IsNullOrWhiteSpace(search))
         {
             // Case-insensitive substring match on ticker / cusip / name.
-            // The catalog is O(N) per ledger (a real one is small) — no
-            // need to push a tsvector index until volume demands it.
+            // The catalog is O(N) per ledger (the design assumes a small
+            // catalog) — no tsvector index until volume demands it.
             var needle = search.Trim();
             q = q.Where(s =>
                 EF.Functions.ILike(s.Name, "%" + needle + "%")
@@ -59,15 +62,11 @@ public sealed class SecuritiesRepository
                 || (s.Cusip  != null && EF.Functions.ILike(s.Cusip,  "%" + needle + "%")));
         }
 
-        // Aggregates: total quantity = SUM(holdings.quantity) across every
-        // holdings sibling that touches this security in the ledger;
-        // latest price = top row of security_prices by price_date DESC.
-        // Both are correlated subqueries — Npgsql translates them to
-        // LATERAL joins efficiently.
         var rows = await q
             .OrderBy(s => s.Ticker == null)            // nulls last
             .ThenBy(s => s.Ticker)
             .ThenBy(s => s.Name)
+            .ThenBy(s => s.Id)
             .Select(s => new SecurityListRow
             {
                 Id          = s.Id,
@@ -77,33 +76,58 @@ public sealed class SecuritiesRepository
                 AssetClass  = s.AssetClass,
                 Exchange    = s.Exchange,
                 IsActive    = s.IsActive,
-                TotalQuantity = _db.Holdings.AsNoTracking()
-                    .Where(h => h.SecurityId == s.Id)
-                    .Sum(h => (decimal?)h.Quantity) ?? 0m,
-                LatestPrice = _db.SecurityPrices.AsNoTracking()
-                    .Where(p => p.SecurityId == s.Id)
-                    .OrderByDescending(p => p.PriceDate)
-                    .Select(p => (decimal?)p.Price)
-                    .FirstOrDefault(),
-                LatestPriceAsOf = _db.SecurityPrices.AsNoTracking()
-                    .Where(p => p.SecurityId == s.Id)
-                    .OrderByDescending(p => p.PriceDate)
-                    .Select(p => (DateOnly?)p.PriceDate)
-                    .FirstOrDefault(),
             })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        return rows.Select(r => new SecuritySummaryDto(
-            r.Id, r.Ticker, r.Cusip, r.Name, r.AssetClass, r.Exchange,
-            r.IsActive, r.TotalQuantity, r.LatestPrice, r.LatestPriceAsOf))
+        // Aggregates on the caller's today (migration 259), the read the portfolio
+        // card values with: total quantity = the positions held that day, summed
+        // across every holdings sibling in the ledger; latest price = the latest close
+        // dated on or before it, else the last trade's price, on the day's split
+        // basis. Not the holdings projection and the newest price row, which count a
+        // trade, split or price the register calls Scheduled, so the catalog's value
+        // for a security would move before the card's did. One read each for the
+        // whole ledger, rather than a function call per row, at one boundary; the
+        // currencies below come from the same two reads.
+        var scheduledFrom = ScheduledBoundary.ScheduledFrom(today, _clock);
+        var held = await SecurityCurrencies.HeldNowAsync(_db, ledgerId, scheduledFrom, null, cancellationToken)
+            .ConfigureAwait(false);
+        var quantityBySecurity = held
+            .GroupBy(h => h.SecurityId)
+            .ToDictionary(g => g.Key, g => g.Sum(h => h.Quantity));
+        var priceBySecurity = await _db.SecurityPricesAsOfNow(ledgerId, scheduledFrom, null)
+            .AsNoTracking()
+            .ToDictionaryAsync(p => p.SecurityId, cancellationToken)
+            .ConfigureAwait(false);
+
+        // The currency each row's price and amount are in, by the detail's rule: the
+        // price's, else the holders', else the ledger's. Nothing converts.
+        var priceCurrency = await SecurityCurrencies.PriceRowAsync(
+                _db, ledgerId, priceBySecurity.Values, null, cancellationToken)
+            .ConfigureAwait(false);
+        var holders = SecurityCurrencies.Holders(held);
+        var ledgerCurrency = await DisplayCurrency.ForLedgerAsync(_db, ledgerId, cancellationToken)
+            .ConfigureAwait(false);
+
+        return rows.Select(r =>
+            {
+                var price = priceBySecurity.GetValueOrDefault(r.Id);
+                return new SecuritySummaryDto(
+                    r.Id, r.Ticker, r.Cusip, r.Name, r.AssetClass, r.Exchange, r.IsActive,
+                    quantityBySecurity.GetValueOrDefault(r.Id),
+                    price?.Price, price?.PriceDate,
+                    PriceCurrencyCode: priceCurrency.GetValueOrDefault(r.Id)
+                        ?? (holders.TryGetValue(r.Id, out var holding) ? holding.Code : ledgerCurrency));
+            })
             .ToList();
     }
 
-    /// <summary>Detail view: hero data + 10 most-recent prices.</summary>
+    /// <summary>Detail view: hero data + 10 most-recent prices. <paramref name="today"/>
+    /// is the caller's local date, as the register takes it (null for its fallback).</summary>
     public async Task<SecurityDetailDto?> GetByIdAsync(
         Guid ledgerId,
         Guid securityId,
+        DateOnly? today,
         CancellationToken cancellationToken = default)
     {
         var s = await _db.Securities.AsNoTracking()
@@ -112,15 +136,97 @@ public sealed class SecuritiesRepository
             .ConfigureAwait(false);
         if (s is null) return null;
 
-        var totalQuantity = await _db.Holdings.AsNoTracking()
-            .Where(h => h.SecurityId == securityId)
-            .SumAsync(h => (decimal?)h.Quantity, cancellationToken)
-            .ConfigureAwait(false) ?? 0m;
+        // The hero's figures are the caller's today (migration 259), as the portfolio
+        // card's are: what is held that day, at the latest close dated on or before
+        // it, else the last trade's price, on the day's split basis. A trade, split or
+        // price the register calls Scheduled does not move them. The recent-prices
+        // list below is a history, so it stays unbounded.
+        var scheduledFrom = ScheduledBoundary.ScheduledFrom(today, _clock);
+        var only = new[] { securityId };
+        var held = await SecurityCurrencies.HeldNowAsync(_db, ledgerId, scheduledFrom, only, cancellationToken)
+            .ConfigureAwait(false);
+        var totalQuantity = held.Sum(h => h.Quantity);
 
-        var totalCostBasis = await _db.Holdings.AsNoTracking()
-            .Where(h => h.SecurityId == securityId)
-            .SumAsync(h => (decimal?)h.CostBasis, cancellationToken)
-            .ConfigureAwait(false) ?? 0m;
+        // The cost basis combines every account holding the security, so it is in the
+        // ledger's reporting currency (ADR-0114 D7): a position kept in another currency
+        // converts lot by lot at each lot's acquisition date, as a trade converts at its
+        // trade date; one in the reporting currency keeps the basis it reports. A missing
+        // rate makes it null and names the pair and day (ADR-0114 D9).
+        var currencies = await LedgerCurrencies.LoadAsync(_db, ledgerId, cancellationToken).ConfigureAwait(false);
+        var reporting = currencies.Reporting;
+        bool Foreign(Guid holdingsAccountId) => currencies.OfPositionsOn(holdingsAccountId) != reporting;
+        var lots = await LotCosts.OpenAsync(
+                _db, ledgerId, ScheduledBoundary.LastCountedInstant(today, _clock),
+                [.. held.Select(h => h.AccountId).Where(Foreign).Distinct()], cancellationToken)
+            .ConfigureAwait(false);
+
+        var latest = await _db.SecurityPricesAsOfNow(ledgerId, scheduledFrom, only)
+            .AsNoTracking()
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        // The market value combines every account holding the security too, so it is in
+        // the reporting currency (ADR-0114 D7). It is a current value: each position from
+        // the price's currency into its brokerage's, as that brokerage shows it, then into
+        // the reporting currency, both at the latest rate, summed and rounded once. The
+        // price's currency is the one the valuation reads (holdings_as_of_now's), so the
+        // value converts from the currency it was computed in.
+        var lookup = new ExchangeRateLookup(_db, _clock);
+        var needs = lookup.NewNeeds();
+        foreach (var h in held.Where(h => Foreign(h.AccountId)))
+            LotCosts.Declare(needs, lots[(h.AccountId, h.SecurityId)], currencies.OfPositionsOn(h.AccountId), reporting);
+        if (latest is not null)
+        {
+            foreach (var h in held)
+            {
+                var account = currencies.OfPositionsOn(h.AccountId);
+                needs.AddLatest(latest.PriceCurrency, account);
+                needs.AddLatest(account, reporting);
+            }
+        }
+        var rates = await lookup.LoadAsync(ledgerId, needs, cancellationToken).ConfigureAwait(false);
+        var costTotal = rates.NewTotal(reporting);
+        foreach (var h in held)
+        {
+            if (Foreign(h.AccountId))
+                LotCosts.AddTo(costTotal, lots[(h.AccountId, h.SecurityId)], currencies.OfPositionsOn(h.AccountId));
+            else
+                costTotal.Add(h.CostBasis, reporting, RateDay.Latest());   // the identity
+        }
+        var totalCostBasis = costTotal.Result;
+
+        // With no current price there is no market value and no gain, and no rate to name.
+        var marketValue = new Converted(null, RateReasons.None);
+        var gainUnavailable = RateReasons.None;
+        if (latest is not null)
+        {
+            var valueTotal = rates.NewTotal(reporting);
+            foreach (var h in held)
+            {
+                var account = currencies.OfPositionsOn(h.AccountId);
+                var own = rates.NewTotal(account)
+                    .AddLatest(ReportingScale.MarketValue(h.Quantity, latest.Price), latest.PriceCurrency)
+                    .Result;
+                valueTotal.Add(own, account, RateDay.Latest());
+            }
+            marketValue = valueTotal.Result;
+            gainUnavailable = Converted.Reasons(marketValue, totalCostBasis);
+        }
+        decimal? unrealizedGain = marketValue.Amount is { } mv && totalCostBasis.Amount is { } cb ? mv - cb : null;
+
+        // The currencies the hero's other figures are in, so each is printed in its own.
+        // The holding accounts' currency: the one the accounts that hold the security that
+        // day agree on, else the first in ordinal order, else the ledger's. The price is in
+        // the price's currency (SecurityCurrencies.PriceRowAsync), else the holders'. Both
+        // come from the two reads above.
+        var holdingsCurrency = SecurityCurrencies.Holders(held).TryGetValue(securityId, out var holders)
+            ? holders.Code
+            : reporting;
+        var priceCurrency = (await SecurityCurrencies.PriceRowAsync(
+                    _db, ledgerId, latest is null ? [] : [latest], only, cancellationToken)
+                .ConfigureAwait(false))
+            .GetValueOrDefault(securityId)
+            ?? holdingsCurrency;
 
         var recentPrices = await _db.SecurityPrices.AsNoTracking()
             .Where(p => p.SecurityId == securityId)
@@ -136,8 +242,6 @@ public sealed class SecuritiesRepository
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        var latest = recentPrices.Count > 0 ? recentPrices[0] : null;
-
         return new SecurityDetailDto(
             Id: s.Id,
             Ticker: s.Ticker,
@@ -147,9 +251,9 @@ public sealed class SecuritiesRepository
             Exchange: s.Exchange,
             IsActive: s.IsActive,
             TotalQuantity: totalQuantity,
-            TotalCostBasis: totalCostBasis,
+            TotalCostBasis: totalCostBasis.Amount,
             LatestPrice: latest?.Price,
-            LatestPriceAsOf: latest?.AsOf,
+            LatestPriceAsOf: latest?.PriceDate,
             RecentPrices: recentPrices,
             QuoteSymbol: s.QuoteSymbol,
             AutoPrice: s.AutoPrice,
@@ -162,12 +266,22 @@ public sealed class SecuritiesRepository
             FiCredit: s.FiCredit,
             TaxCharacter: s.TaxCharacter,
             ClassificationSource: s.ClassificationSource,
-            ClassificationConfidence: s.ClassificationConfidence);
+            ClassificationConfidence: s.ClassificationConfidence,
+            PriceCurrencyCode: priceCurrency,
+            HoldingsCurrencyCode: holdingsCurrency,
+            CostBasisCurrencyCode: reporting,
+            CostBasisRateUnavailable: totalCostBasis.Unavailable,
+            MarketValue: marketValue.Amount,
+            MarketValueCurrencyCode: reporting,
+            MarketValueRateUnavailable: marketValue.Unavailable,
+            UnrealizedGain: unrealizedGain,
+            UnrealizedGainCurrencyCode: reporting,
+            UnrealizedGainRateUnavailable: gainUnavailable);
     }
 
     /// <summary>Cursor-paginated transactions touching this security.
     ///
-    /// <para>One row per <c>txn_header</c>: a DivReinvest event in MD is
+    /// <para>One row per <c>txn_header</c>: a Reinvest event from MD is
     /// "one transaction" in the user's head, not 4 legs across 2 postings.
     /// Per header, ≥2 legs typically have OWN <c>security_id</c> stamped
     /// (income-cash leg from <c>MakeCategoryPair</c> + holdings leg from
@@ -208,7 +322,7 @@ public sealed class SecuritiesRepository
         // tiebreak by lowest leg id for determinism. Picking the holdings
         // leg gives a row with positive qty + price + amount that matches
         // the "shares acquired/disposed" semantics the user expects.
-        // Pure cash Div (no reinvest) has no qty-bearing leg; the lowest-
+        // Pure cash Dividend (no reinvest) has no qty-bearing leg; the lowest-
         // id own-security leg becomes canonical.
         var q = _db.TxnLegs.AsNoTracking()
             .Where(l => l.SecurityId == securityId)
@@ -224,10 +338,10 @@ public sealed class SecuritiesRepository
         // values, so this list orders and labels the same way the register does.
         //
         // Apply the SAME visibility predicate the register + holdings use.
-        // Without it the per-security list leaked hidden/merged legs — e.g. an
-        // import-overlap duplicate the user hid still showed here as a phantom
-        // second buy and inflated the total count — while the register and the
-        // holdings total correctly excluded it.
+        // Without it the per-security list leaks hidden/merged legs — e.g. a
+        // hidden import-overlap duplicate shows here as a phantom second buy and
+        // inflates the total count — while the register and the holdings total
+        // exclude it.
         var withHeader = from l in q
                          join h in _db.TxnHeaders.AsNoTracking() on l.HeaderId equals h.Id
                          where !h.IsHidden && h.IsMergedInto == null
@@ -257,27 +371,34 @@ public sealed class SecuritiesRepository
                     && r.LegId < cursor.LegId));
         }
 
-        // Surface the BROKERAGE account, not the canonical leg's own
-        // account. The holdings leg sits on the Holdings sibling; the
-        // user thinks of these transactions as belonging to the brokerage
-        // they opened. Brokerage = account_type='investment' AND
-        // holdings_account_id IS NOT NULL (distinguishes it from the
-        // Holdings sibling, which is also 'investment' but with NULL
-        // holdings_account_id).
+        // Name the BROKERAGE that owns the canonical leg, not the leg's own
+        // account: the holdings leg sits on the Holdings sibling, and the
+        // user thinks of the trade as belonging to the brokerage they
+        // opened. That brokerage owns the leg's account (its
+        // holdings_account_id). Another brokerage on the header (the other
+        // side of an in-kind transfer, the funding brokerage of a
+        // buy/sell/dividend transfer) is not this trade's. The row's
+        // currency is the owner's, so the price and amount are named in the
+        // currency they were traded in.
+        //
+        // holdings_account_id is not unique, so when more than one brokerage
+        // names the leg's account the row names the one the trade-price rule
+        // reads the currency of (migration 274's fn_trade_currency): the first
+        // by currency code in ordinal order, then the lower id. A row and the
+        // trade price its line sets then name the same currency. A leg that
+        // sits on the brokerage itself (a cash dividend's) has no owner and
+        // names its own account, as the rule reads that account's currency.
         var paged = await (
             from r in withHeader
                 .OrderByDescending(r => r.PostedAt)
                 .ThenBy(r => r.AccountId)
                 .ThenByDescending(r => r.LegId)
                 .Take(pageSize + 1)
-            let brokerage = (
-                from sibling in _db.TxnLegs.AsNoTracking()
-                join b in _db.Accounts.AsNoTracking() on sibling.AccountId equals b.Id
-                where sibling.HeaderId == r.HeaderId
-                    && b.AccountType == "investment"
-                    && b.HoldingsAccountId != null
-                select b
-            ).FirstOrDefault()
+            let brokerage = _db.Accounts.AsNoTracking()
+                .Where(b => b.HoldingsAccountId == r.AccountId)
+                .OrderBy(b => EF.Functions.Collate(b.CurrencyCode, "C"))
+                .ThenBy(b => b.Id)
+                .FirstOrDefault()
             join legAccount in _db.Accounts.AsNoTracking() on r.AccountId equals legAccount.Id
             select new
             {
@@ -290,7 +411,8 @@ public sealed class SecuritiesRepository
                     Amount: r.Amount,
                     Quantity: r.Quantity,
                     UnitPrice: r.UnitPrice,
-                    Payee: r.Payee),
+                    Payee: r.Payee,
+                    CurrencyCode: brokerage != null ? brokerage.CurrencyCode : legAccount.CurrencyCode),
                 SortPostedAt = r.PostedAt,
                 SortAccountId = r.AccountId,
                 SortLegId = r.LegId,
@@ -394,9 +516,8 @@ public sealed class SecuritiesRepository
             .ConfigureAwait(false);
 
         // The unbacked dates in ONE pass, then stamped onto the page. The
-        // per-row predicate rescans the security's legs for every price:
-        // measured at 728ms against 14ms over one security's long daily price
-        // history, so a
+        // per-row predicate rescans the security's legs for every price, so
+        // its cost is prices × legs, and a
         // security with a long history made its own price list slow.
         if (items.Count > 0)
         {
@@ -426,7 +547,10 @@ public sealed class SecuritiesRepository
             .CountAsync(p => p.SecurityId == securityId, cancellationToken)
             .ConfigureAwait(false);
 
-        return new SecurityPricesPage(items, nextCursor, totalCount);
+        var defaultCurrency = await DefaultPriceCurrencyAsync(ledgerId, securityId, cancellationToken)
+            .ConfigureAwait(false);
+
+        return new SecurityPricesPage(items, nextCursor, totalCount, defaultCurrency);
     }
 
     public enum AddPriceResult
@@ -436,8 +560,75 @@ public sealed class SecuritiesRepository
         PriceRequired,
         PriceDateRequired,
         HighLowInvalid,
+        /// <summary>The currency given is not a currency code (<see cref="CurrencyCodes"/>).</summary>
+        CurrencyInvalid,
+        /// <summary>No currency was given and none can be inferred: the security has no
+        /// price yet, and the accounts holding it are none or disagree.</summary>
+        CurrencyRequired,
     }
-    public sealed record AddPriceOutcome(AddPriceResult Kind, Guid? PriceId);
+    public sealed record AddPriceOutcome(AddPriceResult Kind, Guid? PriceId, string? CurrencyCode = null);
+
+    /// <summary>
+    /// The currency a hand-entered price takes when none is given (ADR-0114 D5): the
+    /// security's latest price's currency, else the one currency every account holding it
+    /// is in. Null when neither answers — no price yet, and no holding account or holding
+    /// accounts in more than one currency — so the caller must ask.
+    /// </summary>
+    /// <remarks>
+    /// "Holding" is a non-zero quantity in <c>holdings</c>, one row per (Holdings account,
+    /// security), and a Holdings account takes its brokerage's currency. Also what the
+    /// price editor shows prefilled (<see cref="SecurityPricesPage.DefaultCurrencyCode"/>),
+    /// so the prefill and the server's default are the same answer.
+    /// </remarks>
+    public async Task<string?> DefaultPriceCurrencyAsync(
+        Guid ledgerId,
+        Guid securityId,
+        CancellationToken cancellationToken = default)
+    {
+        var latest = await _db.SecurityPrices.AsNoTracking()
+            .Where(p => p.LedgerId == ledgerId && p.SecurityId == securityId)
+            .OrderByDescending(p => p.PriceDate)
+            .Select(p => p.CurrencyCode)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (latest is not null) return latest;
+
+        var holding = await (
+                from h in _db.Holdings.AsNoTracking()
+                where h.LedgerId == ledgerId && h.SecurityId == securityId && h.Quantity != 0m
+                join a in _db.Accounts.AsNoTracking() on h.AccountId equals a.Id
+                select a.CurrencyCode)
+            .Distinct()
+            .Take(2)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return holding.Count == 1 ? holding[0] : null;
+    }
+
+    /// <summary>
+    /// The currency a hand-entered price is stored in: <paramref name="given"/> in stored
+    /// form when one is given, else <see cref="DefaultPriceCurrencyAsync"/>. The security
+    /// must already be known to be in the ledger.
+    /// </summary>
+    public async Task<(AddPriceResult Result, string? CurrencyCode)> ResolvePriceCurrencyAsync(
+        Guid ledgerId,
+        Guid securityId,
+        string? given,
+        CancellationToken cancellationToken = default)
+    {
+        if (!string.IsNullOrWhiteSpace(given))
+        {
+            return CurrencyCodes.TryNormalize(given, out var code)
+                ? (AddPriceResult.Ok, code)
+                : (AddPriceResult.CurrencyInvalid, null);
+        }
+
+        var inferred = await DefaultPriceCurrencyAsync(ledgerId, securityId, cancellationToken)
+            .ConfigureAwait(false);
+        return inferred is null
+            ? (AddPriceResult.CurrencyRequired, null)
+            : (AddPriceResult.Ok, inferred);
+    }
 
     public async Task<AddPriceOutcome> AddPriceAsync(
         Guid ledgerId,
@@ -453,6 +644,8 @@ public sealed class SecuritiesRepository
             return new AddPriceOutcome(AddPriceResult.PriceDateRequired, null);
         if (HighLowInvalid(request.High, request.Low))
             return new AddPriceOutcome(AddPriceResult.HighLowInvalid, null);
+        if (!string.IsNullOrWhiteSpace(request.CurrencyCode) && !CurrencyCodes.TryNormalize(request.CurrencyCode, out _))
+            return new AddPriceOutcome(AddPriceResult.CurrencyInvalid, null);
 
         // Ledger membership: the price's ledger must match the security's
         // ledger (migration 049 composite FK refuses cross-ledger inserts).
@@ -464,7 +657,14 @@ public sealed class SecuritiesRepository
         if (sec is null) return new AddPriceOutcome(AddPriceResult.SecurityNotInLedger, null);
 
         var priceDate = request.PriceDate;
-        var currency = string.IsNullOrWhiteSpace(request.CurrencyCode) ? "USD" : request.CurrencyCode.Trim();
+        // ADR-0114 D5: the currency given, else the security's latest price's, else its
+        // holding accounts' when they agree. Never an assumed USD.
+        var (currencyResult, resolvedCurrency) = await ResolvePriceCurrencyAsync(
+                sec.LedgerId, securityId, request.CurrencyCode, cancellationToken)
+            .ConfigureAwait(false);
+        if (currencyResult != AddPriceResult.Ok)
+            return new AddPriceOutcome(currencyResult, null);
+        var currency = resolvedCurrency!;
 
         // Manual tops the source ladder (ADR-0070): a hand-entered price OWNS its
         // day. If one already exists for (security, day) — from any source —
@@ -483,7 +683,7 @@ public sealed class SecuritiesRepository
             existing.Volume = request.Volume;
             existing.Source = PriceSource.Manual;
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            return new AddPriceOutcome(AddPriceResult.Ok, existing.Id);
+            return new AddPriceOutcome(AddPriceResult.Ok, existing.Id, currency);
         }
 
         var row = new SecurityPriceRow
@@ -503,7 +703,7 @@ public sealed class SecuritiesRepository
         try
         {
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            return new AddPriceOutcome(AddPriceResult.Ok, row.Id);
+            return new AddPriceOutcome(AddPriceResult.Ok, row.Id, currency);
         }
         catch (DbUpdateException ex) when (IsUniqueViolation(ex, out _))
         {
@@ -520,7 +720,7 @@ public sealed class SecuritiesRepository
             raced.Volume = request.Volume;
             raced.Source = PriceSource.Manual;
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            return new AddPriceOutcome(AddPriceResult.Ok, raced.Id);
+            return new AddPriceOutcome(AddPriceResult.Ok, raced.Id, currency);
         }
     }
 
@@ -531,6 +731,8 @@ public sealed class SecuritiesRepository
         PriceRequired,
         DateConflict,
         HighLowInvalid,
+        /// <summary>The currency given is not a currency code (<see cref="CurrencyCodes"/>).</summary>
+        CurrencyInvalid,
     }
 
     public async Task<PatchPriceResult> PatchPriceAsync(
@@ -560,9 +762,11 @@ public sealed class SecuritiesRepository
         {
             row.PriceDate = priceDate;
         }
-        if (request.CurrencyCode is not null && request.CurrencyCode.Trim().Length > 0)
+        if (!string.IsNullOrWhiteSpace(request.CurrencyCode))
         {
-            row.CurrencyCode = request.CurrencyCode.Trim();
+            if (!CurrencyCodes.TryNormalize(request.CurrencyCode, out var currency))
+                return PatchPriceResult.CurrencyInvalid;
+            row.CurrencyCode = currency;
         }
         if (request.High is { } high) row.High = high;
         if (request.Low is { } low)   row.Low  = low;
@@ -607,7 +811,7 @@ public sealed class SecuritiesRepository
 
     /// <summary>High &lt; Low is the only structural inconsistency we
     /// reject up-front (matches the security_prices CHECK constraint).
-    /// Either being null is fine (real-world exports often carry only the
+    /// Either being null is fine (a price source can carry only the
     /// close, not the OHLC band).</summary>
     private static bool HighLowInvalid(decimal? high, decimal? low) =>
         high is { } h && low is { } l && h < l;
@@ -914,17 +1118,33 @@ public sealed class SecuritiesRepository
     /// <paramref name="targetId"/> (ADR-0068). Repoints every reference that points AT
     /// the security — investment <c>txn_legs</c>, <c>realized_gains</c>,
     /// <c>provider_security_mappings</c> — to the keeper, rebuilds holdings + lots for
-    /// both securities on every touched account (source empties, target absorbs the moved
-    /// legs), then <b>deactivates</b> the source (reversible; not deleted — its own
-    /// prices/components stay with it harmlessly). Provider-mapping rows that would collide
+    /// both securities on every account holding the source or carrying its shares on a
+    /// transaction's line (source empties, target absorbs the moved legs), re-derives the
+    /// keeper's trade price on every day a moved execution prices
+    /// (ADR-0084 D4, 2026-11-03 amendment), then <b>deactivates</b> the source
+    /// (reversible; not deleted — its own prices/components stay with it harmlessly).
+    /// Provider-mapping rows that would collide
     /// with the keeper's existing (provider, ticker) are dropped, the rest repointed.
-    /// <paramref name="dryRun"/> reports the counts that would move. Atomic.
+    /// <paramref name="dryRun"/> reports the counts that would move. Atomic, and the source
+    /// is locked before anything is read, so a line added to it while the merge runs is
+    /// either read and moved with the rest or waits for the merge. The transaction is
+    /// opened by the ledger write lock (<see cref="LedgerWriteLock"/>, migration 275), its
+    /// first statement, ahead of the source's row lock and of every read; a dry run takes
+    /// neither.
     /// </summary>
     public async Task<MergeSecuritiesOutcome> MergeSecuritiesAsync(
         Guid ledgerId, Guid sourceId, Guid targetId, bool dryRun,
         CancellationToken cancellationToken = default)
     {
         if (sourceId == targetId) return new(MergeSecuritiesResult.SameSecurity, 0, 0);
+
+        // The ledger write lock (migration 275), first: the merge recomputes holdings, which
+        // the database refuses in a transaction that wrote or row-locked without it, and the
+        // source's row lock below is one. Every read from here on decides what moves, so it
+        // reads under it. A dry run reads what would move and locks nothing.
+        await using var write = dryRun
+            ? null
+            : await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken).ConfigureAwait(false);
 
         var sourceOk = await _db.Securities.AsNoTracking()
             .AnyAsync(s => s.LedgerId == ledgerId && s.Id == sourceId, cancellationToken).ConfigureAwait(false);
@@ -933,21 +1153,40 @@ public sealed class SecuritiesRepository
             .AnyAsync(s => s.LedgerId == ledgerId && s.Id == targetId, cancellationToken).ConfigureAwait(false);
         if (!targetOk) return new(MergeSecuritiesResult.TargetNotInLedger, 0, 0);
 
-        // Holdings-sibling accounts touching the source (via legs or existing holdings).
-        var legAccounts = await _db.TxnLegs.AsNoTracking()
-            .Where(l => l.LedgerId == ledgerId && l.SecurityId == sourceId)
-            .Select(l => l.AccountId).Distinct().ToListAsync(cancellationToken).ConfigureAwait(false);
-        var holdingAccounts = await _db.Holdings.AsNoTracking()
-            .Where(h => h.LedgerId == ledgerId && h.SecurityId == sourceId)
-            .Select(h => h.AccountId).Distinct().ToListAsync(cancellationToken).ConfigureAwait(false);
-        var accounts = legAccounts.Union(holdingAccounts).Distinct().ToList();
-        var legCount = legAccounts.Count == 0 ? 0 : await _db.TxnLegs.AsNoTracking()
-            .Where(l => l.LedgerId == ledgerId && l.SecurityId == sourceId)
-            .CountAsync(cancellationToken).ConfigureAwait(false);
+        // A dry run reads what would move, and locks nothing.
+        if (write is null)
+        {
+            var (dryLegs, dryAccounts) = await SourceReferencesAsync(ledgerId, sourceId, cancellationToken)
+                .ConfigureAwait(false);
+            return new(MergeSecuritiesResult.Ok, dryLegs, dryAccounts.Count);
+        }
 
-        if (dryRun) return new(MergeSecuritiesResult.Ok, legCount, accounts.Count);
+        // The source is locked before its lines are read (fn_lock_securities, step 0 of
+        // the trade-price lock order, migration 274). A line another request adds to it
+        // after the read would otherwise move below with its holdings and its day with the
+        // keeper never derived. One being added now is waited for and read; one that
+        // starts later waits for this merge.
+        _ = await _db.LockSecurities([sourceId]).Select(r => r.Locked)
+            .SingleAsync(cancellationToken).ConfigureAwait(false);
 
-        await using var tx = await _db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        var (legCount, accounts) = await SourceReferencesAsync(ledgerId, sourceId, cancellationToken)
+            .ConfigureAwait(false);
+
+        // The days the source's executions price, read before they move. The repoint
+        // bypasses TradePriceFromLegInterceptor, so they are re-derived below: each such
+        // execution leaves (source, day), where nothing of the source remains and its
+        // price is kept (ADR-0084 D4), and arrives on (target, day), which then prices
+        // by the rule over both securities' executions.
+        var tradeDays = await (
+                from l in _db.TxnLegs.AsNoTracking()
+                join h in _db.TxnHeaders.AsNoTracking() on l.HeaderId equals h.Id
+                where l.LedgerId == ledgerId && l.SecurityId == sourceId
+                      && !h.IsRecurringTemplate
+                      && l.Quantity != null && l.Quantity != 0m
+                      && l.UnitPrice != null && l.UnitPrice > 0m
+                select h.PostedAt)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
 
         await _db.TxnLegs.Where(l => l.LedgerId == ledgerId && l.SecurityId == sourceId)
             .ExecuteUpdateAsync(s => s.SetProperty(l => l.SecurityId, (Guid?)targetId), cancellationToken)
@@ -963,12 +1202,20 @@ public sealed class SecuritiesRepository
             .ExecuteUpdateAsync(s => s.SetProperty(m => m.SecurityId, targetId), cancellationToken)
             .ConfigureAwait(false);
 
-        // Rebuild holdings + lots for both securities on every touched account (source
-        // empties — no legs left; target absorbs the moved legs). Reuses the canonical
-        // holdings recompute (the same service every leg-mutating writer uses).
+        // Rebuild holdings + lots for both securities on every account holding the source or
+        // carrying its shares on a line (SourceReferencesAsync): the source empties, the
+        // target absorbs the moved legs. Reuses the canonical holdings recompute (the same
+        // service every leg-mutating writer uses).
         var recompute = new HoldingsRecomputeService(_db);
         await recompute.RecomputeAsync(
             accounts.SelectMany(a => new[] { (a, sourceId), (a, targetId) }), cancellationToken)
+            .ConfigureAwait(false);
+
+        // The keeper's trade price on each day the moved executions price, by the
+        // writer's own re-derivation (rank-gated). The source's days need none: no
+        // execution of it is left, so the rule derives nothing there and its rows stay.
+        await new TradePriceRecomputeService(_db).ReseedAsync(
+                tradeDays.Select(d => (ledgerId, targetId, HeaderDates.UtcDay(d))), cancellationToken)
             .ConfigureAwait(false);
 
         // Deactivate the merged-away source (reversible; not deleted).
@@ -976,8 +1223,42 @@ public sealed class SecuritiesRepository
             .ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false), cancellationToken)
             .ConfigureAwait(false);
 
-        await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
         return new(MergeSecuritiesResult.Ok, legCount, accounts.Count);
+    }
+
+    /// <summary>
+    /// How many lines reference the source (what a merge moves), and the accounts whose
+    /// position in it the merge recomputes: those with a line that carries shares of it on
+    /// a transaction, and those holding it.
+    /// </summary>
+    /// <remarks>
+    /// The positions are the ones the holdings walk derives, chosen by the predicate
+    /// <see cref="HoldingsRecomputeInterceptor"/> applies to a save: a line with a security
+    /// and a quantity, on a header that is not a reminder's template. A line that names the
+    /// source with no quantity (the brokerage's cash line of a dividend, a fee or a
+    /// miscellaneous event) and a template's line move with the rest but hold no shares,
+    /// and recomputing a pair with no stored holding creates one.
+    /// </remarks>
+    private async Task<(int LegCount, List<Guid> Accounts)> SourceReferencesAsync(
+        Guid ledgerId, Guid sourceId, CancellationToken cancellationToken)
+    {
+        var legAccounts = await (
+                from l in _db.TxnLegs.AsNoTracking()
+                join h in _db.TxnHeaders.AsNoTracking() on l.HeaderId equals h.Id
+                where l.LedgerId == ledgerId && l.SecurityId == sourceId
+                      && l.Quantity != null
+                      && !h.IsRecurringTemplate
+                select l.AccountId)
+            .Distinct().ToListAsync(cancellationToken).ConfigureAwait(false);
+        var holdingAccounts = await _db.Holdings.AsNoTracking()
+            .Where(h => h.LedgerId == ledgerId && h.SecurityId == sourceId)
+            .Select(h => h.AccountId).Distinct().ToListAsync(cancellationToken).ConfigureAwait(false);
+        var accounts = legAccounts.Union(holdingAccounts).Distinct().ToList();
+        var legCount = await _db.TxnLegs.AsNoTracking()
+            .Where(l => l.LedgerId == ledgerId && l.SecurityId == sourceId)
+            .CountAsync(cancellationToken).ConfigureAwait(false);
+        return (legCount, accounts);
     }
 
     private static bool IsUniqueViolation(DbUpdateException ex, out string constraint)
@@ -1004,8 +1285,5 @@ public sealed class SecuritiesRepository
         public string? AssetClass { get; init; }
         public string? Exchange { get; init; }
         public bool IsActive { get; init; }
-        public decimal TotalQuantity { get; init; }
-        public decimal? LatestPrice { get; init; }
-        public DateOnly? LatestPriceAsOf { get; init; }
     }
 }

@@ -9,10 +9,11 @@ import type { RegisterRow } from '@/lib/types';
 // list of UI rows, with expand state controlling whether group entries
 // reveal their legs inline.
 //
-// The client-side grouping logic that previously inferred groups by
-// scanning rows is no longer needed — the server is the source of
-// truth, and group boundaries never slice a page (ADR-0019 entry-keyed
-// pagination).
+// No client-side inference of groups by scanning rows — the server is
+// the source of truth, and group boundaries never slice a page
+// (ADR-0019 entry-keyed pagination). Only the account that owns a split
+// gets a group; on a line's other side each line is its own row, and the
+// client never clusters them back together.
 
 /**
  * A row in the rendered register — either a single transaction, a
@@ -41,7 +42,7 @@ export type DisplayRow<R extends RegisterRow = RegisterRow> =
  *
  * Shared because focus is resolved by header ID rather than by index: the
  * windowed-register hook counts ENTRIES while a register renders ROWS (after
- * regrouping target splits, filtering by status and expanding groups), and the
+ * filtering by status and expanding groups), and the
  * two counts are not equal on either register. Resolving by id removes the
  * chance of comparing one space against the other.
  */
@@ -55,88 +56,14 @@ export function rowHasHeader<R extends RegisterRow>(
 }
 
 /**
- * A register entry narrowed to a domain row shape `R` — the shared input to
- * {@link regroupTargetSplits} and {@link buildDisplayRows}. Mirrors the API
+ * A register entry narrowed to a domain row shape `R` — the input to
+ * {@link buildDisplayRows}. Mirrors the API
  * `RegisterEntryDto` union; a domain-scoped caller narrows its window to `R`
  * (e.g. `BankRow` / `InvestmentRow`) before piping it through.
  */
 export type RegisterEntryOf<R extends RegisterRow = RegisterRow> =
     | { kind: 'txn'; txn: R; groupId: null; legs: null }
     | { kind: 'group'; txn: null; groupId: string; legs: R[] };
-
-/**
- * Cluster a contiguous run of ADR-0036 TARGET-split entries into one `group`
- * entry, so the register renders them as an expandable split-parent (like an
- * originating split). Shared by BOTH registers (ADR-0080) — a target split is
- * an ordinary bank-shape split that happens to land on some, but not all, of
- * a header's accounts.
- *
- * A target split is keyed by LEG id (not header), so its postings arrive as
- * separate `txn` entries. This folds a contiguous run sharing
- * `(headerId, accountId)` with `1 < accountPostingsOnHeader <
- * headerTotalPostings` into one group; everything else — originating groups,
- * single-posting targets, ordinary txns — passes through untouched. The
- * collapsed parent's numbers come from the shared {@link groupAmount} /
- * {@link groupBalanceAfter} / {@link canonicalLeg} helpers, so there is no
- * bespoke client aggregation.
- *
- * Runs client-side because it is cross-page: leg-keyed target entries can
- * straddle a server page, and this operates on the loaded window. Legs are
- * sorted `leg_index` ASC so an expanded cluster reads in posting order.
- */
-export function regroupTargetSplits<R extends RegisterRow = RegisterRow>(
-    entries: readonly RegisterEntryOf<R>[],
-): RegisterEntryOf<R>[] {
-    const out: RegisterEntryOf<R>[] = [];
-    let i = 0;
-    while (i < entries.length) {
-        const entry = entries[i]!;
-        // Only single-txn entries can be target-split members; existing
-        // groups + non-target txns pass straight through.
-        if (entry.kind !== 'txn') {
-            out.push(entry);
-            i += 1;
-            continue;
-        }
-        const txn = entry.txn;
-        const isTargetSplitMember =
-            txn.accountPostingsOnHeader > 1
-            && txn.accountPostingsOnHeader < txn.headerTotalPostings;
-        if (!isTargetSplitMember) {
-            out.push(entry);
-            i += 1;
-            continue;
-        }
-        // Collect the contiguous run of txn entries sharing this
-        // (headerId, accountId). A header's target legs share posted_at/seq
-        // so they arrive adjacent — a contiguous scan captures the cluster.
-        const legs: R[] = [txn];
-        let j = i + 1;
-        while (j < entries.length) {
-            const next = entries[j]!;
-            if (
-                next.kind !== 'txn'
-                || next.txn.headerId !== txn.headerId
-                || next.txn.accountId !== txn.accountId
-            ) {
-                break;
-            }
-            legs.push(next.txn);
-            j += 1;
-        }
-        // A lone target leg (count says >1 but only one landed contiguously)
-        // stays flat — never emit a one-leg split-parent.
-        if (legs.length <= 1) {
-            out.push(entry);
-            i += 1;
-            continue;
-        }
-        legs.sort((a, b) => a.legIndex - b.legIndex);
-        out.push({ kind: 'group', txn: null, groupId: txn.headerId, legs });
-        i = j;
-    }
-    return out;
-}
 
 /**
  * Translate a server-grouped entry stream into a flat `DisplayRow[]`.
@@ -175,14 +102,32 @@ export function buildDisplayRows<R extends RegisterRow = RegisterRow>(
 }
 
 /**
- * Net cash effect of a split group on its account. Sourced from
- * `headerAccountNetAmount` (ADR-0034 mig 098) — server-computed once
+ * The one currency a split group's lines are in, or null when they are in more than
+ * one. On a real account every line is in the account's currency. A category holds no
+ * money of its own, so each of its lines is in the currency of the account that paid
+ * it, and a category's split paid from accounts in different currencies has no single
+ * currency (ADR-0114 D7).
+ */
+export function groupCurrency(legs: readonly RegisterRow[]): string | null {
+    const first = legs[0]?.currencyCode;
+    if (first === undefined) return null;
+    return legs.every((leg) => leg.currencyCode === first) ? first : null;
+}
+
+/**
+ * Net cash effect of a split group on its account, in {@link groupCurrency}. Sourced
+ * from `headerAccountNetAmount` (ADR-0034 mig 098) — server-computed once
  * per (header, account) and projected onto every leg, so reading
  * `legs[0]` is sufficient. Falls back to summing leg amounts only
  * during transient ingest states where the trigger hasn't yet
  * populated the balance row.
+ *
+ * Null when the lines are in more than one currency: no figure adds currencies, and
+ * the stored net adds the lines as they are (ADR-0114 D7). The caller shows the mixed
+ * marker in place of a figure.
  */
-export function groupAmount(legs: readonly RegisterRow[]): number {
+export function groupAmount(legs: readonly RegisterRow[]): number | null {
+    if (groupCurrency(legs) === null) return null;
     const stored = legs[0]?.headerAccountNetAmount;
     if (stored !== undefined && stored !== null) return stored;
     let sum = 0;
@@ -198,11 +143,25 @@ export function groupAmount(legs: readonly RegisterRow[]): number {
 export function groupBalanceAfter(
     legs: readonly RegisterRow[],
 ): number | null {
+    return lastLeg(legs)?.balanceAfter ?? null;
+}
+
+/**
+ * The missing rates a null group balance needed (ADR-0114 D9): the LAST leg's, as
+ * {@link groupBalanceAfter} reads that leg's balance. Undefined when none is missing.
+ */
+export function groupBalanceRateUnavailable(
+    legs: readonly RegisterRow[],
+): RegisterRow['balanceRateUnavailable'] {
+    return lastLeg(legs)?.balanceRateUnavailable;
+}
+
+function lastLeg(legs: readonly RegisterRow[]): RegisterRow | undefined {
     let best: RegisterRow | undefined;
     for (const leg of legs) {
         if (best === undefined || leg.legIndex > best.legIndex) best = leg;
     }
-    return best?.balanceAfter ?? null;
+    return best;
 }
 
 /**

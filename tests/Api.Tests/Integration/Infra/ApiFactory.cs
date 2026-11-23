@@ -1,9 +1,11 @@
 using Coffer.Api.Auth;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 
 namespace Coffer.Api.Tests.Integration.Infra;
 
@@ -12,24 +14,131 @@ namespace Coffer.Api.Tests.Integration.Infra;
 /// <c>Program</c> so test code drives a real HTTP pipeline. The factory
 /// pre-sets the env vars <c>Program.cs</c> reads eagerly during host
 /// build (so the registration-time dev-auth gate sees the test's
-/// chosen mode), overlays runtime-bound config to point at the
-/// per-collection <see cref="PostgresFixture"/>, and exposes
+/// chosen mode), overlays runtime-bound config to point at the test's
+/// own <see cref="TestDatabase"/>, and exposes
 /// <see cref="WithService{TService}(Func{IServiceProvider, TService})"/>
 /// for per-test DI substitution.
 /// </summary>
 public sealed class ApiFactory : WebApplicationFactory<Program>
 {
-    private readonly PostgresFixture _postgres;
+    private readonly string _appConnectionString;
+    private readonly string _serviceConnectionString;
     private readonly List<Action<IServiceCollection>> _serviceOverrides = new();
     private readonly Dictionary<string, string?> _configOverrides = new();
     private bool _devAuthEnabled = true;
     private bool _mcpEnabled;
     private string _environment = "Development";
 
-    public ApiFactory(PostgresFixture postgres)
+    /// <summary>A host on <paramref name="database"/>, the test's own.</summary>
+    public ApiFactory(TestDatabase database)
     {
-        _postgres = postgres;
+        ArgumentNullException.ThrowIfNull(database);
+        _appConnectionString = database.AppConnectionString;
+        _serviceConnectionString = database.ServiceConnectionString;
         ApplyEnvOverrides();
+        Undisposed.TryAdd(this, CreatedBy());
+    }
+
+    /// <summary>
+    /// Every factory built and not yet disposed, with the test that built it. A host that
+    /// is never disposed stays registered process-wide (its tracing listener, its
+    /// container's timers) and is kept for the rest of the run, so
+    /// <see cref="PostgresFixture"/> fails the run on any left here at its end.
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<ApiFactory, string> Undisposed =
+        new(ReferenceEqualityComparer.Instance);
+
+    /// <summary>The tests whose factories were never disposed, one entry per factory.</summary>
+    internal static IReadOnlyList<string> NotDisposed => [.. Undisposed.Values.Order(StringComparer.Ordinal)];
+
+    /// <summary>The framework rate limiters of the hosts this factory started, disposed
+    /// with them (see <see cref="PipelineRateLimiters"/> and <see cref="ReleaseProcessWideHolders"/>).</summary>
+    private readonly List<System.Threading.RateLimiting.PartitionedRateLimiter<Microsoft.AspNetCore.Http.HttpContext>> _rateLimiters = new();
+
+    /// <summary>The HTTP client factories of the hosts this factory started, whose timers
+    /// stop with them (see <see cref="HttpClientFactoryTimers"/>).</summary>
+    private readonly List<IHttpClientFactory> _httpClientFactories = new();
+
+    protected override IHost CreateHost(IHostBuilder builder)
+    {
+        var host = base.CreateHost(builder);
+        try
+        {
+            var limiters = PipelineRateLimiters.Find(host.Services.GetRequiredService<IServer>());
+            var httpClients = host.Services.GetRequiredService<IHttpClientFactory>();
+            lock (_rateLimiters)
+            {
+                _rateLimiters.AddRange(limiters);
+                _httpClientFactories.Add(httpClients);
+            }
+        }
+        catch (Exception findFailed)
+        {
+            // The factory records a host only once this returns, so a host that cannot be
+            // returned is stopped and disposed here, or its process-wide registrations stay.
+            try { host.StopAsync().GetAwaiter().GetResult(); }
+            catch (Exception stopFailed) { throw new AggregateException(findFailed, stopFailed); }
+            finally { host.Dispose(); }
+            throw;
+        }
+        return host;
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        Undisposed.TryRemove(this, out _);
+        await base.DisposeAsync().ConfigureAwait(false);
+        ReleaseProcessWideHolders();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) Undisposed.TryRemove(this, out _);
+        base.Dispose(disposing);
+        if (disposing) ReleaseProcessWideHolders();
+    }
+
+    /// <summary>
+    /// Once the hosts are stopped, lets go of what the framework and libraries keep
+    /// process-wide for a host and never release: one host per process makes that harmless
+    /// in production, a host per test would keep every one. The rate limiters of the hosts
+    /// this factory started are disposed, so their timers stop; their HTTP client factories'
+    /// handler-expiry timers are stopped; and the MCP tools' descriptors cached under the
+    /// SDK's process-wide options are dropped.
+    /// </summary>
+    private void ReleaseProcessWideHolders()
+    {
+        McpToolDescriptorCache.Release();
+        System.Threading.RateLimiting.PartitionedRateLimiter<Microsoft.AspNetCore.Http.HttpContext>[] limiters;
+        IHttpClientFactory[] httpClients;
+        lock (_rateLimiters)
+        {
+            limiters = [.. _rateLimiters];
+            _rateLimiters.Clear();
+            httpClients = [.. _httpClientFactories];
+            _httpClientFactories.Clear();
+        }
+        foreach (var limiter in limiters) limiter.Dispose();
+        foreach (var factory in httpClients) HttpClientFactoryTimers.Stop(factory);
+    }
+
+    /// <summary>The test method that is building this factory: the first frame outside it
+    /// in this assembly, with an async method's state machine named for its method.</summary>
+    private static string CreatedBy()
+    {
+        foreach (var frame in new System.Diagnostics.StackTrace(2, false).GetFrames())
+        {
+            var type = frame.GetMethod()?.DeclaringType;
+            if (type is null || type == typeof(ApiFactory) || type.Assembly != typeof(ApiFactory).Assembly) continue;
+            var method = frame.GetMethod()!.Name;
+            if (type.Name.StartsWith('<') && type.DeclaringType is { } owner)
+            {
+                method = type.Name[1..type.Name.IndexOf('>', StringComparison.Ordinal)];
+                type = owner;
+            }
+            return $"{type.FullName}.{method}";
+        }
+        return "(unknown)";
     }
 
     /// <summary>
@@ -143,10 +252,8 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
             _mcpEnabled ? "true" : "false");
         // ADR-0026 + ADR-0092 D1 — Program.cs resolves the master KEK eagerly at
         // startup and fails fast if it finds none. Point Api:MasterKey:Path at a
-        // fixture key file so every host build starts. The COFFER_MASTER_KEK_BASE64
-        // clearing that used to sit here is gone with the variable itself (ADR-0094) —
-        // the key file is the only source, so there is nothing left to take precedence
-        // over it.
+        // fixture key file so every host build starts. The key file is the only
+        // source (ADR-0094), so there is nothing else to take precedence over it.
         Environment.SetEnvironmentVariable(
             "COFFER_API__MasterKey__Path", EnsureFixtureKeyFile());
     }
@@ -179,8 +286,8 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
 
     /// <summary>
     /// When dev-auth is enabled for this factory, opt every request in via the
-    /// <c>X-Dev-Auth</c> header the handler now requires (the per-request opt-in
-    /// fix — DevAuth no longer authenticates silently). Factories created with
+    /// <c>X-Dev-Auth</c> header the handler requires (DevAuth authenticates only a
+    /// request that opts in). Factories created with
     /// <see cref="WithoutDevAuth"/> skip this and drive the real cookie path.
     /// </summary>
     protected override void ConfigureClient(System.Net.Http.HttpClient client)
@@ -207,23 +314,23 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
                 // app); these don't need to ride env vars because nothing
                 // reads them eagerly during Program.cs's startup.
                 //
-                // Both connection strings point at the same testcontainer
-                // but with different role credentials. coffer_app for the
+                // Both connection strings point at the test's own database
+                // with different role credentials. coffer_app for the
                 // runtime AppDbContext (RLS applies; the interceptor SETs
                 // app.user_id per request from the authenticated cookie),
                 // coffer_service for the migrations + pre-auth + escalation
                 // paths.
-                ["Api:ConnectionString"]        = _postgres.AppConnectionString,
-                ["Api:ServiceConnectionString"] = _postgres.ServiceConnectionString,
-                // The fixture already applied every migration once (DbUp's
-                // journal makes an app-boot run a no-op), so skip migrations on
-                // boot. Crucially this ALSO disables the Program.cs bootstrap-
-                // restore block (gated on !Migrations:Skip, ADR-0061): test
-                // shards share this bin's data/restore-staging dir, so a
+                ["Api:ConnectionString"]        = _appConnectionString,
+                ["Api:ServiceConnectionString"] = _serviceConnectionString,
+                // The test's database is a clone of the migrated template
+                // (DbUp's journal would make an app-boot run a no-op), so skip
+                // migrations on boot. Crucially this ALSO disables the Program.cs
+                // bootstrap-restore block (gated on !Migrations:Skip, ADR-0061):
+                // test shards share this bin's data/restore-staging dir, so a
                 // restore-endpoint test's staged .cofferbak must never trip a
                 // clean-restore during another test's host startup — which
                 // raced to a FileNotFound host crash (and, post-#326, would run
-                // the schema wipe against the shared test DB).
+                // the schema wipe against that test's database).
                 ["Migrations:Skip"]             = "true",
                 ["Api:Fido2:RpId"]              = "localhost",
                 ["Api:Fido2:Origins:0"]         = "http://localhost",

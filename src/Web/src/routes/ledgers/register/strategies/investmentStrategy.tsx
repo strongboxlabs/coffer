@@ -1,11 +1,13 @@
-import type { InvestmentRow } from '@/lib/types';
+import type { InvestmentRow, LedgerInvestmentAction } from '@/lib/types';
+import investmentActionWords from '@/lib/investmentActionWords.json';
 import { Chip } from '@/components/ui/Chip';
 import { categoryChipVariant } from '@/lib/categoryChip';
 import { displayAccountPath } from '@/lib/accountPath';
 import { ProvenanceIcon } from '@/components/register/ProvenanceIcon';
-import { TagLine } from '@/components/tags/TagLine';
 import { formatShares, formatPrice, formatCurrency } from '@/lib/money';
 import { taxDateSubLabel } from '../bank/columns';
+import { renderAccountChip } from './bankStrategy';
+import { renderRowMemo, renderRowTags } from './rowNotes';
 
 /**
  * Investment-register cell renderers (slice A1.c / A1.d). Consumed
@@ -20,36 +22,47 @@ import { taxDateSubLabel } from '../bank/columns';
  *   8 Amount + fee subtitle
  *   9 Cash balance
  *
- * Multi-posting headers (Buy+Fee, DivReinvest, BuyXfr / SellXfr /
- * DivXfr, Misc with fee) get aggregated to ONE row upstream in the
+ * Multi-posting headers (Buy+Fee, Reinvest, BuyXfr / SellXfr /
+ * DividendXfr, Misc with fee) get aggregated to ONE row upstream in the
  * register's displayRows pipeline — these renderers render the
  * aggregated facts. Slot 6 splits the line-1 "category" leg from
- * the line-1 "transfer" leg so DivXfr-style rows can show both
+ * the line-1 "transfer" leg so DividendXfr-style rows can show both
  * sides side-by-side (income category | transfer destination); the
  * fee leg always lives on line 2.
  */
 
-const ACTION_LABEL: Record<string, string> = {
-    buy: 'Buy',
-    buyx: 'BuyXfr',
-    sell: 'Sell',
-    sellx: 'SellXfr',
-    dividend_cash: 'Div',
-    dividend_reinvest: 'DivReinvest',
-    divx: 'DivXfr',
-    transfer: 'Xfr',
-    misc: 'Misc',
-};
+/** The one word each investment action is shown as (ADR-0027's display words).
+ *  Every surface that names an action reads it from here: the register's chip and
+ *  hint chip, the home lists, a merge candidate, the editor's action picker
+ *  (`ACTION_PICKER_ENTRIES`) and a security page's transactions, so no two of them
+ *  can name an action differently.
+ *  The table is the JSON file the API embeds too, so the register's Action sort,
+ *  which the server runs because the register loads in pages, orders by these words.
+ *  Typed as keyed by every action, so a new one cannot be added without its word. */
+const ACTION_LABEL: Readonly<Record<LedgerInvestmentAction, string>> = investmentActionWords;
 
-function formatAction(action: string): string {
-    return ACTION_LABEL[action] ?? action;
+/** The word for an action, a derived one (`Xfr`) included. Exported so anything
+ *  that names a row's action names it the same way. */
+export function formatInvestmentAction(action: string): string {
+    const labels: Readonly<Record<string, string | undefined>> = ACTION_LABEL;
+    return labels[action] ?? action;
+}
+const formatAction = formatInvestmentAction;
+
+/** The security as the register's security cell names it: `TICKER · Name`, or the
+ *  name alone without a ticker. Null for an action with no security (Xfr, Misc). */
+export function securityLabel(txn: InvestmentRow): string | null {
+    if (!txn.securityTicker && !txn.securityName) return null;
+    return txn.securityTicker
+        ? `${txn.securityTicker} · ${txn.securityName ?? ''}`.trim()
+        : (txn.securityName ?? '');
 }
 
 export const investmentStrategy = {
     renderDateSubLabel(txn: InvestmentRow) {
         // Tax date, same as the bank register: line 2 of the date cell belongs to
         // the date. MD's investment-specific check_number markers (Auto / EXfr /
-        // Xfr / numeric) used to live here and now hang off the Action chip, where
+        // Xfr / numeric) hang off the Action chip instead, where
         // they read as what they are — a qualifier on the action, not on the date.
         const label = taxDateSubLabel(txn);
         return label ? `tax ${label}` : null;
@@ -61,7 +74,12 @@ export const investmentStrategy = {
         return txn.checkNumber ?? null;
     },
 
-    renderSlot4(txn: InvestmentRow) {
+    renderSlot4(txn: InvestmentRow, opts?: {
+        markUnset?: boolean;
+        /** Drawn away from the register (a home list), where no double-click
+         *  opens the editor: the hint's title names only what was detected. */
+        outsideRegister?: boolean;
+    }) {
         // Mig 108 / ADR-0036: read `derivedAction`, not
         // `investmentAction`. For originating-side groups the
         // aggregator already collapsed legs into one row with
@@ -88,20 +106,34 @@ export const investmentStrategy = {
                 <Chip
                     variant="warn"
                     className="font-sans"
-                    title={`Detected ${formatAction(txn.ingestActionHint)} from sync · double-click to review + confirm`}
+                    title={`Detected ${formatAction(txn.ingestActionHint)} from sync`
+                        + (opts?.outsideRegister ? '' : ' · double-click to review + confirm')}
                 >
                     {'↗ '}{formatAction(txn.ingestActionHint)}
+                </Chip>
+            );
+        }
+        // ADR-0028 (2026-10-21): on txn and split-parent rows an unset action
+        // is still a chip — the same neutral one, reading "—" — so the chip
+        // line never collapses and the check# always sits on line 2. Split
+        // legs carry no check# line and keep their blank cell.
+        if (opts?.markUnset) {
+            return (
+                <Chip variant="default" className="font-sans" title="No action">
+                    —
                 </Chip>
             );
         }
         return '';
     },
 
-    renderSlot5(txn: InvestmentRow) {
+    renderSlot5(txn: InvestmentRow, accountPaths?: ReadonlyMap<string, string>) {
         // Description = payee (bold) + memo (subtitle). Same shape
         // as bank rows; investment txns rarely populate both
         // distinctly but when they do (e.g. user-added context on
-        // an imported MD dividend) both lines show.
+        // an imported MD dividend) both lines show. The memo is the one
+        // this register shows — the event's on its own brokerage, with the
+        // inherited marker on a row that shows the other side's.
         // Mig 107: leading provenance icon (online / file / manual +
         // merge-winner overlay), matching the bank register.
         return (
@@ -116,25 +148,25 @@ export const investmentStrategy = {
                         {txn.payee ?? <span className="text-text-subtle">—</span>}
                     </span>
                 </span>
-                {txn.memo ? (
-                    <span className="block truncate text-[0.6875rem] text-text-muted">
-                        {txn.memo}
-                    </span>
-                ) : null}
+                {renderRowMemo(txn, accountPaths)}
             </>
         );
     },
 
     renderSlot6(
         txn: InvestmentRow,
-        accountPaths?: ReadonlyMap<string, string>,
+        accountPaths: ReadonlyMap<string, string> | undefined,
+        /** The ledger's system category ids: their chip is neutral. */
+        systemCategoryIds: ReadonlySet<string>,
     ) {
+        const isSystem = (id: string | null | undefined) =>
+            id !== null && id !== undefined && systemCategoryIds.has(id);
         // Slot 6 — up to three chips across two visual lines:
         //
         //   Line 1: category chip + transfer chip, side-by-side. Both
-        //           chips render only when populated; DivXfr-style rows
+        //           chips render only when populated; DividendXfr-style rows
         //           with income + transfer destination show BOTH, solo
-        //           Div / Xfr / Misc-exp show ONE, solo Buy / Sell show
+        //           Dividend / Xfr / Misc-exp show ONE, solo Buy / Sell show
         //           nothing (Holdings sibling is stripped upstream).
         //   Line 2: fee chip — fee posting's counterparty (typically
         //           "Investment Fees"). Only rendered when present.
@@ -166,6 +198,7 @@ export const investmentStrategy = {
                   txn.categoryAccountName!,
                   txn.categoryAccountType ?? null,
                   txn.categoryAccountId ?? null,
+                  isSystem(txn.categoryAccountId),
               )
             : 'default';
         const transferVariant = hasTransfer
@@ -173,10 +206,11 @@ export const investmentStrategy = {
                   txn.transferAccountName!,
                   txn.transferAccountType ?? null,
                   txn.transferAccountId ?? null,
+                  isSystem(txn.transferAccountId),
               )
             : 'default';
         const feeVariant = hasFee
-            ? categoryChipVariant(txn.feeCategoryName!, 'category', null)
+            ? categoryChipVariant(txn.feeCategoryName!, 'category', null, isSystem(txn.feeCategoryId))
             : 'default';
 
         return (
@@ -194,17 +228,17 @@ export const investmentStrategy = {
                                 </span>
                             </Chip>
                         ) : null}
-                        {hasTransfer ? (
-                            <Chip
-                                variant={transferVariant}
-                                className="min-w-0 max-w-full truncate"
-                                title={displayAccountPath(accountPaths, txn.transferAccountId, txn.transferAccountName) ?? undefined}
-                            >
-                                <span className="truncate">
-                                    {displayAccountPath(accountPaths, txn.transferAccountId, txn.transferAccountName)}
-                                </span>
-                            </Chip>
-                        ) : null}
+                        {/* An Xfr, BuyXfr, SellXfr or DividendXfr between currencies
+                            shows the transfer account's own amount after its chip, as
+                            the bank register does (ADR-0114 D14, ADR-0028 Slot 6). */}
+                        {hasTransfer ? renderAccountChip({
+                            variant: transferVariant,
+                            label: displayAccountPath(accountPaths, txn.transferAccountId, txn.transferAccountName),
+                            chipClassName: 'min-w-0 max-w-full truncate',
+                            otherAmount: txn.transferAmount,
+                            otherCurrency: txn.transferCurrencyCode,
+                            amount: txn.amount,
+                        }) : null}
                     </span>
                 ) : null}
                 {hasFee ? (
@@ -218,23 +252,25 @@ export const investmentStrategy = {
                 ) : null}
                 {/* Tags wrap beneath the account chips, in the same cell and the
                     same order as the bank register's category · tags column —
-                    one row of chips per header, since the aggregator collapses
-                    an investment event's legs into a single row. */}
-                <TagLine tags={txn.tags} inset />
+                    one set per event, since the aggregator collapses an
+                    investment event's legs into a single row. */}
+                {renderRowTags(txn, accountPaths)}
             </>
         );
     },
 
-    renderSlot7(txn: InvestmentRow) {
+    renderSlot7(
+        txn: InvestmentRow,
+        /** The register's account currency: the price the trade was made at
+         *  is the brokerage's, as its amount is. */
+        currency: string,
+    ) {
         // Security cell. Line 1: `TICKER · Name` (or just Name when
-        // ticker is null). Line 2: `N sh @ $X.XX` when the row
-        // carries qty + price. Empty cell for actions with no
-        // security (Xfr / Misc).
-        if (!txn.securityTicker && !txn.securityName) return null;
-
-        const label = txn.securityTicker
-            ? `${txn.securityTicker} · ${txn.securityName ?? ''}`.trim()
-            : (txn.securityName ?? '');
+        // ticker is null). Line 2: `N sh @ <price>` when the row
+        // carries qty + price, in the account's currency. Empty cell
+        // for actions with no security (Xfr / Misc).
+        const label = securityLabel(txn);
+        if (label === null) return null;
 
         const hasQtyPrice =
             txn.quantity !== null &&
@@ -249,14 +285,18 @@ export const investmentStrategy = {
                 </span>
                 {hasQtyPrice ? (
                     <span className="block truncate text-[0.6875rem] text-text-muted">
-                        {formatShares(Math.abs(txn.quantity!))} sh @ {formatPrice(txn.unitPrice!, 'USD')}
+                        {formatShares(Math.abs(txn.quantity!))} sh @ {formatPrice(txn.unitPrice!, currency)}
                     </span>
                 ) : null}
             </>
         );
     },
 
-    renderAmountSubtitle(txn: InvestmentRow) {
+    renderAmountSubtitle(
+        txn: InvestmentRow,
+        /** The register's account currency, the one the Amount above is in. */
+        currency: string,
+    ) {
         // Two possible subtitles share this one line, and only one can win.
         //
         // FEE. The investmentAggregator (slice A1.d) sums the fee-leg amounts
@@ -265,12 +305,12 @@ export const investmentStrategy = {
         //
         // SETTLED. `amount` is ADR-0028's net of this account's legs, which is
         // structurally ZERO for a cash-neutral event — a reinvestment, an
-        // in-kind transfer, a sale a fee consumes. A large share of a real
-        // brokerage register's entries are in that class, and every one of them
-        // rendered a zero amount with nothing to say how big the event was, while the editor behind the
-        // same row showed the trade value (ADR-0073 D1 calls that the Amount;
+        // in-kind transfer, a sale a fee consumes. Every reinvestment is in
+        // that class, and without this line every one of them
+        // renders a zero amount with nothing to say how big the event was, while the editor behind the
+        // same row shows the trade value (ADR-0073 D1 calls that the Amount;
         // ADR-0028 calls the net the Amount — the two ADRs disagree, and this
-        // line is where a reader met the consequence).
+        // line is where a reader meets the consequence).
         //
         // Shown only when the Amount cell is uninformative, i.e. exactly zero.
         // On a row whose net is real, the net IS the answer and a second
@@ -278,27 +318,24 @@ export const investmentStrategy = {
         const fee = txn.feeAmount ?? null;
         const settled = txn.settledAmount ?? null;
 
-        // The fee wins the line when both exist, because it is the one the
+        // The fee wins the line whenever there is one, because it is the one the
         // Amount does not already imply — and on a fee-consumed sale the two
         // are the SAME NUMBER by construction (proceeds exactly cancelled by
-        // the fee), so showing both would print it twice under a zero. A real
-        // ledger has that shape across sell, sellx AND buy; keying the suppression on
-        // the VALUES rather than on the action is what catches all three,
-        // instead of the sells someone happened to notice.
-        const settledDuplicatesFee =
-            fee !== null && settled !== null && Math.abs(settled - fee) < 0.005;
-
+        // the fee), so showing both would print it twice under a zero. The
+        // shape can occur on sell, sellx AND buy; because the settled line is
+        // reached only on a row with no fee, no comparison of the two figures
+        // is needed, at any currency's places (ADR-0114 D15).
         if (fee !== null) {
             return (
                 <span className="block text-right text-[0.6875rem] text-text-muted">
-                    fee {formatCurrency(fee, 'USD')}
+                    fee {formatCurrency(fee, currency)}
                 </span>
             );
         }
-        if (txn.amount === 0 && settled !== null && settled !== 0 && !settledDuplicatesFee) {
+        if (txn.amount === 0 && settled !== null && settled !== 0) {
             return (
                 <span className="block text-right text-[0.6875rem] text-text-muted">
-                    settled {formatCurrency(settled, 'USD')}
+                    settled {formatCurrency(settled, currency)}
                 </span>
             );
         }

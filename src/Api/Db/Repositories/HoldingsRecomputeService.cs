@@ -5,7 +5,8 @@ namespace Coffer.Api.Db.Repositories;
 /// <summary>
 /// Single entry point for re-deriving holdings + lots after any write
 /// that affects investment-shape <c>txn_legs</c> (i.e. legs with
-/// <c>security_id IS NOT NULL</c> and <c>quantity IS NOT NULL</c>).
+/// <c>security_id IS NOT NULL</c> and <c>quantity IS NOT NULL</c>), or a
+/// header field the FIFO walk reads on a header that has them.
 /// Every API writer invokes this at its terminal commit boundary via
 /// <see cref="HoldingsRecomputeInterceptor"/>; the txn_legs holdings
 /// trigger family was dropped in mig 104 per ADR-0032 (recompute at
@@ -35,6 +36,13 @@ public sealed class HoldingsRecomputeService
     /// in <paramref name="affected"/>. Dedupes; one SQL call per
     /// distinct pair.
     /// </summary>
+    /// <remarks>
+    /// Each call takes the position's ledger write lock (migration 275): nothing inside a
+    /// writer's transaction that took it first, and the call's own statement's when run
+    /// outside a transaction (the holdings and realized-gains repairs). A transaction that
+    /// wrote without it is refused. No other writer of the ledger runs beside a call, so
+    /// the pairs go in whatever order they come.
+    /// </remarks>
     /// <param name="affected">Pairs of (holdings-sibling account id,
     /// security id). Empty input is a no-op.</param>
     public async Task RecomputeAsync(

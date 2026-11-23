@@ -19,15 +19,15 @@
 -- so a restore fed this document tries to insert a row of NULLs and dies on the
 -- first NOT NULL column.
 --
--- IMPACT: none in production. The function is diagnostic-only — v3 restore streams
+-- IMPACT: no product path. The function is diagnostic-only — v3 restore streams
 -- chunks through fn_snapshot_restore_part and never reassembles the document, so
--- nothing in the product called this. It was found by a test written to cover the
--- *other* untested thing in mig 193 (see below), which used this helper to
--- manufacture a v2 snapshot and got a 500 instead of a restore.
+-- nothing in the product calls this. Its caller is the test that uses it to
+-- manufacture a v2 snapshot (see below), which gets a 500 instead of a restore
+-- until this is fixed.
 --
 -- Fix: aggregate only non-NULL elements, so an empty part reassembles as '[]'.
 --
--- The reason a test was reaching for this at all is worth recording: mig 193 made
+-- Why a test needs a v2 snapshot: mig 193 made
 -- capture produce v3, so every snapshot test exercises v3 and none exercises v2 —
 -- while 193 also refactored the v2 restore function (extracting its delete block
 -- into fn_ledger_snapshot_clear). An install upgrading to 193 keeps its existing

@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace Coffer.Api.Contracts;
 
 /// <summary>
@@ -66,12 +68,10 @@ public enum ReportGroupBy
     /// a cash-flow report is: money in against money out, per period.
     /// </summary>
     /// <remarks>
-    /// <para>It needed its own dimension because the kind was COMPUTED and then
-    /// thrown away. Every cell already carried it (the measure's allow-list is
-    /// built on it), but <c>ReportRow</c> did not, so a client had no way to ask
-    /// the question — and the first attempt shipped as "Cash flow" grouped by
-    /// CATEGORY, which is net-per-category under a familiar name, and was
-    /// withdrawn.</para>
+    /// <para>It is its own dimension because <c>ReportRow</c> carries no kind.
+    /// Every cell computes it (the measure's allow-list is built on it), and
+    /// grouping by it is the only way a client can ask the question. "Cash flow" grouped by CATEGORY instead is net-per-category
+    /// under a familiar name.</para>
     ///
     /// <para><see cref="ReportSpec.Rollup"/> does not apply: a kind has no
     /// parent, so there is nothing to roll up into.</para>
@@ -113,7 +113,7 @@ public sealed class ReportSpec
     /// <summary>Exclusive upper bound (UTC). Null = open-ended. Ignored when
     /// <see cref="DateMode"/> is <see cref="ReportDateMode.Sliding"/>.</summary>
     public DateTime? ToUtc { get; init; }
-    /// <summary>Restrict to transactions carrying this tag (ADR-0077). Null = any.</summary>
+    /// <summary>Restrict to postings this tag counts for (ADR-0077), as the paying account's register shows them. Null = any.</summary>
     public Guid? TagId { get; init; }
     public ReportMeasure Measure { get; init; } = ReportMeasure.Spending;
     public ReportTimeBucket TimeBucket { get; init; } = ReportTimeBucket.None;
@@ -145,11 +145,15 @@ public sealed class ReportSpec
     /// <see cref="ReportGroupBy.Category"/>), each parent category's amount
     /// includes all its descendants', and rows carry the full set of ancestor
     /// nodes. Ignored for the flat account/payee dimensions. The result
-    /// <see cref="ReportResult.Total"/> stays the true sum of underlying postings
-    /// — parent rows are subtotals, not to be re-summed.</summary>
+    /// <see cref="ReportResult.Total"/> stays the sum of the cells before rollup
+    /// (for every dimension but Tag, the true sum of underlying postings) —
+    /// parent rows are subtotals, not to be re-summed.</summary>
     public bool Rollup { get; init; }
     /// <summary>Keep only the top-N groups by absolute total over the range (the
-    /// time series is limited to those groups). Null = all.</summary>
+    /// time series is limited to those groups). Null = all. With a cut (a value of
+    /// 1 or more), every row carries <see cref="ReportRow.Drawn"/> and the result
+    /// carries <see cref="ReportResult.Rest"/>, so a chart can draw the kept groups
+    /// and one series for everything else without summing rows.</summary>
     public int? TopN { get; init; }
 
     /// <summary>
@@ -162,7 +166,22 @@ public sealed class ReportSpec
     /// left to tell a window the author wanted to slide from one they wanted
     /// fixed.
     /// </remarks>
-    public (DateTime? FromUtc, DateTime? ToUtc) ResolveWindow(DateTime nowUtc)
+    public (DateTime? FromUtc, DateTime? ToUtc) ResolveWindow(DateTime nowUtc) =>
+        ResolveWindow(nowUtc, nowUtc);
+
+    /// <summary>
+    /// The bounds this spec means when the window ends at <paramref name="endUtc"/>
+    /// and its current period is the one holding <paramref name="snapAtUtc"/>.
+    /// </summary>
+    /// <remarks>
+    /// Two instants because a caller's day ends at an exclusive boundary: the
+    /// window ends AT the boundary (the caller's tomorrow at midnight) and a
+    /// rolling window counts back from it, while an aligned window snaps from the
+    /// last instant BEFORE it. Snapping from the boundary itself would put an
+    /// aligned window a period late on a period's last day, and every day for
+    /// <see cref="ReportWindowUnit.Day"/>.
+    /// </remarks>
+    public (DateTime? FromUtc, DateTime? ToUtc) ResolveWindow(DateTime snapAtUtc, DateTime endUtc)
     {
         if (DateMode != ReportDateMode.Sliding) return (FromUtc, ToUtc);
 
@@ -170,11 +189,12 @@ public sealed class ReportSpec
             throw new ReportRequestException(
                 "A sliding date range needs a WindowCount of at least 1.");
 
-        var now = DateTime.SpecifyKind(nowUtc, DateTimeKind.Utc);
+        var snapAt = DateTime.SpecifyKind(snapAtUtc, DateTimeKind.Utc);
+        var end = DateTime.SpecifyKind(endUtc, DateTimeKind.Utc);
         var from = WindowAlignToPeriod
-            ? StartOfPeriod(Shift(StartOfPeriod(now), -(count - 1)))
-            : Shift(now, -count);
-        return (from, now);
+            ? StartOfPeriod(Shift(StartOfPeriod(snapAt), -(count - 1)))
+            : Shift(end, -count);
+        return (from, end);
     }
 
     private DateTime Shift(DateTime at, int units) => WindowUnit switch
@@ -200,11 +220,50 @@ public sealed class ReportSpec
 /// <see cref="GroupId"/> is the category/account id, or null for the payee
 /// dimension. <see cref="ParentId"/> is the category's parent (null for roots /
 /// the flat dimensions).</summary>
+/// <param name="Drawn">
+/// Set only when the spec has a top-N cut; null, and absent from the JSON, without
+/// one. True on the rows a chart draws. Drawn rows never overlap, so with
+/// <see cref="ReportResult.Rest"/> they come to each period's total. Without
+/// rollup every kept row is drawn. Under rollup a kept row holds its whole
+/// subtree, so it is drawn only when no kept row lies below it; otherwise its
+/// kept descendants and its <see cref="IsDirect"/> rows draw it.
+/// </param>
+/// <param name="IsDirect">
+/// True on a row holding a rolled-up kept parent's own postings, added by a
+/// top-N cut when a kept row lies below the parent: the parent's subtree row is
+/// then not drawn, and without these rows its own postings would be drawn
+/// nowhere. One per period the parent has postings in, with the parent's
+/// <see cref="GroupId"/>, name and <see cref="ParentId"/>, and always drawn.
+/// Absent from the JSON when false.
+/// </param>
+/// <param name="Amount">In <see cref="CurrencyCode"/>. A row grouped by account is a
+/// per-account figure, so it stays in that account's own currency, unconverted, and never
+/// needs a rate. Every other row combines accounts, so it is in the ledger's reporting
+/// currency: each posting converted at its own date's rate, summed, rounded once
+/// (ADR-0114 D7), and null when a posting needs a missing rate (ADR-0114 D9).</param>
+/// <param name="RateUnavailable">Every missing rate <see cref="Amount"/> needed; absent
+/// from the JSON when none is.</param>
+/// <param name="CurrencyCode">The currency <see cref="Amount"/> is in: the account's own
+/// for a row grouped by account, else the ledger's reporting currency. Set on every row a
+/// summary returns.</param>
+/// <param name="GroupPath">The group's full name, as a list (ADR-0104 amendment
+/// 2026-11-20): for a category, each name from its top-level category down to its own
+/// (<c>["Salary", "Base"]</c>); for every other dimension, the one name. Set on every
+/// row a summary returns. A list rather than a joined string, so a name that contains the
+/// separator cannot be split wrongly; the client chooses whether to show the leaf or the
+/// whole path. <see cref="GroupName"/> stays the leaf.</param>
 public sealed record ReportRow(
-    string? Period, Guid? GroupId, string GroupName, Guid? ParentId, decimal Amount);
+    string? Period, Guid? GroupId, string GroupName, Guid? ParentId, decimal? Amount,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? Drawn = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool IsDirect = false,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<RateUnavailable>? RateUnavailable = null,
+    string? CurrencyCode = null,
+    IReadOnlyList<string>? GroupPath = null);
 
-/// <summary>Aggregation result: the rows + the overall total of underlying
-/// postings across them.</summary>
+/// <summary>Aggregation result: the rows, the overall total, and the totals per
+/// period and per group. For every dimension but Tag the total is the sum of the
+/// underlying postings; a Tag result counts a posting once per tag it carries, so
+/// its total (and each period's) is the sum of the tag rows.</summary>
 /// <param name="FromUtc">
 /// The RESOLVED lower bound this result covers — the sliding window worked out
 /// against the instant it ran, not the spec's literal field. Null when the
@@ -220,12 +279,134 @@ public sealed record ReportRow(
 /// zero, and adjacent columns then looked like adjacent months. Only the
 /// server knows where a sliding window landed, so only the server can say how
 /// many columns the answer has.
+/// <para><see cref="PeriodTotals"/> and <see cref="GroupTotals"/> are taken
+/// before top-N, like <see cref="Total"/>, so a chart's column heights and a
+/// legend's figures never come from re-summing rows that overlap (rollup) or
+/// were cut (top-N). Period totals are also taken before rollup; group totals
+/// after it, so a parent's figure is its subtree's, as its rows are.</para>
+/// <para><see cref="Rest"/> is set only when the spec has a top-N cut, and is
+/// absent from the JSON otherwise.</para>
 /// </remarks>
+/// <param name="Total">Null when a posting needs a missing rate; <see cref="RateUnavailable"/>
+/// names every one.</param>
 public sealed record ReportResult(
     IReadOnlyList<ReportRow> Rows,
-    decimal Total,
+    decimal? Total,
     DateTime? FromUtc = null,
-    DateTime? ToUtc = null);
+    DateTime? ToUtc = null,
+    IReadOnlyList<ReportPeriodTotal>? PeriodTotals = null,
+    IReadOnlyList<ReportGroupTotal>? GroupTotals = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] ReportRest? Rest = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<RateUnavailable>? RateUnavailable = null);
+
+/// <summary>One period's total, labelled as <see cref="ReportRow.Period"/> is.
+/// Every period the window spans when it has both bounds, zero where nothing
+/// posted; empty for a result with no time bucket. Null, with
+/// <see cref="RateUnavailable"/>, when a posting in it needs a missing rate
+/// (ADR-0114 D9).</summary>
+public sealed record ReportPeriodTotal(
+    string Period, decimal? Amount,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<RateUnavailable>? RateUnavailable = null);
+
+/// <summary>
+/// What a top-N cut leaves undrawn: the postings no <see cref="ReportRow.Drawn"/>
+/// row holds, which a chart shows as one series.
+/// </summary>
+/// <remarks>
+/// For every period, the drawn rows plus <see cref="ByPeriod"/> equal
+/// <see cref="ReportResult.PeriodTotals"/>, with rollup and without. The rest is
+/// summed from the undrawn postings themselves rather than taken as the period
+/// total less the drawn rows, so that equality is a check that drawn rows and
+/// the rest partition the money, not arithmetic that holds whatever is drawn.
+/// For Tag it is on the same footing as the totals: sums of tag cells, so a
+/// posting with two tags counts under each.
+/// <para>Its figures combine groups, so they are in the reporting currency, converted
+/// (ADR-0114 D7), even where the rows are accounts kept in their own currencies; a
+/// figure that needs a missing rate is null, named in <see cref="RateUnavailable"/>
+/// (ADR-0114 D9). The partition above holds in the reporting currency: a row of an
+/// account in another currency counts at its converted value.</para>
+/// </remarks>
+/// <param name="Count">
+/// How many series the rest folds together, at the level the drawn rows are
+/// drawn at: without rollup, each group the cut dropped. Under rollup, each
+/// category whose whole subtree is in the rest, counted once at the highest such
+/// category, so a dropped parent and its children are one series; and each
+/// category that is not kept but has a kept row below it, whose own postings are
+/// in the rest. Zero when nothing is left out.
+/// </param>
+/// <param name="Total">The rest across the window; null when it needs a missing rate.</param>
+/// <param name="ByPeriod">
+/// The rest per period, one entry for each of <see cref="ReportResult.PeriodTotals"/>
+/// in the same order, zero where everything was drawn. Empty with no time bucket.
+/// </param>
+/// <param name="Only">
+/// The one series the rest holds, set only when <see cref="Count"/> is 1 and absent
+/// from the JSON otherwise, so a chart can name it. Under rollup the browser cannot
+/// work out which group that is.
+/// </param>
+public sealed record ReportRest(
+    int Count,
+    decimal? Total,
+    IReadOnlyList<ReportPeriodTotal>? ByPeriod,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] ReportRestGroup? Only = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<RateUnavailable>? RateUnavailable = null);
+
+/// <summary>The group that names a rest holding one series.</summary>
+/// <param name="GroupId">The group's id, as <see cref="ReportRow.GroupId"/> carries it; null where that is.</param>
+/// <param name="GroupName">The group's name.</param>
+/// <param name="IsDirect">
+/// True when the series is the own postings of a category that is not kept but has
+/// a kept row below it. False when it is a whole group, or under rollup a dropped
+/// subtree, named at its highest category.
+/// </param>
+/// <param name="GroupPath">The group's full name, as <see cref="ReportRow.GroupPath"/> carries it.</param>
+public sealed record ReportRestGroup(
+    Guid? GroupId, string GroupName, bool IsDirect, IReadOnlyList<string>? GroupPath = null);
+
+/// <summary>One group's total across the window, whether or not top-N kept its
+/// rows. <see cref="GroupId"/> is null where <see cref="ReportRow.GroupId"/> is. In
+/// <see cref="CurrencyCode"/>, as the group's rows are: the account's own currency for a
+/// group by account, else the reporting currency (ADR-0114 D7). Set on every group total
+/// a summary returns, as is <see cref="GroupPath"/>, the group's full name as
+/// <see cref="ReportRow.GroupPath"/> carries it.</summary>
+public sealed record ReportGroupTotal(
+    Guid? GroupId, string GroupName, decimal? Amount,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<RateUnavailable>? RateUnavailable = null,
+    string? CurrencyCode = null,
+    IReadOnlyList<string>? GroupPath = null);
+
+/// <summary>
+/// A summary report as the app receives it: the result, and the ledger's reporting
+/// currency, which every figure that combines accounts is in (ADR-0114 D7).
+/// </summary>
+/// <remarks>
+/// The endpoint and the MCP tool both build this through
+/// <see cref="Coffer.Api.Db.Repositories.ReportingRepository.SummaryAsync"/>. The total,
+/// period totals and rest are converted, and so are the rows and group totals of every
+/// dimension but Account: a row or group total by account is a per-account figure, so it
+/// stays in the account's own currency, named on it. A converted figure that needs a
+/// missing rate is null and names it (ADR-0114 D9), on the row or total that carries it.
+/// </remarks>
+public sealed record ReportSummaryDto(
+    IReadOnlyList<ReportRow> Rows,
+    decimal? Total,
+    DateTime? FromUtc,
+    DateTime? ToUtc,
+    IReadOnlyList<ReportPeriodTotal> PeriodTotals,
+    IReadOnlyList<ReportGroupTotal> GroupTotals,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] ReportRest? Rest,
+    string CurrencyCode,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<RateUnavailable>? RateUnavailable = null)
+{
+    public static ReportSummaryDto From(ReportResult result, string currencyCode)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        return new ReportSummaryDto(
+            result.Rows, result.Total, result.FromUtc, result.ToUtc,
+            result.PeriodTotals ?? [], result.GroupTotals ?? [], result.Rest, currencyCode,
+            result.RateUnavailable);
+    }
+}
 
 /// <summary>
 /// A report request the reporting code refuses as asked: a daily bucket where only
@@ -233,9 +414,9 @@ public sealed record ReportResult(
 /// Its message is written for the caller and is safe to return (FU-095).
 /// </summary>
 /// <remarks>
-/// Its own type, so the endpoints catch exactly these. They caught ArgumentException and
-/// InvalidOperationException, which the framework and EF also throw, with messages that
-/// name internals; any of those reached the browser as a 400. Derives from
+/// Its own type, so the endpoints catch exactly these. Catching ArgumentException and
+/// InvalidOperationException, which the framework and EF also throw with messages that
+/// name internals, would send any of those to the browser as a 400. Derives from
 /// ArgumentException so a caller that already treats these as bad arguments still does.
 /// </remarks>
 public sealed class ReportRequestException(string message) : ArgumentException(message);

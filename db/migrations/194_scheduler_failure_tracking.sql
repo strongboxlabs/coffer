@@ -9,12 +9,12 @@
 -- on the next tick.
 --
 -- The failure modes that most deserve *not* to be retried are exactly the ones
--- that prevent recording "I ran". Observed on a real deployment: the daily snapshot
--- OOM-killed its Postgres backend (see mig 193), the postmaster entered crash
--- recovery, SaveChangesAsync failed against the recovering database, and a daily
--- job re-ran every 15 minutes for ~2 days — taking the nightly whole-DB backup
--- down with it as collateral. Nothing counted the failures, nothing backed off,
--- nothing gave up, and nothing was visible outside the container log.
+-- that prevent recording "I ran". For example, a daily snapshot that
+-- OOM-kills its Postgres backend (see mig 193) sends the postmaster into crash
+-- recovery, SaveChangesAsync fails against the recovering database, and the daily
+-- job re-runs on every scheduler tick — taking the nightly whole-DB backup
+-- down with it. Without failure tracking nothing counts the failures, backs
+-- off or gives up, and nothing is visible outside the container log.
 --
 -- The C# side of the fix commits the advance BEFORE dispatching, per job, so the
 -- bookkeeping cannot be destroyed by the work. These columns add the second half:

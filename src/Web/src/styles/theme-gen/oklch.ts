@@ -65,11 +65,10 @@ export function oklchToHex(L: number, C: number, H: number): string {
 /**
  * True when the colour survives a round trip — i.e. sRGB can express it.
  * Chroma a hue cannot reach at a given lightness is silently CLIPPED, which is
- * how a direction quietly becomes a different colour. The first cut of this
- * generator fixed accent chroma at the constant that `build()` in palette.ts
- * now passes to `solve()` only as a CAP; teal cannot hold that at a dark
- * lightness, every dark candidate clipped, and the light themes' accent landed
- * at 2.66:1 — under AA across the board.
+ * how a direction quietly becomes a different colour. Fixing accent chroma at
+ * the constant that `build()` in palette.ts passes to `solve()` only as a CAP
+ * fails: teal cannot hold that at a dark lightness, every dark candidate clips,
+ * and the light themes' accent lands at 2.66:1 — under AA across the board.
  */
 export function inGamut(L: number, C: number, H: number): boolean {
     const round = hexToOklch(oklchToHex(L, C, H));

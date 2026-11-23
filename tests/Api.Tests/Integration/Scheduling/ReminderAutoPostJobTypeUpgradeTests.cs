@@ -32,11 +32,12 @@ namespace Coffer.Api.Tests.Integration.Scheduling;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ReminderAutoPostJobTypeUpgradeTests
+public sealed class ReminderAutoPostJobTypeUpgradeTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ReminderAutoPostJobTypeUpgradeTests(PostgresFixture fixture) => _fixture = fixture;
+    public ReminderAutoPostJobTypeUpgradeTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private const string Mig219 = "219_reminder_auto_post_job.sql";
 
@@ -54,7 +55,7 @@ public sealed class ReminderAutoPostJobTypeUpgradeTests
     private (string ConnectionString, string WorkDir) FreshInstallBefore219(string dbName)
     {
         var work = Directory.CreateTempSubdirectory("coffer-mig219-").FullName;
-        var cs = _fixture.EmptyDatabaseConnectionString(dbName);
+        var cs = Db.EmptyDatabaseConnectionString(dbName);
         UpgradeRehearsal.RunStaged(cs, UpgradeRehearsal.StageBefore(Mig219, work));
         return (cs, work);
     }

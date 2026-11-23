@@ -9,9 +9,14 @@ namespace Coffer.Domain.Investment;
 /// <remarks>
 /// Each posting is two legs (cash side + counterparty side) sharing
 /// a <see cref="PostingIndex"/> within a header. <see cref="Amount"/>
-/// is the cash impact on <see cref="AccountId"/>; the two legs of one
-/// posting sum to zero (or both are zero on the legitimate
-/// one-sided shapes MD emits — see ADR-0019).
+/// is the cash impact on <see cref="AccountId"/>, in that account's
+/// currency. The two legs of one posting in one currency sum to zero (or
+/// both are zero on the legitimate one-sided shapes MD emits — see
+/// ADR-0019). A transfer pair between real accounts in different
+/// currencies carries each account's own figure, nonzero and opposite in
+/// sign, and does not sum to zero (ADR-0114 D13); an in-kind move between
+/// brokerages in different currencies carries each lot's basis converted
+/// on the destination side.
 /// <para>
 /// <see cref="SecurityId"/> + <see cref="Quantity"/> + <see cref="UnitPrice"/>
 /// are populated on the holdings-side leg of a <c>sec</c> posting,

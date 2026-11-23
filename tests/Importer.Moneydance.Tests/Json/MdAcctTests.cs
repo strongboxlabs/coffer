@@ -104,10 +104,9 @@ public sealed class MdAcctTests
     [Fact]
     public void Falls_back_to_creation_date_when_date_created_is_absent()
     {
-        // MD is inconsistent about which it writes. On a real export,
-        // creation_date covers a minority of accounts (including every investment one)
-        // while date_created covers far fewer still — so reading the integer alone would
-        // have left most accounts NULL.
+        // MD is inconsistent about which it writes: an account can carry
+        // creation_date without date_created — so reading the integer alone would
+        // have left every such account NULL.
         var item = ReadOnlyAcct("""
             {
               "obj_type": "acct", "id": "inv-2", "name": "Brokerage",
@@ -125,9 +124,7 @@ public sealed class MdAcctTests
         // MD stamps creation_date at LOCAL NOON — 1767286800000 is 17:00Z, i.e.
         // 12:00 at the UTC-5 offset this fixture uses. That convention is what makes taking the UTC date
         // safe: the instant sits far enough from either midnight that no
-        // plausible offset moves it onto an adjacent day. Verified on a real
-        // export: every account carrying both fields agrees, at every offset
-        // from UTC-12 to UTC+2.
+        // plausible offset moves it onto an adjacent day.
         var noonLocal = ReadOnlyAcct("""
             {"obj_type":"acct","id":"a","name":"x","type":"v","currid":"USD",
              "creation_date":"1767286800000"}
@@ -171,8 +168,8 @@ public sealed class MdAcctTests
     public void Loan_first_payment_date_uses_the_same_two_source_read()
     {
         // MdLoanFields derives FirstPaymentDate from the account's creation
-        // stamp and read only `date_created`. On a real export only a minority of
-        // loans carry that field, so the rest amortized with no first-payment date.
+        // stamp and read only `date_created`, so a loan carrying only
+        // creation_date amortized with no first-payment date.
         var item = ReadOnlyAcct("""
             {
               "obj_type": "acct", "id": "loan-1", "name": "Mortgage",

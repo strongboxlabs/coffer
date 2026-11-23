@@ -23,18 +23,15 @@ the running cash balance. The *holdings* recompute
 (`recompute_holdings_cost_basis`, mig 067 / 068; touched by
 ADR-0039 / mig 116) was left out.
 
-Real-data evidence, found on a real ledger: an MD JSON export
-contained a manually-entered "Sample transaction" DivReinvest for
-a whole number of shares of one fund (no OFX provenance). It was
-later soft-deleted via the SPA. `is_hidden = true` landed correctly
-on the header. But `holdings.quantity` for that fund still
-reflected those shares, accounting for the entire mismatch between
-Coffer's holdings (exactly that share count) and the broker's
-(zero).
+The failure: when a Reinvest is soft-deleted via the SPA,
+`is_hidden = true` lands correctly on the header, but
+`holdings.quantity` for that security still includes the deleted
+shares, so the holding disagrees with the broker's by exactly that
+share count.
 
 The Portfolio View, the cost-basis hero numbers, every consumer
-of `holdings.quantity` was telling the user they held a position
-that — per the system's own soft-delete contract — they had
+of `holdings.quantity` then tells the user they hold a position
+that — per the system's own soft-delete contract — they have
 already deleted.
 
 ## Decision
@@ -69,9 +66,9 @@ at the security level, not user-editable transactions.
   silently keeping the quantity around.
 * **Parity with balances** (mig 103). The two derived-state
   systems now use the same source-of-truth predicate.
-* **That case resolves**. After applying mig 117 and re-walking,
-  the fund's quantity should drop to 0, matching Moneydance and
-  the broker.
+* **A soft-deleted reinvest drops out**. Its shares leave the
+  holding's quantity on the next recompute; mig 117 re-walks every
+  existing holding once.
 * **No client-side changes**. The Portfolio View doesn't need a
   filter — the recompute already excludes hidden, and the holdings
   row itself surfaces the correct value.
@@ -137,3 +134,15 @@ already calls the recompute service (or wakes the interceptor) so
 the holdings panel updates without waiting for a server restart.
 If it doesn't, that's a tracking follow-up — but the structural
 fix here makes the next recompute correct regardless.
+
+## Amendment, 2026-11-03 — the hide itself recomputes
+
+The alternative above rejected an interceptor on `is_hidden` as redundant, on the
+premise that the soft-delete path calls the recompute explicitly. It did not, and
+neither did the single unhide: only the bulk paths did, so a single delete of an
+imported investment row kept its shares in the holdings. `HoldingsRecomputeInterceptor`
+now counts a header whose `is_hidden`, `is_merged_into`, `posted_at` or `action`
+changed as a change to every investment line it has, which closes the follow-up above
+for every tracked writer ([ADR-0032](0032-triggers-as-last-resort.md), 2026-11-03
+amendment). The hidden buy's lot is closed at 0 by the same recompute (migration 227),
+rather than left as it was.

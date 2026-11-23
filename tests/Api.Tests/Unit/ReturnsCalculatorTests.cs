@@ -105,7 +105,7 @@ public sealed class ReturnsCalculatorTests
     {
         // Exactly what ReturnsAsync builds for an account with no qualifying flows:
         // start value in, identical end value out, both stamped "now". This is the
-        // shape that produced the bracket midpoint on a real ledger.
+        // shape that produced the bracket midpoint.
         var result = ReturnsCalculator.Xirr(new[]
         {
             new ReturnsCalculator.CashFlow(Y0, -1_234_567.89m),
@@ -251,12 +251,11 @@ public sealed class ReturnsCalculatorTests
 
     // ---- Partial coverage: the account is empty for part of the window --------
     //
-    // These are the cases the old "return null on any non-positive base" threw
-    // away. Found on a real ledger, where they were most of its accounts — every
-    // rollover destination (empty until funded) and every rollover source (empty
-    // afterwards), which is to say both halves of the largest movements a ledger
-    // has. Each has a perfectly well-defined time-weighted return over the stretch
-    // it actually held money.
+    // These are the cases "return null on any non-positive base" would throw
+    // away. They include any account funded mid-window (empty until funded) and any
+    // account emptied mid-window (empty afterwards), such as both ends of a transfer
+    // between brokerages. Each has a perfectly well-defined time-weighted return over
+    // the stretch it actually held money.
 
     [Fact]
     public void Twr_starts_the_chain_at_first_funding_when_the_account_begins_empty()

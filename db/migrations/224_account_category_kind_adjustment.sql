@@ -12,12 +12,12 @@
 -- not say so, so such entries were booked into an ordinary expense category, where
 -- they read as NEGATIVE SPENDING.
 --
--- That is not hypothetical; it was found on a real ledger. A single markup on a
--- property, credited to an expense category and larger than that month's real
--- spending, made the month's total spend compute NEGATIVE against a true positive
--- total — the sign of the largest number on the screen, inverted, with nothing red
--- anywhere. Across the ledger's full history the same shape put many separate months
--- into negative spending and entire calendar years into negative INCOME.
+-- The failure is silent. A single markup on a property, credited to an expense
+-- category and larger than that month's real spending, makes the month's total
+-- spend compute NEGATIVE against a true positive total — the sign of the largest
+-- number on the screen, inverted, with nothing red anywhere. Repeated across a
+-- ledger's history, the same shape can put whole months into negative spending and
+-- whole calendar years into negative INCOME.
 --
 -- WHY THIS IS ENOUGH ON THE REPORTING SIDE. ReportingRepository.SummarizeAsync
 -- selects category postings through an explicit allow-list per measure —

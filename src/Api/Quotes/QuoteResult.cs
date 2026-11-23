@@ -33,7 +33,17 @@ public sealed record QuoteEntry(
     string CurrencyCode,
     /// <summary>Origin tag for the source-priority upsert (ADR-0070) —
     /// <c>PriceSource.Fetch</c> (Yahoo) or <c>PriceSource.Simplefin</c>.</summary>
-    string Source);
+    string Source,
+    /// <summary>How many of the source's quoted units make one unit of
+    /// <see cref="CurrencyCode"/>: 100 for a Yahoo quote in pence (<c>GBp</c>), 1 otherwise
+    /// (<see cref="Yahoo.YahooCurrency.MinorUnits"/>). <see cref="Price"/> is already in the
+    /// major unit; this says the fetch rows stored before the currency fix hold the minor
+    /// unit's figures, which the re-stamp converts (ADR-0114 D5, amendment).</summary>
+    int QuotedMinorUnitFactor = 1,
+    /// <summary>The key of the provider that returned this quote. Providers leave it
+    /// null; the orchestrator stamps it, so an error raised on the quote at the write
+    /// path names its source (<see cref="QuoteError.ProviderKey"/>).</summary>
+    string? ProviderKey = null);
 
 /// <summary>
 /// Provider-side partial failure on one security. <see cref="Code"/>
@@ -46,4 +56,13 @@ public sealed record QuoteError(
     Guid? SecurityId,
     string Ticker,
     string Code,
-    string Message);
+    string Message,
+    /// <summary>The source that raised the error: a provider's key, or
+    /// <see cref="QuoteOrchestrator.MarketSeriesProviderKey"/>. Providers leave it null;
+    /// the orchestrator stamps it on everything a provider returns, and the Activity log
+    /// groups a run's errors by it (migration 303).</summary>
+    string? ProviderKey = null,
+    /// <summary>The feed's id for the account the error is about, when it is about one
+    /// (the SimpleFIN holdings read). Stored as <c>simplefin_account_id</c>; the Activity
+    /// log names the account from it when the run is opened.</summary>
+    string? FeedAccountId = null);

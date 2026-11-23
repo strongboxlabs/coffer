@@ -209,7 +209,7 @@ These need their own design work before the implementation slice:
   cutover are all open.
 * **UI walkthrough per register page.** Columns, filters, empty
   states, header treatments per domain — needs a page-by-page
-  spec (per `feedback_deliberate_design`) before code.
+  spec before code.
 * **Slice ID + timing.** Lands after A4.c.3 (investment editor)
   ships — A4.c.3 introduces the investment manual-create surface
   that the discriminated-union work will then consume. Likely

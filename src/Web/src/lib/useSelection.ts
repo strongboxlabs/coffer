@@ -44,7 +44,9 @@ export interface UseSelectionArgs {
     /** Active structured/search filter (mig 164). Threaded into 'all'-mode
      *  selections so a select-all covers exactly the filtered set (not the whole
      *  account). Resets the selection when it changes (a new filter is a fresh
-     *  intent). Non-status dimensions only — status is `statusFilter`. */
+     *  intent). A new object is a change, so the register's controls hand one
+     *  up only when a dimension differs (`sameRegisterFilter`). Non-status
+     *  dimensions only — status is `statusFilter`. */
     filter?: RegisterFilterArgs;
     /** Debounce window for the server summary call. Default 200ms —
      *  fast enough that the footer feels live, slow enough to coalesce
@@ -58,12 +60,19 @@ export interface UseSelectionResult {
     /** Server-computed summary (count + Σ). Null until the first
      *  query resolves or when the selection is empty. */
     summary: SelectionSummary | null;
+    /** True when `summary` was resolved for the selection as it is now. A
+     *  changed selection keeps the previous summary until its own arrives (so
+     *  the counts don't blink), and a reader that must not show the previous
+     *  selection's figures checks this. */
+    isSummaryCurrent: boolean;
     /** True while a summary query is in flight. The footer can use
      *  this to dim the count subtly. */
     isSummarising: boolean;
     /** Server-side error from the most recent summary query, if
-     *  any. Currently surfaces as a fallback to the last good
-     *  summary; consumers may render a quieter inline message. */
+     *  any; null once a summary succeeds or the selection clears.
+     *  `summary` keeps the last good one, so a reader showing the Σ
+     *  checks this first (the bulk-action bar names the failure in
+     *  place of the Σ, via `selectionErrorMessage`). */
     summaryError: unknown;
     /** True when the user has actively engaged selection (non-empty
      *  explicit set OR 'all' mode active). Drives the bulk-action
@@ -141,6 +150,8 @@ export function useSelection(args: UseSelectionArgs): UseSelectionResult {
     // clicked row in the displayed order. Reset alongside the selection.
     const anchorRef = useRef<string | null>(null);
     const [summary, setSummary] = useState<SelectionSummary | null>(null);
+    // The selection `summary` was resolved for (see `isSummaryCurrent`).
+    const [summaryFor, setSummaryFor] = useState<SelectionRequest | null>(null);
     const [isSummarising, setIsSummarising] = useState(false);
     const [summaryError, setSummaryError] = useState<unknown>(null);
 
@@ -155,11 +166,19 @@ export function useSelection(args: UseSelectionArgs): UseSelectionResult {
     // Esc clears the selection — the keyboard companion to the footer's "✕".
     // Ignored while focus is in a field (search / inline editor / category
     // picker), where Esc means "close / cancel" and must not also nuke the
-    // selection. Only acts when something is selected, so it doesn't swallow
-    // Esc from anything else on the page.
+    // selection. Ignored too when something nearer already used it and marked
+    // it with preventDefault: the inline editor cancels on an Esc from any of
+    // its controls, its Save and Cancel buttons and row-menu openers included.
+    // Those are not fields, so without this check one Esc would cancel the edit
+    // AND clear the selection. A list or popover that closes on an Esc (from
+    // its own buttons, say) marks it and stops it as well, so it seldom gets
+    // here at all; the check holds whichever arrives.
+    // Only acts when something is selected, so it doesn't swallow Esc from
+    // anything else on the page.
     useEffect(() => {
         const onKey = (e: KeyboardEvent) => {
             if (e.key !== 'Escape') return;
+            if (e.defaultPrevented) return;
             const el = e.target as HTMLElement | null;
             const tag = el?.tagName;
             if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
@@ -181,10 +200,15 @@ export function useSelection(args: UseSelectionArgs): UseSelectionResult {
     // Build the API-shape selection from local state.
     const selection: SelectionRequest = useMemo(() => {
         if (state.kind === 'explicit') {
-            // Carry accountId so the server computes the Σ on this account
-            // (GetSelectionSummaryAsync only sums when AccountId is set). The
-            // bulk-apply query ignores it for explicit selections.
-            return { kind: 'explicit', accountId, headerIds: Array.from(state.ids) };
+            // Carry the register's scope: the server computes the Σ on this
+            // account, and refuses a bulk change that names a row the register
+            // shows read-only. The bulk-apply query acts on exactly the ids.
+            return {
+                kind: 'explicit',
+                accountId,
+                headerIds: Array.from(state.ids),
+                includeSubcategories: filter?.includeSubcategories,
+            };
         }
         return {
             kind: 'all',
@@ -225,6 +249,7 @@ export function useSelection(args: UseSelectionArgs): UseSelectionResult {
                 .then((s) => {
                     if (generation !== generationRef.current) return;
                     setSummary(s);
+                    setSummaryFor(selection);
                     setSummaryError(null);
                 })
                 .catch((err: unknown) => {
@@ -360,6 +385,7 @@ export function useSelection(args: UseSelectionArgs): UseSelectionResult {
     return {
         selection,
         summary,
+        isSummaryCurrent: summary !== null && summaryFor === selection,
         isSummarising,
         summaryError,
         hasSelection,

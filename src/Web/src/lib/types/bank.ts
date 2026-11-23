@@ -7,25 +7,67 @@
  * posting in a bank manual create or edit body (ADR-0025). A bank
  * transaction is a list of these. `legId` is meaningful only in
  * PATCH — it asks the server to preserve the existing leg (its
- * counterparty / amount / memo updated to the request values). On
- * POST it's ignored.
+ * counterparty / amount updated to the request values); line memos
+ * travel in `notes.lines`. On POST it's ignored.
  *
  * `amount` is the signed source-side amount (negative = outflow).
  * Server writes the paired counterparty leg's amount as `-amount`
- * so the posting sums to zero (ADR-0019).
+ * so the posting sums to zero (ADR-0019), except on a posting between
+ * two real accounts in different currencies, whose counterparty leg is
+ * `counterpartyAmount` (ADR-0114 D13).
  */
 export interface TransactionPosting {
     /** Existing source-side leg id to preserve on PATCH; null /
      *  omitted for new postings. */
     legId?: string | null;
     counterpartyAccountId: string;
-    /** Signed source-side amount; must be non-zero. */
+    /** Signed source-side amount, in the source account's currency (a category's
+     *  line in the real side's), at its places (ADR-0114 D15): a figure with more is
+     *  refused with `amount-places-exceed-currency`. */
     amount: number;
-    /** Optional per-posting memo (MD's `split.desc`). */
-    legMemo?: string | null;
-    /** Tags on THIS posting (ADR-0103). Omitted leaves them ALONE, `[]` clears
-     *  them — the postings list is replaced wholesale, so a client that echoes
-     *  back what it read must not strip them by omission. */
+    /**
+     * The counterparty leg's own amount, signed, in the counterparty account's
+     * currency, on a posting between two real accounts in different currencies
+     * (ADR-0114 D13). Required there, nonzero and opposite in sign to `amount`
+     * (`transaction-posting-counterparty-amount-required`,
+     * `transaction-posting-two-amounts-nonzero`, `transaction-posting-two-amounts-sign`),
+     * and checked at the counterparty's places. Like the places rule, the nonzero and sign
+     * rules check only a pair the write changes: a pair resent equal to its two stored
+     * legs, on the same accounts, passes them, so a mirrored zero pair a move or a
+     * currency edit left across currencies can still be edited. Omit it on a posting with
+     * a category or between accounts in one currency: the server drops it there.
+     */
+    counterpartyAmount?: number | null;
+}
+
+/**
+ * Mirror of API `TransactionNotesRequest`: the `notes` member of the bank
+ * create and PATCH bodies and of the bank reminder create, edit and fire
+ * bodies. It replaces every top-level and per-posting memo and tag field, so a
+ * posting carries shape only.
+ *
+ * PRESENCE decides. An omitted key leaves the value alone; `null`, `''` or `[]`
+ * clears it, which on a one-split means "inherit the other side's".
+ *
+ * `memo` and `tags` are this side's when the transaction ends with one posting
+ * and the whole transaction's when it ends with several.
+ */
+export interface TransactionNotesRequest {
+    /** The register the write is made from. Equals `postings.sourceAccountId`
+     *  when postings are sent; on a split it becomes the owning account. */
+    side: string;
+    memo?: string | null;
+    tags?: readonly string[];
+    /** Per-line notes of a multi-posting result. Refused on a one-posting
+     *  result (`line-notes-on-one-posting`). */
+    lines?: readonly TransactionLineNotesRequest[];
+}
+
+/** Mirror of API `TransactionLineNotesRequest`; same presence rules. */
+export interface TransactionLineNotesRequest {
+    /** The line's position in the postings sent. */
+    index: number;
+    memo?: string | null;
     tags?: readonly string[];
 }
 
@@ -40,7 +82,6 @@ export interface CreateTransactionRequest {
     /** ISO-8601 UTC timestamp string. */
     postedAt: string;
     payee?: string | null;
-    memo?: string | null;
     /** Short free-text check number (MD's `txn.chk`). */
     checkNumber?: string | null;
     /** ISO-8601 UTC timestamp string. */
@@ -50,10 +91,9 @@ export interface CreateTransactionRequest {
     sourceAccountId: string;
     /** ≥1 posting. */
     postings: readonly TransactionPosting[];
-    /** Slice 2c.6b: tags to attach to the new transaction. Same
-     *  case-insensitive create-on-first-use semantics as the PATCH
-     *  surface; omitted or empty list ⇒ no tags. */
-    tags?: readonly string[];
+    /** Memo and tags, side-aware (see {@link TransactionNotesRequest}).
+     *  Tag names are created on first use, case-insensitively. */
+    notes: TransactionNotesRequest;
 }
 
 /**
@@ -84,11 +124,10 @@ export interface PatchTransactionPostings {
 export interface PatchTransactionRequest {
     /* Header fields: PRESENCE decides, not nullness (migration 230).
      * OMIT a key to leave that column alone; send it as `null` to CLEAR
-     * the column. They used to mean "null = leave alone", which made a
-     * cleared payee, memo or check number impossible to express — the
-     * server read the null as "no change" and handed the old text back. */
+     * the column. "null = leave alone" would make a cleared payee, memo
+     * or check number impossible to express — the server would read the
+     * null as "no change" and hand the old text back. */
     payee?: string | null;
-    memo?: string | null;
     checkNumber?: string | null;
     /** ISO-8601 UTC timestamp string — the bank-side posted date. The
      *  column is NOT NULL, so an explicit `null` is a 422, not a clear. */
@@ -104,22 +143,16 @@ export interface PatchTransactionRequest {
      *  POST /approve endpoint. May be sent on its own (no other
      *  fields set) to accept a bank-feed row as-is. Idempotent. */
     approve?: boolean;
-    /** Slice 2c.6b: replace the tag set on this header.
-     *  - `undefined` / omitted → leave tags untouched.
-     *  - `[]` → clear all tags.
-     *  - `[...]` → set membership exactly matches this list; tag
-     *    names that aren't yet in the ledger's dictionary are
-     *    created on first use. Case-insensitive within the ledger;
-     *    the first user-supplied casing is preserved on insert.
-     *  Server enforces ≤20 tags / ≤64 chars / no empty names. */
-    tags?: readonly string[];
-    /** Slice 2c.6d: stamps the supplied manual row as merged
-     *  into this header (loser → winner). The PATCH body's
-     *  other fields define what the winning row ends up with —
-     *  the editor pre-fills them from the candidate when the
-     *  user clicks a "Possible match" chip. Server rejects
-     *  invalid sources (cross-ledger / non-manual / already
-     *  merged / self) with 422 `merge-source-invalid`. */
+    /** Memo and tags, side-aware (see {@link TransactionNotesRequest}). The
+     *  server refuses a tag set that grows past 20 tags; one that stays the
+     *  same size or shrinks is saved even when it is over the limit. */
+    notes?: TransactionNotesRequest;
+    /** The merge candidate the editor armed. Never sent on the PATCH (the
+     *  server ignores it there): `saveBankEdit` routes a body carrying it to
+     *  `mergeTransaction` (POST …/merge), which folds THIS header into the
+     *  candidate; the candidate survives with its own fields. The server
+     *  refuses an invalid candidate (another ledger, not settled, already
+     *  folded away, the row itself) with 422 `merge-source-invalid`. */
     mergeFromHeaderId?: string | null;
 }
 
@@ -155,36 +188,34 @@ export interface SimilarPayeeDto {
 
 /**
  * Mirror of API `MergeCandidateDto` (slice 2c.6d). Bank-feed editor
- * concern: one row of the editor's "Possible matches" panel for a
- * needs_review bank-feed target. Clicking a candidate pre-fills the
- * editor with this row's header-level fields + posting structure;
- * submit arms `mergeFromHeaderId` so the server stamps
- * `is_merged_into` on the loser in the same PATCH transaction.
+ * concern: one chip of the editor's "Merge candidates" strip for a
+ * needs_review bank-feed target. Picking a candidate arms
+ * `mergeFromHeaderId`; the save folds the edited row into it through
+ * the merge route, and the candidate survives with its own payee,
+ * postings and notes. Nothing is copied into the editor. The chip shows
+ * the posted date, the payee and the counterparty account of the one
+ * posting, or the count of a split's; `origin` names the row in its
+ * tooltip. Nothing else is carried, since nothing else is shown.
  */
 export interface MergeCandidateDto {
     headerId: string;
     payee: string | null;
-    memo: string | null;
     /** ISO-8601 UTC. */
     postedAt: string;
-    /** Signed delta `candidate.postedAt − target.postedAt` in
-     *  whole days. Negative when the candidate is older. */
-    daysDelta: number;
-    tags: readonly string[];
     postings: readonly MergeCandidatePostingDto[];
+    /** How the candidate came into the ledger, as its register row's `origin`:
+     *  `manual`, `online_import` or `file_import`. The chip's tooltip names the
+     *  row a merge keeps by it (mergeChipTitle). */
+    origin: string;
 }
 
 /**
  * Mirror of API `MergeCandidatePostingDto`. The non-source legs
- * of the candidate, in `posting_index` order — what the editor
- * loads into its posting drafts when the user picks a candidate.
+ * of the candidate, in `posting_index` order — what the chip names
+ * (one counterparty, or the split count). The merge keeps them as
+ * they are.
  */
 export interface MergeCandidatePostingDto {
     counterpartyAccountId: string;
     counterpartyAccountName: string;
-    /** Signed counterparty amount. The editor's draft uses the
-     *  source-side amount (negated) — we pass through verbatim
-     *  and let the pre-fill helper invert. */
-    amount: number;
-    legMemo: string | null;
 }

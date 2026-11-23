@@ -1,3 +1,5 @@
+using Coffer.Domain.Annotations;
+
 namespace Coffer.Api.Db.Entities;
 
 /// <summary>
@@ -22,7 +24,6 @@ internal sealed class ResolvedTransactionView
     public Guid Id { get; init; }
     public Guid AccountId { get; init; }
     public string? Payee { get; init; }
-    public string? Memo { get; init; }
     public decimal Amount { get; init; }
     public DateTime PostedAt { get; init; }
     public DateTime? TransactedAt { get; init; }
@@ -36,7 +37,6 @@ internal sealed class ResolvedTransactionView
     public string Status { get; init; } = "uncleared";
 
     public bool IsHidden { get; init; }
-    public bool HasOverrides { get; init; }
     public decimal? BalanceAfter { get; init; }
     public string Origin { get; init; } = string.Empty;
     public bool IsPending { get; init; }
@@ -53,11 +53,6 @@ internal sealed class ResolvedTransactionView
     public Guid? CounterpartyAccountId { get; init; }
     public string? CounterpartyAccountName { get; init; }
     public string? CounterpartyAccountType { get; init; }
-
-    // Postgres text[] maps to string[] in Npgsql. Default to empty
-    // array so callers don't deal with null; the view's COALESCE
-    // ensures the DB never sends null for this column.
-    public string[] Tags { get; init; } = Array.Empty<string>();
 
     /// <summary>
     /// Always-present header identity (migration 028). Distinct from
@@ -83,26 +78,6 @@ internal sealed class ResolvedTransactionView
     /// removed (FK ON DELETE SET NULL).
     /// </summary>
     public Guid? ClearedByUserId { get; init; }
-
-    /// <summary>
-    /// Migration 032 (ADR-0025): raw leg-level memo, no header
-    /// fallback. <see cref="Memo"/> above remains the full 4-way
-    /// COALESCE (still convenient for single-row register display);
-    /// <c>LegMemo</c> is just <c>COALESCE(lo.leg_memo, l.leg_memo)</c>
-    /// — NULL when the leg has no memo of its own. The SPA's editor
-    /// loads this into the per-posting memo field; the register's
-    /// split-leg row displays it directly so header memo doesn't
-    /// bleed onto leg rows.
-    /// </summary>
-    public string? LegMemo { get; init; }
-
-    /// <summary>
-    /// Migration 032 (ADR-0025): raw header-level memo, no leg
-    /// fallback. <c>COALESCE(o.memo, h.memo)</c>. The SPA's editor
-    /// loads this into the umbrella "Memo" field; the register's
-    /// split-parent row displays it directly.
-    /// </summary>
-    public string? HeaderMemo { get; init; }
 
     // Migration 034: OFX online-match identity (fitid + fi_id —
     // the composite OFX dedup key). The audit-only status / type /
@@ -130,8 +105,8 @@ internal sealed class ResolvedTransactionView
     //
     // Commission is intentionally NOT projected. ADR-0019 Rule 5
     // makes the fee LEG (separate paired txn_headers row) the
-    // source of truth; the `txn_legs.commission` column is dead
-    // (not one row of a real ledger populates it). The fee row renders naturally
+    // source of truth; the `txn_legs.commission` column was dead
+    // and migration 046 dropped it. The fee row renders naturally
     // in the same `txn_group_id` group.
     public Guid? SecurityId { get; init; }
     public string? SecurityTicker { get; init; }
@@ -245,9 +220,9 @@ internal sealed class ResolvedTransactionView
     /// <c>COALESCE(header.action, 'Xfr' when this leg's counterparty
     /// sits on an asset-shaped account, NULL otherwise)</c>.
     ///
-    /// <para>True investment events (Buy / Sell / Div / DivReinvest /
-    /// Interest / MiscInc / MiscExp / Split / Transfer set on the
-    /// header by the importer) pass through unchanged. Cash-shape
+    /// <para>True investment events (Buy / Sell / Dividend / Reinvest /
+    /// Misc / Transfer / … set on the header by the importer) pass
+    /// through unchanged. Cash-shape
     /// headers with NULL <see cref="InvestmentAction"/> (paycheck
     /// splits, manual inter-account transfers) gain a per-leg
     /// <c>'Xfr'</c> label when the leg's counter sits on a non-
@@ -287,4 +262,63 @@ internal sealed class ResolvedTransactionView
     /// legs) with investment chrome.
     /// </summary>
     public string AccountType { get; init; } = string.Empty;
+
+    // Mig 264: the stored memo-and-tags presentation (LegNotes) of the row's leg,
+    // then of the posting's other leg, from the two txn_legs rows the view joins.
+    // Null until the rule has run for the leg. Readers go through StoredNotesQuery;
+    // the view has no memo or tag column of its own (mig 266).
+
+    public LegKind? NotesKind { get; init; }
+    public bool? NotesIsReadOnly { get; init; }
+    public bool? NotesGroupsByHeader { get; init; }
+    public string? NotesMemo { get; init; }
+    public bool? NotesMemoInherited { get; init; }
+    public string? NotesInheritedMemo { get; init; }
+    public Guid? NotesInheritFromAccountId { get; init; }
+    public bool? NotesTagsInherited { get; init; }
+    public string? NotesHeaderMemo { get; init; }
+    public bool? NotesHeaderInPlay { get; init; }
+
+    public LegKind? CounterpartyNotesKind { get; init; }
+    public bool? CounterpartyNotesIsReadOnly { get; init; }
+    public bool? CounterpartyNotesGroupsByHeader { get; init; }
+    public string? CounterpartyNotesMemo { get; init; }
+    public bool? CounterpartyNotesMemoInherited { get; init; }
+    public string? CounterpartyNotesInheritedMemo { get; init; }
+    public Guid? CounterpartyNotesInheritFromAccountId { get; init; }
+    public bool? CounterpartyNotesTagsInherited { get; init; }
+    public string? CounterpartyNotesHeaderMemo { get; init; }
+    public bool? CounterpartyNotesHeaderInPlay { get; init; }
+
+    /// <summary>
+    /// Mig 301 (ADR-0114 D15): the bank's figure from the header's originals sidecar,
+    /// <c>txn_header_originals.amount</c>, exactly as kept. The same on every leg of the
+    /// header; null where the header has no originals or they were captured before 301.
+    /// </summary>
+    public decimal? OriginalAmount { get; init; }
+
+    /// <summary>
+    /// Mig 301 (ADR-0114 D15): the sidecar's <c>rounded_at_import</c>, false where the
+    /// header has no originals. With <see cref="NeedsReview"/> it shows the Review marker.
+    /// </summary>
+    public bool AmountRoundedAtImport { get; init; }
+
+    /// <summary>
+    /// Mig 301 (ADR-0114 D14): the posting's other leg's amount, in that leg's own
+    /// account's currency, <see cref="CounterpartyCurrencyCode"/>. Null on a leg with no
+    /// other side. The view projects it on every posting; the register shows it only on
+    /// a transfer between currencies.
+    /// </summary>
+    public decimal? CounterpartyAmount { get; init; }
+
+    /// <summary>Mig 301 (ADR-0114 D14): the currency of the account the posting's other
+    /// leg is on. Null on a leg with no other side.</summary>
+    public string? CounterpartyCurrencyCode { get; init; }
+
+    /// <summary>Mig 301 (ADR-0114 D15): <see cref="TxnHeaderRow.ReviewClearedAmount"/>, the
+    /// same on every leg of the header.</summary>
+    public decimal? ReviewClearedAmount { get; init; }
+
+    /// <summary>Mig 301 (ADR-0114 D15): <see cref="TxnHeaderRow.ReviewClearedByMatch"/>.</summary>
+    public bool ReviewClearedByMatch { get; init; }
 }

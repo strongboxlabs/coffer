@@ -1,5 +1,6 @@
 import { useId, useState, type FormEvent } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { LineChart } from 'lucide-react';
 
@@ -108,7 +109,7 @@ export function LoginPage() {
                                 autoCorrect="off"
                                 spellCheck={false}
                                 required
-                                disabled={loginMutation.isPending}
+                                pending={loginMutation.isPending}
                                 value={username}
                                 onChange={(event) => setUsername(event.target.value)}
                             />
@@ -125,13 +126,12 @@ export function LoginPage() {
 
                         <Button
                             type="submit"
-                            disabled={
-                                loginMutation.isPending ||
-                                username.trim().length === 0
-                            }
+                            disabled={username.trim().length === 0}
+                            pending={loginMutation.isPending}
+                            pendingLabel="Signing in…"
                             className="w-full"
                         >
-                            {loginMutation.isPending ? 'Signing in…' : 'Sign in'}
+                            Sign in
                         </Button>
                     </form>
 

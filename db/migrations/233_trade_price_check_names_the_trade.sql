@@ -1,8 +1,8 @@
 -- ---------------------------------------------------------------------------
 -- 233 — fn_trade_price_check also returns WHICH TRADE decided the day.
 --
--- Migration 232 returned the security, the day and the two prices. On the first
--- real ledger it ran against, a finding read as:
+-- Migration 232 returned the security, the day and the two prices. A finding
+-- read as:
 --
 --   security <a uuid> on <a date> ·
 --   security_prices.price: stored <one price>, expected <another>
@@ -17,7 +17,7 @@
 -- (security, day) — the last trade by `h.seq` — so the leg's account and its
 -- header are right there in the DISTINCT ON; 232 simply threw them away.
 --
--- Returning the header matters most on the case this check was found to catch:
+-- Returning the header matters most on the case this check exists to catch:
 -- ADR-0084 D4 says a DELETE does not retract the price row a trade seeded, so a
 -- day whose trades were later corrected keeps a price no surviving trade
 -- implies. The reader has to compare the stale figure against the trade that is

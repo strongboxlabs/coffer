@@ -32,11 +32,12 @@ namespace Coffer.Api.Tests.Integration.LedgerOperations;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ConsistencyFutureDatedTests
+public sealed class ConsistencyFutureDatedTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ConsistencyFutureDatedTests(PostgresFixture fixture) => _fixture = fixture;
+    public ConsistencyFutureDatedTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -49,15 +50,15 @@ public sealed class ConsistencyFutureDatedTests
     [Fact]
     public async Task Holdings_stay_healthy_when_a_trade_is_posted_in_the_future()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
-        // One settled buy and one SCHEDULED buy. The scheduled one is what used to
-        // make the check disagree with the stored rows it was checking.
+        // One settled buy and one SCHEDULED buy. The scheduled one is what can make
+        // the check disagree with the stored rows it is checking.
         foreach (var at in new[] { DateTime.UtcNow.AddDays(-30), DateTime.UtcNow.AddDays(30) })
         {
             var resp = await client.PostAsJsonAsync(
@@ -74,17 +75,18 @@ public sealed class ConsistencyFutureDatedTests
             Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
         }
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var consistency = new LedgerConsistencyRepository(
-            db, new RegisterRepository(db, TimeProvider.System), new HoldingsRecomputeService(db));
+            db, new RegisterRepository(db, TimeProvider.System), new HoldingsRecomputeService(db),
+            TimeProvider.System);
 
         var report = await consistency.CheckAsync(ledger.LedgerId);
         var holdings = Assert.Single(
             report.Projections, p => p.Projection == ConsistencyProjections.Holdings);
 
-        // Before the fix this reported the scheduled buy's shares and its basis as
-        // drift — stored both buys' shares, "expected" only the settled one's — on
-        // every run, unfixably.
+        // A check that disagrees with the stored rows would report the scheduled
+        // buy's shares and its basis as drift — stored both buys' shares,
+        // "expected" only the settled one's — on every run, unfixably.
         Assert.True(
             holdings.Healthy,
             "holdings reported drift for a future-dated trade: "

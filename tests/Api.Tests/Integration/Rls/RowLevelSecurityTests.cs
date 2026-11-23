@@ -21,27 +21,25 @@ namespace Coffer.Api.Tests.Integration.Rls;
 /// with the user-id pinned rather than resolved from HTTP context.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class RowLevelSecurityTests
+public sealed class RowLevelSecurityTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public RowLevelSecurityTests(PostgresFixture fixture)
+    public RowLevelSecurityTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     [Fact]
     public async Task Accounts_query_as_alice_returns_only_alices_accounts()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var aliceAccount = await alice.AddBankAccountAsync("alices-checking");
         var bobAccount = await bob.AddBankAccountAsync("bobs-checking");
 
         // coffer_app + app.user_id = alice → RLS filters accounts to
         // alice's ledger. No WHERE clause in the test query; only RLS
         // gates the result.
-        await using var aliceDb = _fixture.NewAppDbContextAsUser(alice.UserId);
+        await using var aliceDb = Db.NewAppDbContextAsUser(alice.UserId);
         var aliceVisible = await aliceDb.Accounts.AsNoTracking()
             .Select(a => a.Id)
             .ToListAsync();
@@ -56,14 +54,14 @@ public sealed class RowLevelSecurityTests
         // Service role doesn't apply RLS, but the App role with no
         // app.user_id GUC (pre-auth posture) should see nothing —
         // fail-closed.
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
         await alice.AddBankAccountAsync("alices-checking");
 
         // Use the AppConnectionString directly via a raw DbContext
         // WITHOUT the user interceptor. Mirrors what happens if a
         // future code path forgets to set app.user_id.
         var options = new DbContextOptionsBuilder<Coffer.Api.Db.AppDbContext>()
-            .UseNpgsql(_fixture.AppConnectionString)
+            .UseNpgsql(Db.AppConnectionString)
             .Options;
         await using var db = new Coffer.Api.Db.AppDbContext(options);
 
@@ -77,8 +75,8 @@ public sealed class RowLevelSecurityTests
     [Fact]
     public async Task Transactions_inherit_account_policy_via_FK_chain()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var aliceBank = await alice.AddBankAccountAsync("alice-bank");
         var aliceCategory = await alice.AddCategoryAsync("alice-groceries");
         var bobBank = await bob.AddBankAccountAsync("bob-bank");
@@ -95,7 +93,7 @@ public sealed class RowLevelSecurityTests
         // query) as alice. The view has security_invoker=true so the
         // underlying transactions policy applies — alice sees only
         // her pair (2 rows), not bob's.
-        await using var aliceDb = _fixture.NewAppDbContextAsUser(alice.UserId);
+        await using var aliceDb = Db.NewAppDbContextAsUser(alice.UserId);
         var aliceVisibleAccountIds = await aliceDb.ResolvedTransactions.AsNoTracking()
             .Select(t => t.AccountId)
             .Distinct()
@@ -118,8 +116,8 @@ public sealed class RowLevelSecurityTests
         // would therefore mean "no refusal", which is why the table declares its
         // own pair in migration 230 and why this asserts them directly rather
         // than trusting the endpoint gate.
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var aliceBank = await alice.AddBankAccountAsync("alice-bank");
         var aliceCategory = await alice.AddCategoryAsync("alice-groceries");
         var bobBank = await bob.AddBankAccountAsync("bob-bank");
@@ -138,7 +136,7 @@ public sealed class RowLevelSecurityTests
         await alice.EditHeaderAsync(aliceLeg, payee: "Alice's curated name");
         await bob.EditHeaderAsync(bobLeg, payee: "Bob's curated name");
 
-        await using var aliceDb = _fixture.NewAppDbContextAsUser(alice.UserId);
+        await using var aliceDb = Db.NewAppDbContextAsUser(alice.UserId);
         var visible = await aliceDb.TxnHeaderOriginals.AsNoTracking()
             .Select(o => o.Payee)
             .ToListAsync();
@@ -150,10 +148,10 @@ public sealed class RowLevelSecurityTests
     [Fact]
     public async Task Users_table_returns_only_callers_own_row()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
 
-        await using var aliceDb = _fixture.NewAppDbContextAsUser(alice.UserId);
+        await using var aliceDb = Db.NewAppDbContextAsUser(alice.UserId);
         var visibleUsers = await aliceDb.Users.AsNoTracking()
             .Select(u => u.Id)
             .ToListAsync();
@@ -169,10 +167,10 @@ public sealed class RowLevelSecurityTests
     [Fact]
     public async Task Ledgers_table_returns_only_ledgers_caller_has_grant_on()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
 
-        await using var aliceDb = _fixture.NewAppDbContextAsUser(alice.UserId);
+        await using var aliceDb = Db.NewAppDbContextAsUser(alice.UserId);
         var visibleLedgers = await aliceDb.Ledgers.AsNoTracking()
             .Select(l => l.Id)
             .ToListAsync();
@@ -184,14 +182,14 @@ public sealed class RowLevelSecurityTests
     [Fact]
     public async Task UserLedgerGrants_returns_only_callers_own_grants()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
 
         // SyntheticLedger.CreateAsync grants both the per-test user
         // AND the system user owner on every test ledger. Alice
         // should see only her own grant row, not the system user's
         // grant on the same ledger.
-        await using var aliceDb = _fixture.NewAppDbContextAsUser(alice.UserId);
+        await using var aliceDb = Db.NewAppDbContextAsUser(alice.UserId);
         var visibleGrants = await aliceDb.UserLedgerGrants.AsNoTracking()
             .Select(g => new { g.UserId, g.LedgerId })
             .ToListAsync();
@@ -204,12 +202,12 @@ public sealed class RowLevelSecurityTests
     [Fact]
     public async Task AuthSessions_table_returns_only_callers_own_sessions()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         await alice.IssueSessionCookieAsync();
         await bob.IssueSessionCookieAsync();
 
-        await using var aliceDb = _fixture.NewAppDbContextAsUser(alice.UserId);
+        await using var aliceDb = Db.NewAppDbContextAsUser(alice.UserId);
         var visibleSessions = await aliceDb.AuthSessions.AsNoTracking()
             .Select(s => s.UserId)
             .Distinct()
@@ -227,12 +225,12 @@ public sealed class RowLevelSecurityTests
         // see everything regardless of who set what. Verifies the
         // role split actually delivers two distinct visibility
         // regimes, not just one accidentally-locked-down view.
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         await alice.AddBankAccountAsync("alices-bank");
         await bob.AddBankAccountAsync("bobs-bank");
 
-        await using var serviceDb = _fixture.NewServiceDbContext();
+        await using var serviceDb = Db.NewServiceDbContext();
         var allAccountLedgerIds = await serviceDb.Accounts.AsNoTracking()
             .Select(a => a.LedgerId)
             .Distinct()

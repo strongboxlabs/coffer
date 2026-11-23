@@ -39,7 +39,9 @@ public static class BudgetEndpoints
     /// <summary>
     /// <c>GET /api/ledgers/{ledgerId}/budget/progress?month=yyyy-MM&amp;window=3</c>
     /// — one month's spend per category beside the mean of the trailing
-    /// <c>window</c> complete months.
+    /// <c>window</c> complete months. <c>today</c> is the caller's local date: it
+    /// picks the default month and splits off the rows the register shows as
+    /// Scheduled.
     /// <para>422 throughout — <c>BusinessError.Problem</c> has no 400 path:
     /// <c>ledger-not-visible</c>, an unparseable month, or a window outside 1..24.</para>
     /// </summary>
@@ -47,6 +49,7 @@ public static class BudgetEndpoints
         Guid ledgerId,
         string? month,
         int? window,
+        DateOnly? today,
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         BudgetProgressRepository budget,
@@ -65,8 +68,8 @@ public static class BudgetEndpoints
         DateTime monthStartUtc;
         if (string.IsNullOrWhiteSpace(month))
         {
-            var today = clock.GetUtcNow().UtcDateTime;
-            monthStartUtc = new DateTime(today.Year, today.Month, 1, 0, 0, 0, DateTimeKind.Utc);
+            var local = ScheduledBoundary.Today(today, clock);
+            monthStartUtc = new DateTime(local.Year, local.Month, 1, 0, 0, 0, DateTimeKind.Utc);
         }
         else if (DateTime.TryParseExact(month, "yyyy-MM", CultureInfo.InvariantCulture,
                      DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed))
@@ -84,7 +87,7 @@ public static class BudgetEndpoints
             return BusinessError.Problem(BusinessError.Codes.BudgetRangeInvalid,
                 "window must be between 1 and 24 months.");
 
-        var dto = await budget.GetAsync(ledgerId, monthStartUtc, windowMonths, cancellationToken)
+        var dto = await budget.GetAsync(ledgerId, monthStartUtc, windowMonths, today, cancellationToken)
             .ConfigureAwait(false);
         return Results.Ok(dto);
     }
@@ -116,7 +119,7 @@ public static class BudgetEndpoints
 
         // Refused here as well as by the column CHECK. The CHECK is the backstop;
         // a 23514 surfacing as a 500 is not an answer anyone can act on.
-        if (request.Amount < 0m)
+        if (!IsAllowedTargetAmount(request.Amount))
             return BusinessError.Problem(BusinessError.Codes.BudgetRangeInvalid,
                 "A target cannot be negative. Zero is allowed, and means spending nothing here.");
 
@@ -127,6 +130,8 @@ public static class BudgetEndpoints
         return outcome.Result switch
         {
             BudgetTargetsRepository.SetResult.Ok => Results.NoContent(),
+            BudgetTargetsRepository.SetResult.AmountPlacesExceedCurrency =>
+                MoneyPlaces.Refusal(outcome.CurrencyCode!, "amount"),
             BudgetTargetsRepository.SetResult.CategoryNotInLedger =>
                 BusinessError.Problem(BusinessError.Codes.AccountNotInLedger,
                     "That category is not in this ledger."),
@@ -184,6 +189,10 @@ public static class BudgetEndpoints
     /// failing the batch on the first conflict: a fill is a convenience over rows
     /// the user can already see, and refusing all thirty because one is illegal is
     /// worse than applying twenty-nine and naming the one that was not.</para>
+    /// <para>A typed amount with more places than the reporting currency allows is not a
+    /// conflict to skip: the whole fill is refused with <c>amount-places-exceed-currency</c>,
+    /// naming the first such entry, and nothing is written (ADR-0114 D15). A copy is not
+    /// typed, so its figures are not checked.</para>
     /// </summary>
     private static async Task<IResult> FillTargetsAsync(
         Guid ledgerId,
@@ -203,19 +212,45 @@ public static class BudgetEndpoints
                 "month must be formatted yyyy-MM.");
 
         var entries = request.Entries ?? [];
-        // A ledger has hundreds of categories, not thousands. The cap is here so a
-        // malformed client cannot turn one click into an unbounded write.
-        if (entries.Count > MaxFillEntries)
-            return BusinessError.Problem(BusinessError.Codes.BudgetRangeInvalid,
-                $"A fill carries at most {MaxFillEntries} entries.");
-        if (entries.Any(e => e.Amount < 0m))
-            return BusinessError.Problem(BusinessError.Codes.BudgetRangeInvalid,
-                "A target cannot be negative.");
+        IReadOnlyList<BudgetTargetsRepository.BulkEntryOutcome> outcomes;
+        if (request.CopyFromMonth is not null)
+        {
+            // Copy last month (ADR-0114 D12): the server copies the stored targets, each in
+            // the currency it was typed in, so the client sends the month and no amounts.
+            if (entries.Count > 0)
+                return BusinessError.Problem(BusinessError.Codes.BudgetRangeInvalid,
+                    "A copy names the month to copy from and carries no entries.");
+            if (!TryParseMonth(request.CopyFromMonth, out var source))
+                return BusinessError.Problem(BusinessError.Codes.BudgetRangeInvalid,
+                    "copyFromMonth must be formatted yyyy-MM.");
+            outcomes = await targets.CopyMonthAsync(ledgerId, source, month, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            // A ledger has hundreds of categories, not thousands. The cap is here so a
+            // malformed client cannot turn one click into an unbounded write.
+            if (entries.Count > MaxFillEntries)
+                return BusinessError.Problem(BusinessError.Codes.BudgetRangeInvalid,
+                    $"A fill carries at most {MaxFillEntries} entries.");
+            if (entries.Any(e => !IsAllowedTargetAmount(e.Amount)))
+                return BusinessError.Problem(BusinessError.Codes.BudgetRangeInvalid,
+                    "A target cannot be negative.");
 
-        var outcomes = await targets.SetManyAsync(
-            ledgerId, month,
-            entries.Select(e => (e.CategoryId, e.Amount)).ToList(),
-            cancellationToken).ConfigureAwait(false);
+            outcomes = await targets.SetManyAsync(
+                ledgerId, month,
+                entries.Select(e => (e.CategoryId, e.Amount)).ToList(),
+                cancellationToken).ConfigureAwait(false);
+
+            // A typed amount that does not fit the reporting currency refuses the whole fill,
+            // with nothing written (ADR-0114 D15). The refusal names the first such entry.
+            if (outcomes.FirstOrDefault(o => o.Result == BudgetTargetsRepository.SetResult.AmountPlacesExceedCurrency)
+                is { CurrencyCode: { } unfitCurrency } unfit)
+            {
+                var index = entries.Select((e, i) => (e.CategoryId, i)).First(x => x.CategoryId == unfit.CategoryId).i;
+                return MoneyPlaces.Refusal(unfitCurrency, $"entries[{index}].amount");
+            }
+        }
 
         var skipped = outcomes
             .Where(o => o.Result != BudgetTargetsRepository.SetResult.Ok)
@@ -292,6 +327,15 @@ public static class BudgetEndpoints
         BudgetTargetsRepository.SetResult.CategoryNotInLedger => "category-not-in-ledger",
         _ => "unknown",
     };
+
+    /// <summary>
+    /// Whether a typed target may be written: zero or more. Zero means spending nothing
+    /// in the category; a negative target means nothing, and the column CHECK would
+    /// refuse it as a 500. The rule the repository leaves to its callers, so every
+    /// writer of a typed target (these endpoints and the Demo's examples, ADR-0115 D3)
+    /// applies the same one.
+    /// </summary>
+    internal static bool IsAllowedTargetAmount(decimal amount) => amount >= 0m;
 
     /// <summary>
     /// <c>yyyy-MM</c> to the first of that month. Shared by all three write paths,

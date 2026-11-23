@@ -3,15 +3,17 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 
+using Coffer.Domain.Money;
+
 namespace Coffer.Api.Ingest.Qif;
 
 /// <summary>
 /// QIF (Quicken Interchange Format) file provider — ADR-0042.
 /// Handles investment (<c>!Type:Invst</c>) and bank
 /// (<c>!Type:Bank</c> / <c>!Type:CCard</c>) sections. Built for
-/// a workplace 401(k) plan export (QIF or CSV are its only
-/// download formats; no OFX/QFX), but the parser is the generic QIF
-/// line grammar, not the workplace plan-specific.
+/// workplace-plan exports (a plan recordkeeper may offer only QIF or
+/// CSV downloads, no OFX/QFX), but the parser is the generic QIF
+/// line grammar, not specific to any one recordkeeper.
 /// </summary>
 /// <remarks>
 /// <para><b>Hand-rolled parser, no NuGet dependency (ADR-0042 §D1).</b>
@@ -36,8 +38,9 @@ namespace Coffer.Api.Ingest.Qif;
 /// carries zero because that is the action's net-zero contract on
 /// every feed, not because QIF said so.</para>
 ///
-/// <para><b>Single-account-implicit.</b> A QIF file (at least the
-/// workplace plan dialect) carries no account header — it is one
+/// <para><b>Single-account-implicit.</b> A single-account QIF export
+/// need carry no account header, and any <c>!Account</c> block is
+/// ignored, so a file is read as one
 /// account's transaction list. The provider surfaces exactly one
 /// <see cref="DiscoveredFileAccount"/> with a sentinel
 /// <c>ProviderAccountId</c> (<see cref="SingleAccountKey"/>); the
@@ -96,10 +99,10 @@ public sealed class QifFileProvider : IFileProvider
 
         // QIF lines are CR / LF / CRLF separated; split on both.
         var lines = text.Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None);
-        foreach (var raw in lines)
+        for (var index = 0; index < lines.Length; index++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var line = raw.TrimEnd();
+            var line = lines[index].TrimEnd();
             if (line.Length == 0) continue;
 
             var code = line[0];
@@ -122,7 +125,9 @@ public sealed class QifFileProvider : IFileProvider
                     break;
 
                 default:
-                    record.Apply(code, value);
+                    // The file line, one-based, so a number that does not read can be
+                    // named where the user will find it (ADR-0114 D15).
+                    record.Apply(code, value, line: index + 1);
                     break;
             }
         }
@@ -182,7 +187,7 @@ public sealed class QifFileProvider : IFileProvider
         var mapped = section switch
         {
             QifSection.Investment => MapInvestmentRecord(record, context, errors),
-            QifSection.Bank => MapBankRecord(record, context),
+            QifSection.Bank => MapBankRecord(record, context, errors),
             _ => null,
         };
         if (mapped is not null)
@@ -209,11 +214,9 @@ public sealed class QifFileProvider : IFileProvider
         // Cash moves inside the investment section are the investment
         // register's BANK rows, not security actions, so they leave here
         // before classification rather than failing it.
-        // Cash moves inside the investment section are the investment
-        // register's BANK rows, not security actions, so they leave here
-        // before classification rather than failing it.
-        if (MapInvestmentCashTransfer(r, rawAction, context) is { } cashRow)
-            return cashRow;
+        var cashSign = CashTransferSign(rawAction);
+        if (cashSign != 0m)
+            return MapInvestmentCashTransfer(r, rawAction, cashSign, context, errors);
 
         var action = ClassifyInvestmentAction(rawAction);
         if (action is null)
@@ -226,17 +229,26 @@ public sealed class QifFileProvider : IFileProvider
             return null;
         }
 
-        var (securityName, tickerHint) = SplitSecurity(r.Security);
         // QIF amounts are unsigned magnitudes; the action sets the
         // sign of the bank-shape cash-flow hint (ADR-0042). The wire
         // amount is `T`, falling back to `U` (a historical duplicate).
-        var magnitude = r.Amount ?? r.AltAmount ?? 0m;
+        // A number that is written but does not read is an error on its
+        // row, never a silent zero (ADR-0114 D15).
+        if (!TryReadMagnitude(r, context, errors, out var magnitude)
+            || !TryRead(r.Quantity, NumberField.Quantity, context, errors, out var quantity)
+            || !TryRead(r.Price, NumberField.Price, context, errors, out var price)
+            || !TryRead(r.Commission, NumberField.Commission, context, errors, out var commission))
+        {
+            return null;
+        }
+
+        var (securityName, tickerHint) = SplitSecurity(r.Security);
         var signedAmount = SignAmountForAction(action, magnitude);
 
         var postedAt = DateTime.SpecifyKind(r.Date!.Value, DateTimeKind.Utc);
         var externalId = SynthesizeExternalId(
             context.AccountId, r.Date.Value, rawAction,
-            tickerHint ?? securityName, r.Quantity, r.Price, magnitude, r.Memo);
+            tickerHint ?? securityName, quantity, price, magnitude, r.Memo);
 
         return new IngestedTransaction(
             ExternalId: externalId,
@@ -253,17 +265,35 @@ public sealed class QifFileProvider : IFileProvider
             RawProviderPayload: null,
             ProviderAccountId: SingleAccountKey,
             OnlineMatchFiId: null,           // QIF has no FI id
-            Shares: r.Quantity,
-            UnitPrice: r.Price,
+            Shares: quantity,
+            UnitPrice: price,
             // QIF `O` is commission; null when absent or zero.
-            Fee: r.Commission is > 0m ? r.Commission : null);
+            Fee: commission is > 0m ? commission : null);
     }
+
+    /// <summary>
+    /// The cash direction of an investment-section cash move, or zero for
+    /// every other action, which the caller then classifies as a security
+    /// action.
+    /// </summary>
+    /// <remarks>
+    /// Unlike the security actions, the direction IS knowable from the
+    /// action alone, so these do not land on the positive magnitude the
+    /// <c>misc</c> fallback uses.
+    /// </remarks>
+    private static decimal CashTransferSign(string rawAction) =>
+        rawAction.Trim().ToUpperInvariant() switch
+        {
+            "XIN" or "CONTRIBX"   => 1m,
+            "XOUT" or "WITHDRWX"  => -1m,
+            _                     => 0m,
+        };
 
     /// <summary>
     /// Map an investment-section cash move — <c>XIn</c> / <c>XOut</c> /
     /// <c>ContribX</c> / <c>WithdrwX</c> — to a bank-shape
-    /// <see cref="IngestedTransaction"/>. Returns null for every other
-    /// action, so the caller carries on to security classification.
+    /// <see cref="IngestedTransaction"/>, or null with a row error when its
+    /// amount is written but does not read.
     /// </summary>
     /// <remarks>
     /// These rows carry no security and no share count: they are cash
@@ -272,11 +302,11 @@ public sealed class QifFileProvider : IFileProvider
     /// bank shape with a null action — and this is the same fact in a
     /// different dialect.
     ///
-    /// <para>Skipping them was not a small gap. A workplace-plan
-    /// statement is mostly <c>ContribX</c>, so a workplace plan's
-    /// QIF imported with its contributions dropped: the cash balance was
-    /// wrong, and the missing rows looked like the user's own oversight
-    /// rather than an importer decision.</para>
+    /// <para>Skipping them is not an option. Contributions to a
+    /// workplace plan arrive as <c>ContribX</c>, so skipping the action
+    /// would import such a QIF with its contributions dropped: the cash
+    /// balance would be wrong, and the missing rows would look like the
+    /// user's own oversight rather than an importer decision.</para>
     ///
     /// <para>QIF <c>L</c> (the transfer counterparty) is deliberately not
     /// read here, consistent with the rest of this provider — the row
@@ -287,20 +317,12 @@ public sealed class QifFileProvider : IFileProvider
     private IngestedTransaction? MapInvestmentCashTransfer(
         QifRecordBuilder r,
         string rawAction,
-        FileIngestContext context)
+        decimal sign,
+        FileIngestContext context,
+        List<IngestError> errors)
     {
-        // Unlike the security actions, the direction IS knowable from
-        // the action alone, so these do not land on the positive
-        // magnitude the `misc` fallback uses.
-        var sign = rawAction.Trim().ToUpperInvariant() switch
-        {
-            "XIN" or "CONTRIBX"   => 1m,
-            "XOUT" or "WITHDRWX"  => -1m,
-            _                     => 0m,
-        };
-        if (sign == 0m) return null;
-
-        var magnitude = Math.Abs(r.Amount ?? r.AltAmount ?? 0m);
+        if (!TryReadMagnitude(r, context, errors, out var read)) return null;
+        var magnitude = Math.Abs(read);
         var postedAt = DateTime.SpecifyKind(r.Date!.Value, DateTimeKind.Utc);
 
         // rawAction stays in the key so a cash row cannot collide with a
@@ -326,9 +348,10 @@ public sealed class QifFileProvider : IFileProvider
     /// </summary>
     private IngestedTransaction? MapBankRecord(
         QifRecordBuilder r,
-        FileIngestContext context)
+        FileIngestContext context,
+        List<IngestError> errors)
     {
-        var magnitude = r.Amount ?? r.AltAmount ?? 0m;
+        if (!TryReadMagnitude(r, context, errors, out var magnitude)) return null;
         var postedAt = DateTime.SpecifyKind(r.Date!.Value, DateTimeKind.Utc);
         // Bank QIF `T` is already signed (debit negative). No action
         // classification — bank rows land as cash-flow needs_review.
@@ -363,7 +386,10 @@ public sealed class QifFileProvider : IFileProvider
         var identity = new List<string>(3);
         if ((tickerHint ?? NullIfEmpty(securityName)) is { } security)
             identity.Add(security);
-        if (r.Quantity is { } quantity)
+        // A quantity that does not read is left out: the row is skipped for
+        // its action either way, and the date still identifies it.
+        if (r.Quantity is { } field
+            && ReadNumber(field.Text, threePlaceMoney: false, out var quantity) == NumberReading.Read)
         {
             // 12dp matches txn_legs.quantity's scale; the format trims
             // trailing zeros so whole-share rows stay readable.
@@ -385,9 +411,7 @@ public sealed class QifFileProvider : IFileProvider
     /// to the catalog line.
     ///
     /// <para><c>RtrnCap</c>, <c>XIn</c> / <c>XOut</c> and
-    /// <c>ContribX</c> / <c>WithdrwX</c> used to be listed here with
-    /// reasons, on the note that closing the gap was a classification
-    /// change rather than message text. It was, and it has been: return
+    /// <c>ContribX</c> / <c>WithdrwX</c> are not listed here: return
     /// of capital classifies as a cash distribution like the OFX
     /// provider's RETOFCAP, and the four cash moves take the bank shape
     /// before classification runs.</para>
@@ -490,7 +514,7 @@ public sealed class QifFileProvider : IFileProvider
 
     /// <summary>
     /// Split a QIF security field into a display name and a ticker
-    /// hint. The workplace plan encodes a stable fund code in trailing
+    /// hint. A recordkeeper may encode a stable fund code in trailing
     /// parens — "BOND FUND(BFND)" → name "BOND FUND", hint
     /// "BFND". When there's no parenthetical, the hint is null (the
     /// user maps the security by picking it in the editor) and the
@@ -520,8 +544,8 @@ public sealed class QifFileProvider : IFileProvider
     }
 
     /// <summary>Where the trailing <c>(CODE)</c> of <paramref name="s"/> opens and closes,
-    /// or (-1, -1). <paramref name="s"/> is already trimmed. The workplace plan puts a
-    /// stable per-fund code there, lifted as the ticker hint for the
+    /// or (-1, -1). <paramref name="s"/> is already trimmed. Where a recordkeeper puts a
+    /// stable per-fund code there, it is lifted as the ticker hint for the
     /// provider_security_mappings rail (ADR-0038): mapped once, every row with the same
     /// code resolves.</summary>
     internal static (int Open, int Close) TrailingParenCode(string s)
@@ -539,6 +563,19 @@ public sealed class QifFileProvider : IFileProvider
     /// fields) makes re-import idempotent and prevents cross-account
     /// collisions in the per-provider dedup scope (ADR-0042).
     /// </summary>
+    /// <remarks>
+    /// <para><b><paramref name="amount"/> is the figure as parsed, before any
+    /// rounding</b> (ADR-0114 D15), with the scale it was written at. The
+    /// orchestrator alone fits an amount to its account currency's places, at
+    /// the write; this provider never rounds. Hashing a rounded figure, or
+    /// normalising the amount in the parser, would give two rows the file
+    /// tells apart one id, so the second is dropped as already known, and
+    /// would change the id of every row already imported, so a re-import
+    /// duplicates them.</para>
+    /// <para>The same holds for <paramref name="quantity"/> and
+    /// <paramref name="price"/>: a different reading of the same text is a
+    /// different id.</para>
+    /// </remarks>
     internal static string SynthesizeExternalId(
         Guid accountId,
         DateTime date,
@@ -566,6 +603,190 @@ public sealed class QifFileProvider : IFileProvider
     private static string? NullIfEmpty(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null : value;
 
+    /// <summary>A numeric field of a record as the file wrote it: its text and the
+    /// one-based file line it is on.</summary>
+    internal readonly record struct QifNumber(string Text, int Line);
+
+    /// <summary>The numeric fields a mapper reads. <see cref="Amount"/> and
+    /// <see cref="Commission"/> are money; quantity and price are not.</summary>
+    internal enum NumberField { Amount, Commission, Quantity, Price }
+
+    /// <summary>How the text of a numeric field reads (ADR-0114 D15).</summary>
+    internal enum NumberReading
+    {
+        /// <summary>A number, read one way only.</summary>
+        Read,
+
+        /// <summary>Not a number at all.</summary>
+        Unparseable,
+
+        /// <summary>A comma that is not followed by exactly three digits of the whole
+        /// part, in a figure that is not grouped in thousands or lakh-style, so it could
+        /// be a decimal comma.</summary>
+        AmbiguousComma,
+
+        /// <summary>Money in an account whose currency has three places, with every comma
+        /// followed by exactly three digits of the whole part, grouped by commas in
+        /// thousands or lakh-style or not; a comma there reads as a thousands separator or
+        /// as a decimal comma alike.</summary>
+        CommaInThreePlaceMoney,
+
+        /// <summary>In an account of fewer than three places, or in a figure that is not
+        /// money, commas each followed by three digits of the whole part, but in groups
+        /// <see cref="AmountGrouping"/> does not accept: a first group of more than three
+        /// digits, or one that starts with a zero.</summary>
+        UngroupedComma,
+    }
+
+    /// <summary>
+    /// The magnitude of a record's amount: <c>T</c>, or <c>U</c> when there is no
+    /// <c>T</c>, or zero when the record carries neither. A <c>T</c> that is written
+    /// decides on its own, so a <c>U</c> behind it is never read. False, with a row
+    /// error, when the field that decides does not read.
+    /// </summary>
+    private static bool TryReadMagnitude(
+        QifRecordBuilder r, FileIngestContext context, List<IngestError> errors, out decimal magnitude)
+    {
+        var ok = TryRead(r.Amount ?? r.AltAmount, NumberField.Amount, context, errors, out var read);
+        magnitude = read ?? 0m;
+        return ok;
+    }
+
+    /// <summary>
+    /// Read one numeric field, null when the record does not carry it. False, with a
+    /// row error naming the field's line, when it is written but does not read one way
+    /// only (ADR-0114 D15). An absent field is not an unreadable one.
+    /// </summary>
+    private static bool TryRead(
+        QifNumber? field,
+        NumberField kind,
+        FileIngestContext context,
+        List<IngestError> errors,
+        out decimal? value)
+    {
+        value = null;
+        if (field is not { } f) return true;
+
+        var money = kind is NumberField.Amount or NumberField.Commission;
+        var threePlaceMoney = money
+            && context.CurrencyCode is { } code
+            && CurrencyMinorUnits.PlacesOf(code) >= 3;
+        var reading = ReadNumber(f.Text, threePlaceMoney, out var read);
+        if (reading == NumberReading.Read)
+        {
+            value = read;
+            return true;
+        }
+
+        errors.Add(NotANumber(f, kind, reading, context.CurrencyCode));
+        return false;
+    }
+
+    /// <summary>
+    /// Read the text of a QIF numeric field the one way it can be read, or say why it
+    /// cannot (ADR-0114 D15, "QIF has no layout, so it refuses an amount it cannot read
+    /// one way only"; ADR-0042).
+    /// </summary>
+    /// <remarks>
+    /// <para>QIF names no decimal separator, so commas are read only where they can be
+    /// nothing but grouping: the whole part grouped in thousands or lakh-style, by the
+    /// rule a CSV layout reads by (<see cref="AmountGrouping"/>), and no comma in the
+    /// fraction. Any other comma could be a decimal comma, and the field is refused
+    /// rather than read a hundred or a thousand times too large, which is what removing
+    /// every comma did. In money whose currency has three places
+    /// (<paramref name="threePlaceMoney"/>), a comma followed by three digits is a decimal
+    /// comma as readily as a separator, so every comma is refused there. A quantity or a
+    /// price is never money, so there grouping commas read as grouping.</para>
+    /// <para><b>An accepted text reads exactly as before.</b> The figure is parsed by the
+    /// same call, with the same styles, as the parser this replaces, so its value, its
+    /// sign at either end and its scale are unchanged, and so is the external id hashed
+    /// from it (<see cref="SynthesizeExternalId"/>). A different reading of a text a
+    /// re-imported file has always carried would give its row a new id and duplicate
+    /// it.</para>
+    /// </remarks>
+    internal static NumberReading ReadNumber(string text, bool threePlaceMoney, out decimal value)
+    {
+        if (!decimal.TryParse(
+                text.Replace(",", string.Empty, StringComparison.Ordinal),
+                NumberStyles.Number | NumberStyles.AllowLeadingSign,
+                CultureInfo.InvariantCulture,
+                out value))
+        {
+            value = 0m;
+            return NumberReading.Unparseable;
+        }
+
+        if (!text.Contains(',', StringComparison.Ordinal)) return NumberReading.Read;
+
+        // The text parsed with its commas removed, so around its digits, commas and one
+        // point there is only white space and a sign at either end.
+        var body = text.Trim().Trim('-', '+').Trim();
+        var point = body.IndexOf('.', StringComparison.Ordinal);
+        var whole = point < 0 ? body : body[..point];
+        var grouped = (point < 0 || !body[(point + 1)..].Contains(',', StringComparison.Ordinal))
+            && whole.Contains(',', StringComparison.Ordinal)
+            && AmountGrouping.IsGrouped(whole, ',');
+
+        if (grouped && !threePlaceMoney) return NumberReading.Read;
+
+        value = 0m;
+        if (grouped) return NumberReading.CommaInThreePlaceMoney;
+        if (!EveryCommaPrecedesThreeWholeDigits(body, point)) return NumberReading.AmbiguousComma;
+
+        // Every comma is followed by exactly three digits, in groups no export writes. In
+        // three-place money that is the three-place case still: a zero before a comma and
+        // three digits there reads most readily as a decimal comma.
+        return threePlaceMoney ? NumberReading.CommaInThreePlaceMoney : NumberReading.UngroupedComma;
+    }
+
+    /// <summary>True when every comma of <paramref name="body"/> follows a digit of the
+    /// whole part and is followed by exactly three digits.</summary>
+    private static bool EveryCommaPrecedesThreeWholeDigits(string body, int point)
+    {
+        for (var i = 0; i < body.Length; i++)
+        {
+            if (body[i] != ',') continue;
+            var digits = 0;
+            while (i + 1 + digits < body.Length && char.IsAsciiDigit(body[i + 1 + digits])) digits++;
+            var three = i > 0
+                && char.IsAsciiDigit(body[i - 1])
+                && (point < 0 || i < point)
+                && digits == 3;
+            if (!three) return false;
+        }
+        return true;
+    }
+
+    /// <summary>The row error for a numeric field that does not read, naming its file
+    /// line and its text.</summary>
+    private static IngestError NotANumber(
+        QifNumber field, NumberField kind, NumberReading reading, string? currencyCode)
+    {
+        var noun = kind switch
+        {
+            NumberField.Amount => "an amount",
+            NumberField.Commission => "a commission",
+            NumberField.Quantity => "a quantity",
+            _ => "a price",
+        };
+        var why = reading switch
+        {
+            NumberReading.AmbiguousComma =>
+                " one way only: a comma not followed by exactly three digits could be a decimal comma.",
+            NumberReading.CommaInThreePlaceMoney =>
+                $" one way only: in a {currencyCode} account, whose currency has three decimal places, "
+                + "a comma followed by three digits could be a decimal comma or a thousands separator.",
+            // UngroupedComma takes the plain sentence: it never arises in three-place money,
+            // and its every comma is followed by exactly three digits.
+            _ => ".",
+        };
+        return new IngestError(
+            Code: "qif_row_unreadable",
+            Message: $"Line {field.Line}: '{field.Text}' does not read as {noun}{why} The row was skipped.",
+            ConnectionId: null,
+            AccountId: null);
+    }
+
     private enum QifSection { Unknown, Investment, Bank }
 
     /// <summary>
@@ -577,21 +798,27 @@ public sealed class QifFileProvider : IFileProvider
     /// <c>M</c> memo, <c>P</c> payee, <c>L</c> category, <c>C</c>
     /// cleared status. Unrecognised codes are ignored.
     /// </summary>
+    /// <remarks>
+    /// The numeric fields are kept as written, with their line, and read by the
+    /// mapper, which knows whether a field is money and the account's currency: a field
+    /// that does not read is an error on its row, never a null that a mapper would take
+    /// as zero (ADR-0114 D15). A field written blank is absent, as it always was.
+    /// </remarks>
     private sealed class QifRecordBuilder
     {
         public DateTime? Date { get; private set; }
         public string? Action { get; private set; }
         public string? Security { get; private set; }
-        public decimal? Price { get; private set; }
-        public decimal? Quantity { get; private set; }
-        public decimal? Amount { get; private set; }
-        public decimal? AltAmount { get; private set; }
-        public decimal? Commission { get; private set; }
+        public QifNumber? Price { get; private set; }
+        public QifNumber? Quantity { get; private set; }
+        public QifNumber? Amount { get; private set; }
+        public QifNumber? AltAmount { get; private set; }
+        public QifNumber? Commission { get; private set; }
         public string? Memo { get; private set; }
         public string? Payee { get; private set; }
         public bool HasAny { get; private set; }
 
-        public void Apply(char code, string value)
+        public void Apply(char code, string value, int line)
         {
             HasAny = true;
             switch (code)
@@ -599,11 +826,11 @@ public sealed class QifFileProvider : IFileProvider
                 case 'D': Date = ParseQifDate(value); break;
                 case 'N': Action = value; break;
                 case 'Y': Security = value; break;
-                case 'I': Price = ParseDecimal(value); break;
-                case 'Q': Quantity = ParseDecimal(value); break;
-                case 'T': Amount = ParseDecimal(value); break;
-                case 'U': AltAmount = ParseDecimal(value); break;
-                case 'O': Commission = ParseDecimal(value); break;
+                case 'I': Price = Number(value, line); break;
+                case 'Q': Quantity = Number(value, line); break;
+                case 'T': Amount = Number(value, line); break;
+                case 'U': AltAmount = Number(value, line); break;
+                case 'O': Commission = Number(value, line); break;
                 case 'M': Memo = value; break;
                 case 'P': Payee = value; break;
                 // L (category), C (cleared) intentionally ignored —
@@ -612,21 +839,13 @@ public sealed class QifFileProvider : IFileProvider
             }
         }
 
-        private static decimal? ParseDecimal(string value)
-        {
-            if (string.IsNullOrWhiteSpace(value)) return null;
-            // QIF amounts may carry thousands separators.
-            var cleaned = value.Replace(",", string.Empty, StringComparison.Ordinal);
-            return decimal.TryParse(cleaned, NumberStyles.Number | NumberStyles.AllowLeadingSign,
-                CultureInfo.InvariantCulture, out var d)
-                ? d
-                : null;
-        }
+        private static QifNumber? Number(string value, int line) =>
+            string.IsNullOrWhiteSpace(value) ? null : new QifNumber(value, line);
 
         private static DateTime? ParseQifDate(string value)
         {
             if (string.IsNullOrWhiteSpace(value)) return null;
-            // A workplace-plan export emits MM/DD/YYYY. QIF historically also used
+            // Modern exports use MM/DD/YYYY. QIF historically also used
             // M/D'YY (apostrophe for 20xx) and M/D/YY; accept the
             // common shapes. Quicken pads with spaces ("Q 5/ 9/26").
             var v = value.Replace(" ", string.Empty, StringComparison.Ordinal)

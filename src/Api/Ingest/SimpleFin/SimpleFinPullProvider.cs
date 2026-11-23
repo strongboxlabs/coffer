@@ -1,6 +1,7 @@
 using System.Text;
 
 using Coffer.Api.Crypto;
+using Coffer.Api.Errors;
 using Coffer.Api.Ingest;
 using Coffer.Api.Sync.SimpleFin;
 
@@ -124,15 +125,62 @@ public sealed class SimpleFinPullProvider : IPullProvider
             ? feed.Accounts.Where(a => a.Id == context.AccountIdFilter).ToList()
             : feed.Accounts;
 
-        var pullAccounts = sfinAccounts.Select(ToPullAccount).ToList();
         var errors = feed.Errors
             .Select(e => new IngestError(e.Code, e.Msg, e.ConnId, e.AccountId))
             .ToList();
+
+        // An account's currency must match what is imported into it (ADR-0114 D13). A
+        // binding made before the bind refused a mismatch, or made before the directory
+        // knew the feed account's currency, is judged here by the same rule: its account's
+        // pull fails with an error naming both currencies, and none of its transactions is
+        // handed on. It stays in the result, so the directory still records what the feed
+        // reports, and its error keeps the account's watermark where it was, so the next
+        // sync after the binding is fixed fetches the same window.
+        var mappedCurrency = context.MappedAccounts
+            .Where(m => m.CurrencyCode is not null)
+            .GroupBy(m => m.ExternalId, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.First().CurrencyCode!, StringComparer.Ordinal);
+        var pullAccounts = new List<PullAccount>(sfinAccounts.Count);
+        foreach (var sf in sfinAccounts)
+        {
+            var pulled = ToPullAccount(sf);
+            if (mappedCurrency.TryGetValue(sf.Id, out var accountCurrency)
+                && CurrencyDiffers(sf.Currency, accountCurrency))
+            {
+                errors.Add(new IngestError(
+                    BusinessError.Codes.FeedAccountCurrencyMismatch,
+                    $"Account {sf.Id}: the feed reports {sf.Currency!.Trim()} and the account it is bound to "
+                    + $"is in {accountCurrency}, so its transactions were not imported. Bind it to an "
+                    + $"account in {sf.Currency.Trim()}.",
+                    sf.ConnId,
+                    sf.Id));
+                pulled = pulled with { Transactions = Array.Empty<IngestedTransaction>() };
+            }
+            pullAccounts.Add(pulled);
+        }
 
         return new PullResult(
             Accounts: pullAccounts,
             Errors: errors,
             RequiresReauth: false);
+    }
+
+    /// <summary>
+    /// Whether a feed account's reported currency differs from a Coffer account's
+    /// (ADR-0114 D13): the one rule the bind and the sync both apply.
+    /// </summary>
+    /// <remarks>
+    /// A feed account that reports no currency is not judged. One that reports a value
+    /// that is not a currency code (SimpleFIN names a custom currency by URL) differs from
+    /// every account, so it fails closed. Otherwise the codes are compared in their stored
+    /// form (<see cref="Coffer.Api.Quotes.CurrencyCodes.TryNormalize"/>).
+    /// </remarks>
+    public static bool CurrencyDiffers(string? feedCurrency, string accountCurrency)
+    {
+        ArgumentNullException.ThrowIfNull(accountCurrency);
+        if (string.IsNullOrWhiteSpace(feedCurrency)) return false;
+        if (!Coffer.Api.Quotes.CurrencyCodes.TryNormalize(feedCurrency, out var feed)) return true;
+        return !string.Equals(feed, accountCurrency.Trim().ToUpperInvariant(), StringComparison.Ordinal);
     }
 
     private static PullAccount ToPullAccount(SimpleFinAccount sf)
@@ -198,11 +246,12 @@ public sealed class SimpleFinPullProvider : IPullProvider
 
     /// <summary>Maximum lookback window SimpleFIN exposes — exceeding
     /// it triggers the `gen.api` "date range exceeds 90 days" warning.
-    /// Empirically the bridge fires the cap warning well inside the
-    /// nominal boundary (a 1-hour inset still tripped it on real
-    /// first-syncs against bridge.simplefin.org), suggesting either
-    /// clock skew or day-aligned comparison on their side, so we
-    /// shift the floor inward by <see cref="WindowSafetyMargin"/>.</summary>
+    /// The bridge's cap check is not exact to the second: it may compare
+    /// whole days or use its own clock, so a start date that is only
+    /// hours inside the nominal boundary can still trip the warning. The
+    /// floor therefore sits a whole day inside the cap
+    /// (<see cref="WindowSafetyMargin"/>), which absorbs day-aligned
+    /// comparison and any sub-day clock skew.</summary>
     private const int MaxWindowDays = 90;
 
     /// <summary>Safety margin baked into the first-sync floor so we

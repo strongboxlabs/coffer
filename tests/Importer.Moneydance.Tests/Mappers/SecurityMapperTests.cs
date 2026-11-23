@@ -9,7 +9,7 @@ public sealed class SecurityMapperTests
 {
     private static readonly Guid TestLedgerId = TestLedger.Id;
 
-    private static MdCurr CurrFromJson(string fragment)
+    private static MdItem ItemFromJson(string fragment)
     {
         var wrapped = $$"""
             {
@@ -17,28 +17,14 @@ public sealed class SecurityMapperTests
               "all_items": [ {{fragment}} ]
             }
             """;
-        return MdCurr.From(MdItemReader.ReadString(wrapped).AllItems.Single());
+        return MdItemReader.ReadString(wrapped).AllItems.Single();
     }
 
-    [Theory]
-    // sec_type → (asset_class, vehicle_type): the vehicle is reliable; a fund's
-    // economic class is unknown (null), set later in the editor (ADR-0067).
-    [InlineData(null,          null,           null)]
-    [InlineData("",            null,           null)]
-    [InlineData("Mutual Fund", null,           "mutual_fund")]
-    [InlineData("ETF",         null,           "etf")]
-    [InlineData("Stock",       "equity",       "stock")]
-    [InlineData("Bond",        "fixed_income", "bond")]
-    [InlineData("CD",          "cash",         "cd")]
-    [InlineData("Money Market","cash",         "money_market")]
-    [InlineData("Option",      "alternative",  "option")]
-    [InlineData("UnknownType", null,           "other")]
-    public void TranslateSecType_splits_class_and_vehicle(string? secType, string? expectedClass, string? expectedVehicle)
-    {
-        var (assetClass, vehicleType) = SecurityMapper.TranslateSecType(secType);
-        Assert.Equal(expectedClass, assetClass);
-        Assert.Equal(expectedVehicle, vehicleType);
-    }
+    private static MdCurr CurrFromJson(string fragment) => MdCurr.From(ItemFromJson(fragment));
+
+    /// <summary>The security-type parameters of a type-s account, where Moneydance writes them.</summary>
+    private static MdSecurityFields AcctFieldsFromJson(string fragment) =>
+        MdAcct.From(ItemFromJson(fragment)).Security!;
 
     [Fact]
     public void Map_returns_null_for_non_security_curr()
@@ -46,7 +32,7 @@ public sealed class SecurityMapperTests
         var curr = CurrFromJson("""
             {"obj_type":"curr","id":"c-usd","name":"US Dollar","currid":"USD","isbase":"y"}
             """);
-        Assert.Null(SecurityMapper.Map(curr, TestLedgerId));
+        Assert.Null(SecurityMapper.Map(curr, MdSecurityFields.None, TestLedgerId));
     }
 
     [Fact]
@@ -57,12 +43,18 @@ public sealed class SecurityMapperTests
               "obj_type":"curr","id":"sec-1","name":"Fund A Emerging Markets",
               "currid":"^OEFQ","type":"s",
               "ticker":"IDXE","curr_id.CUSIP":"999888666",
-              "sec_type":"Mutual Fund","sec_exchange":"NYSE",
               "hide_in_ui":"n"
             }
             """);
+        var fields = AcctFieldsFromJson("""
+            {
+              "obj_type":"acct","id":"s-1","name":"Fund A Emerging Markets","type":"s",
+              "parentid":"brk","currid":"sec-1",
+              "sec_type":"2","sec_subtype":"International","sec_exchange":"NYSE"
+            }
+            """);
 
-        var row = SecurityMapper.Map(curr, TestLedgerId);
+        var row = SecurityMapper.Map(curr, fields, TestLedgerId);
 
         Assert.NotNull(row);
         Assert.Equal("sec-1", row!.ExternalId);
@@ -79,17 +71,53 @@ public sealed class SecurityMapperTests
     }
 
     [Fact]
+    public void Map_ignores_type_fields_left_on_the_curr()
+    {
+        // A curr carrying sec_type is not where Moneydance writes it; only the
+        // account's parameters classify the security.
+        var curr = CurrFromJson("""
+            {
+              "obj_type":"curr","id":"sec-c","name":"Fund","currid":"^F","type":"s","ticker":"F",
+              "sec_type":"3","sec_exchange":"NYSE"
+            }
+            """);
+
+        var row = SecurityMapper.Map(curr, MdSecurityFields.None, TestLedgerId);
+
+        Assert.NotNull(row);
+        Assert.Null(row!.VehicleType);
+        Assert.Null(row.AssetClass);
+        Assert.Null(row.ClassificationSource);
+        Assert.Null(row.ClassificationConfidence);
+        Assert.Null(row.Exchange);
+    }
+
+    [Fact]
+    public void Map_with_an_unrecognised_code_gives_vehicle_other()
+    {
+        var curr = CurrFromJson("""
+            {"obj_type":"curr","id":"sec-o","name":"Odd","currid":"^O","type":"s","ticker":"O"}
+            """);
+
+        var row = SecurityMapper.Map(curr, new MdSecurityFields("7", null, null), TestLedgerId);
+
+        Assert.NotNull(row);
+        Assert.Equal("other", row!.VehicleType);
+        Assert.Null(row.AssetClass);
+        Assert.Equal("import", row.ClassificationSource);
+    }
+
+    [Fact]
     public void Map_marks_hidden_securities_inactive()
     {
         var curr = CurrFromJson("""
             {
               "obj_type":"curr","id":"sec-2","name":"Old Fund",
-              "currid":"^Old","type":"s","ticker":"OLD",
-              "sec_type":"Mutual Fund","hide_in_ui":"y"
+              "currid":"^Old","type":"s","ticker":"OLD","hide_in_ui":"y"
             }
             """);
 
-        var row = SecurityMapper.Map(curr, TestLedgerId);
+        var row = SecurityMapper.Map(curr, new MdSecurityFields(MdSecurityType.MutualFund, null, null), TestLedgerId);
 
         Assert.NotNull(row);
         Assert.False(row!.IsActive);
@@ -101,11 +129,11 @@ public sealed class SecurityMapperTests
         var curr = CurrFromJson("""
             {
               "obj_type":"curr","id":"sec-3","name":"",
-              "currid":"^X","type":"s","ticker":"X","sec_type":"Stock"
+              "currid":"^X","type":"s","ticker":"X"
             }
             """);
 
-        var row = SecurityMapper.Map(curr, TestLedgerId);
+        var row = SecurityMapper.Map(curr, new MdSecurityFields(MdSecurityType.Stock, null, null), TestLedgerId);
 
         Assert.NotNull(row);
         Assert.Equal("(unnamed)", row!.Name);
@@ -117,12 +145,14 @@ public sealed class SecurityMapperTests
         var curr = CurrFromJson("""
             {
               "obj_type":"curr","id":"sec-4","name":"Test",
-              "currid":"^T","type":"s","ticker":"",
-              "sec_type":"Stock","sec_exchange":""
+              "currid":"^T","type":"s","ticker":""
             }
             """);
+        var fields = AcctFieldsFromJson("""
+            {"obj_type":"acct","id":"s-4","name":"Test","type":"s","currid":"sec-4","sec_type":"3","sec_exchange":""}
+            """);
 
-        var row = SecurityMapper.Map(curr, TestLedgerId);
+        var row = SecurityMapper.Map(curr, fields, TestLedgerId);
 
         Assert.NotNull(row);
         Assert.Null(row!.Ticker);
@@ -132,7 +162,7 @@ public sealed class SecurityMapperTests
     [Theory]
     [InlineData(4, 4)]    // typical stock / ETF
     [InlineData(5, 5)]    // typical mutual fund
-    [InlineData(9, 9)]    // some fund families' share classes, seen in real exports
+    [InlineData(9, 9)]    // some fund families' share classes
     [InlineData(0, 0)]    // edge: integer-only
     [InlineData(12, 12)]  // edge: matches schema upper bound post-migration 050
     [InlineData(null, 4)] // missing falls back to default
@@ -140,28 +170,26 @@ public sealed class SecurityMapperTests
     [InlineData(-1, 4)]
     public void Map_propagates_share_decimals_clamped_to_schema_bounds(int? mdDec, int expected)
     {
-        // Regression: the per-security precision bug. MD's `dec` was being
-        // parsed (MdCurr.Decimals) but dropped on the floor; the investment
-        // mapper hardcoded a divisor of 10^4 and silently lost precision on
-        // any security whose `dec` differed.
+        // Per-security precision: MD's `dec` (MdCurr.Decimals) must reach the
+        // investment mapper. A hardcoded divisor of 10^4 would silently lose
+        // precision on any security whose `dec` differs.
         //
-        // Migration 050 widened the schema CHECK from [0,6] to [0,12] so
-        // real-world dec=9 mutual funds round-trip
-        // correctly. The clamp follows in lockstep — values 7..12 now
-        // propagate through unchanged instead of falling back to 4.
+        // The schema CHECK allows [0,12] (migration 050) so a security with
+        // dec=9 can round-trip correctly. The clamp follows in lockstep —
+        // values 7..12 propagate through unchanged instead of falling back to 4.
         //
         // MD writes `dec` as a string-quoted integer in the export.
         var decFragment = mdDec is null ? string.Empty : $"\"dec\":\"{mdDec.Value}\",";
         var curr = CurrFromJson($$"""
             {
               "obj_type":"curr","id":"sec-dec","name":"Test",
-              "currid":"^T","type":"s","ticker":"T","sec_type":"Mutual Fund",
+              "currid":"^T","type":"s","ticker":"T",
               {{decFragment}}
               "hide_in_ui":"n"
             }
             """);
 
-        var row = SecurityMapper.Map(curr, TestLedgerId);
+        var row = SecurityMapper.Map(curr, new MdSecurityFields(MdSecurityType.MutualFund, null, null), TestLedgerId);
 
         Assert.NotNull(row);
         Assert.Equal(expected, row!.ShareDecimals);

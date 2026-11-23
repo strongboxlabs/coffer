@@ -3,17 +3,17 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import { WHOLE_TREE_SCAN_TIMEOUT_MS } from '@/lib/wholeTreeScan';
+
 /**
  * A surface with row context menus also offers a visible way in.
  *
- * WHY THIS EXISTS. ADR-0021 Rule 10 closes with "a check that a surface
- * rendering `onContextMenu` also renders a visible control would catch the
- * next one. Not built yet." This is that check.
+ * WHY THIS EXISTS. ADR-0021 Rule 10 calls for a check that a surface
+ * rendering `onContextMenu` also renders a visible control. This is that check.
  *
- * The rule was written after the Tags and Categories settings panels were
- * found to contain ZERO buttons between them: eight actions — rename,
- * recolour, merge, delete, add sub-category, move — reachable only by
- * right-clicking a row. Nothing about that is visible in review. The markup
+ * A settings panel can carry every row action — rename, recolour, merge,
+ * delete, add sub-category, move — reachable only by right-clicking a row,
+ * with zero buttons on it. Nothing about that is visible in review. The markup
  * reads fine, every action works, and the panel looks finished; what is
  * missing is an affordance, and absence is the one thing a screenshot cannot
  * show you.
@@ -21,15 +21,15 @@ import { describe, expect, it } from 'vitest';
  * WHAT IT CHECKS, AND WHY THAT AND NOT SOMETHING WEAKER. "Renders any button"
  * is the obvious check and it is worthless: the sidebar carries four
  * IconButtons — System settings, collapse, Account security, Sign out — all of
- * them global chrome, none of them a row action, and it would have passed
- * while its account rows had no visible path at all. So the check names the
+ * them global chrome, none of them a row action, and it would pass even if
+ * its account rows had no visible path at all. So the check names the
  * mechanism the rule itself prescribes: "On a list row, the visible path is
  * `RowActionsButton`".
  *
  * That is still file-level, and therefore a proxy rather than a proof — a file
  * could render a kebab on one row type and not another. It is the strongest
- * check available without a DOM, and it catches the failure that has actually
- * happened twice: a whole surface with no affordance on it.
+ * check available without a DOM, and it catches the failure that matters most:
+ * a whole surface with no affordance on it.
  *
  * EXCEPTIONS CARRY REASONS, not just names. An allowlist of bare paths
  * eventually vouches for itself; an entry that has to state why is one someone
@@ -56,11 +56,9 @@ const ROW_ACTIONS = /<RowActionsButton/;
  * data remain right-click-only. Anyone adding a row action there should ask
  * whether it also belongs on the bulk bar.
  *
- * This block, the two rationales below and the same claim in RowActionsButton
- * all used to say the bar carried "Categorize / Move / Delete". Categorize and
- * Tag are not on it and never have been — they are blocked on bulk write
- * endpoints that do not exist — so three copies of one sentence advertised a
- * visible path that was not there.
+ * Categorize and Tag are NOT on the bulk bar — they are blocked on bulk write
+ * endpoints that do not exist — so no rationale here may claim the bar offers
+ * them.
  */
 const EXCEPTIONS: ReadonlyMap<string, string> = new Map([
     [
@@ -110,7 +108,8 @@ describe('Rule 10 — a visible affordance beside every row context menu', () =>
         // which, for a rule about absence, would be its own punchline.
         const surfaces = contextMenuSurfaces();
         expect(surfaces.length).toBeGreaterThanOrEqual(5);
-        expect(surfaces).toContain('routes/ledgers/settings/CategoriesPanel.tsx');
+        // The row of Structure's lists owns both doors, so one surface answers for all three.
+        expect(surfaces).toContain('routes/ledgers/structure/StructureRow.tsx');
 
         // And prove the detector distinguishes attaching from threading: a
         // prop TYPE or a pass-through is not a surface.
@@ -118,7 +117,7 @@ describe('Rule 10 — a visible affordance beside every row context menu', () =>
         expect(ATTACHES_CONTEXT_MENU.test('onContextMenu?: (a: Anchor) => void;')).toBe(false);
         expect(ROW_ACTIONS.test('<RowActionsButton items={items} />')).toBe(true);
         expect(ROW_ACTIONS.test('<IconButton aria-label="Sign out" />')).toBe(false);
-    });
+    }, WHOLE_TREE_SCAN_TIMEOUT_MS);
 
     it('gives every context-menu surface a RowActionsButton', () => {
         const offenders: string[] = [];
@@ -133,7 +132,7 @@ describe('Rule 10 — a visible affordance beside every row context menu', () =>
             }
         }
         expect(offenders).toEqual([]);
-    });
+    }, WHOLE_TREE_SCAN_TIMEOUT_MS);
 
     it('keeps every exception honest', () => {
         // An exception that no longer describes anything is worse than no
@@ -147,5 +146,5 @@ describe('Rule 10 — a visible affordance beside every row context menu', () =>
             expect(reason.length, path).toBeGreaterThan(40);
         }
         expect(stale).toEqual([]);
-    });
+    }, WHOLE_TREE_SCAN_TIMEOUT_MS);
 });

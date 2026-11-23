@@ -7,10 +7,10 @@
 -- external_id ("ACT-…"), the Moneydance import emits another (the MD
 -- acct UUID), and so on. Pre-064 the schema stored a single
 -- `accounts.external_id` and the importer keyed on
--- `(ledger_id, external_id)`. When two sources represented the same
--- account, the importer couldn't unify them and created parallel
--- Ledger account rows — which then accumulated as drift and
--- corrupted re-imports added duplicate legs alongside existing ones.
+-- `(ledger_id, external_id)`. When two sources represent the same
+-- account, the importer can't unify them and creates parallel Ledger
+-- account rows, and a re-import then adds duplicate legs alongside the
+-- existing ones.
 --
 -- This migration introduces an `account_external_ids` junction so a
 -- single Ledger account can carry N source-specific external_ids,
@@ -57,9 +57,9 @@ COMMENT ON TABLE account_external_ids IS
     'can carry one external_id per source (moneydance, simplefin, '
     'manual). The importer''s account-adoption path consults this '
     'table to find an existing account before creating a new one. '
-    'Replaces direct keying on accounts.external_id (which only '
-    'supported one identity per account and led to dual-source '
-    'account drift in dev DBs).';
+    'Replaces direct keying on accounts.external_id, which supported '
+    'only one identity per account, so two sources for one account '
+    'produced parallel account rows.';
 
 
 -- -----------------------------------------------------------------------------

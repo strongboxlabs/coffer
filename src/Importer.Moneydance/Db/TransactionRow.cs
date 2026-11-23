@@ -27,7 +27,6 @@ public sealed record TransactionRow(
     bool IsPending,
     string? InvestmentAction,
     string? FeedPayee,
-    string? FeedMemo,
     decimal FeedAmount,
     DateTimeOffset FeedPostedAt,
     DateTimeOffset? FeedTransactedAt,

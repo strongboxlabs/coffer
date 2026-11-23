@@ -13,29 +13,29 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.MultiUser;
 
 /// <summary>
-/// An invite lasts only as long as its sender's authority to send it (2026-10-12
-/// security audit, M6).
+/// An invite lasts only as long as its sender's authority to send it (ADR-0105 D4).
 /// </summary>
 /// <remarks>
-/// Redemption checked only the token, that it was unused and unexpired. A removed owner
-/// could keep an owner invite they had sent as a way back in; a demoted admin could
-/// accept their own admin invite. Now an invite dies with the role — deleted when the
-/// sender loses it, and refused at redemption if one is ever missed.
+/// A redemption that checks only the token, that it is unused and unexpired, lets a
+/// removed owner keep an owner invite they had sent as a way back in, and lets a demoted
+/// admin accept their own admin invite. So an invite dies with the role — deleted when
+/// the sender loses it, and refused at redemption if one is ever missed.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class InviteAuthorityTests
+public sealed class InviteAuthorityTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
+    public InviteAuthorityTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
-    public InviteAuthorityTests(PostgresFixture fixture) => _fixture = fixture;
-
-    private InvitesRepository Invites => new(_fixture.NewServiceFactory(), TimeProvider.System);
+    private InvitesRepository Invites => new(Db.NewServiceFactory(), TimeProvider.System);
 
     /// <summary>A session for any user id (SyntheticLedger issues one only for its own user).</summary>
     private async Task<HttpClient> CookieClientForAsync(ApiFactory factory, Guid userId)
     {
         var (plaintext, hash) = SessionService.GenerateCookieValue();
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             db.AuthSessions.Add(new SessionRow
             {
@@ -51,7 +51,7 @@ public sealed class InviteAuthorityTests
 
     private async Task MakeAdminAsync(Guid userId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await db.Users.Where(u => u.Id == userId)
             .ExecuteUpdateAsync(s => s.SetProperty(u => u.IsAdmin, _ => true));
     }
@@ -67,19 +67,19 @@ public sealed class InviteAuthorityTests
 
     private async Task<int> PendingIssuedByAsync(Guid userId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.Invites.CountAsync(i => i.IssuedByUserId == userId && i.ConsumedAt == null);
     }
 
     [Fact]
     public async Task A_removed_owners_invites_are_deleted_and_stop_working()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);   // ledger.UserId owns it
+        var ledger = await SyntheticLedger.CreateAsync(Db);   // ledger.UserId owns it
         var coOwner = await ledger.AddMemberAsync("owner");
         var token = await Invites.CreateAsync(ledger.UserId, ledger.LedgerId, "owner", grantsAdmin: false);
         var coOwnersToken = await Invites.CreateAsync(coOwner, ledger.LedgerId, "viewer", grantsAdmin: false);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var anonymous = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
         Assert.True(await PreviewWorksAsync(anonymous, token));
 
@@ -98,14 +98,14 @@ public sealed class InviteAuthorityTests
     {
         // The redemption-time check on its own: the role is changed without the
         // cleanup running, as any future path that forgets it would.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var token = await Invites.CreateAsync(ledger.UserId, ledger.LedgerId, "owner", grantsAdmin: false);
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             await db.UserLedgerGrants
                 .Where(g => g.UserId == ledger.UserId && g.LedgerId == ledger.LedgerId)
                 .ExecuteUpdateAsync(s => s.SetProperty(g => g.Role, _ => "viewer"));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var anonymous = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
 
         Assert.False(await PreviewWorksAsync(anonymous, token));
@@ -115,13 +115,13 @@ public sealed class InviteAuthorityTests
     [Fact]
     public async Task A_demoted_admins_admin_invites_are_deleted_and_stop_working()
     {
-        var first = await SyntheticLedger.CreateAsync(_fixture);
-        var second = await SyntheticLedger.CreateAsync(_fixture);
+        var first = await SyntheticLedger.CreateAsync(Db);
+        var second = await SyntheticLedger.CreateAsync(Db);
         await MakeAdminAsync(first.UserId);
         await MakeAdminAsync(second.UserId);
         var token = await Invites.CreateAsync(second.UserId, ledgerId: null, role: null, grantsAdmin: true);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var anonymous = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
         Assert.True(await PreviewWorksAsync(anonymous, token));
 
@@ -138,13 +138,13 @@ public sealed class InviteAuthorityTests
     {
         // An invite with no ledger and no admin grant only creates an account, but only
         // the admin endpoint can issue one, so it is admin authority all the same.
-        var first = await SyntheticLedger.CreateAsync(_fixture);
-        var second = await SyntheticLedger.CreateAsync(_fixture);
+        var first = await SyntheticLedger.CreateAsync(Db);
+        var second = await SyntheticLedger.CreateAsync(Db);
         await MakeAdminAsync(first.UserId);
         await MakeAdminAsync(second.UserId);
         var token = await Invites.CreateAsync(second.UserId, ledgerId: null, role: null, grantsAdmin: false);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var anonymous = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
         Assert.True(await PreviewWorksAsync(anonymous, token));
 
@@ -164,12 +164,12 @@ public sealed class InviteAuthorityTests
     [Fact]
     public async Task A_disabled_senders_invites_are_deleted()
     {
-        var admin = await SyntheticLedger.CreateAsync(_fixture);
+        var admin = await SyntheticLedger.CreateAsync(Db);
         await MakeAdminAsync(admin.UserId);
-        var sender = await SyntheticLedger.CreateAsync(_fixture);
+        var sender = await SyntheticLedger.CreateAsync(Db);
         var token = await Invites.CreateAsync(sender.UserId, sender.LedgerId, "editor", grantsAdmin: false);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var adminClient = await CookieClientForAsync(factory, admin.UserId);
         var disabled = await adminClient.PutAsJsonAsync($"/api/admin/users/{sender.UserId}/disabled", new { disabled = true });
         Assert.Equal(HttpStatusCode.NoContent, disabled.StatusCode);

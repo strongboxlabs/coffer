@@ -1,8 +1,8 @@
 -- 250 — backup_settings: the daily retention tier is at least one day.
 --
--- Migration 161 allowed 0/0/0. At that setting no tier selected the backup that was
--- just written, so the retention pass deleted it straight after writing it, while the
--- create answered 201 and the scheduled job reported success (FU-062). Retention now
+-- Migration 161 allows 0/0/0. At that setting no tier selects the backup that was
+-- just written, so the retention pass deletes it straight after writing it, while the
+-- create answers 201 and the scheduled job reports success (FU-062). Retention now
 -- also never deletes the newest backup (BackupStore.SelectForDeletion); this makes the
 -- stored policy say what it does: at least one daily backup is kept.
 --

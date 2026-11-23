@@ -29,8 +29,33 @@ public static class McpTokensEndpoints
         var group = routes.MapGroup("/api/account/mcp-tokens").RequireAuthorization();
         group.MapGet("/", ListAsync);
         group.MapPost("/", CreateAsync);
+        group.MapPatch("/{tokenId:guid}", RenameAsync);
         group.MapDelete("/{tokenId:guid}", RevokeAsync);
         return routes;
+    }
+
+    private static async Task<IResult> RenameAsync(
+        Guid tokenId,
+        RenameConnectionRequest request,
+        ICurrentUserAccessor currentUser,
+        McpTokensRepository tokens,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        // A token's name is the only handle its owner has on it, so unlike an OAuth
+        // connection it cannot be cleared.
+        var name = request.Name?.Trim();
+        if (string.IsNullOrEmpty(name))
+            return BusinessError.Problem(BusinessError.Codes.McpTokenNameRequired,
+                "A name for the connected app is required.");
+
+        var renamed = await tokens.RenameAsync(currentUser.UserId, tokenId, name, cancellationToken)
+                                  .ConfigureAwait(false);
+        return renamed
+            ? Results.NoContent()
+            : BusinessError.Problem(BusinessError.Codes.McpTokenNotFound,
+                "No active token with that id for this user.");
     }
 
     private static async Task<IResult> ListAsync(
@@ -54,7 +79,7 @@ public static class McpTokensEndpoints
         CancellationToken cancellationToken)
     {
         // A token reads every ledger the user can, for up to 90 days or forever, and
-        // outlives the cookie that minted it: a tap, not just a cookie (2026-10-12 audit, M2).
+        // outlives the cookie that minted it: a tap, not just a cookie (ADR-0105 D1).
         var approval = await stepUp.RequireAsync(StepUpActions.McpToken, cancellationToken)
                                    .ConfigureAwait(false);
         if (approval.Failure is not null)

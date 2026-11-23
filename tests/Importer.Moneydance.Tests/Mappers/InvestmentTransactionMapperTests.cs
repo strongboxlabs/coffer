@@ -52,10 +52,10 @@ public sealed class InvestmentTransactionMapperTests
         return new Lookups(
             Accounts: new Dictionary<string, AccountRef>(StringComparer.Ordinal)
             {
-                [Brokerage] = new(brokerageId, "investment", HoldingsAccountId: holdingsId),
-                [OtherAcct] = new(otherId,    "bank"),
-                [IncomeCat] = new(incomeId,   "category"),
-                [FeeCat]    = new(feeId,      "category"),
+                [Brokerage] = new(brokerageId, "investment", HoldingsAccountId: holdingsId, AmountDecimals: 2),
+                [OtherAcct] = new(otherId,    "bank", AmountDecimals: 2),
+                [IncomeCat] = new(incomeId,   "category", AmountDecimals: 2),
+                [FeeCat]    = new(feeId,      "category", AmountDecimals: 2),
             },
             SecuritiesByAcct: new Dictionary<string, SecurityRef>(StringComparer.Ordinal)
             {
@@ -124,10 +124,10 @@ public sealed class InvestmentTransactionMapperTests
     [Fact]
     public void Buy_uses_per_security_share_decimals_for_quantity_scaling()
     {
-        // Regression for the per-security precision bug: mutual funds with
-        // dec=5 had their share counts silently 10× wrong because the mapper
-        // hardcoded 10^4. The same MD samt means samt / 10^dec shares, so
-        // each extra decimal place means a tenth as many shares.
+        // Per-security precision: a hardcoded 10^4 divisor would make the
+        // share counts of a dec=5 mutual fund silently 10× wrong. The same MD
+        // samt means samt / 10^dec shares, so each extra decimal place means a
+        // tenth as many shares.
         var txn = TxnFromJson($$"""
             {
               "obj_type":"txn","id":"buy-mf","acctid":"{{Brokerage}}",
@@ -138,7 +138,7 @@ public sealed class InvestmentTransactionMapperTests
             }
             """);
 
-        // dec=4: samt / 10^4 shares (the prior hardcoded behaviour).
+        // dec=4: samt / 10^4 shares.
         var stockLookups = BuildLookups(shareDecimals: 4);
         var stockResult = InvestmentTransactionMapper.Map(
             txn, stockLookups.Accounts, stockLookups.SecuritiesByAcct, "test");
@@ -147,7 +147,7 @@ public sealed class InvestmentTransactionMapperTests
         Assert.Equal(100m, stockResult.Rows.Single(r => r.AccountId == stockLookups.HoldingsId).Quantity);
 
         // dec=5: samt / 10^5, a tenth of the dec=4 count (mutual-fund
-        // precision; the case the old hardcoded divisor mis-scaled by 10×).
+        // precision; the case a hardcoded 10^4 divisor mis-scales by 10×).
         var mfLookups = BuildLookups(shareDecimals: 5);
         var mfResult = InvestmentTransactionMapper.Map(
             txn, mfLookups.Accounts, mfLookups.SecuritiesByAcct, "test");
@@ -234,10 +234,10 @@ public sealed class InvestmentTransactionMapperTests
         Assert.Equal(-550.00m, holdings.FeedAmount);
         Assert.Equal("sell", cash.InvestmentAction);
         Assert.Equal(-50m, holdings.Quantity);
-        // Regression: ComputeUnitPrice used to divide positive cash by
-        // signed qty, so Sells produced a negative unit_price and
-        // qty × price came out positive while amount was negative. Unit
-        // price is now always a magnitude — direction lives in qty + amount.
+        // Unit price is always a magnitude — direction lives in qty + amount.
+        // Dividing positive cash by signed qty would give a Sell a negative
+        // unit_price, so qty × price would come out positive while amount
+        // was negative.
         Assert.Equal(11.00m, holdings.UnitPrice);
 
         Assert.Equal(-50m, result.HoldingDelta!.QuantityDelta);
@@ -291,6 +291,33 @@ public sealed class InvestmentTransactionMapperTests
     }
 
     [Fact]
+    public void MapToHeaderAndLegs_stamps_the_home_brokerage_as_the_originating_account()
+    {
+        // Migration 263: the Moneydance home (acctid), literally. On a
+        // buyx funded from another account the home brokerage is on every posting and
+        // the funding account on the transfer posting only.
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"buyx-owner","acctid":"{{Brokerage}}","dt":"20240301","stat":"X",
+              "invest.txntype":"buyx","xfer_type":"xfrtp_buysellxfr",
+              "0.id":"sec","0.acctid":"{{SecAcct}}","0.invest.splittype":"sec","0.samt":"1000000","0.pamt":"-10000","0.stat":"X",
+              "1.id":"xfr","1.acctid":"{{OtherAcct}}","1.invest.splittype":"xfr","1.samt":"-10000","1.pamt":"10000","1.stat":" "
+            }
+            """);
+        var lookups = BuildLookups();
+
+        var result = InvestmentTransactionMapper.MapToHeaderAndLegs(
+            txn, lookups.Accounts, lookups.SecuritiesByAcct,
+            ledgerId: Guid.NewGuid(), importSource: "test");
+
+        Assert.Null(result.Skip);
+        var home = lookups.Accounts[Brokerage].Id;
+        Assert.Equal(home, result.Header!.OriginatingAccountId);
+        var postings = result.Legs.Select(l => l.PostingIndex).Distinct().ToList();
+        Assert.All(postings, p => Assert.Contains(result.Legs, l => l.PostingIndex == p && l.AccountId == home));
+    }
+
+    [Fact]
     public void MapToHeaderAndLegs_seeds_reconciliation_per_leg_role_on_buyx()
     {
         // buyx: brokerage cleared (parent "X"), external cash UNCLEARED (the
@@ -338,7 +365,7 @@ public sealed class InvestmentTransactionMapperTests
     [Fact]
     public void Sellx_with_residual_proceeds_keeps_change_on_brokerage()
     {
-        // Real-world pattern: the amount transferred to the other account
+        // A sellx whose amount transferred to the other account
         // is a few cents short of what the sale grosses. The residual stays
         // on the brokerage's cash side, matching MD's pamt accounting.
         var txn = TxnFromJson($$"""
@@ -432,7 +459,7 @@ public sealed class InvestmentTransactionMapperTests
         // security_id pinned to cash row keeps dividend in the per-security
         // register; quantity/price are NULL because the cash side of a
         // dividend has no per-share semantics (only the buy side of a
-        // DivReinvest does). Earlier code wrote 0/0 here, which the
+        // Reinvest does). Earlier code wrote 0/0 here, which the
         // SecurityDetailPage rendered as a zero-price, zero-share line of noise.
         Assert.Equal(lookups.SecurityId, cash.SecurityId);
         Assert.Null(cash.Quantity);
@@ -733,8 +760,8 @@ public sealed class InvestmentTransactionMapperTests
         // header / split), so the proceeds GENUINELY sit in the brokerage:
         // the sec pair books cash +proceeds / Holdings -proceeds, the
         // self-loop xfr leg is skipped, and the header BALANCES. Regression
-        // guard for ADR-0052 D4 (a prior version zeroed the cash, dropping
-        // the proceeds and unbalancing every self-ref buyx/sellx).
+        // guard for ADR-0052 D4 (zeroing the cash would drop the proceeds and
+        // unbalance every self-ref buyx/sellx).
         var lookups = BuildLookups();
         var primaryAcctId = lookups.Accounts[Brokerage].Id;
         // Xfr target = primary brokerage (self-ref).
@@ -926,5 +953,194 @@ public sealed class InvestmentTransactionMapperTests
         // MD minor units → decimal (pamt / 10^2), sign kept; sign discriminates expense.
         var cashLeg = result.Legs.Single(l => l.Amount < 0);
         Assert.Equal(-15m, cashLeg.Amount);
+    }
+
+    // -- check number ---------------------------------------------------------
+    //
+    // The investment route keeps MD's `chk` on every investment header, as the
+    // bank route does. A QIF-origin row carries its QIF action word there ("Buy",
+    // "ReinvLg"), which is the only place the original QIF distinction between
+    // the reinvest variants survives. Same normalization as the bank route:
+    // blank becomes null, anything else is kept verbatim.
+
+    [Fact]
+    public void Qif_origin_buy_keeps_its_chk_word_as_the_check_number()
+    {
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"qif-buy","acctid":"{{Brokerage}}",
+              "desc":"BUY IDXB","dt":"20240115","chk":"Buy",
+              "qif_invst_action":"Buy","xfer_type":"xfrtp_buysell",
+              "0.id":"s","0.acctid":"{{SecAcct}}","0.invest.splittype":"sec",
+              "0.samt":"1000000","0.pamt":"-10000"
+            }
+            """);
+        var lookups = BuildLookups();
+
+        var result = InvestmentTransactionMapper.MapToHeaderAndLegs(
+            txn, lookups.Accounts, lookups.SecuritiesByAcct,
+            ledgerId: Guid.NewGuid(), importSource: "test");
+
+        Assert.Equal("buy", result.Header!.Action);
+        Assert.Equal("Buy", result.Header.CheckNumber);
+    }
+
+    [Fact]
+    public void Qif_origin_reinvest_keeps_the_reinvest_variant_in_the_check_number()
+    {
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"qif-reinvlg","acctid":"{{Brokerage}}",
+              "dt":"20240320","chk":"ReinvLg",
+              "qif_invst_action":"ReinvLg","xfer_type":"xfrtp_dividend",
+              "0.id":"sec","0.acctid":"{{SecAcct}}","0.invest.splittype":"sec",
+              "0.samt":"100000","0.pamt":"-989",
+              "1.id":"inc","1.acctid":"{{IncomeCat}}","1.invest.splittype":"inc",
+              "1.samt":"-989","1.pamt":"989"
+            }
+            """);
+        var lookups = BuildLookups();
+
+        var result = InvestmentTransactionMapper.MapToHeaderAndLegs(
+            txn, lookups.Accounts, lookups.SecuritiesByAcct,
+            ledgerId: Guid.NewGuid(), importSource: "test");
+
+        Assert.Equal("dividend_reinvest", result.Header!.Action);
+        Assert.Equal("ReinvLg", result.Header.CheckNumber);
+    }
+
+    [Fact]
+    public void Txntype_bank_transfer_keeps_its_check_number()
+    {
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"bank-chk","acctid":"{{Brokerage}}",
+              "dt":"20240401","chk":"XOut",
+              "invest.txntype":"bank","xfer_type":"xfrtp_bank",
+              "0.id":"xfr","0.acctid":"{{OtherAcct}}","0.invest.splittype":"xfr",
+              "0.samt":"100000","0.pamt":"-100000"
+            }
+            """);
+        var lookups = BuildLookups();
+
+        var result = InvestmentTransactionMapper.MapToHeaderAndLegs(
+            txn, lookups.Accounts, lookups.SecuritiesByAcct,
+            ledgerId: Guid.NewGuid(), importSource: "test");
+
+        Assert.Equal("transfer", result.Header!.Action);
+        Assert.Equal("XOut", result.Header.CheckNumber);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void A_blank_chk_becomes_a_null_check_number(string chk)
+    {
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"buy-blank-chk","acctid":"{{Brokerage}}",
+              "dt":"20240115","chk":"{{chk}}",
+              "invest.txntype":"buy","xfer_type":"xfrtp_buysell",
+              "0.id":"s","0.acctid":"{{SecAcct}}","0.invest.splittype":"sec",
+              "0.samt":"1000000","0.pamt":"-10000"
+            }
+            """);
+        var lookups = BuildLookups();
+
+        var result = InvestmentTransactionMapper.MapToHeaderAndLegs(
+            txn, lookups.Accounts, lookups.SecuritiesByAcct,
+            ledgerId: Guid.NewGuid(), importSource: "test");
+
+        Assert.NotNull(result.Header);
+        Assert.Null(result.Header!.CheckNumber);
+    }
+
+    // -- feed originals (FU-024) ----------------------------------------------
+    //
+    // Same rule as the bank route: seed txn_header_originals with the feed's
+    // payee/memo only where they differ from what the header was written with.
+
+    [Fact]
+    public void MapToHeaderAndLegs_seeds_originals_when_the_feed_payee_differs()
+    {
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"div-orig","acctid":"{{Brokerage}}",
+              "desc":"Dividend","memo":"curated memo","dt":"20240320",
+              "ol.orig-payee":"DIV RECEIVED IDXB",
+              "invest.txntype":"div","xfer_type":"xfrtp_dividend",
+              "0.id":"sec","0.acctid":"{{SecAcct}}","0.invest.splittype":"sec",
+              "0.samt":"0","0.pamt":"0",
+              "1.id":"inc","1.acctid":"{{IncomeCat}}","1.invest.splittype":"inc",
+              "1.samt":"-989","1.pamt":"989"
+            }
+            """);
+        var lookups = BuildLookups();
+
+        var result = InvestmentTransactionMapper.MapToHeaderAndLegs(
+            txn, lookups.Accounts, lookups.SecuritiesByAcct,
+            ledgerId: Guid.NewGuid(), importSource: "test");
+
+        var seed = Assert.IsType<HeaderOriginalsSeed>(result.Originals);
+        Assert.Equal(result.Header!.Id, seed.HeaderId);
+        Assert.Equal("DIV RECEIVED IDXB", seed.Payee);
+        Assert.Equal("curated memo",      seed.Memo);
+        Assert.Equal("Dividend",          result.Header.Payee);
+    }
+
+    [Fact]
+    public void MapToHeaderAndLegs_seeds_originals_when_the_feed_memo_differs()
+    {
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"buy-orig-memo","acctid":"{{Brokerage}}",
+              "desc":"BUY IDXB","memo":"curated memo","dt":"20240115",
+              "ol.orig-memo":"raw memo",
+              "invest.txntype":"buy","xfer_type":"xfrtp_buysell",
+              "0.id":"s","0.acctid":"{{SecAcct}}","0.invest.splittype":"sec",
+              "0.samt":"1000000","0.pamt":"-10000"
+            }
+            """);
+        var lookups = BuildLookups();
+
+        var result = InvestmentTransactionMapper.MapToHeaderAndLegs(
+            txn, lookups.Accounts, lookups.SecuritiesByAcct,
+            ledgerId: Guid.NewGuid(), importSource: "test");
+
+        var seed = Assert.IsType<HeaderOriginalsSeed>(result.Originals);
+        Assert.Equal("BUY IDXB", seed.Payee);
+        Assert.Equal("raw memo", seed.Memo);
+        // ADR-0114 D15: the brokerage's cash leg as written; the Holdings sibling's leg
+        // is the other side and is not counted.
+        Assert.Equal(-100.00m, seed.Amount);
+    }
+
+    [Theory]
+    [InlineData("BUY IDXB", "curated memo", "BUY IDXB", "curated memo")]
+    [InlineData("BUY IDXB", "curated memo", null, null)]
+    [InlineData("", "curated memo", "BUY IDXB RAW", null)]
+    public void MapToHeaderAndLegs_seeds_no_originals_when_the_feed_agrees_with_what_was_written(
+        string desc, string memo, string? origPayee, string? origMemo)
+    {
+        var olFields = (origPayee is null ? "" : $"\"ol.orig-payee\":\"{origPayee}\",")
+                     + (origMemo  is null ? "" : $"\"ol.orig-memo\":\"{origMemo}\",");
+        var txn = TxnFromJson($$"""
+            {
+              "obj_type":"txn","id":"buy-orig-none","acctid":"{{Brokerage}}",
+              "desc":"{{desc}}","memo":"{{memo}}",{{olFields}}
+              "dt":"20240115",
+              "invest.txntype":"buy","xfer_type":"xfrtp_buysell",
+              "0.id":"s","0.acctid":"{{SecAcct}}","0.invest.splittype":"sec",
+              "0.samt":"1000000","0.pamt":"-10000"
+            }
+            """);
+        var lookups = BuildLookups();
+
+        var result = InvestmentTransactionMapper.MapToHeaderAndLegs(
+            txn, lookups.Accounts, lookups.SecuritiesByAcct,
+            ledgerId: Guid.NewGuid(), importSource: "test");
+
+        Assert.NotNull(result.Header);
+        Assert.Null(result.Originals);
     }
 }

@@ -12,9 +12,9 @@ namespace Coffer.Api.Reminders;
 /// <para>
 /// Every bound here is NON-DESTRUCTIVE. An occurrence a bound excludes stays exactly as
 /// it was — un-acted, un-skipped, on the calendar, postable by hand. That is the whole
-/// reason auto-post fires with <see cref="ReminderCatchUp.LeaveEarlierOpen"/>: a bound
-/// that stopped the job posting AND let the cascade mark the slot skipped would be silent
-/// data loss dressed up as a safety limit.
+/// reason the job's fire leaves earlier occurrences open rather than marking them skipped
+/// as a person's post does: a bound that stopped the job posting AND let a cascade mark
+/// the slot skipped would be silent data loss dressed up as a safety limit.
 /// </para>
 /// </remarks>
 /// <param name="CatchUpDays">

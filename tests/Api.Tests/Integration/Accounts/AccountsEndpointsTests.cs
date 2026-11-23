@@ -17,13 +17,11 @@ namespace Coffer.Api.Tests.Integration.Accounts;
 /// per-user/per-ledger scoping is exercised end-to-end.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class AccountsEndpointsTests
+public sealed class AccountsEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AccountsEndpointsTests(PostgresFixture fixture)
+    public AccountsEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -40,14 +38,14 @@ public sealed class AccountsEndpointsTests
     [Fact]
     public async Task Get_returns_accounts_that_belong_to_the_ledger_sorted_by_name()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         // Insert two accounts in deliberately non-alphabetical order to
         // assert the endpoint sorts by name (not by insertion order).
         await ledger.AddBankAccountAsync("zebra-checking");
         await ledger.AddBankAccountAsync("alpha-savings");
         await ledger.AddCategoryAsync("groceries", "expense");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.GetAsync($"/api/ledgers/{ledger.LedgerId}/accounts");
@@ -60,6 +58,39 @@ public sealed class AccountsEndpointsTests
         Assert.All(rows, r => Assert.Equal(ledger.LedgerId, r.LedgerId));
     }
 
+    /// <summary>
+    /// Names need not be unique, so the name alone leaves same-named accounts in whatever
+    /// order the database returns them, which can differ between two reads. The id breaks
+    /// the tie: same-named accounts come back in id order, on every read.
+    /// </summary>
+    [Fact]
+    public async Task Get_lists_same_named_accounts_in_id_order_on_every_read()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var made = new List<Guid>();
+        foreach (var name in new[] { "Account T", "Account S", "Account T", "Account T", "Account T",
+                                     "Account T", "Account T", "Account T", "Account T" })
+        {
+            var resp = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/accounts",
+                new CreateAccountRequest { Name = name, AccountType = "bank", CurrencyCode = "USD" });
+            Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+            if (name == "Account T")
+                made.Add((await resp.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetGuid());
+        }
+        // The database's uuid order is the order of the canonical text.
+        var byId = made.OrderBy(id => id.ToString("D"), StringComparer.Ordinal).ToArray();
+
+        for (var read = 0; read < 2; read++)
+        {
+            var rows = (await client.GetFromJsonAsync<AccountSummary[]>($"/api/ledgers/{ledger.LedgerId}/accounts"))!;
+            Assert.Equal("Account S", rows[0].Name);
+            Assert.Equal(byId, rows.Where(r => r.Name == "Account T").Select(r => r.Id).ToArray());
+        }
+    }
+
     [Fact]
     public async Task Get_returns_422_ledger_not_visible_when_user_has_no_grant()
     {
@@ -68,11 +99,11 @@ public sealed class AccountsEndpointsTests
         // fail with the same ledger-not-visible code as
         // /api/ledgers/me/last-opened, so the API doesn't leak ledger
         // existence by status-code differentiation.
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
         await alice.AddBankAccountAsync("alices-account");
 
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var bob = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var response = await bobClient.GetAsync($"/api/ledgers/{alice.LedgerId}/accounts");
@@ -88,8 +119,8 @@ public sealed class AccountsEndpointsTests
     {
         // Fresh ledger, no accounts added — still 200 with []. Confirms
         // the empty-result path doesn't accidentally 404 or 422.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.GetAsync($"/api/ledgers/{ledger.LedgerId}/accounts");
@@ -122,12 +153,12 @@ public sealed class AccountsEndpointsTests
         //   3. PATCH enabled=true  → recompute reads flag=TRUE,
         //      folds fee back in → unit_cost converges back to the
         //      fee-inclusive unit cost.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var securityId = await ledger.AddSecurityAsync("Index ETF A", ticker: "ETFA");
         var expenseCategory = await ledger.AddCategoryAsync("Trading Commission", kind: "expense");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var createResp = await client.PostAsJsonAsync(
@@ -156,7 +187,7 @@ public sealed class AccountsEndpointsTests
             new PatchAccountTradeCommissionRequest { Enabled = false });
         Assert.Equal(HttpStatusCode.NoContent, patchOff.StatusCode);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var lot = await db.Lots.AsNoTracking()
                 .SingleAsync(l => l.LedgerId == ledger.LedgerId);
@@ -176,7 +207,7 @@ public sealed class AccountsEndpointsTests
             new PatchAccountTradeCommissionRequest { Enabled = true });
         Assert.Equal(HttpStatusCode.NoContent, patchOn.StatusCode);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var lot = await db.Lots.AsNoTracking()
                 .SingleAsync(l => l.LedgerId == ledger.LedgerId);
@@ -197,10 +228,10 @@ public sealed class AccountsEndpointsTests
         // alongside the type check (in one query). A non-investment
         // account must still 422 — not throw because HoldingsAccountId
         // is null.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PatchAsJsonAsync(
@@ -217,12 +248,12 @@ public sealed class AccountsEndpointsTests
         // on both. SyntheticLedger.CreateAsync mints a fresh user per
         // call, so this test uses two AddBankAccountAsync calls on two
         // distinct ledgers and authenticates as the first one's user.
-        var ledgerA = await SyntheticLedger.CreateAsync(_fixture);
-        var ledgerB = await SyntheticLedger.CreateAsync(_fixture);
+        var ledgerA = await SyntheticLedger.CreateAsync(Db);
+        var ledgerB = await SyntheticLedger.CreateAsync(Db);
         await ledgerA.AddBankAccountAsync("a-account");
         await ledgerB.AddBankAccountAsync("b-account");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledgerA);
 
         var response = await client.GetAsync($"/api/ledgers/{ledgerA.LedgerId}/accounts");
@@ -241,11 +272,11 @@ public sealed class AccountsEndpointsTests
         // GET the default list and assert only the active remains.
         // Exercises both the new filter (in ListByLedgerAsync) and
         // the PATCH /active endpoint end-to-end.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var active = await ledger.AddBankAccountAsync("active-checking");
         var inactive = await ledger.AddBankAccountAsync("closed-savings");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var deactivateResp = await client.PatchAsJsonAsync(
@@ -268,11 +299,11 @@ public sealed class AccountsEndpointsTests
         // ?includeInactive=true the list returns both accounts.
         // The IsActive flag on each row lets the SPA render them
         // differently (greyed / strikethrough for inactive).
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var active = await ledger.AddBankAccountAsync("active-checking");
         var inactive = await ledger.AddBankAccountAsync("closed-savings");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         await client.PatchAsJsonAsync(
@@ -293,10 +324,10 @@ public sealed class AccountsEndpointsTests
     {
         // Symmetric: PATCH active=false then active=true. The
         // re-activated account reappears in the default list.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var account = await ledger.AddBankAccountAsync("test-account");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         await client.PatchAsJsonAsync(
@@ -322,11 +353,11 @@ public sealed class AccountsEndpointsTests
         // be user-deactivatable. AddInvestmentAccountAsync creates
         // the brokerage + its IsSystem=true Holdings sibling; the
         // brokerage itself is NOT system, so we PATCH the sibling.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Test Brokerage");
         var holdingsSiblingId = brokerage.HoldingsAccountId!.Value;
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PatchAsJsonAsync(

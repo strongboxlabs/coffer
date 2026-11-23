@@ -11,28 +11,29 @@ interface CategoryFieldProps {
     valueId: string | null;
     onChangeId: (next: string | null) => void;
     error?: string | null;
-    disabled?: boolean;
+    /** The save is in flight: the picker keeps focus and refuses input (pending.ts). */
+    pending?: boolean;
 }
 
 /**
  * Category picker for actions whose layout includes a category slot
  * (dividend_cash / dividend_reinvest / divx / misc).
  *
- * KIND IS NO LONGER A FILTER (ADR-0017). This used to offer income kinds only,
- * widening to expense for `misc` alone. Three reasons that went:
+ * KIND IS NOT A FILTER (ADR-0017). Not income kinds only, widening to expense for
+ * `misc` alone, for three reasons:
  *
- *   1. It blocked real work. A valuation adjustment — reconciling a retirement
+ *   1. It would block real work. A valuation adjustment — reconciling a retirement
  *      balance, one of the two cases the 'adjustment' kind exists for — could
- *      never be selected here at all, so the feature had no path to the screen.
- *   2. It was not load-bearing. What classifies an investment posting is
+ *      never be selected here at all, so the feature would have no path to the screen.
+ *   2. It is not load-bearing. What classifies an investment posting is
  *      `posting_role`, stamped from the header action, NOT category_kind:
- *      investment_income filters on posting_role='income'. Opening this up
+ *      investment_income filters on posting_role='income'. An open picker
  *      cannot corrupt investment income or fee netting.
- *   3. It protected almost nothing. The distortion it nominally guarded against
+ *   3. It would protect almost nothing. The distortion it would guard against
  *      — money landing in the wrong reporting measure — arrives overwhelmingly
  *      through the IMPORTER, which bypasses every picker.
  *
- * What replaces it is disclosure: the picker states each category's kind on the
+ * In its place is disclosure: the picker states each category's kind on the
  * row, so the choice is informed rather than prevented. `isActive` and
  * `accountType` stay — those are different rules, about archived rows and about
  * what a category IS.
@@ -41,7 +42,7 @@ interface CategoryFieldProps {
  * matches, grouped, id-resolved, with the frequent pin.
  */
 export function CategoryField({
-    accounts, frequent, valueId, onChangeId, error, disabled,
+    accounts, frequent, valueId, onChangeId, error, pending,
 }: CategoryFieldProps) {
     const isEligible = useCallback(
         (a: AccountSummary) => a.isActive && a.accountType === 'category',
@@ -58,7 +59,7 @@ export function CategoryField({
             placeholder="Pick a category…"
             ariaLabel="Category"
             error={error}
-            disabled={disabled}
+            pending={pending}
         />
     );
 }

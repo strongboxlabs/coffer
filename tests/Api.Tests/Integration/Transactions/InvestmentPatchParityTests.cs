@@ -27,11 +27,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// the date the register shows. Neither prescribes a mechanism.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class InvestmentPatchParityTests
+public sealed class InvestmentPatchParityTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public InvestmentPatchParityTests(PostgresFixture fixture) => _fixture = fixture;
+    public InvestmentPatchParityTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Utc(int y, int m, int d) =>
         new(y, m, d, 12, 0, 0, DateTimeKind.Utc);
@@ -83,11 +84,11 @@ public sealed class InvestmentPatchParityTests
     [Fact]
     public async Task Editing_a_cleared_investment_row_keeps_it_cleared()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("PARX", ticker: "PARX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var postedAt = new DateTime(2026, 5, 4, 12, 0, 0, DateTimeKind.Utc);
@@ -100,7 +101,7 @@ public sealed class InvestmentPatchParityTests
         Assert.Equal(HttpStatusCode.NoContent, cleared.StatusCode);
 
         // Premise: it really is cleared, with the audit pair written.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var before = await db.TxnLegRecon.AsNoTracking()
                 .Join(db.TxnLegs.AsNoTracking(), r => r.LegId, l => l.Id, (r, l) => new { r, l })
@@ -129,7 +130,7 @@ public sealed class InvestmentPatchParityTests
             $"expected 2xx, got {(int)patch.StatusCode}: "
             + await patch.Content.ReadAsStringAsync());
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var after = await db.TxnLegRecon.AsNoTracking()
                 .Join(db.TxnLegs.AsNoTracking(), r => r.LegId, l => l.Id, (r, l) => new { r, l })
@@ -167,11 +168,11 @@ public sealed class InvestmentPatchParityTests
     [Fact]
     public async Task Editing_a_merge_survivors_date_moves_what_the_register_shows()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("PARX", ticker: "PARX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var winnerDate = new DateTime(2026, 5, 4, 12, 0, 0, DateTimeKind.Utc);
@@ -185,7 +186,7 @@ public sealed class InvestmentPatchParityTests
         // Make the loser mergeable the way ingest does — an unreviewed row. This
         // is the one fabricated bit, and it stands in for an import purely to
         // keep the test about the EDIT rather than about ingest.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Database.ExecuteSqlInterpolatedAsync(
                 $"UPDATE txn_headers SET needs_review = TRUE WHERE id = {loser}");
@@ -223,7 +224,7 @@ public sealed class InvestmentPatchParityTests
     /// <summary>The effective date the register renders for a header.</summary>
     private async Task<DateTime> ShownDateAsync(Guid headerId, Guid accountId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.ResolvedTransactions.AsNoTracking()
             .Where(rv => rv.HeaderId == headerId && rv.AccountId == accountId)
             .Select(rv => rv.PostedAt)
@@ -244,11 +245,11 @@ public sealed class InvestmentPatchParityTests
     [Fact]
     public async Task The_reconciliation_stamp_survives_an_amount_edit()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("PARX", ticker: "PARX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var postedAt = new DateTime(2026, 5, 4, 12, 0, 0, DateTimeKind.Utc);
@@ -274,7 +275,7 @@ public sealed class InvestmentPatchParityTests
             });
         Assert.True(patch.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var recon = await db.TxnLegRecon.AsNoTracking()
             .Join(db.TxnLegs.AsNoTracking(), r => r.LegId, l => l.Id, (r, l) => new { r, l })
             .Where(x => x.l.HeaderId == headerId && x.l.AccountId == brokerage.Id)
@@ -288,11 +289,10 @@ public sealed class InvestmentPatchParityTests
     /// A date-only edit still re-derives the FIFO consumption order.
     /// </summary>
     /// <remarks>
-    /// This is the regression that keeping leg identity introduces, and the reason
-    /// the recompute is now called explicitly. <c>HoldingsRecomputeInterceptor</c>
-    /// watches <c>txn_legs</c> and nothing else; it fired on every PATCH only
-    /// because every PATCH deleted every leg. Once legs survive, an edit that
-    /// changes no leg field produces no entry for it to see — and a DATE is exactly
+    /// This is the regression that keeping leg identity invites, and the reason
+    /// the recompute is called explicitly. <c>HoldingsRecomputeInterceptor</c>
+    /// watches <c>txn_legs</c> and nothing else, and legs survive a PATCH, so an
+    /// edit that changes no leg field produces no entry for it to see — and a DATE is exactly
     /// such an edit, while also being the thing the FIFO walk orders by. Lots,
     /// realized gains and cost basis would keep the pre-edit ordering.
     ///
@@ -302,12 +302,12 @@ public sealed class InvestmentPatchParityTests
     [Fact]
     public async Task A_date_only_edit_re_derives_the_fifo_order()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("FIFX", ticker: "FIFX");
         var holdingsAccountId = brokerage.HoldingsAccountId!.Value;
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Cheap lot first, dear lot second.
@@ -361,9 +361,9 @@ public sealed class InvestmentPatchParityTests
     /// A PATCH leaves exactly one lot per acquisition leg.
     /// </summary>
     /// <remarks>
-    /// The lot delete is header-wide and deliberately kept that way. It used to be
-    /// belt-and-braces over <c>lots.leg_id ON DELETE CASCADE</c> (mig 123); with the
-    /// leg surviving, the cascade is no longer a backstop and the delete is the only
+    /// The lot delete is header-wide and deliberately kept that way. With the leg
+    /// surviving an edit, <c>lots.leg_id ON DELETE CASCADE</c> (mig 123) never fires,
+    /// so it is no backstop and the delete is the only
     /// thing standing between an edit and a second lot on the same leg. That failure
     /// is silent — <c>holdings.quantity</c> is recomputed and stays right while the
     /// lots table doubles underneath it.
@@ -371,11 +371,11 @@ public sealed class InvestmentPatchParityTests
     [Fact]
     public async Task A_patch_leaves_exactly_one_lot_per_acquisition_leg()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("LOTZ", ticker: "LOTZ");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var postedAt = new DateTime(2026, 6, 1, 12, 0, 0, DateTimeKind.Utc);
@@ -399,7 +399,7 @@ public sealed class InvestmentPatchParityTests
             Assert.True(patch.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent);
         }
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legIds = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId)
             .Select(l => l.Id).ToListAsync();
@@ -426,12 +426,12 @@ public sealed class InvestmentPatchParityTests
     [Fact]
     public async Task Changing_the_action_reshapes_postings_without_an_index_collision()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("RSHP", ticker: "RSHP");
         var income = await ledger.AddCategoryAsync("Dividends");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var postedAt = new DateTime(2026, 7, 1, 12, 0, 0, DateTimeKind.Utc);
@@ -456,7 +456,7 @@ public sealed class InvestmentPatchParityTests
             $"expected 2xx, got {(int)patch.StatusCode}: "
             + await patch.Content.ReadAsStringAsync());
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId)
             .Select(l => new { l.AccountId, l.PostingIndex })
@@ -476,18 +476,17 @@ public sealed class InvestmentPatchParityTests
     /// computed from committed lots AFTER the leg drop, precisely so the plan cannot
     /// see this transfer's own effect. Leave its legs in place and the plan consumes
     /// against lots the transfer is still holding down, which surfaces as a spurious
-    /// insufficient-shares rejection or a double move. There was no coverage of
-    /// PATCHing one at all before this.
+    /// insufficient-shares rejection or a double move.
     /// </remarks>
     [Fact]
     public async Task An_in_kind_transfer_can_still_be_edited()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddInvestmentAccountAsync("source");
         var dest = await ledger.AddInvestmentAccountAsync("dest");
         var securityId = await ledger.AddSecurityAsync("XFER", ticker: "XFER");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         await BuyAsync(client, ledger, source.Id, securityId,
@@ -525,7 +524,7 @@ public sealed class InvestmentPatchParityTests
             $"expected 2xx, got {(int)patch.StatusCode}: "
             + await patch.Content.ReadAsStringAsync());
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var destQty = await db.Holdings.AsNoTracking()
             .Where(h => h.AccountId == dest.HoldingsAccountId!.Value
                 && h.SecurityId == securityId)
@@ -550,15 +549,15 @@ public sealed class InvestmentPatchParityTests
     /// lot consumption the way the register says it should.
     /// </summary>
     /// <remarks>
-    /// Migration 229. Every holdings function used to read the raw
+    /// Migration 229. A holdings function that reads the raw
     /// <c>txn_headers.posted_at</c> while the register renders
-    /// <c>COALESCE(o.posted_at, h.posted_at)</c>, so a row could sit in one place
+    /// <c>COALESCE(o.posted_at, h.posted_at)</c> lets a row sit in one place
     /// on screen and in another in the walk that decides which lots a sale
     /// consumes, what basis it books and which period the gain lands in.
     ///
-    /// Not hypothetical: an investment merge stamps a posted_at override on the
-    /// SURVIVOR, so every merge winner already had a displayed date its cost
-    /// basis did not know about.
+    /// An investment merge stamps a posted_at override on the SURVIVOR, so
+    /// every merge winner carries a displayed date the raw-reading walk would
+    /// not see.
     ///
     /// The override is written directly rather than through an edit, because the
     /// point is the WALK's reading of it — the edit path that produces one is a
@@ -567,12 +566,12 @@ public sealed class InvestmentPatchParityTests
     [Fact]
     public async Task The_fifo_walk_orders_by_the_effective_date()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("EFFX", ticker: "EFFX");
         var holdingsAccountId = brokerage.HoldingsAccountId!.Value;
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Cheap lot first by RAW date, dear lot second.
@@ -613,7 +612,7 @@ public sealed class InvestmentPatchParityTests
     /// </summary>
     private async Task RecomputeHoldingsAsync(Guid holdingsAccountId, Guid securityId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await db.Database.ExecuteSqlInterpolatedAsync(
             $"SELECT recompute_holdings_for_account_security({holdingsAccountId}, {securityId})");
     }
@@ -621,7 +620,7 @@ public sealed class InvestmentPatchParityTests
     /// <summary>Total realized gain booked for one holding.</summary>
     private async Task<decimal> RealizedGainAsync(Guid holdingsAccountId, Guid securityId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.RealizedGains.AsNoTracking()
             .Where(g => g.AccountId == holdingsAccountId && g.SecurityId == securityId)
             .SumAsync(g => g.RealizedGain);
@@ -631,26 +630,24 @@ public sealed class InvestmentPatchParityTests
     /// An investment edit can leave the row queued for review.
     /// </summary>
     /// <remarks>
-    /// <para>The capability the investment path did not have. A successful PATCH
-    /// used to clear <c>needs_review</c> UNCONDITIONALLY, justified by "the
-    /// investment editor's only Save-pressed exit IS Accept" — a claim about one
-    /// client, applied to the endpoint. Every other caller (MCP, a direct PATCH,
-    /// a script fixing a typo across a ledger) therefore accepted every row it
-    /// touched, and nobody could correct an imported row and leave it for
-    /// later. The bank path has always been able to.</para>
+    /// <para>A PATCH that cleared <c>needs_review</c> UNCONDITIONALLY, on the grounds
+    /// that "the investment editor's only Save-pressed exit IS Accept", would apply
+    /// a claim about one client to the endpoint. Every other caller (MCP, a direct
+    /// PATCH, a script fixing a typo across a ledger) would then accept every row it
+    /// touched, and nobody could correct an imported row and leave it for later, as
+    /// the bank path allows.</para>
     ///
-    /// <para>No test failed when the behaviour changed, which is why it survived:
-    /// nothing asserted the implicit clear in either direction. These three do,
-    /// and each one fails if the flag stops being honoured.</para>
+    /// <para>These three assert the flag in both directions, and each one fails if
+    /// it stops being honoured.</para>
     /// </remarks>
     [Fact]
     public async Task An_investment_edit_without_approve_leaves_the_row_queued()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("APPX", ticker: "APPX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var postedAt = new DateTime(2026, 7, 1, 12, 0, 0, DateTimeKind.Utc);
@@ -681,11 +678,11 @@ public sealed class InvestmentPatchParityTests
     [Fact]
     public async Task An_investment_edit_with_approve_accepts_the_row()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("APPY", ticker: "APPY");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var postedAt = new DateTime(2026, 7, 2, 12, 0, 0, DateTimeKind.Utc);
@@ -717,18 +714,18 @@ public sealed class InvestmentPatchParityTests
     /// <remarks>
     /// The one case that must NOT become opt-in. A folded-away row is resolved,
     /// not awaiting review, and leaving it queued keeps the sidebar's review dot
-    /// lit on an account whose register has nothing to show — the exact defect
-    /// fixed in 0.94.0. Enforced in the repository so it cannot depend on a
+    /// lit on an account whose register has nothing to show. Enforced in the
+    /// repository so it cannot depend on a
     /// caller remembering to pair the two.
     /// </remarks>
     [Fact]
     public async Task A_merge_still_accepts_the_loser_without_being_asked()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("APPZ", ticker: "APPZ");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var winner = await BuyAsync(client, ledger, brokerage.Id, securityId,
@@ -750,14 +747,14 @@ public sealed class InvestmentPatchParityTests
 
     private async Task SetNeedsReviewAsync(Guid headerId, bool value)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await db.Database.ExecuteSqlInterpolatedAsync(
             $"UPDATE txn_headers SET needs_review = {value} WHERE id = {headerId}");
     }
 
     private async Task<bool> NeedsReviewAsync(Guid headerId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return (await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == headerId)).NeedsReview;
     }

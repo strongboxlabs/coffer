@@ -1,7 +1,8 @@
 // Reminders read + manage types (ADR-0047 / ADR-0049), mirroring the C#
 // DTOs in ReminderDtos.cs (camelCase). DateOnly fields are 'YYYY-MM-DD' strings.
 
-import type { TransactionPosting } from './bank';
+import type { TransactionNotesRequest, TransactionPosting } from './bank';
+import type { RateUnavailable } from './conversion';
 import type { CreateInvestmentTransactionRequest } from './investment';
 
 /** One recurring-reminder series for the management list / agenda. */
@@ -24,6 +25,9 @@ export interface ReminderSummary {
     origin: string;
     /** Mig 220: the series' estimate, when it asked for one. */
     estimate?: ReminderEstimate | null;
+    /** The currency `amount` is in: the series' source account's. Null for a series
+     *  with no single source, whose amount is in no currency. */
+    currencyCode?: string | null;
 }
 
 /**
@@ -31,7 +35,14 @@ export interface ReminderSummary {
  *
  * `amount` non-null means the surface's own amount IS this estimate.
  * `amount` null means the series asked and could not have one — `unavailableReason`
- * says why, and the amount shown is the reminder's template figure.
+ * says why, and the amount shown is the reminder's template figure, which stands in
+ * for the estimate and is marked as one all the same (`isEstimating`).
+ *
+ * On a transfer between real accounts in different currencies the other side is
+ * estimated too (ADR-0114 D13), per occurrence: `counterpartyAmount` is `amount` at the
+ * derived rate for the occurrence's due date, rounded once at the other account's
+ * places. With no rate for that day there is no estimate: `amount` is null, the reason
+ * is `rate-unavailable` and `rateUnavailable` names each missing stored leg.
  */
 export interface ReminderEstimate {
     requestedSampleCount: number;
@@ -41,9 +52,15 @@ export interface ReminderEstimate {
     /**
      * Stable codes, rendered differently by each surface:
      * 'no-history' | 'zero-estimate' | 'sign-mismatch' | 'has-split' |
-     * 'loan-driven' | 'not-bank-shape' | 'no-source-account'
+     * 'loan-driven' | 'not-bank-shape' | 'no-source-account' | 'rate-unavailable'
      */
     unavailableReason: string | null;
+    /** The other side's estimate, signed, in the other account's currency; null when the
+     *  series is not a transfer between currencies, or `amount` is null. */
+    counterpartyAmount?: number | null;
+    /** On `rate-unavailable`, each missing stored leg (account currency into the
+     *  reporting currency) and the due date; absent otherwise. */
+    rateUnavailable?: RateUnavailable[];
 }
 
 export type UpcomingKind = 'scheduled' | 'reminder' | 'skipped';
@@ -66,17 +83,51 @@ export interface UpcomingOccurrence {
     seriesNextDue: string | null;
     /** Mig 220. Null on a FIRED occurrence: that carries the real committed figure. */
     estimate?: ReminderEstimate | null;
+    /** The series' source account, its name and currency carried here so a
+     *  deactivated source still has both. All three are null for a series with no
+     *  single source. */
+    sourceAccountId?: string | null;
+    sourceAccountName?: string | null;
+    currencyCode?: string | null;
+    /** Null when the series has no auto-post days; otherwise whether the auto-post
+     *  job posts its occurrences, by the job's own rule. */
+    autoPost?: UpcomingAutoPost | null;
+}
+
+/** Why the auto-post job leaves a series' occurrences for a person to post.
+ *  `loan-across-currencies`: a managed loan payment whose paying account, or real
+ *  escrow account, is in another currency than the loan's, so it can never post
+ *  (ADR-0114 D13). `template-amount-does-not-fit`: a figure the fire would write has
+ *  more places than its currency uses, so it is refused until the reminder or the
+ *  loan terms are edited (ADR-0114 D15). Mirror of API `AutoPostExclusion`. */
+export type AutoPostExcludedReason =
+    | 'investment'
+    | 'no-lines'
+    | 'inactive-account'
+    | 'loan-across-currencies'
+    | 'template-amount-does-not-fit';
+
+export interface UpcomingAutoPost {
+    /** Null when the job posts the series' occurrences. */
+    excludedReason: AutoPostExcludedReason | null;
 }
 
 export type ReminderKind = 'bank' | 'investment';
 
 /** One template leg in a reminder detail (bank fields + investment metadata). */
 export interface ReminderLegDto {
+    /** The template leg's own id. An edit names each stored line by its
+     *  source leg's id, which is what ties a rebuilt line to the stored one
+     *  and keeps both of its sides' memo and tags with it. */
+    legId: string;
     accountId: string;
     accountName: string;
     postingIndex: number;
     amount: number;
     legMemo: string | null;
+    /** The leg's own tags. Every leg carries its set; the editor seeds and
+     *  edits only the source side's. Always an array. */
+    legTags: string[];
     securityId: string | null;
     securityTicker: string | null;
     quantity: number | null;
@@ -90,6 +141,12 @@ export interface ReminderDetail {
     kind: ReminderKind;
     payee: string | null;
     memo: string | null;
+    /** The template's transaction-level tags, from the source side: the
+     *  transaction's own set where it is in play (a split, a multi-posting
+     *  event), else the source side's. The editor opens with them, so a
+     *  picked tag adds to the stored set rather than replacing it. Always an
+     *  array. */
+    tags: string[];
     checkNumber: string | null;
     action: string | null;
     rrule: string | null;
@@ -139,10 +196,6 @@ export interface UnskipReminderResponse {
     nextDueDate: string | null;
 }
 
-export interface FireReminderRequest {
-    occurrenceDate: string;
-}
-
 export interface FireReminderResponse {
     headerId: string;
     /** Catch-up (ADR-0047 §9.2): earlier un-acted occurrences this fire also
@@ -159,8 +212,9 @@ export interface FireBankReminderRequest {
     sourceAccountId: string;
     postings: readonly TransactionPosting[];
     payee?: string | null;
-    memo?: string | null;
     checkNumber?: string | null;
+    /** Memo and tags of the posted occurrence, side-aware. */
+    notes: TransactionNotesRequest;
     /** 'YYYY-MM-DD'; null = the occurrence date. */
     postedDate?: string | null;
 }
@@ -192,10 +246,11 @@ export interface CreateReminderRequest {
     /** Explicit clear, because a null estimateSampleCount means 'unchanged'. */
     clearEstimate?: boolean;
     payee?: string | null;
-    memo?: string | null;
     checkNumber?: string | null;
     sourceAccountId: string;
     postings: readonly TransactionPosting[];
+    /** The template's memo and tags, side-aware. */
+    notes: TransactionNotesRequest;
 }
 
 /** Body for POST /reminders/investment — create an INVESTMENT-shape series.
@@ -233,9 +288,10 @@ export interface EditReminderRequest {
     /** Explicit clear, because a null estimateSampleCount means 'unchanged'. */
     clearEstimate?: boolean;
     payee?: string | null;
-    memo?: string | null;
     checkNumber?: string | null;
     postings?: PatchReminderPostings | null;
+    /** The template's memo and tags; omitted keys are left as they are. */
+    notes?: TransactionNotesRequest;
 }
 
 /** Body for PATCH /reminders/{id}/investment — edit an INVESTMENT series.

@@ -9,25 +9,26 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Auth;
 
 /// <summary>
-/// The cross-site request check (2026-10-12 security audit, M1): a state-changing
+/// The cross-site request check (ADR-0105 D6): a state-changing
 /// request carrying the session cookie must come from Coffer's own origin.
 /// </summary>
 /// <remarks>
 /// SameSite=Strict stops other SITES; a sibling subdomain is the same site. The browser
 /// says where a request came from in <c>Sec-Fetch-Site</c> (or, older ones, <c>Origin</c>),
-/// and the server now listens. "Sign out other sessions" is the probe: a cookie-carrying
+/// and the server checks it. "Sign out other sessions" is the probe: a cookie-carrying
 /// POST whose effect is easy to observe.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class SameOriginRequestTests
+public sealed class SameOriginRequestTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SameOriginRequestTests(PostgresFixture fixture) => _fixture = fixture;
+    public SameOriginRequestTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private async Task<(HttpClient Client, SyntheticLedger User)> TwoSessionsAsync(ApiFactory factory)
     {
-        var user = await SyntheticLedger.CreateAsync(_fixture);
+        var user = await SyntheticLedger.CreateAsync(Db);
         await user.IssueSessionCookieAsync();                 // the "other" session
         var cookie = await user.IssueSessionCookieAsync();
         var client = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
@@ -37,7 +38,7 @@ public sealed class SameOriginRequestTests
 
     private async Task<int> ActiveSessionsAsync(Guid userId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.AuthSessions.CountAsync(s => s.UserId == userId && s.RevokedAt == null);
     }
 
@@ -55,7 +56,7 @@ public sealed class SameOriginRequestTests
     [InlineData("none")]
     public async Task A_cookie_carrying_post_from_elsewhere_is_refused_and_does_nothing(string fetchSite)
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var (client, user) = await TwoSessionsAsync(factory);
 
         var response = await client.SendAsync(SignOutOthers(fetchSite));
@@ -67,7 +68,7 @@ public sealed class SameOriginRequestTests
     [Fact]
     public async Task A_same_origin_post_goes_through()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var (client, user) = await TwoSessionsAsync(factory);
 
         var response = await client.SendAsync(SignOutOthers("same-origin"));
@@ -79,7 +80,7 @@ public sealed class SameOriginRequestTests
     [Fact]
     public async Task Without_Sec_Fetch_Site_a_foreign_Origin_is_refused()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var (client, user) = await TwoSessionsAsync(factory);
 
         var response = await client.SendAsync(SignOutOthers(origin: "https://other.example.com"));
@@ -91,7 +92,7 @@ public sealed class SameOriginRequestTests
     [Fact]
     public async Task Without_Sec_Fetch_Site_our_own_Origin_goes_through()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var (client, _) = await TwoSessionsAsync(factory);
 
         var response = await client.SendAsync(SignOutOthers(origin: "http://localhost"));
@@ -103,7 +104,7 @@ public sealed class SameOriginRequestTests
     public async Task A_request_with_neither_header_is_not_from_a_browser_and_goes_through()
     {
         // A script or CLI holding a cookie: CSRF does not apply to it.
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var (client, _) = await TwoSessionsAsync(factory);
 
         Assert.Equal(HttpStatusCode.OK, (await client.SendAsync(SignOutOthers())).StatusCode);
@@ -112,7 +113,7 @@ public sealed class SameOriginRequestTests
     [Fact]
     public async Task Reads_and_cookieless_requests_are_untouched()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var (client, _) = await TwoSessionsAsync(factory);
 
         // A GET is never refused for its origin.

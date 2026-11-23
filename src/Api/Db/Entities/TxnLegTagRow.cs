@@ -7,10 +7,11 @@ namespace Coffer.Api.Db.Entities;
 /// <remarks>
 /// <para>Distinct from <see cref="TxnHeaderTagRow"/>, and neither is derived
 /// from the other. A header tag is a claim about the transaction — <i>Holiday</i>,
-/// <i>Tax 2026</i>; a leg tag is a claim about one posting — <i>Property B</i>.
-/// A rental payment split across three units is the case that reopened
-/// ADR-0009, which had rejected split-level tags "unless real use surfaces a
-/// split-level tag pattern that matters".</para>
+/// <i>Tax 2026</i>; a leg tag is a claim about one posting — <i>Project B</i>.
+/// A payment split across two projects, each line tagged with its project, needs
+/// a tag per posting: a header tag cannot say which line belongs to which
+/// project. ADR-0009 had rejected split-level tags; ADR-0103 adds them for this
+/// case.</para>
 ///
 /// <para>The union model ADR-0009 named as its alternative was not taken: it
 /// would make a transaction tag a derived artifact that changes silently when a

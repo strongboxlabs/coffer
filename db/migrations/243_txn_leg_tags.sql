@@ -3,13 +3,14 @@
 --
 -- ADR-0103. ADR-0009 put tags at transaction level and named its own reopening
 -- condition in its alternatives: "Rejected unless real use surfaces a
--- split-level tag pattern that matters." A bill split across several rental
--- units is that pattern — one header, one posting per unit, and the only
--- question the tags exist to answer is which posting the money went to.
+-- split-level tag pattern that matters." A payment split across two projects,
+-- each line tagged with its project, is that pattern — one header, one posting
+-- per project, and the only question the tags exist to answer is which posting
+-- the money went to.
 --
 -- BOTH LEVELS, and they mean different things. txn_header_tags is untouched: a
 -- header tag is a claim about the transaction (Holiday, Tax 2026), a leg tag a
--- claim about one posting (Property B). Not ADR-0009's own union model, which
+-- claim about one posting (Project B). Not ADR-0009's own union model, which
 -- would make a transaction tag a derived artifact that changes silently when a
 -- leg is added later, and would force a rewrite of every header tag that is
 -- correct today. This migration moves no existing row.
@@ -159,8 +160,8 @@ BEGIN
         'txn_legs',                         (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_legs t WHERE t.ledger_id = p_ledger_id),
         'txn_leg_recon',                    (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_leg_recon t WHERE t.ledger_id = p_ledger_id),
         'lots',                             (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM lots t WHERE t.ledger_id = p_ledger_id),
-        -- mig 188: realized_gains is derived, but re-deriving it on restore cost
-        -- ~27s and overwrote the holdings/lots restored above. Keys on
+        -- mig 188: realized_gains is derived, but re-deriving it on restore walked
+        -- the whole ledger and overwrote the holdings/lots restored above. Keys on
         -- sell_leg_id (a captured txn_legs row) so it round-trips 1:1.
         'realized_gains',                   (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM realized_gains t WHERE t.ledger_id = p_ledger_id),
         'txn_header_originals',             (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_header_originals t WHERE t.ledger_id = p_ledger_id),

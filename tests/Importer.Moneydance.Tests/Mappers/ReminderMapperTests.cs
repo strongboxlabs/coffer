@@ -28,12 +28,47 @@ public sealed class ReminderMapperTests
         return MdReminder.From(MdItemReader.ReadString(wrapped).AllItems.Single());
     }
 
+    /// <summary>
+    /// Accounts by MD id. A brokerage gets a Holdings sibling, as AccountImportStep
+    /// wires every investment account: an event is owned by a brokerage, which is
+    /// an account that names its holdings account.
+    /// </summary>
     private static IReadOnlyDictionary<string, AccountRef> AccountMap(params (string MdId, string Type)[] accounts) =>
-        accounts.ToDictionary(a => a.MdId, a => new AccountRef(Guid.NewGuid(), a.Type), StringComparer.Ordinal);
+        accounts.ToDictionary(
+            a => a.MdId,
+            a => new AccountRef(Guid.NewGuid(), a.Type, HoldingsAccountId: a.Type == "investment" ? Guid.NewGuid() : null,
+                AmountDecimals: 2),
+            StringComparer.Ordinal);
 
     private static ReminderMapper.MapResult Map(
         MdReminder reminder, IReadOnlyDictionary<string, AccountRef> accounts, string rawJson = "{\"k\":1}") =>
         ReminderMapper.Map(reminder, accounts, Guid.NewGuid(), ImportSource, rawJson);
+
+    [Fact]
+    public void Map_stamps_the_reminder_account_as_the_template_owner()
+    {
+        // Migration 263: the reminder's account (txn.acctid), which is also the
+        // series source, on every posting of a two-line template.
+        var reminder = ReminderFromJson("""
+            {
+              "obj_type":"reminder","id":"rem-owner",
+              "desc":"Recurring A","type":"monthly","sdt":"20230101",
+              "monthlydays":"1","monthlymod":"1",
+              "daily":"0","weeklydays":"","yearly":"0",
+              "is_loan_reminder":"0",
+              "txn.acctid":"a-checking","txn.desc":"Recurring A",
+              "txn.0.acctid":"a-cat","txn.0.samt":"1000","txn.0.pamt":"-1000",
+              "txn.1.acctid":"a-cat2","txn.1.samt":"500","txn.1.pamt":"-500"
+            }
+            """);
+        var accounts = AccountMap(("a-checking", "bank"), ("a-cat", "category"), ("a-cat2", "category"));
+
+        var result = Map(reminder, accounts);
+
+        Assert.Null(result.Skip);
+        Assert.Equal(accounts["a-checking"].Id, result.Header!.OriginatingAccountId);
+        Assert.Equal(result.Row!.SourceAccountId, result.Header.OriginatingAccountId);
+    }
 
     [Fact]
     public void Map_builds_a_template_header_and_legs_for_a_monthly_reminder()
@@ -63,7 +98,7 @@ public sealed class ReminderMapperTests
         Assert.Null(h.ProviderKey);
         Assert.Equal("mdreminder:rem-rent", h.ExternalId);
         Assert.Equal("Recurring A", h.Payee);
-        Assert.Equal("note", h.Memo);
+        Assert.Null(h.Memo);   // a one-split template's memo is its account's own (below)
         Assert.Equal("uncleared", h.Status);
         Assert.Equal(new DateTimeOffset(2023, 1, 1, 0, 0, 0, TimeSpan.Zero), h.PostedAt);
 
@@ -76,6 +111,8 @@ public sealed class ReminderMapperTests
         var counter = result.Legs.Single(l => l.AccountId == accounts["a-cat"].Id);
         Assert.Equal(-1500.00m, origin.Amount);
         Assert.Equal(1500.00m, counter.Amount);
+        Assert.Equal("note", origin.LegMemo);
+        Assert.Null(counter.LegMemo);
 
         // Slim recurring row.
         var row = result.Row!;
@@ -96,24 +133,24 @@ public sealed class ReminderMapperTests
     [Fact]
     public void Map_seeds_next_due_after_the_acknowledged_date()
     {
-        // A monthly-on-the-10th reminder running since 2015, acknowledged through
-        // 2026-06-10 in Moneydance: the cursor must seed at 2026-07-10, NOT the
-        // 2015 first occurrence (ADR-0051 — the acknowledged floor).
+        // An invented monthly-on-the-10th reminder started years ago (2012-03-04),
+        // acknowledged through 2025-02-10 in Moneydance: the cursor must seed at
+        // 2025-03-10, NOT the 2012 first occurrence (ADR-0051 — the acknowledged floor).
         var reminder = ReminderFromJson("""
             {
-              "obj_type":"reminder","id":"rem-mortgage","desc":"Mortgage","sdt":"20150609",
+              "obj_type":"reminder","id":"rem-loan","desc":"Loan payment","sdt":"20120304",
               "type":"monthly","monthlydays":"10","monthlymod":"1",
               "daily":"0","weeklydays":"","yearly":"0","is_loan_reminder":"1",
-              "ackdt":"20260610",
+              "ackdt":"20250210",
               "txn.acctid":"a-checking",
-              "txn.0.acctid":"a-mortgage","txn.0.samt":"100000","txn.0.pamt":"-100000"
+              "txn.0.acctid":"a-loan","txn.0.samt":"100000","txn.0.pamt":"-100000"
             }
             """);
-        var accounts = AccountMap(("a-checking", "bank"), ("a-mortgage", "loan"));
+        var accounts = AccountMap(("a-checking", "bank"), ("a-loan", "loan"));
 
         var row = Map(reminder, accounts).Row!;
-        Assert.Equal(new DateOnly(2026, 6, 10), row.LastAcknowledgedDate);
-        Assert.Equal(new DateOnly(2026, 7, 10), row.NextDueDate);
+        Assert.Equal(new DateOnly(2025, 2, 10), row.LastAcknowledgedDate);
+        Assert.Equal(new DateOnly(2025, 3, 10), row.NextDueDate);
     }
 
     [Fact]
@@ -233,5 +270,115 @@ public sealed class ReminderMapperTests
             """);
         var accounts = AccountMap(("a-checking", "bank"), ("a-mortgage", "loan"));
         Assert.True(Map(reminder, accounts).Row!.IsLoanReminder);
+    }
+
+    // -- brokerage cash moves -------------------------------------------------
+    //
+    // A template is built like a live bank-route txn, so it must classify like
+    // one: a one-posting cash move out of a brokerage is a 'transfer'
+    // (BrokerageCashTransfer), or a fired occurrence would carry an action its
+    // template never had.
+
+    [Theory]
+    [InlineData("category")]
+    [InlineData("bank")]
+    public void Map_a_brokerage_template_with_one_split_is_a_transfer(string targetType)
+    {
+        var reminder = ReminderFromJson("""
+            {"obj_type":"reminder","id":"rem-broker","desc":"Sweep","sdt":"20240101",
+             "type":"monthly","monthlydays":"1","monthlymod":"1",
+             "daily":"0","weeklydays":"","yearly":"0","is_loan_reminder":"0",
+             "txn.acctid":"a-brokerage",
+             "txn.0.acctid":"a-target","txn.0.samt":"100","txn.0.pamt":"-100"}
+            """);
+        var accounts = AccountMap(("a-brokerage", "investment"), ("a-target", targetType));
+
+        var result = Map(reminder, accounts);
+
+        Assert.Equal("transfer", result.Header!.Action);
+        Assert.Equal(2, result.Legs.Count);
+        Assert.All(result.Legs, l => Assert.Equal("transfer", l.PostingRole));
+    }
+
+    [Fact]
+    public void Map_a_brokerage_template_with_more_than_one_split_stays_actionless()
+    {
+        var reminder = ReminderFromJson("""
+            {"obj_type":"reminder","id":"rem-broker-multi","desc":"Two ways","sdt":"20240101",
+             "type":"monthly","monthlydays":"1","monthlymod":"1",
+             "daily":"0","weeklydays":"","yearly":"0","is_loan_reminder":"0",
+             "txn.acctid":"a-brokerage",
+             "txn.0.acctid":"a-cat","txn.0.samt":"100","txn.0.pamt":"-100",
+             "txn.1.acctid":"a-bank","txn.1.samt":"50","txn.1.pamt":"-50"}
+            """);
+        var accounts = AccountMap(("a-brokerage", "investment"), ("a-cat", "category"), ("a-bank", "bank"));
+
+        var result = Map(reminder, accounts);
+
+        Assert.Null(result.Header!.Action);
+        Assert.Equal(4, result.Legs.Count);
+        Assert.All(result.Legs, l => Assert.Null(l.PostingRole));
+    }
+
+    [Fact]
+    public void Map_a_bank_template_stays_actionless()
+    {
+        var reminder = ReminderFromJson("""
+            {"obj_type":"reminder","id":"rem-bank","desc":"Bill","sdt":"20240101",
+             "type":"monthly","monthlydays":"1","monthlymod":"1",
+             "daily":"0","weeklydays":"","yearly":"0","is_loan_reminder":"0",
+             "txn.acctid":"a-checking",
+             "txn.0.acctid":"a-brokerage","txn.0.samt":"100","txn.0.pamt":"-100"}
+            """);
+        var accounts = AccountMap(("a-checking", "bank"), ("a-brokerage", "investment"));
+
+        var result = Map(reminder, accounts);
+
+        Assert.Null(result.Header!.Action);
+        Assert.All(result.Legs, l => Assert.Null(l.PostingRole));
+    }
+
+    // The bank route only ever sees txns that are NOT investment-shaped
+    // (MdTxn.IsInvestmentShape), so the rule applies to a template only when
+    // its embedded txn is not investment-shaped either: a txntype, or one of
+    // the investment xfer_types, keeps it out.
+    [Theory]
+    [InlineData(""" "txn.invest.txntype":"bank", """)]
+    [InlineData(""" "txn.xfer_type":"xfrtp_dividend", """)]
+    [InlineData(""" "txn.xfer_type":"xfrtp_miscincexp", """)]
+    public void Map_an_investment_shaped_brokerage_template_stays_actionless(string shape)
+    {
+        var reminder = ReminderFromJson($$"""
+            {"obj_type":"reminder","id":"rem-broker-inv","desc":"Sweep","sdt":"20240101",
+             "type":"monthly","monthlydays":"1","monthlymod":"1",
+             "daily":"0","weeklydays":"","yearly":"0","is_loan_reminder":"0",
+             "txn.acctid":"a-brokerage", {{shape}}
+             "txn.0.acctid":"a-target","txn.0.samt":"100","txn.0.pamt":"-100"}
+            """);
+        var accounts = AccountMap(("a-brokerage", "investment"), ("a-target", "category"));
+
+        var result = Map(reminder, accounts);
+
+        Assert.Null(result.Header!.Action);
+        Assert.Equal(2, result.Legs.Count);
+        Assert.All(result.Legs, l => Assert.Null(l.PostingRole));
+    }
+
+    [Fact]
+    public void Map_a_brokerage_template_with_a_bank_xfer_type_is_still_a_transfer()
+    {
+        // xfrtp_bank is not an investment xfer_type: the QIF cash rows carry it.
+        var reminder = ReminderFromJson("""
+            {"obj_type":"reminder","id":"rem-broker-xfr","desc":"Sweep","sdt":"20240101",
+             "type":"monthly","monthlydays":"1","monthlymod":"1",
+             "daily":"0","weeklydays":"","yearly":"0","is_loan_reminder":"0",
+             "txn.acctid":"a-brokerage","txn.xfer_type":"xfrtp_bank",
+             "txn.0.acctid":"a-target","txn.0.samt":"100","txn.0.pamt":"-100"}
+            """);
+        var accounts = AccountMap(("a-brokerage", "investment"), ("a-target", "category"));
+
+        var result = Map(reminder, accounts);
+
+        Assert.Equal("transfer", result.Header!.Action);
     }
 }

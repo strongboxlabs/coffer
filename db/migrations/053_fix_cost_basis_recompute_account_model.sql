@@ -2,17 +2,16 @@
 -- 053 — fix recompute_holdings_cost_basis: holdings.account_id IS the sibling
 -- =============================================================================
 --
--- Migration 052 ran but no-op'd against real data because its avg-cost
+-- Migration 052 ran but no-op'd on every brokerage because its avg-cost
 -- function assumed `holdings.account_id` pointed at the brokerage, then
 -- traversed to the Holdings sibling via `accounts.holdings_account_id`.
--- The actual model (per InvestmentTransactionMapper line 291 and the
--- on-disk data) is the inverse: the importer stamps
+-- The actual model (per InvestmentTransactionMapper) is the inverse: the importer stamps
 -- `holdings.account_id = ctx.HoldingsAccountId` directly — the sibling's
 -- id. So 052's sibling lookup returned NULL for every brokerage and the
 -- per-holding loop skipped the CONTINUE branch, leaving cost_basis
 -- untouched. Lots got wiped (the DELETE worked) but the rebuild INSERT
--- matched zero rows for the same reason. The DB is now in a worse state
--- than before 052 ran — lots is empty.
+-- matched zero rows for the same reason. A database 052 ran on is in a
+-- worse state than before — lots is empty.
 --
 -- This migration:
 --   1. Replaces the function with a correct implementation that joins

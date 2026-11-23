@@ -1,14 +1,12 @@
 -- 201 — batched cash balances: every requested instant in ONE pass
 --
 -- The last piece of the TWR boundary cost, and the reason MaxReturnsBoundaries can
--- now be deleted rather than retuned a fourth time.
+-- now be deleted rather than retuned.
 --
--- Migration 200 batched the holdings half of a boundary valuation: 420 instants
--- went from 7398 ms to 698 ms, ~1.7 ms each. That relocated the cost rather than
--- removing it — the stress lane's end-to-end figure was still 27.9 ms per
--- boundary, because account_balance_as_of_set was called ONCE PER BOUNDARY, each
--- call re-running a LATERAL per account in scope. 400 boundaries meant 400 round
--- trips over the same balance rows.
+-- Migration 200 batched the holdings half of a boundary valuation. That leaves the
+-- cash half: account_balance_as_of_set is called ONCE PER BOUNDARY, each call
+-- re-running a LATERAL per account in scope, so N boundaries mean N round trips
+-- over the same balance rows.
 --
 -- Same treatment as mig 200: merge the requested instants into the balance stream
 -- as pseudo-rows, sort once, and forward-fill. Each account's balance rows and the
@@ -21,8 +19,8 @@
 -- `ORDER BY COALESCE(o.posted_at, h.posted_at) DESC, h.seq DESC` — including the
 -- posted-at OVERRIDE (mig 173). The override matters more than it looks: it can
 -- move a header's effective date without changing its relative order, which is
--- what disproved an earlier attempt to denormalise this ordering onto
--- txn_header_account_balances. So the effective date is computed here, in the
+-- why this ordering cannot be denormalised onto txn_header_account_balances.
+-- So the effective date is computed here, in the
 -- stream, and never assumed to agree with h.posted_at.
 --
 -- An instant sharing its effective date with balance rows must see them, so the
@@ -98,8 +96,8 @@ filled AS (
         -- exactly ONE balance row and followed by the instants that fall after it.
         -- MAX over the island picks that single value — island 0 has no balance row
         -- at all and yields NULL, which the outer COALESCE turns into the opening
-        -- balance. (Ordering by the balance VALUE here, as a first draft did, would
-        -- pick the largest balance in the island rather than the applicable one.)
+        -- balance. (Ordering by the balance VALUE here would pick the largest
+        -- balance in the island rather than the applicable one.)
         SELECT account_id, ask_at,
                MAX(balance_after) OVER (PARTITION BY account_id, island) AS ff_balance
         FROM islands

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useMutation } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import { startDriveConnect } from '@/lib/api';
 import { errorMessage } from '@/lib/errorMessage';
@@ -86,8 +86,9 @@ export function ConnectDriveDialog({ onClose }: { onClose: () => void }) {
                     <Button type="button" variant="ghost" size="sm" onClick={onClose}>
                         Cancel
                     </Button>
-                    <Button type="submit" variant="primary" size="sm" disabled={!canStart || startMutation.isPending}>
-                        {startMutation.isPending ? 'Starting…' : 'Continue to Google'}
+                    <Button type="submit" variant="primary" size="sm" disabled={!canStart} pending={startMutation.isPending}
+                        pendingLabel="Starting…">
+                        Continue to Google
                     </Button>
                 </footer>
             </form>

@@ -11,9 +11,10 @@ export interface FeedConnectionSummary {
     ledgerId: string;
     /** `"simplefin"` today; expandable when other providers land. */
     provider: string;
-    /** Display name from SimpleFIN's first-connect probe. NULL
-     *  until the probe (or first sync, slice 2b) populates;
-     *  SPA renders "SimpleFIN" as the fallback. */
+    /** The connection's name: the one institution SimpleFIN listed
+     *  when it was connected, or what an owner renamed it to. NULL
+     *  when it reached several institutions or none, which the SPA
+     *  renders as "SimpleFIN"; syncs never change it. */
     institutionName: string | null;
     /** One of `active` / `needs_reauth` / `error` /
      *  `disconnected`. DB CHECK constraint enforces validity. */
@@ -28,6 +29,12 @@ export interface FeedConnectionSummary {
  *  simplefin.org/setup; the server exchanges + seals + persists. */
 export interface CreateFeedConnectionRequest {
     setupToken: string;
+}
+
+/** Body of `PATCH /api/ledgers/{ledgerId}/feed-connections/{id}`:
+ *  the connection's new name, 1 to 80 characters once trimmed. */
+export interface RenameFeedConnectionRequest {
+    name: string;
 }
 
 /**
@@ -57,16 +64,21 @@ export interface FeedConnectionAccountDto {
 }
 
 /**
- * Mirror of API `Coffer.Api.Contracts.SyncErrorDto`. One
- * SimpleFIN v2 `errlist[]` entry, surfaced verbatim. `code` is the
- * structured `prefix.subcode` string (e.g. `auth.revoked`); the
- * SPA today renders `message` and uses `code` for telemetry only.
+ * Mirror of API `Coffer.Api.Contracts.SyncErrorDto`. One error a run recorded: a
+ * SimpleFIN v2 `errlist[]` entry surfaced verbatim, or a quote source's failure.
+ * `code` is the structured code (e.g. `auth.revoked`).
  */
 export interface SyncErrorDto {
     code: string;
     message: string;
     simpleFinConnectionId: string | null;
     simpleFinAccountId: string | null;
+    /** The source that raised it, on a quote run's errors (`simplefin-holdings`,
+     *  `yahoo`, `market-series`); null on a sync's errors and on older rows. */
+    providerKey: string | null;
+    /** What to call the account `simpleFinAccountId` names: its mapped Coffer account's
+     *  name, else "name · institution" from the feed. Null when there is none to name. */
+    accountLabel: string | null;
 }
 
 /**
@@ -128,8 +140,9 @@ export interface SyncAllResultDto {
 
 /**
  * Mirror of API `Coffer.Api.Contracts.SyncRunSummary` (slice 2c.1
- * / migration 038). One row in the per-connection sync activity
- * log. `status` is one of `running` / `completed` / `partial` /
+ * / migration 038). One run's summary as `SyncRunDetail.summary`
+ * carries it, read when a Settings → Activity row is opened.
+ * `status` is one of `running` / `completed` / `partial` /
  * `failed` / `needs_reauth`.
  */
 export interface SyncRunSummary {
@@ -165,6 +178,10 @@ export interface SyncRunPromotionDto {
     becameAmount: number;
     /** ISO-8601 UTC timestamp string. */
     promotedAt: string;
+    /** The currency `wasAmount` and `becameAmount` are in (ADR-0114 D15): that of the
+     *  account the row now lives on. A move relabels, so after one the figures read in
+     *  the new account's currency. Null for a row with no originating account. */
+    currencyCode: string | null;
 }
 
 /**

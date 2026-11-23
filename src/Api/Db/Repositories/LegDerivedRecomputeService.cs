@@ -45,6 +45,13 @@ public sealed class LegDerivedRecomputeService
     /// <paramref name="affected"/>. Dedupes to <c>MIN(anchor)</c> per
     /// account; one SQL call per distinct account.
     /// </summary>
+    /// <remarks>
+    /// Each call takes the account's ledger write lock (migration 275): nothing inside a
+    /// writer's transaction that took it first, and the call's own statement's when run
+    /// outside a transaction. A transaction that wrote without it is refused. No other
+    /// writer of the ledger runs beside a call, so the accounts go in whatever order they
+    /// come.
+    /// </remarks>
     /// <param name="affected">Pairs of (account id, anchor posted_at).
     /// Empty input is a no-op.</param>
     public async Task RecomputeAsync(

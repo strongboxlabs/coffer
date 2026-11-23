@@ -2,13 +2,16 @@ using Microsoft.EntityFrameworkCore;
 
 using Coffer.Api.Contracts;
 using Coffer.Api.Db.Entities;
+using Coffer.Domain.Annotations;
 
 namespace Coffer.Api.Db.Repositories;
 
 /// <summary>
 /// Write gateway for creating new transactions. Inserts one
-/// <c>txn_headers</c> row plus a symmetric posting pair into
-/// <c>txn_legs</c> (ADR-0019) inside a single Postgres transaction.
+/// <c>txn_headers</c> row plus a posting pair per posting into
+/// <c>txn_legs</c> (ADR-0019) inside a single Postgres transaction: mirrored,
+/// except between real accounts in different currencies, where each leg carries
+/// its own account's figure (ADR-0114 D13, <see cref="PostingLegPair"/>).
 ///
 /// Writes go through the regular <see cref="AppDbContext"/>
 /// (coffer_app role). Migration 022 RLS policies cover the inserts:
@@ -32,6 +35,12 @@ namespace Coffer.Api.Db.Repositories;
 /// <c>SaveChangesAsync</c>, so balance maintenance is implicit. Do
 /// NOT add explicit recompute calls — the interceptor is the single
 /// source of truth.</para>
+///
+/// <para><b>The ledger write lock</b> (migration 275). Every method whose save can
+/// recompute balances or holdings takes it as the first statement of its transaction,
+/// before the reads its write is planned from (<see cref="LedgerWriteLock"/>); the
+/// recompute functions refuse a transaction that wrote without it. Methods that write
+/// only notes, tags or reconciliation status recompute neither and take no lock.</para>
 /// </remarks>
 public sealed class TransactionsRepository
 {
@@ -54,11 +63,43 @@ public sealed class TransactionsRepository
     /// this it sees only the payload, where "unchanged" and "newly chosen"
     /// look identical.
     /// </remarks>
-    public async Task<IReadOnlySet<Guid>> LegAccountIdsAsync(
-        Guid ledgerId, Guid headerId, CancellationToken cancellationToken = default)
+    public Task<IReadOnlySet<Guid>> LegAccountIdsAsync(
+        Guid ledgerId, Guid headerId, CancellationToken cancellationToken = default) =>
+        LegAccountIdsAsync(_db, ledgerId, headerId, cancellationToken);
+
+    /// <summary>
+    /// The stored pair of each posting of <paramref name="headerId"/>, keyed by the id of
+    /// its leg on <paramref name="sourceAccountId"/>: that leg and the other leg of its
+    /// posting (<see cref="PostingLegPair.StoredPairs"/>). Read before an edit, so the
+    /// posting validation can pass a figure the edit resends as it was stored
+    /// (ADR-0114 D15). Empty for a header with no legs on that account.
+    /// </summary>
+    internal async Task<IReadOnlyDictionary<Guid, PostingLegPair.StoredPair>> StoredPairsAsync(
+        Guid ledgerId, Guid headerId, Guid sourceAccountId, CancellationToken cancellationToken = default)
     {
-        var ids = await _db.TxnLegs.AsNoTracking()
-            .Where(l => l.LedgerId == ledgerId && l.HeaderId == headerId)
+        // A merged-away header has no stored pairs, as an id that does not exist has none
+        // (MergedAway): the edit it validates answers not-found.
+        var live = _db.TxnHeaders.NotMergedAway();
+        var legs = await _db.TxnLegs.AsNoTracking()
+            .Where(l => l.LedgerId == ledgerId && l.HeaderId == headerId && live.Any(h => h.Id == l.HeaderId))
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return PostingLegPair.StoredPairs(legs, sourceAccountId);
+    }
+
+    /// <summary>
+    /// <see cref="LegAccountIdsAsync(Guid, Guid, CancellationToken)"/> on a given
+    /// context, for a repository that must read it inside its own transaction (the
+    /// investment PATCH).
+    /// </summary>
+    internal static async Task<IReadOnlySet<Guid>> LegAccountIdsAsync(
+        AppDbContext db, Guid ledgerId, Guid headerId, CancellationToken cancellationToken = default)
+    {
+        // A merged-away header sits on no account, as an id that does not exist sits on
+        // none (MergedAway), so the posting validation reads it as it reads an unknown id.
+        var live = db.TxnHeaders.NotMergedAway();
+        var ids = await db.TxnLegs.AsNoTracking()
+            .Where(l => l.LedgerId == ledgerId && l.HeaderId == headerId && live.Any(h => h.Id == l.HeaderId))
             .Select(l => l.AccountId)
             .Distinct()
             .ToListAsync(cancellationToken)
@@ -72,23 +113,34 @@ public sealed class TransactionsRepository
     /// single-row; <c>&gt; 1</c> produces a multi-split. All
     /// postings' source-side legs land on <paramref name="sourceAccountId"/>;
     /// each posting's counterparty leg is created on its
-    /// <see cref="TransactionPosting.CounterpartyAccountId"/> with the
-    /// negated amount so per-posting sum-to-zero holds. Inserts
-    /// happen inside one Postgres transaction.
+    /// <see cref="TransactionPosting.CounterpartyAccountId"/>, built by
+    /// <see cref="PostingLegPair.Build"/>: the negated amount, so the posting sums to
+    /// zero, except between two real accounts in different currencies, where it is the
+    /// posting's <see cref="TransactionPosting.CounterpartyAmount"/> in the counterparty's
+    /// own currency (ADR-0114 D13). Inserts happen inside one Postgres transaction.
     /// </summary>
-    /// <remarks>Balance recompute is automatic via
+    /// <remarks>
+    /// <para>A posting across currencies without a second amount, or with a zero or
+    /// same-signed one, is refused (<see cref="CreateOutcome.PostingRefusal"/>) before
+    /// anything is written, whoever the caller is: the reminder fire reaches here without
+    /// the endpoint's validation.</para>
+    /// <para>Balance recompute is automatic via
     /// <see cref="LegDerivedRecomputeInterceptor"/> after this method's
-    /// <c>SaveChangesAsync</c>.</remarks>
-    public async Task<Guid> CreateAsync(
+    /// <c>SaveChangesAsync</c>.</para>
+    /// <para>The memo and tags are planned by the write primitive from
+    /// <paramref name="notes"/>, written from <paramref name="sourceAccountId"/>: on one
+    /// posting they are that side's own, on several the whole transaction's with
+    /// per-line notes. A refusal returns before anything is written.</para>
+    /// </remarks>
+    public async Task<CreateOutcome> CreateAsync(
         Guid ledgerId,
         Guid sourceAccountId,
         DateTime postedAt,
         string? payee,
-        string? memo,
         string? checkNumber,
         DateTime? transactedAt,
         IReadOnlyList<TransactionPosting> postings,
-        IReadOnlyList<string>? tags,
+        AnnotationIntent<string>? notes,
         // Adjust-at-post fire (ADR-0049): when set, the committed occurrence is
         // stamped to its series + slot. Null = a normal live bank create.
         Guid? recurringTransactionId = null,
@@ -99,70 +151,85 @@ public sealed class TransactionsRepository
 
         var headerId = Guid.NewGuid();
 
-        // Reuse-from-fire (ADR-0049): join an ambient transaction (the reminder
-        // fire path opened one to make the committed occurrence + catch-up
-        // atomic) instead of nesting — and let that caller commit.
-        var ownsTransaction = _db.Database.CurrentTransaction is null;
-        await using var transaction = ownsTransaction
-            ? await _db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false)
-            : null;
-
-        _db.TxnHeaders.Add(new TxnHeaderRow
-        {
-            Id = headerId,
-            LedgerId = ledgerId,
-            // 'manual' marks rows the user created in-app; importer
-            // rows use 'moneydance_import' / 'simplefin' / etc.
-            // The origin column also informs the future hard-delete
-            // path (manual rows can be hard-deleted; imported rows
-            // become is_hidden=true to preserve audit).
-            Origin = "manual",
-            Payee = HeaderText.Normalize(payee),
-            Memo = HeaderText.Normalize(memo),
-            CheckNumber = checkNumber,
-            PostedAt = postedAt,
-            // NOT NULL since mig 189: a null request value means "no distinct tax
-            // date", which is stored as the posted date.
-            TransactedAt = transactedAt ?? postedAt,
-            // Stamped only when the reminder fire path supplies them.
-            RecurringTransactionId = recurringTransactionId,
-            OccurrenceDate = occurrenceDate,
-        });
-
-        var newLegIds = new Guid[postings.Count];
-        for (var i = 0; i < postings.Count; i++)
-        {
-            newLegIds[i] = AddPostingLegs(
-                headerId, ledgerId, sourceAccountId, postings[i], postingIndex: i);
-        }
-
-        // Per-posting tags (ADR-0103). Applied per leg rather than resolved once
-        // for the request: TagDictionary reuses tracker-pending rows, so two
-        // postings introducing the same brand-new name still land on ONE
-        // dictionary row.
-        for (var i = 0; i < postings.Count; i++)
-        {
-            if (postings[i].Tags is { } legTags)
+        // Plan first: a refused write stores nothing. The side must be the register
+        // the transaction is entered from, which carries the source leg of every
+        // posting; it becomes the originating account.
+        var intent = notes ?? AnnotationIntent<string>.Untouched(sourceAccountId);
+        if (intent.Side != sourceAccountId)
+            return CreateOutcome.Refused(new AnnotationViolation(
+                AnnotationViolationCodes.SideNotOnTransaction,
+                "The notes must be written from the account the transaction is entered from."));
+        var shape = AnnotationWriter.Shape(null, null,
+            postings.SelectMany((p, i) => new[]
             {
-                await LegTags.ApplyAsync(_db, ledgerId, newLegIds[i], legTags, cancellationToken)
-                    .ConfigureAwait(false);
-            }
+                new AnnotationWriter.PlannedLeg(i, sourceAccountId),
+                new AnnotationWriter.PlannedLeg(i, p.CounterpartyAccountId),
+            }),
+            AnnotationWriter.AccountFacts.None);
+
+        // The ledger write lock (migration 275) is the first statement, before the reads
+        // the write is planned from. Reuse-from-fire (ADR-0049): inside an ambient
+        // transaction (the reminder fire path opened one, with the lock, to make the
+        // committed occurrence + catch-up atomic) it joins that transaction, takes
+        // nothing new, and leaves the commit to that caller.
+        await using var write = await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken)
+            .ConfigureAwait(false);
+
+        var resolved = await AnnotationWriter.ResolveAsync(_db, ledgerId, intent, cancellationToken)
+            .ConfigureAwait(false);
+        var plan = AnnotationPlanner.Seed(shape, resolved);
+        if (!plan.IsValid) return CreateOutcome.Refused(plan.Violations[0]);
+
+        // Each posting's two legs, from both accounts' type and currency, read once.
+        var sides = await PostingLegPair.LoadSidesAsync(
+                _db, ledgerId, postings.Select(p => p.CounterpartyAccountId).Append(sourceAccountId), cancellationToken)
+            .ConfigureAwait(false);
+        var amounts = new PostingLegPair.LegAmounts[postings.Count];
+        for (var i = 0; i < postings.Count; i++)
+        {
+            var (built, refused) = PostingLegPair.Build(sourceAccountId, postings[i], i, sides);
+            if (refused is not null) return CreateOutcome.RefusedPosting(refused);
+            amounts[i] = built;
         }
 
-        // Slice 2c.6b: tags on create. Same create-on-first-use,
-        // case-insensitive lookup as the PATCH surface — calling the one
-        // HeaderTags helper against the freshly-added header keeps the
-        // semantics symmetric.
-        if (tags is not null && tags.Count > 0)
-        {
-            await HeaderTags.ApplyAsync(_db, ledgerId, headerId, tags, cancellationToken)
-                .ConfigureAwait(false);
-        }
+        // 'manual' origin: the factory's; the origin column also informs the
+        // hard-delete path (manual rows can be hard-deleted; imported rows become
+        // is_hidden=true to preserve audit).
+        var header = TxnHeaderRow.NewTransaction(headerId, ledgerId, sourceAccountId);
+        header.Payee = HeaderText.Normalize(payee);
+        header.CheckNumber = checkNumber;
+        header.PostedAt = postedAt;
+        // NOT NULL since mig 189: a null request value means "no distinct tax
+        // date", which is stored as the posted date.
+        header.TransactedAt = transactedAt ?? postedAt;
+        // Stamped only when the reminder fire path supplies them.
+        header.RecurringTransactionId = recurringTransactionId;
+        header.OccurrenceDate = occurrenceDate;
+        _db.TxnHeaders.Add(header);
+
+        var legs = new List<TxnLegRow>(postings.Count * 2);
+        for (var i = 0; i < postings.Count; i++)
+            legs.AddRange(AddPostingLegs(headerId, ledgerId, sourceAccountId, postings[i], amounts[i], postingIndex: i));
+
+        await AnnotationWriter.ApplyAsync(_db, header, legs, plan, cancellationToken).ConfigureAwait(false);
 
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        if (ownsTransaction)
-            await transaction!.CommitAsync(cancellationToken).ConfigureAwait(false);
-        return headerId;
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return CreateOutcome.Created(headerId);
+    }
+
+    /// <summary>
+    /// Outcome of <see cref="CreateAsync"/>: the new header; or the reason the write
+    /// primitive refused the notes (a 422 with the violation's code); or the posting the
+    /// leg-pair builder refused (<see cref="PostingRefusal"/>, ADR-0114 D13). Nothing is
+    /// written on either refusal.
+    /// </summary>
+    public sealed record CreateOutcome(
+        Guid HeaderId, AnnotationViolation? Refusal, PostingLegPair.Refusal? PostingRefusal = null)
+    {
+        public static CreateOutcome Created(Guid headerId) => new(headerId, null);
+        public static CreateOutcome Refused(AnnotationViolation violation) => new(Guid.Empty, violation);
+        internal static CreateOutcome RefusedPosting(PostingLegPair.Refusal refusal) => new(Guid.Empty, null, refusal);
     }
 
     /// <summary>
@@ -181,7 +248,7 @@ public sealed class TransactionsRepository
         /// existing source-side leg on this header.</summary>
         LegNotInHeader,
         /// <summary>Two request items carry the SAME <c>LegId</c>.
-        /// Silently destructive before this was checked: both items
+        /// Silently destructive if unchecked: both items
         /// resolve to one tracked row, so the last array position
         /// wins, the earlier one produces no posting, and the header
         /// ends up with fewer postings than the request listed plus a
@@ -205,7 +272,12 @@ public sealed class TransactionsRepository
         IReadOnlyList<TxnLegRow> SourceLegs,
         IReadOnlyDictionary<Guid, TxnLegRow> SourceLegById,
         IReadOnlyDictionary<Guid, TxnLegRow> CounterpartyBySourceLegId,
-        IReadOnlySet<Guid> KeepLegIds);
+        IReadOnlySet<Guid> KeepLegIds)
+    {
+        /// <summary>Each item's two leg amounts, in item order, built by
+        /// <see cref="PostingLegPair.Build"/> before anything is applied.</summary>
+        public IReadOnlyList<PostingLegPair.LegAmounts> Amounts { get; init; } = [];
+    }
 
     /// <summary>
     /// Outcome of <see cref="PatchAsync"/>. Each rejection code maps
@@ -240,6 +312,25 @@ public sealed class TransactionsRepository
         /// the exact failure the presence-based header fields exist to
         /// remove.</summary>
         HeaderDateNull,
+        /// <summary>The write primitive refused the notes (a read-only row, a side
+        /// not on the transaction, bad line notes, a tag set grown past the limit);
+        /// <see cref="PatchOutcome.Refusal"/> says which. Nothing is written.</summary>
+        NotesRefused,
+        /// <summary>The leg-pair builder refused a posting between real accounts in
+        /// different currencies: no second amount, or a zero or same-signed pair that the
+        /// edit changes (ADR-0114 D13); <see cref="PatchOutcome.PostingRefusal"/> says
+        /// which. Nothing is written.</summary>
+        PostingRefused,
+    }
+
+    /// <summary>
+    /// <see cref="PatchAsync"/>'s result, with the write primitive's reason when it
+    /// refused the notes.
+    /// </summary>
+    public sealed record PatchOutcome(
+        PatchResult Result, AnnotationViolation? Refusal = null, PostingLegPair.Refusal? PostingRefusal = null)
+    {
+        public static implicit operator PatchOutcome(PatchResult result) => new(result);
     }
 
     /// <summary>Outcome of <see cref="RecategorizeAsync"/> (ADR-0068).</summary>
@@ -265,7 +356,15 @@ public sealed class TransactionsRepository
         Guid ledgerId, Guid headerId, Guid newCategoryId, bool dryRun,
         CancellationToken cancellationToken = default)
     {
-        var header = await _db.TxnHeaders.AsNoTracking()
+        // The ledger write lock (migration 275) before the reads the reshape is built
+        // from, so no other write to the ledger lands between them and the reshape. A dry
+        // run writes nothing and takes no lock.
+        await using var write = dryRun
+            ? null
+            : await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken).ConfigureAwait(false);
+
+        // A merged-away header is not in the ledger to a write by id (MergedAway).
+        var header = await _db.TxnHeaders.AsNoTracking().NotMergedAway()
             .Where(h => h.Id == headerId && h.LedgerId == ledgerId)
             .Select(h => new { h.Action })
             .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
@@ -276,7 +375,7 @@ public sealed class TransactionsRepository
             from l in _db.TxnLegs.AsNoTracking()
             where l.HeaderId == headerId && l.LedgerId == ledgerId
             join a in _db.Accounts.AsNoTracking() on l.AccountId equals a.Id
-            select new { l.Id, l.AccountId, l.PostingIndex, l.Amount, l.LegMemo, a.AccountType, a.Name })
+            select new { l.Id, l.AccountId, l.PostingIndex, l.Amount, a.AccountType, a.Name })
             .ToListAsync(cancellationToken).ConfigureAwait(false);
 
         if (legs.Select(l => l.PostingIndex).Distinct().Count() > 1)
@@ -302,8 +401,10 @@ public sealed class TransactionsRepository
 
         // Reuse the canonical bank-transaction edit: keep the single posting (matched
         // by its source-side leg id) with its counterparty repointed to the new
-        // category. PatchAsync owns the reshape + the derived-state recompute.
-        var patch = await PatchAsync(ledgerId, headerId, new PatchTransactionRequest
+        // category. PatchAsync owns the reshape + the derived-state recompute. A
+        // repoint, not a notes write: each leg keeps its own memo and tags (it is the
+        // same row), and ownership follows the moved leg if it was the owner's.
+        var patch = await PatchCoreAsync(ledgerId, headerId, new PatchTransactionRequest
         {
             Postings = new PatchTransactionPostings
             {
@@ -315,15 +416,15 @@ public sealed class TransactionsRepository
                         LegId = sourceLeg.Id,
                         CounterpartyAccountId = newCategoryId,
                         Amount = sourceLeg.Amount,
-                        LegMemo = sourceLeg.LegMemo,
                     },
                 },
             },
-        }, cancellationToken).ConfigureAwait(false);
+        }, repointTarget: newCategoryId, cancellationToken).ConfigureAwait(false);
+        if (patch.Result != PatchResult.Ok)
+            return new(RecategorizeResult.ApplyFailed, categoryLeg.Name, newCat.Name);
 
-        return patch == PatchResult.Ok
-            ? new(RecategorizeResult.Ok, categoryLeg.Name, newCat.Name)
-            : new(RecategorizeResult.ApplyFailed, categoryLeg.Name, newCat.Name);
+        await write!.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return new(RecategorizeResult.Ok, categoryLeg.Name, newCat.Name);
     }
 
     public enum SplitPostingRecategorizeResult
@@ -351,7 +452,14 @@ public sealed class TransactionsRepository
         Guid ledgerId, Guid headerId, Guid fromCategoryId, Guid toCategoryId,
         bool dryRun, CancellationToken cancellationToken = default)
     {
-        var header = await _db.TxnHeaders.AsNoTracking()
+        // The ledger write lock first, as RecategorizeAsync takes it: a reshape built from
+        // a split read before another write changed it would drop or misplace lines.
+        await using var write = dryRun
+            ? null
+            : await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken).ConfigureAwait(false);
+
+        // A merged-away header is not in the ledger to a write by id (MergedAway).
+        var header = await _db.TxnHeaders.AsNoTracking().NotMergedAway()
             .Where(h => h.Id == headerId && h.LedgerId == ledgerId)
             .Select(h => new { h.Action })
             .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
@@ -375,7 +483,7 @@ public sealed class TransactionsRepository
             // The sibling read in RecategorizeAsync needs no such clause: it returns
             // IsSplit before order can matter, so it only ever sees one posting.
             orderby l.PostingIndex, l.Id
-            select new { l.Id, l.AccountId, l.PostingIndex, l.Amount, l.LegMemo, a.AccountType, a.Name })
+            select new { l.Id, l.AccountId, l.PostingIndex, l.Amount, a.AccountType, a.Name })
             .ToListAsync(cancellationToken).ConfigureAwait(false);
 
         // A split has >1 posting. Single-posting is set_transaction_category's job.
@@ -426,26 +534,39 @@ public sealed class TransactionsRepository
                 LegId = src.Id,
                 CounterpartyAccountId = isTarget ? toCategoryId : other.AccountId,
                 Amount = src.Amount,
-                LegMemo = src.LegMemo,
+                // The far leg as stored (ADR-0114 D13): a transfer between currencies keeps
+                // its own figure, and the builder drops it on a mirrored line.
+                CounterpartyAmount = other.Amount,
             });
         }
 
         if (dryRun)
             return new(SplitPostingRecategorizeResult.Ok, moved, fromName, toCat.Name);
 
-        var patch = await PatchAsync(ledgerId, headerId, new PatchTransactionRequest
+        // A repoint (see RecategorizeAsync): the moved legs keep their notes, and
+        // ownership follows them only if the owner had no other leg.
+        var patch = await PatchCoreAsync(ledgerId, headerId, new PatchTransactionRequest
         {
             Postings = new PatchTransactionPostings
             {
                 SourceAccountId = sourceAccountId,
                 Items = items.ToArray(),
             },
-        }, cancellationToken).ConfigureAwait(false);
+        }, repointTarget: toCategoryId, cancellationToken).ConfigureAwait(false);
+        if (patch.Result != PatchResult.Ok)
+            return new(SplitPostingRecategorizeResult.ApplyFailed, moved, fromName, toCat.Name);
 
-        return patch == PatchResult.Ok
-            ? new(SplitPostingRecategorizeResult.Ok, moved, fromName, toCat.Name)
-            : new(SplitPostingRecategorizeResult.ApplyFailed, moved, fromName, toCat.Name);
+        await write!.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return new(SplitPostingRecategorizeResult.Ok, moved, fromName, toCat.Name);
     }
+
+    /// <summary>
+    /// The reject reason of a header a bulk recategorize could not move because another
+    /// write to the ledger held its write lock past the wait (migration 275): the busy
+    /// refusal's own code. The header wrote nothing; the headers moved before it stay moved,
+    /// and the bulk goes on to the next.
+    /// </summary>
+    public const string LedgerWriteBusyReject = Errors.BusinessError.Codes.LedgerWriteBusy;
 
     public enum BulkSplitPostingResult { Ok, TargetNotInLedger, NoHeaders }
 
@@ -459,8 +580,10 @@ public sealed class TransactionsRepository
     /// Bulk <c>set_split_posting_category</c> (ADR-0068 slice E): across
     /// <paramref name="headerIds"/>, repoint every posting on fromCategory to
     /// toCategory via the per-header <see cref="RecategorizeSplitPostingsAsync"/>.
-    /// Best-effort — a header that isn't a bank-shape split with a fromCategory posting
-    /// is returned in <c>Rejects</c> (never blocks the rest). The whole call fails only
+    /// Best-effort — a header that isn't a bank-shape split with a fromCategory posting,
+    /// or that another write to the ledger kept from its write lock past the wait
+    /// (<see cref="LedgerWriteBusyReject"/>), is returned in <c>Rejects</c> (never blocks
+    /// the rest; each header commits on its own). The whole call fails only
     /// for a bad target category or an empty list (mirrors
     /// <see cref="BulkRecategorizeAsync"/>). dryRun previews the tally without writing.
     /// </summary>
@@ -485,9 +608,22 @@ public sealed class TransactionsRepository
         var rejects = new List<BulkSplitPostingReject>();
         foreach (var headerId in headerIds.Distinct())
         {
-            var r = await RecategorizeSplitPostingsAsync(
-                ledgerId, headerId, fromCategoryId, toCategoryId, dryRun, cancellationToken)
-                .ConfigureAwait(false);
+            SplitPostingRecategorizeOutcome r;
+            try
+            {
+                r = await RecategorizeSplitPostingsAsync(
+                    ledgerId, headerId, fromCategoryId, toCategoryId, dryRun, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (LedgerWriteBusyException)
+            {
+                // Each header commits on its own, so the headers before this one stay moved;
+                // this one wrote nothing (its transaction rolled back at the lock) and is
+                // rejected, as any header that could not be moved is.
+                _db.ChangeTracker.Clear();
+                rejects.Add(new(headerId, LedgerWriteBusyReject));
+                continue;
+            }
             switch (r.Result)
             {
                 case SplitPostingRecategorizeResult.Ok: moved += r.Moved; break;
@@ -504,7 +640,8 @@ public sealed class TransactionsRepository
     }
 
     /// <summary>One header a bulk recategorize could not move, with a reason code
-    /// (split / transfer / investment-transaction / not-in-ledger / apply-failed).</summary>
+    /// (split / transfer / investment-transaction / not-in-ledger / category-not-in-ledger /
+    /// apply-failed / <see cref="LedgerWriteBusyReject"/>).</summary>
     public sealed record BulkRecategorizeReject(Guid HeaderId, string Reason);
 
     /// <summary>Outcome of <see cref="BulkRecategorizeAsync"/>.</summary>
@@ -521,9 +658,11 @@ public sealed class TransactionsRepository
     /// Recategorize MANY simple transactions to one target category — the same
     /// single-category-leg reshape as <see cref="RecategorizeAsync"/>, applied per id.
     /// <b>Best-effort</b>: every recategorizable header is moved; a header that can't be
-    /// (split, transfer, investment, or not-in-ledger) is REJECTED and returned in
-    /// <see cref="BulkRecategorizeOutcome.Rejects"/> with a reason, so one bad row never
-    /// blocks the rest. The target category is validated ONCE up front — an invalid
+    /// (split, transfer, investment, or not-in-ledger), or that another write to the ledger
+    /// kept from its write lock past the wait (<see cref="LedgerWriteBusyReject"/>), is
+    /// REJECTED and returned in <see cref="BulkRecategorizeOutcome.Rejects"/> with a reason,
+    /// so one bad row never blocks the rest. Each header commits on its own, so a header
+    /// moved before a rejected one stays moved. The target category is validated ONCE up front — an invalid
     /// target rejects the WHOLE call (nothing written), since it's a batch-level
     /// precondition, not a per-row one; an empty id list is likewise a no-op reject.
     /// dryRun previews the split (recategorized / unchanged / rejects) without writing.
@@ -549,8 +688,20 @@ public sealed class TransactionsRepository
         int recategorized = 0, unchanged = 0;
         foreach (var headerId in ids)
         {
-            var r = await RecategorizeAsync(ledgerId, headerId, newCategoryId, dryRun, cancellationToken)
-                .ConfigureAwait(false);
+            RecategorizeOutcome r;
+            try
+            {
+                r = await RecategorizeAsync(ledgerId, headerId, newCategoryId, dryRun, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (LedgerWriteBusyException)
+            {
+                // As in the split-posting bulk: the headers before this one stay moved, and
+                // this one, which wrote nothing, is rejected.
+                _db.ChangeTracker.Clear();
+                rejects.Add(new(headerId, LedgerWriteBusyReject));
+                continue;
+            }
             switch (r.Result)
             {
                 case RecategorizeResult.Ok: recategorized++; break;
@@ -573,71 +724,107 @@ public sealed class TransactionsRepository
     }
 
     /// <summary>Outcome of <see cref="SetTransactionTagsAsync"/> (ADR-0081 D6).</summary>
-    public enum SetTagsResult { Ok, HeadersNotInLedger }
+    public enum SetTagsResult
+    {
+        Ok,
+        HeadersNotInLedger,
+        /// <summary>The write primitive refused at least one transaction (a row the
+        /// account shows read-only, an account not on it, a set grown past the limit);
+        /// <see cref="SetTagsOutcome.Placements"/> says which. Nothing is tagged.</summary>
+        Refused,
+    }
 
+    /// <param name="Tags">The tag set, one name per tag (the first spelling given).</param>
+    /// <param name="Placements">Per transaction: where the tags land, or why they do not.</param>
     public sealed record SetTagsOutcome(
         SetTagsResult Result,
         int HeaderCount,
         IReadOnlyList<string> Tags,
-        IReadOnlyList<Guid> UnknownHeaderIds);
+        IReadOnlyList<Guid> UnknownHeaderIds,
+        IReadOnlyList<SetTransactionTagsPlacement> Placements);
 
     /// <summary>
-    /// Replace the tag set on MANY transactions at once (ADR-0081 D6 — the deliberate
+    /// Replace the tag set on MANY transactions at once, as
+    /// <paramref name="accountId"/>'s register writes it (ADR-0081 D6 — the deliberate
     /// bulk exception to ADR-0068 D4's one-entity-per-call rule; tagging is an
     /// idempotent replace-set on a junction table with low blast radius). Every header
     /// must belong to <paramref name="ledgerId"/>; if any doesn't, the WHOLE batch is
     /// rejected (all-or-nothing) with the offending ids, so a bad id fails loud rather
     /// than silently tagging a subset. <paramref name="tags"/> is a replace-set — the
-    /// complete set to assign to each header; an empty list clears all tags. Runs in
-    /// one transaction; tag resolution (create-on-first-use) happens ONCE for the batch
-    /// (see <see cref="TagDictionary.ResolveIdsAsync"/>). dryRun validates +
-    /// reports the header count and normalized tag set without writing.
+    /// complete set to assign; an empty list clears it.
     /// </summary>
+    /// <remarks>
+    /// <para>The same transaction carries different tags on each side, so the tags
+    /// are written from one account, through the write primitive: on a one-posting
+    /// transaction they are that account's own; on a multi-posting one, the whole
+    /// transaction's. A transaction that account shows read-only, or that it is not
+    /// on, refuses the whole call, like an id outside the ledger, and nothing is
+    /// tagged.</para>
+    /// <para>Runs in one transaction; tag resolution (create-on-first-use) happens
+    /// ONCE for the batch. dryRun plans every write and reports each transaction's
+    /// placement without writing.</para>
+    /// </remarks>
     public async Task<SetTagsOutcome> SetTransactionTagsAsync(
         Guid ledgerId,
         IReadOnlyList<Guid> headerIds,
+        Guid accountId,
         IReadOnlyList<string> tags,
         bool dryRun,
         CancellationToken cancellationToken = default)
     {
         var ids = headerIds.Distinct().ToList();
-        var normalized = tags
-            .Select(t => t.Trim())
-            .Where(t => t.Length > 0)
-            .GroupBy(t => t.ToLowerInvariant())
-            .Select(g => g.First())
-            .ToList();
+        var requested = tags.Select(t => t.Trim()).Where(t => t.Length > 0).Distinct(StringComparer.Ordinal).ToList();
 
         // Header-in-ledger guard for the WHOLE batch (RLS also scopes the query to the
         // caller's ledgers, so a foreign header simply doesn't resolve here). Any id
-        // that doesn't resolve → reject the batch, tag nothing.
-        var found = await _db.TxnHeaders.AsNoTracking()
+        // that doesn't resolve → reject the batch, tag nothing. A merged-away header does
+        // not resolve either: it is reported as an unknown id (MergedAway).
+        var headers = await _db.TxnHeaders.NotMergedAway()
             .Where(h => h.LedgerId == ledgerId && ids.Contains(h.Id))
-            .Select(h => h.Id)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
-        var foundSet = found.ToHashSet();
+        var foundSet = headers.Select(h => h.Id).ToHashSet();
         var unknown = ids.Where(id => !foundSet.Contains(id)).ToList();
         if (unknown.Count > 0)
-            return new(SetTagsResult.HeadersNotInLedger, 0, normalized, unknown);
-
-        if (dryRun)
-            return new(SetTagsResult.Ok, ids.Count, normalized, Array.Empty<Guid>());
+            return new(SetTagsResult.HeadersNotInLedger, 0, requested, unknown, []);
 
         await using var transaction = await _db.Database
             .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-        // Resolve target tag-ids ONCE for the batch, then diff each header against it.
-        var targetTagIds = await TagDictionary
-            .ResolveIdsAsync(_db, ledgerId, tags, cancellationToken)
+        // Resolve ONCE for the batch; names that share a key are one tag, reported
+        // under the first spelling given.
+        var resolved = await TagDictionary.ResolveAsync(_db, ledgerId, requested, cancellationToken)
             .ConfigureAwait(false);
-        foreach (var headerId in ids)
-            await HeaderTags
-                .DiffHeaderTagPairingsAsync(_db, ledgerId, headerId, targetTagIds, cancellationToken)
-                .ConfigureAwait(false);
+        var tagIds = requested.Select(n => resolved[n]).Distinct().ToList();
+        var names = requested.Where((n, i) => requested.FindIndex(m => resolved[m] == resolved[n]) == i).ToList();
+        var intent = new AnnotationIntent<Guid>(
+            accountId,
+            FieldEdit<string>.Leave,
+            tagIds.Count == 0 ? FieldEdit<IReadOnlyList<Guid>>.Inherit : FieldEdit<IReadOnlyList<Guid>>.Set(tagIds));
+
+        // Loaded and stored as one batch, so the round trips do not grow with the ids.
+        var ordered = headers.OrderBy(h => ids.IndexOf(h.Id)).ToList();
+        var storedAll = await AnnotationWriter.LoadManyAsync(_db, ordered, cancellationToken).ConfigureAwait(false);
+        var planned = new List<AnnotationWriter.PlannedWrite>(headers.Count);
+        var placements = new List<SetTransactionTagsPlacement>(headers.Count);
+        foreach (var stored in storedAll)
+        {
+            var plan = AnnotationPlanner.Plan(ShapeChange<Guid>.Unchanged(stored.Shape, stored.Notes), intent);
+            placements.Add(plan.IsValid
+                ? new SetTransactionTagsPlacement(stored.Header.Id, SetTransactionTagsContract.LandsOn(stored.Shape), null)
+                : new SetTransactionTagsPlacement(stored.Header.Id, null, plan.Violations[0].Code));
+            planned.Add(new AnnotationWriter.PlannedWrite(stored.Header, stored.Legs, plan));
+        }
+
+        if (placements.Any(p => p.Refused is not null))
+            return new(SetTagsResult.Refused, 0, names, [], placements);
+        if (dryRun)
+            return new(SetTagsResult.Ok, ids.Count, names, [], placements);
+
+        await AnnotationWriter.ApplyManyAsync(_db, planned, cancellationToken).ConfigureAwait(false);
 
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        return new(SetTagsResult.Ok, ids.Count, normalized, Array.Empty<Guid>());
+        return new(SetTagsResult.Ok, ids.Count, names, [], placements);
     }
 
     /// <summary>
@@ -745,7 +932,9 @@ public sealed class TransactionsRepository
         //    candidate scope below would have nothing to match against
         //    anyway.
         var anchor = await (
-            from h in _db.TxnHeaders.AsNoTracking()
+            // A merged-away anchor is not found (MergedAway): no suggestions, as for an
+            // id that does not exist.
+            from h in _db.TxnHeaders.AsNoTracking().NotMergedAway()
             where h.Id == headerId && h.LedgerId == ledgerId
                 && h.ProviderKey != null
                 // Accept-flow gates — match merge-candidates'
@@ -756,7 +945,6 @@ public sealed class TransactionsRepository
                 // is_hidden is canonical since mig 230 — no override layer left
                 // to resolve through.
                 && !h.IsHidden
-                && h.IsMergedInto == null
             // The money side — the leg that isn't a category. The
             // NeedsReview gate above guarantees an un-accepted feed
             // row, which lands as (real account, Uncategorized), so
@@ -770,8 +958,7 @@ public sealed class TransactionsRepository
                 .Select(o => o.Payee)
                 .FirstOrDefault()
             // "The anchor has a bank payee to search by" — asked of the FEED's
-            // payee, not the header's. This gate used to read h.Payee, which was
-            // the same thing before mig 230 and is not now: on a needs_review row
+            // payee, not the header's. Since mig 230 h.Payee is not the feed's: on a needs_review row
             // someone edited without approving (MCP, or a direct PATCH — the SPA
             // always pairs a save with approve), h.Payee is the curated name, and
             // a CLEARED one would fail the gate while the bank's payee sat in the
@@ -873,6 +1060,8 @@ public sealed class TransactionsRepository
                 g.Max(r => r.PostedAt)))
             .OrderByDescending(s => s.UseCount)
             .ThenByDescending(s => s.LastUsedAt)
+            .ThenBy(s => s.Payee, StringComparer.Ordinal)
+            .ThenBy(s => s.CounterpartyAccountId)
             .Take(limit)
             .ToList();
     }
@@ -882,22 +1071,23 @@ public sealed class TransactionsRepository
     /// candidate is a settled row in the same ledger whose
     /// aggregated amount on the target's source account exactly
     /// matches the target's source-account amount, posted within
-    /// ±7 days. Used by the editor's "Possible matches" panel.
+    /// ±7 days. Used by the editor's "Merge candidates" strip.
     ///
     /// <para>Settled = accepted (<c>needs_review=false</c>), not a
-    /// loser of a prior merge (<c>is_merged_into IS NULL</c>), not
-    /// already a winner of a prior merge
-    /// (<c>is_merge_winner=false</c>), and not hidden. Merging into
-    /// a pending row absorbs nothing the user has curated; merging
-    /// into an already-won row creates a two-loser graph no UI
-    /// surface traverses today. Candidates may be manual OR
+    /// loser of a prior merge (<c>is_merged_into IS NULL</c>), and not
+    /// hidden. Merging into a pending row absorbs nothing the user has
+    /// curated. A prior merge winner qualifies: folding another row into
+    /// it keeps the graph one hop. Candidates may be manual OR
     /// bank-fed: an accepted bank-fed twin (the bank double-posted
     /// the same charge and one was already curated) is just as
     /// valid a merge target as a manual placeholder.</para>
     ///
-    /// <para>The candidate's posting list and tags come back
-    /// pre-resolved so clicking a candidate can pre-fill the
-    /// editor without an additional round-trip.</para>
+    /// <para>Each candidate carries what its chip shows: the posted date, the
+    /// resolved payee, the counterparty account of each posting (the chip
+    /// names the one, or counts a split's) and the origin its tooltip names.
+    /// Picking one folds the edited row into it through the merge route; the
+    /// candidate keeps its own fields and nothing is copied into the
+    /// editor.</para>
     ///
     /// <para>Returns empty when: the target doesn't exist or isn't
     /// in the ledger; the target has no identifiable source-side
@@ -919,7 +1109,7 @@ public sealed class TransactionsRepository
         // must be a fresh, undecided, *effectively*-visible row, and the
         // window matches its *effective* posted_at — NOT raw txn_headers —
         // so a user-curated date/visibility is what we match on, agreeing
-        // with what the register shows (the bug this fix closes). Source
+        // with what the register shows. Source
         // account = the non-category leg (lowest leg_index for the rare
         // multi-leg target). Ledger scope comes from the source account
         // (accounts are ledger-bound).
@@ -955,7 +1145,7 @@ public sealed class TransactionsRepository
         //    resolved_transactions so the window + visibility honour
         //    overrides: a user-curated posted_at is what the register
         //    shows, so a same-effective-day twin must be offered even
-        //    when its raw posted_at is days off (the bug this fixes).
+        //    when its raw posted_at is days off.
         var windowStart = anchor.PostedAt.AddDays(-7);
         var windowEnd = anchor.PostedAt.AddDays(7);
 
@@ -992,33 +1182,33 @@ public sealed class TransactionsRepository
         var candidateIds = candidates
             .OrderBy(c => Math.Abs((c.PostedAt - anchor.PostedAt).TotalDays))
             .ThenByDescending(c => c.PostedAt)
+            .ThenBy(c => c.Id)
             .Take(limit)
             .Select(c => c.Id)
             .ToList();
 
         // 4. Hydrate the chosen candidates: header (with override
-        //    resolution), posting list (with counterparty account
-        //    names), tags. Three parallel reads keyed on the
-        //    candidate id set; assembled in memory.
-        // Effective header fields (payee/memo/posted_at) — one view row
-        // per header carries the header-level values; Distinct collapses
-        // the per-leg duplication.
+        //    resolution) and posting list (with counterparty account
+        //    names). Keyed on the candidate id set; assembled in memory.
+        // Effective header fields (payee/posted_at/origin) — one view row per
+        // header carries the header-level values; Distinct collapses the
+        // per-leg duplication.
         var headers = await _db.ResolvedTransactions.AsNoTracking()
             .Where(rv => candidateIds.Contains(rv.HeaderId))
             .Select(rv => new
             {
                 Id = rv.HeaderId,
                 rv.Payee,
-                Memo = rv.HeaderMemo,
                 rv.PostedAt,
+                rv.Origin,
             })
             .Distinct()
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
         // Postings: every leg whose account_id != source account
-        // becomes a "counterparty" in the editor-pre-fill shape (the
-        // source leg is implied). Effective amount + leg memo via the view.
+        // becomes a "counterparty" the chip names (the source leg is
+        // implied).
         var legs = await (
             from rv in _db.ResolvedTransactions.AsNoTracking()
             where candidateIds.Contains(rv.HeaderId)
@@ -1030,17 +1220,7 @@ public sealed class TransactionsRepository
                 PostingIndex = rv.LegIndex,
                 CounterpartyAccountId = a.Id,
                 CounterpartyAccountName = a.Name,
-                rv.Amount,
-                rv.LegMemo,
             })
-            .ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
-
-        var tagsByHeader = await (
-            from p in _db.TxnHeaderTags.AsNoTracking()
-            where candidateIds.Contains(p.HeaderId)
-            join t in _db.Tags.AsNoTracking() on p.TagId equals t.Id
-            select new { p.HeaderId, t.Name })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
@@ -1050,16 +1230,8 @@ public sealed class TransactionsRepository
                 .OrderBy(l => l.PostingIndex)
                 .Select(l => new MergeCandidatePostingDto(
                     l.CounterpartyAccountId,
-                    l.CounterpartyAccountName,
-                    l.Amount,
-                    l.LegMemo))
+                    l.CounterpartyAccountName))
                 .ToList() as IReadOnlyList<MergeCandidatePostingDto>);
-        var tagsByHeaderId = tagsByHeader
-            .GroupBy(t => t.HeaderId)
-            .ToDictionary(g => g.Key, g => g
-                .Select(t => t.Name)
-                .OrderBy(n => n, StringComparer.Ordinal)
-                .ToList() as IReadOnlyList<string>);
 
         // Re-emit in candidateIds order so the SPA gets the
         // server-sorted list (by date-proximity then recency)
@@ -1069,15 +1241,12 @@ public sealed class TransactionsRepository
         foreach (var id in candidateIds)
         {
             if (!headersById.TryGetValue(id, out var h)) continue;
-            var daysDelta = (int)Math.Round((h.PostedAt - anchor.PostedAt).TotalDays);
             result.Add(new MergeCandidateDto(
                 h.Id,
                 h.Payee,
-                h.Memo,
                 h.PostedAt,
-                daysDelta,
-                tagsByHeaderId.GetValueOrDefault(h.Id, Array.Empty<string>()),
-                legsByHeader.GetValueOrDefault(h.Id, Array.Empty<MergeCandidatePostingDto>())));
+                legsByHeader.GetValueOrDefault(h.Id, Array.Empty<MergeCandidatePostingDto>()),
+                h.Origin));
         }
         return result;
     }
@@ -1113,16 +1282,33 @@ public sealed class TransactionsRepository
     /// account. The intermediate <c>SaveChangesAsync</c> inside
     /// <see cref="ApplyPostingsReshapeAsync"/> also triggers the
     /// interceptor — each save is atomic with its own recompute.</remarks>
-    public async Task<PatchResult> PatchAsync(
+    public Task<PatchOutcome> PatchAsync(
         Guid ledgerId,
         Guid headerId,
         PatchTransactionRequest request,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        PatchCoreAsync(ledgerId, headerId, request, repointTarget: null, cancellationToken);
+
+    /// <param name="repointTarget">Set by the recategorize paths, which reuse the
+    /// reshape to move legs to another account: no notes are planned or written (every
+    /// kept leg is the same row, with its own memo and tags), and ownership follows the
+    /// owner's legs to this account when none of them is left on it. Null for a PATCH,
+    /// whose notes and ownership the write primitive plans.</param>
+    private async Task<PatchOutcome> PatchCoreAsync(
+        Guid ledgerId,
+        Guid headerId,
+        PatchTransactionRequest request,
+        Guid? repointTarget,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        await using var transaction = await _db.Database
-            .BeginTransactionAsync(cancellationToken)
+        // The ledger write lock (migration 275) is the transaction's first statement, so
+        // the validation reads, every save below (the reshape saves twice) and their
+        // recomputes run with no other recomputing write to the ledger in flight. A
+        // recategorize took it already, before its own reads; then this joins that
+        // transaction and the caller commits.
+        await using var write = await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken)
             .ConfigureAwait(false);
 
         // ---- VALIDATE ------------------------------------------------
@@ -1132,7 +1318,12 @@ public sealed class TransactionsRepository
         // tracked so the approve path can flip needs_review via
         // property assignment (batched in the single SaveChanges
         // below).
-        var header = await _db.TxnHeaders
+        //
+        // A merged-away header is not in the ledger to an edit, an approve or a
+        // recategorize (MergedAway). The merge reads it as it is: its own gate below
+        // refuses a tombstone at either end, as merge-source-invalid.
+        var headers = request.MergeFromHeaderId is null ? _db.TxnHeaders.NotMergedAway() : _db.TxnHeaders;
+        var header = await headers
             .FirstOrDefaultAsync(h => h.Id == headerId && h.LedgerId == ledgerId,
                 cancellationToken)
             .ConfigureAwait(false);
@@ -1155,6 +1346,17 @@ public sealed class TransactionsRepository
             return PatchResult.HeaderDateNull;
         }
 
+        // A carried date on the stored day is not an edit (HeaderDates): the
+        // editor sends midnight UTC of the picked day, and assigning it would
+        // overwrite a feed row's time of day on a save that never touched the
+        // date. Decided here, against the stored row, so an unchanged date
+        // neither writes nor, on its own, captures originals.
+        var dates = new HeaderDateEdit(
+            request.HasPostedAt && HeaderDates.Changes(header.PostedAt, request.PostedAt!.Value)
+                ? request.PostedAt!.Value : null,
+            request.HasTransactedAt && HeaderDates.Changes(header.TransactedAt, request.TransactedAt!.Value)
+                ? request.TransactedAt!.Value : null);
+
         PostingsReshapePlan? postingsPlan = null;
         if (request.Postings is { } postings)
         {
@@ -1173,6 +1375,12 @@ public sealed class TransactionsRepository
                     postingsPlan = plan;
                     break;
             }
+
+            var (amounts, refused) = await BuildReshapeAmountsAsync(postingsPlan!, cancellationToken)
+                .ConfigureAwait(false);
+            if (refused is not null)
+                return new PatchOutcome(PatchResult.PostingRefused, PostingRefusal: refused);
+            postingsPlan = postingsPlan! with { Amounts = amounts };
         }
 
         // Slice 2c.6d: when a merge source is supplied, validate
@@ -1229,9 +1437,50 @@ public sealed class TransactionsRepository
                 || mergeSource.NeedsReview
                 || mergeSource.IsMergedInto is not null
                 // is_hidden is canonical since mig 230.
-                || mergeSource.IsHidden)
+                || mergeSource.IsHidden
+                // A reminder's template is no transaction (ADR-0047): it is in no
+                // register, so the candidates never offer it, and a merge into it
+                // would fold a real row away into one no register shows.
+                || mergeSource.IsRecurringTemplate)
             {
                 return PatchResult.MergeSourceInvalid;
+            }
+        }
+
+        // Notes and ownership, planned against the stored transaction before anything
+        // is written, so a refusal is a clean 422. A reshape with no notes is still
+        // planned, as an untouched write from the postings' source account: only the
+        // originating account may reshape a split, and the plan says who owns the
+        // result. A recategorize is a repoint instead (see repointTarget).
+        AnnotationPlan<Guid>? notesPlan = null;
+        Guid? repointOwner = null;
+        if (request.Notes is not null || postingsPlan is not null)
+        {
+            var stored = await AnnotationWriter.LoadAsync(_db, header, cancellationToken,
+                    postingsPlan?.Items.Select(i => i.CounterpartyAccountId))
+                .ConfigureAwait(false);
+            var after = postingsPlan is null ? stored.Shape : ShapeAfter(postingsPlan, stored);
+
+            if (repointTarget is { } target)
+            {
+                repointOwner = AnnotationPlanner.Repoint(stored.Shape, after, target);
+            }
+            else
+            {
+                if (request.Notes is { } sent && postingsPlan is not null && sent.Side != postingsPlan.SourceAccountId)
+                    return new PatchOutcome(PatchResult.NotesRefused, new AnnotationViolation(
+                        AnnotationViolationCodes.SideNotOnTransaction,
+                        "The notes must be written from the account the postings are entered from."));
+                var intent = request.Notes?.Intent()
+                             ?? AnnotationIntent<string>.Untouched(postingsPlan!.SourceAccountId);
+                var change = postingsPlan is null
+                    ? ShapeChange<Guid>.Unchanged(stored.Shape, stored.Notes)
+                    : new ShapeChange<Guid>(stored.Shape, stored.Notes, after, ShapeChange<Guid>.ByLegId(stored.Shape, after));
+                var resolved = await AnnotationWriter.ResolveAsync(_db, ledgerId, intent, cancellationToken)
+                    .ConfigureAwait(false);
+                notesPlan = AnnotationPlanner.Plan(change, resolved);
+                if (!notesPlan.IsValid)
+                    return new PatchOutcome(PatchResult.NotesRefused, notesPlan.Violations[0]);
             }
         }
 
@@ -1241,9 +1490,12 @@ public sealed class TransactionsRepository
         // shift dance, calls SaveChanges as a sub-step internal to
         // the reshape). The terminal SaveChanges + Commit at the
         // bottom is the single visible commit boundary.
-        if (HasAnyHeaderField(request))
+        // A reshape is planned too, and can rewrite memos with no notes sent (a split
+        // copies the memo to the header, a collapse joins it with the line's), so the
+        // feed's memo is captured before any plan is stored.
+        if (HasAnyHeaderField(request, dates) || request.Notes is not null || notesPlan is not null)
         {
-            await ApplyHeaderFieldsAsync(header, request, cancellationToken)
+            await ApplyHeaderFieldsAsync(header, request, dates, cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -1253,15 +1505,17 @@ public sealed class TransactionsRepository
                 .ConfigureAwait(false);
         }
 
+        if (notesPlan is not null)
+        {
+            var legsAfter = _db.TxnLegs.Local.Where(l => l.HeaderId == headerId).ToList();
+            await AnnotationWriter.ApplyAsync(_db, header, legsAfter, notesPlan, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        if (repointOwner is { } followed) AnnotationWriter.ApplyRepoint(header, followed);
+
         if (request.Approve == true)
         {
             header.NeedsReview = false;
-        }
-
-        if (request.Tags is { } tags)
-        {
-            await HeaderTags.ApplyAsync(_db, ledgerId, headerId, tags, cancellationToken)
-                .ConfigureAwait(false);
         }
 
         if (mergeSource is not null)
@@ -1274,14 +1528,12 @@ public sealed class TransactionsRepository
             // already-TRUE winner is a no-op for the change tracker.
             header.IsMergedInto = mergeSource.Id;
             mergeSource.IsMergeWinner = true;
-            // A merged loser is never awaiting review. This used to depend on the
-            // SPA pairing the merge with `approve: true`, which it does — but that
-            // left the invariant in the caller, so any other client (MCP, a direct
-            // PATCH) merged a row and left it flagged, which keeps the sidebar's
-            // review dot lit on an account whose register has nothing to review.
-            // Enforced here, where the state lives, so it holds for every caller.
-            // The investment branch does the same; the two paths were reconciled
-            // on this deliberately rather than left to diverge.
+            // A merged loser is never awaiting review. Left to the SPA pairing the
+            // merge with `approve: true`, the invariant would live in the caller, so
+            // any other client (MCP, a direct PATCH) would merge a row and leave it
+            // flagged, keeping the sidebar's review dot lit on an account whose
+            // register has nothing to review. Enforced here, where the state lives,
+            // so it holds for every caller. The investment branch does the same.
             header.NeedsReview = false;
 
             // The survivor adopts the IMPORTED (loser) row's posted date:
@@ -1294,10 +1546,15 @@ public sealed class TransactionsRepository
             // `request.PostedAt` covers an in-editor date edit made on the
             // same PATCH; otherwise it's the import row's raw posted_at. Note
             // `header.PostedAt` is read AFTER ApplyHeaderFieldsAsync above, so
-            // the `??` arm and the explicit arm now agree by construction.
-            // A posted_at change is balance-relevant, so the recompute
-            // interceptor rewalks the winner's account on save — same path as
-            // a normal date edit.
+            // the `??` arm and the explicit arm agree on the day by construction
+            // (a same-day request leaves the loser's timestamp in place; the
+            // survivor still takes the request as sent).
+            // A posted_at change is a header change the walks read, so the save
+            // rewalks the winner's accounts and, when the winner is an investment
+            // row (nothing here requires a bank one), re-sorts its positions and
+            // re-derives its trade days, the one it moves to and the one it leaves —
+            // same path as a normal date edit (InvestmentMergeTests holds this path
+            // to it).
             var importedPostedAt = request.PostedAt ?? header.PostedAt;
             await SetPostedAtAsync(mergeSource, importedPostedAt, cancellationToken)
                 .ConfigureAwait(false);
@@ -1341,8 +1598,28 @@ public sealed class TransactionsRepository
         }
 
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
         return PatchResult.Ok;
+    }
+
+    /// <summary>
+    /// The transaction's shape once <paramref name="plan"/> is applied: posting i is
+    /// the plan's item i, a kept posting by the ids of its two stored legs, a new one
+    /// with none. Legs keep their identity, which is how values follow their leg
+    /// through a reorder or a recategorize.
+    /// </summary>
+    private static TxnShape ShapeAfter(PostingsReshapePlan plan, AnnotationWriter.Stored stored)
+    {
+        var legs = new List<AnnotationWriter.PlannedLeg>(plan.Items.Count * 2);
+        for (var i = 0; i < plan.Items.Count; i++)
+        {
+            var item = plan.Items[i];
+            var kept = item.LegId is { } id && plan.SourceLegById.ContainsKey(id) ? id : (Guid?)null;
+            legs.Add(new AnnotationWriter.PlannedLeg(i, plan.SourceAccountId, kept));
+            legs.Add(new AnnotationWriter.PlannedLeg(i, item.CounterpartyAccountId,
+                kept is { } k ? plan.CounterpartyBySourceLegId[k].Id : null));
+        }
+        return AnnotationWriter.Shape(stored.Header.OriginatingAccountId, stored.Header.Action, legs, stored.Facts);
     }
 
     /// <summary>
@@ -1420,6 +1697,33 @@ public sealed class TransactionsRepository
     }
 
     /// <summary>
+    /// Each item's two leg amounts (<see cref="PostingLegPair.Build"/>), or the first
+    /// posting refused. A kept posting is checked against its stored pair, so one resent
+    /// as stored, from either side, passes the nonzero and sign rules (ADR-0114 D13).
+    /// </summary>
+    private async Task<(IReadOnlyList<PostingLegPair.LegAmounts> Amounts, PostingLegPair.Refusal? Refused)>
+        BuildReshapeAmountsAsync(PostingsReshapePlan plan, CancellationToken cancellationToken)
+    {
+        var sides = await PostingLegPair.LoadSidesAsync(
+                _db, plan.LedgerId, plan.Items.Select(i => i.CounterpartyAccountId).Append(plan.SourceAccountId),
+                cancellationToken)
+            .ConfigureAwait(false);
+        var stored = PostingLegPair.StoredPairs(
+            plan.SourceLegs.Concat(plan.CounterpartyBySourceLegId.Values), plan.SourceAccountId);
+
+        var amounts = new PostingLegPair.LegAmounts[plan.Items.Count];
+        for (var i = 0; i < plan.Items.Count; i++)
+        {
+            var item = plan.Items[i];
+            PostingLegPair.StoredPair? pair = item.LegId is { } id && stored.TryGetValue(id, out var p) ? p : null;
+            var (built, refused) = PostingLegPair.Build(plan.SourceAccountId, item, i, sides, pair);
+            if (refused is not null) return ([], refused);
+            amounts[i] = built;
+        }
+        return (amounts, null);
+    }
+
+    /// <summary>
     /// Execute a postings reshape against a validated plan
     /// (ADR-0025). Three phases:
     /// <list type="number">
@@ -1461,69 +1765,67 @@ public sealed class TransactionsRepository
 
         // Phase 3 — final ordering + insert new postings.
         //
-        // This used to be preceded by a "drop overrides on kept legs" step, on
-        // the reasoning that a canonical re-save supersedes the override layer.
-        // txn_leg_overrides went away in migration 230: nothing in the API ever
-        // wrote one and no database was found holding any, so it was a join on
-        // the hottest view and on the balance walk for no rows at all.
-        // posting_index = position in items[].
+        // No "drop overrides on kept legs" step: txn_leg_overrides went away in
+        // migration 230. Nothing in the API ever wrote one, so the table was a join
+        // on the hottest view and on the balance walk with no writer behind it.
+        // posting_index = position in items[]. Each item's leg amounts were built before
+        // the apply (plan.Amounts): the source leg's, and the counterparty's, which is the
+        // source's negated unless the posting is between real accounts in two currencies.
+        // A leg repointed from a category register to an account in another currency is
+        // a relabel (ADR-0114 D13): the category's figure is kept, and the account's leg
+        // mirrors it, read in that account's currency.
         for (var i = 0; i < plan.Items.Count; i++)
         {
             var item = plan.Items[i];
-            Guid sourceLegId;
+            var amounts = plan.Amounts[i];
             if (item.LegId.HasValue && plan.SourceLegById.TryGetValue(
                 item.LegId.Value, out var keep))
             {
                 var counter = plan.CounterpartyBySourceLegId[keep.Id];
                 keep.PostingIndex = i;
-                keep.Amount = item.Amount;
-                keep.LegMemo = item.LegMemo;
+                keep.Amount = amounts.Source;
                 counter.PostingIndex = i;
                 counter.AccountId = item.CounterpartyAccountId;
-                counter.Amount = -item.Amount;
-                sourceLegId = keep.Id;
+                counter.Amount = amounts.Counterparty;
             }
             else
             {
-                sourceLegId = AddPostingLegs(
-                    plan.HeaderId, plan.LedgerId, plan.SourceAccountId, item, postingIndex: i);
-            }
-
-            // Null leaves this posting's tags alone; [] clears them (ADR-0103).
-            // The distinction is load-bearing here and nowhere else: the postings
-            // list is replaced WHOLESALE, so a client that reads a transaction and
-            // echoes its postings back — as every client written before leg tags
-            // existed does — must not strip them by omission.
-            if (item.Tags is { } itemTags)
-            {
-                await LegTags.ApplyAsync(
-                        _db, plan.LedgerId, sourceLegId, itemTags, cancellationToken)
-                    .ConfigureAwait(false);
+                AddPostingLegs(plan.HeaderId, plan.LedgerId, plan.SourceAccountId, item, amounts, postingIndex: i);
             }
         }
+        // Memos and tags are not touched here: a kept leg keeps its own, and the
+        // write primitive's plan, applied after this, places every value.
     }
+
+    /// <summary>
+    /// The header dates a PATCH actually changes, decided against the stored row
+    /// by <see cref="HeaderDates"/>: null where the request omitted the date or
+    /// sent one on the stored day.
+    /// </summary>
+    private sealed record HeaderDateEdit(DateTime? PostedAt, DateTime? TransactedAt);
 
     /// <summary>
     /// Did the request CARRY any header field? Presence, not nullness
     /// (migration 230) — a body sending <c>"payee": null</c> to clear the payee
     /// is a header edit, and reading it as "no header fields" would drop it on
-    /// the floor, which is the bug this replaced.
+    /// the floor. A date counts only when it changes the day
+    /// (<paramref name="dates"/>).
     /// </summary>
-    private static bool HasAnyHeaderField(PatchTransactionRequest r) =>
+    private static bool HasAnyHeaderField(PatchTransactionRequest r, HeaderDateEdit dates) =>
         r.HasPayee
-        || r.HasMemo
         || r.HasCheckNumber
-        || r.HasPostedAt
-        || r.HasTransactedAt;
+        || dates.PostedAt is not null
+        || dates.TransactedAt is not null;
 
     /// <summary>
     /// Apply the header fields the request CARRIED to the canonical row,
     /// capturing the feed's values to <c>txn_header_originals</c> first
-    /// (migration 230).
+    /// (migration 230). Called for a notes edit too, so the feed's memo is captured
+    /// before the plan overwrites it.
     /// </summary>
     /// <remarks>
     /// <para>A field the body omitted is left alone; a field it carried is
-    /// assigned, <c>null</c> included — that is how a payee, memo or check
+    /// assigned, <c>null</c> included — that is how a payee or check
     /// number gets CLEARED, which the override layer could not express.</para>
     ///
     /// <para>The capture runs even when the assignment turns out to be a no-op
@@ -1533,26 +1835,32 @@ public sealed class TransactionsRepository
     /// moment the user typed a value back to what the feed said. Existence, not
     /// difference, is the signal.</para>
     ///
+    /// <para>The dates are the exception, and only because the editor cannot
+    /// state a time of day: a date on the stored day is the editor's
+    /// representation of "unchanged", not a value the user typed, so
+    /// <paramref name="dates"/> carries only the dates that change the day
+    /// (<see cref="HeaderDates"/>).</para>
+    ///
     /// <para>This is the same helper the investment path calls, which is the
     /// point: one capture rule, not two that agree today.</para>
     /// </remarks>
     private async Task ApplyHeaderFieldsAsync(
         TxnHeaderRow header,
         PatchTransactionRequest r,
+        HeaderDateEdit dates,
         CancellationToken cancellationToken)
     {
-        await HeaderOriginals.CaptureAsync(_db, header, cancellationToken)
+        await AnnotationWriter.CaptureOriginalsAsync(_db, header, cancellationToken)
             .ConfigureAwait(false);
 
         // Normalized here rather than trusted from the request: the editors
         // disagreed about trimming and only one of them did it, so the same
         // keystrokes stored different bytes per register. See HeaderText.
         if (r.HasPayee) header.Payee = HeaderText.Normalize(r.Payee);
-        if (r.HasMemo) header.Memo = HeaderText.Normalize(r.Memo);
         if (r.HasCheckNumber) header.CheckNumber = HeaderText.Normalize(r.CheckNumber);
-        // Non-null guaranteed by the HeaderDateNull gate in the validate phase.
-        if (r.HasPostedAt) header.PostedAt = r.PostedAt!.Value;
-        if (r.HasTransactedAt) header.TransactedAt = r.TransactedAt!.Value;
+        // Null where the request omitted the date or sent the stored day.
+        if (dates.PostedAt is { } postedAt) header.PostedAt = postedAt;
+        if (dates.TransactedAt is { } transactedAt) header.TransactedAt = transactedAt;
     }
 
     /// <summary>
@@ -1565,53 +1873,53 @@ public sealed class TransactionsRepository
         DateTime postedAt,
         CancellationToken cancellationToken)
     {
-        await HeaderOriginals.CaptureAsync(_db, header, cancellationToken)
+        await AnnotationWriter.CaptureOriginalsAsync(_db, header, cancellationToken)
             .ConfigureAwait(false);
         header.PostedAt = postedAt;
     }
 
     /// <summary>
-    /// Add one posting (a source-side leg + its negated
-    /// counterparty) to the EF change tracker. Caller owns the
-    /// SaveChanges + transaction commit. <paramref name="ledgerId"/>
-    /// is stamped on both legs (migration 049); the DB composite FK
-    /// rejects the insert if either account_id resolves to a
-    /// different ledger.
+    /// Add one posting (a source-side leg + its counterparty) to the EF change tracker,
+    /// with the amounts <see cref="PostingLegPair.Build"/> gave it: the counterparty's is
+    /// the source's negated, or its own figure on a posting between real accounts in
+    /// different currencies (ADR-0114 D13). Caller owns the SaveChanges + transaction
+    /// commit. <paramref name="ledgerId"/> is stamped on both legs (migration 049); the DB
+    /// composite FK rejects the insert if either account_id resolves to a different
+    /// ledger.
     /// </summary>
     /// <remarks>
-    /// Returns the SOURCE-side leg's id, which is the one a posting's tags and
-    /// memo attach to (ADR-0103). The counterparty leg carries neither: a
-    /// posting is one fact with two sides, and recording "Property B" twice
-    /// would double every count and make un-tagging ambiguous.
+    /// Returns both legs, source first. They carry no memo and no tags: the write
+    /// primitive places those once every leg of the transaction exists.
     /// </remarks>
-    private Guid AddPostingLegs(
+    private TxnLegRow[] AddPostingLegs(
         Guid headerId,
         Guid ledgerId,
         Guid sourceAccountId,
         TransactionPosting posting,
+        PostingLegPair.LegAmounts amounts,
         int postingIndex)
     {
-        var sourceLegId = Guid.NewGuid();
-        _db.TxnLegs.Add(new TxnLegRow
+        var source = new TxnLegRow
         {
-            Id = sourceLegId,
+            Id = Guid.NewGuid(),
             HeaderId = headerId,
             LedgerId = ledgerId,
             AccountId = sourceAccountId,
             PostingIndex = postingIndex,
-            Amount = posting.Amount,
-            LegMemo = posting.LegMemo,
-        });
-        _db.TxnLegs.Add(new TxnLegRow
+            Amount = amounts.Source,
+        };
+        var counterparty = new TxnLegRow
         {
             Id = Guid.NewGuid(),
             HeaderId = headerId,
             LedgerId = ledgerId,
             AccountId = posting.CounterpartyAccountId,
             PostingIndex = postingIndex,
-            Amount = -posting.Amount,
-        });
-        return sourceLegId;
+            Amount = amounts.Counterparty,
+        };
+        _db.TxnLegs.Add(source);
+        _db.TxnLegs.Add(counterparty);
+        return [source, counterparty];
     }
 
     /// <summary>
@@ -1651,10 +1959,14 @@ public sealed class TransactionsRepository
         Guid currentUserId,
         CancellationToken cancellationToken = default)
     {
+        // A merged-away header has no leg to set, as an id that does not exist has none
+        // (MergedAway).
+        var live = _db.TxnHeaders.NotMergedAway();
         var legIds = await _db.TxnLegs
             .Where(l => l.HeaderId == headerId
                 && l.AccountId == accountId
-                && l.LedgerId == ledgerId)
+                && l.LedgerId == ledgerId
+                && live.Any(h => h.Id == l.HeaderId))
             .Select(l => l.Id)
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -1747,13 +2059,24 @@ public sealed class TransactionsRepository
     /// <c>SaveChangesAsync</c>. For the hard-delete branch, the
     /// interceptor's pre-save snapshot reads the doomed header's
     /// legs from the DB so the affected-accounts set survives the
-    /// cascade.</remarks>
+    /// cascade, and the rows merged into the header, which the delete
+    /// un-merges, are tracked first so the save recomputes them too
+    /// (<see cref="MergeLosers"/>).
+    /// <para>Both branches run in one transaction that takes the ledger write lock
+    /// (migration 275) first: the hard delete's cascade row-locks the header's stored
+    /// balances before its recompute runs, so without the lock a recompute of the same
+    /// account that waits on those rows could be waited on in turn.</para></remarks>
     public async Task<DeleteOutcome> DeleteAsync(
         Guid ledgerId,
         Guid headerId,
         CancellationToken cancellationToken = default)
     {
-        var header = await _db.TxnHeaders
+        await using var write = await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken)
+            .ConfigureAwait(false);
+
+        // A merged-away header is not found (MergedAway). Deleting a winner still
+        // un-merges its losers below.
+        var header = await _db.TxnHeaders.NotMergedAway()
             .FirstOrDefaultAsync(
                 h => h.Id == headerId && h.LedgerId == ledgerId,
                 cancellationToken)
@@ -1777,17 +2100,17 @@ public sealed class TransactionsRepository
         // Soft-hiding keeps the stamp, so the slot stays consumed and the agenda keeps
         // showing it as scheduled (GetUpcomingAsync's fired-rows query does not filter
         // is_hidden). The transaction leaves the register exactly as a soft-deleted feed
-        // transaction does, and UnhideAsync is already the undo — no new concept, and no
-        // one-way door needing an un-skip that does not exist yet.
-        var isReminderOccurrence =
-            header.RecurringTransactionId is not null
-            && header.OccurrenceDate is not null
-            && !header.IsRecurringTemplate;
-
-        if (header.ExternalId is null && !isReminderOccurrence)
+        // transaction does, and the bulk unhide is the undo — no new concept, and no
+        // one-way door needing an un-skip that does not exist yet. The rule is
+        // TxnHeaderRow.IsDeletedOutright, which the relabel's refusal reads too.
+        if (header.DeletesOutright())
         {
+            // A manual row can be a merge winner, and deleting it un-merges its losers;
+            // tracked first, the save recomputes them (MergeLosers).
+            await MergeLosers.TrackAsync(_db, [header.Id], cancellationToken).ConfigureAwait(false);
             _db.TxnHeaders.Remove(header);
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await write.CommitAsync(cancellationToken).ConfigureAwait(false);
             return DeleteOutcome.HardDeleted;
         }
 
@@ -1798,33 +2121,7 @@ public sealed class TransactionsRepository
         header.IsHidden = true;
         header.NeedsReview = false;
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
         return DeleteOutcome.SoftHidden;
-    }
-
-    /// <summary>Outcome of <see cref="UnhideAsync"/>.</summary>
-    public enum UnhideOutcome { HeaderNotFound, NotHidden, Unhidden }
-
-    /// <summary>
-    /// Un-hide a soft-hidden transaction (ADR-0072 D2): flip <c>is_hidden</c>
-    /// back to false so the row re-enters the register + the balance walk. The
-    /// recompute interceptor fires on SaveChanges (is_hidden is balance-relevant,
-    /// mig 103). Idempotent — a row that isn't hidden is a NotHidden no-op.
-    /// </summary>
-    public async Task<UnhideOutcome> UnhideAsync(
-        Guid ledgerId,
-        Guid headerId,
-        CancellationToken cancellationToken = default)
-    {
-        var header = await _db.TxnHeaders
-            .FirstOrDefaultAsync(
-                h => h.Id == headerId && h.LedgerId == ledgerId,
-                cancellationToken)
-            .ConfigureAwait(false);
-        if (header is null) return UnhideOutcome.HeaderNotFound;
-        if (!header.IsHidden) return UnhideOutcome.NotHidden;
-
-        header.IsHidden = false;
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        return UnhideOutcome.Unhidden;
     }
 }

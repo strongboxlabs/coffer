@@ -114,7 +114,28 @@ public sealed class NotificationPublisher
         ArgumentNullException.ThrowIfNull(notification);
 
         await using var db = _dbFactory.Create();
+        RecordLedgerEvent(db, ledgerId, notification);
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await DeliverLedgerAsync(db, ledgerId, notification, cancellationToken).ConfigureAwait(false);
+    }
 
+    /// <summary>
+    /// Add a LEDGER-scope event's row to <paramref name="db"/>, to be saved by the caller's
+    /// own save, in one transaction with whatever else it writes there; once that has
+    /// committed, <see cref="DeliverLedgerAsync(Guid, NotificationEvent, CancellationToken)"/>
+    /// delivers it.
+    /// </summary>
+    /// <remarks>
+    /// For an event that must commit with the state it reports, so that no writer of that
+    /// state can save between the two: <c>ConsistencyVerdicts</c> saves a ledger's stored
+    /// verdict and the consistency event that follows it together. Recorded through the
+    /// caller's context, which must write as the service role, as
+    /// <see cref="PublishLedgerAsync"/> does.
+    /// </remarks>
+    internal static void RecordLedgerEvent(AppDbContext db, Guid ledgerId, NotificationEvent notification)
+    {
+        ArgumentNullException.ThrowIfNull(db);
+        ArgumentNullException.ThrowIfNull(notification);
         db.LedgerEvents.Add(new LedgerEventRow
         {
             LedgerId = ledgerId,
@@ -126,8 +147,29 @@ public sealed class NotificationPublisher
                 ? "{}"
                 : JsonSerializer.Serialize(notification.Detail),
         });
-        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
 
+    /// <summary>
+    /// Deliver a LEDGER-scope event already recorded (<see cref="RecordLedgerEvent"/>)
+    /// wherever that ledger says, as <see cref="PublishLedgerAsync"/> does once it has
+    /// recorded one.
+    /// </summary>
+    internal async Task DeliverLedgerAsync(
+        Guid ledgerId,
+        NotificationEvent notification,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(notification);
+        await using var db = _dbFactory.Create();
+        await DeliverLedgerAsync(db, ledgerId, notification, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task DeliverLedgerAsync(
+        AppDbContext db,
+        Guid ledgerId,
+        NotificationEvent notification,
+        CancellationToken cancellationToken)
+    {
         // One small read for the name the delivered payload needs.
         var ledger = await db.Ledgers.AsNoTracking()
             .Where(l => l.Id == ledgerId)
@@ -160,12 +202,11 @@ public sealed class NotificationPublisher
         };
         var delivered = notification with { Detail = detail };
 
-        // A ledger's own targets, always. There used to be an 'inherit' mode that read
-        // the DEPLOYMENT table here instead, with no ledger filter — so on a shared
-        // install one ledger's activity went to whoever watched the deployment channel,
-        // and it was the default. Migration 214 moved the inherited targets into each
-        // ledger and dropped the mode; two scopes that overlap by default are not two
-        // scopes.
+        // A ledger's own targets, always — never the DEPLOYMENT table, which has no
+        // ledger filter: on a shared install that would send one ledger's activity to
+        // whoever watches the deployment channel. Migration 214 moves inherited targets
+        // into each ledger and drops the 'inherit' mode; two scopes that overlap by
+        // default are not two scopes.
         var targets = (await db.LedgerNotificationSubscribers
                 .Where(t => t.LedgerId == ledgerId && t.IsEnabled)
                 .ToListAsync(cancellationToken).ConfigureAwait(false))
@@ -463,8 +504,8 @@ public sealed class NotificationPublisher
                 m => bound.Contains(m, StringComparer.Ordinal),
                 StringComparer.Ordinal);
 
-        // The half the coverage map throws away, and the one that produced a real check
-        // reading "Never" for months. Coverage answers "of the jobs you run, which are
+        // The half the coverage map throws away, and the one that leaves a check reading
+        // "Never" indefinitely. Coverage answers "of the jobs you run, which are
         // watched" — so a switch bound to a job that is NOT enabled matches no key and
         // disappears from the answer entirely. Nothing then reports it: the job is not
         // running so it never pings, and the panel has no row for it to be missing from.
@@ -562,8 +603,16 @@ public sealed class NotificationPublisher
                 && string.Equals(n.Monitor, target.Monitors, StringComparison.Ordinal);
         }
 
-        if (target.Topics is { Length: > 0 } topics && !topics.Contains(n.Topic))
+        // No topic filter means every topic, except the opt-in ones: those arrive only at a
+        // destination that names them (NotificationTopics.OptIn).
+        if (target.Topics is { Length: > 0 } topics)
+        {
+            if (!topics.Contains(n.Topic)) return false;
+        }
+        else if (NotificationTopics.OptIn.Contains(n.Topic))
+        {
             return false;
+        }
 
         return NotificationSeverity.MeetsFloor(n.Severity, target.MinSeverity);
     }

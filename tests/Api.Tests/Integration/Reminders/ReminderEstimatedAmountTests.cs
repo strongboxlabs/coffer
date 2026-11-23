@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Json;
 
@@ -25,11 +26,12 @@ namespace Coffer.Api.Tests.Integration.Reminders;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ReminderEstimatedAmountTests
+public sealed class ReminderEstimatedAmountTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ReminderEstimatedAmountTests(PostgresFixture fixture) => _fixture = fixture;
+    public ReminderEstimatedAmountTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -39,13 +41,15 @@ public sealed class ReminderEstimatedAmountTests
         return client;
     }
 
-    private sealed record Setup(SyntheticLedger Ledger, HttpClient Client, Guid SeriesId, string BaseUrl);
+    private sealed record Setup(SyntheticLedger Ledger, HttpClient Client, Guid SeriesId, string BaseUrl, Guid BankId);
 
-    /// <summary>A monthly bank reminder from 2026-01-01, optionally estimating.</summary>
-    private async Task<Setup> SeriesAsync(ApiFactory factory, int? sampleCount, decimal templateAmount = -100m)
+    /// <summary>A monthly bank reminder from 2026-01-01, optionally estimating, paid from an
+    /// account in <paramref name="currencyCode"/>.</summary>
+    private async Task<Setup> SeriesAsync(
+        ApiFactory factory, int? sampleCount, decimal templateAmount = -100m, string currencyCode = "USD")
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var bank = await ledger.AddBankAccountAsync("checking");
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("checking", currencyCode: currencyCode);
         var cat = await ledger.AddCategoryAsync("utilities");
         var client = await AuthedClientAsync(factory, ledger);
 
@@ -65,24 +69,22 @@ public sealed class ReminderEstimatedAmountTests
             });
         Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
         var id = (await resp.Content.ReadFromJsonAsync<ReminderDetail>())!.Id;
-        return new Setup(ledger, client, id, $"/api/ledgers/{ledger.LedgerId}/reminders/{id}");
+        return new Setup(ledger, client, id, $"/api/ledgers/{ledger.LedgerId}/reminders/{id}", bank.Id);
     }
 
     /// <summary>
     /// Commit one occurrence at a chosen amount: fire it, then correct the amount.
     /// </summary>
     /// <remarks>
-    /// Fired through the API rather than seeded with SQL so the occurrence carries the
-    /// real (series, date) stamp the sample window keys on — a raw insert would test the
-    /// query against data the application never produces.
+    /// Fired through the auto-post job's clone rather than seeded with SQL so the
+    /// occurrence carries the real (series, date) stamp the sample window keys on — a raw
+    /// insert would test the query against data the application never produces.
     /// </remarks>
     private async Task CommitOccurrenceAsync(Setup s, DateOnly date, decimal sourceNet)
     {
-        var fire = await s.Client.PostAsJsonAsync(
-            $"{s.BaseUrl}/fire", new FireReminderRequest { OccurrenceDate = date });
-        Assert.Equal(HttpStatusCode.OK, fire.StatusCode);
+        await ReminderCloneFire.PostedAsync(Db, s.Ledger.LedgerId, s.SeriesId, date);
 
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         var headerId = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.RecurringTransactionId == s.SeriesId
                         && h.OccurrenceDate == date
@@ -104,8 +106,8 @@ public sealed class ReminderEstimatedAmountTests
     /// </summary>
     /// <remarks>
     /// History has to be built BEFORE the estimate is enabled, because firing an
-    /// estimating series with no history is refused — the feature's own safety rule,
-    /// which bit these tests' setup first. It is also the realistic order: the bill
+    /// estimating series with no history is refused — the feature's own safety rule.
+    /// It is also the realistic order: the bill
     /// exists, and the user then asks for it to be estimated.
     /// </remarks>
     private static async Task EnableEstimateAsync(Setup s, int sampleCount)
@@ -129,7 +131,7 @@ public sealed class ReminderEstimatedAmountTests
     [Fact]
     public async Task The_estimate_averages_the_last_n_occurrences()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await SeriesAsync(factory, sampleCount: null);
         using var client = s.Client;
 
@@ -156,13 +158,13 @@ public sealed class ReminderEstimatedAmountTests
     /// Fewer than N is fine: the average covers what exists.
     /// </summary>
     /// <remarks>
-    /// The maintainer's spec, and the reason this feature is useful on a fresh ledger
-    /// rather than three months from now: "use N or less if N is not available".
+    /// The rule is "use N, or fewer if N are not available", which is what makes the
+    /// estimate useful on a fresh ledger rather than only after N occurrences exist.
     /// </remarks>
     [Fact]
     public async Task Fewer_than_n_occurrences_still_produce_an_estimate()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await SeriesAsync(factory, sampleCount: null);
         using var client = s.Client;
 
@@ -190,7 +192,7 @@ public sealed class ReminderEstimatedAmountTests
     [Fact]
     public async Task No_history_means_no_estimate_and_the_template_amount_stands()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await SeriesAsync(factory, sampleCount: 3, templateAmount: -100m);
         using var client = s.Client;
 
@@ -223,7 +225,7 @@ public sealed class ReminderEstimatedAmountTests
     [Fact]
     public async Task A_deleted_occurrence_leaves_the_sample_window_full()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await SeriesAsync(factory, sampleCount: null);
         using var client = s.Client;
 
@@ -237,7 +239,7 @@ public sealed class ReminderEstimatedAmountTests
         // Delete the outlier. It keeps its stamp, so a rank-then-filter window would
         // still count it as one of the last three.
         Guid outlier;
-        await using (var db = _fixture.NewServiceDbContext())
+        await using (var db = Db.NewServiceDbContext())
         {
             outlier = await db.TxnHeaders.AsNoTracking()
                 .Where(h => h.RecurringTransactionId == s.SeriesId
@@ -267,7 +269,7 @@ public sealed class ReminderEstimatedAmountTests
     [Fact]
     public async Task A_fired_occurrence_shows_its_real_amount_and_no_estimate()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await SeriesAsync(factory, sampleCount: null);
         using var client = s.Client;
 
@@ -289,7 +291,7 @@ public sealed class ReminderEstimatedAmountTests
     [Fact]
     public async Task A_series_that_did_not_opt_in_has_no_estimate()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await SeriesAsync(factory, sampleCount: null);
         using var client = s.Client;
 
@@ -307,13 +309,13 @@ public sealed class ReminderEstimatedAmountTests
     /// </summary>
     /// <remarks>
     /// The display half is worth little on its own: a forecast that disagrees with what
-    /// actually posts is worse than no forecast. This is also the path auto-post takes —
-    /// FireAsync is the verbatim-clone route — so it is what a timer commits unattended.
+    /// actually posts is worse than no forecast. The clone is what the auto-post job
+    /// writes, so this is what a timer commits unattended.
     /// </remarks>
     [Fact]
     public async Task Firing_an_estimated_reminder_commits_the_estimate()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await SeriesAsync(factory, sampleCount: null, templateAmount: -100m);
         using var client = s.Client;
 
@@ -323,11 +325,9 @@ public sealed class ReminderEstimatedAmountTests
         await EnableEstimateAsync(s, 2);
 
         var slot = new DateOnly(2026, 3, 1);
-        var fire = await client.PostAsJsonAsync(
-            $"{s.BaseUrl}/fire", new FireReminderRequest { OccurrenceDate = slot });
-        Assert.Equal(HttpStatusCode.OK, fire.StatusCode);
+        await ReminderCloneFire.PostedAsync(Db, s.Ledger.LedgerId, s.SeriesId, slot);
 
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         var headerId = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.RecurringTransactionId == s.SeriesId
                         && h.OccurrenceDate == slot && !h.IsRecurringTemplate)
@@ -360,24 +360,25 @@ public sealed class ReminderEstimatedAmountTests
     /// run nobody would see the swap.
     /// </para>
     /// <para>
-    /// Asserts the template amount was NOT committed, not merely that the request failed:
-    /// a 422 with a transaction written anyway would be the worst of both.
+    /// Asserts the template amount was NOT committed, not merely that the fire was
+    /// refused: a refusal with a transaction written anyway would be the worst of both.
     /// </para>
     /// </remarks>
     [Fact]
     public async Task Firing_is_refused_when_the_estimate_cannot_be_produced()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await SeriesAsync(factory, sampleCount: 3, templateAmount: -100m);
         using var client = s.Client;
 
         var slot = new DateOnly(2026, 1, 1);
-        var fire = await client.PostAsJsonAsync(
-            $"{s.BaseUrl}/fire", new FireReminderRequest { OccurrenceDate = slot });
+        var fire = await ReminderCloneFire.FireAsync(Db, s.Ledger.LedgerId, s.SeriesId, slot);
 
-        Assert.Equal(HttpStatusCode.UnprocessableEntity, fire.StatusCode);
+        Assert.Equal(
+            Coffer.Api.Db.Repositories.RemindersRepository.FireOutcome.EstimateUnavailableForFire,
+            fire.Outcome);
 
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         Assert.Equal(
             0,
             await db.TxnHeaders.AsNoTracking()
@@ -392,11 +393,11 @@ public sealed class ReminderEstimatedAmountTests
     [Fact]
     public async Task A_split_reminder_cannot_estimate()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var a = await ledger.AddCategoryAsync("power");
         var b = await ledger.AddCategoryAsync("water");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -430,7 +431,7 @@ public sealed class ReminderEstimatedAmountTests
     [Fact]
     public async Task An_estimating_reminder_cannot_be_given_a_split_by_editing()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await SeriesAsync(factory, sampleCount: 3);
         using var client = s.Client;
         var second = await s.Ledger.AddCategoryAsync("water");
@@ -456,10 +457,10 @@ public sealed class ReminderEstimatedAmountTests
     [Fact]
     public async Task A_sample_count_outside_the_supported_range_is_refused()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("power");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         foreach (var n in new[] { 0, 25 })
@@ -487,22 +488,20 @@ public sealed class ReminderEstimatedAmountTests
     /// </summary>
     /// <remarks>
     /// <para>
-    /// A bug in shipped code, not a gap in this feature. The single-delete path was fixed
-    /// so a reminder occurrence soft-hides and keeps its (series, date) stamp — the
-    /// idempotency key that stops auto-post re-posting it. <c>BulkTransactionsRepository</c>
-    /// was missed, so selecting occurrences in the register and bulk-deleting them removed
-    /// the stamp and the timer resurrected every one.
+    /// A deleted reminder occurrence soft-hides and keeps its (series, date) stamp — the
+    /// idempotency key that stops auto-post re-posting it. That has to hold on the bulk
+    /// path (<c>BulkTransactionsRepository</c>) as well as the single delete: a bulk delete
+    /// that removed the stamp would let the timer resurrect every occurrence.
     /// </para>
     /// <para>
     /// Asserts on IDENTITY, not a count: hard-delete-then-re-post and soft-hide both leave
-    /// exactly one row, so a count cannot tell the two apart. That mistake was made once
-    /// already on the single-delete test and caught by mutation.
+    /// exactly one row, so a count cannot tell the two apart.
     /// </para>
     /// </remarks>
     [Fact]
     public async Task Bulk_deleting_a_reminder_occurrence_soft_hides_it_and_keeps_the_stamp()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await SeriesAsync(factory, sampleCount: null);
         using var client = s.Client;
 
@@ -510,7 +509,7 @@ public sealed class ReminderEstimatedAmountTests
         await CommitOccurrenceAsync(s, slot, -55m);
 
         Guid headerId;
-        await using (var db = _fixture.NewServiceDbContext())
+        await using (var db = Db.NewServiceDbContext())
         {
             headerId = await db.TxnHeaders.AsNoTracking()
                 .Where(h => h.RecurringTransactionId == s.SeriesId && !h.IsRecurringTemplate)
@@ -524,6 +523,7 @@ public sealed class ReminderEstimatedAmountTests
                 Selection = new SelectionRequest
                 {
                     Kind = "explicit",
+                    AccountId = s.BankId,
                     HeaderIds = new[] { headerId },
                 },
             });
@@ -534,7 +534,7 @@ public sealed class ReminderEstimatedAmountTests
         Assert.Equal(0, body!.HardDeleted);
         Assert.Equal(1, body.SoftHidden);
 
-        await using var read = _fixture.NewServiceDbContext();
+        await using var read = Db.NewServiceDbContext();
         var survivor = await read.TxnHeaders.AsNoTracking()
             .Where(h => h.RecurringTransactionId == s.SeriesId && !h.IsRecurringTemplate)
             .Select(h => new { h.Id, h.IsHidden, h.OccurrenceDate })
@@ -547,7 +547,7 @@ public sealed class ReminderEstimatedAmountTests
 
     private async Task<Guid> FirstBankAccountIdAsync(Setup s)
     {
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         return await db.RecurringTransactions.AsNoTracking()
             .Where(r => r.Id == s.SeriesId)
             .Select(r => r.SourceAccountId!.Value)
@@ -555,17 +555,17 @@ public sealed class ReminderEstimatedAmountTests
     }
 
     /// <summary>
-    /// The average rounds ONCE, at the 2dp destination scale.
+    /// The average rounds ONCE, at the source account's places.
     /// </summary>
     /// <remarks>
-    /// Three amounts a cent apart whose mean is a repeating decimal, which must land on
-    /// the nearest cent and not on a value the money CHECK
-    /// (<c>ck_txn_legs_amount_scale_2</c>) would reject.
+    /// Three amounts one minor unit apart whose mean is a repeating decimal, which must
+    /// land on the nearest minor unit and not on a value the account's currency cannot
+    /// hold.
     /// </remarks>
     [Fact]
-    public async Task The_average_rounds_once_at_two_decimal_places()
+    public async Task The_average_rounds_once_at_the_source_accounts_places()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         var s = await SeriesAsync(factory, sampleCount: null);
         using var client = s.Client;
 
@@ -578,5 +578,60 @@ public sealed class ReminderEstimatedAmountTests
         var slot = await SlotAsync(s, new DateOnly(2026, 4, 1));
 
         Assert.Equal(-10.01m, slot!.Estimate!.Amount);
+    }
+
+    /// <summary>
+    /// An average exactly on a half of the last minor unit rounds away from zero, at the
+    /// source account's places (ADR-0114 D15): two places, none, and three.
+    /// </summary>
+    /// <remarks>
+    /// Each pair of samples is one minor unit apart and averages to exactly half of one,
+    /// with the even neighbour toward zero, so rounding half to even lands on a different
+    /// figure, and rounding at two places for every currency lands on another again.
+    /// </remarks>
+    [Theory]
+    [InlineData("USD", "-10.00", "-10.01", "-10.01")]
+    [InlineData("JPY", "-100", "-101", "-101")]
+    [InlineData("KWD", "-1.000", "-1.001", "-1.001")]
+    public async Task An_average_on_a_half_rounds_away_from_zero_at_the_source_accounts_places(
+        string currency, string firstSample, string secondSample, string expected)
+    {
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        var s = await SeriesAsync(factory, sampleCount: null, currencyCode: currency);
+        using var client = s.Client;
+
+        await CommitOccurrenceAsync(s, new DateOnly(2026, 1, 1), decimal.Parse(firstSample, CultureInfo.InvariantCulture));
+        await CommitOccurrenceAsync(s, new DateOnly(2026, 2, 1), decimal.Parse(secondSample, CultureInfo.InvariantCulture));
+
+        await EnableEstimateAsync(s, 2);
+
+        var slot = await SlotAsync(s, new DateOnly(2026, 3, 1));
+
+        Assert.Equal(decimal.Parse(expected, CultureInfo.InvariantCulture), slot!.Estimate!.Amount);
+        Assert.Null(slot.Estimate.UnavailableReason);
+    }
+
+    /// <summary>
+    /// An average that rounds to zero at a whole-unit currency's places is no estimate
+    /// (<c>zero-estimate</c>), though at two places it would be one.
+    /// </summary>
+    [Fact]
+    public async Task An_average_that_rounds_to_zero_at_a_whole_unit_currency_is_a_zero_estimate()
+    {
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        var s = await SeriesAsync(factory, sampleCount: null, currencyCode: "JPY");
+        using var client = s.Client;
+
+        // A mean of a third of one unit toward the template's direction.
+        await CommitOccurrenceAsync(s, new DateOnly(2026, 1, 1), -1m);
+        await CommitOccurrenceAsync(s, new DateOnly(2026, 2, 1), 1m);
+        await CommitOccurrenceAsync(s, new DateOnly(2026, 3, 1), -1m);
+
+        await EnableEstimateAsync(s, 3);
+
+        var slot = await SlotAsync(s, new DateOnly(2026, 4, 1));
+
+        Assert.Null(slot!.Estimate!.Amount);
+        Assert.Equal("zero-estimate", slot.Estimate.UnavailableReason);
     }
 }

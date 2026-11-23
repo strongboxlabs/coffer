@@ -45,8 +45,9 @@ public sealed class LedgerSnapshotRow
     /// <c>ContentJson != null</c> only, and restore reads it server-side.</summary>
     public string? ContentJson { get; init; }
 
-    /// <summary>Uncompressed payload size in bytes. Persisted at
-    /// create time so the SPA's snapshots panel can display "N MB
-    /// before compression" without decompressing every row.</summary>
+    /// <summary>Length of the payload's JSON text in bytes, recorded at capture.
+    /// Not what the snapshot occupies: the database compresses what it stores, so
+    /// the snapshots panel shows the stored size instead
+    /// (<c>ledger_snapshot_stored_sizes</c>, migration 271).</summary>
     public int ContentSizeUncompressed { get; init; }
 }

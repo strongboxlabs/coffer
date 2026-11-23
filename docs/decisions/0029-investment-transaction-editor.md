@@ -3,7 +3,10 @@
 * Status: Accepted. **Extended by [ADR-0065](0065-transfer-shares-in-kind.md)** —
   the `transfer_shares` action adds a row to the action × field matrix (security +
   positive qty + destination investment account; no price/amount/fee).
-* Date: 2026-05-21
+  Amended 2026-11-14 by [ADR-0114](0114-benchmarks-and-currency-conversion.md) (a transfer account in another currency carries its
+  own amount, a new row in the matrix and a new field in the request; the price input
+  shows the brokerage's currency).
+* Date: 2026-05-21 (amended 2026-11-04: the picker's words are ADR-0027's display words)
 * Related: ADR-0024 (bulk selection), ADR-0025 (transactions as
   postings list), ADR-0027 (action catalog), ADR-0028 (register
   surface)
@@ -30,11 +33,18 @@ contract the API's input shape, not a post-hoc validation.
 ### Action picker: 9 catalog entries (+ transfer_shares)
 
 The user-facing action selector exposes the 9 ADR-0027
-catalog actions: **Buy / BuyXfr / Sell / SellXfr / Div / DivReinvest /
-DivXfr / Xfr / Misc** — plus **Transfer shares** (ADR-0065, in-kind move
+catalog actions: **Buy / BuyXfr / Sell / SellXfr / Dividend / Reinvest /
+DividendXfr / Xfr / Misc** — plus **Transfer shares** (ADR-0065, in-kind move
 to another investment account). Direction (income vs expense for Misc; in vs
 out for Transfer) is **discriminated by amount sign**, not by
 separate picker entries. Matches ADR-0027's data-model collapse.
+
+Each entry's word is ADR-0027's display word, the one the register's action
+chip shows: the picker (`ACTION_PICKER_ENTRIES`) holds the order and a hint
+per action and takes every label from the register's one table, so the two
+cannot name an action differently. *(Amended 2026-11-04: the dividend entries
+read Dividend, Reinvest and DividendXfr, where they read Div, DivReinvest and
+DivXfr.)*
 
 ### Action × field state matrix
 
@@ -77,7 +87,7 @@ Distinct from `/transactions`. Same lifecycle verbs:
 
 `InvestmentTransactionsController` + `InvestmentTransactionsRepository`,
 new in `src/Api/`. LINQ + EF only — no raw SQL in the data-access
-layer (matches `feedback_no_raw_sql_in_api`). FIFO consumption +
+layer (the no-raw-SQL rule for `src/Api`). FIFO consumption +
 holdings recompute on POST/PATCH happen via
 `fn_recompute_holdings_cost_basis` (migration 056); the endpoint
 inserts/replaces legs and triggers the recompute.
@@ -110,6 +120,25 @@ PATCH mirrors POST but every field optional; null clears
 overrides on managed rows. Server rejects shape violations with a
 structured 422 envelope (matching the bank `/transactions` error
 contract).
+
+*Amended 2026-10-27 ([ADR-0108](0108-memo-and-tags-per-side.md) D1, D3, D4): memo and tags are the event's, placed
+by the write primitive.*
+
+- `memo` is decided by **presence** on the PATCH: omitted leaves it, `null` or
+  blank clears it. `tags` keeps its meaning: omitted or `null` leaves them,
+  `[]` clears them, a list replaces them.
+- The writing side is the request's brokerage (an in-kind transfer's source
+  brokerage). The value goes on that brokerage's leg when the event has one
+  posting and on the header when it has several; its other rows show it
+  inherited.
+- An action change that changes the posting count moves the value between
+  the brokerage leg and the header, and makes the brokerage the transaction's
+  originating account.
+- On an edit, an account already on the transaction is kept even if it has
+  since been deactivated, and a newly added inactive one is refused; a create
+  stays strict.
+- A requested date on the stored calendar day keeps the stored posted
+  timestamp, time of day included; only a different day changes it.
 
 ### Shared domain layer: `Coffer.Domain.Investment`
 
@@ -145,8 +174,8 @@ reopens the preview on input change).
 *Amended 2026-10-20 (FU-097):* the preview asks for the lots open on the
 transaction's own date, without the transaction
 (`?as_of=&exclude_header_id=`), from the same FIFO walk the writer uses.
-It used to read today's lots, which on a since-closed account are none, so
-every historical edit warned. The server now refuses a save that would sell
+Today's lots are the wrong set for a historical edit: on a since-closed
+account there are none, so every historical edit would warn. The server refuses a save that would sell
 more than was held, and the warning says so.
 
 ### Fee + `is_trade_commission` interaction
@@ -195,11 +224,9 @@ entry patterns from ADR-0024 / ADR-0025.
 
 ### Amendment (2026-09): three parity corrections
 
-The merge slice parked above has long since shipped. Reviewing it against
-the bank editor turned up three places where the investment side had
-quietly acquired a rule the bank side does not have. All three are
-corrections toward bank, not new behaviour — the divergences were
-accidents of how each surface grew, not decisions anyone recorded.
+The merge slice parked above has shipped. In three places the investment
+side carried a rule the bank side does not have, none of them a recorded
+decision. All three are corrections toward bank, not new behaviour.
 
 **1. Merge candidates constrain settledness only.** The bank rule is: any
 accepted, un-merged, effectively-visible row on the same account, same
@@ -208,19 +235,31 @@ required a candidate to carry a SECURITY leg on the Holdings sibling,
 with a non-null quantity and action — a SHAPE constraint on a rule about
 settledness.
 
-The consequence was that the commonest duplicate on a brokerage could
-never be offered. A dividend the user already recorded as cash is
+With that constraint a routine duplicate on a brokerage can never be
+offered. A dividend the user already recorded as cash is
 (brokerage cash, income category) with no holdings leg at all; a
 feed-delivered `INVBANKTRAN` row is (brokerage cash, Uncategorized) with
-no action either. The merge panel came up empty on exactly the rows it
+no action either. The merge panel comes up empty on exactly the rows it
 exists for.
 
 The amount match now runs on the brokerage cash leg, which is bank's rule
 verbatim. The share match on the Holdings sibling is kept ALONGSIDE it,
 because it covers a case bank has no analogue for: a reinvest moves no
-cash, so an amount match can never see one. A candidate's ticker, share
-count and price still come from its security leg when it has one, and are
-null on the chip when it does not.
+cash, so an amount match can never see one. A reinvest is also missed by
+the cash-leg amount match when the edited row is a cash row of its
+principal, since its income and purchase legs cancel on the brokerage; the
+principal is on its holdings leg, so a third match reads the amount there,
+in magnitude. A candidate's ticker and price
+still come from its security leg when it has one, and are null on the chip
+when it does not.
+
+**The chip reads like the candidate's register row.** Its amount, share
+count, derived action and other account are the values of the candidate's
+row in the edited brokerage's register, read and projected by the register
+itself (`RegisterRepository.GetRowsForHeadersAsync`), not a second reading of
+the legs. The legs disagree with the row: a sell's holdings leg is negative
+where its row is cash coming in, a principal leaves out a fee the row
+includes, and an action-less cash transfer's `Xfr` exists only on the row.
 
 The `ingest_security_id` narrowing still applies — but only to candidates
 that HAVE a security to contradict. A cash-shape row carries none
@@ -228,14 +267,11 @@ that HAVE a security to contradict. A cash-shape row carries none
 the duplicate worth offering.
 
 **Direction is part of the rule.** Bank compares the SIGNED sum on the
-source account; the investment query compared magnitudes — on the
-security leg with `Math.Abs` before the widening, and on the brokerage leg
-with the same absolute comparison after it, under a comment claiming
-parity it did not have. So a sell that brought in some amount was offered
-the buy that spent exactly that amount on the same security the same day:
-the same magnitude, the opposite event, and a merge that would tombstone a real
-transaction and halve the position. Found on the dev rig immediately
-after release.
+source account. A magnitude comparison (`Math.Abs`), on the security leg
+or on the brokerage leg, offers a sell that brought in some amount the buy
+that spent exactly that amount on the same security the same day: the same
+magnitude, the opposite event, and a merge that would tombstone a real
+transaction and halve the position.
 
 A candidate whose cash moved the opposite way is now dropped. The check
 is applied once over every match path, not inside the amount match,
@@ -248,13 +284,13 @@ contradict.
 `PatchAsync` opens its transaction as its first statement, and says why:
 the ledger-membership guard must run inside the transaction that later
 writes, or there is a TOCTOU window between the endpoint's cross-ledger
-check and the writes. The investment `PatchAsync` opened two transactions
-further down — one inside the merge branch, one after validation — so the
-membership guard, the merge branch's eligibility checks and the whole
-action × field matrix validation ran unprotected.
+check and the writes. Opening the transaction further down — one inside the
+merge branch, one after validation — leaves the membership guard, the merge
+branch's eligibility checks and the whole action × field matrix validation
+unprotected.
 
-This has no single-threaded symptom, which is why every integration test
-passed before and after. It is pinned by a source-level assertion
+This has no single-threaded symptom, so no ordinary integration test can see
+it. It is pinned by a source-level assertion
 (`WriteTransactionBoundaryTests`) rather than a concurrency harness: a
 test that can only be written as a race is a test that gets skipped.
 
@@ -262,9 +298,9 @@ test that can only be written as a race is a test that gets skipped.
 needed nothing: a feed row lands BANK-shape whatever account it is bound
 for — two legs, (real account, Uncategorized), with the investment detail
 parked in the `ingest_*` carriers until someone classifies it — so its
-anchor resolves on a brokerage exactly as on a checking account. The
-investment editor simply never called it, and a dividend categorised the
-same way every quarter had to be categorised by hand every quarter.
+anchor resolves on a brokerage exactly as on a checking account. Without
+the call in the investment editor, a dividend categorised the same way
+every quarter has to be categorised by hand every quarter.
 
 Two rules make it fit this editor:
 
@@ -282,23 +318,53 @@ So the halves are treated separately:
   - **The chip hides its "→ X" in exactly the cases it will not apply X**,
     so a chip never advertises something it then skips.
 
-**Corrected 2026-09 (same day, from the dev rig).** Both of those rules
-started stricter and were wrong for it. The chips were gated to actions
-with a category slot, and the repository dropped any suggestion whose
-counterparty was a Holdings sub-account — reasoning that "categorise it
-as Holdings" is meaningless (ADR-0019: it is structural), which is true.
+**Why not stricter.** Gating the chips to actions with a category slot,
+or dropping any suggestion whose counterparty is a Holdings sub-account
+(true that "categorise it as Holdings" is meaningless, ADR-0019: it is
+structural), discards the suggestion's PAYEE. On a brokerage the row
+carrying the name the user curated can be exactly that buy: a settled buy
+has two legs, one on the brokerage, and its other leg IS the Holdings
+sibling. Recall would then be silent on such a buy — twice over when the
+row being edited is a sell, which has no category slot and so would show
+no panel at all.
 
-What that missed is that dropping the row discards its PAYEE, and on a
-brokerage the row carrying the name the user curated is very often
-exactly that buy: a settled buy has two legs, one on the brokerage, and
-its other leg IS the Holdings sibling. On the dev rig a curated payee sat
-on such a buy and recall stayed silent — twice over, since the row being
-edited was a sell, which has no category slot and so showed no panel at
-all.
-
-The repository now returns the row and the caller decides which half it
+The repository returns the row and the caller decides which half it
 can take. The rule of thumb this leaves: filter at the point of USE, not
 at the source, when the thing being filtered is one half of a value.
+
+### Amendment (2026-11): the direction guard needs a direction
+
+Merge candidates exclude a twin whose cash moved the other way, so a sell is
+never offered as the twin of an equal-amount buy. That guard reads the edited
+row's cash sign as its direction. For a row with a classification, an action or
+an ingest action hint, it is one. For an unclassified feed row it is only the
+feed's sign, and a feed that cannot tell a fund purchase from a sale reports
+cash with its own convention: a buy can arrive as money in. The guard then hid
+the row's true twin, and the panel was empty on the row it exists for.
+
+The guard now applies only to a classified row. An unclassified row is offered
+twins of both directions, the ones that agree with its sign first. Nothing is
+decided for the person: the chip shows the twin's own direction and the merge is
+their pick. A classified row (an imported sell, say) still never sees the buy
+that closed the same lot.
+
+The accepted cost: for an unclassified row, an equal-amount buy and sell on the
+same day are both offered, so the person must read the chip's direction.
+
+### Amendment, 2026-11-14 — a transfer account in another currency carries its own amount ([ADR-0114](0114-benchmarks-and-currency-conversion.md) D13, D14)
+
+- **The matrix gains a row, the second amount (Received or Sent).** It is required for
+  buyx, sellx, divx and xfr while the Transfer destination is a real account in another
+  currency than the brokerage, and hidden otherwise and for every other action. It sits
+  right of Amount, and for buyx, sellx and divx it pairs with the trade amount, not the
+  fee. A new entry prefills it from Amount at the rate `RateDay.Of` gives its date,
+  derived from the stored rates against the reporting currency (ADR-0114 D13, D14).
+- **The request gains the transfer account's own amount**, a new field `transferAmount`
+  beside `transferAccountId`, on the create and the PATCH body alike. It is required
+  when `transferAccountId` is a real account in another currency than the brokerage, and
+  dropped otherwise. A missing, zero or same-signed second amount is refused.
+- **The price input's symbol is the brokerage's currency**, since price × shares =
+  amount.
 
 ## Consequences
 

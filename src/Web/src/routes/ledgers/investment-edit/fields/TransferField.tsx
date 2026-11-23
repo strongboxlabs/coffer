@@ -34,7 +34,8 @@ interface TransferFieldProps {
     valueId: string | null;
     onChangeId: (next: string | null) => void;
     error?: string | null;
-    disabled?: boolean;
+    /** The save is in flight: the picker keeps focus and refuses input (pending.ts). */
+    pending?: boolean;
     /** transfer_shares (ADR-0065): the destination must be another
      * investment account (shares move holdings → holdings). When true
      * the picker shows only investment accounts. */
@@ -51,7 +52,7 @@ interface TransferFieldProps {
  * excludes the current brokerage.
  */
 export function TransferField({
-    accounts, frequent, brokerageAccountId, valueId, onChangeId, error, disabled,
+    accounts, frequent, brokerageAccountId, valueId, onChangeId, error, pending,
     restrictToInvestment = false,
 }: TransferFieldProps) {
     const isEligible = useCallback(
@@ -74,7 +75,7 @@ export function TransferField({
             placeholder={restrictToInvestment ? 'Investment account…' : 'Account or category…'}
             ariaLabel="Transfer destination"
             error={error}
-            disabled={disabled}
+            pending={pending}
         />
     );
 }

@@ -21,11 +21,12 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// response carries the two fields that say when not to trust it.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class AllocationEndpointTests
+public sealed class AllocationEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AllocationEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public AllocationEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static readonly DateTime Buy = new(2026, 1, 5, 0, 0, 0, DateTimeKind.Utc);
     private static readonly DateTime Priced = new(2026, 6, 1, 0, 0, 0, DateTimeKind.Utc);
@@ -44,7 +45,7 @@ public sealed class AllocationEndpointTests
     /// <summary>A brokerage holding one equity and one bond, 75/25 by value.</summary>
     private async Task<SyntheticLedger> SeedAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
 
@@ -64,7 +65,7 @@ public sealed class AllocationEndpointTests
     public async Task It_buckets_by_asset_class_by_default()
     {
         var ledger = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = await ClientAsync(factory, ledger);
 
         var response = await client.GetAsync(Url(ledger.LedgerId));
@@ -84,12 +85,12 @@ public sealed class AllocationEndpointTests
         // `undecomposedMultiAssets` and `excludedBrokerageCash` are the whole
         // reason this passes the repository result through rather than
         // reducing it to buckets. A fund with no component weights sits
-        // entirely in one opaque bucket and understates every other one — the
-        // DTO records a real case, equity shown at a small fraction of its true
-        // share — and totalMarketValue is SECURITIES ONLY, so uninvested cash is
+        // entirely in one opaque bucket and understates every other one — a
+        // portfolio held mostly in such a fund shows equity at a small fraction
+        // of its true share — and totalMarketValue is SECURITIES ONLY, so uninvested cash is
         // missing from any chart that treats the buckets as the portfolio.
         var ledger = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = await ClientAsync(factory, ledger);
 
         using var body = JsonDocument.Parse(
@@ -118,7 +119,7 @@ public sealed class AllocationEndpointTests
         // PascalCase enum names while the LLM uses snake_case, and the two
         // would drift the first time a dimension is added.
         var ledger = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = await ClientAsync(factory, ledger);
 
         var response = await client.GetAsync(Url(ledger.LedgerId, $"dimension={dimension}"));
@@ -131,7 +132,7 @@ public sealed class AllocationEndpointTests
         // ADR-0063 D4. Falling back to asset_class would answer a question
         // nobody asked and label it as the one they did.
         var ledger = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = await ClientAsync(factory, ledger);
 
         var response = await client.GetAsync(Url(ledger.LedgerId, "dimension=assetclas"));

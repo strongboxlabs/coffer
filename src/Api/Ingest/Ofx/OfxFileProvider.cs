@@ -131,10 +131,10 @@ public sealed class OfxFileProvider : IFileProvider
         // OfxNet is LAZY: Load returns before most of the file has been
         // looked at, and the missing-element checks fire here — inside
         // GetStatements() / GetInvestmentStatements(). A SELLOPT with no
-        // <SECURED>, which is a malformed file and nothing more, used to
-        // escape the Load guard and reach the endpoint as an unhandled
-        // exception: HTTP 500, a trace id, and no way for the user to
-        // learn which row was wrong.
+        // <SECURED>, which is a malformed file and nothing more, would
+        // otherwise escape the Load guard and reach the endpoint as an
+        // unhandled exception: HTTP 500, a trace id, and no way for the
+        // user to learn which row was wrong.
         //
         // The filter is deliberately the SAME four types Load catches,
         // rather than `catch (Exception)`. Widening it would turn a
@@ -358,7 +358,7 @@ public sealed class OfxFileProvider : IFileProvider
             if (string.IsNullOrWhiteSpace(sec.Id) || string.IsNullOrWhiteSpace(sec.IdType))
                 continue;
             // Last entry wins on duplicate (id, idType) — OFX doesn't
-            // forbid duplicates but real-world files don't ship them.
+            // forbid duplicates, so the index needs a rule for one.
             index[SecListKey(sec.Id, sec.IdType)] = sec;
         }
         return index;
@@ -480,10 +480,10 @@ public sealed class OfxFileProvider : IFileProvider
     /// units, trade date. It deliberately drops two things the old
     /// message led with: the OfxNet runtime class name, which is an
     /// implementation detail no statement shows, and the FITID, which
-    /// some institutions assemble out of a hundred characters of
-    /// concatenated internal keys (a 401(k) recordkeeper in the wild
-    /// emits contract number + amount + date + CUSIP + units + price
-    /// + a DB2 timestamp) and which is unreadable in a preview list.
+    /// the OFX spec leaves opaque to the institution — it may be a long
+    /// concatenation of internal keys (account, amount, date, CUSIP,
+    /// units, timestamps) — and which is then unreadable in a preview
+    /// list.
     /// </summary>
     private static string DescribeUnsupported(
         OfxInvestmentTransaction txn,
@@ -588,17 +588,17 @@ public sealed class OfxFileProvider : IFileProvider
     {
         return txn switch
         {
-            // BEFORE the buy/sell arms, and that order is the whole fix.
+            // BEFORE the buy/sell arms, and that order is load-bearing.
             // OfxNet models BUYOPT / SELLOPT as OfxBuyInvestment /
-            // OfxSellInvestment subclasses, so the arms below used to claim
-            // them and an options contract entered the ledger as a share
+            // OfxSellInvestment subclasses, so the arms below would claim
+            // them and an options contract would enter the ledger as a share
             // position — feeding FIFO lots, cost basis, holdings quantity,
-            // allocation and returns with equity data that was never real.
+            // allocation and returns with equity data that is not real.
             // Unclassified here means the caller skips the row with the same
             // preview warning CLOSUREOPT already produced.
             //
             // Moving these two below the buy/sell arms does not merely
-            // reintroduce the bug — it fails to COMPILE. A subclass arm
+            // misclassify options — it fails to COMPILE. A subclass arm
             // after its base is unreachable (CS8510), and this project
             // sets TreatWarningsAsErrors. So the ordering is enforced by
             // the compiler rather than by this comment.
@@ -695,12 +695,12 @@ public sealed class OfxFileProvider : IFileProvider
     /// this provider consumes — which is what a later backfill would need.
     /// Callers must not treat it as the file's own bytes.</para>
     ///
-    /// <para>WHY AT ALL: a REINVEST's TOTAL had nowhere to live, so the editor
-    /// rebuilt the amount from shares x price and landed a cent out. Mig 228
-    /// gives that one field a column — but the reason the damage could not be
-    /// repaired retroactively is that this payload was NULL, so the original
-    /// figure was simply gone. Keeping it means the next field we discover we
-    /// needed is recoverable instead.</para>
+    /// <para>WHY AT ALL: a field the import does not keep cannot be recovered
+    /// later. A REINVEST's TOTAL with nowhere to live makes the editor rebuild the
+    /// amount from shares x price and land a cent out; mig 228 gives that one field
+    /// a column, but rows imported without this payload have no original figure to
+    /// backfill it from. Keeping the payload means the next field found to be
+    /// needed is recoverable.</para>
     ///
     /// <para>RUNTIME TYPE, and the parameter is <c>object</c> for that reason.
     /// System.Text.Json serializes the DECLARED type, which for a value typed

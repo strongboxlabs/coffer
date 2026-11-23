@@ -5,7 +5,7 @@ import { useTxnRowDraft } from './useTxnRowDraft';
 import type { TxnRowMode } from '../../TxnRowEdit';
 
 /**
- * Unit tests for the draft state that previously lived inline in the shell.
+ * Unit tests for the editor's draft state hook.
  *
  * Every case here is one the component-level gate cannot reach or cannot see:
  * the reorder semantics (the editor's only path to them is a drag, which jsdom
@@ -35,7 +35,9 @@ function editMode(n: number): TxnRowMode {
         postedAt: '2026-01-02T00:00:00.000Z',
         transactedAt: null,
         balanceAfter: 100,
+        balanceCurrencyCode: 'USD',
         tags: [],
+        inherited: null,
         needsReview: false,
     };
 }
@@ -50,7 +52,7 @@ describe('useTxnRowDraft — seeding', () => {
         // The property that forces useState over useMemo. A recomputed initial
         // carries different keys from the live draft, which remounts every leg
         // row: focus lost, textarea heights reset, in-flight edit discarded.
-        const { result, rerender } = renderHook(({ m }) => useTxnRowDraft(m), {
+        const { result, rerender } = renderHook(({ m }) => useTxnRowDraft(m, 'USD'), {
             initialProps: { m: editMode(3) },
         });
         const before = result.current.draft.postings.map((p) => p.key);
@@ -62,7 +64,7 @@ describe('useTxnRowDraft — seeding', () => {
         // They are passed to the row components and into the picker's
         // eligibility chain. A new function per render re-runs a
         // scroll-highlight effect on every keystroke anywhere in the form.
-        const { result } = renderHook(() => useTxnRowDraft(editMode(2)));
+        const { result } = renderHook(() => useTxnRowDraft(editMode(2), 'USD'));
         const before = {
             patch: result.current.patchPosting,
             add: result.current.addPosting,
@@ -85,7 +87,7 @@ describe('useTxnRowDraft — addPosting', () => {
         // Both in ONE act() deliberately: that is the batching the ghost row
         // depends on. If the key had to come back from a later render, the new
         // row would mount once with autoFocusAmount=false and never focus.
-        const { result } = renderHook(() => useTxnRowDraft(editMode(1)));
+        const { result } = renderHook(() => useTxnRowDraft(editMode(1), 'USD'));
         let key = '';
         act(() => {
             key = result.current.addPosting();
@@ -96,7 +98,7 @@ describe('useTxnRowDraft — addPosting', () => {
     });
 
     it('applies a prefill but forces legId null, so an add never PATCHes a leg', () => {
-        const { result } = renderHook(() => useTxnRowDraft(editMode(1)));
+        const { result } = renderHook(() => useTxnRowDraft(editMode(1), 'USD'));
         act(() => {
             result.current.addPosting({ amount: '-12.50', legId: 'stolen-leg' });
         });
@@ -108,7 +110,7 @@ describe('useTxnRowDraft — addPosting', () => {
 
 describe('useTxnRowDraft — removePosting', () => {
     it('drops the named posting', () => {
-        const { result } = renderHook(() => useTxnRowDraft(editMode(3)));
+        const { result } = renderHook(() => useTxnRowDraft(editMode(3), 'USD'));
         const second = result.current.draft.postings[1]!.key;
         act(() => result.current.removePosting(second));
         expect(order(result.current)).toEqual(['-1.00', '-3.00']);
@@ -117,7 +119,7 @@ describe('useTxnRowDraft — removePosting', () => {
     it('refuses to empty the transaction', () => {
         // A transaction with no postings is not representable — the single-row
         // branch renders postings[0] unconditionally.
-        const { result } = renderHook(() => useTxnRowDraft(editMode(1)));
+        const { result } = renderHook(() => useTxnRowDraft(editMode(1), 'USD'));
         const only = result.current.draft.postings[0]!.key;
         act(() => result.current.removePosting(only));
         expect(result.current.draft.postings).toHaveLength(1);
@@ -131,21 +133,21 @@ describe('useTxnRowDraft — reorderPostings (the drop semantic)', () => {
     // which is what a drag reads as. A well-meaning symmetric "fix" would
     // change where every downward drag lands.
     it('dropping DOWN lands after the target', () => {
-        const { result } = renderHook(() => useTxnRowDraft(editMode(4)));
+        const { result } = renderHook(() => useTxnRowDraft(editMode(4), 'USD'));
         const [a, , c] = result.current.draft.postings;
         act(() => result.current.reorderPostings(a!.key, c!.key));
         expect(order(result.current)).toEqual(['-2.00', '-3.00', '-1.00', '-4.00']);
     });
 
     it('dropping UP lands before the target', () => {
-        const { result } = renderHook(() => useTxnRowDraft(editMode(4)));
+        const { result } = renderHook(() => useTxnRowDraft(editMode(4), 'USD'));
         const [a, , , d] = result.current.draft.postings;
         act(() => result.current.reorderPostings(d!.key, a!.key));
         expect(order(result.current)).toEqual(['-4.00', '-1.00', '-2.00', '-3.00']);
     });
 
     it('ignores a drop on itself and an unknown key', () => {
-        const { result } = renderHook(() => useTxnRowDraft(editMode(3)));
+        const { result } = renderHook(() => useTxnRowDraft(editMode(3), 'USD'));
         const a = result.current.draft.postings[0]!.key;
         act(() => result.current.reorderPostings(a, a));
         act(() => result.current.reorderPostings(a, 'no-such-key'));
@@ -155,7 +157,7 @@ describe('useTxnRowDraft — reorderPostings (the drop semantic)', () => {
 
 describe('useTxnRowDraft — movePosting (the keyboard path)', () => {
     it('moves exactly one slot in each direction', () => {
-        const { result } = renderHook(() => useTxnRowDraft(editMode(4)));
+        const { result } = renderHook(() => useTxnRowDraft(editMode(4), 'USD'));
         const third = result.current.draft.postings[2]!.key;
         act(() => result.current.movePosting(third, -1));
         expect(order(result.current)).toEqual(['-1.00', '-3.00', '-2.00', '-4.00']);
@@ -167,7 +169,7 @@ describe('useTxnRowDraft — movePosting (the keyboard path)', () => {
         // Wrapping would send the top row to the bottom on an Alt+Up that the
         // user expected to do nothing — a 25-split reorder you cannot undo by
         // pressing the opposite key, because the opposite key wraps too.
-        const { result } = renderHook(() => useTxnRowDraft(editMode(3)));
+        const { result } = renderHook(() => useTxnRowDraft(editMode(3), 'USD'));
         const first = result.current.draft.postings[0]!.key;
         const last = result.current.draft.postings[2]!.key;
         act(() => result.current.movePosting(first, -1));
@@ -176,7 +178,7 @@ describe('useTxnRowDraft — movePosting (the keyboard path)', () => {
     });
 
     it('preserves every key, so no row remounts on a move', () => {
-        const { result } = renderHook(() => useTxnRowDraft(editMode(3)));
+        const { result } = renderHook(() => useTxnRowDraft(editMode(3), 'USD'));
         const before = new Set(result.current.draft.postings.map((p) => p.key));
         act(() => result.current.movePosting(result.current.draft.postings[0]!.key, 1));
         expect(new Set(result.current.draft.postings.map((p) => p.key))).toEqual(before);
@@ -185,7 +187,7 @@ describe('useTxnRowDraft — movePosting (the keyboard path)', () => {
 
 describe('useTxnRowDraft — patchPosting', () => {
     it('merges into one posting and leaves the others alone', () => {
-        const { result } = renderHook(() => useTxnRowDraft(editMode(2)));
+        const { result } = renderHook(() => useTxnRowDraft(editMode(2), 'USD'));
         const second = result.current.draft.postings[1]!;
         act(() => result.current.patchPosting(second.key, { legMemo: 'plumber' }));
         expect(result.current.draft.postings[1]).toMatchObject({

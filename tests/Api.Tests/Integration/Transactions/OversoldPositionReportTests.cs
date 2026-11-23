@@ -15,7 +15,7 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Transactions;
 
 /// <summary>
-/// Positions already short are reported, not repaired (FU-097, decided 2026-10-20).
+/// Positions already short are reported, not repaired (FU-097).
 /// </summary>
 /// <remarks>
 /// Migration 256 stops any create or edit from selling more shares than were held, or
@@ -26,11 +26,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// and how to fix it.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class OversoldPositionReportTests
+public sealed class OversoldPositionReportTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public OversoldPositionReportTests(PostgresFixture fixture) => _fixture = fixture;
+    public OversoldPositionReportTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Day(int month, int day) =>
         new(2014, month, day, 12, 0, 0, DateTimeKind.Utc);
@@ -65,12 +66,12 @@ public sealed class OversoldPositionReportTests
     /// </summary>
     private async Task<Seed> ShortPositionAsync(bool boughtBackAfter)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var securityId = await ledger.AddSecurityAsync("Index Fund", ticker: "IDX");
         var s = new Seed(ledger, brokerage.Id, brokerage.HoldingsAccountId!.Value, securityId);
 
-        await using (var factory = new ApiFactory(_fixture).WithoutDevAuth())
+        await using (var factory = new ApiFactory(Db).WithoutDevAuth())
         {
             var cookie = await ledger.IssueSessionCookieAsync();
             using var client = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
@@ -79,27 +80,28 @@ public sealed class OversoldPositionReportTests
             await TradeAsync(client, s, "sell", -10m, Day(2, 1));
             if (boughtBackAfter) await TradeAsync(client, s, "buy", 2m, Day(3, 1));
 
-            await using var db = _fixture.NewDbContext();
+            await using var db = Db.NewDbContext();
             await db.TxnLegs
                 .Where(l => l.HeaderId == buy && l.AccountId == s.HoldingsId)
                 .ExecuteUpdateAsync(u => u.SetProperty(l => l.Quantity, 8m));
         }
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             await new HoldingsRecomputeService(db).RecomputeAsync([(s.HoldingsId, s.SecurityId)]);
         await ledger.RecomputeTradePricesAsync();
         return s;
     }
 
     private static LedgerConsistencyRepository RepoFor(AppDbContext db) =>
-        new(db, new RegisterRepository(db, TimeProvider.System), new HoldingsRecomputeService(db));
+        new(db, new RegisterRepository(db, TimeProvider.System), new HoldingsRecomputeService(db),
+            TimeProvider.System);
 
     [Fact]
     public async Task A_short_position_is_listed_and_the_ledger_is_unhealthy_for_it_alone()
     {
         var s = await ShortPositionAsync(boughtBackAfter: false);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var report = await RepoFor(db).CheckAsync(s.Ledger.LedgerId);
 
         var oversold = Assert.Single(report.Oversold);
@@ -120,13 +122,20 @@ public sealed class OversoldPositionReportTests
         // booked the unmatched shares at zero cost.
         var s = await ShortPositionAsync(boughtBackAfter: true);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Equal(0m, await db.Holdings.AsNoTracking()
             .Where(h => h.AccountId == s.HoldingsId && h.SecurityId == s.SecurityId)
             .Select(h => h.Quantity).SingleAsync());
         var report = await RepoFor(db).CheckAsync(s.Ledger.LedgerId);
 
         Assert.Equal(2m, Assert.Single(report.Oversold).SharesShort);
+
+        // The walk returns no position for it, and its stored row keeps the buy-back's
+        // cost at quantity 0, which is what the walk computes: the holdings check
+        // compares only its quantity.
+        var holdings = Assert.Single(report.Projections, p => p.Projection == ConsistencyProjections.Holdings);
+        Assert.True(holdings.Healthy, "a bought-back position was reported as drift: " + string.Join("; ",
+            holdings.Mismatches.Select(m => $"{m.Field} stored {m.Stored} expected {m.Expected}")));
     }
 
     [Fact]
@@ -134,22 +143,22 @@ public sealed class OversoldPositionReportTests
     {
         var s = await ShortPositionAsync(boughtBackAfter: false);
         var monitor = new ConsistencyMonitor(
-            _fixture.NewServiceFactory(),
+            Db.NewServiceFactory(),
             new NotificationPublisher(
-                _fixture.NewServiceFactory(),
-                _fixture.NewLedgerKeyService(),
+                Db.NewServiceFactory(),
+                Db.NewLedgerKeyService(),
                 Array.Empty<INotificationSubscriber>(),
                 NullLogger<NotificationPublisher>.Instance, TimeProvider.System),
             NullLogger<ConsistencyMonitor>.Instance, TimeProvider.System);
         // The API the position was made through runs the scheduler, which checked this
         // ledger as it started, before the position was short. Forget that check, or
         // the monitor's twelve-hour gate skips the ledger.
-        await using (var reset = _fixture.NewDbContext())
+        await using (var reset = Db.NewDbContext())
             await reset.LedgerConsistencyStates.Where(r => r.LedgerId == s.Ledger.LedgerId).ExecuteDeleteAsync();
 
         await monitor.CheckAllAsync();
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var state = await db.LedgerConsistencyStates.AsNoTracking()
             .SingleAsync(r => r.LedgerId == s.Ledger.LedgerId);
         Assert.False(state.Healthy);

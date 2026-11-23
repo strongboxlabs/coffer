@@ -10,7 +10,7 @@
 * Date: 2026-06-26
 * Related: ADR-0027 (investment action catalog), ADR-0029 (action × field matrix),
   ADR-0039/0040/0041 (recompute ordering), ADR-0063 (MCP — the `realized_gains`
-  tool that surfaced this), ADR-0065 (transfer-shares — amends this recompute)
+  tool), ADR-0065 (transfer-shares — amends this recompute)
 
 ## Context
 
@@ -20,9 +20,9 @@ the `lots` table with **FIFO** consumption (mig 054, "for a future per-lot tax
 surface"). The two diverge the moment a security is partially sold, so the
 displayed basis (average) and the lots (FIFO) disagreed.
 
-Building the MCP `realized_gains` tool (ADR-0063 v2) forced the question: a
-realized-gain figure must reconcile with the basis shown everywhere else. The
-owner's call: **be consistent — switch the whole app to FIFO.** FIFO is also the
+A realized-gain figure (the MCP `realized_gains` tool, ADR-0063 v2) must
+reconcile with the basis shown everywhere else, so **the whole app switches to
+FIFO.** FIFO is also the
 tax-correct default for US individual equities (average cost isn't permitted for
 stocks), and the FIFO lot machinery already exists — only the *derivation of the
 holding's basis* was average-cost.
@@ -43,7 +43,7 @@ recompute self-heals (a self-heal would race the create path, which already
 inserts the lot in the same unit of work, and mask a real producer bug). All
 producers uphold it: the API create path (`_db.Lots.Add` from the domain
 `InvestmentHoldingsImpact.NewLot`), the API edit/PATCH path (drops + rebuilds
-legs *and* lots), and the importer (`BuildHoldingsImpact` → `BulkReplaceLots`).
+legs *and* lots), and the importer (`InvestmentTransactionMapper`'s `NewLot` → `InsertLotsAsync`).
 The recompute only *resets + consumes* lots; it never invents them. Tests seed
 lots the same way production does (`InsertLotForHeader`), so they exercise the
 real path rather than a parallel one.
@@ -65,8 +65,8 @@ all history in one pass (the established mig-068/116/117/118 pattern).
 
 ### D4 — Validate against brokerage statements before release
 Per the standing rule that investment numbers must reconcile with reality:
-holdings basis + realized gains are checked against brokerage statements in dev
-before the release. Sell-side fee treatment (D2) is the most uncertain detail and
+holdings basis + realized gains are checked against brokerage statements before
+the release. Sell-side fee treatment (D2) is the most uncertain detail and
 is the focus of that check.
 
 ### D5 — Short-/long-term split (mig 169)
@@ -92,9 +92,9 @@ renders `COALESCE(o.posted_at, h.posted_at)` — the user's curated date. So a r
 could sit in one place on screen and in another in the walk that decides which
 lots a sale consumes, which basis it books and which period the gain lands in.
 
-Already live rather than hypothetical: an investment merge stamps a `posted_at`
-override on the SURVIVOR (it adopts the folded row's date), so every merge winner
-had a displayed date its cost basis did not know about.
+An investment merge stamps a `posted_at` override on the SURVIVOR (it adopts the
+folded row's date), so a merge winner carries a displayed date its cost basis does
+not know about.
 
 `holdings_fifo_walk`, `holdings_cost_basis_as_of` and
 `holdings_market_value_as_of_set` all moved together. Moving only the walk would
@@ -113,10 +113,9 @@ directly instead.
 upsert, never set — hiding writes `txn_headers.is_hidden`. If that changes, these
 predicates need the same treatment.
 
-Verified by equivalence rather than by fixture: the migration was applied to a
-clone of the real dev database and `holdings`, `lots` and `realized_gains`
-checksummed identical before and after, which is what "no row without an
-overridden date moves" means in practice.
+No row without an overridden date moves: for such a row the effective date is
+the raw `posted_at`, so `holdings`, `lots` and `realized_gains` are unchanged by
+the migration wherever no date was overridden.
 
 ## Consequences
 
@@ -127,11 +126,11 @@ overridden date moves" means in practice.
   updated to the FIFO expectations.
 - `realized_gains` becomes a first-class, queryable surface (MCP + future UI).
 - Tax-method correctness for US equities; groundwork for lot-level tax reporting.
-- **Surfaces (does not cause) a pre-existing modeling gap:** in-kind transfers /
-  rollovers recorded as sell+buy now show a fabricated realized gain (and the
-  destination basis was reset to transfer-date market). The fix is the
-  transfer-shares action + a data scrub — its own slice (see docs/maintainer/follow-ups.md).
-  FIFO is correct given the recorded actions; it just made the issue visible.
+- **A modeling gap FIFO does not cause but does show:** an in-kind transfer /
+  rollover recorded as sell+buy books a fabricated realized gain (and resets the
+  destination basis to transfer-date market). FIFO is correct given the recorded
+  actions. The fix is the `transfer_shares` action and its guided conversion
+  ([ADR-0065](0065-transfer-shares-in-kind.md)).
 
 ## Amendment, 2026-10-20 — a sale cannot take more than was held (FU-097, migration 256)
 
@@ -152,10 +151,10 @@ shares at zero cost, overstating the gain by their whole proceeds.
   It covers the indirect cases too: a buy edited down under a later sale, or a sale moved
   before its shares arrived.
 - **The editor's lot preview asks the same walk** about the sale's own date, without the
-  sale (`?as_of=&exclude_header_id=`). It used to read `lots`, which FIFO drains in place,
-  so it only knew today. On a since-closed account it warned about every historical edit
-  while a real oversell went through.
-- **Positions already short are reported, not repaired** (decided 2026-10-20). The
+  sale (`?as_of=&exclude_header_id=`). Reading `lots`, which FIFO drains in place, knows
+  only today: on a since-closed account it warns about every historical edit while a real
+  oversell goes through.
+- **Positions already short are reported, not repaired.** The
   purchase they are missing is not in the data, so any repair would invent a cost basis
   or cut the sale. The consistency report lists them (`holdings_fifo_shortfalls`, the
   `Oversold` section), they count against `Healthy`, and the monitor's warning names them

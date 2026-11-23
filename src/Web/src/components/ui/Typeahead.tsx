@@ -12,6 +12,9 @@ import {
 } from 'react';
 
 import { cn } from '@/lib/cn';
+import { useFieldSizeClass } from './fieldSize';
+import { pendingTextProps } from './pending';
+import { happenedInside } from './popoverDismissal';
 
 // Typeahead — controlled input with a filtered-suggestion popover.
 //
@@ -31,7 +34,12 @@ import { cn } from '@/lib/cn';
 //       Enter (with highlight) — apply highlight via onChange; close popover; prevent default so the parent form catches it
 //       Enter (no highlight)   — pass through to the parent form (no onChange)
 //       Tab (with highlight)   — apply highlight via onChange; close popover; DO NOT preventDefault so focus advances
-//       Escape                 — close the popover; let the event bubble so the parent form's cancel handler can fire
+//       Escape (list showing)  — close the list and stop there: preventDefault + stopPropagation, so neither the
+//                                parent form's cancel nor a dialog around it acts. Focus and the typed text stay.
+//       Escape (no list)       — pass through to the parent form, whose Escape cancels the edit
+//     Every list in the transaction editors follows that Escape rule
+//     (ADR-0023 §F): the first Escape closes the list, the next one
+//     cancels.
 //   * Click on an item        — onChange + close popover (same as Enter with highlight)
 //   * Click outside           — close popover, no onChange (the parent keeps whatever's typed)
 //
@@ -68,13 +76,17 @@ export interface TypeaheadProps<T> {
     renderItem?: (item: T, query: string) => React.ReactNode;
     placeholder?: string;
     disabled?: boolean;
+    /** The request this field belongs to is in flight: it keeps focus, is
+     *  read-only, and shows no suggestions to pick (pending.ts). */
+    pending?: boolean;
     autoFocus?: boolean;
     className?: string;
     /** Forwarded to the underlying input. */
     'aria-label'?: string;
     /** Forwarded to the input. Use for form-level submit/cancel
      * keyboard handling; the Typeahead's own keyboard logic runs
-     * first but bubbles for unhandled keys. */
+     * first, and a key it used (Enter on a highlight, Escape that
+     * closed the list) never reaches this. */
     onKeyDown?: (event: KeyboardEvent<HTMLInputElement>) => void;
     /** Forwarded to the input. The popover closes on blur
      * regardless. */
@@ -157,6 +169,7 @@ function TypeaheadInner<T>(
         renderItem,
         placeholder,
         disabled,
+        pending,
         autoFocus,
         className,
         'aria-label': ariaLabel,
@@ -169,6 +182,7 @@ function TypeaheadInner<T>(
 ) {
     const inputId = useId();
     const listboxId = `${inputId}-listbox`;
+    const sizeClass = useFieldSizeClass();
 
     const containerRef = useRef<HTMLDivElement | null>(null);
     const inputRef = useRef<HTMLInputElement | null>(null);
@@ -218,6 +232,10 @@ function TypeaheadInner<T>(
     // (positions after all filtered items). -1 when not shown.
     const creationRowIndex = showCreationRow ? filtered.length : -1;
     const totalSelectable = filtered.length + (showCreationRow ? 1 : 0);
+    // What the user sees. `isOpen` alone is not it: the field is "open" from
+    // the moment it takes focus, and with nothing matching there is no list.
+    // A pending field offers nothing to pick.
+    const listShown = isOpen && totalSelectable > 0 && pending !== true;
 
     // Reset highlight when the filtered set shifts under us.
     // First filtered item wins; if there are none but a creation
@@ -247,7 +265,7 @@ function TypeaheadInner<T>(
     useEffect(() => {
         if (!isOpen) return;
         const onPointerDown = (event: PointerEvent) => {
-            if (containerRef.current?.contains(event.target as Node)) return;
+            if (happenedInside(event, containerRef.current)) return;
             setIsOpen(false);
         };
         document.addEventListener('pointerdown', onPointerDown, true);
@@ -267,6 +285,12 @@ function TypeaheadInner<T>(
     }
 
     function handleKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+        // Pending: no key opens the list or picks from it; the form's own keys
+        // still reach it.
+        if (pending) {
+            onKeyDown?.(event);
+            return;
+        }
         if (event.key === 'ArrowDown') {
             event.preventDefault();
             if (!isOpen) {
@@ -317,13 +341,16 @@ function TypeaheadInner<T>(
             }
             // Tab always bubbles; parent gets it too.
         }
-        if (event.key === 'Escape') {
-            if (isOpen) {
-                // First Esc: close the popover. Don't preventDefault
-                // — let the parent form's cancel handler see it too.
-                setIsOpen(false);
-            }
-            // Subsequent Esc (popover already closed) just bubbles.
+        if (event.key === 'Escape' && listShown) {
+            // This Escape dismissed the suggestions, nothing more. Marked
+            // handled with preventDefault, the mark every list in the editors
+            // leaves and the editors and Modal read; stopped as well, so
+            // nothing further up acts on it. The next Escape, with no list
+            // showing, falls through below and cancels the edit.
+            event.preventDefault();
+            event.stopPropagation();
+            setIsOpen(false);
+            return;
         }
         onKeyDown?.(event);
     }
@@ -345,10 +372,12 @@ function TypeaheadInner<T>(
                 role="combobox"
                 aria-label={ariaLabel}
                 aria-autocomplete="list"
-                aria-expanded={isOpen}
+                // The list on screen, not the focus state: a focused field with
+                // nothing matching shows no list and must not announce one.
+                aria-expanded={listShown}
                 aria-controls={listboxId}
                 aria-activedescendant={
-                    isOpen && highlightIndex >= 0 && filtered[highlightIndex] !== undefined
+                    listShown && highlightIndex >= 0 && filtered[highlightIndex] !== undefined
                         ? `${listboxId}-${getKey(filtered[highlightIndex]!)}`
                         : undefined
                 }
@@ -375,9 +404,12 @@ function TypeaheadInner<T>(
                     'flex h-control-28px w-full rounded border border-border bg-surface px-2 text-xs text-text',
                     'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-accent',
                     'disabled:cursor-not-allowed disabled:opacity-50',
+                    'aria-disabled:cursor-not-allowed aria-disabled:opacity-50',
+                    sizeClass,
                 )}
+                {...pendingTextProps<HTMLInputElement>(pending)}
             />
-            {isOpen && (filtered.length > 0 || showCreationRow) ? (
+            {listShown ? (
                 <ul
                     id={listboxId}
                     role="listbox"

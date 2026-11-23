@@ -12,6 +12,7 @@ import type {
 } from '../types/bank';
 import type { RegisterEntry } from '../types/register';
 import { request } from './_request';
+import { requestSavedEntries } from './savedEntries';
 
 /**
  * POST /api/ledgers/{ledgerId}/transactions — create a manual
@@ -39,15 +40,17 @@ export function createTransaction(
 
 /**
  * PATCH /api/ledgers/{ledgerId}/transactions/{headerId} (ADR-0025).
- * Apply header overrides and/or a postings reshape in one atomic
- * Postgres transaction. `null` (or omitted) on a header field
- * means "leave the override column alone"; `postings` omitted
- * means "don't touch the postings list."
+ * Apply header fields and/or a postings reshape in one atomic
+ * Postgres transaction. Presence decides, not nullness (mig 230): an
+ * omitted header field is left alone and an explicit `null` CLEARS
+ * it; `postings` omitted means "don't touch the postings list."
  *
- * When `accountId` is supplied, the response is the freshly-resolved
- * `RegisterEntry` for the saved header on that account — used by the
- * SPA to patch the register in place (via `mutateEntries`) without
- * a full window refresh. When omitted, the endpoint replies 204.
+ * When `accountId` is supplied, the response is every freshly-resolved
+ * entry the saved header has on that account (`SavedHeaderEntries`) —
+ * used by the SPA to swap that header's rows in place (via
+ * `replaceHeaderEntries`) without a full window refresh. It resolves to
+ * an empty list when the header has none there, and when `accountId` is
+ * omitted (the endpoint replies 204).
  *
  * 422 codes:
  *   * `transaction-patch-empty`                — body has neither header fields nor postings.
@@ -65,11 +68,11 @@ export function patchTransaction(
     headerId: string,
     body: PatchTransactionRequest,
     accountId?: string,
-): Promise<RegisterEntry | null> {
+): Promise<RegisterEntry[]> {
     const url = accountId
         ? `/api/ledgers/${encodeURIComponent(ledgerId)}/transactions/${encodeURIComponent(headerId)}?account_id=${encodeURIComponent(accountId)}`
         : `/api/ledgers/${encodeURIComponent(ledgerId)}/transactions/${encodeURIComponent(headerId)}`;
-    return request<RegisterEntry | null>(url, { method: 'PATCH', body });
+    return requestSavedEntries(url, { method: 'PATCH', body });
 }
 
 /**
@@ -87,10 +90,10 @@ export function approveTransaction(
     ledgerId: string,
     headerId: string,
     accountId?: string,
-): Promise<RegisterEntry | null> {
+): Promise<RegisterEntry[]> {
     const base = `/api/ledgers/${encodeURIComponent(ledgerId)}/transactions/${encodeURIComponent(headerId)}/approve`;
     const url = accountId ? `${base}?account_id=${encodeURIComponent(accountId)}` : base;
-    return request<RegisterEntry | null>(url, { method: 'POST' });
+    return requestSavedEntries(url, { method: 'POST' });
 }
 
 /**
@@ -98,8 +101,8 @@ export function approveTransaction(
  *
  * DIRECTION IS INVERTED: `headerId` (the row being edited) is the LOSER, and
  * `fromHeaderId` is the surviving WINNER — the canonical row picked in the
- * candidates panel. The response is the SURVIVOR's register entry, because the
- * edited row has become a tombstone and left the register.
+ * candidates panel. The response is the SURVIVOR's register entries, because
+ * the edited row has become a tombstone and left the register.
  *
  * No approve flag: clearing the loser's review state is the server's job, so it
  * cannot depend on a caller remembering to pair two fields.
@@ -109,10 +112,10 @@ export function mergeTransaction(
     headerId: string,
     fromHeaderId: string,
     accountId?: string,
-): Promise<RegisterEntry | null> {
+): Promise<RegisterEntry[]> {
     const base = `/api/ledgers/${encodeURIComponent(ledgerId)}/transactions/${encodeURIComponent(headerId)}/merge`;
     const url = accountId ? `${base}?account_id=${encodeURIComponent(accountId)}` : base;
-    return request<RegisterEntry | null>(url, { method: 'POST', body: { fromHeaderId } });
+    return requestSavedEntries(url, { method: 'POST', body: { fromHeaderId } });
 }
 
 /**
@@ -137,12 +140,14 @@ export function fetchSimilarPayees(
 
 /**
  * GET /api/ledgers/{ledgerId}/transactions/{headerId}/merge-candidates
- * — slice 2c.6d. Bank-feed editor concern: returns up to 5 manual
- * rows whose aggregated source-account amount matches this
- * header's, within ±7 days. The editor's "Possible matches" panel
- * renders them as chips; clicking pre-fills the editor and arms
- * `mergeFromHeaderId` on the next PATCH. Empty array for
- * non-existent / cross-ledger targets, or when no manual rows
+ * — slice 2c.6d. Bank-feed editor concern: returns up to 5 settled
+ * rows (manual, or a feed or imported row already accepted) whose
+ * aggregated source-account amount matches this header's, within
+ * ±7 days. The editor's "Merge candidates" strip renders them as
+ * chips; clicking one arms `mergeFromHeaderId`, and the next save
+ * folds the edited row into that candidate through
+ * {@link mergeTransaction}. Nothing is copied into the form. Empty array for
+ * non-existent / cross-ledger targets, or when no settled rows
  * match the (account, amount, date) filter.
  */
 export function fetchMergeCandidates(

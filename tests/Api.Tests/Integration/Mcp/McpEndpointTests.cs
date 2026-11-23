@@ -17,11 +17,12 @@ namespace Coffer.Api.Tests.Integration.Mcp;
 /// silently expose the financial tools anonymously.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class McpEndpointTests
+public sealed class McpEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public McpEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public McpEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static readonly object InitializeRequest = new
     {
@@ -51,7 +52,7 @@ public sealed class McpEndpointTests
     [Fact]
     public async Task Unauthenticated_call_is_rejected()
     {
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled().WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled().WithoutDevAuth();
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
         {
             HandleCookies = false,
@@ -68,7 +69,7 @@ public sealed class McpEndpointTests
         // Dev-auth factory adds X-Dev-Auth, so the request is authenticated.
         // We only assert it clears the authorization gate (not 401/403) — the
         // protocol body itself is the real client's job to validate on dev.
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled();
         using var client = factory.CreateClient();
 
         var response = await client.SendAsync(NewInitialize());
@@ -83,11 +84,10 @@ public sealed class McpEndpointTests
     /// server-to-client SSE stream, which makes mcp-remote — the bridge claude.ai
     /// and Claude Desktop use — reconnect-loop and drop the connector.
     ///
-    /// This exists because the SDK 1.4.1 -> 2.1.0 bump flipped
-    /// `HttpServerTransportOptions.Stateless` from false to true by DEFAULT. It
-    /// compiled clean with zero warnings and every other MCP test still passed —
-    /// the only symptom would have been a connector that stops working in
-    /// production. An explicit setting can be dropped by a future refactor just as
+    /// Since SDK 2.1.0, `HttpServerTransportOptions.Stateless` defaults to TRUE
+    /// (1.4.1 defaulted to false). A flip of that default compiles clean with zero
+    /// warnings and leaves every other MCP test passing; its only symptom is a
+    /// connector that stops working. An explicit setting can be dropped by a future refactor just as
     /// easily as a default can change under us, so the behaviour is asserted here
     /// rather than the option value: a session id is what the client needs, and
     /// it's what breaks.
@@ -95,7 +95,7 @@ public sealed class McpEndpointTests
     [Fact]
     public async Task Initialize_returns_a_session_id_because_the_transport_is_stateful()
     {
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled();
         using var client = factory.CreateClient();
 
         var response = await client.SendAsync(NewInitialize());
@@ -122,7 +122,7 @@ public sealed class McpEndpointTests
     [Fact]
     public async Task Budget_progress_is_actually_exposed_as_a_tool()
     {
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled();
         using var client = factory.CreateClient();
 
         // Stateful transport: tools/list has to carry the session initialize hands back.

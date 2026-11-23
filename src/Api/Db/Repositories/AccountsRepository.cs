@@ -1,7 +1,11 @@
+using System.Linq.Expressions;
+
 using Microsoft.EntityFrameworkCore;
 
 using Coffer.Api.Contracts;
 using Coffer.Api.Db.Entities;
+using Coffer.Api.Quotes;
+using Coffer.Domain.Money;
 
 namespace Coffer.Api.Db.Repositories;
 
@@ -32,6 +36,35 @@ public sealed class AccountsRepository
     }
 
     /// <summary>
+    /// Whether a non-category account of the ledger other than
+    /// <paramref name="excluding"/> is kept in <paramref name="currencyCode"/>: the test for
+    /// an account created or edited "into a new currency", which starts a market-series
+    /// backfill (ADR-0114 D11).
+    /// </summary>
+    public Task<bool> CurrencyHeldByAnotherAccountAsync(
+        Guid ledgerId, string currencyCode, IReadOnlyCollection<Guid> excluding,
+        CancellationToken cancellationToken = default) =>
+        _db.Accounts.AsNoTracking()
+            .AnyAsync(a => a.LedgerId == ledgerId
+                           && a.AccountType != "category"
+                           && a.CurrencyCode == currencyCode
+                           && !excluding.Contains(a.Id),
+                cancellationToken);
+
+    /// <summary>One account's currency, type and holdings sibling, or null when it is not
+    /// in the ledger: what an edit had before it (ADR-0114 D11).</summary>
+    public async Task<(string CurrencyCode, string AccountType, Guid? HoldingsAccountId)?> CurrencyOfAsync(
+        Guid ledgerId, Guid accountId, CancellationToken cancellationToken = default)
+    {
+        var row = await _db.Accounts.AsNoTracking()
+            .Where(a => a.LedgerId == ledgerId && a.Id == accountId)
+            .Select(a => new { a.CurrencyCode, a.AccountType, a.HoldingsAccountId })
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return row is null ? null : (row.CurrencyCode, row.AccountType, row.HoldingsAccountId);
+    }
+
+    /// <summary>
     /// User-facing accounts in the supplied ledger. Sorted by name
     /// (ascii, case-sensitive — matches Postgres default collation)
     /// so the picker UI gets a stable order without an extra client-
@@ -48,16 +81,13 @@ public sealed class AccountsRepository
     public async Task<IReadOnlyList<AccountSummary>> ListByLedgerAsync(
         Guid ledgerId,
         bool includeInactive = false,
-        CancellationToken cancellationToken = default) =>
-        // Slice 2c.2 adds two derived fields:
+        CancellationToken cancellationToken = default)
+    {
+        // Two derived fields:
         //   FeedConnectionId — already on the entity; surfaced so the
         //     mapping wizard can filter already-bound accounts.
-        //   NeedsReviewCount — aggregated over txn_legs ↔ txn_headers
-        //     for bank-feed rows flagged needs_review=true. Postgres
-        //     translates the correlated Count() to a LATERAL JOIN; the
-        //     partial index `txn_headers (ledger_id) WHERE needs_review`
-        //     (migration 037) keeps the join cheap because only flagged
-        //     headers participate.
+        //   NeedsReviewCount — the account's register entries awaiting review,
+        //     by the register's own definition (below).
         //
         // Holdings siblings (the system-managed shadow accounts that
         // hold per-security positions on every investment account)
@@ -74,13 +104,28 @@ public sealed class AccountsRepository
         // layer (slice for ADR-0032 inactive-account lifecycle). Opt-in
         // via includeInactive=true for the SPA's "Show inactive"
         // toggle and the account-settings dialog.
-        await _db.Accounts.AsNoTracking()
+        //
+        // The review count is the register's: the legs its needs_review
+        // status keeps on the visible side (RegisterQuery.Filtered, here over
+        // every account and tied to each by the correlation), counted as
+        // DISTINCT ENTRIES the way the register's status count counts them. A
+        // split on its own account is one entry; each of its lines on another
+        // account is an entry there, so a split with two lines on one other
+        // account counts two on it, as that register lists two rows. The
+        // visibility terms (not hidden, not merged) are the register's too: a
+        // merge and a delete clear the flag, and the terms keep out a row that
+        // is still flagged while hidden or merged, which only data written
+        // before those writers cleared it can be (ADR-0052 D3). One correlated
+        // subquery per account in the same statement, never a read per account.
+        var awaitingReview = RegisterQuery.FilteredOnEveryAccount(
+            _db, ledgerId, hidden: false, AwaitingReview, ScheduledBoundary.Today(null, _clock));
+        return await _db.Accounts.AsNoTracking()
             .Where(a => a.LedgerId == ledgerId
-                        && (includeInactive || a.IsActive)
-                        && !_db.Accounts.Any(o =>
-                            o.LedgerId == ledgerId
-                            && o.HoldingsAccountId == a.Id))
+                        && (includeInactive || a.IsActive))
+            .Where(NotAHoldingsSibling(_db, ledgerId))
+            // Names need not be unique: the id breaks a tie, so two reads list them alike.
             .OrderBy(a => a.Name)
+            .ThenBy(a => a.Id)
             .Select(a => new AccountSummary(
                 a.Id,
                 a.LedgerId,
@@ -92,29 +137,9 @@ public sealed class AccountsRepository
                 a.IsActive,
                 a.IsSystem,
                 a.FeedConnectionId,
-                // Needs-review count via resolved_transactions so the
-                // visibility gate is the override-aware effective value.
-                //
-                // MERGED ROWS DO NOT COUNT. A merge stamps is_merged_into and
-                // leaves needs_review alone — deliberately, since the flag records
-                // how the row arrived — so a folded-away duplicate stayed in this
-                // count forever and the sidebar dot never cleared, even though the
-                // register no longer shows the row anywhere. Every other reader of
-                // the flag already excludes merged rows (see
-                // BulkTransactionsRepository's base predicate); this one was the
-                // outlier. Filtering here rather than clearing the flag on merge
-                // also repairs rows already merged, with no backfill.
-                //
-                // DISTINCT BY HEADER, because the view is per-LEG and the contract
-                // is per-transaction: a split with several postings on this account
-                // counted once per posting, so one transaction could read as
-                // "3 transactions to review" in the dot's tooltip.
-                _db.ResolvedTransactions
-                    .Where(rv => rv.AccountId == a.Id
-                        && rv.NeedsReview
-                        && !rv.IsHidden
-                        && rv.IsMergedInto == null)
-                    .Select(rv => rv.HeaderId)
+                awaitingReview
+                    .Where(l => l.Row.AccountId == a.Id)
+                    .Select(l => l.EntryKey)
                     .Distinct()
                     .Count(),
                 a.HoldingsAccountId,
@@ -123,6 +148,23 @@ public sealed class AccountsRepository
                 a.ImportProviderKey))
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>The register's needs-review view, the review count's definition.</summary>
+    private static readonly RegisterFilter AwaitingReview = new(Status: "needs_review");
+
+    /// <summary>
+    /// An account of <paramref name="ledgerId"/> that is not a holdings sibling: no
+    /// account of the ledger names it as its <c>holdings_account_id</c>. The one test
+    /// for "an account a person reads", shared by this listing and the ledger-wide
+    /// register entries (<see cref="RegisterRepository.GetLedgerPageAsync"/>), so the
+    /// entries never show an account the sidebar does not list.
+    /// </summary>
+    internal static Expression<Func<AccountRow, bool>> NotAHoldingsSibling(AppDbContext db, Guid ledgerId)
+    {
+        ArgumentNullException.ThrowIfNull(db);
+        return a => !db.Accounts.Any(o => o.LedgerId == ledgerId && o.HoldingsAccountId == a.Id);
+    }
 
     /// <summary>
     /// Returns true when an account with <paramref name="accountId"/>
@@ -198,8 +240,8 @@ public sealed class AccountsRepository
                                           && s.AccountId == accountId
                                           && s.PostingIndex == leg.PostingIndex)
             join h in _db.TxnHeaders.AsNoTracking() on leg.HeaderId equals h.Id
-            // is_hidden is canonical since mig 230 — the override layer that
-            // used to sit over it is gone.
+            // is_hidden is canonical since mig 230 — no override layer sits
+            // over it.
             where h.IsHidden == false
                   && h.IsMergedInto == null
             join a in _db.Accounts.AsNoTracking() on leg.AccountId equals a.Id
@@ -265,6 +307,7 @@ public sealed class AccountsRepository
             .OrderByDescending(r => r.Score)
             .ThenByDescending(r => r.LastUsed)
             .ThenBy(r => r.Name, StringComparer.Ordinal)
+            .ThenBy(r => r.Id)
             .ToList();
 
         IReadOnlyList<FrequentCounterpartyDto> Take(bool categories) => ranked
@@ -283,7 +326,7 @@ public sealed class AccountsRepository
 
     /// <summary>
     /// Membership + activity for a batch of account ids in one round
-    /// trip. Powers the inactive-account gate (PR #132 follow-up): the
+    /// trip. Powers the inactive-account gate: the
     /// caller resolves "in this ledger?" and "currently active?" in a
     /// single query, avoiding N+1 against <see cref="BelongsToLedgerAsync"/>.
     /// Returns a dictionary keyed by the requested id; ids missing from
@@ -299,10 +342,12 @@ public sealed class AccountsRepository
 
         var rows = await _db.Accounts.AsNoTracking()
             .Where(a => a.LedgerId == ledgerId && accountIds.Contains(a.Id))
-            .Select(a => new { a.Id, a.IsActive })
+            .Select(a => new { a.Id, a.IsActive, a.AccountType, a.CurrencyCode })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
-        return rows.ToDictionary(r => r.Id, r => new AccountActivity(r.IsActive));
+        // A Holdings sibling's stored currency is its brokerage's, which
+        // HoldingsAccountCurrency.AlignAsync keeps (ADR-0019 Rule 4).
+        return rows.ToDictionary(r => r.Id, r => new AccountActivity(r.IsActive, r.AccountType, r.CurrencyCode));
     }
 
     /// <summary>
@@ -312,7 +357,15 @@ public sealed class AccountsRepository
     /// <c>account-not-in-ledger</c>; <c>IsActive=false</c> on an existing
     /// row maps to <c>account-inactive</c>.
     /// </summary>
-    public readonly record struct AccountActivity(bool IsActive);
+    /// <remarks><see cref="AccountType"/> and <see cref="CurrencyCode"/> are the stored
+    /// ones, which the posting validation reads to check a typed amount at its currency's
+    /// places (ADR-0114 D15).</remarks>
+    public readonly record struct AccountActivity(bool IsActive, string AccountType, string CurrencyCode)
+    {
+        /// <summary>A real account: anything but a category, which holds no money of its
+        /// own (ADR-0114 D13).</summary>
+        public bool IsReal => !string.Equals(AccountType, "category", StringComparison.Ordinal);
+    }
 
     /// <summary>
     /// True iff the account exists in this ledger AND its
@@ -378,7 +431,18 @@ public sealed class AccountsRepository
         /// <summary>The supplied feed_connection_id doesn't exist
         /// in this ledger.</summary>
         ConnectionMismatch,
+        /// <summary>The feed account's currency, as the connection's directory last
+        /// recorded it, differs from the Coffer account's (ADR-0114 D13). Nothing is
+        /// bound.</summary>
+        CurrencyMismatch,
     }
+
+    /// <summary>
+    /// The result of <see cref="BindFeedMappingAsync"/>, with both currencies on a
+    /// <see cref="BindFeedMappingResult.CurrencyMismatch"/> so the refusal can name them.
+    /// </summary>
+    public sealed record BindFeedMappingOutcome(
+        BindFeedMappingResult Result, string? FeedCurrency = null, string? AccountCurrency = null);
 
     /// <summary>
     /// Bind a Coffer account to one SimpleFIN-side account on a
@@ -387,7 +451,16 @@ public sealed class AccountsRepository
     /// (slice 2b — option 2 in the mapping design discussion).
     /// Idempotent: re-binding the same pair is a no-op.
     /// </summary>
-    public async Task<BindFeedMappingResult> BindFeedMappingAsync(
+    /// <remarks>
+    /// An account's currency must match what is imported into it (ADR-0114 D13), so a
+    /// feed account whose currency differs from the Coffer account's is refused, by the
+    /// rule the sync applies to a binding made before this check
+    /// (<see cref="Coffer.Api.Ingest.SimpleFin.SimpleFinPullProvider.CurrencyDiffers"/>). The feed's
+    /// currency is the one the connection's directory recorded at its last sync; a feed
+    /// account the directory does not hold yet, or one that reported no currency, binds,
+    /// and the sync judges it when it is fetched.
+    /// </remarks>
+    public async Task<BindFeedMappingOutcome> BindFeedMappingAsync(
         Guid ledgerId,
         Guid accountId,
         Guid feedConnectionId,
@@ -402,7 +475,23 @@ public sealed class AccountsRepository
             .AsNoTracking()
             .AnyAsync(c => c.Id == feedConnectionId && c.LedgerId == ledgerId, cancellationToken)
             .ConfigureAwait(false);
-        if (!connectionInLedger) return BindFeedMappingResult.ConnectionMismatch;
+        if (!connectionInLedger) return new(BindFeedMappingResult.ConnectionMismatch);
+
+        var feedCurrency = await _db.FeedConnectionAccounts.AsNoTracking()
+            .Where(d => d.FeedConnectionId == feedConnectionId
+                        && d.LedgerId == ledgerId
+                        && d.ExternalId == simpleFinAccountId)
+            .Select(d => d.Currency)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var accountCurrency = await _db.Accounts.AsNoTracking()
+            .Where(a => a.Id == accountId && a.LedgerId == ledgerId)
+            .Select(a => a.CurrencyCode)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (accountCurrency is not null
+            && Coffer.Api.Ingest.SimpleFin.SimpleFinPullProvider.CurrencyDiffers(feedCurrency, accountCurrency))
+            return new(BindFeedMappingResult.CurrencyMismatch, feedCurrency!.Trim(), accountCurrency);
 
         await _db.Accounts
             .Where(a => a.Id == accountId && a.LedgerId == ledgerId)
@@ -411,7 +500,7 @@ public sealed class AccountsRepository
                 .SetProperty(a => a.ExternalId, simpleFinAccountId),
                 cancellationToken)
             .ConfigureAwait(false);
-        return BindFeedMappingResult.Ok;
+        return new(BindFeedMappingResult.Ok);
     }
 
     /// <summary>
@@ -549,10 +638,12 @@ public sealed class AccountsRepository
     /// adds fee-marked postings (<c>posting_role='fee'</c>) in that
     /// account's transactions to cost basis; when FALSE they're ignored.
     ///
-    /// The flag's effect on existing data is realised by calling
-    /// <c>recompute_holdings_cost_basis(ledgerId)</c> in the same
-    /// transaction, so the caller sees converged <c>holdings.cost_basis</c>
-    /// and <c>lots.unit_cost</c> by the time the response returns.
+    /// The flag's effect on existing data is realised by recomputing the
+    /// brokerage's holdings (<c>recompute_holdings_for_brokerage</c>) in the same
+    /// transaction as the flag's write, so the caller sees converged
+    /// <c>holdings.cost_basis</c> and <c>lots.unit_cost</c> by the time the response
+    /// returns, and a recompute that fails leaves the flag as it was. The transaction
+    /// takes the ledger's write lock first (migration 275).
     /// </summary>
     public async Task<SetIsTradeCommissionResult> SetIsTradeCommissionAsync(
         Guid ledgerId,
@@ -567,6 +658,9 @@ public sealed class AccountsRepository
             .ConfigureAwait(false);
         if (brokerage is null || brokerage.AccountType != "investment")
             return SetIsTradeCommissionResult.AccountNotInvestment;
+
+        await using var write = await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken)
+            .ConfigureAwait(false);
 
         await _db.Accounts
             .Where(a => a.Id == accountId && a.LedgerId == ledgerId)
@@ -590,6 +684,7 @@ public sealed class AccountsRepository
                 .ConfigureAwait(false);
         }
 
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
         return SetIsTradeCommissionResult.Ok;
     }
 
@@ -675,9 +770,55 @@ public sealed class AccountsRepository
         var txnAggs = await _db.TxnLegs.AsNoTracking()
             .Where(l => l.LedgerId == ledgerId)
             .GroupBy(l => l.AccountId)
-            .Select(g => new { AccountId = g.Key, Count = g.Count(), Total = g.Sum(l => l.Amount) })
-            .ToDictionaryAsync(x => x.AccountId, x => (x.Count, x.Total), cancellationToken)
+            .Select(g => new { AccountId = g.Key, Count = g.Count() })
+            .ToDictionaryAsync(x => x.AccountId, x => x.Count, cancellationToken)
             .ConfigureAwait(false);
+
+        // The total is in the ledger's reporting currency (ADR-0114 D7): a category's
+        // leg carries the money of the real account on its posting's other side, in that
+        // account's currency, so each is converted at its transaction's date and summed,
+        // rounded once. A leg whose posting has no real account (between two categories)
+        // is in the category's own currency. Legs in the reporting currency are summed as
+        // they stand, so they are grouped by category alone and need no date.
+        var reporting = await DisplayCurrency.ForLedgerAsync(_db, ledgerId, cancellationToken).ConfigureAwait(false);
+        var sums = await (
+                from l in _db.TxnLegs.AsNoTracking()
+                join a in _db.Accounts.AsNoTracking() on l.AccountId equals a.Id
+                join h in _db.TxnHeaders.AsNoTracking() on l.HeaderId equals h.Id
+                where l.LedgerId == ledgerId && a.AccountType == "category"
+                let paying = _db.TxnLegs
+                    .Where(o => o.HeaderId == l.HeaderId && o.PostingIndex == l.PostingIndex && o.Id != l.Id)
+                    .Join(_db.Accounts, o => o.AccountId, oa => oa.Id, (o, oa) => oa)
+                    .Where(oa => oa.AccountType != "category")
+                    .Select(oa => oa.CurrencyCode)
+                    .FirstOrDefault()
+                let currency = paying ?? a.CurrencyCode
+                group l.Amount by new
+                {
+                    l.AccountId,
+                    Currency = currency,
+                    Day = currency == reporting ? (DateTime?)null : h.PostedAt.Date,
+                } into g
+                select new { g.Key.AccountId, g.Key.Currency, g.Key.Day, Total = g.Sum() })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var lookup = new ExchangeRateLookup(_db, _clock);
+        var needs = lookup.NewNeeds();
+        foreach (var s in sums.Where(s => s.Day is not null))
+            needs.Add(s.Currency, reporting, DateOnly.FromDateTime(s.Day!.Value));
+        var rates = await lookup.LoadAsync(ledgerId, needs, cancellationToken).ConfigureAwait(false);
+        var totals = sums
+            .GroupBy(s => s.AccountId)
+            .ToDictionary(g => g.Key, g =>
+            {
+                var total = rates.NewTotal(reporting);
+                foreach (var s in g)
+                {
+                    if (s.Day is { } day) total.Add(s.Total, s.Currency, DateOnly.FromDateTime(day));
+                    else total.Add(s.Total, reporting, RateDay.Latest());   // the identity
+                }
+                return total.Result;
+            });
 
         var childCounts = await _db.Accounts.AsNoTracking()
             .Where(a => a.LedgerId == ledgerId && a.ParentId != null)
@@ -689,10 +830,12 @@ public sealed class AccountsRepository
         return cats
             .Select(c =>
             {
-                var (count, total) = txnAggs.GetValueOrDefault(c.Id);
+                var count = txnAggs.GetValueOrDefault(c.Id);
+                var total = totals.GetValueOrDefault(c.Id, Converted.Of(0m));
                 return new CategoryNode(
                     c.Id, c.Name, c.CategoryKind!, c.ParentId, c.IsActive, c.IsSystem,
-                    count, childCounts.GetValueOrDefault(c.Id), total);
+                    count, childCounts.GetValueOrDefault(c.Id), total.Amount,
+                    total.Unavailable.Count > 0 ? total.Unavailable : null);
             })
             .ToList();
     }
@@ -702,18 +845,27 @@ public sealed class AccountsRepository
     {
         Ok, SourceNotInLedger, TargetNotInLedger, NotCategory, KindMismatch,
         SameCategory, SourceIsSystem,
+        /// <summary>The target sits somewhere beneath the source.</summary>
+        TargetIsDescendant,
+        /// <summary>A month's two budget targets are in different currencies and the rate
+        /// between them is missing (ADR-0114 D9, D12): nothing is written, and
+        /// <see cref="MergeCategoryOutcome.MissingRate"/> names the pair and the day.</summary>
+        RateUnavailable,
     }
 
     /// <summary>Counts moved by a (non-dry-run) merge, for the API / MCP echo.</summary>
-    /// <param name="BudgetTargetsMoved">Stored targets repointed to the destination
-    /// (ADR-0099). Summed where both sides held one for the same month.</param>
-    /// <param name="BudgetTargetsDropped">Targets on the source's children that had
-    /// to go because the destination already held one for that month — D1a allows a
-    /// target on a node or on its descendants, never both, and reparenting the
-    /// children under the destination is what creates the clash.</param>
+    /// <param name="BudgetTargetsMoved">The source's targets the destination kept
+    /// (ADR-0099). Summed into the destination's where both sides held one for the same month.</param>
+    /// <param name="BudgetTargetsDropped">Targets that had to go because a category above them
+    /// already held one for that month — D1a allows a target on a node or on its descendants,
+    /// never both. Whatever sits beneath the destination (the source's children, who arrive
+    /// under it, and its own) loses to the destination's, which now includes what moved onto it;
+    /// and what arrived on the destination sits beneath the destination's ancestors, whose
+    /// targets win.</param>
     public sealed record MergeCategoryOutcome(
         MergeCategoryResult Result, int TransactionsMoved, int ChildrenReparented,
-        int BudgetTargetsMoved = 0, int BudgetTargetsDropped = 0);
+        int BudgetTargetsMoved = 0, int BudgetTargetsDropped = 0,
+        RateUnavailable? MissingRate = null);
 
     /// <summary>
     /// Merge category <paramref name="sourceId"/> into <paramref name="targetId"/>
@@ -721,11 +873,14 @@ public sealed class AccountsRepository
     /// transactions AND recurring-template legs (reminder category postings live on
     /// their template <c>txn_legs</c>) — to the target, reparents the source's child
     /// categories to the target, then <b>deactivates</b> the now-empty source
-    /// (reversible; the row + its history are preserved, not deleted). Both must be
-    /// categories of the same <c>category_kind</c> (income↔income / expense↔expense)
-    /// in the ledger; the source must not be system-managed. Maintained balances for
-    /// both categories are rebuilt. <paramref name="dryRun"/> reports the counts that
-    /// would move without writing. Atomic.
+    /// (the row is kept, not deleted; reactivating it brings back an empty category,
+    /// and nothing moves back). Both must be
+    /// categories in the ledger, of any kind (see below); the source must not be
+    /// system-managed, and the target must not sit beneath the source, because the
+    /// source's children are reparented to the target and the target would end up under
+    /// itself. Maintained balances for both categories are rebuilt.
+    /// <paramref name="dryRun"/> reports the counts that would move without writing.
+    /// Atomic.
     /// </summary>
     public async Task<MergeCategoryOutcome> MergeCategoryAsync(
         Guid ledgerId, Guid sourceId, Guid targetId, bool dryRun,
@@ -754,12 +909,26 @@ public sealed class AccountsRepository
             return new MergeCategoryOutcome(MergeCategoryResult.SourceIsSystem, 0, 0);
         // Kinds MAY differ, deliberately (ADR-0017). This is now the only way to
         // reclassify a category, so refusing a cross-kind merge would leave no way
-        // at all — and the alternative it used to push people towards, flipping the
-        // kind in place, is the strictly worse version of the same rewrite: no
+        // at all — and the alternative, flipping the kind in place, is the
+        // strictly worse version of the same rewrite: no
         // counts, no confirmation, no trail. Here the caller is told how many
         // transactions and children move, and the source is deactivated rather than
         // destroyed. KindMismatch is retained on the enum so an older client that
         // still switches on it keeps compiling; nothing returns it.
+
+        // A target beneath the source: the children are reparented to the target below, so a
+        // child that is (or contains) the target would be put under itself, and the tree would
+        // have a loop no read can walk out of. Refused before anything is counted or written.
+        if ((await DescendantsOfChildrenAsync(ledgerId, sourceId, cancellationToken).ConfigureAwait(false))
+            .Contains(targetId))
+            return new MergeCategoryOutcome(MergeCategoryResult.TargetIsDescendant, 0, 0);
+
+        // A month whose two targets are in different currencies needs the rate between
+        // them (ADR-0114 D12); a missing one refuses the merge before anything is counted
+        // or written, the preview included.
+        if ((await PlanTargetMergeAsync(ledgerId, sourceId, targetId, cancellationToken).ConfigureAwait(false))
+            .Missing is { } missingRate)
+            return new MergeCategoryOutcome(MergeCategoryResult.RateUnavailable, 0, 0, MissingRate: missingRate);
 
         var txnCount = await _db.TxnLegs
             .Where(l => l.LedgerId == ledgerId && l.AccountId == sourceId)
@@ -770,6 +939,18 @@ public sealed class AccountsRepository
 
         if (dryRun)
             return new MergeCategoryOutcome(MergeCategoryResult.Ok, txnCount, childCount);
+
+        // The ledger's write lock first (migration 275), before the source's row lock
+        // below: the merge recomputes balances, and two writers of one ledger take turns.
+        await using var write = await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken)
+            .ConfigureAwait(false);
+
+        // The source is locked before its legs are read (fn_lock_accounts): a leg or a
+        // transaction another request adds to it after the read would otherwise move
+        // below with no recompute of its balances or its stored presentation. One being
+        // added now is waited for and read.
+        _ = await _db.LockAccounts([sourceId]).Select(r => r.Locked)
+            .SingleAsync(cancellationToken).ConfigureAwait(false);
 
         // Capture the affected legs' headers + EFFECTIVE posted_at
         // (COALESCE(override, header) — mig 103) BEFORE the move: the recompute
@@ -793,14 +974,31 @@ public sealed class AccountsRepository
         // collide with a target on the destination (ADR-0099 D1a).
         var movedSubtree = await DescendantsOfChildrenAsync(ledgerId, sourceId, cancellationToken)
             .ConfigureAwait(false);
+        // The same refusal as above, asked again inside the transaction, so a category moved
+        // under the source since that first read is caught before the merge writes. The lock
+        // above is on the source's row; an edit of the tree takes no lock (a reparent has
+        // none), so this narrows the window between two requests and does not close it. The
+        // transaction ends unwritten.
+        if (movedSubtree.Contains(targetId))
+            return new MergeCategoryOutcome(MergeCategoryResult.TargetIsDescendant, 0, 0);
 
-        await using var tx = await _db.Database.BeginTransactionAsync(cancellationToken)
+        // The targets' conversion, read again inside the transaction, before the first
+        // write: a target retyped since the read above is the one converted. A missing rate
+        // ends the transaction unwritten.
+        var targetPlan = await PlanTargetMergeAsync(ledgerId, sourceId, targetId, cancellationToken)
             .ConfigureAwait(false);
+        if (targetPlan.Missing is { } missingNow)
+            return new MergeCategoryOutcome(MergeCategoryResult.RateUnavailable, 0, 0, MissingRate: missingNow);
 
         // Repoint every referencing leg (committed txns + reminder templates) → target.
         await _db.TxnLegs
             .Where(l => l.LedgerId == ledgerId && l.AccountId == sourceId)
             .ExecuteUpdateAsync(s => s.SetProperty(l => l.AccountId, targetId), cancellationToken)
+            .ConfigureAwait(false);
+        // Every transaction the source category owned now has no leg on it, so it
+        // follows its legs to the target (mig 263) — before the source could go.
+        await AnnotationWriter.FollowRepointAsync(
+                _db, ledgerId, sourceId, targetId, headerIds: null, cancellationToken)
             .ConfigureAwait(false);
 
         // Reparent the source's child categories to the target.
@@ -810,9 +1008,9 @@ public sealed class AccountsRepository
             .ConfigureAwait(false);
 
         var (targetsMoved, targetsDropped) = await MergeBudgetTargetsAsync(
-            ledgerId, sourceId, targetId, movedSubtree, cancellationToken).ConfigureAwait(false);
+            ledgerId, sourceId, targetId, movedSubtree, targetPlan.Converted, cancellationToken).ConfigureAwait(false);
 
-        // Deactivate the now-empty source (reversible; preserves the row).
+        // Deactivate the now-empty source (the row is kept; nothing moves back if it is reactivated).
         await _db.Accounts
             .Where(a => a.LedgerId == ledgerId && a.Id == sourceId)
             .ExecuteUpdateAsync(s => s.SetProperty(a => a.IsActive, false), cancellationToken)
@@ -827,8 +1025,12 @@ public sealed class AccountsRepository
         await _recompute.RecomputeAsync(anchors, cancellationToken).ConfigureAwait(false);
         await _recompute.RecomputePostingCountsAsync(
             moved.Select(m => m.HeaderId), cancellationToken).ConfigureAwait(false);
+        // What a moved leg's side, and its posting's other side, show (their account,
+        // and an owner that followed its legs) changed without the change tracker.
+        await LegNotes.RecomputeAsync(
+            _db, moved.Select(m => m.HeaderId).Distinct().ToList(), cancellationToken).ConfigureAwait(false);
 
-        await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
         return new MergeCategoryOutcome(
             MergeCategoryResult.Ok, txnCount, childCount, targetsMoved, targetsDropped);
     }
@@ -918,9 +1120,57 @@ public sealed class AccountsRepository
     /// a new explicit instruction to treat the two categories as one, not as
     /// history drifting on its own.
     /// </remarks>
+    /// <summary>
+    /// For each month both categories hold a target in, the source's amount in the
+    /// destination's currency (ADR-0114 D12): the same rate the Budget screen shows it at,
+    /// the month's last day for a past month, the latest rate for the current month or a
+    /// later one. A month in one currency needs no rate and keeps the amount as typed.
+    /// <see cref="TargetMergePlan.Missing"/> is the first missing rate, by month.
+    /// </summary>
+    private async Task<TargetMergePlan> PlanTargetMergeAsync(
+        Guid ledgerId, Guid sourceId, Guid targetId, CancellationToken cancellationToken)
+    {
+        var pairs = await (
+                from s in _db.BudgetTargets.AsNoTracking()
+                join d in _db.BudgetTargets.AsNoTracking()
+                    on new { s.LedgerId, s.TargetMonth } equals new { d.LedgerId, d.TargetMonth }
+                where s.LedgerId == ledgerId && s.CategoryId == sourceId && d.CategoryId == targetId
+                select new { s.Id, s.TargetMonth, s.Amount, From = s.CurrencyCode, To = d.CurrencyCode })
+            .OrderBy(x => x.TargetMonth)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var converted = new Dictionary<Guid, decimal>();
+        if (pairs.Count == 0) return new TargetMergePlan(converted, null);
+
+        // The month the server is in: a merge has no caller's date, and the screen's
+        // current month is the one the latest rate applies to.
+        var today = ScheduledBoundary.Today(null, _clock);
+        var lookup = new ExchangeRateLookup(_db, _clock);
+        var needs = lookup.NewNeeds();
+        RateDay DayOf(DateOnly month) =>
+            month.AddMonths(1) <= today
+                ? RateDay.Of(month.AddMonths(1).AddDays(-1), needs.ServerToday)
+                : RateDay.Latest();
+
+        foreach (var p in pairs) DayOf(p.TargetMonth).Declare(needs, p.From, p.To);
+        var rates = await lookup.LoadAsync(ledgerId, needs, cancellationToken).ConfigureAwait(false);
+        foreach (var p in pairs)
+        {
+            var rate = DayOf(p.TargetMonth).Read(rates, p.From, p.To);
+            if (rate.Unavailable is { } why) return new TargetMergePlan(converted, why);
+            converted[p.Id] = p.Amount * rate.Rate!.Value;
+        }
+        return new TargetMergePlan(converted, null);
+    }
+
+    /// <summary>The source targets' amounts in their destination's currency, by source
+    /// target id, at full precision; or the missing rate that refuses the merge.</summary>
+    private sealed record TargetMergePlan(IReadOnlyDictionary<Guid, decimal> Converted, RateUnavailable? Missing);
+
     private async Task<(int Moved, int Dropped)> MergeBudgetTargetsAsync(
         Guid ledgerId, Guid sourceId, Guid targetId,
-        IReadOnlySet<Guid> arrivingSubtree, CancellationToken cancellationToken)
+        IReadOnlySet<Guid> arrivingSubtree, IReadOnlyDictionary<Guid, decimal> convertedSource,
+        CancellationToken cancellationToken)
     {
         var sourceTargets = await _db.BudgetTargets
             .Where(t => t.LedgerId == ledgerId && t.CategoryId == sourceId)
@@ -936,7 +1186,15 @@ public sealed class AccountsRepository
         {
             if (destByMonth.TryGetValue(src.TargetMonth, out var dest))
             {
-                dest.Amount += src.Amount;
+                // Summed in the destination's currency, which it keeps (ADR-0114 D12): the
+                // source converted at full precision and rounded once, at the destination
+                // currency's places, half away from zero (ADR-0114 D15), then added. The
+                // stored destination figure is added as it is, never re-rounded, so a
+                // stored figure that does not fit its currency is kept as it was. One
+                // currency is the plain sum it always was.
+                dest.Amount = dest.CurrencyCode == src.CurrencyCode
+                    ? dest.Amount + src.Amount
+                    : dest.Amount + CurrencyMinorUnits.RoundAwayFromZero(convertedSource[src.Id], dest.CurrencyCode);
                 dest.UpdatedAt = now;
                 _db.BudgetTargets.Remove(src);
             }
@@ -948,26 +1206,88 @@ public sealed class AccountsRepository
             }
         }
 
-        // The destination now speaks for the arriving children, so any target they
-        // hold in a month the destination also covers is a D1a violation the merge
-        // itself created. The ancestor wins, matching the bulk-fill rule; the count
-        // comes back so the caller can say so rather than lose it silently.
-        var dropped = 0;
-        if (arrivingSubtree.Count > 0 && destByMonth.Count > 0)
+        // What the loop moved is the destination's now, which the reads below must see.
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+
+        // The destination speaks for everything beneath it, so a target held beneath it in a month
+        // it now covers is a D1a violation the merge itself created. That is the source's children
+        // (reparented under it already), and equally a sub-category the destination had before,
+        // now that a target has arrived on the destination for that month. The ancestor wins,
+        // matching the bulk-fill rule; the count comes back so the caller can say so rather than
+        // lose it silently.
+        var doomed = new HashSet<BudgetTargetRow>();
+        if (destByMonth.Count > 0)
         {
-            var months = destByMonth.Keys.ToList();
-            var ids = arrivingSubtree.ToList();
-            var clashes = await _db.BudgetTargets
-                .Where(t => t.LedgerId == ledgerId
-                            && ids.Contains(t.CategoryId)
-                            && months.Contains(t.TargetMonth))
-                .ToListAsync(cancellationToken).ConfigureAwait(false);
-            _db.BudgetTargets.RemoveRange(clashes);
-            dropped = clashes.Count;
+            var beneath = await CategoryTree
+                .DescendantsAsync(_db, ledgerId, targetId, includeRoot: false, cancellationToken)
+                .ConfigureAwait(false);
+            if (beneath.Count > 0)
+            {
+                var months = destByMonth.Keys.ToList();
+                var ids = beneath.ToList();
+                doomed.UnionWith(await _db.BudgetTargets
+                    .Where(t => t.LedgerId == ledgerId
+                                && ids.Contains(t.CategoryId)
+                                && months.Contains(t.TargetMonth))
+                    .ToListAsync(cancellationToken).ConfigureAwait(false));
+            }
         }
 
+        // The same rule upward. A category above the destination speaks for it, so a target
+        // that arrived on the destination, or on what arrived beneath it, in a month one of
+        // those ancestors already holds would sit under another for that month. The
+        // destination's own targets from before the merge cannot clash with its ancestors', or
+        // they could not have been set, so what is dropped here is what the merge brought.
+        var above = await CategoriesAboveAsync(ledgerId, targetId, includeSelf: false, cancellationToken)
+            .ConfigureAwait(false);
+        if (above.Count > 0)
+        {
+            var aboveIds = above.ToList();
+            var ancestorMonths = await _db.BudgetTargets.AsNoTracking()
+                .Where(t => t.LedgerId == ledgerId && aboveIds.Contains(t.CategoryId))
+                .Select(t => t.TargetMonth)
+                .Distinct()
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            if (ancestorMonths.Count > 0)
+            {
+                var arrived = arrivingSubtree.Append(targetId).ToList();
+                doomed.UnionWith(await _db.BudgetTargets
+                    .Where(t => t.LedgerId == ledgerId
+                                && arrived.Contains(t.CategoryId)
+                                && ancestorMonths.Contains(t.TargetMonth))
+                    .ToListAsync(cancellationToken).ConfigureAwait(false));
+            }
+        }
+
+        _db.BudgetTargets.RemoveRange(doomed);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        return (sourceTargets.Count, dropped);
+        // Moved is what the destination kept of the source's targets: one that was summed into
+        // the destination's counts, and one that arrived and was then dropped does not.
+        return (sourceTargets.Count(s => !doomed.Contains(s)), doomed.Count);
+    }
+
+    /// <summary>
+    /// The categories above <paramref name="categoryId"/>, nearest first, and the category
+    /// itself when <paramref name="includeSelf"/>. Category trees are shallow; the walk is
+    /// bounded defensively and stops at a node it has seen.
+    /// </summary>
+    private async Task<HashSet<Guid>> CategoriesAboveAsync(
+        Guid ledgerId, Guid categoryId, bool includeSelf, CancellationToken cancellationToken)
+    {
+        var tree = await _db.Accounts.AsNoTracking()
+            .Where(a => a.LedgerId == ledgerId && a.AccountType == "category")
+            .Select(a => new { a.Id, a.ParentId })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var parentOf = tree.ToDictionary(t => t.Id, t => t.ParentId);
+
+        var above = new HashSet<Guid>();
+        Guid? cursor = includeSelf ? categoryId : parentOf.GetValueOrDefault(categoryId);
+        while (cursor is Guid node && above.Count < 64)
+        {
+            if (!above.Add(node)) break;
+            cursor = parentOf.TryGetValue(node, out var p) ? p : null;
+        }
+        return above;
     }
 
     /// <summary>
@@ -977,20 +1297,9 @@ public sealed class AccountsRepository
     private async Task<bool> ReparentWouldClashAsync(
         Guid ledgerId, Guid categoryId, Guid newParentId, CancellationToken cancellationToken)
     {
-        var tree = await _db.Accounts.AsNoTracking()
-            .Where(a => a.LedgerId == ledgerId && a.AccountType == "category")
-            .Select(a => new { a.Id, a.ParentId })
-            .ToListAsync(cancellationToken).ConfigureAwait(false);
-        var parentOf = tree.ToDictionary(t => t.Id, t => t.ParentId);
-
         // The destination chain: the new parent and everything above it.
-        var above = new HashSet<Guid>();
-        Guid? cursor = newParentId;
-        while (cursor is Guid node && above.Count < 64)
-        {
-            if (!above.Add(node)) break;
-            cursor = parentOf.TryGetValue(node, out var p) ? p : null;
-        }
+        var above = await CategoriesAboveAsync(ledgerId, newParentId, includeSelf: true, cancellationToken)
+            .ConfigureAwait(false);
 
         // The moving tree: the node and everything under it.
         var below = await DescendantsOfChildrenAsync(ledgerId, categoryId, cancellationToken)
@@ -1090,9 +1399,20 @@ public sealed class AccountsRepository
     {
         None, NameRequired, TypeInvalid, CategoryKindInvalid, CurrencyInvalid, ParentInvalid,
         OpeningBalanceInvalid, LoanTermsRequired, LoanTermsInvalid, LoanTermsNotAllowed,
+        /// <summary>A category named a currency other than the ledger's reporting one.</summary>
+        CategoryCurrencyNotReporting,
+        /// <summary>A typed money figure (the opening balance or a loan term) carries more
+        /// places than the account's currency allows (ADR-0114 D15); the outcome's
+        /// <see cref="CreateAccountOutcome.Unfit"/> names it.</summary>
+        AmountPlacesExceedCurrency,
     }
 
-    public sealed record CreateAccountOutcome(CreateAccountFailure Failure, AccountSummary? Account);
+    /// <summary>A typed money figure of an account write that does not fit its currency
+    /// (ADR-0114 D15): the request field's wire name, and the currency it is checked at.</summary>
+    public readonly record struct UnfitTypedAmount(string Field, string CurrencyCode);
+
+    public sealed record CreateAccountOutcome(
+        CreateAccountFailure Failure, AccountSummary? Account, UnfitTypedAmount? Unfit = null);
 
     /// <summary>
     /// Create an account of any type (ADR-0050). Enforces the ADR-0017
@@ -1128,9 +1448,31 @@ public sealed class AccountsRepository
             return new(CreateAccountFailure.CategoryKindInvalid, null);
         }
 
-        var currency = string.IsNullOrWhiteSpace(request.CurrencyCode)
-            ? "USD" : request.CurrencyCode.Trim().ToUpperInvariant();
-        if (currency.Length != 3) return new(CreateAccountFailure.CurrencyInvalid, null);
+        // The stored form is CurrencyCodes' (prices share it); blank is USD. A real
+        // account's code must also be one an account can take (ADR-0114 D15): an ISO 4217
+        // currency with at most 3 places. That second check is made here, at the account
+        // writer, and not in CurrencyCodes, which a price or quote currency also passes
+        // through and which this rule does not cover. A category keeps its own rule below.
+        var currency = "USD";
+        if (!string.IsNullOrWhiteSpace(request.CurrencyCode)
+            && !CurrencyCodes.TryNormalize(request.CurrencyCode, out currency))
+        {
+            return new(CreateAccountFailure.CurrencyInvalid, null);
+        }
+        if (!isCategory && !CurrencyMinorUnits.IsAcceptedAccountCurrency(currency))
+            return new(CreateAccountFailure.CurrencyInvalid, null);
+        // A category has no currency of its own (ADR-0109 D9): its lines carry the paying
+        // account's. Its row takes the ledger's reporting currency, so it never reads as
+        // foreign, and a request that names another is refused rather than stored.
+        if (isCategory)
+        {
+            var reporting = await DisplayCurrency.ForLedgerAsync(_db, ledgerId, cancellationToken)
+                .ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(request.CurrencyCode)
+                && !string.Equals(currency, reporting, StringComparison.Ordinal))
+                return new(CreateAccountFailure.CategoryCurrencyNotReporting, null);
+            currency = reporting;
+        }
 
         // Only a category may have a parent, and it must itself be a category here.
         Guid? parentId = null;
@@ -1169,6 +1511,11 @@ public sealed class AccountsRepository
         {
             return new(CreateAccountFailure.LoanTermsNotAllowed, null);
         }
+
+        // Every typed money figure is at the account currency's places (ADR-0114 D15).
+        if (FirstUnfitMoney(currency, openingBalance, null, type == "loan" ? request.LoanTerms : null, null)
+            is { } unfit)
+            return new(CreateAccountFailure.AmountPlacesExceedCurrency, null, unfit);
 
         var accountId = Guid.NewGuid();
         Guid? holdingsSiblingId = null;
@@ -1253,6 +1600,42 @@ public sealed class AccountsRepository
         && t.PaymentsPerYear > 0
         && (t.PaymentIsComputed || (t.FixedPayment is { } fp && fp > 0m));
 
+    /// <summary>
+    /// The first typed money figure of an account write that carries more places than
+    /// <paramref name="currencyCode"/> allows, or null when every one fits (ADR-0114 D15):
+    /// the opening balance, then the loan's principal, escrow and fixed payment, all in the
+    /// account's currency (escrow takes the loan's, whatever the escrow account's). A figure
+    /// equal to its stored value passes even when it does not fit, because stored amounts
+    /// that do not fit are kept and an edit that leaves one as it was is not refused for it.
+    /// A fixed payment is checked only when it is used, since a computed payment ignores it.
+    /// </summary>
+    /// <param name="currencyCode">The currency the write leaves the account in.</param>
+    /// <param name="openingBalance">The opening balance the write sends, or null when it
+    /// sends none.</param>
+    /// <param name="storedOpening">The stored opening balance, on an edit.</param>
+    /// <param name="terms">The loan terms the write sends, or null.</param>
+    /// <param name="storedTerms">The stored loan terms, on an edit of a loan that has
+    /// them.</param>
+    private static UnfitTypedAmount? FirstUnfitMoney(
+        string currencyCode, decimal? openingBalance, decimal? storedOpening,
+        LoanTermsDto? terms, LoanTermsRow? storedTerms)
+    {
+        bool Unfit(decimal value, decimal? stored) =>
+            !(stored is { } s && value == s) && !CurrencyMinorUnits.Fits(value, currencyCode);
+
+        if (openingBalance is { } ob && Unfit(ob, storedOpening))
+            return new UnfitTypedAmount("openingBalance", currencyCode);
+        if (terms is null) return null;
+        if (Unfit(terms.OriginalPrincipal, storedTerms?.OriginalPrincipal))
+            return new UnfitTypedAmount("loanTerms.originalPrincipal", currencyCode);
+        if (Unfit(terms.EscrowAmount, storedTerms?.EscrowAmount))
+            return new UnfitTypedAmount("loanTerms.escrowAmount", currencyCode);
+        if (!terms.PaymentIsComputed && terms.FixedPayment is { } fixedPayment
+            && Unfit(fixedPayment, storedTerms?.FixedPayment))
+            return new UnfitTypedAmount("loanTerms.fixedPayment", currencyCode);
+        return null;
+    }
+
     /// <summary>The interest / escrow target accounts (when set) must belong to
     /// this ledger — the DB composite FK enforces it too, but this returns a
     /// clean 422 instead of a constraint violation.</summary>
@@ -1295,6 +1678,30 @@ public sealed class AccountsRepository
         OpeningBalanceInvalid, LoanTermsInvalid, LoanTermsNotAllowed, TaxStatusInvalid,
         /// <summary>The request tried to CHANGE the kind of an existing category.</summary>
         CategoryKindImmutable,
+        /// <summary>A category named a currency other than the ledger's reporting one.</summary>
+        CategoryCurrencyNotReporting,
+        /// <summary>A typed money figure (the opening balance or a loan term) carries more
+        /// places than the currency the edit leaves the account in allows (ADR-0114 D15);
+        /// the outcome's <see cref="UpdateAccountOutcome.Unfit"/> names it.</summary>
+        AmountPlacesExceedCurrency,
+        /// <summary>A currency change cannot relabel the account's stored figures
+        /// (ADR-0114 D13, D15); the outcome's <see cref="UpdateAccountOutcome.Relabel"/>
+        /// says why.</summary>
+        RelabelRefused,
+    }
+
+    /// <summary>What an account edit did, or why it was refused: <see cref="Result"/>; for
+    /// <see cref="UpdateAccountResult.AmountPlacesExceedCurrency"/> the figure that does
+    /// not fit; for <see cref="UpdateAccountResult.RelabelRefused"/> the relabel's verdict;
+    /// and on <see cref="UpdateAccountResult.Ok"/> how many mirrored pairs a currency
+    /// change left across currencies (ADR-0114 D13).</summary>
+    public sealed record UpdateAccountOutcome(
+        UpdateAccountResult Result,
+        UnfitTypedAmount? Unfit = null,
+        RelabelCheck.Verdict? Relabel = null,
+        int BecameTwoAmount = 0)
+    {
+        public static implicit operator UpdateAccountOutcome(UpdateAccountResult result) => new(result);
     }
 
     /// <summary>
@@ -1305,10 +1712,21 @@ public sealed class AccountsRepository
     /// <c>ExecuteUpdateAsync</c> (no tracked mutation — the row type is
     /// init-only, matching <see cref="SetIsActiveAsync"/>).
     /// </summary>
-    public async Task<UpdateAccountResult> UpdateAsync(
+    public async Task<UpdateAccountOutcome> UpdateAsync(
         Guid ledgerId, Guid accountId, UpdateAccountRequest request, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+
+        // The ledger's write lock first (migration 275), before the account is read and
+        // whatever the edit names: an opening balance recomputes the account's balances, a
+        // currency re-derives trade prices under row locks a trade's save also takes, and
+        // every edit writes the account's row, which a trade's save in flight may hold. Two
+        // writers of one ledger take turns, so none of them waits on another's rows, and the
+        // row is read after any earlier edit of it has committed: every field the edit does
+        // not name is written back as that edit left it (the active flag, which has a writer
+        // that takes no such lock, is not written back at all; below).
+        await using var write = await _db.BeginLedgerWriteAsync(ledgerId, cancellationToken)
+            .ConfigureAwait(false);
 
         var cur = await _db.Accounts.AsNoTracking()
             .Where(a => a.Id == accountId && a.LedgerId == ledgerId)
@@ -1316,7 +1734,7 @@ public sealed class AccountsRepository
             {
                 a.Name, a.AccountType, a.CategoryKind, a.CurrencyCode, a.InstitutionName,
                 a.AccountNumber, a.RoutingNumber, a.AccountUrl, a.Notes, a.IsActive, a.IsSystem,
-                a.OpeningBalance, a.OpenedOn, a.TaxStatus,
+                a.OpeningBalance, a.OpenedOn, a.TaxStatus, a.HoldingsAccountId,
             })
             .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
         if (cur is null) return UpdateAccountResult.NotInLedger;
@@ -1349,8 +1767,24 @@ public sealed class AccountsRepository
         var currency = cur.CurrencyCode;
         if (request.CurrencyCode is not null)
         {
-            var c = request.CurrencyCode.Trim().ToUpperInvariant();
-            if (c.Length != 3) return UpdateAccountResult.CurrencyInvalid;
+            // CurrencyCodes is the stored form; unlike create, a blank here is invalid, not USD.
+            if (!CurrencyCodes.TryNormalize(request.CurrencyCode, out var c))
+                return UpdateAccountResult.CurrencyInvalid;
+            // A real account's new code must be one an account can take (ADR-0114 D15). Only
+            // a change is refused: resending the stored code is not one, so a code stored
+            // before the rule keeps working, at 2 places. A category keeps its own rule.
+            if (cur.AccountType != "category"
+                && !string.Equals(c, cur.CurrencyCode, StringComparison.Ordinal)
+                && !CurrencyMinorUnits.IsAcceptedAccountCurrency(c))
+                return UpdateAccountResult.CurrencyInvalid;
+            // A category has no currency of its own (ADR-0109 D9): only the ledger's
+            // reporting currency is accepted for one, never another.
+            if (cur.AccountType == "category"
+                && !string.Equals(
+                    c,
+                    await DisplayCurrency.ForLedgerAsync(_db, ledgerId, cancellationToken).ConfigureAwait(false),
+                    StringComparison.Ordinal))
+                return UpdateAccountResult.CategoryCurrencyNotReporting;
             currency = c;
         }
 
@@ -1365,15 +1799,11 @@ public sealed class AccountsRepository
             // A category's kind is IMMUTABLE (ADR-0017). Changing it does not edit a
             // label: it retroactively moves every posting in that category between
             // the Spending and Income measures — silently, with no record, and for
-            // history going back as far as the ledger does. Until now this was the
-            // one unguarded path to that, reachable by touching a dropdown, while
-            // the SAFE route (merge into a category of the wanted kind) was the one
-            // the code refused.
+            // history going back as far as the ledger does. An editable kind would
+            // make that reachable by touching a dropdown.
             //
-            // Reclassification now has exactly one mechanism, and it is the one that
-            // already existed: create a category of the wanted kind, merge this one
-            // into it, and the merge states what moves and can be undone by
-            // reactivating the source.
+            // Reclassification has exactly one mechanism: create a category of the
+            // wanted kind, merge this one into it, and the merge states what moves.
             //
             // Equal is not a change. The account editor sends this field on every
             // save, so refusing a no-op would make a category impossible to rename.
@@ -1423,24 +1853,103 @@ public sealed class AccountsRepository
                 return UpdateAccountResult.LoanTermsInvalid;
         }
 
-        await using var tx = await _db.Database
-            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        // Every typed money figure is at the places of the currency the edit leaves the
+        // account in (ADR-0114 D15), and one resent equal to its stored value passes. A
+        // stored figure the edit does not send is the relabel's to judge, not this check's.
+        var storedTerms = request.LoanTerms is null
+            ? null
+            : await _db.LoanTerms.AsNoTracking()
+                .FirstOrDefaultAsync(t => t.LedgerId == ledgerId && t.AccountId == accountId, cancellationToken)
+                .ConfigureAwait(false);
+        if (FirstUnfitMoney(currency, request.OpeningBalance, cur.OpeningBalance, request.LoanTerms, storedTerms)
+            is { } unfit)
+            return new UpdateAccountOutcome(UpdateAccountResult.AmountPlacesExceedCurrency, unfit);
+
+        // A change of a real account's currency relabels (ADR-0114 D13, D15): every stored
+        // figure on it and on its Holdings sibling is kept and reads in the new currency,
+        // judged before anything is written. A category's line beside a real line takes the
+        // real side's currency, so a category's own code changes only the lines of its
+        // postings between categories, which read in that code: those are judged for places,
+        // and a category has no opening balance or loan terms to name.
+        var becameTwoAmount = 0;
+        if (cur.AccountType == "category" && !string.Equals(currency, cur.CurrencyCode, StringComparison.Ordinal))
+        {
+            var relabel = await RelabelCheck.JudgeAsync(
+                    _db, ledgerId, [new RelabelCheck.Relabel(accountId, cur.CurrencyCode, currency)],
+                    null, currency, [], cancellationToken)
+                .ConfigureAwait(false);
+            if (relabel.Refused)
+                return new UpdateAccountOutcome(UpdateAccountResult.RelabelRefused, Relabel: relabel);
+        }
+        else if (!string.Equals(currency, cur.CurrencyCode, StringComparison.Ordinal))
+        {
+            var relabel = await JudgeCurrencyRelabelAsync(
+                    ledgerId, accountId, cur.CurrencyCode, currency, cur.HoldingsAccountId, openingBalance,
+                    cur.AccountType == "loan", request.LoanTerms, storedTerms,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (relabel.Refused)
+                return new UpdateAccountOutcome(UpdateAccountResult.RelabelRefused, Relabel: relabel);
+            becameTwoAmount = relabel.BecameTwoAmount;
+        }
+
+        // A change of currency changes the currency of every trade price whose trade this
+        // account made (ADR-0084 D2, 2026-11-04 amendment, migration 274). Before its row
+        // is written it takes the trade-price lock order's first step (TradePriceLocks):
+        // FOR NO KEY UPDATE, in id order, on this account, the brokerages naming its
+        // holdings account, and every account whose currency the rule reads for the days
+        // its trades are on, so a re-derivation in flight on those days is waited for, and
+        // one that starts later waits for this edit; a trade-price repair or another
+        // brokerage's edit over the same days takes the same accounts in the same order.
+        // The days are read again after the lock, so a trade committed while it waited is
+        // among them.
+        //
+        // Only this branch writes the currency: an edit whose code equals the one it read
+        // leaves the column as it is, and one whose code differs takes the lock and
+        // re-derives below. Every writer of an account's currency takes the ledger write
+        // lock, which this edit took before it read `cur`, so the code read is the one
+        // committed.
+        var currencyChanges = currency != cur.CurrencyCode;
+        List<(Guid LedgerId, Guid SecurityId, DateOnly Day)> tradeDays = [];
+        if (currencyChanges)
+        {
+            List<Guid> brokerages = cur.HoldingsAccountId is { } holdings
+                ? await _db.Accounts.AsNoTracking()
+                    .Where(a => a.LedgerId == ledgerId && a.HoldingsAccountId == holdings)
+                    .Select(a => a.Id)
+                    .ToListAsync(cancellationToken).ConfigureAwait(false)
+                : [];
+            brokerages.Add(accountId);
+            tradeDays = await TradePriceLocks.LockThenReadAsync(
+                    _db, ledgerId,
+                    read: ct => TradeDaysAsync(ledgerId, accountId, cur.HoldingsAccountId, ct),
+                    days: found => found.Select(d => (d.SecurityId, d.Day)),
+                    accounts: _ => brokerages,
+                    forWrite: true,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
 
         await _db.Accounts
             .Where(a => a.Id == accountId && a.LedgerId == ledgerId)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(a => a.Name, name)
-                .SetProperty(a => a.CurrencyCode, currency)
-                .SetProperty(a => a.InstitutionName, institution)
-                .SetProperty(a => a.AccountNumber, accountNumber)
-                .SetProperty(a => a.RoutingNumber, routingNumber)
-                .SetProperty(a => a.AccountUrl, accountUrl)
-                .SetProperty(a => a.Notes, notes)
-                .SetProperty(a => a.CategoryKind, categoryKind)
-                .SetProperty(a => a.IsActive, isActive)
-                .SetProperty(a => a.OpeningBalance, openingBalance)
-                .SetProperty(a => a.OpenedOn, openedOn)
-                .SetProperty(a => a.TaxStatus, taxStatus),
+            .ExecuteUpdateAsync(s =>
+                {
+                    s.SetProperty(a => a.Name, name)
+                        .SetProperty(a => a.InstitutionName, institution)
+                        .SetProperty(a => a.AccountNumber, accountNumber)
+                        .SetProperty(a => a.RoutingNumber, routingNumber)
+                        .SetProperty(a => a.AccountUrl, accountUrl)
+                        .SetProperty(a => a.Notes, notes)
+                        .SetProperty(a => a.CategoryKind, categoryKind)
+                        .SetProperty(a => a.OpeningBalance, openingBalance)
+                        .SetProperty(a => a.OpenedOn, openedOn)
+                        .SetProperty(a => a.TaxStatus, taxStatus);
+                    if (currencyChanges) s.SetProperty(a => a.CurrencyCode, currency);
+                    // The active flag has a writer of its own that takes no ledger write
+                    // lock (SetIsActiveAsync), so it is written only when the edit names it:
+                    // written back from `cur`, it would undo a flip committed since the read.
+                    if (request.IsActive is not null) s.SetProperty(a => a.IsActive, isActive);
+                },
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -1469,11 +1978,124 @@ public sealed class AccountsRepository
                 cancellationToken).ConfigureAwait(false);
         }
 
+        // A brokerage's holdings account keeps the brokerage's currency (ADR-0019 Rule 4,
+        // 2026-11-04 amendment). It is a system account, which this method refuses to edit,
+        // so the brokerage's edit writes it, in this transaction. Without it the
+        // brokerage's shares would stay in the currency the person replaced, and the
+        // check's holdings_currency projection would report the holdings account, named by
+        // its brokerage, after every such edit. No price reads the holdings account's
+        // currency, so this writes none. It reads the brokerage's code after this edit's
+        // update of the brokerage's row, which no other edit can change until this one
+        // commits: the code this edit wrote, or the one committed when it writes none.
+        if (cur.HoldingsAccountId is { } holdingsAccountId)
+        {
+            await HoldingsAccountCurrency.AlignAsync(_db, ledgerId, holdingsAccountId, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        // The days read under the lock above: every trade whose line sits on this account
+        // or on its holdings account, re-derived in the new currency, in this transaction.
+        // It does so whatever the holdings account held before: a pair that disagreed
+        // already had its prices in this account's currency.
+        if (tradeDays.Count > 0)
+        {
+            await new TradePriceRecomputeService(_db).ReseedAsync(tradeDays, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
         if (request.LoanTerms is { } loanTerms)
             await UpsertLoanTermsAsync(ledgerId, accountId, loanTerms, cancellationToken).ConfigureAwait(false);
 
-        await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
-        return UpdateAccountResult.Ok;
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return new UpdateAccountOutcome(UpdateAccountResult.Ok, BecameTwoAmount: becameTwoAmount);
+    }
+
+    /// <summary>
+    /// The relabel a currency change makes (ADR-0114 D13, D15; ADR-0050 D8): the legs on
+    /// the account, and on its Holdings sibling when the sibling's currency changes with it
+    /// (ADR-0019 Rule 4, <see cref="HoldingsAccountCurrency"/>: the first of its brokerages'
+    /// codes in ordinal order, so a sibling another brokerage keeps in the old code does not
+    /// move), and the account-level figures as the edit leaves them: the opening balance
+    /// and, on a loan, the loan terms (the principal, the escrow and a fixed payment that is
+    /// used). Read under the ledger write lock the edit took, before anything is written.
+    /// </summary>
+    /// <param name="openingBalance">The opening balance as the edit leaves it.</param>
+    /// <param name="isLoan">Whether the account is a loan, the one type with terms.</param>
+    /// <param name="sentTerms">The loan terms the edit sends, or null.</param>
+    /// <param name="storedTerms">The stored loan terms when the edit sends terms (read for
+    /// the typed check), or null, in which case they are read here.</param>
+    private async Task<RelabelCheck.Verdict> JudgeCurrencyRelabelAsync(
+        Guid ledgerId, Guid accountId, string fromCurrency, string toCurrency, Guid? holdingsAccountId,
+        decimal openingBalance, bool isLoan, LoanTermsDto? sentTerms, LoanTermsRow? storedTerms,
+        CancellationToken cancellationToken)
+    {
+        List<RelabelCheck.Relabel> relabels = [new(accountId, fromCurrency, toCurrency)];
+        if (holdingsAccountId is { } holdings)
+        {
+            var stored = await _db.Accounts.AsNoTracking()
+                .Where(a => a.Id == holdings && a.LedgerId == ledgerId)
+                .Select(a => a.CurrencyCode)
+                .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            var brokerages = await _db.Accounts.AsNoTracking()
+                .Where(a => a.LedgerId == ledgerId && a.HoldingsAccountId == holdings)
+                .Select(a => new { a.Id, a.CurrencyCode })
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            var expected = DisplayCurrency.Of(
+                brokerages.Select(b => b.Id == accountId ? toCurrency : b.CurrencyCode)).Code;
+            if (stored is not null) relabels.Add(new(holdings, stored, expected));
+        }
+
+        List<string> figures = [];
+        if (!CurrencyMinorUnits.Fits(openingBalance, toCurrency)) figures.Add(UnfitAmountKinds.OpeningBalance);
+
+        // The terms as the edit leaves them: the ones it sends, or the stored ones.
+        (decimal Principal, decimal Escrow, decimal? Fixed)? terms = null;
+        if (isLoan && sentTerms is not null)
+        {
+            terms = (sentTerms.OriginalPrincipal, sentTerms.EscrowAmount,
+                sentTerms.PaymentIsComputed ? null : sentTerms.FixedPayment);
+        }
+        else if (isLoan)
+        {
+            var row = storedTerms ?? await _db.LoanTerms.AsNoTracking()
+                .FirstOrDefaultAsync(r => r.LedgerId == ledgerId && r.AccountId == accountId, cancellationToken)
+                .ConfigureAwait(false);
+            if (row is not null)
+                terms = (row.OriginalPrincipal, row.EscrowAmount, row.PaymentIsComputed ? null : row.FixedPayment);
+        }
+        if (terms is { } t
+            && (!CurrencyMinorUnits.Fits(t.Principal, toCurrency)
+                || !CurrencyMinorUnits.Fits(t.Escrow, toCurrency)
+                || (t.Fixed is { } fixedPayment && !CurrencyMinorUnits.Fits(fixedPayment, toCurrency))))
+            figures.Add(UnfitAmountKinds.LoanTerms);
+
+        return await RelabelCheck.JudgeAsync(_db, ledgerId, relabels, null, toCurrency, figures, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The (security, UTC day) of every trade line on the account or on its holdings
+    /// account: the days whose trade price takes the account's currency. Trade-shaped
+    /// lines (a priced security line with shares) on a header that is no template, as the
+    /// interceptor reads the lines a change takes off their days; re-deriving a day another
+    /// brokerage's execution prices writes the price and currency the rule already names.
+    /// </summary>
+    private async Task<List<(Guid LedgerId, Guid SecurityId, DateOnly Day)>> TradeDaysAsync(
+        Guid ledgerId, Guid accountId, Guid? holdingsAccountId, CancellationToken cancellationToken)
+    {
+        var lines = await (
+                from l in _db.TxnLegs.AsNoTracking()
+                join h in _db.TxnHeaders.AsNoTracking() on l.HeaderId equals h.Id
+                where l.LedgerId == ledgerId
+                      && (l.AccountId == accountId || l.AccountId == holdingsAccountId)
+                      && !h.IsRecurringTemplate
+                      && l.SecurityId != null
+                      && l.Quantity != null && l.Quantity != 0m
+                      && l.UnitPrice != null && l.UnitPrice > 0m
+                select new { SecurityId = l.SecurityId!.Value, h.PostedAt })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return lines.Select(d => (ledgerId, d.SecurityId, HeaderDates.UtcDay(d.PostedAt))).Distinct().ToList();
     }
 
     /// <summary>Insert or update the loan account's <c>loan_terms</c> row

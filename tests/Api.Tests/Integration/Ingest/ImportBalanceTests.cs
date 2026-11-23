@@ -28,8 +28,8 @@ namespace Coffer.Api.Tests.Integration.Ingest;
 ///   <item><description><b>No double-count on re-ingest</b> — importing /
 ///   syncing the same payload twice leaves the header count AND the balances
 ///   unchanged. The existing ingest tests pin the header-count dedup; this
-///   pins the BALANCE, which had no oracle (the gap the PR #196 audit
-///   flagged).</description></item>
+///   pins the BALANCE, which header-count dedup alone does not
+///   prove.</description></item>
 /// </list>
 ///
 /// <para>Plus one investment-import invariant: an imported investment row
@@ -40,11 +40,12 @@ namespace Coffer.Api.Tests.Integration.Ingest;
 /// oracles, atomic per-test ledger.</para>
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class ImportBalanceTests
+public sealed class ImportBalanceTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ImportBalanceTests(PostgresFixture fixture) => _fixture = fixture;
+    public ImportBalanceTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -74,7 +75,7 @@ public sealed class ImportBalanceTests
     /// column as a reader would see it.</summary>
     private async Task<List<decimal>> BalancesByPostedAtAsync(Guid ledgerId, Guid accountId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.TxnHeaderAccountBalances.AsNoTracking()
             .Where(b => b.AccountId == accountId)
             .Join(
@@ -143,9 +144,9 @@ public sealed class ImportBalanceTests
     [Fact]
     public async Task Ofx_import_accrues_running_balances()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -161,9 +162,9 @@ public sealed class ImportBalanceTests
     [Fact]
     public async Task Ofx_reimport_does_not_double_count_balances()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         for (var i = 0; i < 2; i++)
@@ -213,9 +214,9 @@ public sealed class ImportBalanceTests
     [Fact]
     public async Task Qif_import_accrues_running_balances()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -230,9 +231,9 @@ public sealed class ImportBalanceTests
     [Fact]
     public async Task Qif_reimport_does_not_double_count_balances()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         for (var i = 0; i < 2; i++)
@@ -251,9 +252,9 @@ public sealed class ImportBalanceTests
     [Fact]
     public async Task Investment_import_moves_cash_but_creates_no_holdings()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -267,7 +268,7 @@ public sealed class ImportBalanceTests
 
         // But the import stages share/price into ingest_* fields only — it
         // does NOT open a holding. Holdings materialise on editor resolution.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var holdingsAccountId = brokerage.HoldingsAccountId!.Value;
         var holdings = await db.Holdings.AsNoTracking()
             .CountAsync(h => h.AccountId == holdingsAccountId);
@@ -320,9 +321,9 @@ public sealed class ImportBalanceTests
     private async Task<(ApiFactory Factory, SyntheticLedger Ledger, FeedConnectionSummary Connection, Coffer.Api.Db.Entities.AccountRow Bank, HttpClient Client)>
         ConnectAndMapAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var keys = _fixture.NewLedgerKeyService();
-        await using (var seed = _fixture.NewDbContext())
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var keys = Db.NewLedgerKeyService();
+        await using (var seed = Db.NewDbContext())
         {
             var row = await seed.Ledgers.SingleAsync(l => l.Id == ledger.LedgerId);
             row.WrappedLek = keys.CreateWrappedLek();
@@ -331,7 +332,7 @@ public sealed class ImportBalanceTests
             await seed.SaveChangesAsync();
         }
 
-        var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(SimpleFinBody));
         var client = await AuthedClientAsync(factory, ledger);
 

@@ -47,6 +47,12 @@ public static class BalanceValidator
     {
         ArgumentNullException.ThrowIfNull(export);
 
+        // Each account's MD amounts are at its own currency's decimal places; an
+        // account whose currency cannot be read throws, naming it (the import refuses
+        // such a file before this could run).
+        var currencies = MdCurrencies.From(export);
+        var decimalsByAccount = new Dictionary<string, int>(StringComparer.Ordinal);
+
         // Seed with sbal for every non-category, non-security-sub, non-root account.
         var result = new Dictionary<string, decimal>(StringComparer.Ordinal);
         foreach (var item in export.AllItems)
@@ -59,7 +65,9 @@ public static class BalanceValidator
             // skip them here so the caller doesn't need to second-guess.
             if (acct.TypeCode is "i" or "e") continue;
 
-            result[acct.Id] = AccountMapper.MinorUnitsToDecimal(acct.StartingBalance ?? 0);
+            var decimals = currencies.RequireAccount(acct).Decimals;
+            decimalsByAccount[acct.Id] = decimals;
+            result[acct.Id] = MdAmounts.ToMoney(acct.StartingBalance ?? 0, decimals);
         }
 
         // Apply every txn's flows on top of sbal.
@@ -73,7 +81,7 @@ public static class BalanceValidator
             if (result.ContainsKey(txn.AcctId))
             {
                 var pamtSum = txn.Splits.Sum(s => s.ParentAmount);
-                result[txn.AcctId] += AccountMapper.MinorUnitsToDecimal(pamtSum);
+                result[txn.AcctId] += MdAmounts.ToMoney(pamtSum, decimalsByAccount[txn.AcctId]);
             }
 
             // Target side: split_amount on every split whose target is a
@@ -85,7 +93,7 @@ public static class BalanceValidator
             {
                 if (split.AcctId == txn.AcctId) continue;
                 if (!result.ContainsKey(split.AcctId)) continue;
-                result[split.AcctId] += AccountMapper.MinorUnitsToDecimal(split.SplitAmount);
+                result[split.AcctId] += MdAmounts.ToMoney(split.SplitAmount, decimalsByAccount[split.AcctId]);
             }
         }
 

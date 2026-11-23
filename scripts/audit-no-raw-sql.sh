@@ -3,12 +3,10 @@
 # with an APPROVED-RAW-SQL-EXCEPTION comment within the preceding
 # few lines.
 #
-# The policy is docs/decisions/0005-dapper-and-efcore.md (as realigned
-# in PR 3.6.5): the API data-access layer goes through LINQ + EF;
-# complex SQL lives in Postgres functions/views declared in
-# db/migrations/ and is bound via HasDbFunction. Operational notes —
-# what this script does and does NOT cover — are in the memory entry
-# `feedback_no_raw_sql_in_api`.
+# The policy is docs/decisions/0005-dapper-and-efcore.md: the API
+# data-access layer goes through LINQ + EF; complex SQL lives in
+# Postgres functions/views declared in db/migrations/ and is bound via
+# HasDbFunction. What this script does and does NOT cover is below.
 #
 # SCOPE, so a green run isn't over-read: src/Api ONLY.
 #   * src/Importer.Moneydance is deliberately Dapper (ADR-0005:
@@ -21,20 +19,20 @@
 # (tagged) or (b) violations. Resolve (b) by moving the SQL into a
 # Postgres function, or — when the code must run BEFORE migrations,
 # where no migration-created function can exist yet — by using plain
-# EF with a narrow catch. Tagging a new exception instead requires
-# explicit sign-off from the repo owner; the bar is high (exactly one
-# exists today, the RLS session interceptor).
+# EF with a narrow catch. Tagging a new exception instead is a reviewed
+# change of its own, with its reason in the tag; the bar is high (exactly
+# one exists, the RLS session interceptor).
 #
 # Usage:
 #   scripts/audit-no-raw-sql.sh          # report + exit 1 on violations
 #
-# Wired into .github/workflows/ci.yml as the `api-no-raw-sql` job.
+# Wired into .github/workflows/ci.yml as the `api-no-raw-sql-audit` job.
 
 set -euo pipefail
 
-# Run from the repo root whatever the caller's cwd is. This previously used a
-# bare relative 'src/Api': from any other directory grep failed, the `|| true`
-# below swallowed the failure, and the audit printed OK having scanned nothing.
+# Run from the repo root whatever the caller's cwd is. With a bare relative
+# 'src/Api', grep fails from any other directory, the `|| true` below swallows
+# the failure, and the audit prints OK having scanned nothing.
 cd "$(dirname "$0")/.."
 
 AUDIT_ROOT='src/Api'
@@ -43,9 +41,17 @@ WINDOW=20  # lines of context before the match to scan for the approval token
 
 # The escapes this audit looks for, each paired with a line it MUST match. The
 # pairing is the point: the joined regex below is the entire job of this script,
-# so a pattern that quietly stops matching turns every future run green. That is
-# not hypothetical — check-no-identity.sh carried a pattern with an invisible
-# 0x08 byte and was dead for its whole life.
+# so a pattern that quietly stops matching turns every future run green — one
+# invisible control byte in a pattern is enough.
+#
+# EF Core's interpolated forms take SQL text as surely as the Raw ones do — the
+# parameters are bound, the statement is still hand-written — so they are
+# escapes too: FromSql, Database.SqlQuery<T>, ExecuteSql and ExecuteSqlAsync.
+#
+# So do ADO.NET's other doors: a command made with its text in one call
+# (NpgsqlDataSource.CreateCommand("…"), so CreateCommand with any arguments), a
+# batch and its commands (NpgsqlBatch, NpgsqlBatchCommand), and the text set on a
+# command however it was obtained (CommandText).
 RAW_SQL_PATTERNS=(
     'FromSqlRaw'
     'SqlQueryRaw'
@@ -53,8 +59,14 @@ RAW_SQL_PATTERNS=(
     'ExecuteSqlInterpolated'
     'FromSqlInterpolated'
     'NpgsqlCommand'
-    'CreateCommand\(\)'
+    'CreateCommand\('
     'using Dapper'
+    'FromSql\('
+    'SqlQuery<'
+    'ExecuteSql\('
+    'ExecuteSqlAsync\('
+    'NpgsqlBatch'
+    'CommandText'
 )
 RAW_SQL_PROBES=(
     'var rows = db.Things.FromSqlRaw("select 1");'
@@ -63,8 +75,14 @@ RAW_SQL_PROBES=(
     'await db.Database.ExecuteSqlInterpolated($"update t set c = {v}");'
     'var rows = db.Things.FromSqlInterpolated($"select {v}");'
     'await using var cmd = (NpgsqlCommand)conn.CreateCommand();'
-    'var cmd = conn.CreateCommand();'
+    'await using var cmd = dataSource.CreateCommand("delete from things");'
     'using Dapper;'
+    'var rows = db.Things.FromSql($"select * from things where id = {id}");'
+    'var ids = await db.Database.SqlQuery<Guid>($"select id from things").ToListAsync();'
+    'db.Database.ExecuteSql($"update things set c = {v}");'
+    'await db.Database.ExecuteSqlAsync($"update things set c = {v}", ct);'
+    'batch.BatchCommands.Add(new NpgsqlBatchCommand("update things set c = 1"));'
+    'command.CommandText = "update things set c = 1";'
 )
 
 PATTERNS="$(IFS='|'; printf '%s' "${RAW_SQL_PATTERNS[*]}")"
@@ -96,7 +114,8 @@ scan_for_violations() {
         # Scan the window before (and including) the match for the approval
         # token. Tolerate sed exit codes — we only care whether the token
         # appears.
-        if ! sed -n "${start},${line}p" "$file" 2>/dev/null | grep -q "$TOKEN"; then
+        window_text="$(sed -n "${start},${line}p" "$file" 2>/dev/null)" || true
+        if ! grep -q "$TOKEN" <<<"$window_text"; then
             if [[ $violations -eq 0 ]]; then
                 echo "Raw-SQL audit failed ($root/):"
                 echo
@@ -113,9 +132,8 @@ scan_for_violations() {
 # SELF-TEST — prove the audit can still fail, before trusting that it didn't.
 #
 # This is an ABSENCE check: it greps, finds nothing, prints OK. That is
-# indistinguishable from a check that finds nothing because it is BROKEN. This
-# script's own history says so — it used `rg`, which silently false-passed
-# everywhere ripgrep was not installed.
+# indistinguishable from a check that finds nothing because it is BROKEN — a
+# search tool that is not installed, for one, finds nothing and passes.
 #
 # Runs on every invocation, never behind a flag: a self-test you have to
 # remember to run fails the same way as the bug it looks for.
@@ -131,12 +149,12 @@ fi
 # (a) Every pattern must still match its probe, both alone and inside the joined
 # regex the scan actually uses.
 for i in "${!RAW_SQL_PATTERNS[@]}"; do
-    if ! printf '%s\n' "${RAW_SQL_PROBES[$i]}" | grep -qE "${RAW_SQL_PATTERNS[$i]}"; then
+    if ! grep -qE "${RAW_SQL_PATTERNS[$i]}" <<<"${RAW_SQL_PROBES[$i]}"; then
         echo "SELF-TEST FAILED: pattern '${RAW_SQL_PATTERNS[$i]}' no longer matches" >&2
         echo "  its probe: ${RAW_SQL_PROBES[$i]}" >&2
         selftest_fail=1
     fi
-    if ! printf '%s\n' "${RAW_SQL_PROBES[$i]}" | grep -qE "$PATTERNS"; then
+    if ! grep -qE "$PATTERNS" <<<"${RAW_SQL_PROBES[$i]}"; then
         echo "SELF-TEST FAILED: the joined regex misses '${RAW_SQL_PATTERNS[$i]}'." >&2
         echo "  Joining the alternatives corrupted one of them." >&2
         selftest_fail=1
@@ -147,7 +165,7 @@ done
 # which is its own way of not being an audit.
 while IFS= read -r clean_line; do
     [[ -z "$clean_line" ]] && continue
-    if printf '%s\n' "$clean_line" | grep -qE "$PATTERNS"; then
+    if grep -qE "$PATTERNS" <<<"$clean_line"; then
         echo "SELF-TEST FAILED: the audit flags ordinary EF: $clean_line" >&2
         selftest_fail=1
     fi
@@ -155,6 +173,9 @@ done <<'CLEAN_EF'
 var rows = await db.Things.Where(t => t.Id == id).ToListAsync();
 await db.SaveChangesAsync(ct);
 var n = await db.Things.CountAsync(ct);
+await db.Things.Where(t => t.Id == id).ExecuteDeleteAsync(ct);
+await db.Things.Where(t => t.Id == id).ExecuteUpdateAsync(s => s.SetProperty(t => t.C, 1), ct);
+var rows = db.HoldingsAsOfNow(ledgerId, at, null).FromExpression();
 CLEAN_EF
 
 # (c) The approval/window logic must work in BOTH directions. A token that
@@ -163,12 +184,12 @@ CLEAN_EF
 # direction worth proving: the fixtures below include a hit whose token sits
 # outside WINDOW, which MUST still count.
 #
-# THE FIXTURES ARE LITERALS ON PURPOSE. They used to be built from "$TOKEN" and
-# from $(( WINDOW + 5 )), and that made this arm untestable: widen WINDOW and the
-# filler grew with it, so the hit stayed outside the window and the count never
-# changed; rename TOKEN and the fixture renamed too, so it still matched. A
+# THE FIXTURES ARE LITERALS ON PURPOSE. Built from "$TOKEN" and from
+# $(( WINDOW + 5 )), they would make this arm untestable: widen WINDOW and the
+# filler grows with it, so the hit stays outside the window and the count never
+# changes; rename TOKEN and the fixture renames too, so it still matches. A
 # fixture derived from the value it is meant to test cannot detect a change to
-# that value. Both mutations passed this self-test before the literals went in.
+# that value.
 #
 # The cost of pinning them is that changing WINDOW or TOKEN now fails here until
 # this block is updated too — which is the point. Those are policy changes, not
@@ -255,11 +276,11 @@ if [[ "$VIOLATION_COUNT" -gt 0 ]]; then
     echo "      migration-created function can exist yet — use plain EF"
     echo "      with a narrow catch instead;"
     echo "  (c) tag it '$TOKEN' + date + rationale"
-    echo "      within the preceding $WINDOW lines. (c) requires explicit"
-    echo "      sign-off from the repo owner — do not self-approve."
+    echo "      within the preceding $WINDOW lines. (c) is a reviewed change"
+    echo "      of its own, never folded into the change that needs it."
     echo
     echo "Policy: docs/decisions/0005-dapper-and-efcore.md"
-    echo "Scope + operational notes: feedback_no_raw_sql_in_api in project memory."
+    echo "Scope: the header of scripts/audit-no-raw-sql.sh."
     exit 1
 fi
 

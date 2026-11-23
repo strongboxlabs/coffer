@@ -152,7 +152,7 @@ describe('RestoreBackupCard', () => {
         await user.click(screen.getByRole('button', { name: /restore database/i }));
 
         expect(await screen.findByText(/restoring/i)).toBeInTheDocument();
-        // It no longer promises a sign-out. Nothing in a restore revokes
+        // It does not promise a sign-out. Nothing in a restore revokes
         // sessions, so whether one is needed is not knowable at this point —
         // and it says only what it knows.
         expect(screen.getByText(/will say what happened when it is done/i)).toBeInTheDocument();
@@ -307,9 +307,9 @@ describe('RestoreBackupCard', () => {
     //
     // The card and the backups panel are separate components on one screen.
     // They read the SAME cache entry, so a backup created or deleted over
-    // there has to change the picker here. It did not: the panel invalidated
-    // "admin-backups" while this card queried "backups", so the picker showed
-    // whatever was true when the page loaded.
+    // there has to change the picker here. If the panel invalidated one key
+    // while this card queried another, the picker would show whatever was true
+    // when the page loaded.
 
     const aBackup = (id: string) => ({
         id,
@@ -362,12 +362,10 @@ describe('RestoreBackupCard', () => {
 
     // --- the restarting notice says what happened ---------------------------
     //
-    // The first version stated "wait a moment, then sign in" and never changed, so a
-    // restore that had already completed looked identical to one that had hung. A
-    // later one asked /api/auth/me whether your session had survived, because a
-    // restore used to bring every session back — which also handed back access revoked
-    // after the backup. A restore now signs everyone out (FU-076), so the notice says
-    // that, and what each person has to redo.
+    // A static "wait a moment, then sign in" would make a restore that has already
+    // completed look identical to one that has hung. A restore signs everyone out
+    // (FU-076) — bringing sessions back would also hand back access revoked after the
+    // backup — so the notice says that, and what each person has to redo.
 
     it('says the restore completed, that everyone is signed out, and what was reset', async () => {
         vi.spyOn(backupApi, 'restoreBackup').mockResolvedValue(ACCEPTED);
@@ -417,9 +415,9 @@ describe('RestoreBackupCard', () => {
 
     // --- a failed restore is reported as failed -------------------------------
     //
-    // Found on a real install (2026-10-09): the boot-time restore failed — logged,
-    // database untouched — and this page said "Restore complete", because it
-    // took "the server answers again" for success. The outcome is now read back.
+    // A boot-time restore can fail — logged, database untouched — while the
+    // server still comes back, so "the server answers again" is not success. The
+    // outcome is read back instead.
 
     it('reports a failed restore as failed, and that nothing was changed', async () => {
         vi.spyOn(backupApi, 'restoreBackup').mockResolvedValue(ACCEPTED);
@@ -466,7 +464,7 @@ describe('RestoreBackupCard', () => {
 
     it('resumes waiting for a restore after the page is reloaded mid-restore', async () => {
         // A restore of a large backup keeps the server down for minutes; a reload
-        // in that time used to lose the attempt, and with it any way to learn the
+        // in that time must not lose the attempt, and with it any way to learn the
         // outcome.
         sessionStorage.setItem('coffer.pendingRestoreAttempt', 'attempt-9');
         const outcome = vi.spyOn(authApi, 'waitForRestoreOutcome').mockResolvedValue(APPLIED);

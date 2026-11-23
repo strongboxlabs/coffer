@@ -11,25 +11,27 @@ namespace Coffer.Api.Tests.Integration.Notifications;
 /// </summary>
 /// <remarks>
 /// <para>
-/// This is the one part of the change that cannot be tested against the shared fixture,
-/// because the state it acts on no longer exists once every migration has run: the
+/// This is the one part of the change that cannot be tested on the test's own clone of
+/// the template, because the state it acts on no longer exists once every migration has run: the
 /// <c>notification_mode</c> column is gone. So each case builds a database at migration
 /// 213, seeds the pre-upgrade state by hand, and then runs 214 alone.
 /// </para>
 /// <para>
-/// Worth the trouble because this is the highest-risk piece of the whole change. Every
-/// ledger in the field is <c>inherit</c> and almost none have targets of their own;
-/// retiring the mode without moving anything would mute ledger scope on every existing
-/// install — reproducing ADR-0096's founding incident inside the subsystem built to end
-/// it. A green suite against a fresh database would say nothing about that.
+/// Worth the trouble because this is the highest-risk piece of the whole change.
+/// <c>inherit</c> is the column default (migration 208), so it is what a ledger carries
+/// unless someone changed it, and a ledger has targets of its own only if someone added
+/// them; retiring the mode without moving anything would mute ledger scope on every existing
+/// install — the silence ADR-0096 exists to end, reintroduced inside the subsystem built
+/// to end it. A green suite against a fresh database would say nothing about that.
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class LedgerNotificationBackfillTests
+public sealed class LedgerNotificationBackfillTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public LedgerNotificationBackfillTests(PostgresFixture fixture) => _fixture = fixture;
+    public LedgerNotificationBackfillTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private const string Mig214 = "214_ledgers_own_their_notifications.sql";
 
@@ -37,14 +39,12 @@ public sealed class LedgerNotificationBackfillTests
     /// A database migrated to 213 — i.e. an install as it exists in the field today.
     /// </summary>
     /// <remarks>
-    /// The staging and single-migration mechanics this class originally hand-rolled
-    /// now live in <see cref="UpgradeRehearsal"/>, because three more migrations
-    /// need them. Behaviour is unchanged: stage every script that sorts before 214,
-    /// run them, seed, then apply 214 alone.
+    /// Staging and single-migration mechanics live in <see cref="UpgradeRehearsal"/>:
+    /// stage every script that sorts before 214, run them, seed, then apply 214 alone.
     /// </remarks>
     private async Task<string> FreshDatabaseAt213Async(string dbName, string workDir)
     {
-        var connectionString = _fixture.EmptyDatabaseConnectionString(dbName);
+        var connectionString = Db.EmptyDatabaseConnectionString(dbName);
         UpgradeRehearsal.RunStaged(
             connectionString, UpgradeRehearsal.StageBefore(Mig214, workDir));
         await Task.CompletedTask;

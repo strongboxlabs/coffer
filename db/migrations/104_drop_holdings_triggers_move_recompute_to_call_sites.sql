@@ -7,10 +7,10 @@
 -- Mig 102 retired the balance-trigger family in favour of an EF
 -- SaveChangesInterceptor. The holdings/lots trigger family was
 -- intentionally kept then — different recompute surface, narrower
--- trigger set, no observed bugs.
+-- trigger set, no known defect.
 --
--- We're cleaning it up anyway. The same arguments that made balance
--- triggers a continuous source of bugs apply here in latent form:
+-- It goes too. The failure modes of the balance triggers apply here
+-- in latent form:
 --
 --   * AFTER STATEMENT triggers with REFERENCING transition tables
 --     see whatever the statement saw — they don't span an EF
@@ -64,9 +64,9 @@
 --
 -- Unlike mig 102 (which had stale balance rows from the
 -- batch-fire-order bug) and mig 103 (which had inflated balances from
--- ignoring is_hidden), the holdings/lots state is correct as of the
--- last trigger fire — the trigger family never produced observed
--- bugs. Migrations run at API startup, before any new writes; the
+-- ignoring is_hidden), the holdings/lots triggers have no known defect
+-- that leaves stored state wrong, so there is nothing to repair.
+-- Migrations run at API startup, before any new writes; the
 -- interceptor takes over for the next save onward.
 --
 -- C# COMPANION

@@ -18,11 +18,12 @@ namespace Coffer.Importer.Moneydance.Tests.Db;
 /// re-run the migration is written to tolerate.
 /// </summary>
 [Collection(DbCollection.Name)]
-public sealed class AccountOpenedOnBackfillTests
+public sealed class AccountOpenedOnBackfillTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AccountOpenedOnBackfillTests(PostgresFixture fixture) => _fixture = fixture;
+    public AccountOpenedOnBackfillTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static string MigrationSql()
     {
@@ -76,8 +77,7 @@ public sealed class AccountOpenedOnBackfillTests
     [Fact]
     public async Task Backfills_from_the_yyyymmdd_field()
     {
-        await using var connection = _fixture.OpenConnection();
-        await connection.ExecuteAsync("TRUNCATE accounts CASCADE;");
+        await using var connection = Db.OpenConnection();
 
         var id = await SeedAsync(connection, """{"date_created":"20180314"}""");
         await RunBackfillAsync(connection);
@@ -88,10 +88,9 @@ public sealed class AccountOpenedOnBackfillTests
     [Fact]
     public async Task Backfills_from_epoch_millis_when_the_int_field_is_absent()
     {
-        // The common case in a real export: creation_date covers a minority of
-        // accounts, date_created far fewer still.
-        await using var connection = _fixture.OpenConnection();
-        await connection.ExecuteAsync("TRUNCATE accounts CASCADE;");
+        // MD can write creation_date without date_created, so the epoch field
+        // is the only start date such an account carries.
+        await using var connection = Db.OpenConnection();
 
         // 1767286800000 = 2026-01-01T17:00Z — MD's local-noon stamp.
         var id = await SeedAsync(connection, """{"creation_date":"1767286800000"}""");
@@ -103,8 +102,7 @@ public sealed class AccountOpenedOnBackfillTests
     [Fact]
     public async Task Prefers_the_int_field_when_both_are_present()
     {
-        await using var connection = _fixture.OpenConnection();
-        await connection.ExecuteAsync("TRUNCATE accounts CASCADE;");
+        await using var connection = Db.OpenConnection();
 
         var id = await SeedAsync(connection,
             """{"date_created":"20260101","creation_date":"1767286800000"}""");
@@ -127,8 +125,7 @@ public sealed class AccountOpenedOnBackfillTests
     [InlineData("""{}""")]
     public async Task Leaves_null_when_the_payload_has_no_usable_stamp(string payload)
     {
-        await using var connection = _fixture.OpenConnection();
-        await connection.ExecuteAsync("TRUNCATE accounts CASCADE;");
+        await using var connection = Db.OpenConnection();
 
         var id = await SeedAsync(connection, payload);
         await RunBackfillAsync(connection);
@@ -139,8 +136,7 @@ public sealed class AccountOpenedOnBackfillTests
     [Fact]
     public async Task A_malformed_int_field_still_falls_back_to_the_epoch_field()
     {
-        await using var connection = _fixture.OpenConnection();
-        await connection.ExecuteAsync("TRUNCATE accounts CASCADE;");
+        await using var connection = Db.OpenConnection();
 
         var id = await SeedAsync(connection,
             """{"date_created":"20261301","creation_date":"1767286800000"}""");
@@ -154,8 +150,7 @@ public sealed class AccountOpenedOnBackfillTests
     {
         // The editor owns the field (ADR-0050). A backfill that clobbered a
         // user's correction would be unrecoverable — there is no re-import.
-        await using var connection = _fixture.OpenConnection();
-        await connection.ExecuteAsync("TRUNCATE accounts CASCADE;");
+        await using var connection = Db.OpenConnection();
 
         var id = await SeedAsync(connection, """{"date_created":"20180314"}""",
             existingOpenedOn: new DateOnly(2011, 7, 1));
@@ -167,8 +162,7 @@ public sealed class AccountOpenedOnBackfillTests
     [Fact]
     public async Task Skips_categories_and_coffer_native_accounts()
     {
-        await using var connection = _fixture.OpenConnection();
-        await connection.ExecuteAsync("TRUNCATE accounts CASCADE;");
+        await using var connection = Db.OpenConnection();
 
         // A category: its opening balance is forced to 0, so the as-of date of
         // that balance is meaningless even when MD recorded one.
@@ -186,8 +180,7 @@ public sealed class AccountOpenedOnBackfillTests
     [Fact]
     public async Task Is_idempotent()
     {
-        await using var connection = _fixture.OpenConnection();
-        await connection.ExecuteAsync("TRUNCATE accounts CASCADE;");
+        await using var connection = Db.OpenConnection();
 
         var id = await SeedAsync(connection, """{"date_created":"20180314"}""");
         await RunBackfillAsync(connection);

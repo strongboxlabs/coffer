@@ -16,19 +16,20 @@ namespace Coffer.Api.Tests.Integration.Ingest;
 /// then read a file with it.
 /// </summary>
 /// <remarks>
-/// The fixture is SYNTHETIC and mirrors a real department-store card export in shape:
+/// The fixture is SYNTHETIC and follows a card-issuer export shape:
 /// UTF-8 with a BOM, TAB-delimited despite a .csv name, no header row, a currency symbol
 /// in the amount, and amounts signed from the issuer's perspective so a purchase is
 /// positive. Invented merchants and digits throughout.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class CsvIngestTests
+public sealed class CsvIngestTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
+    public CsvIngestTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
-    public CsvIngestTests(PostgresFixture fixture) => _fixture = fixture;
-
-    private const string StoreCardYaml = """
+    private const string CardIssuerYaml = """
         version: 1
         delimiter: tab
         header_rows: 0
@@ -44,7 +45,7 @@ public sealed class CsvIngestTests
         """;
 
     /// <summary>Two purchases and a RETURN, which is negative in the file.</summary>
-    private static string StoreCardFile() =>
+    private static string CardIssuerFile() =>
         "﻿"
         + Row("09/02/2026", "$12.34", "SAMPLE.COM              ANYTOWN      ST")
         + Row("09/03/2026", "$7.99", "SAMPLE STORE            ANYTOWN      ST")
@@ -66,12 +67,13 @@ public sealed class CsvIngestTests
     }
 
     private static MultipartFormDataContent Upload(
-        Guid? accountId = null, Guid? mappingId = null, string? mappingYaml = null)
+        Guid? accountId = null, Guid? mappingId = null, string? mappingYaml = null,
+        string? file = null)
     {
         var content = new MultipartFormDataContent();
-        var body = new ByteArrayContent(Encoding.UTF8.GetBytes(StoreCardFile()));
+        var body = new ByteArrayContent(Encoding.UTF8.GetBytes(file ?? CardIssuerFile()));
         body.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        content.Add(body, "file", "unbilled.csv");
+        content.Add(body, "file", "statement.csv");
         if (accountId is not null)
         {
             content.Add(new StringContent(accountId.Value.ToString()), "accountId");
@@ -102,20 +104,20 @@ public sealed class CsvIngestTests
         // purchase positive because it increases what you owe — and Coffer signs from the
         // account holder's, where a purchase is money out. invert: true is what reconciles
         // them, and it must hold for the RETURN too: negative in the file, money in here.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var card = await ledger.AddBankAccountAsync("Store card");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var card = await ledger.AddBankAccountAsync("Credit card");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var mappingId = await SaveMappingAsync(
-            client, ledger.LedgerId, "Store card statement", StoreCardYaml);
+            client, ledger.LedgerId, "Credit card statement", CardIssuerYaml);
 
         var resp = await client.PostAsync(
             $"/api/ledgers/{ledger.LedgerId}/ingest/csv/import",
             Upload(accountId: card.Id, mappingId: mappingId));
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var headers = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "csv-generic")
             .OrderBy(h => h.PostedAt)
@@ -133,18 +135,51 @@ public sealed class CsvIngestTests
     }
 
     [Fact]
+    public async Task An_imported_rows_memo_is_the_imported_accounts_own()
+    {
+        // A one-split's memo sits on the side that entered it, never the header; an
+        // imported row is entered from the account imported into, which owns it.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var card = await ledger.AddBankAccountAsync("Credit card");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+        var mappingId = await SaveMappingAsync(
+            client, ledger.LedgerId, "Card statement with memo", CardIssuerYaml + "\nmemo:\n  column: 4\n");
+
+        var resp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/csv/import",
+            Upload(accountId: card.Id, mappingId: mappingId));
+        Assert.True(resp.StatusCode == HttpStatusCode.OK, await resp.Content.ReadAsStringAsync());
+
+        await using var db = Db.NewDbContext();
+        var headers = await db.TxnHeaders.AsNoTracking()
+            .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "csv-generic")
+            .ToListAsync();
+        Assert.Equal(3, headers.Count);
+        foreach (var header in headers)
+        {
+            Assert.Null(header.Memo);
+            Assert.Equal(card.Id, header.OriginatingAccountId);
+            var notes = await ledger.LoadNotesAsync(header.Id);
+            Assert.Equal("purchase", notes.Legs.Single(l => l.Key.AccountId == card.Id).Value.Memo);
+            Assert.All(notes.Legs.Where(l => l.Key.AccountId != card.Id), l => Assert.True(l.Value.IsEmpty));
+        }
+        await OriginatingAccountCheck.AssertHoldsAsync(Db, ledger.LedgerId);
+    }
+
+    [Fact]
     public async Task A_draft_mapping_can_preview_a_file_without_ever_being_saved()
     {
         // The iteration path, for the wizard and for an assistant composing YAML from a
         // few sample lines. Requiring a saved mapping first would mean storing half-built
         // rows just to find out the delimiter was wrong.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
             $"/api/ledgers/{ledger.LedgerId}/ingest/csv/preview",
-            Upload(mappingYaml: StoreCardYaml));
+            Upload(mappingYaml: CardIssuerYaml));
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
         var preview = await resp.Content.ReadFromJsonAsync<FileIngestPreviewResponse>();
@@ -152,7 +187,7 @@ public sealed class CsvIngestTests
         Assert.Equal(3, account.TransactionCount);
 
         // Nothing was stored — not the mapping, not the rows.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Empty(await db.FeedCsvMappings.AsNoTracking()
             .Where(m => m.LedgerId == ledger.LedgerId).ToListAsync());
         Assert.Empty(await db.TxnHeaders.AsNoTracking()
@@ -163,8 +198,8 @@ public sealed class CsvIngestTests
     [Fact]
     public async Task An_invalid_document_is_refused_with_every_problem_named()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -174,7 +209,7 @@ public sealed class CsvIngestTests
                 Name = "Broken",
                 // A typo the strict validator must catch: `ammount` would otherwise be
                 // ignored and the amount left unmapped.
-                DefinitionYaml = StoreCardYaml.Replace("amount:", "ammount:", StringComparison.Ordinal),
+                DefinitionYaml = CardIssuerYaml.Replace("amount:", "ammount:", StringComparison.Ordinal),
             });
 
         Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
@@ -183,7 +218,7 @@ public sealed class CsvIngestTests
         Assert.Contains(verdict.Errors, e => e.Path == "ammount");
 
         // And nothing was stored, so an invalid draft leaves no debris.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Empty(await db.FeedCsvMappings.AsNoTracking()
             .Where(m => m.LedgerId == ledger.LedgerId).ToListAsync());
     }
@@ -193,8 +228,8 @@ public sealed class CsvIngestTests
     {
         // An invalid document is a valid question. Returning 422 here would make an
         // iterating client treat a normal step as a failure.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -210,8 +245,8 @@ public sealed class CsvIngestTests
     [Fact]
     public async Task An_upload_must_name_exactly_one_mapping()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Neither.
@@ -222,26 +257,26 @@ public sealed class CsvIngestTests
         // Both — refused rather than silently preferring one, which would mean reading
         // the file with a mapping the caller did not choose.
         var mappingId = await SaveMappingAsync(
-            client, ledger.LedgerId, "Store card statement", StoreCardYaml);
+            client, ledger.LedgerId, "Credit card statement", CardIssuerYaml);
         var both = await client.PostAsync(
             $"/api/ledgers/{ledger.LedgerId}/ingest/csv/preview",
-            Upload(mappingId: mappingId, mappingYaml: StoreCardYaml));
+            Upload(mappingId: mappingId, mappingYaml: CardIssuerYaml));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, both.StatusCode);
     }
 
     [Fact]
     public async Task Two_mappings_on_one_ledger_cannot_share_a_name()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
-        await SaveMappingAsync(client, ledger.LedgerId, "Store card", StoreCardYaml);
+        await SaveMappingAsync(client, ledger.LedgerId, "Credit card", CardIssuerYaml);
 
-        // Case-insensitively: "Store card" and "store CARD" are the same choice in a list.
+        // Case-insensitively: "Credit card" and "credit CARD" are the same choice in a list.
         var clash = await client.PostAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/csv-mappings",
-            new CsvMappingWriteRequest { Name = "store CARD", DefinitionYaml = StoreCardYaml });
+            new CsvMappingWriteRequest { Name = "credit CARD", DefinitionYaml = CardIssuerYaml });
 
         Assert.Equal(HttpStatusCode.UnprocessableEntity, clash.StatusCode);
     }
@@ -252,12 +287,12 @@ public sealed class CsvIngestTests
         // The point of storing YAML text rather than a parsed structure: comments and
         // formatting belong to whoever wrote it, and a document meant to be hand-edited
         // has to survive a round trip through the database unchanged.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
-        var annotated = "# Store card: tab-separated despite the .csv name\n" + StoreCardYaml;
-        var id = await SaveMappingAsync(client, ledger.LedgerId, "Store card", annotated);
+        var annotated = "# Credit card: tab-separated despite the .csv name\n" + CardIssuerYaml;
+        var id = await SaveMappingAsync(client, ledger.LedgerId, "Credit card", annotated);
 
         var fetched = await client.GetFromJsonAsync<CsvMappingDto>(
             $"/api/ledgers/{ledger.LedgerId}/csv-mappings/{id}");
@@ -265,16 +300,133 @@ public sealed class CsvIngestTests
         Assert.Equal(annotated, fetched!.DefinitionYaml);
     }
 
+    // ----- the decimal separator (ADR-0114 D15) -----------------------------------
+
+    /// <summary>
+    /// A version-2 layout for a file that writes decimals after a comma and groups
+    /// thousands with a point, semicolon-delimited as such exports usually are.
+    /// </summary>
+    private const string CommaYaml = """
+        version: 2
+        delimiter: semicolon
+        header_rows: 1
+        date:
+          column: 1
+          format: dd.MM.yyyy
+        payee:
+          column: 2
+        amount:
+          shape: signed
+          column: 3
+          decimal_separator: comma
+        """;
+
+    /// <summary>
+    /// A charge with a comma decimal, a deposit grouped with a point, and a second charge
+    /// whose trailing zero is part of the figure. Synthetic.
+    /// </summary>
+    private const string CommaFile =
+        "Date;Payee;Amount\n"
+        + "02.09.2026;SAMPLE STORE;-12,34\n"
+        + "03.09.2026;SAMPLE.COM;1.234,50\n"
+        + "04.09.2026;SAMPLE STORE;-7,50\n";
+
+    [Fact]
+    public async Task A_comma_layout_is_stored_as_version_2_and_imports_each_amount_with_its_decimals()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var checking = await ledger.AddBankAccountAsync("Checking");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var mappingId = await SaveMappingAsync(client, ledger.LedgerId, "Comma statement", CommaYaml);
+        var stored = await client.GetFromJsonAsync<CsvMappingDto>(
+            $"/api/ledgers/{ledger.LedgerId}/csv-mappings/{mappingId}");
+        Assert.Equal(2, stored!.SchemaVersion);
+
+        var resp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/csv/import",
+            Upload(accountId: checking.Id, mappingId: mappingId, file: CommaFile));
+        Assert.True(resp.StatusCode == HttpStatusCode.OK, await resp.Content.ReadAsStringAsync());
+
+        await using var db = Db.NewDbContext();
+        var headerIds = await db.TxnHeaders.AsNoTracking()
+            .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "csv-generic")
+            .Select(h => h.Id)
+            .ToListAsync();
+        var legs = await db.TxnLegs.AsNoTracking()
+            .Where(l => headerIds.Contains(l.HeaderId) && l.AccountId == checking.Id)
+            .Select(l => l.Amount)
+            .ToListAsync();
+
+        // Read as grouping, each of these would have landed a far larger figure.
+        Assert.Equal(new[] { -12.34m, -7.50m, 1234.50m }, legs.Order().ToArray());
+    }
+
+    [Fact]
+    public async Task A_version_1_layout_is_stored_as_version_1_and_reads_back_with_a_point()
+    {
+        // Stored layouts are re-validated on every use, so version 1 stays accepted, keeps
+        // its stored version, and the guided form reopens it with a point.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var id = await SaveMappingAsync(client, ledger.LedgerId, "Card statement", CardIssuerYaml);
+        var stored = await client.GetFromJsonAsync<CsvMappingDto>(
+            $"/api/ledgers/{ledger.LedgerId}/csv-mappings/{id}");
+        Assert.Equal(1, stored!.SchemaVersion);
+
+        foreach (var (yaml, version, separator) in new[]
+                 {
+                     (CardIssuerYaml, 1, "point"),
+                     (CommaYaml, 2, "comma"),
+                 })
+        {
+            var resp = await client.PostAsJsonAsync(
+                $"/api/ledgers/{ledger.LedgerId}/csv-mappings/validate",
+                new CsvMappingWriteRequest { Name = "n/a", DefinitionYaml = yaml });
+            var verdict = await resp.Content.ReadFromJsonAsync<CsvMappingValidationResponse>();
+            Assert.True(verdict!.Valid);
+            Assert.Equal(version, verdict.Mapping!.Version);
+            Assert.Equal(separator, verdict.Mapping.DecimalSeparator);
+        }
+    }
+
+    [Fact]
+    public async Task A_preview_names_a_cell_that_does_not_read_and_counts_only_the_rows_that_do()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        // A point followed by two digits, in a layout that names a comma.
+        var file = CommaFile + "05.09.2026;SAMPLE.COM;12.34\n";
+
+        var resp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/csv/preview",
+            Upload(mappingYaml: CommaYaml, file: file));
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var preview = await resp.Content.ReadFromJsonAsync<FileIngestPreviewResponse>();
+        Assert.Equal(3, Assert.Single(preview!.Accounts).TransactionCount);
+        var warning = Assert.Single(preview.Errors);
+        Assert.Equal("csv_row_unreadable", warning.Code);
+        Assert.Equal(
+            "Line 5: '12.34' is not an amount with a comma as the decimal separator. The row was skipped.",
+            warning.Message);
+    }
+
     [Fact]
     public async Task Another_ledgers_mapping_cannot_be_used_or_read_from_here()
     {
-        var mine = await SyntheticLedger.CreateAsync(_fixture);
-        var theirs = await SyntheticLedger.CreateAsync(_fixture);
+        var mine = await SyntheticLedger.CreateAsync(Db);
+        var theirs = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var theirClient = await AuthedClientAsync(factory, theirs);
         var theirMapping = await SaveMappingAsync(
-            theirClient, theirs.LedgerId, "Store card", StoreCardYaml);
+            theirClient, theirs.LedgerId, "Credit card", CardIssuerYaml);
 
         using var myClient = await AuthedClientAsync(factory, mine);
         var read = await myClient.GetAsync(

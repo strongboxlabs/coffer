@@ -50,10 +50,9 @@ describe('RegisterSortMenu', () => {
     });
 
     it('names the counterparty column ACCOUNT on a category register', () => {
-        // The third time this defect shipped, after the column header and the
-        // editor field: on a category's register the counterparty is a money
-        // account, and the filter and chips beside this menu always knew it.
-        // The menu was the one control in the bar never handed the kind.
+        // On a category's register the counterparty is a money account, as the
+        // column header, the editor field, and the filter and chips beside this
+        // menu say. The menu has to be handed the kind too.
         const onChange = vi.fn();
         render(
             <RegisterSortMenu

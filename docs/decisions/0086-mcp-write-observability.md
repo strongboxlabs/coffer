@@ -6,7 +6,7 @@
 
 ## Context
 
-Diagnosing a report of MCP write tools ("timing out") exposed that the write path is effectively **unobservable**, in two independent ways:
+The MCP write path is effectively **unobservable**, in two independent ways:
 
 1. **The write-audit silently loses rows.** `McpAuditRecorder.RecordAsync` ran `SaveChangesAsync(cancellationToken)` on the *caller's* token, and `McpAuditFilter` invoked it — including on the exception path — with that same token. When a client cancels/times out, the token is already cancelled, so the audit write aborts and the `catch {}` swallows it. The audit is also written in a *separate* transaction *after* the tool returns, so a call that never returns (hang/timeout) records nothing at all. Result: the writes an oversight log most needs to capture — abandoned, timed-out, errored-under-cancellation — are exactly the ones dropped, with no trace.
 
@@ -56,7 +56,7 @@ declared non-secret with a reason, or sit under a listed prefix, and so must eve
 in the SPA's `router.ts`. A new unconstrained parameter fails the suite until it is
 classified.
 
-The same sweep found that HttpClient's own Information logging wrote every outbound URL.
+HttpClient's own Information logging writes every outbound URL.
 A webhook, a Healthchecks ping URL and a SimpleFIN access URL carry their secret in the
 path. `System.Net.Http.HttpClient` is held at Warning in `appsettings.json`, and a test
 delivers a real webhook through the app's registered client and asserts that no log line

@@ -22,11 +22,12 @@ namespace Coffer.Api.Tests.Integration.Ingest;
 /// to resolve to something better than "try the same broken thing again tomorrow".
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class FeedSyncJobHandlerTests
+public sealed class FeedSyncJobHandlerTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public FeedSyncJobHandlerTests(PostgresFixture fixture) => _fixture = fixture;
+    public FeedSyncJobHandlerTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private sealed class StubHandler : HttpMessageHandler
     {
@@ -71,9 +72,9 @@ public sealed class FeedSyncJobHandlerTests
 
     private async Task<SyntheticLedger> LedgerWithLekAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var keys = _fixture.NewLedgerKeyService();
-        await using var db = _fixture.NewDbContext();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var keys = Db.NewLedgerKeyService();
+        await using var db = Db.NewDbContext();
         var row = await db.Ledgers.SingleAsync(l => l.Id == ledger.LedgerId);
         row.WrappedLek = keys.CreateWrappedLek();
         row.LekKekId = keys.CurrentKekId;
@@ -111,14 +112,14 @@ public sealed class FeedSyncJobHandlerTests
 
     private async Task SetStatusAsync(Guid connectionId, string status)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await db.FeedConnections
             .Where(c => c.Id == connectionId)
             .ExecuteUpdateAsync(s => s.SetProperty(c => c.Status, status));
     }
 
     private static async Task<JobRunOutcome> RunHandlerAsync(
-        ApiFactory factory, PostgresFixture fixture, Guid ledgerId, Guid userId)
+        ApiFactory factory, TestDatabase database, Guid ledgerId, Guid userId)
     {
         using var scope = factory.Services.CreateScope();
         var handler = scope.ServiceProvider.GetServices<IScheduledJobHandler>()
@@ -127,9 +128,8 @@ public sealed class FeedSyncJobHandlerTests
         // The SERVICE-role context, exactly as SchedulerService supplies. Resolving
         // AppDbContext from the scope instead would give the app-role context with no
         // app.user_id, RLS would hide every connection, and the handler would report a
-        // clean run over nothing — which is precisely the bug the first version of these
-        // tests found.
-        await using var db = fixture.NewServiceDbContext();
+        // clean run over nothing.
+        await using var db = database.NewServiceDbContext();
         return await handler.RunAsync(
             db, ledgerId, userId, new JobRunClock(DateTime.UtcNow, "UTC"), default);
     }
@@ -144,7 +144,7 @@ public sealed class FeedSyncJobHandlerTests
         // connections down with the broken one.
         var ledger = await LedgerWithLekAsync();
         var fetched = new HashSet<string>(StringComparer.Ordinal);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => StubClient(fetched));
         using var client = await AuthedClientAsync(factory, ledger);
 
@@ -153,7 +153,7 @@ public sealed class FeedSyncJobHandlerTests
         await SetStatusAsync(dead, "needs_reauth");
 
         fetched.Clear();
-        var outcome = await RunHandlerAsync(factory, _fixture, ledger.LedgerId, ledger.UserId);
+        var outcome = await RunHandlerAsync(factory, Db, ledger.LedgerId, ledger.UserId);
 
         // The dead one was never contacted...
         Assert.DoesNotContain(fetched, u => u.Contains("dead", StringComparison.Ordinal));
@@ -173,14 +173,14 @@ public sealed class FeedSyncJobHandlerTests
         // thrown" is not a success criterion.
         var ledger = await LedgerWithLekAsync();
         var fetched = new HashSet<string>(StringComparer.Ordinal);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => StubClient(fetched));
         using var client = await AuthedClientAsync(factory, ledger);
 
         var only = await AddConnectionAsync(client, ledger.LedgerId, "only");
         await SetStatusAsync(only, "needs_reauth");
 
-        var outcome = await RunHandlerAsync(factory, _fixture, ledger.LedgerId, ledger.UserId);
+        var outcome = await RunHandlerAsync(factory, Db, ledger.LedgerId, ledger.UserId);
 
         Assert.Equal(JobRunResult.Degraded, outcome.Result);
         Assert.True(outcome.NothingDone);   // every connection waiting: nothing synced (FU-071)
@@ -192,7 +192,7 @@ public sealed class FeedSyncJobHandlerTests
     {
         var ledger = await LedgerWithLekAsync();
         var fetched = new HashSet<string>(StringComparer.Ordinal);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => StubClient(fetched, faultOn: "broken"));
         using var client = await AuthedClientAsync(factory, ledger);
 
@@ -200,7 +200,7 @@ public sealed class FeedSyncJobHandlerTests
         await AddConnectionAsync(client, ledger.LedgerId, "healthy");
 
         fetched.Clear();
-        var outcome = await RunHandlerAsync(factory, _fixture, ledger.LedgerId, ledger.UserId);
+        var outcome = await RunHandlerAsync(factory, Db, ledger.LedgerId, ledger.UserId);
 
         Assert.Equal(JobRunResult.Degraded, outcome.Result);
         Assert.False(outcome.NothingDone);  // the healthy bank synced: a partial run
@@ -214,10 +214,10 @@ public sealed class FeedSyncJobHandlerTests
         // A schedule can be enabled before any bank is connected. Reporting that as a
         // failure would mark the switch down over a state nobody needs to fix.
         var ledger = await LedgerWithLekAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => StubClient([]));
 
-        var outcome = await RunHandlerAsync(factory, _fixture, ledger.LedgerId, ledger.UserId);
+        var outcome = await RunHandlerAsync(factory, Db, ledger.LedgerId, ledger.UserId);
 
         Assert.Equal(JobRunResult.Ok, outcome.Result);
     }
@@ -229,14 +229,14 @@ public sealed class FeedSyncJobHandlerTests
         // scheduled run would have claimed a person pressed the button.
         var ledger = await LedgerWithLekAsync();
         var fetched = new HashSet<string>(StringComparer.Ordinal);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => StubClient(fetched));
         using var client = await AuthedClientAsync(factory, ledger);
 
         await AddConnectionAsync(client, ledger.LedgerId, "bank");
-        await RunHandlerAsync(factory, _fixture, ledger.LedgerId, ledger.UserId);
+        await RunHandlerAsync(factory, Db, ledger.LedgerId, ledger.UserId);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var triggers = await read.LedgerOperations.AsNoTracking()
             .Where(o => o.LedgerId == ledger.LedgerId && o.Family == "ingest")
             .Select(o => o.TriggeredVia)

@@ -19,6 +19,15 @@ export type LedgerInvestmentAction =
     | 'transfer_shares';
 
 /**
+ * The actions whose transfer account is a real account that may be in another currency,
+ * so that across currencies they carry `transferAmount` (ADR-0114 D13). Mirror of the
+ * API's `LedgerActions.Transfer`, `BuyXfr`, `SellXfr` and `DivXfr`; typed against
+ * {@link LedgerInvestmentAction}, so a name not on the wire does not compile.
+ * `transfer_shares` moves shares in kind and carries no second amount.
+ */
+export const TRANSFER_AMOUNT_ACTIONS: readonly LedgerInvestmentAction[] = ['transfer', 'buyx', 'sellx', 'divx'];
+
+/**
  * Mirror of API `Coffer.Api.Contracts.CreateInvestmentTransactionRequest`
  * (ADR-0029). One investment txn — multi-posting under the hood, but
  * the wire shape speaks the user-facing field set (action × required
@@ -30,6 +39,8 @@ export interface CreateInvestmentTransactionRequest {
     postedAt: string;
     action: LedgerInvestmentAction;
     payee?: string | null;
+    /** The event's memo. The server puts it on the brokerage leg of a
+     *  one-posting event and on the transaction of a multi-posting one. */
     memo?: string | null;
     checkNumber?: string | null;
     /** ISO-8601 UTC timestamp string. */
@@ -40,6 +51,20 @@ export interface CreateInvestmentTransactionRequest {
     amount?: number | null;
     categoryAccountId?: string | null;
     transferAccountId?: string | null;
+    /**
+     * The transfer account's own leg, signed, in that account's currency, when
+     * `transferAccountId` is a real account in another currency than the brokerage's
+     * (ADR-0114 D13), on the actions in {@link TRANSFER_AMOUNT_ACTIONS}; on `buyx`,
+     * `sellx` and `divx` it pairs with the trade amount, not the fee. Required there,
+     * nonzero and opposite in sign to the brokerage's leg of the transfer pair
+     * (`investment-txn-transfer-amount-required`,
+     * `investment-txn-transfer-amounts-nonzero`, `investment-txn-transfer-amounts-sign`),
+     * and checked at the transfer account's places. Like the places rule, the nonzero
+     * and sign rules check only a pair the write changes: a pair resent equal to its two
+     * stored legs, on the same accounts, passes them. Omit it on a category or a
+     * same-currency transfer: the server drops it there.
+     */
+    transferAmount?: number | null;
     feeAccountId?: string | null;
     feeAmount?: number | null;
     /** ADR-0031 Phase 3d.2 — mirrors PATCH; see PatchInvestmentTransactionRequest. */
@@ -67,6 +92,9 @@ export interface PatchInvestmentTransactionRequest {
     postedAt?: string | null;
     action?: LedgerInvestmentAction | null;
     payee?: string | null;
+    /** PRESENCE decides, unlike the fields around it: an omitted memo is left
+     *  as it is, `null` or blank clears it (mirror of API
+     *  `IInvestmentWriteNotes`). */
     memo?: string | null;
     checkNumber?: string | null;
     transactedAt?: string | null;
@@ -76,6 +104,11 @@ export interface PatchInvestmentTransactionRequest {
     amount?: number | null;
     categoryAccountId?: string | null;
     transferAccountId?: string | null;
+    /** The transfer account's own leg across currencies, as on create. A PATCH that
+     *  resends the stored leg unchanged passes the places check, and one that resends
+     *  the transfer pair equal to its two stored legs, on the same accounts, passes the
+     *  nonzero and sign checks too. */
+    transferAmount?: number | null;
     feeAccountId?: string | null;
     feeAmount?: number | null;
     /**
@@ -89,23 +122,22 @@ export interface PatchInvestmentTransactionRequest {
     providerSecurityHint?: ProviderSecurityHint | null;
     /** When `true`, clears `needsReview` on this transaction in the same
      *  transaction as the edit — mirrors the bank PATCH. Omit it to save
-     *  changes and leave the row queued for review, which was impossible
-     *  before: a successful investment PATCH used to accept unconditionally. */
+     *  changes and leave the row queued for review. */
     approve?: boolean;
     /**
-     * Replace the header's tag set in the same PATCH. Unlike every other field
-     * on this contract, tags follow the bank PATCH's PRESENCE rule rather than
-     * ADR-0025's "supplied set IS the new state": omitted leaves them alone,
-     * `[]` clears them. The editor always sends the array, so the distinction
-     * only matters to other callers.
+     * Replace the event's tag set in the same PATCH. Like `memo`, tags follow
+     * the PRESENCE rule rather than ADR-0025's "supplied set IS the new state":
+     * omitted or `null` leaves them alone, `[]` clears them. The editor sends
+     * them only when the user changed them.
      */
     tags?: readonly string[] | null;
 
     /**
-     * Investment merge (mirrors bank `mergeFromHeaderId`). When set, the
-     * PATCHed row (the edited row) is the LOSER and folds into this
-     * candidate (the surviving winner). Sent as a merge-only PATCH — no
-     * other fields are read. See `InvestmentMergeCandidate`.
+     * The merge candidate the editor armed (mirrors bank `mergeFromHeaderId`).
+     * Never sent on the PATCH (the server ignores it there): the editor's save
+     * routes a body carrying it to `mergeInvestmentTransaction` (POST …/merge),
+     * which folds the edited row into the candidate; the candidate survives
+     * with its own fields. See `InvestmentMergeCandidate`.
      */
     mergeFromHeaderId?: string | null;
 }
@@ -114,7 +146,8 @@ export interface PatchInvestmentTransactionRequest {
  * Mirror of API `Coffer.Api.Contracts.InvestmentMergeCandidateDto`. One
  * "possible match" surfaced in the editor's merge panel; picking one folds
  * the edited (fresh, needs-review) row into it. Shaped for a one-line chip
- * (date · action · ticker · shares · amount).
+ * that reads like the candidate's register row (date · action · payee ·
+ * ticker · shares · amount).
  */
 export interface InvestmentMergeCandidate {
     headerId: string;
@@ -123,11 +156,27 @@ export interface InvestmentMergeCandidate {
     /** Signed day offset from the edited row (chip subtitle). */
     dayDelta: number;
     action: LedgerInvestmentAction | null;
+    /** The action the candidate's register row shows: same meaning and values
+     *  as the register row's `derivedAction` (`Xfr` on a cash transfer that
+     *  carries no header action). */
+    derivedAction: string | null;
     securityTicker: string | null;
+    /** The candidate's register row's quantity in the edited brokerage's
+     *  register: same sign and meaning. */
     shares: number | null;
     unitPrice: number | null;
+    /** The candidate's register row's amount in the edited brokerage's
+     *  register: same sign and meaning. */
     amount: number;
     payee: string | null;
+    /** A cash transfer's other account, same meaning as on a register row;
+     *  null otherwise. */
+    counterpartyAccountId: string | null;
+    counterpartyAccountName: string | null;
+    /** How the candidate came into the ledger, as its register row's `origin`:
+     *  `manual`, `online_import` or `file_import`. The chip's tooltip names the
+     *  row a merge keeps by it (mergeChipTitle). */
+    origin: string;
 }
 
 /** Mirror of API `Coffer.Api.Contracts.ProviderSecurityHint`. */

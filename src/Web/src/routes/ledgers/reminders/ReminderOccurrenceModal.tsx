@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import {
     ApiError, fetchAccounts, fetchPayees, fetchReminderDetail,
@@ -11,15 +12,19 @@ import type {
 import { buildAccountPathMap } from '@/lib/accountPath';
 import { formatLedgerDate } from '@/lib/dates';
 import { formatSignedAmount } from '@/lib/money';
+import { estimateTitle, isEstimating } from '@/lib/reminderEstimate';
 import { errorMessage } from '@/lib/errorMessage';
 import { invalidateLedgerRegister } from '@/lib/registerInvalidation';
 import { Button } from '@/components/ui/Button';
+import { EditorDialog } from '@/components/ui/EditorDialog';
+import { PendingScope } from '@/components/ui/pending';
+import { PendingLabel } from '@/components/ui/PendingLabel';
+import { Skeleton } from '@/components/ui/Skeleton';
 import { TxnRowEdit } from '@/routes/ledgers/TxnRowEdit';
-import { BANK_COLS } from '@/routes/ledgers/register/bank/columns';
+import { buildNotes } from '@/routes/ledgers/bank-edit/notesBody';
+import { prefillToDraft } from '@/routes/ledgers/bank-edit/postingDraft';
 import { InvestmentTxnRowEdit } from '@/routes/ledgers/investment-edit/InvestmentTxnRowEdit';
-import { INVESTMENT_FORM_COLS } from '@/routes/ledgers/register/investment/columns';
 
-import { ReminderDialogShell } from './ReminderDialogShell';
 import { reminderBankPrefill, reminderInvestmentDraft } from './reminderOccurrenceDraft';
 
 /**
@@ -38,9 +43,11 @@ export function ReminderOccurrenceModal({ ledgerId, occ, onClose, onActed }: {
 }) {
     const queryClient = useQueryClient();
 
+    // For THIS occurrence: a managed loan's split is priced as of the payment's own
+    // date (ADR-0078), so two occurrences of one series can split differently.
     const detailQuery = useQuery({
-        queryKey: ['reminders', 'detail', ledgerId, occ.reminderId],
-        queryFn: () => fetchReminderDetail(ledgerId, occ.reminderId),
+        queryKey: ['reminders', 'detail', ledgerId, occ.reminderId, occ.date],
+        queryFn: () => fetchReminderDetail(ledgerId, occ.reminderId, occ.date),
     });
     const accountsQuery = useQuery({
         queryKey: ['accounts', ledgerId],
@@ -55,10 +62,13 @@ export function ReminderOccurrenceModal({ ledgerId, occ, onClose, onActed }: {
     // Shared post-action: refresh the reminders list / calendar, report the
     // catch-up tally, close. Only a FIRE commits a transaction, so the register /
     // accounts / holdings refresh lives in the fire mutations below (a skip
-    // changes nothing on the register).
+    // changes nothing on the register). Every series' detail is refreshed too, for
+    // every occurrence: acting moves the series' cursor, and a fired loan payment
+    // moves the balance a later occurrence's split is priced on (ADR-0078).
     function afterAct(verb: string, skippedEarlierCount: number, skippedEarlierFrom: string | null) {
         queryClient.invalidateQueries({ queryKey: ['reminders', 'upcoming', ledgerId] });
         queryClient.invalidateQueries({ queryKey: ['reminders', ledgerId] });
+        queryClient.invalidateQueries({ queryKey: ['reminders', 'detail', ledgerId] });
         const back = skippedEarlierFrom ? ` (back to ${formatLedgerDate(skippedEarlierFrom)})` : '';
         const notice = skippedEarlierCount > 0
             ? `${verb}. Also marked ${skippedEarlierCount} earlier occurrence`
@@ -74,8 +84,8 @@ export function ReminderOccurrenceModal({ ledgerId, occ, onClose, onActed }: {
             sourceAccountId: body.sourceAccountId,
             postings: body.postings,
             payee: body.payee,
-            memo: body.memo,
             checkNumber: body.checkNumber,
+            notes: body.notes,
             postedDate: body.postedAt.slice(0, 10),
         }),
         onSuccess: (data) => {
@@ -98,6 +108,11 @@ export function ReminderOccurrenceModal({ ledgerId, occ, onClose, onActed }: {
         onSuccess: (data) => afterAct('Skipped', data.skippedEarlierCount, data.skippedEarlierFrom),
     });
 
+    // Any of the dialog's requests in flight holds every action in it: Skip,
+    // Post, Cancel and an editor's Enter-to-save alike. A post sent while the
+    // skip of the same occurrence is unanswered (or the reverse) is a second,
+    // conflicting answer to one occurrence. The editors' labels still say
+    // "Posting…" only while a post is the request in flight.
     const busy = fireBank.isPending || fireInvestment.isPending || skipMutation.isPending;
     const actionError = fireBank.error ?? fireInvestment.error ?? skipMutation.error;
 
@@ -105,7 +120,9 @@ export function ReminderOccurrenceModal({ ledgerId, occ, onClose, onActed }: {
     // as a left-aligned peer of the editor's Cancel / Save — one consistent
     // action row, not a stranded extra footer.
     const skipButton = (
-        <Button type="button" variant="ghost" size="sm" disabled={busy}
+        <Button type="button" variant="ghost" size="sm" pending={busy}
+            // A 44px target in a narrow dialog, beside the editor's own.
+            className="@max-3xl/dialog:h-control-44px"
             onClick={() => skipMutation.mutate()}>
             Skip this occurrence
         </Button>
@@ -114,10 +131,13 @@ export function ReminderOccurrenceModal({ ledgerId, occ, onClose, onActed }: {
     const accounts = useMemo(() => accountsQuery.data ?? [], [accountsQuery.data]);
     const accountPaths = useMemo(() => buildAccountPathMap(accounts), [accounts]);
 
-    // Bank prefill + investment draft (memoized — the editors read the seed once).
+    // Bank prefill + investment draft (memoized — the editors read the seed once). The
+    // occurrence's own estimate seeds its amount (ADR-0049 D10), and both sides of an
+    // estimating transfer between currencies (ADR-0114 D13).
+    const occurrenceEstimate = occ.estimate ?? null;
     const bank = useMemo(
-        () => (detail && detail.kind === 'bank' ? reminderBankPrefill(detail) : null),
-        [detail]);
+        () => (detail && detail.kind === 'bank' ? reminderBankPrefill(detail, occurrenceEstimate) : null),
+        [detail, occurrenceEstimate]);
     const investment = useMemo(
         () => (detail && detail.kind === 'investment' ? reminderInvestmentDraft(detail, occ.date) : null),
         [detail, occ.date]);
@@ -128,6 +148,12 @@ export function ReminderOccurrenceModal({ ledgerId, occ, onClose, onActed }: {
     const sourceAccountId = bank?.sourceAccountId ?? investment?.brokerageAccountId ?? null;
     const sourceName = sourceAccountId !== null
         ? (accounts.find((a) => a.id === sourceAccountId)?.name ?? null) : null;
+    // Every figure here is the source account's: the occurrence carries its
+    // currency (a deactivated source keeps it), else the account list does.
+    // Null while neither has it: no figure is printed until it is known.
+    const currency = occ.currencyCode
+        ?? (sourceAccountId !== null ? accounts.find((a) => a.id === sourceAccountId)?.currencyCode : undefined)
+        ?? null;
 
     // Catch-up: acting will cascade-skip earlier occurrences iff the series'
     // next-due cursor is before this occurrence.
@@ -136,16 +162,30 @@ export function ReminderOccurrenceModal({ ledgerId, occ, onClose, onActed }: {
     const loading = detailQuery.isPending || accountsQuery.isPending || payeesQuery.isPending;
     const loadError = detailQuery.isError || accountsQuery.isError || payeesQuery.isError;
 
+    // One group (pending.ts): a press of Skip, Post or an editor's save holds
+    // every action in the dialog from the press, before `busy` has rendered.
     return (
-        <ReminderDialogShell
+        <PendingScope>
+        <EditorDialog
             ariaLabel={`${occ.payee ?? 'Reminder'} — ${formatLedgerDate(occ.date)}`}
-            title={
+            title={occ.payee ?? 'Reminder'}
+            subtitle={
                 <>
-                    {occ.payee ?? 'Reminder'}
-                    <span className="ml-2 text-sm font-normal text-text-muted">
-                        {formatLedgerDate(occ.date)} · {formatSignedAmount(occ.amount)}
-                        {sourceName !== null ? ` · ${sourceName}` : ''}
-                    </span>
+                    {formatLedgerDate(occ.date)}
+                    {/* A placeholder while the reads that say the currency are in
+                        flight; nothing once they have answered without one (the
+                        body says why). */}
+                    {currency !== null
+                        ? <>
+                            {' · '}
+                            {/* An estimating series' amount is not the bill (mig 220). */}
+                            {isEstimating(occ) ? <span title={estimateTitle(occ.estimate)}>≈</span> : null}
+                            {formatSignedAmount(occ.amount, currency)}
+                        </>
+                        : loading
+                            ? <> · <Skeleton className="inline-block h-fixed-12px w-fixed-80px align-middle" /></>
+                            : null}
+                    {sourceName !== null ? ` · ${sourceName}` : ''}
                 </>
             }
             onClose={onClose}
@@ -166,16 +206,20 @@ export function ReminderOccurrenceModal({ ledgerId, occ, onClose, onActed }: {
 
             {loading ? (
                 <p className="py-6 text-center text-sm text-text-subtle">Loading…</p>
-            ) : loadError || !detail ? (
+            ) : loadError || !detail || (sourceAccountId !== null && currency === null) ? (
+                // Loaded without the source's currency (no occurrence code, and
+                // a source the account list does not hold) is no better than not
+                // loaded: every figure below is in it.
                 <p role="alert" className="py-6 text-center text-sm text-state-danger">
                     Could not load this reminder.
                 </p>
-            ) : detail.kind === 'bank' && detail.isLoanReminder && bank ? (
+            ) : detail.kind === 'bank' && detail.isLoanReminder && bank && currency !== null ? (
                 <div className="space-y-3">
                     <p className="rounded bg-accent-soft px-3 py-2 text-xs text-accent">
                         <span className="font-semibold">Managed loan payment.</span>{' '}
                         The principal / interest / escrow split is computed from the loan
-                        terms + current balance, so it's shown read-only. Change the schedule
+                        terms + the loan's balance on this payment's date, so it's shown
+                        read-only. Change the schedule
                         from the loan account, or delete it on the Reminders page.
                     </p>
                     <ul className="divide-y divide-border rounded border border-border text-sm">
@@ -200,46 +244,59 @@ export function ReminderOccurrenceModal({ ledgerId, occ, onClose, onActed }: {
                                         ?? 'Account'}
                                 </span>
                                 <span className="shrink-0 font-mono tabular-nums text-text">
-                                    {formatSignedAmount(p.amount)}
+                                    {formatSignedAmount(p.amount, currency)}
                                 </span>
                             </li>
                         ))}
                         <li className="flex items-center justify-between gap-2 px-3 py-1.5 font-medium">
                             <span className="text-text-muted">Total</span>
                             <span className="shrink-0 font-mono tabular-nums text-text">
-                                {formatSignedAmount((bank.prefill.postings ?? []).reduce((s, p) => s + p.amount, 0))}
+                                {formatSignedAmount((bank.prefill.postings ?? []).reduce((s, p) => s + p.amount, 0), currency)}
                             </span>
                         </li>
                     </ul>
                     <div className="flex items-center justify-between gap-2">
                         {skipButton}
                         <div className="flex gap-2">
-                            <Button type="button" variant="secondary" size="sm" onClick={onClose} disabled={busy}>
+                            <Button type="button" variant="secondary" size="sm" onClick={onClose} pending={busy}
+                                className="@max-3xl/dialog:h-control-44px">
                                 Cancel
                             </Button>
-                            <Button type="button" variant="primary" size="sm" disabled={busy}
-                                onClick={() => fireBank.mutate({
-                                    postedAt: occ.date,
-                                    sourceAccountId: bank.sourceAccountId,
+                            <Button type="button" variant="primary" size="sm" pending={busy}
+                                className="@max-3xl/dialog:h-control-44px"
+                                onClick={() => {
                                     // Amounts are placeholders here — the server recomputes the
                                     // managed split on fire; we just carry the counterparties.
-                                    postings: (bank.prefill.postings ?? [])
-                                        .filter((p) => p.counterpartyAccountId !== null)
-                                        .map((p) => ({
+                                    const postings = (bank.prefill.postings ?? [])
+                                        .filter((p) => p.counterpartyAccountId !== null);
+                                    fireBank.mutate({
+                                        postedAt: occ.date,
+                                        sourceAccountId: bank.sourceAccountId,
+                                        postings: postings.map((p) => ({
                                             counterpartyAccountId: p.counterpartyAccountId!,
                                             amount: p.amount,
-                                            legMemo: p.legMemo,
                                         })),
-                                    payee: bank.prefill.payee,
-                                    memo: bank.prefill.memo,
-                                    checkNumber: bank.prefill.checkNumber,
-                                })}>
-                                {fireBank.isPending ? 'Posting…' : 'Post'}
+                                        payee: bank.prefill.payee,
+                                        checkNumber: bank.prefill.checkNumber,
+                                        // The template's values, as a create of the
+                                        // occurrence sends them.
+                                        notes: buildNotes({
+                                            side: bank.sourceAccountId,
+                                            isNew: true,
+                                            memo: bank.prefill.memo ?? '',
+                                            tags: bank.prefill.tags ?? [],
+                                            postings: postings.map((p) => prefillToDraft(p, currency)),
+                                            baseline: { memo: '', tags: [] },
+                                        }),
+                                    });
+                                }}>
+                                {/* Posting… only while the post is the request in flight. */}
+                                <PendingLabel pending={fireBank.isPending} label="Post" pendingLabel="Posting…" />
                             </Button>
                         </div>
                     </div>
                 </div>
-            ) : detail.kind === 'bank' && bank ? (
+            ) : detail.kind === 'bank' && bank && currency !== null ? (
                 <TxnRowEdit
                     ledgerId={ledgerId}
                     mode={{
@@ -251,30 +308,35 @@ export function ReminderOccurrenceModal({ ledgerId, occ, onClose, onActed }: {
                     payees={payeesQuery.data ?? []}
                     accounts={accounts}
                     accountPaths={accountPaths}
-                    currency={accounts.find((a) => a.id === bank.sourceAccountId)?.currencyCode ?? 'USD'}
-                    cols={BANK_COLS}
+                    currency={currency}
+                    layout="dialog"
                     onSaveCreate={(body) => fireBank.mutate(body)}
                     onCancel={onClose}
                     submitLabel="Post"
                     submittingLabel="Posting…"
-                    isSaving={fireBank.isPending}
-                    saveError={fireBank.error instanceof ApiError ? fireBank.error.detail : null}
+                    // While a skip is pending Post waits on it, and reads Post.
+                    submitting={fireBank.isPending}
+                    isSaving={busy}
+                    saveError={fireBank.error instanceof ApiError ? fireBank.error : null}
                     cancelOnOutsideClick={false}
                     footerLeading={skipButton}
                 />
-            ) : detail.kind === 'investment' && investment ? (
+            ) : detail.kind === 'investment' && investment && currency !== null ? (
                 <InvestmentTxnRowEdit
                     ledgerId={ledgerId}
                     brokerageAccountId={investment.brokerageAccountId}
                     accounts={accounts}
+                    currency={currency}
                     isTradeCommission={
                         accounts.find((a) => a.id === investment.brokerageAccountId)?.isTradeCommission ?? false}
-                    cols={INVESTMENT_FORM_COLS}
+                    layout="dialog"
                     footerLeading={skipButton}
                     submitLabel="Post"
                     submittingLabel="Posting…"
+                    // While a skip is pending Post waits on it, and reads Post.
+                    submitting={fireInvestment.isPending}
                     onCancel={onClose}
-                    isSaving={fireInvestment.isPending}
+                    isSaving={busy}
                     mode={{
                         kind: 'fire',
                         initialDraft: investment.draft,
@@ -286,6 +348,7 @@ export function ReminderOccurrenceModal({ ledgerId, occ, onClose, onActed }: {
                     This reminder can't be edited (no source account / unsupported shape).
                 </p>
             )}
-        </ReminderDialogShell>
+        </EditorDialog>
+        </PendingScope>
     );
 }

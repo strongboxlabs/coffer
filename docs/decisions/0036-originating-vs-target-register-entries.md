@@ -1,6 +1,6 @@
 # 0036 — Originating vs target register entries
 
-* Status: Accepted
+* Status: Accepted (amended 2026-10-26, [ADR-0108](0108-memo-and-tags-per-side.md) D3, D14: the side and the entry key come from the stored presentation)
 * Date: 2026-06-03
 * Refines: [ADR-0022](0022-txn-headers-and-legs.md), [ADR-0028](0028-investment-register-surface.md)
 * Related: [ADR-0019](0019-symmetric-postings.md), [ADR-0025](0025-transaction-as-postings-list.md)
@@ -28,7 +28,7 @@ It's wrong for target-side accounts:
 
   - A paycheck split lands three transfer legs on a brokerage cash
     sleeve, each with its own amount. The brokerage register
-    aggregated them into one row carrying their sum, with no Action,
+    aggregates them into one row carrying their sum, with no Action,
     no per-leg counterparty, and no way for the user to see "these are three
     independent contributions."
   - A manual cross-account split that hits two bank accounts collapses
@@ -95,7 +95,7 @@ hint on the bank register's row body. The view exposes
 `derived_action = COALESCE(h.action, 'Xfr' when this leg's counter
 sits on an asset-shaped account, NULL otherwise)`:
 
-  - True investment events (Buy / Sell / Div / DivReinvest / …)
+  - True investment events (Buy / Sell / Dividend / Reinvest / …)
     have `header.action` populated; `derived_action` passes through
     unchanged.
   - Cash-shape headers (paycheck splits, manual transfers between
@@ -142,8 +142,32 @@ aggregator's collapse-vs-expand decision reads `header.action`
     changes are needed for the bank register surface itself — the
     existing single-leg render path handles target rows, and the
     "↗ Split" chip already fires on `txnGroupId !== null`.
-  - **Hidden data state issues** discovered while diagnosing this
-    bug (multi-leg paycheck headers missing from
-    `txn_header_account_balances`; duplicate header rows from
-    re-imports without dedup) are tracked separately — they're
+  - **Data-state defects** that can look similar in a register (a
+    multi-leg header missing from `txn_header_account_balances`;
+    duplicate header rows from a re-import without dedup) are
     distinct from the assembly-layer policy this ADR governs.
+
+## Amendment, 2026-10-26 — the side and the entry key are the stored presentation's (mig 264/266)
+
+Which side an entry is on is no longer read off the posting counts. The memo-and-tags
+rule decides it from the header's originating account (an event's investment side for
+an investment event) and stores it per leg (`txn_legs.notes_groups_by_header`,
+`notes_kind`, `notes_is_read_only`; migration 264): the entry key is the header on the
+side the header belongs to and the leg on every other side, including a one-posting
+transaction's other side, which the counts could not tell from its owner. The register's
+keyset page, rail and counts key by that stored grouping (`RegisterQuery`); the SQL
+function that keyed by the counts went with migration 266.
+
+The register row still carries `accountPostingsOnHeader`, `headerTotalPostings` and
+`txnGroupId` as before; which rows offer Edit follows `notesKind` and `isReadOnly`. The
+view and `txn_legs` keep the counts, which the balance walk and the recompute also use.
+
+Select-all and the bulk actions follow the stored flag too, not the counts
+(`BulkTransactionsRepository`, ADR-0108 D14). A selection is one register's: without
+`accountId` it is refused with 422 `account-not-in-ledger`, so there is no ledger-wide
+selection. A select-all delete, unhide or move covers only the headers with a leg in the
+register's scope whose `notes_is_read_only` is false. An explicit selection that names a
+row the register shows read-only is refused whole by those three, before anything is
+written, with 422 `selection-includes-read-only`. Reconciliation is the exception: a row's
+status is the account's own leg (ADR-0082), so bulk recon status, explicit or select-all,
+reaches read-only rows as well.

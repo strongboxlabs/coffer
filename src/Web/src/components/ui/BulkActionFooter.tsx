@@ -3,14 +3,18 @@ import type { ReactNode } from 'react';
 import { cn } from '@/lib/cn';
 
 // BulkActionFooter — bottom strip that appears when ≥1 register row is
-// selected. Shows "N selected" + the caller's bulk actions. ADR-0021 Rule 6.
+// selected. Shows "N selected" (with "· M read-only" when some are) + the
+// caller's bulk actions. ADR-0021 Rule 6.
 // It deliberately does NOT surface how many rows are loaded into the virtual
 // window — that's an internal windowing detail the user doesn't care about.
 
 export interface BulkActionFooterProps {
-    /** Number of selected rows. Footer is hidden when 0 (unless `alwaysVisible`
-     *  or a `trailing` node is present). */
+    /** Number of selected rows, read-only rows included. Footer is hidden when
+     *  0 (unless `alwaysVisible` or a `trailing` node is present). */
     selectedCount: number;
+    /** How many of `selectedCount` are read-only, named beside the count
+     *  ("15 selected · 3 read-only"). Nothing is added when 0 or omitted. */
+    readOnlyCount?: number;
     /** Clear the selection — rendered as an ✕ next to the "N selected" count
      *  (the clear affordance, in place of a separate button). Omit to show the
      *  count with no clear control. */
@@ -26,6 +30,7 @@ export interface BulkActionFooterProps {
 
 export function BulkActionFooter({
     selectedCount,
+    readOnlyCount = 0,
     onClear,
     actions,
     trailing,
@@ -48,7 +53,11 @@ export function BulkActionFooter({
             <div className="flex items-center gap-1.5 font-mono tabular-nums text-text-muted">
                 {selectedCount > 0 ? (
                     <>
-                        <span>{selectedCount} selected</span>
+                        <span>
+                            {readOnlyCount > 0
+                                ? `${selectedCount} selected · ${readOnlyCount} read-only`
+                                : `${selectedCount} selected`}
+                        </span>
                         {onClear ? (
                             <button
                                 type="button"

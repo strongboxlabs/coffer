@@ -16,11 +16,12 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// These also guard against LINQ-translation regressions in the new queries.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class ReportingDrilldownTests
+public sealed class ReportingDrilldownTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ReportingDrilldownTests(PostgresFixture fixture) => _fixture = fixture;
+    public ReportingDrilldownTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static readonly DateTime May = new(2026, 5, 15, 12, 0, 0, DateTimeKind.Utc);
 
@@ -35,13 +36,13 @@ public sealed class ReportingDrilldownTests
     [Fact]
     public async Task Spending_by_account_attributes_to_the_paying_account()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense");
         await ledger.AddTransactionPairAsync(groceries.Id, bank.Id, 100m, May);
         await ledger.AddTransactionPairAsync(groceries.Id, bank.Id, 50m, May);
 
-        var result = await new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System).SummarizeAsync(new ReportSpec
+        var result = await new ReportingRepository(Db.NewDbContext(), TimeProvider.System).SummarizeAsync(new ReportSpec
         {
             LedgerId = ledger.LedgerId,
             Measure = ReportMeasure.Spending,
@@ -58,7 +59,7 @@ public sealed class ReportingDrilldownTests
     [Fact]
     public async Task Category_rollup_folds_children_into_the_parent()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var food = await ledger.AddCategoryAsync("Food", "expense");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense", parentId: food.Id);
@@ -66,7 +67,7 @@ public sealed class ReportingDrilldownTests
         await ledger.AddTransactionPairAsync(groceries.Id, bank.Id, 100m, May);
         await ledger.AddTransactionPairAsync(dining.Id, bank.Id, 40m, May);
 
-        var rolled = await new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System).SummarizeAsync(new ReportSpec
+        var rolled = await new ReportingRepository(Db.NewDbContext(), TimeProvider.System).SummarizeAsync(new ReportSpec
         {
             LedgerId = ledger.LedgerId,
             Measure = ReportMeasure.Spending,
@@ -86,14 +87,14 @@ public sealed class ReportingDrilldownTests
     [Fact]
     public async Task List_transactions_filters_by_account_and_direction()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense");
         var salary = await ledger.AddCategoryAsync("Salary", "income");
         await ledger.AddTransactionPairAsync(groceries.Id, bank.Id, 100m, May);   // bank: an outflow
         await ledger.AddTransactionPairAsync(bank.Id, salary.Id, 5000m, May);     // bank: an inflow
 
-        var repo = new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System);
+        var repo = new ReportingRepository(Db.NewDbContext(), TimeProvider.System);
 
         var inflow = await repo.ListTransactionsAsync(new TransactionQuery
         {
@@ -117,7 +118,7 @@ public sealed class ReportingDrilldownTests
     [Fact]
     public async Task List_accounts_and_net_worth_use_market_value_aware_balances()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var security = await ledger.AddSecurityAsync("Fund", "FND");
@@ -125,19 +126,19 @@ public sealed class ReportingDrilldownTests
         await ledger.AddHoldingAsync(holdings, security, 10m, 1000m);
         await ledger.AddSecurityPriceAsync(security, 150m, May);
 
-        var db = _fixture.NewDbContext();
-        var balances = new AccountBalancesRepository(db);
+        var db = Db.NewDbContext();
+        var balances = new AccountBalancesRepository(db, TimeProvider.System);
         var invest = new InvestmentReportingRepository(db, TimeProvider.System);
         var overview = new OverviewRepository(db, balances, invest);
         var repo = new AccountsReportingRepository(db, balances, invest, overview);
 
         var accounts = await repo.ListAccountsAsync(
-            ledger.LedgerId, includeCategories: false, includeInactive: false, type: null);
+            ledger.LedgerId, includeCategories: false, includeInactive: false, type: null, today: null);
         var brokRow = accounts.Single(a => a.Id == brokerage.Id);
         Assert.Equal("asset", brokRow.Class);
         Assert.Equal(1500m, brokRow.Balance);   // no cash, so the holdings' market value alone
 
-        var nw = await repo.NetWorthAsync(ledger.LedgerId);
+        var nw = await repo.NetWorthAsync(ledger.LedgerId, today: null);
         Assert.Equal(1500m, nw.TotalAssets);
         Assert.Equal(1500m, nw.NetWorth);
     }
@@ -145,12 +146,12 @@ public sealed class ReportingDrilldownTests
     [Fact]
     public async Task Investment_income_sums_dividends_per_security()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var security = await ledger.AddSecurityAsync("Fund", "FND");
         var divCategory = await ledger.AddCategoryAsync("Dividends", "income");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -166,7 +167,7 @@ public sealed class ReportingDrilldownTests
             });
         Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
 
-        var income = await new InvestmentReportingRepository(_fixture.NewDbContext(), TimeProvider.System)
+        var income = await new InvestmentReportingRepository(Db.NewDbContext(), TimeProvider.System)
             .IncomeAsync(ledger.LedgerId, null, null, null, null,
                 InvestmentIncomeGroupBy.Security, ReportTimeBucket.None);
 

@@ -20,5 +20,11 @@ internal sealed class LedgerOperationErrorRow
     public string Message { get; init; } = string.Empty;
     public string? SimpleFinConnectionId { get; init; }
     public string? SimpleFinAccountId { get; init; }
+    /// <summary>
+    /// The source that raised the error (migration 303): a quote provider's key, or
+    /// <c>market-series</c> for the benchmark and exchange-rate fetch. Null on a sync or
+    /// import error, whose run names its one source, and on rows written before 303.
+    /// </summary>
+    public string? ProviderKey { get; init; }
     public DateTime CreatedAt { get; init; }
 }

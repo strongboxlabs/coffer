@@ -4,20 +4,17 @@ using Coffer.Importer.Moneydance.Db;
 namespace Coffer.Importer.Moneydance.Tests.Db;
 
 [Collection(DbCollection.Name)]
-public sealed class SecuritiesRepositoryTests
+public sealed class SecuritiesRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SecuritiesRepositoryTests(PostgresFixture fixture)
+    public SecuritiesRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     [Fact]
     public async Task Upsert_inserts_a_new_row_and_returns_the_supplied_id()
     {
-        await using var connection = _fixture.OpenConnection();
-        await TruncateAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var repo = new SecuritiesRepository(connection);
         var id = Guid.NewGuid();
@@ -55,8 +52,7 @@ public sealed class SecuritiesRepositoryTests
     [Fact]
     public async Task Upsert_updates_data_fields_but_preserves_id_on_conflict()
     {
-        await using var connection = _fixture.OpenConnection();
-        await TruncateAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var repo = new SecuritiesRepository(connection);
         var externalId = $"md-{Guid.NewGuid():N}";
@@ -100,7 +96,7 @@ public sealed class SecuritiesRepositoryTests
     [Fact]
     public async Task Upsert_rejects_row_with_empty_external_id()
     {
-        await using var connection = _fixture.OpenConnection();
+        await using var connection = Db.OpenConnection();
         var repo = new SecuritiesRepository(connection);
 
         await Assert.ThrowsAsync<ArgumentException>(() => repo.UpsertByExternalIdAsync(new SecurityRow(
@@ -110,10 +106,5 @@ public sealed class SecuritiesRepositoryTests
             VehicleType: null, ClassificationSource: null,
             ClassificationConfidence: null, Exchange: null,
             IsActive: true, ExternalId: null, ShareDecimals: 4)));
-    }
-
-    private static async Task TruncateAsync(Npgsql.NpgsqlConnection connection)
-    {
-        await connection.ExecuteAsync("TRUNCATE securities CASCADE;");
     }
 }

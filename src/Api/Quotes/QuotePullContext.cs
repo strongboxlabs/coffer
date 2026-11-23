@@ -34,10 +34,16 @@ public sealed record QuotePullContext(
 /// recovered symbol; the Yahoo-side ticker); <see cref="SecurityId"/>
 /// is the Coffer id the orchestrator binds the resulting price to.
 /// </summary>
+/// <remarks>
+/// It carries no currency, deliberately. A request knows only which symbol it wants; the
+/// currency a price is in comes from where the price comes from — the response a market
+/// data provider returns, or the feed account a holdings price was reported in
+/// (ADR-0114 D5). A currency on the request was stamped onto every price as if it were
+/// the answer.
+/// </remarks>
 public sealed record QuoteSecurityRef(
     Guid SecurityId,
     string Ticker,
-    string CurrencyCode,
     /// <summary>Whether <see cref="Ticker"/> is a public market symbol
     /// (ADR-0054 D2). False = a private / feed-internal quote symbol: egress
     /// (opt-in) providers skip it; the no-egress feed provider still matches it.</summary>

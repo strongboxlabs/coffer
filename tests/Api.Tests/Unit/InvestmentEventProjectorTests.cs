@@ -23,7 +23,6 @@ public sealed class InvestmentEventProjectorTests
         int legIndex = 0,
         decimal amount = 0,
         decimal? balanceAfter = 1000,
-        bool hasOverrides = false,
         string? postingRole = null,
         string? derivedAction = null,
         Guid? securityId = null,
@@ -39,7 +38,6 @@ public sealed class InvestmentEventProjectorTests
             LegIndex: legIndex,
             Amount: amount,
             BalanceAfter: balanceAfter,
-            HasOverrides: hasOverrides,
             PostingRole: postingRole,
             DerivedAction: derivedAction,
             CounterpartyId: CounterpartyLeg,
@@ -357,7 +355,7 @@ public sealed class InvestmentEventProjectorTests
     /// amount EQUALS the fee by construction.
     /// </summary>
     /// <remarks>
-    /// Real ledgers carry entries of this shape, across sell, sellx AND buy. The
+    /// Entries of this shape are legitimate, across sell, sellx AND buy. The
     /// projector still reports both numbers — suppressing here would hide a
     /// true value from every other consumer, including MCP — and it is the
     /// register's subtitle that declines to print the same figure twice. The

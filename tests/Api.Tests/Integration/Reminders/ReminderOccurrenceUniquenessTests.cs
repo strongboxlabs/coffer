@@ -32,11 +32,12 @@ namespace Coffer.Api.Tests.Integration.Reminders;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ReminderOccurrenceUniquenessTests
+public sealed class ReminderOccurrenceUniquenessTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ReminderOccurrenceUniquenessTests(PostgresFixture fixture) => _fixture = fixture;
+    public ReminderOccurrenceUniquenessTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -74,20 +75,20 @@ public sealed class ReminderOccurrenceUniquenessTests
     [Fact]
     public async Task A_second_committed_header_for_one_occurrence_is_refused()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var seriesId = await NewSeriesAsync(client, ledger, bank.Id, cat.Id);
 
         var slot = new DateOnly(2026, 1, 1);
 
-        await using var db = _fixture.NewServiceDbContext();
-        db.Add(NewOccurrenceHeader(ledger.LedgerId, seriesId, slot));
+        await using var db = Db.NewServiceDbContext();
+        AddOccurrenceHeader(db, ledger.LedgerId, bank.Id, seriesId, slot);
         await db.SaveChangesAsync();
 
-        db.Add(NewOccurrenceHeader(ledger.LedgerId, seriesId, slot));
+        AddOccurrenceHeader(db, ledger.LedgerId, bank.Id, seriesId, slot);
         var ex = await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync());
 
         var pg = Assert.IsType<PostgresException>(ex.InnerException);
@@ -112,14 +113,14 @@ public sealed class ReminderOccurrenceUniquenessTests
     [Fact]
     public async Task The_template_header_carries_no_occurrence_stamp_and_does_not_block_the_first_fire()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var seriesId = await NewSeriesAsync(client, ledger, bank.Id, cat.Id);
 
-        await using (var probe = _fixture.NewServiceDbContext())
+        await using (var probe = Db.NewServiceDbContext())
         {
             var template = await probe.TxnHeaders.AsNoTracking()
                 .SingleAsync(h => h.LedgerId == ledger.LedgerId && h.IsRecurringTemplate);
@@ -130,11 +131,9 @@ public sealed class ReminderOccurrenceUniquenessTests
                 + "case — confirm that predicate is still present before changing this.");
         }
 
-        var fire = await client.PostAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/reminders/{seriesId}/fire",
-            new FireReminderRequest { OccurrenceDate = new DateOnly(2026, 1, 1) });
+        var fire = await ReminderCloneFire.FireAsync(Db, ledger.LedgerId, seriesId, new DateOnly(2026, 1, 1));
 
-        Assert.Equal(HttpStatusCode.OK, fire.StatusCode);
+        Assert.Equal(Coffer.Api.Db.Repositories.RemindersRepository.FireOutcome.Ok, fire.Outcome);
     }
 
     /// <summary>
@@ -144,23 +143,23 @@ public sealed class ReminderOccurrenceUniquenessTests
     [Fact]
     public async Task Firing_an_already_committed_slot_is_idempotent()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var seriesId = await NewSeriesAsync(client, ledger, bank.Id, cat.Id);
 
         var slot = new DateOnly(2026, 1, 1);
-        var url = $"/api/ledgers/{ledger.LedgerId}/reminders/{seriesId}/fire";
 
-        var first = await client.PostAsJsonAsync(url, new FireReminderRequest { OccurrenceDate = slot });
-        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        var first = await ReminderCloneFire.FireAsync(Db, ledger.LedgerId, seriesId, slot);
+        Assert.Equal(Coffer.Api.Db.Repositories.RemindersRepository.FireOutcome.Ok, first.Outcome);
 
-        var second = await client.PostAsJsonAsync(url, new FireReminderRequest { OccurrenceDate = slot });
-        Assert.Equal(HttpStatusCode.OK, second.StatusCode);
+        var second = await ReminderCloneFire.FireAsync(Db, ledger.LedgerId, seriesId, slot);
+        Assert.Equal(Coffer.Api.Db.Repositories.RemindersRepository.FireOutcome.Ok, second.Outcome);
+        Assert.Equal(first.HeaderId, second.HeaderId);
 
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         var committed = await db.TxnHeaders.AsNoTracking()
             .CountAsync(h => h.RecurringTransactionId == seriesId
                              && h.OccurrenceDate == slot
@@ -183,12 +182,12 @@ public sealed class ReminderOccurrenceUniquenessTests
         var seriesId = Guid.NewGuid();
         var slot = new DateOnly(2026, 5, 1);
 
-        await using var holder = new NpgsqlConnection(_fixture.ServiceConnectionString);
+        await using var holder = new NpgsqlConnection(Db.ServiceConnectionString);
         await holder.OpenAsync();
         await using var holderTx = await holder.BeginTransactionAsync();
         await TakeLockAsync(holder, holderTx, seriesId, slot);
 
-        await using var contender = new NpgsqlConnection(_fixture.ServiceConnectionString);
+        await using var contender = new NpgsqlConnection(Db.ServiceConnectionString);
         await contender.OpenAsync();
         await using var contenderTx = await contender.BeginTransactionAsync();
         await SetShortTimeoutAsync(contender, contenderTx);
@@ -212,12 +211,12 @@ public sealed class ReminderOccurrenceUniquenessTests
     {
         var seriesId = Guid.NewGuid();
 
-        await using var holder = new NpgsqlConnection(_fixture.ServiceConnectionString);
+        await using var holder = new NpgsqlConnection(Db.ServiceConnectionString);
         await holder.OpenAsync();
         await using var holderTx = await holder.BeginTransactionAsync();
         await TakeLockAsync(holder, holderTx, seriesId, new DateOnly(2026, 5, 1));
 
-        await using var other = new NpgsqlConnection(_fixture.ServiceConnectionString);
+        await using var other = new NpgsqlConnection(Db.ServiceConnectionString);
         await other.OpenAsync();
         await using var otherTx = await other.BeginTransactionAsync();
         await SetShortTimeoutAsync(other, otherTx);
@@ -226,20 +225,18 @@ public sealed class ReminderOccurrenceUniquenessTests
         await TakeLockAsync(other, otherTx, seriesId, new DateOnly(2026, 6, 1));
     }
 
-    private static TxnHeaderRow NewOccurrenceHeader(Guid ledgerId, Guid seriesId, DateOnly slot) =>
-        new()
-        {
-            Id = Guid.NewGuid(),
-            LedgerId = ledgerId,
-            Origin = "manual",
-            Payee = "Rent",
-            PostedAt = slot.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc),
-            TransactedAt = slot.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc),
-            CreatedAt = slot.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc),
-            IsRecurringTemplate = false,
-            RecurringTransactionId = seriesId,
-            OccurrenceDate = slot,
-        };
+    /// <summary>A committed occurrence header, owned by the series' source account.</summary>
+    private static void AddOccurrenceHeader(
+        Coffer.Api.Db.AppDbContext db, Guid ledgerId, Guid sourceAccountId, Guid seriesId, DateOnly slot)
+    {
+        var header = TxnHeaderRow.NewOccurrence(Guid.NewGuid(), ledgerId, sourceAccountId);
+        header.Payee = "Rent";
+        header.PostedAt = slot.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        header.TransactedAt = slot.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        header.RecurringTransactionId = seriesId;
+        header.OccurrenceDate = slot;
+        db.AddHeader(header, createdAt: slot.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc));
+    }
 
     private static async Task TakeLockAsync(
         NpgsqlConnection connection, NpgsqlTransaction transaction, Guid seriesId, DateOnly slot)

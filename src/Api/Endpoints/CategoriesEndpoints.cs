@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Routing;
 
 using Coffer.Api.Auth;
 using Coffer.Api.Contracts;
+using Coffer.Api.Db;
 using Coffer.Api.Db.Repositories;
 using Coffer.Api.Errors;
 
@@ -11,8 +12,8 @@ namespace Coffer.Api.Endpoints;
 
 /// <summary>
 /// Per-ledger category-management endpoints (Slice A) — the REST surface for the
-/// manage-categories UI, over the ADR-0068 repository methods that previously had
-/// only an MCP consumer. Same auth contract as <see cref="AccountsEndpoints"/>:
+/// manage-categories UI, over the ADR-0068 repository methods the MCP tools also
+/// use. Same auth contract as <see cref="AccountsEndpoints"/>:
 /// authenticated user + a grant on the ledger; RLS enforces the same predicate
 /// at the data layer. Categories are accounts (<c>account_type='category'</c>);
 /// create / rename / activate reuse the accounts endpoints, so this file only
@@ -37,13 +38,16 @@ public static class CategoriesEndpoints
     /// <summary>
     /// <c>GET /api/ledgers/{ledgerId}/categories</c> — the management tree source:
     /// every category with its hierarchy pointer + usage counts (txn legs + child
-    /// categories). <c>?includeInactive=true</c> includes deactivated categories.
+    /// categories), and the ledger's display currency its figures are formatted in
+    /// (<see cref="CategoryListDto"/>). <c>?includeInactive=true</c> includes
+    /// deactivated categories.
     /// </summary>
     private static async Task<IResult> ListAsync(
         Guid ledgerId,
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         AccountsRepository accounts,
+        AppDbContext db,
         CancellationToken cancellationToken,
         bool? includeInactive = null)
     {
@@ -55,7 +59,8 @@ public static class CategoriesEndpoints
 
         var rows = await accounts.ListCategoriesWithUsageAsync(
             ledgerId, includeInactive ?? false, cancellationToken).ConfigureAwait(false);
-        return Results.Ok(rows);
+        var currencyCode = await DisplayCurrency.ForLedgerAsync(db, ledgerId, cancellationToken).ConfigureAwait(false);
+        return Results.Ok(new CategoryListDto(rows, currencyCode));
     }
 
     /// <summary>
@@ -117,13 +122,17 @@ public static class CategoriesEndpoints
     /// <c>POST /api/ledgers/{ledgerId}/categories/{categoryId}/merge</c> — merge this
     /// (source) category into <c>targetId</c>: repoint every leg (committed +
     /// reminder templates), reparent the source's children to the target, and
-    /// deactivate the source (reversible). <c>dryRun</c> returns the counts that
+    /// deactivate the source (the row is kept; reactivating it brings back an empty
+    /// category, and nothing moves back). <c>dryRun</c> returns the counts that
     /// would move without writing.
     /// <para>The kinds MAY differ (ADR-0017). A cross-kind merge is now the only
     /// way to reclassify a category, because the kind of an existing one is
     /// immutable — flipping it in place would move every posting between the
-    /// spending and income totals silently, where this states the counts,
-    /// deactivates rather than destroys, and can be undone by reactivating.</para>
+    /// spending and income totals silently, where this states the counts and
+    /// deactivates rather than destroys.</para>
+    /// <para>The destination must not sit beneath the source (<c>category-cycle</c>), and the
+    /// response says how many budget targets moved and how many were dropped (ADR-0099,
+    /// ADR-0111 D8; both zero on a dry run).</para>
     /// </summary>
     private static async Task<IResult> MergeAsync(
         Guid ledgerId,
@@ -152,7 +161,8 @@ public static class CategoriesEndpoints
         {
             AccountsRepository.MergeCategoryResult.Ok =>
                 Results.Ok(new MergeCategoryResponse(
-                    outcome.TransactionsMoved, outcome.ChildrenReparented, request.DryRun)),
+                    outcome.TransactionsMoved, outcome.ChildrenReparented, request.DryRun,
+                    outcome.BudgetTargetsMoved, outcome.BudgetTargetsDropped)),
             AccountsRepository.MergeCategoryResult.SourceNotInLedger =>
                 BusinessError.Problem(BusinessError.Codes.AccountNotInLedger,
                     "Source category does not belong to this ledger."),
@@ -175,6 +185,18 @@ public static class CategoriesEndpoints
             AccountsRepository.MergeCategoryResult.SourceIsSystem =>
                 BusinessError.Problem(BusinessError.Codes.AccountIsSystem,
                     "System categories cannot be merged away."),
+            AccountsRepository.MergeCategoryResult.TargetIsDescendant =>
+                BusinessError.Problem(BusinessError.Codes.CategoryCycle,
+                    "A category cannot be merged into one of its own sub-categories: its "
+                    + "sub-categories would end up beneath themselves."),
+            AccountsRepository.MergeCategoryResult.RateUnavailable when outcome.MissingRate is { } missing =>
+                BusinessError.Problem(BusinessError.Codes.RateUnavailable,
+                    $"The two categories both have a budget target for {missing.Date:yyyy-MM}, in "
+                    + $"{missing.FromCurrency} and {missing.ToCurrency}, and there is no "
+                    + $"{missing.FromCurrency} to {missing.ToCurrency} exchange rate for "
+                    + $"{missing.Date:yyyy-MM-dd} to add them with. Nothing was merged.",
+                    title: null,
+                    extra: new Dictionary<string, object?> { ["rateUnavailable"] = missing }),
             _ => Results.Problem("Unknown merge-category result.", statusCode: 500),
         };
     }

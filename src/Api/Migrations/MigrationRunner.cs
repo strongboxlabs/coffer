@@ -2,6 +2,7 @@ using DbUp;
 using DbUp.Engine.Output;
 using DbUp.ScriptProviders;
 using Microsoft.Extensions.Logging;
+using Npgsql;
 
 namespace Coffer.Api.Migrations;
 
@@ -12,11 +13,8 @@ namespace Coffer.Api.Migrations;
 /// <c>docs/engineering-standards.md §3.1</c>.
 /// </summary>
 /// <remarks>
-/// The importer's <c>PostgresFixture</c> applies the same files differently
-/// (re-runs every script against a fresh container). DbUp's tracked-runs
-/// model is the right shape for a long-lived API but wrong for the
-/// per-test-class fixture, so the two stay separate. Both read the same
-/// directory, so the source of truth is one set of <c>NNN_*.sql</c> files.
+/// Both test projects migrate their template database through this runner, as
+/// <c>coffer_service</c>, so tests run on a schema built the way an install's is.
 /// </remarks>
 public static class MigrationRunner
 {
@@ -27,6 +25,34 @@ public static class MigrationRunner
     /// it's discoverable in <c>\dt</c>.
     /// </summary>
     private const string JournalTable = "__schema_migrations";
+
+    /// <summary>
+    /// The session setting every connection the runner opens carries, set to <c>on</c> at
+    /// connect (<see cref="ForMigrationSession"/>).
+    /// </summary>
+    /// <remarks>
+    /// <para><c>fn_ledger_write_lock</c> (migration 275) does nothing on such a session. It
+    /// otherwise refuses a transaction that has written before taking the ledger write lock,
+    /// and a data migration writes (and may run DDL) before it recomputes balances or
+    /// holdings, all in one transaction. Migrations run before the API serves, so there is
+    /// nothing for the lock to order them against.</para>
+    /// <para>Only the runner sets it: the API's own connection strings never carry it, and
+    /// no SQL function sets it (<c>LedgerWriteLockCatalogTests</c>). The marked connection
+    /// string differs from the plain one, so its connections sit in a pool of their own and
+    /// are never handed to a request.</para>
+    /// </remarks>
+    internal const string MigrationSessionSetting = "coffer.migration_session";
+
+    /// <summary><paramref name="connectionString"/> with <see cref="MigrationSessionSetting"/>
+    /// set to <c>on</c> for every session it opens, alongside any options it already
+    /// carries.</summary>
+    internal static string ForMigrationSession(string connectionString)
+    {
+        var builder = new NpgsqlConnectionStringBuilder(connectionString);
+        var mark = $"-c {MigrationSessionSetting}=on";
+        builder.Options = string.IsNullOrWhiteSpace(builder.Options) ? mark : builder.Options + " " + mark;
+        return builder.ConnectionString;
+    }
 
     /// <summary>
     /// Apply every <c>NNN_*.sql</c> migration that hasn't run yet.
@@ -49,6 +75,9 @@ public static class MigrationRunner
 
         EnsureDatabase.For.PostgresqlDatabase(connectionString);
 
+        // Every script and C# step runs on a session marked as a migration's.
+        var session = ForMigrationSession(connectionString);
+
         // 10-minute per-script command timeout. The default 30s ceiling is
         // fine for the small test-container DBs but trips on a populated
         // database, where some migrations touch the full transactions table
@@ -56,8 +85,8 @@ public static class MigrationRunner
         // a populated txn_headers). Schema changes are off-line by design;
         // an upper bound large enough to fit any reasonable migration is
         // safer than a tight default that masquerades as a network failure.
-        var upgrader = DeployChanges.To
-            .PostgresqlDatabase(connectionString)
+        var builder = DeployChanges.To
+            .PostgresqlDatabase(session)
             .WithExecutionTimeout(TimeSpan.FromMinutes(10))
             .WithScriptsFromFileSystem(migrationsDirectory, new FileSystemScriptOptions
             {
@@ -73,8 +102,26 @@ public static class MigrationRunner
             // literals were already tolerated; this covers named delimiters too.)
             .WithVariablesDisabled()
             .JournalToPostgresqlTable("public", JournalTable)
-            .LogTo(new DbUpLoggerAdapter(logger))
-            .Build();
+            .LogTo(new DbUpLoggerAdapter(logger));
+
+        // The C# steps among the SQL files, each ordered by its name like them, directly
+        // after the script it belongs to (Registered says which apply here).
+        var steps = Registered(migrationsDirectory)
+            .Select(s => (Step: s, Script: s.Create(session, logger)))
+            .ToList();
+        foreach (var (step, script) in steps)
+            builder = builder.WithScript(step.Name, script);
+
+        var upgrader = builder.Build();
+
+        // When one upgrade runs several recompute steps, only the last computes: the
+        // values are then computed once, under the final schema and rule, and the earlier
+        // steps journal without computing (each would compute what the last recomputes).
+        var last = ComputingStep(
+            steps.Select(s => s.Step.Name).ToList(),
+            upgrader.GetScriptsToExecute().Select(s => s.Name).ToHashSet(StringComparer.Ordinal));
+        foreach (var (step, script) in steps)
+            script.Computes = step.Name == last;
 
         var result = upgrader.PerformUpgrade();
         if (!result.Successful)
@@ -87,6 +134,107 @@ public static class MigrationRunner
         logger.LogInformation(
             "Applied {Count} migration script(s) from {Directory}.",
             result.Scripts.Count(), migrationsDirectory);
+    }
+
+    /// <summary>
+    /// A migration step written in C#, journaled under <see cref="Name"/> directly after
+    /// the SQL script <see cref="AfterScript"/>.
+    /// </summary>
+    /// <remarks>Each one recomputes the stored memo-and-tags presentation: the rule it
+    /// stores is defined in C# only, so no SQL script may compute it.</remarks>
+    public sealed record CSharpStep(string Name, string AfterScript)
+    {
+        internal Func<string, ILogger, RecomputeStep> Create { get; init; } = null!;
+    }
+
+    /// <summary>A C# step's script: DbUp runs it in name order like a SQL file.</summary>
+    internal abstract class RecomputeStep : DbUp.Engine.IScript
+    {
+        /// <summary>False for every recompute step of a run but the last: it journals
+        /// without computing, because the last one recomputes everything anyway.</summary>
+        public bool Computes { get; set; } = true;
+
+        public abstract string ProvideScript(Func<System.Data.IDbCommand> dbCommandFactory);
+    }
+
+    /// <summary>
+    /// Every C# step this build ships, in journal order. The one list: the runner
+    /// registers from it, a whole-database restore counts its names as known migrations
+    /// (<see cref="KnownScriptNames"/>), and the test harnesses that apply scripts one by
+    /// one run it after the script it follows.
+    /// </summary>
+    public static IReadOnlyList<CSharpStep> CSharpSteps { get; } =
+    [
+        new(LegNotesBackfill.Name, LegNotesBackfill.AfterScript)
+        {
+            Create = (connectionString, logger) => new LegNotesBackfill(connectionString, logger),
+        },
+    ];
+
+    /// <summary>
+    /// Every journal name this build can have written to a database migrated from
+    /// <paramref name="migrationsDirectory"/>: its SQL files and its C# steps. A journal
+    /// row outside this set comes from a newer build.
+    /// </summary>
+    public static IReadOnlySet<string> KnownScriptNames(string migrationsDirectory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(migrationsDirectory);
+        var names = Directory.EnumerateFiles(migrationsDirectory, "*.sql")
+            .Select(Path.GetFileName)
+            .OfType<string>()
+            .ToHashSet(StringComparer.Ordinal);
+        names.UnionWith(CSharpSteps.Select(s => s.Name));
+        return names;
+    }
+
+    /// <summary>
+    /// Of the recompute steps <paramref name="steps"/>, the one that computes in a run
+    /// that executes <paramref name="toRun"/>: the last by name among those it runs. Null
+    /// when it runs none.
+    /// </summary>
+    internal static string? ComputingStep(IReadOnlyCollection<string> steps, IReadOnlySet<string> toRun) =>
+        steps.Where(toRun.Contains).Order(StringComparer.Ordinal).LastOrDefault();
+
+    /// <summary>
+    /// Run one C# step by name, outside DbUp and without journaling it: for a harness that
+    /// applies the SQL files itself, after it has applied the step's script.
+    /// </summary>
+    public static void RunCSharpStep(string name, string connectionString, ILogger logger)
+    {
+        var step = CSharpSteps.SingleOrDefault(s => s.Name == name)
+            ?? throw new ArgumentException($"No C# migration step named '{name}'.", nameof(name));
+        step.Create(ForMigrationSession(connectionString), logger).ProvideScript(() => throw new InvalidOperationException(
+            "A C# migration step does its work itself and runs no command of DbUp's."));
+    }
+
+    /// <summary>
+    /// The steps that belong to this run: those whose script is in the directory. A
+    /// directory staged before a step's script (an upgrade rehearsal) leaves the step
+    /// out, so it never runs against tables it lacks. A directory that holds a script
+    /// sorting after the step's script but not the script itself is refused: the step
+    /// would be silently skipped on a database that goes past it.
+    /// </summary>
+    private static IEnumerable<CSharpStep> Registered(string migrationsDirectory)
+    {
+        var scripts = Directory.EnumerateFiles(migrationsDirectory, "*.sql")
+            .Select(Path.GetFileName)
+            .OfType<string>()
+            .ToList();
+        foreach (var step in CSharpSteps)
+        {
+            if (scripts.Contains(step.AfterScript, StringComparer.Ordinal))
+            {
+                yield return step;
+                continue;
+            }
+            var later = scripts.Where(s => string.CompareOrdinal(s, step.AfterScript) > 0)
+                .Order(StringComparer.Ordinal).FirstOrDefault();
+            if (later is not null)
+                throw new InvalidOperationException(
+                    $"The migrations directory holds {later}, which sorts after {step.AfterScript}, "
+                    + $"but not {step.AfterScript} itself: the C# step {step.Name} that follows it "
+                    + "could not run. Restore the missing script.");
+        }
     }
 }
 

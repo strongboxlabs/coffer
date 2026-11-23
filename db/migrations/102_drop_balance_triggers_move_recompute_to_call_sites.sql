@@ -4,7 +4,8 @@
 --
 -- WHY (continued from ADR-0032 "triggers as last resort")
 --
--- The balance-trigger family has proven a continuous source of bugs:
+-- The balance-trigger family has these failure modes, each needing its
+-- own fix:
 --   * mig 026: leg-DELETE cascade-from-header race
 --   * mig 094: same race re-introduced under the header-walk family
 --   * mig 099: posted_at overrides were silently bypassed
@@ -14,8 +15,8 @@
 --     (Uncategorized leftover when the counter leg's account_id was
 --     UPDATEd in the same batch as a header is_merged_into UPDATE).
 --
--- Each fix added more trigger surface. Each new surface introduced
--- new edge cases. The structural answer is to stop hiding the
+-- Each fix adds trigger surface, and each new surface adds new edge
+-- cases. The structural answer is to stop hiding the
 -- recompute behind triggers entirely — make it explicit at every
 -- writer.
 --

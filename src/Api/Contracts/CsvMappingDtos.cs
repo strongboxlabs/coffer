@@ -49,14 +49,18 @@ public sealed record CsvMappingValidationResponse(
 /// What the document actually SAYS, once read.
 /// </summary>
 /// <remarks>
-/// <para>The validator already builds this to decide whether a document is usable, and
-/// used to throw it away. Returning it is what lets a saved mapping open in the guided
+/// <para>The validator already builds this to decide whether a document is usable.
+/// Returning it is what lets a saved mapping open in the guided
 /// form: the form cannot populate itself from YAML it has not parsed, and the honest
 /// answer to "who parses it" is the parser of record, not a second reader written in
 /// another language that could disagree with it.</para>
 /// <para>Named in the document's own vocabulary — <c>tab</c>, <c>signed</c> — rather
 /// than as enum members, so the round trip through the form cannot silently rename a
 /// value the document spells one way.</para>
+/// <para><c>DecimalSeparator</c> is the amount block's <c>amount.decimal_separator</c>
+/// (ADR-0114 D15), <c>point</c> or <c>comma</c>, required from schema version 2. A
+/// version-1 document has no such key and reads as <c>point</c>, the only reading a file
+/// ever had, so a saved layout loads back with its separator and is never re-guessed.</para>
 /// </remarks>
 public sealed record CsvMappingShapeDto(
     int Version,
@@ -71,4 +75,9 @@ public sealed record CsvMappingShapeDto(
     int? AmountColumn,
     bool AmountInvert,
     int? DebitColumn,
-    int? CreditColumn);
+    int? CreditColumn,
+    string DecimalSeparator = CsvMappingShapeDto.PointSeparator)
+{
+    /// <summary>The separator a version-1 document reads with.</summary>
+    public const string PointSeparator = "point";
+}

@@ -10,13 +10,13 @@
 -- `txn_headers.action`. After this slice, the editor and register
 -- read `header.action`; the leg column is gone.
 --
--- Audit before the move (found on a real ledger):
---   * Most investment headers have uniform action across all legs.
---   * Some MD-imported headers DO have conflicting leg actions —
+-- What the backfill has to handle:
+--   * An investment header whose legs agree on one action takes it.
+--   * MD-imported headers CAN have conflicting leg actions —
 --     specifically the buyx / sellx / divx shapes where the
 --     principal posting carries the buy/sell/dividend_cash action
 --     and a second posting carries 'transfer' (the cash source/sink
---     external account). Patterns, most common first:
+--     external account). The shapes:
 --         {buy,transfer}
 --         {sell,transfer}
 --         {dividend_cash,transfer}

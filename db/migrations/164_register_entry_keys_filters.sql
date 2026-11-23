@@ -2,7 +2,7 @@
 --
 -- The register is a sliding window (useWindowedRegister, ~1000 rows, keyset
 -- cursor). Client-side filtering only sees the loaded window and trips the
--- edge-load-suppression (#322), so any filter that must match across full
+-- edge-load-suppression, so any filter that must match across full
 -- history has to push into register_entry_keys so the cursor walks ONLY
 -- matching entries. This extends mig 158 with filter predicates + folds the
 -- status tabs (previously client-side) server-side.

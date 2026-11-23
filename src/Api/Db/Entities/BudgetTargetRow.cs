@@ -45,14 +45,30 @@ public sealed class BudgetTargetRow
     public DateOnly TargetMonth { get; set; }
 
     /// <summary>
-    /// The typed amount, <c>NUMERIC(19,2)</c>. Zero is meaningful ("I intend to spend
-    /// nothing here"); negatives are refused by a CHECK.
+    /// The typed amount, in <see cref="CurrencyCode"/>, <c>NUMERIC(20,3)</c> (migration
+    /// 301). Zero is meaningful ("I intend to spend nothing here"); negatives are refused
+    /// by a CHECK.
     ///
-    /// <para>Round NOWHERE else. The column is the single rounding point, and mig 209
-    /// exists only to undo a double-round introduced by a well-meaning <c>round(x, 4)</c>
-    /// upstream of a 2dp column three migrations earlier.</para>
+    /// <para>The column is no longer the rounding point (ADR-0114 D15). It holds up to 3
+    /// places for every currency, and no CHECK holds a row to its currency's places, because
+    /// a stored target that does not fit is kept. The API holds the rule instead: a typed
+    /// target that carries more places than its currency allows is refused
+    /// (<c>BudgetTargetsRepository</c>), and a figure the API computes, a category merge's
+    /// converted share, is rounded once at its currency's places, half away from zero,
+    /// before it is stored. Round nowhere else: mig 209 exists only to undo a double-round
+    /// introduced by a well-meaning <c>round(x, 4)</c> upstream of a 2dp column three
+    /// migrations earlier.</para>
     /// </summary>
     public decimal Amount { get; set; }
+
+    /// <summary>
+    /// The currency <see cref="Amount"/> was typed in: the ledger's reporting currency at
+    /// the time (migration 280, ADR-0114 D12). Stamped on every insert and every retype,
+    /// and never rewritten when the reporting currency changes, so a target typed in the
+    /// old currency converts at read time and changing the currency back reads it as
+    /// typed. <c>required</c>, and the column has no default: a writer cannot leave it out.
+    /// </summary>
+    public required string CurrencyCode { get; set; }
 
     public DateTime CreatedAt { get; set; }
 

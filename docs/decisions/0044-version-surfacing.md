@@ -9,8 +9,8 @@
 
 There was no way to see what's deployed. Each layer ships on its own
 cadence — DbUp migrations, the .NET API process, the SPA bundle — and
-when they drift (most often: the SPA hot-reloads after a merge but the
-API wasn't restarted) there was no signal. We want to *see* the running
+when they drift (for example, the SPA hot-reloads after a merge while the
+API keeps running the previous build) nothing signals it. We want to *see* the running
 versions, and tell at a glance whether one build is newer than another.
 
 ## Decision
@@ -50,16 +50,13 @@ Rationale: a container tag that doesn't match the build version inside it
 is a lie — the image says `0.2.0` while About says `0.1.0`. Semver must
 therefore move on every build.
 
-**Superseded caveat (fixed 2026-08-17).** This decision originally accepted
-that container images build `.git`-less — `.dockerignore` excludes it, and
-rightly so — leaving the build-number and SHA axes at `0` / `nogit` in every
-shipped image, with semver as the only axis carrying meaning. That held for
-as long as the axes were only feeding an About panel. It stopped being
-acceptable once reporting responses began carrying `engineVersion`
-(ADR-0063) to let a consumer tell a stale figure from a current one: an
-identity that reads `0.62.0+nogit` names the release but not the commit, so
-every image of a release is indistinguishable — which is the one job that
-field has. The values are now PASSED IN rather than discovered: the
+**Container builds pass the git values in (since 2026-08-17).** A container
+image builds `.git`-less — `.dockerignore` excludes it, and rightly so — so
+values discovered from git would read `0` / `nogit` in every image. Reporting
+responses carry `engineVersion` (ADR-0063) so a consumer can tell a stale
+figure from a current one, and an identity that reads `0.62.0+nogit` names
+the release but not the commit: every image of a release would be
+indistinguishable. The values are therefore PASSED IN rather than discovered: the
 stamping target skips a git call when the corresponding property is already
 set, the Dockerfile takes `SOURCE_COMMIT_SHA` / `_COUNT` / `_DATE` as build
 args, and the release workflow supplies them from the tagged commit (with

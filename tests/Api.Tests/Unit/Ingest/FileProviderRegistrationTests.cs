@@ -14,9 +14,8 @@ namespace Coffer.Api.Tests.Unit.Ingest;
 /// serves, and previews a file perfectly — then throws when the user presses Import,
 /// after they have chosen a file and an account.</para>
 ///
-/// <para>Which is precisely what the Fidelity provider did. It was found on a real
-/// import, because nothing in the build could see the map. This
-/// test is that missing pair of eyes: it reflects over every IFileProvider in the
+/// <para>Nothing in the build can see the map, so without this test only running
+/// an import exposes the gap. It reflects over every IFileProvider in the
 /// assembly, so a new one is covered the moment it exists rather than when someone
 /// remembers to add a case.</para>
 /// </remarks>

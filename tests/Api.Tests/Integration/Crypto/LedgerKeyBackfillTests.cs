@@ -10,36 +10,37 @@ namespace Coffer.Api.Tests.Integration.Crypto;
 /// <summary>
 /// Boot-time LEK backfill (<see cref="LedgersRepository.BackfillMissingWrappedLeksAsync"/>).
 ///
-/// <para>Migration 035 shipped <c>ledgers.wrapped_lek</c> nullable and promised "a
-/// subsequent migration sets NOT NULL once backfill is verified complete". No such
-/// migration could exist — wrapping a LEK needs the master KEK and SQL does not have
-/// it — so the backfill runs in the API at boot and the constraint has to follow in a
-/// later release.</para>
+/// <para>Migration 035 leaves <c>ledgers.wrapped_lek</c> nullable until backfill is
+/// complete. No migration can do that backfill — wrapping a LEK needs the master KEK
+/// and SQL does not have it — so the backfill runs in the API at boot and the NOT NULL
+/// constraint has to follow in a later release.</para>
 ///
-/// <para>The NULLs come from the Moneydance importer, a separate binary with no KEK
-/// that inserts <c>ledgers (id, name)</c> directly; the API's own
+/// <para>The NULLs come from the Moneydance import: the importer library writes through
+/// its own repository, which has no KEK and inserts <c>ledgers (id, name)</c> directly;
+/// the API's own
 /// <c>CreateWithOwnerAsync</c> has wrapped one in the ledger's INSERT since
 /// ADR-0026.</para>
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class LedgerKeyBackfillTests
+public sealed class LedgerKeyBackfillTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public LedgerKeyBackfillTests(PostgresFixture fixture) => _fixture = fixture;
+    public LedgerKeyBackfillTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static LedgerKeyService Keys => new(new MasterKey(new byte[32], "v1"));
 
     // The backfill only uses the service factory; the other two are constructor
     // requirements of the repository as a whole.
     private LedgersRepository NewRepository() =>
-        new(_fixture.NewDbContext(), _fixture.NewServiceFactory(), Keys, TimeProvider.System);
+        new(Db.NewDbContext(), Db.NewServiceFactory(), Keys, TimeProvider.System);
 
     /// <summary>A ledger inserted the way the importer does it — name only.</summary>
     private async Task<Guid> InsertLekLessLedgerAsync()
     {
         var id = Guid.NewGuid();
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         db.Ledgers.Add(new LedgerRow
         {
             Id = id,
@@ -52,7 +53,7 @@ public sealed class LedgerKeyBackfillTests
 
     private async Task<(byte[]? Wrapped, string? KekId)> ReadAsync(Guid ledgerId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.Ledgers.AsNoTracking().FirstAsync(l => l.Id == ledgerId);
         return (row.WrappedLek, row.LekKekId);
     }
@@ -67,7 +68,7 @@ public sealed class LedgerKeyBackfillTests
         // would be a silent key-rotation nobody asked for, and would break any
         // ciphertext sealed under the old LEK.
         var existing = Guid.NewGuid();
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             db.Ledgers.Add(new LedgerRow
             {
@@ -86,9 +87,9 @@ public sealed class LedgerKeyBackfillTests
 
         var wrapped = await NewRepository().BackfillMissingWrappedLeksAsync(Keys);
 
-        // At least the one we seeded — other tests in this collection may leave
-        // their own LEK-less rows behind, so an exact count would be flaky.
-        Assert.True(wrapped >= 1);
+        // Exactly the one LEK-less ledger: the template carries no ledger, so the
+        // already-keyed one is the only other row, and wrapping it would be the bug.
+        Assert.Equal(1, wrapped);
 
         var after = await ReadAsync(lekLess);
         Assert.NotNull(after.Wrapped);
@@ -108,7 +109,7 @@ public sealed class LedgerKeyBackfillTests
 
         var repo = NewRepository();
         var first = await repo.BackfillMissingWrappedLeksAsync(Keys);
-        Assert.True(first >= 1);
+        Assert.Equal(1, first);
 
         var second = await repo.BackfillMissingWrappedLeksAsync(Keys);
         Assert.Equal(0, second);

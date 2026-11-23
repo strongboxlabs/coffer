@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.ChangeTracking;
@@ -11,17 +11,17 @@ namespace Coffer.Api.Db;
 
 /// <summary>
 /// EF Core <c>SaveChangesInterceptor</c> that re-derives
-/// <c>holdings</c> + <c>lots</c> after every API write that touches
-/// investment-shape <c>txn_legs</c> (legs with
-/// <c>security_id IS NOT NULL</c> and <c>quantity IS NOT NULL</c>).
+/// <c>holdings</c>, <c>lots</c> and <c>realized_gains</c> after every API
+/// write that touches investment-shape <c>txn_legs</c> (legs with
+/// <c>security_id IS NOT NULL</c> and <c>quantity IS NOT NULL</c>), or
+/// changes a header field the FIFO walk reads
+/// (<see cref="RecomputeHeaderProperties"/>) on a header that has them.
 /// </summary>
 /// <remarks>
-/// <para><b>Why an interceptor (and not a Postgres trigger)</b>. The
-/// holdings trigger family (mig 068 / 073) was kept for two slices
-/// after mig 102 retired the balance triggers — different surface,
-/// narrower trigger set, no observed bugs. Mig 104 retires it anyway:
-/// the same arguments that made balance triggers a continuous source
-/// of bugs apply here in latent form (AFTER STATEMENT triggers see
+/// <para><b>Why an interceptor (and not a Postgres trigger)</b>. Mig 104
+/// retires the holdings trigger family (mig 068 / 073), as mig 102
+/// retired the balance triggers: the arguments against balance
+/// triggers apply here in latent form (AFTER STATEMENT triggers see
 /// per-statement transition tables, not post-SaveChanges end state;
 /// the recompute is invisible to the writer; duplicate dispatch
 /// logic).</para>
@@ -30,8 +30,9 @@ namespace Coffer.Api.Db;
 /// structure:</para>
 ///
 /// <list type="bullet">
-///   <item><description>Runs once per <c>SaveChanges</c>, after every
-///   DML statement in the batch has committed. The ChangeTracker
+///   <item><description>Runs once per <c>SaveChanges</c>, after the
+///   save's statements, inside its transaction
+///   (<see cref="LegNotesRecomputeInterceptor"/>). The ChangeTracker
 ///   gives a single consistent snapshot.</description></item>
 ///   <item><description>FK cascade DELETEs are handled explicitly: when
 ///   a header is being deleted, we read its legs from the live DB
@@ -42,23 +43,32 @@ namespace Coffer.Api.Db;
 ///   captures BOTH the OLD and NEW pairs so both holdings reconcile
 ///   — same dual-end handling the trigger pair did via separate
 ///   UPDATE-OLD and UPDATE-NEW triggers.</description></item>
+///   <item><description>A modified header counts as touching every
+///   investment leg it has when a property in
+///   <see cref="RecomputeHeaderProperties"/> changed: the walk leaves out
+///   a hidden or merged header, orders by its date and reads its action,
+///   so a soft-delete, a merge stamp or a re-date changes the
+///   position with no leg written. Its legs are read from the live DB
+///   before the save, as a deleted header's are.</description></item>
 ///   <item><description>Recompute is a regular SQL function call from
 ///   C#, not a trigger; it can't re-fire this interceptor.</description></item>
 /// </list>
 ///
 /// <para><b>Every writer's responsibility</b>. Any repository method
-/// that mutates <c>txn_legs</c> with investment-shape values MUST
-/// reach <c>SaveChangesAsync</c> on the shared <see cref="AppDbContext"/>
-/// for its writes (the standard pattern). No explicit recompute call
-/// is needed. The interceptor reads <see cref="ChangeTracker"/>
-/// entries, identifies the affected (account, security) pairs, and
-/// invokes <see cref="HoldingsRecomputeService"/> after the save
-/// commits.</para>
+/// that mutates <c>txn_legs</c> with investment-shape values, or a
+/// header field in <see cref="RecomputeHeaderProperties"/>, MUST reach
+/// <c>SaveChangesAsync</c> on the shared <see cref="AppDbContext"/> for
+/// its writes (the standard pattern). No explicit recompute call is
+/// needed. The interceptor reads <see cref="ChangeTracker"/> entries,
+/// identifies the affected (account, security) pairs, and invokes
+/// <see cref="HoldingsRecomputeService"/> after the save's statements,
+/// inside its transaction.</para>
 ///
-/// <para>If you ARE going to write an investment-leg mutation via
-/// raw SQL / Dapper / <c>ExecuteUpdateAsync</c> that bypasses the
-/// ChangeTracker, call <see cref="HoldingsRecomputeService"/>
-/// explicitly. The Moneydance importer already does this via
+/// <para>If you ARE going to write an investment-leg mutation, or one of
+/// those header fields, via raw SQL / Dapper / <c>ExecuteUpdateAsync</c>
+/// that bypasses the ChangeTracker, call
+/// <see cref="HoldingsRecomputeService"/> explicitly, as the bulk delete
+/// and bulk unhide do. The Moneydance importer already does this via
 /// <c>InvestmentRepository.RecomputeCostBasisAsync(ledgerId)</c> at
 /// end-of-import.</para>
 ///
@@ -69,22 +79,25 @@ namespace Coffer.Api.Db;
 /// the explicit-call pattern; mig 104 finishes the job for the
 /// txn_legs side.</para>
 ///
-/// <para>ADR-0032 (triggers as last resort) — mig 104.</para>
+/// <para>ADR-0032 (triggers as last resort) — mig 104; the header rule is
+/// its 2026-11-03 amendment.</para>
 /// </remarks>
 public sealed class HoldingsRecomputeInterceptor : SaveChangesInterceptor
 {
     // Per-DbContext snapshot of which (account, security) pairs need a
     // post-save recompute. Captured in SavingChangesAsync (where we
     // still see the OLD state of modified rows AND the to-be-cascaded
-    // legs of a doomed header); consumed in SavedChangesAsync.
-    private static readonly ConcurrentDictionary<DbContext, Snapshot> _pending = new();
+    // legs of a doomed header); consumed in SavedChangesAsync. Keyed
+    // weakly, as in LegDerivedRecomputeInterceptor: an entry a save leaves
+    // must not keep its context alive, and the next save replaces it.
+    private static readonly ConditionalWeakTable<DbContext, Snapshot> _pending = new();
 
     public override InterceptionResult<int> SavingChanges(
         DbContextEventData eventData, InterceptionResult<int> result)
     {
         if (eventData.Context is AppDbContext db)
         {
-            _pending[db] = CaptureSnapshotAsync(db, CancellationToken.None).GetAwaiter().GetResult();
+            _pending.AddOrUpdate(db, CaptureSnapshotAsync(db, CancellationToken.None).GetAwaiter().GetResult());
         }
         return base.SavingChanges(eventData, result);
     }
@@ -96,8 +109,8 @@ public sealed class HoldingsRecomputeInterceptor : SaveChangesInterceptor
     {
         if (eventData.Context is AppDbContext db)
         {
-            _pending[db] = await CaptureSnapshotAsync(db, cancellationToken)
-                .ConfigureAwait(false);
+            _pending.AddOrUpdate(db, await CaptureSnapshotAsync(db, cancellationToken)
+                .ConfigureAwait(false));
         }
         return await base.SavingChangesAsync(eventData, result, cancellationToken)
             .ConfigureAwait(false);
@@ -105,8 +118,9 @@ public sealed class HoldingsRecomputeInterceptor : SaveChangesInterceptor
 
     public override int SavedChanges(SaveChangesCompletedEventData eventData, int result)
     {
-        if (eventData.Context is AppDbContext db && _pending.TryRemove(db, out var snapshot))
+        if (eventData.Context is AppDbContext db && _pending.TryGetValue(db, out var snapshot))
         {
+            _pending.Remove(db);
             RecomputeAsync(db, snapshot, CancellationToken.None)
                 .GetAwaiter().GetResult();
         }
@@ -118,25 +132,40 @@ public sealed class HoldingsRecomputeInterceptor : SaveChangesInterceptor
         int result,
         CancellationToken cancellationToken = default)
     {
-        if (eventData.Context is AppDbContext db && _pending.TryRemove(db, out var snapshot))
+        if (eventData.Context is AppDbContext db && _pending.TryGetValue(db, out var snapshot))
         {
+            _pending.Remove(db);
             await RecomputeAsync(db, snapshot, cancellationToken).ConfigureAwait(false);
         }
         return await base.SavedChangesAsync(eventData, result, cancellationToken)
             .ConfigureAwait(false);
     }
 
+    // A failed save, and a cancelled one, drop the snapshot it captured.
     public override void SaveChangesFailed(DbContextErrorEventData eventData)
     {
-        if (eventData.Context is AppDbContext db) _pending.TryRemove(db, out _);
+        if (eventData.Context is AppDbContext db) _pending.Remove(db);
         base.SaveChangesFailed(eventData);
     }
 
     public override Task SaveChangesFailedAsync(
         DbContextErrorEventData eventData, CancellationToken cancellationToken = default)
     {
-        if (eventData.Context is AppDbContext db) _pending.TryRemove(db, out _);
+        if (eventData.Context is AppDbContext db) _pending.Remove(db);
         return base.SaveChangesFailedAsync(eventData, cancellationToken);
+    }
+
+    public override void SaveChangesCanceled(DbContextEventData eventData)
+    {
+        if (eventData.Context is AppDbContext db) _pending.Remove(db);
+        base.SaveChangesCanceled(eventData);
+    }
+
+    public override Task SaveChangesCanceledAsync(
+        DbContextEventData eventData, CancellationToken cancellationToken = default)
+    {
+        if (eventData.Context is AppDbContext db) _pending.Remove(db);
+        return base.SaveChangesCanceledAsync(eventData, cancellationToken);
     }
 
     // ----- snapshot capture -----
@@ -161,12 +190,20 @@ public sealed class HoldingsRecomputeInterceptor : SaveChangesInterceptor
             .Select(e => e.Entity.Id)
             .ToHashSet();
 
-        // Headers being deleted: their legs will cascade away. Capture
-        // (account, security) for the about-to-vanish investment legs
-        // BEFORE the DB delete by reading the still-live legs. Template
-        // headers are excluded — their legs never contributed to holdings.
-        var headersBeingDeleted = db.ChangeTracker.Entries<TxnHeaderRow>()
-            .Where(e => e.State == EntityState.Deleted && !e.Entity.IsRecurringTemplate)
+        // Headers whose every investment leg needs its position recomputed, read
+        // from the still-live legs BEFORE the save:
+        //  * a header being deleted: its legs will cascade away, so this is the
+        //    last moment they can be read;
+        //  * a header whose change the walk reads (RecomputeHeaderProperties):
+        //    hiding, unhiding, merging or re-dating it moves its shares into or
+        //    out of the position, or reorders it, with no leg written. A leg the
+        //    same save adds, moves or deletes is captured from its own entry.
+        // Template headers are excluded — their legs never contributed to holdings.
+        var headersToRead = db.ChangeTracker.Entries<TxnHeaderRow>()
+            .Where(e => !e.Entity.IsRecurringTemplate
+                && (e.State == EntityState.Deleted
+                    || (e.State == EntityState.Modified
+                        && e.Properties.Any(p => p.IsModified && RecomputeHeaderProperties.Contains(p.Metadata.Name)))))
             .Select(e => e.Entity.Id)
             .ToList();
 
@@ -175,15 +212,15 @@ public sealed class HoldingsRecomputeInterceptor : SaveChangesInterceptor
             CaptureLegEntry(entry, snap, templateHeaderIds);
         }
 
-        // For headers being deleted, look up their legs (which the
-        // ChangeTracker probably doesn't have if the cascade is
-        // DB-side) so the affected (account, security) set survives.
-        // Filter to investment-shape legs at the DB query — bank legs
-        // (security_id IS NULL) don't affect holdings.
-        if (headersBeingDeleted.Count > 0)
+        // Look up those headers' legs (which the ChangeTracker usually doesn't
+        // have: a cascade is DB-side, and a header edit loads no legs) so the
+        // affected (account, security) set survives. Filter to investment-shape
+        // legs at the DB query — bank legs (security_id IS NULL) don't affect
+        // holdings.
+        if (headersToRead.Count > 0)
         {
             var legs = await db.TxnLegs.AsNoTracking()
-                .Where(l => headersBeingDeleted.Contains(l.HeaderId)
+                .Where(l => headersToRead.Contains(l.HeaderId)
                     && l.SecurityId != null
                     && l.Quantity != null)
                 .Select(l => new { l.AccountId, l.SecurityId })
@@ -195,6 +232,27 @@ public sealed class HoldingsRecomputeInterceptor : SaveChangesInterceptor
 
         return snap;
     }
+
+    /// <summary>
+    /// The <see cref="TxnHeaderRow"/> properties the FIFO walk reads that can change
+    /// after a header is inserted. A modified header with any of them changed touches
+    /// the position of every investment leg it has.
+    /// </summary>
+    /// <remarks>
+    /// Held to the recompute SQL by a guard test: every header column
+    /// <c>recompute_holdings_cost_basis</c> and the walk it persists name, other than
+    /// one fixed for the life of the row, is here, and nothing else is.
+    /// </remarks>
+    internal static readonly IReadOnlySet<string> RecomputeHeaderProperties = new HashSet<string>(StringComparer.Ordinal)
+    {
+        // The walk's event order and its as-of bound.
+        nameof(TxnHeaderRow.PostedAt),
+        // The walk leaves out a hidden and a merged header (ADR-0040, mig 163).
+        nameof(TxnHeaderRow.IsHidden),
+        nameof(TxnHeaderRow.IsMergedInto),
+        // A transfer_shares disposal books no realized gain (ADR-0065).
+        nameof(TxnHeaderRow.Action),
+    };
 
     private static void CaptureLegEntry(
         EntityEntry<TxnLegRow> entry,

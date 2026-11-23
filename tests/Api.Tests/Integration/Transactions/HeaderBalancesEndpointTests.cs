@@ -16,11 +16,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// balance row on the specified account.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class HeaderBalancesEndpointTests
+public sealed class HeaderBalancesEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public HeaderBalancesEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public HeaderBalancesEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -36,11 +37,11 @@ public sealed class HeaderBalancesEndpointTests
     [Fact]
     public async Task Returns_balance_after_and_net_amount_for_requested_headers()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> createAsync(int day, decimal amount)
@@ -86,10 +87,10 @@ public sealed class HeaderBalancesEndpointTests
     [Fact]
     public async Task Empty_header_id_list_returns_empty_array_without_querying()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -107,11 +108,11 @@ public sealed class HeaderBalancesEndpointTests
         // The same header has balance rows on multiple accounts (cash
         // leg on bank, counterparty leg on category). The bulk lookup
         // returns ONLY the row for the requested account.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var createResp = await client.PostAsJsonAsync(
@@ -146,8 +147,8 @@ public sealed class HeaderBalancesEndpointTests
     [Fact]
     public async Task Returns_422_when_account_id_missing()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -159,11 +160,11 @@ public sealed class HeaderBalancesEndpointTests
     [Fact]
     public async Task Returns_422_when_account_in_another_ledger()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var otherLedger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var otherLedger = await SyntheticLedger.CreateAsync(Db);
         var otherBank = await otherLedger.AddBankAccountAsync("checking");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(

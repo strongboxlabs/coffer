@@ -1,13 +1,11 @@
 -- =============================================================================
--- 257 — re-issue text Postgres stores, after a privacy rewrite of its source
+-- 257 — re-issue text Postgres stores, so an upgraded install matches a fresh one
 -- =============================================================================
 --
 -- WHY
 -- ---
--- The repo's prose carries no account names and no amounts, real or invented
--- (a preflight gate enforces the shape). Making it so meant
--- rewriting comments in shipped migrations, which engineering-standards.md §3.1
--- allows for comments only. A comment in a migration's header is gone once the
+-- Comments in shipped migrations may be edited (engineering-standards.md §3.1
+-- allows it for comments only). A comment in a migration's header is gone once the
 -- script has run, so editing it changes nothing an install holds. Two kinds of
 -- text are different, because Postgres keeps them:
 --
@@ -42,9 +40,8 @@ COMMENT ON FUNCTION recompute_holdings_cost_basis(UUID, UUID, UUID) IS
     'ADR-0064 FIFO basis writer. Since mig 202 a thin persist over holdings_fifo_walk, '
     'so the algorithm is shared with the as-of read path and the two cannot drift. '
     'Bounds what it stores at each column''s OWN scale (money 2dp per mig 182, shares '
-    '12dp) — mig 205 rounded money to 4dp believing these columns were unbounded, but '
-    'mig 182 had already narrowed them to NUMERIC(19,2), so that rounded twice and '
-    'shifted some disposals by a cent (mig 209).';
+    '12dp). Rounding money to 4dp first, as mig 205 did, rounds twice against these '
+    'NUMERIC(19,2) columns and can shift a disposal by a cent (fixed in mig 209).';
 
 
 -- From 222_feed_csv_mappings.sql.
@@ -271,9 +268,9 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     -- Ceiling for the unchunked path only. Two uuid columns per row, so even at
-    -- this many rows the aggregate is tens of MB — far from the multi-GB peak
-    -- that mig 193 set out to eliminate — but it fails rather than degrading
-    -- quietly.
+    -- this many rows the aggregate is tens of MB — bounded, unlike the
+    -- whole-payload aggregate mig 193 set out to eliminate — but it fails rather
+    -- than degrading quietly.
     c_unchunked_max CONSTANT bigint := 500000;
 
     v_has_id  boolean;

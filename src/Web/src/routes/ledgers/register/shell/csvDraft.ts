@@ -1,14 +1,16 @@
+import type { CsvDecimalSeparatorName } from '@/lib/types';
+
 import { toYaml, type WizardChoices } from './csvSniff';
 
 /**
  * Everything the mapping step remembers, and the two functions that read it.
  *
- * <b>Owned by the import dialog, not by the step.</b> It used to be seven `useState`
- * calls inside `CsvMappingStep`, and the dialog renders its steps conditionally — so
- * moving to the preview UNMOUNTED the wizard and destroyed all of it. Back from a bad
- * preview landed on the file picker with the file still listed, looking untouched, and
- * re-entering gave a freshly sniffed document: the hand-edited YAML gone, the name box
- * empty. There was no route from a bad preview back to the mapping that caused it.
+ * <b>Owned by the import dialog, not by the step.</b> The dialog renders its steps
+ * conditionally, so state held in `useState` calls inside `CsvMappingStep` would be
+ * destroyed when moving to the preview UNMOUNTS the wizard. Back from a bad preview
+ * would land on the file picker with the file still listed, looking untouched, and
+ * re-entering would give a freshly sniffed document: the hand-edited YAML gone, the name
+ * box empty — no route from a bad preview back to the mapping that caused it.
  *
  * In its own module because a file that exports both a component and the values around
  * it cannot be hot-reloaded, which the linter says and the gate enforces.
@@ -41,6 +43,15 @@ export interface CsvDraft {
      * with the document is what says "re-read before showing the form".
      */
     parsedFrom: string | null;
+    /**
+     * The decimal separator guessed from the sample when this layout was first made, or
+     * null when nothing was guessed: a saved layout keeps the separator it was saved
+     * with and is never guessed again (ADR-0114 D15).
+     *
+     * Kept apart from `choices` so the step can say "Guessed from the sample." only
+     * while the select still shows the guess, on a layout that is not saved.
+     */
+    guessedSeparator: CsvDecimalSeparatorName | null;
 }
 
 export const EMPTY_CSV_DRAFT: CsvDraft = {
@@ -50,7 +61,16 @@ export const EMPTY_CSV_DRAFT: CsvDraft = {
     tab: 'guided',
     name: '',
     parsedFrom: null,
+    guessedSeparator: null,
 };
+
+/** Whether the step says "Guessed from the sample." under the decimal separator: on a
+ *  layout not yet saved, while the select still holds the guess (ADR-0114 D15). */
+export function separatorIsGuess(draft: CsvDraft): boolean {
+    return draft.source.kind === 'new'
+        && draft.guessedSeparator !== null
+        && draft.choices?.decimalSeparator === draft.guessedSeparator;
+}
 
 /** The document this draft describes. */
 export function csvDraftYaml(draft: CsvDraft): string {

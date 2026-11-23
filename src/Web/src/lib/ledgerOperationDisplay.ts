@@ -8,6 +8,41 @@ import type { LedgerOperationSummary } from './types';
 /** Bootstrap "system" user (migration 014) — automated/scheduled runs. */
 export const SYSTEM_USER_ID = '00000000-0000-0000-0000-000000000001';
 
+/** The provider key of a standalone exchange-rate and benchmark backfill's run
+ *  (ADR-0114 D11): a quote-family row with no prices. */
+export const MARKET_SERIES_BACKFILL ='market-series-backfill';
+
+/** The provider key of a Demo's marker (ADR-0115 D9): the row that records which of the
+ *  Demo's examples were added. Its details hold one entry per examples step, 1 when the
+ *  step was added. */
+export const DEMO_EXAMPLES = 'demo';
+
+/** How many examples steps a Demo has: the server's step list, whose details a marker
+ *  may record only part of while it runs. */
+export const DEMO_EXAMPLE_STEPS = 11;
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+/**
+ * What a quote run stored besides prices (ADR-0114 D5, D11), each part only when it is
+ * not zero: exchange-rate days, benchmark days, securities whose currency was confirmed,
+ * and fetched prices re-stamped to it. The Activity log and the Securities refresh
+ * notice read the same counts, from `details` and from the run's outcome.
+ */
+export function marketSeriesParts(c: {
+    ratesInserted?: number;
+    benchmarkDaysInserted?: number;
+    currenciesConfirmed?: number;
+    rowsRestamped?: number;
+}): string[] {
+    const parts: string[] = [];
+    if ((c.ratesInserted ?? 0) > 0) parts.push(plural(c.ratesInserted!, 'rate day', 'rate days'));
+    if ((c.benchmarkDaysInserted ?? 0) > 0) parts.push(plural(c.benchmarkDaysInserted!, 'benchmark day', 'benchmark days'));
+    if ((c.currenciesConfirmed ?? 0) > 0) parts.push(plural(c.currenciesConfirmed!, 'currency confirmed', 'currencies confirmed'));
+    if ((c.rowsRestamped ?? 0) > 0) parts.push(`${c.rowsRestamped!} re-stamped`);
+    return parts;
+}
+
 export function ledgerOperationLabel(key: string): string {
     switch (key) {
         case 'simplefin':
@@ -16,14 +51,39 @@ export function ledgerOperationLabel(key: string): string {
             return 'OFX';
         case 'qif':
             return 'QIF';
+        case 'csv-generic':
+            return 'CSV import';
+        case 'csv-fidelity':
+            return 'Fidelity CSV import';
+        // The key migration 132 gave every file run recorded before runs carried their
+        // reader's key; no run is recorded under it since.
         case 'file':
             return 'File import';
         case 'moneydance':
             return 'Moneydance import';
+        case DEMO_EXAMPLES:
+            return 'Demo examples';
         case 'quote-refresh':
             return 'Quote refresh';
+        case MARKET_SERIES_BACKFILL:
+            return 'Rates and benchmarks backfill';
         case 'snapshot-restore':
             return 'Snapshot restore';
+        default:
+            return key;
+    }
+}
+
+/** The name of the source a run's error came from (`providerKey`, migration 303). An
+ *  unknown key shows as itself rather than as nothing. */
+export function errorSourceLabel(key: string): string {
+    switch (key) {
+        case 'simplefin-holdings':
+            return 'SimpleFIN holdings';
+        case 'yahoo':
+            return 'Yahoo Finance';
+        case 'market-series':
+            return 'Rates and benchmarks';
         default:
             return key;
     }
@@ -35,8 +95,10 @@ export function triggerLabel(via: string): string {
             return 'manual';
         case 'file-upload':
             return 'upload';
+        // Only a SimpleFIN sync triggers a run after it: the quote refresh that reads
+        // the holdings the sync just fetched (ADR-0033 §5).
         case 'post-sync':
-            return 'after sync';
+            return 'after SimpleFIN sync';
         case 'scheduled':
             return 'scheduled';
         default:
@@ -96,7 +158,23 @@ export function summarizeLedgerOperation(run: LedgerOperationSummary): string {
         if (duration > 0) parts.push(`${duration}s`);
         return parts.join(' · ');
     }
+    if (run.providerKey === DEMO_EXAMPLES) {
+        // A Demo's marker counts no rows: it records each examples step as added (1) or
+        // not (0), and the ones not added, with why, are in its detail.
+        const done = Object.values(d).filter((value) => value === 1).length;
+        return `${done} of ${DEMO_EXAMPLE_STEPS} example steps added`;
+    }
     if (run.family === 'quote') {
+        const series = marketSeriesParts({
+            ratesInserted: d.rates_inserted,
+            benchmarkDaysInserted: d.benchmark_days_inserted,
+            currenciesConfirmed: d.currencies_confirmed,
+            rowsRestamped: d.rows_restamped,
+        });
+        // A standalone backfill stores no prices, so it leads with what it did store.
+        if (run.providerKey === MARKET_SERIES_BACKFILL) {
+            return series.length > 0 ? series.join(' · ') : 'Nothing new';
+        }
         const parts = [`${d.prices_inserted ?? 0} new`];
         if ((d.prices_updated ?? 0) > 0) parts.push(`${d.prices_updated} updated`);
         if ((d.securities_unresolved ?? 0) > 0)
@@ -107,6 +185,7 @@ export function summarizeLedgerOperation(run: LedgerOperationSummary): string {
         if ((d.prices_from_fetch ?? 0) > 0) from.push(`Yahoo ${d.prices_from_fetch}`);
         if ((d.prices_from_simplefin ?? 0) > 0) from.push(`SimpleFIN ${d.prices_from_simplefin}`);
         if (from.length > 0) parts.push(`from ${from.join(', ')}`);
+        parts.push(...series);
         return parts.join(' · ');
     }
     const parts = [`${d.txns_inserted ?? 0} new`];

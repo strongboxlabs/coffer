@@ -6,10 +6,9 @@
 -- in another in the FIFO walk that decides which lots a sale consumes, which
 -- cost basis it books and which reporting period the gain lands in.
 --
--- The gap was already live, not hypothetical: an investment merge stamps a
--- posted_at override on the SURVIVOR (it adopts the folded row's date), so
--- every merge winner already had a displayed date its cost basis did not know
--- about.
+-- An investment merge stamps a posted_at override on the SURVIVOR (it adopts
+-- the folded row's date), so every merge winner has a displayed date its cost
+-- basis does not know about.
 --
 -- WHY ALL THREE FUNCTIONS. holdings_fifo_walk is the one with the bug, but
 -- moving it alone would make the as-of feeders disagree with it: a position
@@ -29,9 +28,8 @@
 -- legs, which would double-count every holdings leg against its cash twin.
 --
 -- These bodies were extracted from the LIVE catalogue with pg_get_functiondef
--- and edited in place -- NOT copied forward from an older migration. Migration
--- 227 records why: copying 163 forward silently reverted a fix that 209 had to
--- undo.
+-- and edited in place -- NOT copied forward from an older migration, which
+-- silently reverts every fix made since (see 227).
 
 -- 1 of 3: the FIFO walk -- cost basis, lots, realized gains.
 CREATE OR REPLACE FUNCTION public.holdings_fifo_walk(p_account_id uuid, p_security_id uuid, p_as_of timestamp with time zone DEFAULT NULL::timestamp with time zone, OUT o_quantity numeric, OUT o_cost_basis numeric, OUT o_lots holdings_fifo_lot[], OUT o_gains holdings_fifo_gain[])

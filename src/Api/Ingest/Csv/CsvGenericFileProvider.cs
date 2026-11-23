@@ -2,7 +2,6 @@ using System.Globalization;
 using System.Text;
 
 using CsvHelper;
-using CsvHelper.Configuration;
 
 namespace Coffer.Api.Ingest.Csv;
 
@@ -71,14 +70,9 @@ public sealed class CsvGenericFileProvider : IFileProvider
             : rows;
 
         var transactions = new List<IngestedTransaction>();
-        for (var i = 0; i < usable.Count; i++)
+        foreach (var (lineNumber, row) in usable)
         {
             cancellationToken.ThrowIfCancellationRequested();
-
-            // 1-based, and counting the header rows the reader already consumed, so the
-            // number in an error message is the line the author sees in their editor.
-            var lineNumber = mapping.HeaderRows + i + 1;
-            var row = usable[i];
 
             // A wholly blank line is skipped in silence. Exports end with one constantly,
             // and reporting it as a problem would train the reader to ignore warnings.
@@ -101,39 +95,64 @@ public sealed class CsvGenericFileProvider : IFileProvider
 
     // ----- reading ------------------------------------------------------------
 
-    private static List<string[]> ReadRows(Stream payload, CsvMapping mapping)
+    /// <summary>
+    /// Every record after the header rows, with the 1-based line of the file it starts on.
+    /// </summary>
+    /// <remarks>
+    /// The line is the reader's, counting every line of the file: header rows, blank lines,
+    /// and the lines inside a quoted field that spans several. So the number in an error
+    /// message is the line the author sees in their editor.
+    /// </remarks>
+    private static List<(int Line, string[] Fields)> ReadRows(Stream payload, CsvMapping mapping)
     {
-        // detectEncodingFromByteOrderMarks: the first real target file is UTF-8 WITH a
-        // BOM, and a BOM read as data puts three invisible bytes on the front of the
-        // first field — which is the date, so every row would fail to parse and the file
-        // would look corrupt.
+        // detectEncodingFromByteOrderMarks: an export can be UTF-8 WITH a BOM, and a
+        // BOM read as data puts three invisible bytes on the front of the first field —
+        // which, when that column is the date, makes every row fail to parse and the
+        // file look corrupt.
         using var reader = new StreamReader(
             payload, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, leaveOpen: true);
 
-        var config = new CsvConfiguration(CultureInfo.InvariantCulture)
+        // Every option that decides how the file splits into records and fields is set,
+        // including those equal to CsvHelper's default: several of its defaults would
+        // change what a mapping means, and none may change with a package update.
+        var options = new CsvReaderOptions
         {
-            Delimiter = mapping.Separator.ToString(),
-            // The mapping addresses columns by INDEX, because the first real target file
-            // has no header row to name them by. Header handling is therefore purely
+            // Never detected. A detected separator overrides the mapping, and an Excel
+            // `sep=` first line would be consumed as an instruction instead of counted
+            // as a header row.
+            Separator = mapping.Separator,
+            DetectSeparatorHint = false,
+            // The mapping addresses columns by INDEX, because a file need not have a
+            // header row to name them by. Header handling is therefore purely
             // "skip this many lines".
-            HasHeaderRecord = false,
+            HasHeader = false,
+            // A blank line is a record, so header_rows counts it like the author does.
+            SkipEmptyLines = false,
+            // A '#' is data: a payee or a reference can start with one.
+            CommentPrefix = null,
+            // RFC 4180: a quote opens a field only as its first character, two quotes are
+            // one, and a quoted field may span lines. A backslash is data.
+            Mode = CsvMode.Rfc4180,
+            Quote = '"',
+            AllowLineBreaksInQuotes = true,
+            // Whitespace is the field's. ParseRow trims what it reads.
+            TrimWhitespace = false,
             // A short row is a data problem to report per row, not a reason to abandon
             // the file: one malformed line should not cost every other line.
-            BadDataFound = null,
-            MissingFieldFound = null,
-            IgnoreBlankLines = false,
-            TrimOptions = TrimOptions.None,
+            MalformedData = CsvMalformedDataHandling.Recover,
+            FieldCountMismatch = CsvFieldCountHandling.Allow,
+            TrackLineNumbers = true,
         };
 
-        using var csv = new CsvReader(reader, config);
-        var rows = new List<string[]>();
+        using var csv = CsvReader.Create(reader, options, leaveOpen: true);
+        var rows = new List<(int Line, string[] Fields)>();
         var skipped = 0;
         while (csv.Read())
         {
             if (skipped < mapping.HeaderRows) { skipped++; continue; }
-            var record = new string[csv.Parser.Count];
-            for (var i = 0; i < csv.Parser.Count; i++) record[i] = csv.Parser[i] ?? string.Empty;
-            rows.Add(record);
+            var record = new string[csv.FieldCount];
+            for (var i = 0; i < csv.FieldCount; i++) record[i] = csv.GetString(i);
+            rows.Add((checked((int)csv.LineNumber), record));
         }
         return rows;
     }
@@ -156,12 +175,21 @@ public sealed class CsvGenericFileProvider : IFileProvider
         }
 
         decimal amount;
+        var separator = mapping.DecimalSeparator;
         if (mapping.AmountShape == CsvAmountShape.Signed)
         {
             var raw = Field(row, mapping.AmountColumn!.Value);
-            if (!TryMoney(raw, out amount))
+            var cell = ReadMoney(raw, separator, out amount);
+            // A cell with no digits reads with neither separator, so the message does
+            // not name one: switching the setting cannot fix that row.
+            if (cell == MoneyCell.Empty)
             {
                 errors.Add(Problem(lineNumber, $"'{raw?.Trim()}' is not an amount."));
+                return null;
+            }
+            if (cell == MoneyCell.Unreadable)
+            {
+                errors.Add(NotAnAmount(lineNumber, raw, separator));
                 return null;
             }
             // The whole point of the flag. The file signs from the ISSUER's perspective
@@ -175,8 +203,27 @@ public sealed class CsvGenericFileProvider : IFileProvider
         {
             var debitRaw = Field(row, mapping.DebitColumn!.Value);
             var creditRaw = Field(row, mapping.CreditColumn!.Value);
-            var hasDebit = TryMoney(debitRaw, out var debit) && debit != 0m;
-            var hasCredit = TryMoney(creditRaw, out var credit) && credit != 0m;
+            var debitCell = ReadMoney(debitRaw, separator, out var debit);
+            var creditCell = ReadMoney(creditRaw, separator, out var credit);
+
+            // A cell with digits that does not read is a row error, not an empty side: a
+            // decimal comma read as absent would land the row on the other column's
+            // value, or report it as having none, and neither names the real problem.
+            // A cell with no digits at all (blank, a lone dash, a bare symbol) is the
+            // empty side, as exports pad the unused column with one.
+            if (debitCell == MoneyCell.Unreadable)
+            {
+                errors.Add(NotAnAmount(lineNumber, debitRaw, separator));
+                return null;
+            }
+            if (creditCell == MoneyCell.Unreadable)
+            {
+                errors.Add(NotAnAmount(lineNumber, creditRaw, separator));
+                return null;
+            }
+
+            var hasDebit = debitCell == MoneyCell.Amount && debit != 0m;
+            var hasCredit = creditCell == MoneyCell.Amount && credit != 0m;
 
             if (hasDebit && hasCredit)
             {
@@ -252,42 +299,114 @@ public sealed class CsvGenericFileProvider : IFileProvider
     private static string? Field(string[] row, int oneBasedColumn) =>
         oneBasedColumn >= 1 && oneBasedColumn <= row.Length ? row[oneBasedColumn - 1] : null;
 
+    /// <summary>What an amount cell holds, once read.</summary>
+    internal enum MoneyCell
+    {
+        /// <summary>No digits at all: blank, a lone sign, a bare currency symbol.</summary>
+        Empty,
+
+        /// <summary>A figure, read one way only.</summary>
+        Amount,
+
+        /// <summary>Digits that do not read as an amount with the layout's separator.</summary>
+        Unreadable,
+    }
+
     /// <summary>
-    /// Money with the decoration real exports put around it.
+    /// Money with the decoration an export can put around it, read with the layout's
+    /// decimal separator (ADR-0114 D15).
     /// </summary>
     /// <remarks>
-    /// Strips everything that is not a digit, sign, separator or point — a currency
-    /// symbol, a space, a stray non-breaking space. Handles accounting parentheses,
-    /// which mean negative. Deliberately not configurable: there is exactly one right
-    /// answer here and a setting would only be a way to get it wrong.
+    /// <para>
+    /// Strips everything that is not a digit, sign, point or comma: a currency symbol, a
+    /// space, a no-break space. Handles accounting parentheses, which mean negative, and
+    /// one sign at either end.
+    /// </para>
+    /// <para>
+    /// <b>The separator decides, never the cell.</b> The layout's decimal character may
+    /// appear once; the other character groups thousands and is accepted only as whole
+    /// groups of three digits after a first group of one to three, or as lakh grouping
+    /// (a first group of one or two, groups of two, a last group of three), which
+    /// invariant parsing always read for a version-1 layout. The first group never starts
+    /// with a zero. This is <see cref="AmountGrouping"/>, the rule the QIF reader shares.
+    /// Anything else is <see cref="MoneyCell.Unreadable"/> rather than read
+    /// some other way: invariant number parsing took a comma followed by two digits as
+    /// grouping and read a decimal-comma cell as a far larger figure, silently, which is
+    /// the defect this replaces.
+    /// </para>
+    /// <para>
+    /// The figure keeps the scale it was written with, trailing zeros included, so the
+    /// bank's figure as sent is what an import that rounds records.
+    /// </para>
     /// </remarks>
-    internal static bool TryMoney(string? raw, out decimal value)
+    internal static MoneyCell ReadMoney(string? raw, CsvDecimalSeparator separator, out decimal value)
     {
         value = 0m;
-        if (string.IsNullOrWhiteSpace(raw)) return false;
+        if (string.IsNullOrWhiteSpace(raw)) return MoneyCell.Empty;
 
         var text = raw.Trim();
-        var negative = text.StartsWith('(') && text.EndsWith(')');
-        if (negative) text = text[1..^1];
+        var parenthesised = text.Length >= 2 && text.StartsWith('(') && text.EndsWith(')');
+        if (parenthesised) text = text[1..^1];
 
-        var cleaned = new StringBuilder(text.Length);
+        var kept = new StringBuilder(text.Length);
         foreach (var c in text)
         {
             if (char.IsAsciiDigit(c) || c == '-' || c == '+' || c == '.' || c == ',')
-                cleaned.Append(c);
+                kept.Append(c);
         }
-        if (cleaned.Length == 0) return false;
+        var body = kept.ToString();
+        if (!body.Any(char.IsAsciiDigit)) return MoneyCell.Empty;
 
-        if (!decimal.TryParse(cleaned.ToString(),
-                NumberStyles.Number | NumberStyles.AllowLeadingSign,
+        // One sign, leading or trailing; a sign anywhere else is not a figure.
+        var minus = false;
+        if (body[0] is '-' or '+')
+        {
+            minus = body[0] == '-';
+            body = body[1..];
+        }
+        else if (body[^1] is '-' or '+')
+        {
+            minus = body[^1] == '-';
+            body = body[..^1];
+        }
+        if (body.Contains('-', StringComparison.Ordinal) || body.Contains('+', StringComparison.Ordinal))
+            return MoneyCell.Unreadable;
+
+        var (decimalChar, groupChar) = separator == CsvDecimalSeparator.Comma ? (',', '.') : ('.', ',');
+        var at = body.IndexOf(decimalChar, StringComparison.Ordinal);
+        if (at >= 0 && body.IndexOf(decimalChar, at + 1) >= 0) return MoneyCell.Unreadable;
+
+        var whole = at >= 0 ? body[..at] : body;
+        var fraction = at >= 0 ? body[(at + 1)..] : "";
+        if (fraction.Contains(groupChar, StringComparison.Ordinal)) return MoneyCell.Unreadable;
+
+        if (whole.Contains(groupChar, StringComparison.Ordinal))
+        {
+            // The grouping rule QIF reads by too (AmountGrouping).
+            if (!AmountGrouping.IsGrouped(whole, groupChar)) return MoneyCell.Unreadable;
+            whole = whole.Replace(groupChar.ToString(), string.Empty, StringComparison.Ordinal);
+        }
+
+        var canonical = (whole.Length == 0 ? "0" : whole) + (fraction.Length == 0 ? "" : "." + fraction);
+        if (!decimal.TryParse(canonical, NumberStyles.AllowDecimalPoint,
                 CultureInfo.InvariantCulture, out value))
         {
-            return false;
+            // Only overflow reaches here: the canonical text is digits and one point.
+            return MoneyCell.Unreadable;
         }
 
-        if (negative) value = -Math.Abs(value);
-        return true;
+        if (minus || parenthesised) value = -Math.Abs(value);
+        return MoneyCell.Amount;
     }
+
+    /// <summary>
+    /// The row error for an amount cell that does not read, naming the separator it was
+    /// read with (ADR-0114 D15, the CSV wizard paragraph).
+    /// </summary>
+    private static IngestError NotAnAmount(int line, string? raw, CsvDecimalSeparator separator) =>
+        Problem(line, $"'{raw?.Trim()}' is not an amount with "
+            + (separator == CsvDecimalSeparator.Comma ? "a comma" : "a point")
+            + " as the decimal separator.");
 
     private static IngestError Problem(int line, string message) =>
         new(Code: "csv_row_unreadable",

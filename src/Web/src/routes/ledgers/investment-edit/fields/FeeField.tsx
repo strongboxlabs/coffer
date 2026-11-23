@@ -1,11 +1,17 @@
 import { useCallback, useId } from 'react';
 import { cn } from '@/lib/cn';
 import { FieldLabel } from '@/components/ui/FieldLabel';
+import { useFieldSizeClass } from '@/components/ui/fieldSize';
+import { MoneyInput } from '@/components/ui/MoneyInput';
+import { parseMoneyText } from './moneyText';
 import type {
     AccountSummary,
     FrequentCounterpartiesResponse,
 } from '@/lib/types';
 import { AccountCategoryPicker } from '@/components/register/AccountCategoryPicker';
+
+/** The fee amount's width before its currency's symbol (the `w-fixed-96px` token). */
+const FEE_FIGURE_WIDTH = 'var(--spacing-fixed-96px)';
 
 interface FeeFieldProps {
     /** All accounts; the picker filters to expense-kind categories
@@ -20,10 +26,14 @@ interface FeeFieldProps {
      * the validation function enforces account ⇔ amount together. */
     feeAmount: number | null;
     onChangeFeeAmount: (next: number | null) => void;
+    /** The brokerage's currency: the fee amount's symbol, step and rounding
+     *  (ADR-0114 D14, D15). Null while the accounts load. */
+    currency: string | null;
     /** Single error string covering the paired-presence rule
      * (rendered under the amount input). */
     error?: string | null;
-    disabled?: boolean;
+    /** The save is in flight: both fields keep focus and refuse input (pending.ts). */
+    pending?: boolean;
     /** Optional contextual hint (e.g., "Adds to cost basis" when
      * the brokerage's is_trade_commission flag is on). Rendered as
      * helper text under the amount when there's no error. */
@@ -39,9 +49,10 @@ interface FeeFieldProps {
  */
 export function FeeField({
     accounts, frequent, feeAccountId, onChangeFeeAccount,
-    feeAmount, onChangeFeeAmount, error, disabled, contextualHint,
+    feeAmount, onChangeFeeAmount, currency, error, pending, contextualHint,
 }: FeeFieldProps) {
     const amountId = useId();
+    const sizeClass = useFieldSizeClass();
     // Kind is DISCLOSED, not filtered (ADR-0017). A fee is normally an expense
     // category and the picker says so on every row, but what makes this leg a
     // fee is its posting_role — stamped from the header, netted against return
@@ -66,34 +77,29 @@ export function FeeField({
                         onChangeId={onChangeFeeAccount}
                         placeholder="Fee category…"
                         ariaLabel="Fee category"
-                        disabled={disabled}
+                        pending={pending}
                     />
                 </div>
-                <input
+                <MoneyInput
                     id={amountId}
-                    type="number"
-                    step="0.01"
+                    currency={currency}
                     min="0"
-                    inputMode="decimal"
                     value={feeAmount ?? ''}
-                    placeholder="0.00"
-                    disabled={disabled}
-                    onChange={(e) => {
-                        const v = e.target.value;
-                        if (v.length === 0) {
-                            onChangeFeeAmount(null);
-                        } else {
-                            const n = Number(v);
-                            onChangeFeeAmount(Number.isFinite(n) ? n : null);
-                        }
-                    }}
+                    pending={pending}
+                    onValueChange={(text) => onChangeFeeAmount(parseMoneyText(text))}
+                    wrapperClassName="shrink-0"
+                    // 96px for the figure, plus the symbol's room: a three-character
+                    // symbol would otherwise cut an ordinary fee short (ADR-0114 D14).
+                    figureWidth={FEE_FIGURE_WIDTH}
                     aria-label="Fee amount"
                     aria-invalid={!!error}
                     aria-describedby={error ? `${amountId}-error` : undefined}
                     className={cn(
-                        'h-control-28px w-fixed-96px rounded border bg-surface px-2 text-right font-mono text-xs tabular-nums',
+                        'h-control-28px rounded border bg-surface px-2 text-right font-mono text-xs tabular-nums',
                         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+                        'aria-disabled:cursor-not-allowed aria-disabled:opacity-50',
                         error ? 'border-state-danger' : 'border-border',
+                        sizeClass,
                     )}
                 />
             </div>

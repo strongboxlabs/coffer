@@ -9,8 +9,8 @@ Amends: [ADR-0060](0060-whole-db-backup-and-admin-role.md)
 
 ADR-0060 made whole-DB restore an **operator CLI step** (`coffer-api restore`),
 because restore runs on a fresh install before auth/admin exists and replaces the
-entire database. The disaster-recovery drill confirmed that works but is fiddly
-(manual file copy, init-script perms, start-order). A fresh install already shows
+entire database. That works but is fiddly (manual file copy, init-script perms,
+start-order). A fresh install already shows
 a setup ceremony (create the first user + ledger), and that **pre-auth, no-admin
 window is exactly the safe time to restore**. So the setup screen should offer
 **Create a new install** OR **Restore from a backup** — making restore a
@@ -64,20 +64,20 @@ cap is lifted for the endpoint).
 
 ## Amendment — 2026-10-09: restore by database swap
 
-**What failed.** A production restore of the previous night's backup reported
-"Restore complete" and changed nothing. Two in-place mechanisms had replaced the
-original `--clean --if-exists` (fragile over a populated or cross-version
-schema): a wipe of everything the service role owns, then `pg_restore` into the
-empty schema. The wipe enumerated object kinds by hand. Migration 200 added an
-aggregate (`DROP FUNCTION` refuses one) and 202 two composite types the list did
-not know, so **from v0.62.0 every restore over an existing install failed** at the
-wipe. The wipe is one `DO` block, so the database was left untouched — by luck: the
-`pg_restore` after it was not transactional, and a failure there would have left
-a wiped, half-loaded database. The boot logged `Bootstrap restore FAILED`, booted
-the old database, and the browser — which only polled `/healthz` — said "Restore
-complete". Separately, every backup taken while a snapshot existed was itself
-unrestorable: the dump kept `ledger_snapshot_parts` (the payload since mig 193)
-while excluding its parent `ledger_snapshots`, so the FK between them failed.
+**The issue.** An in-place restore can report "Restore complete" and change
+nothing. The in-place path (replacing the original `--clean --if-exists`, which is
+fragile over a populated or cross-version schema) wiped everything the service role
+owns, then ran `pg_restore` into the empty schema. The wipe enumerated object kinds
+by hand, so any object kind missing from its list fails it: migration 200 adds an
+aggregate (`DROP FUNCTION` refuses one) and 202 two composite types, so **from
+v0.62.0 every restore over an existing install fails** at the wipe. The wipe is one
+`DO` block, so that failure leaves the database untouched; the `pg_restore` after it
+is not transactional, so a failure there leaves a wiped, half-loaded database. The
+boot logs `Bootstrap restore FAILED` and serves the old database, and a browser that
+only polls `/healthz` reports "Restore complete". Separately, a backup taken while a
+snapshot exists is unrestorable when the dump keeps `ledger_snapshot_parts` (the
+payload since mig 193) but excludes its parent `ledger_snapshots`: the FK between
+them fails.
 
 **Decision.**
 
@@ -89,7 +89,7 @@ while excluding its parent `ledger_snapshots`, so the FK between them failed.
    build's migrations **on it** → reset the install's Drive identity → swap with
    two `ALTER DATABASE … RENAME` in **one transaction**. On any failure the new
    database is dropped and the live one was never touched. No object-kind list
-   exists any more, so the class of bug that broke production cannot recur.
+   exists any more, so an object kind a list does not know cannot break a restore.
 2. **The replaced database is kept** as `{name}_pre_restore_{utc}` — the way back —
    until the next restore prunes it (one kept at a time; each is a full copy).
 3. **Privileges.** The swap needs `coffer_service` to own the live database and hold
@@ -108,7 +108,7 @@ while excluding its parent `ledger_snapshots`, so the FK between them failed.
 5. **Backups exclude `ledger_snapshot_parts` data** as well as `ledger_snapshots`, and
    the restore skips both tables' data, so archives taken before the fix restore too.
 
-**Hardened after an adversarial review** of the first cut, before release:
+**Further guarantees:**
 - **The swap's result is read from the catalog, not psql's exit code.** The incoming
   database is stamped `coffer-restore:<attempt>:<replaced-name>` (its COMMENT) before
   the swap; if the swap reports an error, the live database's stamp decides applied or
@@ -118,7 +118,7 @@ while excluding its parent `ledger_snapshots`, so the FK between them failed.
   pruned the real pre-restore copy. Pruning older copies happens only after the outcome
   is recorded and the staging cleared.
 - **Only the server's own boot applies a staged restore**; a CLI subcommand
-  (`coffer-api backup`, `bootstrap-token`) runs the same program and used to race it.
+  (`coffer-api backup`, `bootstrap-token`) runs the same program and would race it.
 - **A failed restore that had adopted the source install's key puts the original key
   back** and restarts onto it, so "nothing was changed" is true of the key file too.
 - **A backup from a newer build is refused** (its migration journal names scripts this
@@ -127,17 +127,16 @@ while excluding its parent `ledger_snapshots`, so the FK between them failed.
   to the browser drops lines that can quote row data.
 - **Readiness is checked in full at staging** — grants, name length, maintenance
   database, locale provider — and the refusal names the SQL as well as the script.
-- **No `DROP DATABASE … WITH (FORCE)`.** The drill once left an abandoned database
-  behind; traced to a race with autovacuum, not tolerated as flakiness. FORCE makes a
-  non-superuser terminate every other session first, an autovacuum worker counts as a
-  superuser's, and a freshly loaded database draws one within a minute — so the drop
-  failed ("permission denied to terminate process") exactly when a worker was in it:
-  6 of 6 in a probe with a worker present, against 6 of 6 successes for a plain DROP,
-  which has Postgres cancel the worker itself. A unit test pins the statement and the
-  drill re-proves the Postgres behaviour with a worker provably in the database.
+- **No `DROP DATABASE … WITH (FORCE)`.** FORCE makes a non-superuser terminate every
+  other session first, an autovacuum worker counts as a superuser's, and a freshly
+  loaded database draws one within a minute — so a FORCE drop fails ("permission
+  denied to terminate process") whenever a worker is in the database, and the database
+  is left behind. A plain DROP has Postgres cancel the worker itself. A unit test pins
+  the statement and the drill re-proves the Postgres behaviour with a worker provably
+  in the database.
 
-**Proven by** the maintainer's restore drill, which runs the real images: an
-install on the previous release with a real dataset (snapshots included), a backup
+**Proven by** the restore drill, which runs the real images: an
+install on the previous release with a populated dataset (snapshots included), a backup
 by that release's own CLI, an upgrade to the new build, provisioning, then the
 restore through the boot path — asserting every table equals the backup and the
 kept database equals the pre-restore state exactly — and a second restore refused
@@ -145,18 +144,16 @@ while another session holds the database. "Every table" means every one a restor
 does not leave out by design. The drill gives the app nothing to write by itself
 (each monitor's check already on record, a fresh backup in the store, jobs and
 retention off) instead of excusing the tables it writes: an excused table is one
-whose restore nobody checked, and a calibration that diffed two consecutive starts
-once missed a monitor that writes only when its own history says it has not yet.
-Run against the previous release as "new", it fails exactly as production did. The old `scripts/backup-restore-roundtrip.sh`
+whose restore nobody checked, and a calibration that diffs two consecutive starts
+misses a monitor that writes only when its own history says it has not yet.
+Run against the previous release as "new", it fails, because that release's restore changes nothing. The old `scripts/backup-restore-roundtrip.sh`
 tested a hand-copied duplicate of the wipe on a synthetic schema and is removed.
 
 
 ## Amendment — 2026-10-16: the restore is proven on every push to main
 
-The 2026-10-09 amendment above came from a production restore that reported success and
-did nothing, which no test could see because none had ever run the real restore against
-the real schema. the restore drill script does, and it ran by hand against a
-dataset someone supplied. It is now continuous:
+A restore that reports success and does nothing is invisible to any test that does not run
+the real restore against the real schema. The restore drill does, and it is continuous:
 
 - **Dataset.** Generated, never copied from a ledger: `make-drill-dataset.sh` imports the
   committed synthetic fixtures (`data/samples/`) through the real importer into a database
@@ -166,6 +163,14 @@ dataset someone supplied. It is now continuous:
   `pg_dump`. The previous release migrates it forward at boot, so one dataset serves every
   drill; it is regenerated only when the shapes it holds need to change, or when the oldest
   release a drill might use predates its schema (the drill refuses, by name, if so).
+  *Amended 2026-10-25:* the importer that writes it is the pinned release's own, built
+  from that release's tag rather than the current tree. An importer newer than the pinned
+  schema writes columns the schema does not have yet, and the current tree has no
+  command-line import (the in-app wizard is the only import path; see the ADR-0071
+  amendment of that date). The generator therefore works only while the pinned release
+  still has that command. No release from the one that removes it onward does, so as it
+  stands the pin cannot move to a later schema: regenerating at a newer schema needs the
+  generator to drive the pinned image's own import instead.
 - **Previous release.** Built from its source (`git archive` of its tag), not pulled: the
   release registry is private and the CI VM holds no credentials, by design. That is also
   why `preflight-vm.ps1` ships the tree in beside the snapshot, which has no git history.
@@ -189,7 +194,7 @@ revokes are seeded before the backup since the 2026-10-17 amendment below.
 ## Amendment — 2026-10-16: undoing a restore stays a documented procedure, proven by the drill
 
 FU-068 asked for "Undo the last restore" in the admin panel, staged and applied at boot.
-Not built, by the maintainer's decision: the replaced database is already kept, going back
+Not built: the replaced database is already kept, going back
 is two renames in one transaction (operations.md, "Undoing a restore"), and a second
 destructive boot path is one more place a swap can fail, for an operation that is rare and
 done by the one operator who has the server's shell anyway. What FU-068 needed was for that
@@ -199,7 +204,7 @@ exactly, and the API must serve.
 
 ## Amendment — 2026-10-16: what a restore takes in, leaves behind, and still trusts
 
-From the 2026-10-12 audit (FU-072, FU-073, FU-075, FU-079):
+Closes FU-072, FU-073, FU-075 and FU-079:
 
 - **A free-space floor on uploads.** The parts protocol had no total cap, so an upload could
   fill the data volume — the one holding the master key and the stored backups. Every part,
@@ -218,7 +223,7 @@ From the 2026-10-12 audit (FU-072, FU-073, FU-075, FU-079):
   setup link in `bootstrap.url` are written owner-only from the first byte and renamed into
   place whole (`SecretFile`); they were 0644 and written in place.
 
-**Accepted, by the maintainer's decision of 2026-10-16:** `pg_restore` runs the archive's SQL
+**Accepted risk:** `pg_restore` runs the archive's SQL
 as `coffer_service`, which owns the live database and may create databases, so a hostile
 archive could change role-level settings that outlive the restore or drop the kept pre-restore
 database. Restoring as a throwaway role that owns only the new database would close it, at
@@ -228,11 +233,10 @@ the passphrase check, and v3 now makes an edited legitimate backup fail that che
 
 ## Amendment — 2026-10-17: a restore signs everyone out
 
-A restore brought every session, MCP token and OAuth grant back exactly as it was at backup
-time, revoked ones included, and every pending invite. Incident response backfired: revoke
-the attacker, restore a backup from before the incident, and their access came back. The
-restore copy said it "signs everyone out", which was false; the restore card even asked
-`/api/auth/me` whether the admin's own session had survived (FU-076).
+A restore that copies the database back brings every session, MCP token and OAuth grant
+back exactly as it was at backup time, revoked ones included, and every pending invite. That
+defeats incident response: revoke an attacker, restore a backup from before the compromise,
+and their access returns (FU-076).
 
 The database a restore builds now has, after its migrations and before the marker that says
 it is ready, every cookie session, manual MCP token, OAuth authorization and OAuth token
@@ -244,8 +248,31 @@ registrations stay, so a connector signs in again rather than registering anew. 
 keeping the tokens with a warning, and carrying forward revocations made after the backup.
 
 The reset, and the Drive reset beside it, run through EF in one transaction on the incoming
-database (`RestoreReset`); the Drive half used to be a psql script, which the raw-SQL audit
-could not see. Both restore screens say what was reset. The restore drill seeds a session, an
+database (`RestoreReset`), not through a psql script, so the raw-SQL audit sees both.
+Both restore screens say what was reset. The restore drill seeds a session, an
 MCP token, an OAuth grant with a refresh token and two invites before its backup, and checks
 that the kept database still has them live and the restored one has them revoked, the pending
 invite gone, and the accepted invite and the OAuth client kept.
+
+## Amendment — 2026-10-28: the drill checks the upgrade itself
+
+A restore through the boot path proves the restore, not the upgrade it runs on. The drill
+now also asserts, of the upgrade from the previous release to this build:
+
+- **The journal.** The upgrade journals, in name order, exactly the SQL scripts and C# steps
+  this build ships beyond the old install's, each C# step directly after its script, whatever
+  order the old install applied its own in; the log's applied count agrees. A restored
+  database journals every name the build ships and nothing else.
+- **The upgrade's own checks.** Every migration that checks invariants completes with no
+  violation logged, and the stored memo-and-tags presentation exists for every transaction,
+  with no leg left without one.
+- **Stored equals computed.** Every ledger's consistency check, asked through the API,
+  reports no stored memo-and-tags drift, on the upgraded install and on the restored one.
+- **Older snapshots are retired.** A snapshot the previous release took through its own API
+  before the upgrade is refused on restore with `snapshot-schema-version-mismatch`, and
+  nothing changes ([ADR-0108](0108-memo-and-tags-per-side.md) D10).
+- **This build's backups restore.** A backup this build's CLI takes after the upgrade
+  restores through the same boot path, every table equal to it exactly, the journal
+  unchanged.
+
+The drill's seeded session is a working one, so it can call the API as a ledger's owner.

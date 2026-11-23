@@ -4,21 +4,19 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Auth;
 
 [Collection(ApiCollection.Name)]
-public sealed class ChallengeStoreTests
+public sealed class ChallengeStoreTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ChallengeStoreTests(PostgresFixture fixture)
+    public ChallengeStoreTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     [Fact]
     public async Task Save_then_Consume_returns_the_persisted_row()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var store = new ChallengeStore(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var store = new ChallengeStore(Db.NewServiceFactory(), TimeProvider.System);
 
         var id = await store.SaveAsync(
             ChallengeStore.SetupFlow,
@@ -38,9 +36,9 @@ public sealed class ChallengeStoreTests
     [Fact]
     public async Task Consume_is_single_shot()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var store = new ChallengeStore(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var store = new ChallengeStore(Db.NewServiceFactory(), TimeProvider.System);
 
         var id = await store.SaveAsync(ChallengeStore.SetupFlow, null, "{}", null, TimeSpan.FromMinutes(2));
 
@@ -51,9 +49,9 @@ public sealed class ChallengeStoreTests
     [Fact]
     public async Task Consume_rejects_a_different_flow_than_the_one_persisted()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var store = new ChallengeStore(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var store = new ChallengeStore(Db.NewServiceFactory(), TimeProvider.System);
 
         var id = await store.SaveAsync(ChallengeStore.SetupFlow, null, "{}", null, TimeSpan.FromMinutes(2));
 
@@ -69,9 +67,9 @@ public sealed class ChallengeStoreTests
     [Fact]
     public async Task Consume_returns_null_for_unknown_id()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var store = new ChallengeStore(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var store = new ChallengeStore(Db.NewServiceFactory(), TimeProvider.System);
 
         Assert.Null(await store.ConsumeAsync(Guid.NewGuid(), ChallengeStore.SetupFlow));
     }
@@ -79,9 +77,9 @@ public sealed class ChallengeStoreTests
     [Fact]
     public async Task Save_rejects_zero_or_negative_ttl()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var store = new ChallengeStore(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var store = new ChallengeStore(Db.NewServiceFactory(), TimeProvider.System);
 
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
             store.SaveAsync(ChallengeStore.SetupFlow, null, "{}", null, TimeSpan.Zero));
@@ -92,9 +90,9 @@ public sealed class ChallengeStoreTests
     [Fact]
     public async Task Sweep_deletes_expired_and_consumed_rows()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var store = new ChallengeStore(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var store = new ChallengeStore(Db.NewServiceFactory(), TimeProvider.System);
 
         // One unconsumed + still valid: should survive the sweep.
         var fresh = await store.SaveAsync(ChallengeStore.SetupFlow, null, "{}", null, TimeSpan.FromMinutes(2));

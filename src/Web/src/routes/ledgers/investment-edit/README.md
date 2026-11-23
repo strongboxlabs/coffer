@@ -104,7 +104,7 @@ server-side for double-defence if needed.
 
 ### 6. Edit mode loads the full leg set from the `/legs` endpoint
 
-The register window now returns **collapsed** investment events (ADR-0080:
+The register window returns **collapsed** investment events (ADR-0080:
 the server-side `InvestmentEventProjector` does the aggregation, and
 `InvestmentRow` carries the synthesized `categoryAccountId` /
 `transferAccountId` / `feeAmount` / etc. slots directly). The raw per-leg
@@ -116,25 +116,40 @@ draft via `legsToDraft`. Duplicate and "Create reminder" reuse the same fetch
 
 **Why:** one authoritative leg source (all accounts), shared by edit,
 Duplicate, and the raw-data modal — no reliance on the register window,
-which no longer carries raw legs.
+which carries no raw legs.
 
 ### 7. Tags sit with the header fields, not in the action matrix
 
-The `TagsInput` renders between Payee/Memo and the action-specific row,
+The `TagSelect` renders between Payee/Memo and the action-specific row,
 outside `ACTION_LAYOUTS`. Tags are a property of the **event** (ADR-0009):
 they apply to every action, so putting a `tags` key in the matrix would mean
 repeating it on all ten rows and inviting someone to leave it off one.
 
 `InvestmentTxnDraft.tags` is therefore always an array, never null, and
 `validate()` ignores it — there is no action for which a tag is required or
-forbidden. Both request builders send it unconditionally, because the server
-reads an omitted `tags` as "leave them alone": omitting an emptied list would
-make a tag impossible to remove from this surface, and the save would look
-like it had worked.
+forbidden. Memo and tags follow PRESENCE: an edit sends each only when it
+differs from what the editor opened with (`changedNotes` in `validation.ts`),
+so an untouched save writes neither. The server reads an omitted key as
+"leave it", and `null` or `[]` as "clear it"; on a one-posting event, clearing
+means inheriting the other side's value again.
 
-One input for the whole event. The legs an action derives never carry tags of
-their own, exactly as a bank split's postings do not — `txn_header_tags` has
-no leg column.
+What the editor shows as inherited is what the save will leave
+(`inheritedAfterSave.ts`). The save rebuilds the event's legs and keeps a
+stored leg, with its memo and tags, only where the new event has a leg on the
+same account in the same role, or, for a stored leg with no role yet (a feed
+row's), on the same account in any role (`ShapeChange.ByAccountAndRole`). So
+the stored value shows only while the draft saves one posting (a transfer, or
+a cash dividend or misc entry with no fee) across from that account, in a role
+that keeps the leg. A draft that writes several postings (a fee, or a
+multi-posting action) shows nothing inherited: the event then owns its memo
+and tags, and the save copies what the brokerage showed onto them. An action
+whose one posting faces the brokerage's holdings account shows nothing either,
+because a leg on the investment side never carries a value.
+
+One memo and one tag set for the whole event, stored on its editable side
+(ADR-0108): on the brokerage leg of a one-posting event, on the header of a
+multi-posting one. The legs an action derives never carry a value of their
+own on the investment side.
 
 ## Out of scope here
 

@@ -1,3 +1,5 @@
+import { useId } from 'react';
+
 import { cn } from '@/lib/cn';
 
 /**
@@ -29,13 +31,20 @@ export const pointsAttr = (points: readonly Point[]): string =>
  * element for a test to find and believe in.
  */
 export function Line({
-    points, className, dashed = false, width = 2,
+    points, className, dashed = false, width = 2, nonScaling = false,
 }: {
     points: readonly Point[];
     /** Stroke colour as a theme class, e.g. `stroke-accent`. */
     className: string;
     dashed?: boolean;
     width?: number;
+    /**
+     * Stroke in screen pixels, not viewBox units. The kit's viewBox is stretched
+     * unevenly to the box (`preserveAspectRatio="none"`), which stretches a dash with
+     * it, so a dash meant to read the same at every width sets this; `width` and the
+     * dash are then in CSS pixels.
+     */
+    nonScaling?: boolean;
 }) {
     if (points.length < 2) return null;
     return (
@@ -51,6 +60,7 @@ export function Line({
             strokeLinecap={dashed ? 'butt' : 'round'}
             strokeLinejoin="round"
             {...(dashed ? { strokeDasharray: '4 4' } : {})}
+            {...(nonScaling ? { vectorEffect: 'non-scaling-stroke' } : {})}
         />
     );
 }
@@ -105,7 +115,7 @@ export function Area({
  * way a refund disappears from a chart.
  */
 export function Bar({
-    x, width, baselineY, valueY, className,
+    x, width, baselineY, valueY, className, hatched = false, title, onHover,
 }: {
     x: number;
     width: number;
@@ -113,19 +123,55 @@ export function Bar({
     valueY: number;
     /** Fill colour as a theme class, e.g. `fill-accent`. */
     className: string;
+    /**
+     * Striped rather than solid: a figure still in progress — the month to date,
+     * today's net worth beside month-ends. The stripes are VERTICAL because the
+     * frame stretches its viewBox unevenly, which would shear a diagonal hatch
+     * into a different angle at every width.
+     */
+    hatched?: boolean;
+    /**
+     * What the bar is, as the browser's tooltip: for a chart whose colours
+     * repeat, the one way to tell two same-looking segments apart.
+     */
+    title?: string;
+    /** Pointer over the bar (true) and off it (false). */
+    onHover?: (over: boolean) => void;
 }) {
+    // A pattern id unique per bar; useId's punctuation is not safe inside url(#…).
+    const patternId = `hatch${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`;
     const top = Math.min(baselineY, valueY);
     const height = Math.abs(valueY - baselineY);
+    const box = {
+        x: fmt(x),
+        y: fmt(top),
+        width: fmt(Math.max(width, 0)),
+        // A zero-value bar still gets a hairline, so a category that
+        // netted to nothing is visibly present rather than absent.
+        height: fmt(Math.max(height, 1)),
+    };
+    if (!hatched) {
+        return (
+            <rect
+                {...box}
+                className={className}
+                {...(onHover ? { onMouseEnter: () => onHover(true), onMouseLeave: () => onHover(false) } : {})}
+            >
+                {title ? <title>{title}</title> : null}
+            </rect>
+        );
+    }
     return (
-        <rect
-            x={fmt(x)}
-            y={fmt(top)}
-            width={fmt(Math.max(width, 0))}
-            // A zero-value bar still gets a hairline, so a category that
-            // netted to nothing is visibly present rather than absent.
-            height={fmt(Math.max(height, 1))}
-            className={className}
-        />
+        <g data-hatched="true">
+            <defs>
+                <pattern id={patternId} patternUnits="userSpaceOnUse" width={6} height={10}>
+                    <rect x={0} y={0} width={3} height={10} className={className} />
+                </pattern>
+            </defs>
+            {/* A faint fill under the stripes keeps the bar's extent readable. */}
+            <rect {...box} className={cn(className, 'opacity-30')} />
+            <rect {...box} fill={`url(#${patternId})`} />
+        </g>
     );
 }
 

@@ -3,14 +3,15 @@
   Recover a wedged Coffer MCP connection.
 
 .DESCRIPTION
-  Claude Desktop / Gemini reach the remote Coffer MCP server through a local
-  `npx mcp-remote` Node proxy. That proxy occasionally hangs (dead socket to the
-  CDN), and then every MCP call times out even though the server is fine. This:
+  For an MCP client that reaches the Coffer MCP server through a local
+  `npx mcp-remote` Node proxy. When that proxy's connection to the server dies
+  without the proxy noticing, every MCP call times out while the server itself
+  is healthy. Use this when MCP calls time out. It:
     1. lists + kills the mcp-remote proxy process(es) for this server,
     2. health-checks the server's public OAuth discovery endpoint so you can tell
        "hung proxy" (server 200) from "server actually down",
     3. optionally (-ClearAuth) wipes the cached OAuth token to force re-sign-in.
-  Then fully quit and reopen Claude Desktop so it spawns a fresh proxy.
+  Then fully quit and reopen the MCP client so it spawns a fresh proxy.
 
 .PARAMETER Server
   MCP host. Defaults to $env:COFFER_MCP_SERVER — the host is your deployment's, so
@@ -79,7 +80,8 @@ if (-not $targets) {
 }
 
 # 2) Is the SERVER up, or just the proxy? ---------------------------------
-# Any HTTP response (even 401/404) means the server + CDN are reachable, so the
+# Any HTTP response (even 401/404) means the server, and any proxy or CDN in front
+# of it, is reachable, so the
 # timeout was the local proxy. Only a connection failure (timeout/DNS/refused)
 # points at the server. Note: in PS 5.1 a 4xx/5xx is thrown, so inspect the
 # exception's Response before concluding "unreachable".
@@ -101,16 +103,16 @@ try {
     } else {
         Warn ("  Connection FAILED to {0}:" -f $discovery)
         Warn ("    {0}" -f $_.Exception.Message)
-        Warn "  -> server/network problem (timeout, DNS, refused). Check Traefik / the container, not the proxy."
+        Warn "  -> server/network problem (timeout, DNS, refused). Check the reverse proxy / the container, not the local proxy."
     }
 }
 if ($reachable) {
     if ($body -match 'Just a moment|Enable JavaScript|challenge-platform') {
         Warn ("  Reachable (HTTP {0}) but got a CDN bot-challenge page instead of JSON." -f $status)
-        Warn "  -> the MCP subdomain may have lost its DNS-only (grey-cloud) setting in Cloudflare."
+        Warn "  -> exempt the MCP host from the CDN's challenge (on Cloudflare: make its DNS record DNS-only)."
     } else {
         Good ("  Server reachable: HTTP {0} from {1}" -f $status, $discovery)
-        Good "  -> server + CDN are up; the timeout was the local proxy (now killed). A 401/404 here is fine."
+        Good "  -> the server is up; the timeout was the local proxy (now killed). A 401/404 here is fine."
     }
 }
 
@@ -131,5 +133,5 @@ if ($ClearAuth) {
 
 # 4) Next step ------------------------------------------------------------
 Info "`n== Done =="
-Info "Fully QUIT Claude Desktop (system tray -> Quit, not just close the window),"
+Info "Fully QUIT the MCP client (a tray app: system tray -> Quit, not just close the window),"
 Info "then reopen it so it spawns a fresh mcp-remote proxy against $Server."

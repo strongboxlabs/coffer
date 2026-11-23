@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import {
     ApiError,
@@ -126,7 +127,8 @@ export function MasterKeyPanel() {
                 <h2 className="text-base font-semibold">Master key</h2>
                 <p className="text-sm text-text-muted">
                     Wraps this install's sealed secrets — bank-feed tokens, the stored
-                    backup passphrase, and the Google Drive connection. It is what carries
+                    backup passphrase, the Google Drive connection, and a private fork's
+                    upgrade token. It is what carries
                     those to another install; your ledger data, passkeys, and backups do
                     not depend on it. Back it up somewhere separate from the server.
                 </p>
@@ -136,8 +138,8 @@ export function MasterKeyPanel() {
                 <PanelBody>
                     {/* `rotated` overrides every loading and error state. Rotation takes
                         the server down, so the status query fails for a few seconds — and
-                        this used to render the error branch instead of the body, which
-                        HID THE NEWLY MINTED KEY before the operator had saved it. The one
+                        rendering the error branch instead of the body would HIDE THE
+                        NEWLY MINTED KEY before the operator has saved it. The one
                         copy on screen must not disappear because an unrelated fetch is
                         briefly failing. */}
                     {statusQuery.isPending && rotated === null ? (
@@ -150,12 +152,12 @@ export function MasterKeyPanel() {
                         <div className="space-y-4">
                             {/* ---- status: metadata only, no key material ---- */}
                             {/* Id and fingerprint answer "which key is this install on?",
-                                which is what the status block is for. The file path used to
-                                sit here too and doesn't belong: it's a path INSIDE the
-                                container, so an operator can't act on it directly, and it
-                                answers a question nobody is asking at a glance. It moved
-                                down to the reveal block, where you're actually saving or
-                                replacing the key and the location matters. */}
+                                which is what the status block is for. The file path doesn't
+                                belong here: it's a path INSIDE the container, so an operator
+                                can't act on it directly, and it answers a question nobody is
+                                asking at a glance. It sits in the reveal block, where you're
+                                actually saving or replacing the key and the location
+                                matters. */}
                             {status ? (
                                 <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
                                     <dt className="text-text-muted">Key id</dt>
@@ -200,13 +202,10 @@ export function MasterKeyPanel() {
                                             <Button
                                                 variant="secondary"
                                                 onClick={() => revealMutation.mutate()}
-                                                disabled={revealMutation.isPending}
+                                                pending={revealMutation.isPending}
+                                                pendingLabel="Confirming…"
                                             >
-                                                {revealMutation.isPending
-                                                    ? 'Confirming…'
-                                                    : hasRevealed
-                                                      ? 'Show again'
-                                                      : 'Show key'}
+                                                {hasRevealed ? 'Show again' : 'Show key'}
                                             </Button>
                                         )}
                                     </div>
@@ -280,8 +279,11 @@ export function MasterKeyPanel() {
                                     <span className="mb-1 block">
                                         Type “{ROTATE_CONFIRM_PHRASE}” to confirm
                                     </span>
+                                    {/* Pending while the rotation is in flight: its success
+                                        clears the field (ADR-0023 §L). */}
                                     <Input
                                         value={confirmText}
+                                        pending={rotateMutation.isPending}
                                         onChange={(e) => setConfirmText(e.target.value)}
                                         placeholder={ROTATE_CONFIRM_PHRASE}
                                         className="w-fixed-160px"
@@ -290,12 +292,11 @@ export function MasterKeyPanel() {
 
                                 <Button
                                     onClick={() => rotateMutation.mutate()}
-                                    disabled={
-                                        rotateMutation.isPending
-                                        || confirmText.trim().toLowerCase() !== ROTATE_CONFIRM_PHRASE
-                                    }
+                                    disabled={confirmText.trim().toLowerCase() !== ROTATE_CONFIRM_PHRASE}
+                                    pending={rotateMutation.isPending}
+                                    pendingLabel="Rotating…"
                                 >
-                                    {rotateMutation.isPending ? 'Rotating…' : 'Rotate master key'}
+                                    Rotate master key
                                 </Button>
 
                                 {/* A blocked rotation is the one failure an operator can
@@ -367,16 +368,16 @@ export function MasterKeyPanel() {
                                                 mistake is reversible.
                                             </p>
                                         ) : null}
-                                        {/* Live progress, then a definite finish. The old copy
-                                            said "this page will fail to load for a few seconds
-                                            — that's expected", which tells an operator nothing
-                                            they can use: not whether to act, not whether it
-                                            worked, and not when it's over. The panel polls and
-                                            answers those itself. */}
-                                        {/* Explicit colour, not inherited. This line was the
-                                            one reported as unreadable — dark-on-dark — and
-                                            since it inherited its colour from an ancestor it
-                                            was at the mercy of whatever that ancestor was.
+                                        {/* Live progress, then a definite finish. "This page
+                                            will fail to load for a few seconds — that's
+                                            expected" tells an operator nothing they can use:
+                                            not whether to act, not whether it worked, and not
+                                            when it's over. The panel polls and answers those
+                                            itself. */}
+                                        {/* Explicit colour, not inherited. A line that
+                                            inherits its colour from an ancestor is at the
+                                            mercy of whatever that ancestor is, and can land
+                                            dark-on-dark.
                                             state-warning (#92400e) on state-warning-soft
                                             (#fef3c7) is a deliberate pairing from the token
                                             set, so it can't collapse.
@@ -440,6 +441,9 @@ function rotatedItems(rotated: MasterKeyRotation): string[] {
         );
     }
     if (rotated.oauthKeysRotated) items.push('the keys that keep AI connectors signed in');
+    // Same reason as the delivery URLs above: an install whose only sealed material is this
+    // token would otherwise be told nothing was stored under the old key.
+    if (rotated.upgradeTokenRotated) items.push('your upgrade repository token');
     return items;
 }
 

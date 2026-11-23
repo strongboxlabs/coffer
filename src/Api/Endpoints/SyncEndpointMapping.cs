@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Http;
 
 using Coffer.Api.Contracts;
+using Coffer.Api.Db;
 using Coffer.Api.Errors;
 using Coffer.Api.Ingest;
 
@@ -46,14 +47,17 @@ internal static class SyncEndpointMapping
                 IngestFailureReason.SyncInProgress =>
                     BusinessError.Problem(BusinessError.Codes.FeedSyncInProgress,
                         "Another sync is already running for this connection. Wait for it to finish."),
-                // A provider fault used to escape as an unhandled exception and answer
-                // 500. It is the bank being unreachable or answering badly, which is
-                // ordinary and usually transient — a 500 invited the operator to look for
-                // a bug on this side.
+                // A provider fault is the bank being unreachable or answering badly,
+                // which is ordinary and usually transient — answered as an unhandled 500
+                // it would invite the operator to look for a bug on this side.
                 IngestFailureReason.ProviderFault =>
                     BusinessError.Problem(BusinessError.Codes.FeedSyncProviderFault,
                         "The bank did not answer, or answered with something unusable. "
                         + "This is usually temporary — try again shortly."),
+                // The refusal every other write answers when the ledger's write lock is
+                // held past the wait (LedgerWriteBusyExceptionHandler), in the same words.
+                IngestFailureReason.LedgerBusy =>
+                    BusinessError.Problem(BusinessError.Codes.LedgerWriteBusy, LedgerWriteLock.BusyDetail),
                 _ => Results.Problem("Unknown sync failure.", statusCode: 500),
             };
         }
@@ -98,6 +102,8 @@ internal static class SyncEndpointMapping
                 BusinessError.Codes.FeedSyncInProgress,
             IngestFailureReason.ProviderFault =>
                 BusinessError.Codes.FeedSyncProviderFault,
+            IngestFailureReason.LedgerBusy =>
+                BusinessError.Codes.LedgerWriteBusy,
             _ => "unknown",
         };
 }

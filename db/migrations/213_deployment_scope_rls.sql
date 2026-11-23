@@ -7,10 +7,9 @@
 -- WHY THAT MATTERED. The admin endpoints are the only app-role reader and they carry
 -- RequireAuthorization(AuthPolicies.RequireAdmin), so there was no live escalation. But
 -- this repo treats RLS as the backstop and the API filter as the primary check — mig
--- 174 and ADR-0083 exist because a filter is one forgotten attribute away from absent,
--- and the ledger notification endpoints proved that exact point in 0.65.0 by shipping
--- without RequireLedgerAccess(). A credentials table with no DB-level refusal is the
--- one place not to rely on the attribute being there.
+-- 174 and ADR-0083 exist because a filter is one forgotten attribute away from absent.
+-- A credentials table with no DB-level refusal is the one place not to rely on the
+-- attribute being there.
 --
 -- WHY NOT SCOPED BY GRANT. These two tables are deployment scope (ADR-0096 D1): no
 -- ledger_id, no grant to join. The right predicate is "is this app user an admin",

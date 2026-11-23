@@ -9,18 +9,22 @@ namespace Coffer.Domain.Investment;
 /// </summary>
 /// <remarks>
 /// A single investment event is 1..N of these (one per leg of the header on the
-/// account being read): a solo Buy is one leg; a Buy+Fee is two; a 3-leg DivXfr+Fee
+/// account being read): a solo Buy is one leg; a Buy+Fee is two; a 3-leg DividendXfr+Fee
 /// is three. Per ADR-0028 the projector collapses them to one event row.
 /// <see cref="SecurityId"/>/<see cref="Quantity"/>/<see cref="UnitPrice"/> are on
-/// the holdings-side leg of a <c>security</c> posting; for Div/DivXfr/Misc the
+/// the holdings-side leg of a <c>security</c> posting; for Dividend/DividendXfr/Misc the
 /// security id rides on the qty=0 cash leg (<see cref="Quantity"/> null there).
+/// <para><see cref="CounterpartyAmount"/> and <see cref="CounterpartyCurrencyCode"/> are
+/// the posting's other leg as stored, on <see cref="CounterpartyAccountId"/>, in that
+/// account's currency: on a transfer between currencies a figure of its own, not this
+/// leg's negated (ADR-0114 D13). The projector carries them to the slot they fill; the
+/// caller, which knows this account's currency, decides whether they show.</para>
 /// </remarks>
 public sealed record InvestmentEventLeg(
     Guid Id,
     int LegIndex,
     decimal Amount,
     decimal? BalanceAfter,
-    bool HasOverrides,
     string? PostingRole,
     string? DerivedAction,
     Guid CounterpartyId,
@@ -31,7 +35,9 @@ public sealed record InvestmentEventLeg(
     decimal? UnitPrice,
     Guid? CounterpartyAccountId,
     string? CounterpartyAccountName,
-    string? CounterpartyAccountType);
+    string? CounterpartyAccountType,
+    decimal? CounterpartyAmount = null,
+    string? CounterpartyCurrencyCode = null);
 
 /// <summary>
 /// The derived fields of one aggregated investment event (ADR-0028 §2): the cash
@@ -44,7 +50,6 @@ public sealed record InvestmentEventLeg(
 public sealed record InvestmentEventProjection(
     decimal Amount,
     decimal? BalanceAfter,
-    bool HasOverrides,
     Guid CounterpartyId,
     Guid? SecurityId,
     string? SecurityTicker,
@@ -75,12 +80,22 @@ public sealed record InvestmentEventProjection(
     /// sleeve. For a cash-neutral event — a reinvestment, an in-kind transfer,
     /// a sale whose proceeds a fee consumes — that sum is structurally ZERO,
     /// and a column of zeroes is a true answer to a question nobody asked.
-    /// On a real brokerage history that class is a large share of the
-    /// entries, not an edge case.
+    /// Every reinvestment is in that class, so on any brokerage that
+    /// reinvests it is routine, not an edge case.
     ///
     /// Both numbers are real and neither replaces the other, so both are
     /// projected and the surface decides. Named "settled" rather than "gross"
     /// because ADR-0073 already calls it that; a third word for one number is
     /// how the two ADRs came to disagree in the first place.
     /// </remarks>
-    decimal? SettledAmount);
+    decimal? SettledAmount,
+    /// <summary>The other leg of the posting that fills the counterparty chip, in its
+    /// account's currency (<see cref="InvestmentEventLeg.CounterpartyAmount"/>).</summary>
+    decimal? CounterpartyAmount = null,
+    /// <summary>The currency <see cref="CounterpartyAmount"/> is in.</summary>
+    string? CounterpartyCurrencyCode = null,
+    /// <summary>The transfer slot's other leg, on the transfer account, in its currency
+    /// (ADR-0114 D14, ADR-0028 Slot 6).</summary>
+    decimal? TransferAmount = null,
+    /// <summary>The currency <see cref="TransferAmount"/> is in.</summary>
+    string? TransferCurrencyCode = null);

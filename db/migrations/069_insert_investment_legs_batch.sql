@@ -4,8 +4,8 @@
 --
 -- THE PERF PROBLEM (continued from 067/068)
 --
--- After 067/068 narrowed the recompute scope, an investment Buy save
--- still took ~3.5 s. Diagnosis: EF Core + Npgsql batches per-row
+-- With the recompute scope narrowed (067/068), an investment save still
+-- pays per-leg trigger work: EF Core + Npgsql batches per-row
 -- INSERTs into one network round trip BUT emits N sequential
 -- `INSERT INTO txn_legs ... VALUES (...);` statements separated by
 -- `;`. Postgres treats each as a separate statement, so per-statement

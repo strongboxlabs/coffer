@@ -11,21 +11,24 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Transactions;
 
 /// <summary>
-/// Per-posting tags end to end (ADR-0103, migration 243).
+/// Per-line tags of a split end to end (ADR-0103, migration 243).
 /// </summary>
 /// <remarks>
-/// The rental-property case that reopened ADR-0009: one header, three postings,
+/// The case per-line tags exist for: one header whose postings are about different
+/// things — a payment split across two projects, each line tagged with its project —
 /// and the question the tags exist to answer is which posting the money went to.
-/// These go through HTTP because the contract — what <c>null</c> means versus
-/// <c>[]</c> on a list that is replaced wholesale — is the part that can be wrong
-/// while every repository method is right.
+/// A line's notes travel in <c>notes.lines</c> by index, apart from the postings, and
+/// land on the split side's leg of that line. These go through HTTP because the
+/// contract — omitted versus <c>[]</c>, and a postings list replaced wholesale — is
+/// the part that can be wrong while every repository method is right.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class LegTagsTests
+public sealed class LegTagsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public LegTagsTests(PostgresFixture fixture) => _fixture = fixture;
+    public LegTagsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static readonly DateTime Posted = new(2026, 4, 1, 12, 0, 0, DateTimeKind.Utc);
 
@@ -38,10 +41,10 @@ public sealed class LegTagsTests
         return client;
     }
 
-    /// <summary>The tag names on each source-side leg of a header, by leg id.</summary>
+    /// <summary>The tag names on each leg of a header, by leg id.</summary>
     private async Task<Dictionary<Guid, List<string>>> LegTagsAsync(Guid headerId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var pairs = await (
             from lt in db.TxnLegTags.AsNoTracking()
             join l in db.TxnLegs.AsNoTracking() on lt.LegId equals l.Id
@@ -55,152 +58,135 @@ public sealed class LegTagsTests
             .ToDictionary(g => g.Key, g => g.Select(x => x.Name).OrderBy(n => n).ToList());
     }
 
-    private async Task<(Guid HeaderId, Guid BankId, HttpClient Client, SyntheticLedger Ledger, ApiFactory Factory)>
-        RentalSplitAsync(params string?[] postingTags)
-    {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var bank = await ledger.AddBankAccountAsync("checking");
-        var rent = await ledger.AddCategoryAsync("Rent");
+    private sealed record Split(Guid HeaderId, Guid BankId, Guid SuppliesId, HttpClient Client, SyntheticLedger Ledger, ApiFactory Factory);
 
-        var factory = new ApiFactory(_fixture).WithoutDevAuth();
+    /// <summary>
+    /// A two-line split entered from the bank, tagged "work" as a whole, each line
+    /// with its given tag (null: none).
+    /// </summary>
+    private async Task<Split> ProjectSplitAsync(string? first, string? second)
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        var supplies = await ledger.AddCategoryAsync("Supplies");
+
+        var factory = new ApiFactory(Db).WithoutDevAuth();
         var client = await ClientAsync(factory, ledger);
 
-        var postings = postingTags.Select(t => new TransactionPosting
-        {
-            CounterpartyAccountId = rent.Id,
-            Amount = -100m,
-            Tags = t is null ? null : new[] { t },
-        }).ToArray();
-
+        var lines = new[] { first, second }
+            .Select((t, i) => t is null ? null : new TransactionLineNotesRequest { Index = i, Tags = [t] })
+            .Where(l => l is not null)
+            .Select(l => l!)
+            .ToList();
         var resp = await client.PostAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/transactions",
             new CreateTransactionRequest
             {
                 PostedAt = Posted,
-                Payee = "Rent",
+                Payee = "Supplies",
                 SourceAccountId = bank.Id,
-                Postings = postings,
-                Tags = new[] { "rental" },
+                Postings =
+                [
+                    new TransactionPosting { CounterpartyAccountId = supplies.Id, Amount = -100m },
+                    new TransactionPosting { CounterpartyAccountId = supplies.Id, Amount = -50m },
+                ],
+                Notes = new TransactionNotesRequest { Side = bank.Id, Tags = ["work"], Lines = lines },
             });
         Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
         using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
-        return (doc.RootElement.GetProperty("headerId").GetGuid(), bank.Id, client, ledger, factory);
+        return new Split(doc.RootElement.GetProperty("headerId").GetGuid(), bank.Id, supplies.Id, client, ledger, factory);
     }
 
     [Fact]
     public async Task Each_posting_keeps_its_own_tag()
     {
-        var (headerId, _, _, ledger, factory) = await RentalSplitAsync("Property A", "Property B");
-        await using var _f = factory;
+        var split = await ProjectSplitAsync("Project A", "Project B");
+        await using var _f = split.Factory;
 
-        var byLeg = await LegTagsAsync(headerId);
+        var byLeg = await LegTagsAsync(split.HeaderId);
         Assert.Equal(2, byLeg.Count);
-        Assert.Contains(byLeg, kv => kv.Value.SequenceEqual(new[] { "Property A" }));
-        Assert.Contains(byLeg, kv => kv.Value.SequenceEqual(new[] { "Property B" }));
+        Assert.Contains(byLeg, kv => kv.Value.SequenceEqual(new[] { "Project A" }));
+        Assert.Contains(byLeg, kv => kv.Value.SequenceEqual(new[] { "Project B" }));
+        // On the split side's legs, never the opposite side's.
+        await using var db = Db.NewDbContext();
+        var tagged = byLeg.Keys.ToList();
+        Assert.All(await db.TxnLegs.AsNoTracking().Where(l => tagged.Contains(l.Id)).Select(l => l.AccountId).ToListAsync(),
+            a => Assert.Equal(split.BankId, a));
 
-        // The header keeps its OWN tag and does not absorb the postings' —
+        // The header keeps its OWN tag and does not absorb the lines' —
         // neither level is derived from the other (ADR-0103 D1).
-        await using var db = _fixture.NewDbContext();
         var headerTags = await (
             from ht in db.TxnHeaderTags.AsNoTracking()
             join t in db.Tags.AsNoTracking() on ht.TagId equals t.Id
-            where ht.HeaderId == headerId
+            where ht.HeaderId == split.HeaderId
             select t.Name).ToListAsync();
-        Assert.Equal(["rental"], headerTags);
-        Assert.DoesNotContain("Property A", headerTags);
+        Assert.Equal(["work"], headerTags);
     }
 
     [Fact]
     public async Task A_name_used_at_both_levels_is_one_dictionary_row()
     {
-        // The tracker-pending case: the header and a posting both introduce
-        // "rental" in ONE request. Resolving per call without consulting pending
+        // The tracker-pending case: the header and a line both introduce
+        // "work" in ONE request. Resolving per call without consulting pending
         // inserts would create the tag twice and leave the ledger with two
         // identically named tags nobody can tell apart.
-        var (headerId, _, _, ledger, factory) = await RentalSplitAsync("rental");
-        await using var _f = factory;
+        var split = await ProjectSplitAsync("work", null);
+        await using var _f = split.Factory;
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var rows = await db.Tags.AsNoTracking()
-            .Where(t => t.LedgerId == ledger.LedgerId && t.Name == "rental")
+            .Where(t => t.LedgerId == split.Ledger.LedgerId && t.Name == "work")
             .ToListAsync();
         Assert.Single(rows);
 
-        var byLeg = await LegTagsAsync(headerId);
-        Assert.Equal(["rental"], Assert.Single(byLeg).Value);
+        var byLeg = await LegTagsAsync(split.HeaderId);
+        Assert.Equal(["work"], Assert.Single(byLeg).Value);
     }
 
     [Fact]
-    public async Task A_patch_that_omits_tags_leaves_them_alone()
+    public async Task A_patch_that_omits_notes_leaves_them_alone()
     {
         // The trap this contract exists for. The postings list is replaced
         // WHOLESALE, so a client that reads a transaction and echoes its postings
-        // back — every client written before leg tags existed — must not strip
-        // them by omission.
-        var (headerId, _, client, ledger, factory) = await RentalSplitAsync("Property A");
-        await using var _f = factory;
+        // back must not strip the lines' tags by omission.
+        var split = await ProjectSplitAsync("Project A", "Project B");
+        await using var _f = split.Factory;
 
-        var legId = Assert.Single(await LegTagsAsync(headerId)).Key;
-
-        var resp = await client.PatchAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/transactions/{headerId}",
-            new PatchTransactionRequest
-            {
-                Postings = new PatchTransactionPostings
-                {
-                    SourceAccountId = await LegAccountAsync(legId),
-                    Items = new[]
-                    {
-                        new TransactionPosting
-                        {
-                            LegId = legId,
-                            CounterpartyAccountId = (await LegCounterpartyAsync(legId)),
-                            Amount = -150m,
-                            // Tags deliberately omitted.
-                        },
-                    },
-                },
-            });
+        var resp = await split.Client.PatchAsJsonAsync(
+            $"/api/ledgers/{split.Ledger.LedgerId}/transactions/{split.HeaderId}",
+            new PatchTransactionRequest { Postings = await EchoPostingsAsync(split, firstAmount: -150m) });
         Assert.True(resp.IsSuccessStatusCode,
             $"patch failed: {resp.StatusCode} {await resp.Content.ReadAsStringAsync()}");
 
-        var byLeg = await LegTagsAsync(headerId);
-        Assert.Equal(["Property A"], Assert.Single(byLeg).Value);
+        var byLeg = await LegTagsAsync(split.HeaderId);
+        Assert.Equal(2, byLeg.Count);
+        Assert.Contains(byLeg, kv => kv.Value.SequenceEqual(new[] { "Project A" }));
+        Assert.Contains(byLeg, kv => kv.Value.SequenceEqual(new[] { "Project B" }));
     }
 
     [Fact]
     public async Task A_patch_with_an_empty_list_clears_them()
     {
         // The other half of the contract: omitted means leave alone, [] means
-        // clear. Without both, there is no way to remove a posting's last tag.
-        var (headerId, _, client, ledger, factory) = await RentalSplitAsync("Property A");
-        await using var _f = factory;
+        // clear. Without both, there is no way to remove a line's last tag.
+        var split = await ProjectSplitAsync("Project A", null);
+        await using var _f = split.Factory;
 
-        var legId = Assert.Single(await LegTagsAsync(headerId)).Key;
-
-        var resp = await client.PatchAsJsonAsync(
-            $"/api/ledgers/{ledger.LedgerId}/transactions/{headerId}",
+        var resp = await split.Client.PatchAsJsonAsync(
+            $"/api/ledgers/{split.Ledger.LedgerId}/transactions/{split.HeaderId}",
             new PatchTransactionRequest
             {
-                Postings = new PatchTransactionPostings
+                Postings = await EchoPostingsAsync(split, firstAmount: -100m),
+                Notes = new TransactionNotesRequest
                 {
-                    SourceAccountId = await LegAccountAsync(legId),
-                    Items = new[]
-                    {
-                        new TransactionPosting
-                        {
-                            LegId = legId,
-                            CounterpartyAccountId = (await LegCounterpartyAsync(legId)),
-                            Amount = -100m,
-                            Tags = Array.Empty<string>(),
-                        },
-                    },
+                    Side = split.BankId,
+                    Lines = [new TransactionLineNotesRequest { Index = 0, Tags = [] }],
                 },
             });
         Assert.True(resp.IsSuccessStatusCode,
             $"patch failed: {resp.StatusCode} {await resp.Content.ReadAsStringAsync()}");
 
-        Assert.Empty(await LegTagsAsync(headerId));
+        Assert.Empty(await LegTagsAsync(split.HeaderId));
     }
 
     [Fact]
@@ -208,45 +194,49 @@ public sealed class LegTagsTests
     {
         // What the editor reads. Without it a split's postings come back with no
         // tags and the next save would look like a deliberate clear.
-        var (headerId, bankId, client, ledger, factory) = await RentalSplitAsync("Property A", "Property B");
-        await using var _f = factory;
+        var split = await ProjectSplitAsync("Project A", "Project B");
+        await using var _f = split.Factory;
 
         // The SOURCE account: both postings sit on it, so the register collapses
         // them into one group entry whose legs are the postings. Reading a
         // category account instead gives target-side single entries and no legs,
-        // which is how an earlier version of this test found nothing and said so.
-        var page = await client.GetFromJsonAsync<JsonElement>(
-            $"/api/ledgers/{ledger.LedgerId}/transactions?account_id={bankId}");
+        // so the test would find nothing to check.
+        var page = await split.Client.GetFromJsonAsync<JsonElement>(
+            $"/api/ledgers/{split.Ledger.LedgerId}/transactions?account_id={split.BankId}");
 
         var entries = page.GetProperty("entries").EnumerateArray().ToList();
         var group = Assert.Single(entries, e => e.GetProperty("kind").GetString() == "group");
 
+        // A split-side line shows its own tags: they are the row's tags, and no raw
+        // leg field is on the row.
         var seen = new List<string>();
         foreach (var leg in group.GetProperty("legs").EnumerateArray())
-            foreach (var t in leg.GetProperty("legTags").EnumerateArray())
+        {
+            Assert.False(leg.TryGetProperty("legTags", out _));
+            foreach (var t in leg.GetProperty("tags").EnumerateArray())
                 seen.Add(t.GetString()!);
+        }
 
-        Assert.Contains("Property A", seen);
-        Assert.Contains("Property B", seen);
+        Assert.Contains("Project A", seen);
+        Assert.Contains("Project B", seen);
     }
 
-    /// <summary>The account the source-side leg sits on.</summary>
-    private async Task<Guid> LegAccountAsync(Guid sourceLegId)
+    /// <summary>The split's two postings as a client that read them would send them back.</summary>
+    private async Task<PatchTransactionPostings> EchoPostingsAsync(Split split, decimal firstAmount)
     {
-        await using var db = _fixture.NewDbContext();
-        return await db.TxnLegs.AsNoTracking()
-            .Where(l => l.Id == sourceLegId).Select(l => l.AccountId).SingleAsync();
-    }
-
-    private async Task<Guid> LegCounterpartyAsync(Guid sourceLegId)
-    {
-        await using var db = _fixture.NewDbContext();
-        var leg = await db.TxnLegs.AsNoTracking().SingleAsync(l => l.Id == sourceLegId);
-        return await db.TxnLegs.AsNoTracking()
-            .Where(l => l.HeaderId == leg.HeaderId
-                        && l.PostingIndex == leg.PostingIndex
-                        && l.Id != leg.Id)
-            .Select(l => l.AccountId)
-            .FirstAsync();
+        await using var db = Db.NewDbContext();
+        var bankLegs = await db.TxnLegs.AsNoTracking()
+            .Where(l => l.HeaderId == split.HeaderId && l.AccountId == split.BankId)
+            .OrderBy(l => l.PostingIndex)
+            .ToListAsync();
+        return new PatchTransactionPostings
+        {
+            SourceAccountId = split.BankId,
+            Items =
+            [
+                new TransactionPosting { LegId = bankLegs[0].Id, CounterpartyAccountId = split.SuppliesId, Amount = firstAmount },
+                new TransactionPosting { LegId = bankLegs[1].Id, CounterpartyAccountId = split.SuppliesId, Amount = bankLegs[1].Amount },
+            ],
+        };
     }
 }

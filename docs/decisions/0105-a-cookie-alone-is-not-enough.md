@@ -2,33 +2,30 @@
 
 * Status: Accepted (amends 0013, 0063, 0083, 0092); amended 2026-10-19 (FU-087, FU-095)
 * Date: 2026-10-13
-* Related: the 2026-10-12 security audit (H1, H2, M1, M2, M6, S3, S5, S6, S7, and the
-  setup-complete `no-store` from Info). The audit's remaining findings are tracked in
-  the open-work backlog.
+* Related: open hardening items are tracked in the open-work backlog.
 
 ## Context
 
-The audit found that a stolen or forged session could do almost anything the person it
-belonged to could, and that the controls meant to stop it either were not there or did
-not hold:
+A stolen or forged session could do almost anything the person it belonged to could,
+and the controls meant to stop it either were not there or did not hold:
 
 - **Step-up covered two surfaces.** ADR-0092's `FreshAssertionGate` guarded the master
   key and passphrase reveals. Adding a passkey, minting an MCP token, granting admin,
   restoring a backup and turning on MCP writes needed only the cookie. The gate itself
   accepted any of the user's passkeys, including one the same session had just enrolled,
-  and accepted user verification "preferred", so a PIN-less key passed (H1/M2, S7).
+  and accepted user verification "preferred", so a PIN-less key passed.
 - **Disable was a sign-in block, not a revocation.** A disabled user kept their sessions,
   MCP tokens and OAuth grants. A disabled admin still passed `current_app_user_is_admin()`
-  and could re-enable themselves (H2).
+  and could re-enable themselves.
 - **Invites outlived the issuer's authority.** A link stayed redeemable after the person
-  who issued it was disabled, demoted or removed from the ledger (M6).
+  who issued it was disabled, demoted or removed from the ledger.
 - **OAuth consent showed the client's own words.** The consent screen rendered the client
   name and redirect from the query string, accepted a `javascript:` redirect at
   registration despite ADR-0063 saying "https or loopback only", and approved by default
-  through `form_post` (H1).
-- **CSRF protection was SameSite=Strict alone,** which a sibling subdomain passes (M1).
+  through `form_post`.
+- **CSRF protection was SameSite=Strict alone,** which a sibling subdomain passes.
 - **Setup re-armed** whenever the passkey count reached zero, exposing the pre-auth
-  whole-database restore on a populated install (S3).
+  whole-database restore on a populated install.
 
 ## Decision
 
@@ -36,7 +33,9 @@ not hold:
 
 Nine actions need a fresh passkey assertion made for that action:
 `passkey-add`, `passkey-delete`, `recovery-codes`, `mcp-token`, `grant-admin`,
-`restore`, `backup-passphrase`, `backup-delete`, `mcp-writes`. The client calls
+`restore`, `backup-passphrase`, `backup-delete`, `mcp-writes`. *(Amended 2026-10-31: a
+tenth, `upgrade`, guards starting an upgrade from the app, migration 270;
+[ADR-0110](0110-upgrade-from-the-app.md).)* The client calls
 `POST /api/auth/step-up/begin {action}`, runs the ceremony, and sends the result as
 base64url JSON in the `X-Coffer-Step-Up` header of the request it guards. A header, not a
 body field, because restore is multipart and regenerating recovery codes has no body.
@@ -117,18 +116,18 @@ credentials exist" and ADR-0083's "only while zero credentials exist".
 
 ### D8 — Smaller fixes, same pass
 
-- Expired WebAuthn challenges are swept on the scheduler tick (S5).
+- Expired WebAuthn challenges are swept on the scheduler tick.
 - Setup-complete, recovery-code regenerate and MCP-token mint responses are `no-store`.
 - The post-login `returnUrl` is parsed the way the browser will parse it, and followed
-  only to `/oauth/authorize` on this origin, the one place the server ever sends it (S6).
+  only to `/oauth/authorize` on this origin, the one place the server ever sends it.
 
 ### D9 — One clock
 
 Everything in `src/Api` reads time through an injected `TimeProvider`: the wall clock,
-elapsed time and timers. Before this, 147 direct reads made "now" impossible to place in
-a test. Several were not even the process clock: `DateTime.UtcNow` inside an EF lambda
-is translated to the database's `now()`, so the session idle timeout compared a Postgres
-timestamp with a process one. Those reads now go to the app clock, sent as parameters.
+elapsed time and timers. Direct clock reads make "now" impossible to place in a test, and
+some are not even the process clock: `DateTime.UtcNow` inside an EF lambda is translated
+to the database's `now()`, so a session idle timeout compares a Postgres timestamp with
+a process one. Those reads now go to the app clock, sent as parameters.
 Session start and passkey creation, which D1 compares, are stamped from it too, instead
 of column defaults. `ClockDisciplineTests` fails the build on a direct read, on
 `TimeProvider.System` anywhere except its one registration, and on a delay or timer that
@@ -165,7 +164,7 @@ is not handed the clock.
 - **Requiring user verification everywhere.** It would lock out existing PIN-less keys at
   sign-in. Required for step-up only, where the stakes justify it.
 
-## Amendment, 2026-10-19 — what the first pass left (FU-087, FU-095)
+## Amendment, 2026-10-19 — sessions, grant lifetime and endpoint policy (FU-087, FU-095)
 
 **Sessions are listed, and a credential change ends the others (FU-087).** D3 left
 ADR-0013's session list owed. *Account → Security → Sessions* now lists your live
@@ -175,8 +174,9 @@ using is marked. Each of the others can be ended on its own
 ends every other session too, because the passkey or code being retired may be what
 opened them.
 
-**An OAuth grant ends 90 days after consent (FU-087).** Refresh tokens are sliding, so an
-app that kept refreshing kept its access for ever, and the user could not see it. A grant
+**An OAuth grant ends 90 days after consent (FU-087).** Refresh tokens are sliding, so
+without a limit an app that keeps refreshing keeps its access for ever, unseen by the
+user. A grant
 now lasts 90 days from the authorization that created it, however often the app
 refreshes (`OAuthGrants.MaxAge`). Past that, the token endpoint revokes the grant and
 refuses it with `invalid_grant`, and the next authorize asks for consent again. *Connected
@@ -195,14 +195,14 @@ and clients registered before it are given it once at boot.
 - `prompt=none` answers `login_required` or `consent_required` to the client instead of
   showing a page, as OpenID Connect requires.
 - `prompt=login` is satisfied by a sign-in made in the last five minutes. Honouring it on
-  every visit sent a user who had just signed in back to the login page.
+  every visit would send a user who has just signed in back to the login page.
 - Fido2's exception text is logged, not returned.
 - The signature counter is written compare-and-set against the value the assertion was
   verified against. Of two concurrent assertions with one counter, only one signs in.
 
-**Every endpoint says who may call it (FU-095).** There was no fallback policy, so a
-route without `RequireAuthorization()` was open, and `/openapi/v1.json` was anonymous in
-production.
+**Every endpoint says who may call it (FU-095).** Without a fallback policy, a route
+without `RequireAuthorization()` is open, and `/openapi/v1.json` was anonymous on every
+deployed install.
 - The fallback policy is now the default one: a signed-in user.
 - `EndpointAuthorizationCatalogTests` holds every route to declaring one or the other,
   and names each anonymous route with its reason.

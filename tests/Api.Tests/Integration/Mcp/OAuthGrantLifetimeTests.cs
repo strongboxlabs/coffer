@@ -21,14 +21,15 @@ namespace Coffer.Api.Tests.Integration.Mcp;
 
 /// <summary>
 /// What a connection made through OAuth may do, and for how long (FU-087), and how the
-/// authorization endpoint answers the prompts it used to get wrong (FU-095).
+/// authorization endpoint answers the <c>prompt</c> values (FU-095).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class OAuthGrantLifetimeTests
+public sealed class OAuthGrantLifetimeTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public OAuthGrantLifetimeTests(PostgresFixture fixture) => _fixture = fixture;
+    public OAuthGrantLifetimeTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private const string RedirectUri = "https://example.com/callback";
     // RFC 7636's example pair.
@@ -43,7 +44,7 @@ public sealed class OAuthGrantLifetimeTests
         + (prompt is null ? "" : "&prompt=" + prompt);
 
     private ApiFactory NewFactory() =>
-        new ApiFactory(_fixture).WithMcpEnabled().WithConfig("Api:Cookie:RequireHttps", "false");
+        new ApiFactory(Db).WithMcpEnabled().WithConfig("Api:Cookie:RequireHttps", "false");
 
     private static HttpClient NewClient(ApiFactory factory, bool cookies = true) =>
         factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false, HandleCookies = cookies });
@@ -240,12 +241,12 @@ public sealed class OAuthGrantLifetimeTests
         using var client = NewClient(factory);
         await SignInAsync(client);
 
-        // Just signed in: the login page sent the user back here, prompt and all. This
-        // used to send them to the login page again, for ever.
+        // Just signed in: the login page sent the user back here, prompt and all.
+        // Honouring prompt=login again here would loop them to the login page for ever.
         var fresh = await client.GetAsync("/oauth/authorize?" + AuthorizeQuery(clientId, "login"));
         Assert.StartsWith("/oauth/consent?", fresh.Headers.Location!.OriginalString);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             await db.AuthSessions.Where(s => s.RevokedAt == null && s.AuthMethod == "dev")
                 .ExecuteUpdateAsync(s => s.SetProperty(x => x.CreatedAt, DateTime.UtcNow.AddHours(-1)));
 
@@ -316,7 +317,7 @@ public sealed class OAuthGrantLifetimeTests
     // --- the user's own list (FU-087) ---------------------------------------------
 
     [Fact]
-    public async Task A_user_lists_and_disconnects_their_own_grants_and_no_one_elses()
+    public async Task A_user_lists_and_revokes_their_own_grants_and_no_one_elses()
     {
         await using var factory = NewFactory();
         const string clientId = "grants-list";
@@ -355,7 +356,7 @@ public sealed class OAuthGrantLifetimeTests
         Assert.Equal(HttpStatusCode.NoContent,
             (await client.DeleteAsync($"/api/account/oauth-grants/{mine.Id}")).StatusCode);
 
-        // Disconnected means its tokens are dead too.
+        // Revoked means its tokens are dead too.
         Assert.Equal(HttpStatusCode.BadRequest, (await RefreshAsync(client, clientId, refresh)).StatusCode);
         Assert.DoesNotContain(
             (await client.GetFromJsonAsync<List<Coffer.Api.Endpoints.OAuthGrantsEndpoints.OAuthGrantSummary>>("/api/account/oauth-grants"))!,
@@ -427,8 +428,8 @@ public sealed class OAuthGrantLifetimeTests
     [Fact]
     public async Task A_token_without_coffer_read_is_refused_at_mcp()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled().WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithMcpEnabled().WithoutDevAuth();
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
 
         async Task<string> IssueAsync(string scopes)

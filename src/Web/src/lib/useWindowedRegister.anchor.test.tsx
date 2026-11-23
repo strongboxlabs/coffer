@@ -31,7 +31,6 @@ function row(headerId: string): RegisterRow {
         needsReview: false,
         origin: 'manual',
         checkNumber: null,
-        hasOverrides: false,
         txnGroupId: null,
         legIndex: 0,
         isMergeWinner: false,
@@ -49,9 +48,9 @@ function entry(headerId: string): RegisterEntry {
  *
  * `RegisterRepository.GetPageAsync` pins an anchor only if the row matches the
  * active filter, and otherwise silently returns the ordinary most-recent page —
- * `RegisterPage` has no field distinguishing the two. The hook used to treat
- * "an anchor was requested" as "the anchor is at index 0", which is a guarantee
- * the server never made.
+ * `RegisterPage` has no field distinguishing the two. So "an anchor was
+ * requested" must not be read as "the anchor is at index 0", which is a
+ * guarantee the server never makes.
  *
  * Tested at the hook rather than through a page because a page that resolves
  * focus by header id is immune to the bad value anyway: an id that is not in the

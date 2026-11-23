@@ -21,11 +21,12 @@ namespace Coffer.Api.Tests.Integration.Auth;
 /// IApplicationRestarter records the restart request without stopping the host.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class SetupRestoreEndpointTests
+public sealed class SetupRestoreEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SetupRestoreEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public SetupRestoreEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private sealed class FakeRestarter : IApplicationRestarter
     {
@@ -35,8 +36,7 @@ public sealed class SetupRestoreEndpointTests
 
     private async Task<string> SeedTokenAsync()
     {
-        await using var db = _fixture.NewDbContext();
-        await db.Database.ExecuteSqlRawAsync("TRUNCATE bootstrap_tokens CASCADE;");
+        await using var db = Db.NewDbContext();
         var (plaintext, hash) = BootstrapTokenService.GenerateToken();
         db.BootstrapTokens.Add(new BootstrapTokenRow { TokenHash = hash, ExpiresAt = DateTime.UtcNow.AddHours(1) });
         await db.SaveChangesAsync();
@@ -92,7 +92,7 @@ public sealed class SetupRestoreEndpointTests
         BootstrapRestoreStaging.Clear();
         var token = await SeedTokenAsync();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithService<IApplicationRestarter>(_ => fake)
             .WithConfig("Api:Backup:RestoreFreeSpaceReserveMb", int.MaxValue.ToString(System.Globalization.CultureInfo.InvariantCulture));
         using var client = factory.CreateClient();
@@ -112,7 +112,7 @@ public sealed class SetupRestoreEndpointTests
         BootstrapRestoreStaging.Clear();
         var token = await SeedTokenAsync();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         var sourceKey = SourceKeyBytes();
@@ -135,7 +135,7 @@ public sealed class SetupRestoreEndpointTests
         BootstrapRestoreStaging.Clear();
         var token = await SeedTokenAsync();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         using var content = Multipart(
@@ -155,7 +155,7 @@ public sealed class SetupRestoreEndpointTests
     {
         BootstrapRestoreStaging.Clear();
         var token = await SeedTokenAsync();
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithService<IApplicationRestarter>(_ => new FakeRestarter());
         using var client = factory.CreateClient();
 
@@ -172,7 +172,7 @@ public sealed class SetupRestoreEndpointTests
     {
         BootstrapRestoreStaging.Clear();
         var token = await SeedTokenAsync();
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithService<IApplicationRestarter>(_ => new FakeRestarter());
         using var client = factory.CreateClient();
 
@@ -196,7 +196,7 @@ public sealed class SetupRestoreEndpointTests
         BootstrapRestoreStaging.EnsureDir();
         await BootstrapRestoreStaging.StageSourceKeyAsync(Convert.ToBase64String(SourceKeyBytes()));
         var token = await SeedTokenAsync();
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithService<IApplicationRestarter>(_ => new FakeRestarter());
         using var client = factory.CreateClient();
 
@@ -215,7 +215,7 @@ public sealed class SetupRestoreEndpointTests
         BootstrapRestoreStaging.Clear();
         var token = await SeedTokenAsync();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         const string pass = "a-good-passphrase";
@@ -234,7 +234,7 @@ public sealed class SetupRestoreEndpointTests
         BootstrapRestoreStaging.Clear();
         var token = await SeedTokenAsync();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         // Encrypted under one passphrase, uploaded with a different one.
@@ -255,7 +255,7 @@ public sealed class SetupRestoreEndpointTests
         BootstrapRestoreStaging.Clear();
         await SeedTokenAsync();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         const string pass = "a-good-passphrase";
@@ -273,7 +273,7 @@ public sealed class SetupRestoreEndpointTests
         BootstrapRestoreStaging.Clear();
         var token = await SeedTokenAsync();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         using var content = Multipart(MakeArtifact("x"), passphrase: null);
@@ -325,7 +325,7 @@ public sealed class SetupRestoreEndpointTests
         BootstrapRestoreStaging.Clear();
         var token = await SeedTokenAsync();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         var artifact = MakeOversizeArtifact("pw");
@@ -362,7 +362,7 @@ public sealed class SetupRestoreEndpointTests
         BootstrapRestoreStaging.Clear();
         var token = await SeedTokenAsync();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         // Part 1 of 2 arrives; part 2 never does. The operator clicks Restore.
@@ -392,7 +392,7 @@ public sealed class SetupRestoreEndpointTests
         BootstrapRestoreStaging.Clear();
         var token = await SeedTokenAsync();
         var fake = new FakeRestarter();
-        await using var factory = new ApiFactory(_fixture).WithService<IApplicationRestarter>(_ => fake);
+        await using var factory = new ApiFactory(Db).WithService<IApplicationRestarter>(_ => fake);
         using var client = factory.CreateClient();
 
         // The upload never started, or died on its first part. Without an
@@ -414,7 +414,7 @@ public sealed class SetupRestoreEndpointTests
     public async Task Parts_need_a_valid_bootstrap_token()
     {
         BootstrapRestoreStaging.Clear();
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         using var form = PartForm([1, 2, 3], 1, 1);
@@ -431,7 +431,7 @@ public sealed class SetupRestoreEndpointTests
     public async Task Setup_info_carries_the_configured_part_size()
     {
         var token = await SeedTokenAsync();
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithConfig("Api:Backup:PartSizeMb", "7");
         using var client = factory.CreateClient();
 

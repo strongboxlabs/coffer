@@ -27,7 +27,15 @@ public sealed class AccountMapperTests
 
     private static readonly AccountMapper.MapInputs EmptyInputs = new(
         AccountsWithOwnTransactions: new HashSet<string>(StringComparer.Ordinal),
-        AccountsThatAreParents: new HashSet<string>(StringComparer.Ordinal));
+        AccountsThatAreParents: new HashSet<string>(StringComparer.Ordinal),
+        RootAccounts: new HashSet<string>(StringComparer.Ordinal));
+
+    /// <summary>The currencies these fixtures name: one <c>curr</c> item whose id is
+    /// <c>USD</c>, the file's base. A fixture account's <c>currid</c> is that id.</summary>
+    private static readonly MdCurrencies Usd = MdCurrencies.From([
+        new MdCurr("USD", "US Dollar", "USD", Type: null, Ticker: null, Cusip: null,
+            Decimals: 2, Rate: 1m, RelativeRate: 1m, IsHidden: false, IsBase: true),
+    ]);
 
     private static MdAcct AcctFromJson(string fragment)
     {
@@ -72,7 +80,7 @@ public sealed class AccountMapperTests
         var md = AcctFromJson("""
             {"obj_type":"acct","id":"r-1","name":"","type":"r","currid":"USD"}
             """);
-        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId, Usd, "USD");
         Assert.Null(result.Row);
         Assert.Equal(AccountMapper.SkipReason.Root, result.Skip);
     }
@@ -83,7 +91,7 @@ public sealed class AccountMapperTests
         var md = AcctFromJson("""
             {"obj_type":"acct","id":"s-1","name":"IDXB","type":"s","currid":"sec-1"}
             """);
-        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId, Usd, "USD");
         Assert.Null(result.Row);
         Assert.Equal(AccountMapper.SkipReason.SecuritySubAccount, result.Skip);
     }
@@ -94,7 +102,7 @@ public sealed class AccountMapperTests
         var md = AcctFromJson("""
             {"obj_type":"acct","id":"x-1","name":"weird","type":"x","currid":"USD"}
             """);
-        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId, Usd, "USD");
         Assert.Null(result.Row);
         Assert.Equal(AccountMapper.SkipReason.UnknownTypeCode, result.Skip);
     }
@@ -107,7 +115,7 @@ public sealed class AccountMapperTests
              "currid":"USD","sbal":"246810"}
             """);
 
-        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId, Usd, "USD");
 
         Assert.NotNull(result.Row);
         Assert.Equal("bank", result.Row!.AccountType);
@@ -121,6 +129,99 @@ public sealed class AccountMapperTests
     }
 
     [Fact]
+    public void Map_gives_each_account_the_code_of_its_own_moneydance_currency()
+    {
+        // ADR-0114: acct.currid is a curr item's id, and that item's currid is the code.
+        // A EUR-base file with a USD account: each account keeps its own, neither the
+        // base nor USD by default.
+        var currencies = MdCurrencies.From([
+            Currency("c-eur-id", "EUR", isBase: true),
+            Currency("c-usd-id", "USD", isBase: false),
+        ]);
+        var euro = AcctFromJson("""
+            {"obj_type":"acct","id":"b-eu","name":"Account A","type":"b","currid":"c-eur-id","sbal":"100"}
+            """);
+        var dollar = AcctFromJson("""
+            {"obj_type":"acct","id":"b-us","name":"Account B","type":"b","currid":"c-usd-id","sbal":"100"}
+            """);
+        Assert.Equal("EUR", AccountMapper.Map(euro, EmptyInputs, TestLedgerId, currencies, "EUR").Row!.CurrencyCode);
+        Assert.Equal("USD", AccountMapper.Map(dollar, EmptyInputs, TestLedgerId, currencies, "EUR").Row!.CurrencyCode);
+        // Two places each: the sbal is divided by a hundred in either.
+        Assert.Equal(1.00m, AccountMapper.Map(dollar, EmptyInputs, TestLedgerId, currencies, "EUR").Row!.OpeningBalance);
+    }
+
+    [Fact]
+    public void Map_gives_a_category_the_ledgers_reporting_currency_whatever_moneydance_kept_it_in()
+    {
+        // ADR-0114 D7: a category holds no money of its own; Coffer reads its lines in
+        // the currency of the real account on the other side. A category Moneydance
+        // kept in dollars, in a ledger that reports in euros, is a euro category.
+        var currencies = MdCurrencies.From([
+            Currency("c-eur-id", "EUR", isBase: true),
+            Currency("c-usd-id", "USD", isBase: false),
+        ]);
+        var dollarCategory = AcctFromJson("""
+            {"obj_type":"acct","id":"e-1","name":"Category A","type":"e","currid":"c-usd-id"}
+            """);
+
+        Assert.Equal("EUR", AccountMapper.Map(dollarCategory, EmptyInputs, TestLedgerId, currencies, "EUR").Row!.CurrencyCode);
+        Assert.Equal("GBP", AccountMapper.Map(dollarCategory, EmptyInputs, TestLedgerId, currencies, "GBP").Row!.CurrencyCode);
+    }
+
+    [Fact]
+    public void Map_scales_an_opening_balance_by_its_currencys_own_places()
+    {
+        var currencies = MdCurrencies.From([
+            Currency("c-eur-id", "EUR", isBase: true),
+            Currency("c-jpy-id", "JPY", isBase: false, decimals: 0),
+        ]);
+        var yen = AcctFromJson("""
+            {"obj_type":"acct","id":"b-jp","name":"Account Y","type":"b","currid":"c-jpy-id","sbal":"125000"}
+            """);
+
+        var row = AccountMapper.Map(yen, EmptyInputs, TestLedgerId, currencies, "EUR").Row!;
+
+        Assert.Equal("JPY", row.CurrencyCode);
+        Assert.Equal(125_000m, row.OpeningBalance);
+    }
+
+    [Theory]
+    [InlineData("""{"obj_type":"acct","id":"b-x","name":"Account C","type":"b","sbal":"0"}""")]
+    [InlineData("""{"obj_type":"acct","id":"b-x","name":"Account C","type":"b","currid":"c-missing","sbal":"0"}""")]
+    [InlineData("""{"obj_type":"acct","id":"b-x","name":"Account C","type":"b","currid":"c-sec","sbal":"0"}""")]
+    [InlineData("""{"obj_type":"acct","id":"b-x","name":"Account C","type":"b","currid":"c-odd","sbal":"0"}""")]
+    public void Map_throws_naming_the_account_when_its_currency_cannot_be_read(string fragment)
+    {
+        var currencies = MdCurrencies.From([
+            Currency("c-eur-id", "EUR", isBase: true),
+            Currency("c-sec", "^SEC", isBase: false, type: "s"),
+            Currency("c-odd", "Gold", isBase: false),
+        ]);
+
+        var ex = Assert.Throws<InvalidDataException>(() =>
+            AccountMapper.Map(AcctFromJson(fragment), EmptyInputs, TestLedgerId, currencies, "EUR"));
+        Assert.Contains("'Account C'", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Map_skips_before_it_reads_a_currency()
+    {
+        // The root and a security sub-account never become accounts, so neither needs a
+        // currency of its own: a missing one is not an error for them.
+        var currencies = MdCurrencies.From([Currency("c-eur-id", "EUR", isBase: true)]);
+        var root = AcctFromJson("""{"obj_type":"acct","id":"r-1","name":"","type":"r"}""");
+        var sub = AcctFromJson("""{"obj_type":"acct","id":"s-1","name":"IDXB","type":"s","currid":"c-gone"}""");
+
+        Assert.Equal(AccountMapper.SkipReason.Root, AccountMapper.Map(root, EmptyInputs, TestLedgerId, currencies, "EUR").Skip);
+        Assert.Equal(AccountMapper.SkipReason.SecuritySubAccount,
+            AccountMapper.Map(sub, EmptyInputs, TestLedgerId, currencies, "EUR").Skip);
+    }
+
+    internal static MdCurr Currency(string id, string code, bool isBase, string? type = null, int? decimals = 2) =>
+        new(id, Name: code + " name", CurrId: code, Type: type, Ticker: null, Cusip: null,
+            Decimals: decimals, Rate: 1m, RelativeRate: 1m, IsHidden: false, IsBase: isBase);
+
+    [Fact]
     public void Map_translates_loan_with_negative_balance()
     {
         var md = AcctFromJson("""
@@ -128,7 +229,7 @@ public sealed class AccountMapperTests
              "currid":"USD","sbal":"-25000075"}
             """);
 
-        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId, Usd, "USD");
 
         Assert.NotNull(result.Row);
         Assert.Equal("loan", result.Row!.AccountType);
@@ -142,7 +243,7 @@ public sealed class AccountMapperTests
             {"obj_type":"acct","id":"i-1","name":"Salary","type":"i","currid":"USD","sbal":"123456"}
             """);
 
-        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId, Usd, "USD");
 
         Assert.NotNull(result.Row);
         Assert.Equal("category", result.Row!.AccountType);
@@ -158,7 +259,7 @@ public sealed class AccountMapperTests
             {"obj_type":"acct","id":"e-1","name":"Groceries","type":"e","currid":"USD"}
             """);
 
-        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId, Usd, "USD");
 
         Assert.NotNull(result.Row);
         Assert.Equal("category", result.Row!.AccountType);
@@ -173,7 +274,7 @@ public sealed class AccountMapperTests
              "currid":"USD","is_inactive":"y"}
             """);
 
-        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId, Usd, "USD");
         Assert.NotNull(result.Row);
         Assert.False(result.Row!.IsActive);
     }
@@ -184,9 +285,86 @@ public sealed class AccountMapperTests
         var md = AcctFromJson("""
             {"obj_type":"acct","id":"b-3","name":"","type":"b","currid":"USD"}
             """);
-        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId, Usd, "USD");
         Assert.NotNull(result.Row);
         Assert.Equal("(unnamed)", result.Row!.Name);
+    }
+
+    // Moneydance's "uncategorized" is a top-level category with a blank name.
+    // Map still names any blank account "(unnamed)"; IsBlankLeafCategory is
+    // what tells AccountImportStep to land this one on the ledger's system
+    // Uncategorized instead. A blank category with children, or nested under
+    // another category, is a real node in the user's tree, so it fails closed
+    // and keeps today's "(unnamed)" row.
+
+    [Theory]
+    [InlineData("e", "")]
+    [InlineData("i", "")]
+    [InlineData("e", "   ")]
+    public void IsBlankLeafCategory_is_true_for_a_blank_category_with_no_children(string type, string name)
+    {
+        var md = AcctFromJson($$"""
+            {"obj_type":"acct","id":"c-blank","name":"{{name}}","type":"{{type}}","currid":"USD"}
+            """);
+
+        Assert.True(AccountMapper.IsBlankLeafCategory(md, EmptyInputs));
+    }
+
+    [Fact]
+    public void IsBlankLeafCategory_is_false_for_a_blank_category_with_children()
+    {
+        var md = AcctFromJson("""
+            {"obj_type":"acct","id":"c-blank-parent","name":"","type":"e","currid":"USD"}
+            """);
+        var inputs = EmptyInputs with
+        {
+            AccountsThatAreParents = new HashSet<string>(StringComparer.Ordinal) { "c-blank-parent" },
+        };
+
+        Assert.False(AccountMapper.IsBlankLeafCategory(md, inputs));
+        // ...and Map keeps the "(unnamed)" row for it.
+        Assert.Equal("(unnamed)", AccountMapper.Map(md, inputs, TestLedgerId, Usd, "USD").Row!.Name);
+    }
+
+    [Fact]
+    public void IsBlankLeafCategory_is_true_for_a_blank_category_directly_under_the_root()
+    {
+        var md = AcctFromJson("""
+            {"obj_type":"acct","id":"c-blank","name":"","type":"e","currid":"USD","parentid":"a-root"}
+            """);
+        var inputs = EmptyInputs with { RootAccounts = new HashSet<string>(StringComparer.Ordinal) { "a-root" } };
+
+        Assert.True(AccountMapper.IsBlankLeafCategory(md, inputs));
+    }
+
+    // Only a TOP-LEVEL blank category is Moneydance's "uncategorized". One nested
+    // under another category is a node in the user's tree, as is one whose parent
+    // the file does not name as its root: both keep their "(unnamed)" row.
+    [Theory]
+    [InlineData("e-bills")]      // a named parent category
+    [InlineData("a-missing")]    // a parent the file does not mark as the root
+    public void IsBlankLeafCategory_is_false_for_a_blank_category_below_the_top_level(string parentId)
+    {
+        var md = AcctFromJson($$"""
+            {"obj_type":"acct","id":"c-blank","name":"","type":"e","currid":"USD","parentid":"{{parentId}}"}
+            """);
+        var inputs = EmptyInputs with { RootAccounts = new HashSet<string>(StringComparer.Ordinal) { "a-root" } };
+
+        Assert.False(AccountMapper.IsBlankLeafCategory(md, inputs));
+    }
+
+    [Theory]
+    [InlineData("e", "Groceries")]   // named category
+    [InlineData("b", "")]            // blank, but not a category
+    [InlineData("v", "")]
+    [InlineData("r", "")]            // the root is blank and childless-looking, and never a category
+    public void IsBlankLeafCategory_is_false_otherwise(string type, string name)
+    {
+        var md = AcctFromJson($$"""
+            {"obj_type":"acct","id":"x-1","name":"{{name}}","type":"{{type}}","currid":"USD"}
+            """);
+
+        Assert.False(AccountMapper.IsBlankLeafCategory(md, EmptyInputs));
     }
 
     [Fact]
@@ -199,9 +377,10 @@ public sealed class AccountMapperTests
 
         var inputs = new AccountMapper.MapInputs(
             AccountsWithOwnTransactions: new HashSet<string>(StringComparer.Ordinal),
-            AccountsThatAreParents: new HashSet<string>(StringComparer.Ordinal) { "placeholder" });
+            AccountsThatAreParents: new HashSet<string>(StringComparer.Ordinal) { "placeholder" },
+            RootAccounts: new HashSet<string>(StringComparer.Ordinal));
 
-        var result = AccountMapper.Map(md, inputs, TestLedgerId);
+        var result = AccountMapper.Map(md, inputs, TestLedgerId, Usd, "USD");
 
         Assert.Null(result.Row);
         Assert.Equal(AccountMapper.SkipReason.FakeNonCategoryPlaceholder, result.Skip);
@@ -218,9 +397,10 @@ public sealed class AccountMapperTests
 
         var inputs = new AccountMapper.MapInputs(
             AccountsWithOwnTransactions: new HashSet<string>(StringComparer.Ordinal) { "v-1" },
-            AccountsThatAreParents: new HashSet<string>(StringComparer.Ordinal) { "v-1" });
+            AccountsThatAreParents: new HashSet<string>(StringComparer.Ordinal) { "v-1" },
+            RootAccounts: new HashSet<string>(StringComparer.Ordinal));
 
-        var result = AccountMapper.Map(md, inputs, TestLedgerId);
+        var result = AccountMapper.Map(md, inputs, TestLedgerId, Usd, "USD");
 
         Assert.NotNull(result.Row);
         Assert.Equal("investment", result.Row!.AccountType);
@@ -238,9 +418,10 @@ public sealed class AccountMapperTests
 
         var inputs = new AccountMapper.MapInputs(
             AccountsWithOwnTransactions: new HashSet<string>(StringComparer.Ordinal),
-            AccountsThatAreParents: new HashSet<string>(StringComparer.Ordinal) { "e-bills" });
+            AccountsThatAreParents: new HashSet<string>(StringComparer.Ordinal) { "e-bills" },
+            RootAccounts: new HashSet<string>(StringComparer.Ordinal));
 
-        var result = AccountMapper.Map(md, inputs, TestLedgerId);
+        var result = AccountMapper.Map(md, inputs, TestLedgerId, Usd, "USD");
 
         Assert.NotNull(result.Row);
         Assert.Equal("category", result.Row!.AccountType);
@@ -253,7 +434,8 @@ public sealed class AccountMapperTests
             {
               "metadata": {"exporter":"x","moneydance_build":1,"export_date":1,"file_name":"y"},
               "all_items": [
-                {"obj_type":"acct","id":"a-parent","name":"P","type":"e","currid":"USD"},
+                {"obj_type":"acct","id":"a-root",  "name":"", "type":"r","currid":"USD"},
+                {"obj_type":"acct","id":"a-parent","name":"P","type":"e","currid":"USD","parentid":"a-root"},
                 {"obj_type":"acct","id":"a-child", "name":"C","type":"e","currid":"USD","parentid":"a-parent"},
                 {"obj_type":"acct","id":"a-leaf",  "name":"L","type":"b","currid":"USD"},
                 {"obj_type":"txn","id":"t-1","acctid":"a-leaf","desc":"x","dt":"20240101",
@@ -270,14 +452,15 @@ public sealed class AccountMapperTests
         Assert.Contains("a-parent", inputs.AccountsThatAreParents);
         Assert.DoesNotContain("a-leaf",   inputs.AccountsThatAreParents);
         Assert.DoesNotContain("a-child",  inputs.AccountsThatAreParents);
+        Assert.Equal(["a-root"], inputs.RootAccounts);
     }
 
     [Fact]
     public void Map_propagates_account_metadata_from_md()
     {
-        // Regression for migration 012: MD's hide flag, comment, account
-        // numbers (bank vs invst), institution name (bank vs inst), routing
-        // number, and account URL were previously parsed and dropped.
+        // Migration 012: MD's hide flag, comment, account numbers (bank vs
+        // invst), institution name (bank vs inst), routing number, and account
+        // URL must all reach the row, not be parsed and dropped.
         // Mig 106: MD's `hide` flag collapses into IsActive=false (single
         // lifecycle flag in Coffer).
         var md = AcctFromJson("""
@@ -293,7 +476,7 @@ public sealed class AccountMapperTests
               "account_url":"https://bank.example"
             }
             """);
-        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId, Usd, "USD");
 
         Assert.NotNull(result.Row);
         var row = result.Row!;
@@ -316,7 +499,7 @@ public sealed class AccountMapperTests
               "inst_name":"Brokerage A Group"
             }
             """);
-        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId, Usd, "USD");
 
         Assert.NotNull(result.Row);
         Assert.Equal("V-99887766",     result.Row!.AccountNumber);
@@ -329,7 +512,7 @@ public sealed class AccountMapperTests
         var md = AcctFromJson("""
             {"obj_type":"acct","id":"a-bare","name":"Bare","type":"b","currid":"USD","sbal":"0"}
             """);
-        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId, Usd, "USD");
 
         Assert.NotNull(result.Row);
         var row = result.Row!;
@@ -352,7 +535,7 @@ public sealed class AccountMapperTests
             {"obj_type":"acct","id":"a-inv","name":"Brokerage A","type":"v",
              "currid":"USD","sbal":"100000","date_created":"20180314"}
             """);
-        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId, Usd, "USD");
 
         Assert.NotNull(result.Row);
         Assert.Equal(new DateOnly(2018, 3, 14), result.Row!.OpenedOn);
@@ -367,7 +550,7 @@ public sealed class AccountMapperTests
             {"obj_type":"acct","id":"c-1","name":"Groceries","type":"e",
              "currid":"USD","date_created":"20180314"}
             """);
-        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId);
+        var result = AccountMapper.Map(md, EmptyInputs, TestLedgerId, Usd, "USD");
 
         Assert.NotNull(result.Row);
         Assert.Equal("category", result.Row!.AccountType);

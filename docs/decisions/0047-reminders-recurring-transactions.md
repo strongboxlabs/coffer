@@ -1,11 +1,14 @@
 # 0047 — Reminders / recurring transactions / calendar
 
-* Status: Accepted — **two of its deferrals shipped under their own ADRs.**
+* Status: Accepted — **two of its deferrals shipped under their own ADRs.** Amended
+  2026-11-14 by [ADR-0114](0114-benchmarks-and-currency-conversion.md) (a bank template's posting between real accounts in
+  different currencies stores the counterpart's own amount, not `-amount`; extended
+  2026-11-16, D15: an estimate rounds once at its account's currency's places, half
+  away from zero).
 
 > *Auto-commit firing* ("`auto_commit_days_before` is captured, not acted on") shipped
-> as ADR-0097 + migration 219's `reminder-auto-post` job. Migration 219's header
-> records the defect this ADR left behind: the value "validates, persists and
-> round-trips on edit, and NOTHING HAS EVER FIRED IT".
+> as ADR-0097 + migration 219's `reminder-auto-post` job. Before that job the value
+> validated, persisted and round-tripped on edit, and nothing fired it.
 >
 > *Loan-account-driven reminders* — the "separate ADR" referred to below without a
 > name — is ADR-0078, with migration 168's `recurring_transactions.loan_account_id`.
@@ -26,7 +29,7 @@
 ADR-0010 shipped the `recurring_transactions` table and the Moneydance
 importer round-trips reminders into it idempotently (`external_id`,
 mig 013), snapshot-included (mig 112) — but deliberately deferred the UI.
-Verified state today: **no EF entity, no DTO, no repository, no
+At this point there is **no EF entity, no DTO, no repository, no
 endpoints, no UI, and no firing engine.** The table is effectively
 write-only from the importer. `next_due_date` is null in every import.
 
@@ -37,7 +40,7 @@ filter catches any future-dated header, never a recurring template.
 
 This ADR designs reminders/recurring transactions and the calendar
 surface on top of that foundation, settling the data model and the
-first-slice scope. All decisions below were agreed with the user.
+first-slice scope.
 
 ## Decisions
 
@@ -61,8 +64,8 @@ the same kind of structural discriminator.
 ### D2 — View-layer separation: live vs template (the exclusion is structural)
 
 The discriminator alone is not enough — **every** reader of "live"
-transactions must exclude templates, and that is the balance/holdings
-surface just hardened (\#196–#198). Rather than scatter
+transactions must exclude templates, and that includes the
+balance/holdings surface. Rather than scatter
 `AND NOT is_recurring_template` across N readers, the exclusion lives in
 the **view layer**:
 
@@ -79,7 +82,7 @@ the **view layer**:
   mechanism as the mig-103 `is_hidden` exclusion), so templates are
   invisible to balances/holdings structurally, not by caller discipline.
 
-Reader inventory to update (known from the \#196–#198 work): the view, the
+Reader inventory to update: the view, the
 two recompute functions, the posting-count denorm, the `scheduled`
 predicate, reports.
 
@@ -91,8 +94,8 @@ The table slims to *recurrence* concerns and points at the template:
   discrete `frequency` / `monthly_day` / `weekly_dow` / `interval_units`
   columns (dropped). RRULE expresses MD's patterns directly (*Monthly ·
   every · 5th* → `FREQ=MONTHLY;BYMONTHDAY=5`; *Last* → `BYMONTHDAY=-1`)
-  and the future patterns MD can't. Chosen by the user over discrete
-  columns for expressiveness.
+  and the future patterns MD can't. Chosen over discrete columns for
+  expressiveness.
 - **`source_payload JSONB`** — the raw MD reminder object, lossless
   (same pattern as `provider_raw_payload`, mig 110). Preserves the full
   split structure, `acdays`, and anything else MD sends, independent of
@@ -114,7 +117,7 @@ payoff tracking, likely auto-generation from loan terms. That is a
 preserved but inert. Tracked in `follow-ups.md`.
 
 RRULE expansion is genuinely complex (RFC 5545: `BYSETPOS`, edge cases) —
-unlike the trivial QIF parser (ADR-0042), this warrants a **vetted,
+unlike QIF's line-based format (ADR-0042), this warrants a **vetted,
 maintained RRULE library** rather than hand-rolling, pinned per the
 dependency-hygiene posture (exact package an implementation choice,
 reviewed at build time). Expansion is C# computation (a
@@ -150,6 +153,16 @@ back to series + slot). It then flows through the normal register/recon
 path and the `scheduled` filter catches it for free if it is future-
 dated — no new status value. The series `next_due_date` advances.
 
+*Amended 2026-10-27 (ADR-0108 D1, D3): the clone carries the template's notes and
+owner.* The occurrence gets the template's memo and tags where they sit, the
+header's and every leg's own, and the template's originating account
+(`RemindersRepository`, through `AnnotationPlanner.Seed`); as a clone it is
+never capped by the tag limit. A template with no lines has no originating
+account, and firing it is refused (`reminder-template-has-no-lines`) rather
+than committing a transaction that moves no money and belongs to no account.
+Where the reminders list, agenda and editor show such a template, they show
+its header's own memo and tags, since no side presents them.
+
 ### D6 — Edit scope: series + skip-next first; never mutate committed headers
 
 v1 supports **edit the series** (the pattern) and **skip the next
@@ -164,8 +177,8 @@ retroactively mutated (committed cash is immutable).
 - A top-level **Reminders** sidebar entry with: the management **list**,
   the **recurrence editor**, and an **upcoming** surface that ships with
   BOTH a **month-grid calendar** (primary) and an **agenda** list toggle
-  over the same windowed-expansion data. The calendar is in slice 1 (user
-  call) — not deferred.
+  over the same windowed-expansion data. The calendar is in slice 1 —
+  not deferred.
 - The upcoming-occurrences endpoint is deliberately reusable: a future,
   **separate** Home dashboard (its own ADR) can render a reminders summary
   from it. Home is **out of scope** here.
@@ -179,8 +192,6 @@ is preserved (both structurally as `auto_commit_days_before` and raw in
 `source_payload`).
 
 ## UI walkthrough (page-by-page)
-
-Examples below use generic placeholders (no plan-identifying data).
 
 1. **Reminders list** — series from `GET …/reminders`: Description,
    Source → Target account, Amount, recurrence rendered human
@@ -244,11 +255,10 @@ Examples below use generic placeholders (no plan-identifying data).
 - One new runtime dependency (an RRULE library), dependency-hygiene
   reviewed. Justified: RFC 5545 expansion should not be hand-rolled.
 - A migration rewrites the existing imported `recurring_transactions`
-  rows into template headers+legs + RRULE. One-time, tested against a
-  large real-world MD export's reminder count.
+  rows into template headers+legs + RRULE. One-time.
 
 ## Resolved (formerly open)
-- **Month-grid calendar** ships in slice 1 (user call), with an agenda
+- **Month-grid calendar** ships in slice 1, with an agenda
   toggle on the same data.
 - **Home dashboard** is a separate ADR; this design only exposes the
   reusable upcoming-occurrences endpoint, builds no Home surface.
@@ -310,6 +320,17 @@ template's net.
   `-amount`, so sum-to-zero is server-enforced). The per-posting shape +
   account validation is the shared `PostingValidation` extracted from
   `TransactionsEndpoints`.
+  *(Amended 2026-11-14, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D13: the counterpart is `-amount` except on a
+  posting between real accounts in different currencies. There the template stores the
+  counterpart's own amount, which is required, and each fire carries it as entered or,
+  for an estimating series, as the source estimate at the rate `RateDay.Of` gives the
+  due date, derived from the stored rates against the reporting currency (ADR-0114 D13)
+  ([ADR-0022](0022-txn-headers-and-legs.md) Rule 2, 2026-11-14 amendment). A reminder request's posting
+  carries it as `counterpartyAmount`, as the bank request's does. Extended 2026-11-16,
+  ADR-0114 D15: every estimate, the source side's and, between currencies, the other
+  side's, is rounded once at its own account's currency's places, half away from zero;
+  the source estimate rounded half to even at two places before (settled by Claude,
+  2026-11-16).)*
 - **Investment** legs are built by
   `InvestmentTransactionsRepository.BuildTemplateLegsAsync`, which runs the
   identical action-by-field validation + account/security resolution + posting
@@ -357,11 +378,11 @@ transaction (before the cursor recompute) and report the tally
 its confirm + a post-action notice. This **supersedes** the earlier "a
 far-future skip doesn't regress the near cursor" intent: the cursor computation
 is still earliest-un-consumed, but acting now deliberately consumes the backlog
-behind the acted slot. (User-confirmed: **Post cascades like Skip**, gated by a
-named-count confirm given the income-hiding risk on un-posted past deposits.)
+behind the acted slot. (**Post cascades like Skip**, gated by a named-count
+confirm given the income-hiding risk on un-posted past deposits.)
 
 Migration 125 also extends `fn_ledger_snapshot_payload` / `_restore` to
-round-trip the new table (the mig 111->112 lesson) and keeps
+round-trip the new table and keeps
 `LedgerSnapshotPayload.InScopeTables` aligned.
 
 ### Deferred (not built here)

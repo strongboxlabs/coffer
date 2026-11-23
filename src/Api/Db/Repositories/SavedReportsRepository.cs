@@ -37,6 +37,7 @@ internal sealed class SavedReportsRepository
         await _db.SavedReports.AsNoTracking()
             .Where(r => r.LedgerId == ledgerId)
             .OrderBy(r => r.Name)
+            .ThenBy(r => r.Id)
             .ToListAsync(cancellationToken).ConfigureAwait(false)
             is var rows ? rows.Select(ToDto).ToList() : [];
 

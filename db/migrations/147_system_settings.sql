@@ -5,7 +5,7 @@
 -- A generic, deployment-global settings store — the home for install-wide
 -- (non-ledger, non-user) configuration that an admin should be able to change
 -- from the UI rather than by editing env/compose. The first inhabitant is
--- `mcp.enabled` (the MCP server runtime toggle, D8); future System-settings
+-- `mcp.enabled` (the MCP server runtime toggle, ADR-0063 D8); future System-settings
 -- tabs slot their flags in here too.
 --
 -- Deployment-global, service-role only (same posture as global_scheduled_jobs /

@@ -7,8 +7,8 @@
 -- product leaves a sub-cent remainder) left sub-cent amounts on txn_legs
 -- (`amount` is numeric(19,4)). Those sub-cent legs then summed into the
 -- running balances (txn_header_account_balances is numeric(19,4) too),
--- producing fractional balances that rendered as a negative zero. At
--- migration time such legs existed on a real ledger.
+-- producing fractional balances that rendered as a negative zero. Any
+-- ledger written through that path before the fix can carry such legs.
 --
 -- The producer is fixed in code: the request `amount` (2dp — the real settled
 -- cash) is now authoritative and `unit_price` is DERIVED metadata

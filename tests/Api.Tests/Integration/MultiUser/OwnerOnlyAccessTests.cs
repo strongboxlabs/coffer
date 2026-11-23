@@ -15,16 +15,19 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.MultiUser;
 
 /// <summary>
-/// What became the owner's on 2026-10-19 (FU-095): granting access to a ledger, admins
-/// included; connecting and disconnecting a bank; and choosing where a ledger's events go.
-/// Editors keep syncing. Each held at the API, and the last two at RLS too (ADR-0083 D2).
+/// What only the owner may do (FU-095): granting access to a ledger, admins
+/// included; connecting, renaming and disconnecting a bank; and choosing where a ledger's
+/// events go. Editors keep syncing. Each held at the API, and connecting, disconnecting and
+/// the event targets at RLS too (ADR-0083 D2); a rename writes the row a sync writes, so it
+/// is the API's alone.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class OwnerOnlyAccessTests
+public sealed class OwnerOnlyAccessTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public OwnerOnlyAccessTests(PostgresFixture fixture) => _fixture = fixture;
+    public OwnerOnlyAccessTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<string> CodeOfAsync(HttpResponseMessage response)
     {
@@ -37,7 +40,7 @@ public sealed class OwnerOnlyAccessTests
     {
         _ = ledger;
         var (plaintext, hash) = Coffer.Api.Auth.Webauthn.SessionService.GenerateCookieValue();
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             db.AuthSessions.Add(new SessionRow
             {
@@ -53,7 +56,7 @@ public sealed class OwnerOnlyAccessTests
 
     private async Task<Guid> AdminAsync()
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var suffix = Guid.NewGuid().ToString("N");
         var admin = new UserRow
         {
@@ -70,30 +73,30 @@ public sealed class OwnerOnlyAccessTests
     [Fact]
     public async Task An_admin_who_does_not_own_a_ledger_cannot_invite_anyone_into_it()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var adminId = await AdminAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var admin = await ClientAsync(factory, ledger, adminId);
 
         var response = await admin.PostAsJsonAsync("/api/admin/invites",
             new { ledgerId = ledger.LedgerId, role = "editor", grantsAdmin = false });
 
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.False(await db.Invites.AnyAsync(i => i.IssuedByUserId == adminId));
     }
 
     [Fact]
     public async Task An_admin_who_owns_the_ledger_may()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var adminId = await AdminAsync();
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             db.UserLedgerGrants.Add(new UserLedgerGrantRow { UserId = adminId, LedgerId = ledger.LedgerId, Role = "owner" });
             await db.SaveChangesAsync();
         }
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var admin = await ClientAsync(factory, ledger, adminId);
 
         var response = await admin.PostAsJsonAsync("/api/admin/invites",
@@ -107,9 +110,9 @@ public sealed class OwnerOnlyAccessTests
     {
         // Issued before 0.122.0, when admin alone was enough: it carries authority its sender
         // no longer has, and redemption re-checks it.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var adminId = await AdminAsync();
-        var invites = new InvitesRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var invites = new InvitesRepository(Db.NewServiceFactory(), TimeProvider.System);
         var token = await invites.CreateAsync(adminId, ledger.LedgerId, "editor", grantsAdmin: false);
 
         Assert.Null(await invites.GetValidScopeAsync(token));
@@ -124,10 +127,10 @@ public sealed class OwnerOnlyAccessTests
     [Fact]
     public async Task An_editor_cannot_connect_a_bank_change_its_mapping_or_add_a_notification_target()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var editor = await ledger.AddMemberAsync("editor");
         var account = await ledger.AddBankAccountAsync("checking");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger, editor);
         var ledgerPath = $"/api/ledgers/{ledger.LedgerId}";
 
@@ -139,6 +142,8 @@ public sealed class OwnerOnlyAccessTests
             ["connect"] = await client.PostAsJsonAsync($"{ledgerPath}/feed-connections",
                 new { setupToken = "aHR0cHM6Ly9icmlkZ2Uuc2ltcGxlZmluLm9yZy9jbGFpbS94" }),
             ["disconnect"] = await client.DeleteAsync($"{ledgerPath}/feed-connections/{Guid.NewGuid()}"),
+            ["rename"] = await client.PatchAsJsonAsync($"{ledgerPath}/feed-connections/{Guid.NewGuid()}",
+                new { name = "Renamed feed" }),
             ["map"] = await client.PatchAsJsonAsync($"{ledgerPath}/accounts/{account.Id}/feed-mapping",
                 new { feedConnectionId = Guid.NewGuid(), simpleFinAccountId = "ACT-1" }),
             ["unmap"] = await client.DeleteAsync($"{ledgerPath}/accounts/{account.Id}/feed-mapping"),
@@ -159,9 +164,9 @@ public sealed class OwnerOnlyAccessTests
     [Fact]
     public async Task An_editor_still_syncs()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var editor = await ledger.AddMemberAsync("editor");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger, editor);
 
         // No connection with this id: the answer comes from the sync itself, so the role
@@ -194,28 +199,28 @@ public sealed class OwnerOnlyAccessTests
     [Fact]
     public async Task At_the_database_an_editor_may_sync_a_connection_and_may_not_create_or_remove_one()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var editor = await ledger.AddMemberAsync("editor");
         var existing = Connection(ledger.LedgerId);
-        await using (var svc = _fixture.NewServiceDbContext())
+        await using (var svc = Db.NewServiceDbContext())
         {
             svc.FeedConnections.Add(existing);
             await svc.SaveChangesAsync();
         }
 
-        await using (var db = _fixture.NewAppDbContextAsUser(editor))
+        await using (var db = Db.NewAppDbContextAsUser(editor))
         {
             db.FeedConnections.Add(Connection(ledger.LedgerId));
             await AssertRefusedAsync(() => db.SaveChangesAsync());
         }
-        await using (var db = _fixture.NewAppDbContextAsUser(editor))
+        await using (var db = Db.NewAppDbContextAsUser(editor))
         {
             // What a sync writes.
             Assert.Equal(1, await db.FeedConnections.Where(f => f.Id == existing.Id)
                 .ExecuteUpdateAsync(s => s.SetProperty(f => f.LastSyncedAt, DateTime.UtcNow)));
             Assert.Equal(0, await db.FeedConnections.Where(f => f.Id == existing.Id).ExecuteDeleteAsync());
         }
-        await using (var db = _fixture.NewAppDbContextAsUser(ledger.UserId))
+        await using (var db = Db.NewAppDbContextAsUser(ledger.UserId))
         {
             db.FeedConnections.Add(Connection(ledger.LedgerId));
             Assert.Equal(1, await db.SaveChangesAsync());
@@ -225,15 +230,15 @@ public sealed class OwnerOnlyAccessTests
     [Fact]
     public async Task At_the_database_only_an_owner_writes_a_notification_target()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var editor = await ledger.AddMemberAsync("editor");
 
-        await using (var db = _fixture.NewAppDbContextAsUser(editor))
+        await using (var db = Db.NewAppDbContextAsUser(editor))
         {
             db.LedgerNotificationSubscribers.Add(Target(ledger.LedgerId));
             await AssertRefusedAsync(() => db.SaveChangesAsync());
         }
-        await using (var db = _fixture.NewAppDbContextAsUser(ledger.UserId))
+        await using (var db = Db.NewAppDbContextAsUser(ledger.UserId))
         {
             db.LedgerNotificationSubscribers.Add(Target(ledger.LedgerId));
             Assert.Equal(1, await db.SaveChangesAsync());

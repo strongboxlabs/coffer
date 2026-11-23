@@ -22,13 +22,11 @@ namespace Coffer.Api.Tests.Integration.FeedConnections;
 /// disable is UX clarity only — the API must own the race.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class SyncConcurrencyTests
+public sealed class SyncConcurrencyTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SyncConcurrencyTests(PostgresFixture fixture)
+    public SyncConcurrencyTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -65,9 +63,9 @@ public sealed class SyncConcurrencyTests
                        FeedConnectionSummary Connection)>
         ConnectAsync(string accountsBody, Func<Exception>? failSyncWith = null)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var keys = _fixture.NewLedgerKeyService();
-        await using (var seed = _fixture.NewDbContext())
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var keys = Db.NewLedgerKeyService();
+        await using (var seed = Db.NewDbContext())
         {
             var row = await seed.Ledgers.SingleAsync(l => l.Id == ledger.LedgerId);
             row.WrappedLek = keys.CreateWrappedLek();
@@ -78,7 +76,7 @@ public sealed class SyncConcurrencyTests
         const string accessUrl = "https://u:p@bridge.simplefin.org/simplefin/access/abc";
         // The POST leg is the setup-token claim and must succeed for the connection
         // to exist at all; only the GET (the sync itself) fails when asked to.
-        var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(req =>
             {
                 if (req.Method == HttpMethod.Post)
@@ -115,10 +113,11 @@ public sealed class SyncConcurrencyTests
                "sfin_url":"https://sfin/banka"}
             ],"errlist":[],"accounts":[]}
             """);
+        await using var connectFactory = setup.Factory;
 
         // Replace the SimpleFIN client with one that gates GET
         // /accounts so we can hold the first sync's HTTP call open.
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => new SimpleFinClient(
                 new HttpClient(new GatedHandler(
                     async req =>
@@ -173,7 +172,7 @@ public sealed class SyncConcurrencyTests
 
         // Exactly one sync_runs row landed (the rejected second
         // attempt never wrote one).
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var runs = await db.LedgerOperations.AsNoTracking()
             .Where(r => r.FeedConnectionId == setup.Connection.Id)
             .ToListAsync();
@@ -199,7 +198,7 @@ public sealed class SyncConcurrencyTests
 
         // Seed a stale `running` row 15 minutes old.
         Guid staleRunId;
-        await using (var seed = _fixture.NewDbContext())
+        await using (var seed = Db.NewDbContext())
         {
             var row = new LedgerOperationRow
             {
@@ -226,7 +225,7 @@ public sealed class SyncConcurrencyTests
 
         // The stale row was reaped to `failed`; a fresh `completed`
         // row exists for this attempt.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var stale = await db.LedgerOperations.AsNoTracking()
             .SingleAsync(r => r.Id == staleRunId);
         Assert.Equal("failed", stale.Status);
@@ -244,11 +243,11 @@ public sealed class SyncConcurrencyTests
     /// </summary>
     /// <remarks>
     /// HttpClient signals a timeout with <see cref="TaskCanceledException"/>, which is
-    /// not a <c>SimpleFinException</c> — so it unwound straight past the orchestrator
-    /// catch that stamps the run <c>failed</c>, leaving the row <c>running</c> with no
-    /// <c>completed_at</c>. The partial unique index then rejected the next sync on
-    /// that connection as "already running" until the 10-minute reaper caught up.
-    /// Found on a real install as a sync stuck on RUNNING.
+    /// not a <c>SimpleFinException</c> — so unhandled, it unwinds straight past the
+    /// orchestrator catch that stamps the run <c>failed</c>, leaving the row
+    /// <c>running</c> with no <c>completed_at</c>. The partial unique index then rejects
+    /// the next sync on that connection as "already running" until the 10-minute reaper
+    /// catches up: a sync stuck on RUNNING.
     /// </remarks>
     [Theory]
     [InlineData("timeout")]
@@ -279,7 +278,7 @@ public sealed class SyncConcurrencyTests
         // A provider fault, reported as one — not a 500 from an unhandled throw.
         Assert.Equal(HttpStatusCode.UnprocessableEntity, sync.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var run = await db.LedgerOperations.AsNoTracking()
             .Where(r => r.FeedConnectionId == setup.Connection.Id)
             .OrderByDescending(r => r.StartedAt)
@@ -333,7 +332,7 @@ public sealed class SyncConcurrencyTests
             // leave the run open behind it.
         }
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Equal(0, await db.LedgerOperations.AsNoTracking()
             .CountAsync(r => r.FeedConnectionId == setup.Connection.Id
                           && r.Status == "running"));
@@ -355,9 +354,9 @@ public sealed class SyncConcurrencyTests
         // watermark - 7d. The captured query strings prove the
         // second sync's start-date sits strictly closer to now.
         var capturedStartDates = new List<long>();
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var keys = _fixture.NewLedgerKeyService();
-        await using (var seed = _fixture.NewDbContext())
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var keys = Db.NewLedgerKeyService();
+        await using (var seed = Db.NewDbContext())
         {
             var row = await seed.Ledgers.SingleAsync(l => l.Id == ledger.LedgerId);
             row.WrappedLek = keys.CreateWrappedLek();
@@ -378,7 +377,7 @@ public sealed class SyncConcurrencyTests
                "currency":"USD","balance":"0.00","transactions":[]}
             ]}
             """;
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => new SimpleFinClient(
                 new HttpClient(new RecordingHandler(req =>
                 {
@@ -433,9 +432,9 @@ public sealed class SyncConcurrencyTests
         var first = DateTimeOffset.FromUnixTimeSeconds(capturedStartDates[0]);
         // First-sync window = MaxWindowDays - WindowSafetyMargin
         // = 90 days - 1 day = 89 days. Asserts strictly < 90 so the
-        // SimpleFIN cap-boundary regression can't sneak back (a 1-hour
-        // margin shipped first and still tripped the warning on real
-        // bridges — see WindowSafetyMargin xmldoc).
+        // window stays clear of SimpleFIN's 90-day cap: the bridge does not
+        // apply the cap to the exact second, so the floor sits a whole day
+        // inside it (see WindowSafetyMargin xmldoc).
         var firstAgo = (DateTimeOffset.UtcNow - first).TotalDays;
         Assert.InRange(firstAgo, 88.5, 89.5);
         // Second sync (watermark ~now) asks for ~7 days back

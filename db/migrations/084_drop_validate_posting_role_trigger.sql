@@ -40,8 +40,7 @@
 --     057's one-shot backfill cleaned MD-imported legs; the
 --     repository now stamps role on insert.
 --   * Test fixtures (SyntheticLedger, etc.) — already stamp the
---     role correctly (they were tested against the trigger and
---     passed; same expectations apply).
+--     role correctly.
 --
 -- Direct SQL writes (data fixes) are rare and the operator accepts
 -- responsibility; removing the trigger doesn't materially weaken

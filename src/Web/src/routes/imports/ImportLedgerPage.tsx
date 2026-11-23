@@ -1,5 +1,6 @@
-import { useEffect, useId, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useEffect, useId, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 import { useNavigate } from '@tanstack/react-router';
 import { FileUp, CheckCircle2, AlertTriangle } from 'lucide-react';
 
@@ -9,37 +10,54 @@ import {
     fetchImportJob,
     type ImportPreview,
 } from '@/lib/api/import';
+import { ApiError } from '@/lib/api';
+import { currencyChoices } from '@/lib/currencies';
 import { errorMessage } from '@/lib/errorMessage';
 import { Breadcrumb } from '@/components/ui/Breadcrumb';
 import { Button } from '@/components/ui/Button';
 import { FieldLabel } from '@/components/ui/FieldLabel';
 import { Input } from '@/components/ui/Input';
 import { Panel, PanelBody } from '@/components/ui/Panel';
+import { pendingChoiceProps } from '@/components/ui/pending';
 import { MainArea, MainPane, TopBar } from '@/components/ui/SidebarLayout';
+
+import { ImportWarnings, ImportWarningsStatus } from './ImportWarnings';
 
 /**
  * Create a new ledger from a Moneydance export (ADR-0071 D2). A four-step
  * wizard: pick the file → preview per-type counts + name the ledger → the
  * import runs as a background job we poll → open the new ledger. Import is
- * always into a *new* ledger, which also satisfies the seed-once guard.
+ * always into a *new* ledger, whatever other ledgers share its name. A finished
+ * import whose validation checks failed says so on the last step, with a box per
+ * failed check (ImportWarnings); one with nothing to report ends on "Import complete."
  */
 export function ImportLedgerPage() {
     const navigate = useNavigate();
     const queryClient = useQueryClient();
     const nameId = useId();
+    const currencyId = useId();
+    const currencyHintId = useId();
 
     const [file, setFile] = useState<File | null>(null);
     const [preview, setPreview] = useState<ImportPreview | null>(null);
     const [ledgerName, setLedgerName] = useState('');
+    // The new ledger's reporting currency (ADR-0114 D7): the export's base currency
+    // unless changed. Null until the preview names it.
+    const [currency, setCurrency] = useState<string | null>(null);
     const [jobId, setJobId] = useState<string | null>(null);
+    const runRef = useRef<HTMLDivElement>(null);
 
     const previewMutation = useMutation({
         mutationFn: (f: File) => previewMoneydanceImport(f),
-        onSuccess: (p) => setPreview(p),
+        onSuccess: (p) => {
+            setPreview(p);
+            setCurrency(p.baseCurrencyCode);
+        },
     });
 
     const startMutation = useMutation({
-        mutationFn: (args: { f: File; name: string }) => startMoneydanceImport(args.f, args.name),
+        mutationFn: (args: { f: File; name: string; currency: string }) =>
+            startMoneydanceImport(args.f, args.name, args.currency),
         onSuccess: (job) => setJobId(job.jobId),
     });
 
@@ -60,10 +78,15 @@ export function ImportLedgerPage() {
         }
     }, [job?.state, queryClient]);
 
+    useEffect(() => {
+        if (jobId) runRef.current?.focus();
+    }, [jobId]);
+
     function reset() {
         setFile(null);
         setPreview(null);
         setLedgerName('');
+        setCurrency(null);
         setJobId(null);
     }
 
@@ -73,6 +96,10 @@ export function ImportLedgerPage() {
     const previewError = previewMutation.error
         ? errorMessage(previewMutation.error, 'Could not read the export.')
         : null;
+    // An export whose currencies cannot be told is refused by name (ADR-0114 D5): the
+    // server's sentence names the accounts, and the way out is in Moneydance.
+    const currencyUnresolved = previewMutation.error instanceof ApiError
+        && previewMutation.error.code === 'import-currency-unresolved';
     const startError = startMutation.error
         ? errorMessage(startMutation.error, 'Could not start the import.')
         : null;
@@ -114,18 +141,26 @@ export function ImportLedgerPage() {
                                     />
                                 </div>
                                 {previewError ? (
-                                    <p role="alert" className="text-sm text-state-danger">
-                                        {previewError}
-                                    </p>
+                                    <div role="alert" className="space-y-1 text-sm text-state-danger">
+                                        <p>{previewError}</p>
+                                        {currencyUnresolved ? (
+                                            <p className="text-xs">
+                                                Give each of these accounts its currency in
+                                                Moneydance, export again, and choose the new file.
+                                            </p>
+                                        ) : null}
+                                    </div>
                                 ) : null}
                                 <div className="flex justify-end">
                                     <Button
                                         type="button"
-                                        disabled={!file || previewMutation.isPending}
+                                        disabled={!file}
+                                        pending={previewMutation.isPending}
                                         onClick={() => file && previewMutation.mutate(file)}
+                                        pendingLabel={<><FileUp className="mr-1 size-icon-md" aria-hidden />Analyzing…</>}
                                     >
                                         <FileUp className="mr-1 size-icon-md" aria-hidden />
-                                        {previewMutation.isPending ? 'Analyzing…' : 'Analyze export'}
+                                        Analyze export
                                     </Button>
                                 </div>
                             </PanelBody>
@@ -154,9 +189,31 @@ export function ImportLedgerPage() {
                                         autoFocus
                                         placeholder="e.g. Personal (imported)"
                                         value={ledgerName}
-                                        disabled={startMutation.isPending}
+                                        pending={startMutation.isPending}
                                         onChange={(e) => setLedgerName(e.target.value)}
                                     />
+                                </div>
+                                <div className="space-y-1.5">
+                                    <FieldLabel htmlFor={currencyId}>Reporting currency</FieldLabel>
+                                    <select
+                                        id={currencyId}
+                                        aria-describedby={currencyHintId}
+                                        value={currency ?? preview.baseCurrencyCode}
+                                        {...pendingChoiceProps<HTMLSelectElement>(startMutation.isPending, {
+                                            onChange: (e) => setCurrency(e.target.value),
+                                        })}
+                                        className="flex h-control-40px w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-accent aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
+                                    >
+                                        {currencyChoices(currency ?? preview.baseCurrencyCode).map((c) => (
+                                            <option key={c} value={c}>{c}</option>
+                                        ))}
+                                    </select>
+                                    <p id={currencyHintId} className="text-[0.6875rem] text-text-muted">
+                                        Totals that combine accounts are shown in it. It starts as
+                                        the export&apos;s base currency. Each imported account keeps
+                                        the currency it has in Moneydance. You can change it later
+                                        in Settings.
+                                    </p>
                                 </div>
                                 {startError ? (
                                     <p role="alert" className="text-sm text-state-danger">
@@ -169,12 +226,18 @@ export function ImportLedgerPage() {
                                     </Button>
                                     <Button
                                         type="button"
-                                        disabled={ledgerName.trim().length === 0 || startMutation.isPending}
+                                        disabled={ledgerName.trim().length === 0}
+                                        pending={startMutation.isPending}
                                         onClick={() =>
-                                            file && startMutation.mutate({ f: file, name: ledgerName.trim() })
+                                            file && startMutation.mutate({
+                                                f: file,
+                                                name: ledgerName.trim(),
+                                                currency: currency ?? preview.baseCurrencyCode,
+                                            })
                                         }
+                                        pendingLabel="Starting…"
                                     >
-                                        {startMutation.isPending ? 'Starting…' : 'Create ledger'}
+                                        Create ledger
                                     </Button>
                                 </div>
                             </PanelBody>
@@ -183,13 +246,50 @@ export function ImportLedgerPage() {
 
                     {step === 'running' ? (
                         <Panel>
-                            <PanelBody className="space-y-4">
+                            {/* Takes focus when the run starts, since the button that started it
+                                is gone; it holds every state the run settles into. */}
+                            <PanelBody
+                                ref={runRef}
+                                tabIndex={-1}
+                                className="space-y-4 focus-visible:outline-none"
+                            >
+                                {/* One live region from the start of the run to its result, so the
+                                    change is announced; a region that mounts already filled often
+                                    is not. A failed run speaks through its alert instead. */}
+                                <div
+                                    role="status"
+                                    hidden={job?.state === 'failed'}
+                                    className="space-y-2"
+                                >
+                                    {job?.state === 'succeeded' ? (
+                                        job.warnings.length === 0 ? (
+                                            <p className="flex items-center gap-2 text-sm font-medium text-state-success">
+                                                <CheckCircle2 className="size-icon-lg" aria-hidden />
+                                                Import complete.
+                                            </p>
+                                        ) : (
+                                            <ImportWarningsStatus job={job} />
+                                        )
+                                    ) : job?.state === 'failed' ? null : (
+                                        <>
+                                            <p className="text-sm text-text-muted">
+                                                Importing… {job ? `${job.completed} of ${job.total} steps` : 'starting'}
+                                                {job?.step ? ` — ${job.step}` : ''}
+                                            </p>
+                                            <div className="h-fixed-8px w-full overflow-hidden rounded bg-surface-hover">
+                                                <div
+                                                    className="h-full bg-accent transition-all"
+                                                    style={{
+                                                        width: `${job && job.total > 0 ? Math.round((job.completed / job.total) * 100) : 5}%`,
+                                                    }}
+                                                />
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
                                 {job?.state === 'succeeded' ? (
                                     <div className="space-y-4">
-                                        <p className="flex items-center gap-2 text-sm font-medium text-state-success">
-                                            <CheckCircle2 className="size-icon-lg" aria-hidden />
-                                            Import complete.
-                                        </p>
+                                        {job.warnings.length > 0 ? <ImportWarnings job={job} /> : null}
                                         <div className="flex justify-end">
                                             <Button
                                                 type="button"
@@ -217,22 +317,7 @@ export function ImportLedgerPage() {
                                             </Button>
                                         </div>
                                     </div>
-                                ) : (
-                                    <div className="space-y-2" aria-live="polite">
-                                        <p className="text-sm text-text-muted">
-                                            Importing… {job ? `${job.completed} of ${job.total} steps` : 'starting'}
-                                            {job?.step ? ` — ${job.step}` : ''}
-                                        </p>
-                                        <div className="h-fixed-8px w-full overflow-hidden rounded bg-surface-hover">
-                                            <div
-                                                className="h-full bg-accent transition-all"
-                                                style={{
-                                                    width: `${job && job.total > 0 ? Math.round((job.completed / job.total) * 100) : 5}%`,
-                                                }}
-                                            />
-                                        </div>
-                                    </div>
-                                )}
+                                ) : null}
                             </PanelBody>
                         </Panel>
                     ) : null}

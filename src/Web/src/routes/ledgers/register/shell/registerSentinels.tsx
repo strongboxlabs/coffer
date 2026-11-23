@@ -4,8 +4,7 @@ import type { Components } from 'react-virtuoso';
 // `─── Newest transaction ───` / `─── Oldest transaction · DATE ───`
 // edge markers — honest cues for "yes, this really is the end" so the
 // user isn't second-guessing whether the scrollbar means "absolute
-// end" or "edge of the loaded window." Bank shipped these; investment
-// had none. Extracting the builder means both registers render the
+// end" or "edge of the loaded window." One builder means both registers render the
 // identical sentinels off the same `atTimelineHead`/`atTimelineTail`
 // flags from `useRegisterController`.
 

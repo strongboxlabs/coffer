@@ -100,10 +100,87 @@ public sealed class McpTokensRepository
         return await db.McpAccessTokens.AsNoTracking()
             .Where(t => t.UserId == userId && t.RevokedAt == null)
             .OrderByDescending(t => t.CreatedAt)
+            .ThenByDescending(t => t.Id)
             .Select(t => new McpTokenSummary(
                 t.Id, t.Name, t.Scopes, t.CreatedAt, t.LastUsedAt, t.ExpiresAt))
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Every live token of every user, newest first, with its owner's display name — the
+    /// admin's view across users. Live means not revoked and not past its expiry: an expired
+    /// token is not a connection to show. Never returns the hash or any secret material.
+    /// </summary>
+    public async Task<IReadOnlyList<AdminMcpToken>> ListAllLiveAsync(CancellationToken cancellationToken = default)
+    {
+        var now = _clock.GetUtcNow().UtcDateTime;
+        await using var db = _serviceFactory.Create();
+        return await db.McpAccessTokens.AsNoTracking()
+            .Where(t => t.RevokedAt == null && (t.ExpiresAt == null || t.ExpiresAt > now))
+            .Join(db.Users.AsNoTracking(), t => t.UserId, u => u.Id, (t, u) => new { Token = t, User = u })
+            // Ordered before the projection: EF cannot map a property of the constructed
+            // record back to the column it came from, so ordering after it does not translate.
+            .OrderByDescending(x => x.Token.CreatedAt)
+            .ThenByDescending(x => x.Token.Id)
+            .Select(x => new AdminMcpToken(
+                x.Token.Id, x.Token.UserId, x.User.DisplayName, x.Token.Name, x.Token.Scopes,
+                x.Token.CreatedAt, x.Token.LastUsedAt, x.Token.ExpiresAt))
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Rename one active token, scoped to its owner so a user can't rename another user's by
+    /// id. Returns true iff a matching active row was renamed.
+    /// </summary>
+    public Task<bool> RenameAsync(
+        Guid userId, Guid tokenId, string name, CancellationToken cancellationToken = default) =>
+        RenameCoreAsync(userId, tokenId, name, cancellationToken);
+
+    /// <summary>
+    /// Rename one active token whoever owns it — the admin path, reached only from a
+    /// <c>RequireAdmin</c> endpoint. Returns true iff an active row was renamed.
+    /// </summary>
+    public Task<bool> RenameAnyAsync(Guid tokenId, string name, CancellationToken cancellationToken = default) =>
+        RenameCoreAsync(null, tokenId, name, cancellationToken);
+
+    private async Task<bool> RenameCoreAsync(
+        Guid? userId, Guid tokenId, string name, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        await using var db = _serviceFactory.Create();
+        var rows = await db.McpAccessTokens
+            .Where(t => t.Id == tokenId && t.RevokedAt == null && (userId == null || t.UserId == userId))
+            .ExecuteUpdateAsync(s => s.SetProperty(x => x.Name, _ => name), cancellationToken)
+            .ConfigureAwait(false);
+        return rows == 1;
+    }
+
+    /// <summary>
+    /// Revoke one token whoever owns it — the admin path, reached only from a
+    /// <c>RequireAdmin</c> endpoint. Returns the owner's id, so the caller can record whose
+    /// access was ended, or null when no active token has this id.
+    /// </summary>
+    public async Task<Guid?> RevokeAnyAsync(Guid tokenId, CancellationToken cancellationToken = default)
+    {
+        var now = _clock.GetUtcNow().UtcDateTime;
+        await using var db = _serviceFactory.Create();
+        var owner = await db.McpAccessTokens.AsNoTracking()
+            .Where(t => t.Id == tokenId && t.RevokedAt == null)
+            .Select(t => (Guid?)t.UserId)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (owner is null)
+            return null;
+
+        var rows = await db.McpAccessTokens
+            .Where(t => t.Id == tokenId && t.RevokedAt == null)
+            .ExecuteUpdateAsync(
+                s => s.SetProperty(x => x.RevokedAt, _ => (DateTime?)now),
+                cancellationToken)
+            .ConfigureAwait(false);
+        return rows == 1 ? owner : null;
     }
 
     /// <summary>
@@ -144,4 +221,9 @@ public sealed class McpTokensRepository
     /// <summary>A resolved token: its id (to bump last-used), owning user,
     /// scopes, and the owner's admin flag for the principal.</summary>
     public sealed record ValidatedToken(Guid TokenId, Guid UserId, string Scopes, bool IsAdmin);
+
+    /// <summary>A live token as the admin sees it: the row's metadata and who owns it.</summary>
+    public sealed record AdminMcpToken(
+        Guid Id, Guid UserId, string User, string Name, string Scopes,
+        DateTime CreatedAt, DateTime? LastUsedAt, DateTime? ExpiresAt);
 }

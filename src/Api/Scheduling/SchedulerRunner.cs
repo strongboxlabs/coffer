@@ -13,14 +13,13 @@ namespace Coffer.Api.Scheduling;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>The advance is committed BEFORE the handler runs</b> (mig 194). It used to
-/// be applied in memory after the handler returned and persisted by a single
-/// <c>SaveChangesAsync</c> after the whole loop, over the same context the
-/// handler had just used. That made the bookkeeping a hostage of the work: once,
-/// the daily snapshot OOM-killed its Postgres backend, the postmaster
-/// entered crash recovery, the save failed against a recovering database, and the
-/// job stayed due — so a daily job re-ran every 15 minutes for days and took
-/// the nightly whole-DB backup down with it. The failure modes that most deserve
+/// <b>The advance is committed BEFORE the handler runs</b> (mig 194). Applied in
+/// memory after the handler returns and persisted by one <c>SaveChangesAsync</c>
+/// after the whole loop, over the same context the handler used, the bookkeeping
+/// would be a hostage of the work: a handler that gets its Postgres backend
+/// OOM-killed puts the postmaster into crash recovery, the save then fails against
+/// a recovering database, and the job stays due — so a daily job re-runs on every
+/// 15-minute tick, and each re-run can take the nightly whole-DB backup down with it. The failure modes that most deserve
 /// not to be retried are exactly the ones that stop you recording "I ran".
 /// </para>
 /// <para>
@@ -244,7 +243,7 @@ public sealed class SchedulerRunner
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 // The process is stopping while the job runs. The run was claimed above
-                // (last_run_at advanced) and this rethrow used to leave it that way: a
+                // (last_run_at advanced), and a bare rethrow would leave it that way: a
                 // started run with no outcome, which only the 48-hour age alert would ever
                 // notice (FU-065). Record it as a failure, with the reason, before leaving —
                 // counted like any other, so the schedule's own failure state tells the truth.
@@ -465,9 +464,9 @@ public sealed class SchedulerRunner
             row, failures, message, nowUtc,
             disable ? false : null,
             // Stamped only when this run is the one that switches the job off. mig 216:
-            // `enabled = FALSE` has three authors and used to record none of them, so a
-            // job the scheduler gave up on was indistinguishable from one an operator
-            // meant to leave off.
+            // `enabled = FALSE` has three authors, and without a recorded reason a job
+            // the scheduler gave up on is indistinguishable from one an operator meant
+            // to leave off.
             disable ? ScheduleDisableReasons.ConsecutiveFailures : null);
 
         if (disable)
@@ -497,6 +496,14 @@ public sealed class SchedulerRunner
     /// filtering on the scheduler topic — not to drive a check.
     /// </para>
     /// <para>
+    /// The key is the JOB's subject, <c>&lt;jobType&gt;.disabled</c>, so the job's next
+    /// <c>&lt;jobType&gt;.succeeded</c> (<see cref="JobMonitorSignal"/>, or the backup
+    /// job's own) clears it once someone re-enables the job and it runs (ADR-0102 D1).
+    /// A shared <c>scheduler.</c> subject had no all-clear at all, and two disabled jobs
+    /// counted as one problem. The topic stays <c>scheduler</c>. Rows published under
+    /// the old shared key were moved to their job's subject by migration 267.
+    /// </para>
+    /// <para>
     /// The exception is described, never quoted, for the same reason every other
     /// published summary is: this text reaches whatever URL an operator configured.
     /// </para>
@@ -506,7 +513,7 @@ public sealed class SchedulerRunner
         new(
             Severity: Notifications.NotificationSeverity.Critical,
             Topic: Notifications.NotificationTopics.Scheduler,
-            EventKey: "scheduler.job-disabled",
+            EventKey: jobType + ".disabled",
             Summary: $"Scheduled {jobType} has been switched OFF after {failures} "
                 + $"consecutive failures. It will not run again until it is re-enabled. "
                 + Notifications.PublishedFailure.Describe(failure),

@@ -15,7 +15,7 @@ namespace Coffer.Api.Scheduling;
 /// <para>
 /// Degraded maps to FAILURE, not success. A healthchecks check has two states, and a run
 /// that completed without doing its work must not hold the check green — that is the lie
-/// this whole outcome channel was added to prevent. It is safe to be this strict because
+/// this whole outcome channel exists to prevent. It is safe to be this strict because
 /// Degraded is already scoped to a genuine provider outage rather than any error at all:
 /// a delisted ticker does not reach here.
 /// </para>
@@ -29,8 +29,8 @@ public static class JobMonitorSignal
     /// Matches <c>SchedulerRunner.MaxErrorLength</c>, deliberately. The same message is
     /// written to <c>scheduled_jobs.last_error</c> through <c>Truncate(…, 500)</c>, whose
     /// comment says why: "A message, never a stack trace — the column is surfaced in the
-    /// SPA." The published summary had no cap at all, which made the stricter of the two
-    /// paths the one nobody looks at.
+    /// SPA." An uncapped published summary would make the column the stricter of the
+    /// two paths, though the summary is the one that travels further.
     ///
     /// This summary travels further than the column does. It is delivered to whatever URL
     /// a ledger holder configured, and <c>ledger_events_read</c> (mig 208) grants SELECT
@@ -73,7 +73,7 @@ public static class JobMonitorSignal
         // text is delivered to whatever URL a ledger holder configured and is readable by
         // every grant holder including a viewer, and a raw Npgsql or HttpRequestException
         // message routinely names a host, a port, a database or a full URL. Capping the
-        // length bounded how much of that escaped; it did not stop it escaping.
+        // length bounds how much of that escapes; it does not stop it escaping.
         //
         // The detail is not lost: the runner logs the exception in full, and the capped
         // message still goes to scheduled_jobs.last_error. Both stay on this side of the

@@ -1,0 +1,40 @@
+{
+  "catalogPins": ["income-and-expenses", "returns"],
+  "layout": {
+    "version": 2,
+    "columns": "wide-narrow",
+    "widgets": [
+      { "id": "problems", "key": "problems", "visible": true, "column": "main", "settings": { "collapseWhenClear": true } },
+      { "id": "bills", "key": "bills", "visible": true, "column": "main", "settings": { "horizonDays": 14, "rows": 8, "includeIncome": true, "showPosted": false } },
+      { "id": "review", "key": "review", "visible": true, "column": "main", "settings": { "rows": 5, "groupByAccount": false } },
+      { "id": "budget-pace", "key": "budget-pace", "visible": true, "column": "main", "settings": { "windowMonths": 3, "overRows": 3 } },
+      { "id": { "savedReportRef": 1 }, "key": "report", "visible": true, "column": "main", "settings": { "view": "chart", "height": "compact" } },
+      { "id": { "savedReportRef": 2 }, "key": "report", "visible": true, "column": "main", "settings": { "view": "chart", "height": "compact" } },
+      { "id": { "savedReportRef": 3 }, "key": "report", "visible": true, "column": "main", "settings": { "view": "table", "height": "compact" } },
+      { "id": "cash-flow", "key": "cash-flow", "visible": true, "column": "main", "settings": { "months": 12, "showTable": true } },
+      { "id": "recent-transactions", "key": "recent-transactions", "visible": false, "column": "main", "settings": { "rows": 10, "direction": "all" } },
+      { "id": "net-worth", "key": "net-worth", "visible": true, "column": "side", "settings": { "months": 12, "showSplit": true } },
+      {
+        "id": "watchlist",
+        "key": "watchlist",
+        "visible": true,
+        "column": "side",
+        "settings": {
+          "categoryIds": [
+            { "categoryRef": ["Personal", "Groceries"] },
+            { "categoryRef": ["Personal", "Dining"] },
+            { "categoryRef": ["Personal", "Entertainment"] },
+            { "categoryRef": ["Personal", "Clothing"] },
+            { "categoryRef": ["Bills", "Electric"] }
+          ],
+          "sort": "chosen"
+        }
+      },
+      { "id": "cash-forecast", "key": "cash-forecast", "visible": true, "column": "side", "settings": { "days": 30, "focusAccountId": { "accountRef": "joint-checking" } } },
+      { "id": "investments", "key": "investments", "visible": true, "column": "side", "settings": { "allocation": "asset_class", "returnWindow": "ytd" } },
+      { "id": "data-health", "key": "data-health", "visible": true, "column": "side", "settings": {} },
+      { "id": "activity", "key": "activity", "visible": false, "column": "side", "settings": { "rows": 5, "families": ["ingest", "quote"] } },
+      { "id": "accounts", "key": "accounts", "visible": false, "column": "side", "settings": { "includeInactive": false } }
+    ]
+  }
+}

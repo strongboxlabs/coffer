@@ -2,7 +2,7 @@
 --
 -- ADR-0003 put user edits in txn_header_overrides and read
 -- COALESCE(o.<field>, h.<field>), so txn_headers held the feed's values and the
--- override row held yours. Three things went wrong with that in practice.
+-- override row held yours. That design has three defects.
 --
 -- 1. A CLEARED FIELD IS UNREPRESENTABLE. The override columns are plain
 --    nullable columns with no "is overridden" marker, so NULL has to mean both
@@ -14,8 +14,8 @@
 --    onto txn_headers; bank writes the override row. So an investment edit of a
 --    row that already carried an override (every merge winner does — the
 --    survivor adopts the folded row's date) landed underneath it, where COALESCE
---    could not see it. The user retyped the date, saved successfully, and the
---    register did not move.
+--    could not see it. A retyped date saves successfully and the register does
+--    not move.
 -- 3. NOTHING EVER DELETED AN OVERRIDE ROW. Created on first edit and then
 --    permanent, so (2) was not a transient state — it was forever.
 --
@@ -36,9 +36,9 @@
 -- the original from here. "Reset to original" and the modified indicator stay
 -- possible for the same reason.
 --
--- txn_leg_overrides GOES TOO, in the same migration. It holds zero rows in
--- every database and nothing in the API has ever written one, so it is a join
--- on the hottest view and on the balance walk for no rows at all. Splitting it
+-- txn_leg_overrides GOES TOO, in the same migration. Nothing in the API or the
+-- importer has ever written one, so it is a join on the hottest view and on the
+-- balance walk for rows no code path creates. Splitting it
 -- out would have left the schema half-migrated across two releases, which is a
 -- worse state than either end.
 
@@ -100,7 +100,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON txn_header_originals TO coffer_app;
 --    the FIRST pass, not a header edited after the upgrade. Skipping the whole
 --    block is the only correct second behaviour.
 --
---    A re-run is not hypothetical. DbUp skips a journalled script on restart, but
+--    A re-run is possible. DbUp skips a journalled script on restart, but
 --    a hand-applied script does not consult the journal, and neither does a
 --    restore that brings back the journal row alongside an older schema.
 --
@@ -108,9 +108,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON txn_header_originals TO coffer_app;
 --    which is precisely what an original is; after the fold they are gone and the
 --    override table is dropped, so there is nothing left to recover them from.
 --
---    THE FOLD IS COALESCE, NEVER ASSIGNMENT. Most override rows carry only SOME
+--    THE FOLD IS COALESCE, NEVER ASSIGNMENT. An override row may carry only SOME
 --    fields — a payee rename sets payee and leaves posted_at NULL — so
---    `SET posted_at = o.posted_at` would blank the date on every one of them.
+--    `SET posted_at = o.posted_at` would blank the date on every such row.
 --    That is the single most dangerous line in this migration.
 --
 --    is_hidden is deliberately NOT folded. Nothing has ever written
@@ -235,15 +235,15 @@ CREATE OR REPLACE VIEW resolved_transactions AS
 
 -- security_invoker is the RLS boundary, and CREATE OR REPLACE VIEW does NOT
 -- preserve reloptions — nor does pg_get_viewdef emit them, so this is invisible
--- in a diff. Migration 228 records this exact accident turning the view into a
--- cross-ledger leak that only the RLS suite caught. Re-assert it, always.
+-- in a diff. Without it the view runs as its owner and leaks across ledgers
+-- (see 228). Re-assert it, always.
 ALTER VIEW resolved_transactions SET (security_invoker = true);
 
 -- ---------------------------------------------------------------------------
 -- 5. The balance walk reads the same way.
 --
---    It joined BOTH override tables. The leg-amount join was a no-op on every
---    row in every database (txn_leg_overrides has never held one), and the
+--    It joined BOTH override tables. The leg-amount join is a no-op (no code
+--    path writes a txn_leg_overrides row), and the
 --    header join is now redundant because the canonical row holds the effective
 --    values.
 -- ---------------------------------------------------------------------------
@@ -355,8 +355,8 @@ BEGIN
         'txn_legs',                         (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_legs t WHERE t.ledger_id = p_ledger_id),
         'txn_leg_recon',                    (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_leg_recon t WHERE t.ledger_id = p_ledger_id),
         'lots',                             (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM lots t WHERE t.ledger_id = p_ledger_id),
-        -- mig 188: realized_gains is derived, but re-deriving it on restore cost
-        -- ~27s and overwrote the holdings/lots restored above. Keys on
+        -- mig 188: realized_gains is derived, but re-deriving it on restore walked
+        -- the whole ledger and overwrote the holdings/lots restored above. Keys on
         -- sell_leg_id (a captured txn_legs row) so it round-trips 1:1.
         'realized_gains',                   (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM realized_gains t WHERE t.ledger_id = p_ledger_id),
         'txn_header_originals',             (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_header_originals t WHERE t.ledger_id = p_ledger_id),
@@ -428,13 +428,12 @@ BEGIN
     --
     -- The rows just inserted ARE the feed's values, which is what makes the
     -- capture correct and why it has to happen BEFORE the fold. COALESCE, never
-    -- assignment: most override rows carry only some fields, and assigning
+    -- assignment: an override row may carry only some fields, and assigning
     -- would blank every column the row leaves NULL.
     --
-    -- txn_leg_overrides is deliberately not folded. It held zero rows in every
-    -- database and nothing ever wrote one, so there is nothing in any payload
-    -- to carry; silently ignoring the key is the whole of the correct
-    -- behaviour.
+    -- txn_leg_overrides is deliberately not folded. Nothing ever wrote one, so
+    -- there is nothing in any payload to carry; silently ignoring the key is
+    -- the whole of the correct behaviour.
     IF (v_payload->'txn_header_overrides') IS NOT NULL THEN
         INSERT INTO txn_header_originals
             (header_id, ledger_id, payee, memo, posted_at, transacted_at, check_number)
@@ -556,15 +555,12 @@ $function$;
 --     do it. The canonical row now holds that value, so each collapses to
 --     h.<field> and loses a join.
 --
---     The three holdings functions are here because migration 229 ADDED those
---     joins one release ago — it moved them off the raw date and onto the
---     effective one, which was correct then and is now what the canonical row
---     already is. 229 was not wasted: it fixed the cost-basis mismatch on its
---     own, immediately, without waiting for this.
+--     The three holdings functions are here because migration 229 added those
+--     joins to move them off the raw date onto the effective one, which is now
+--     what the canonical row already holds.
 --
---     account_current_balances is a VIEW and was the one this migration missed
---     on its first dry run — DROP TABLE named it as a dependency. Left in the
---     comment as the reason to trust the clone over the grep.
+--     account_current_balances is a VIEW over the table: DROP TABLE names it as
+--     a dependency, which a grep for the function bodies would not find.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE VIEW account_current_balances AS
  SELECT a.id AS account_id,
@@ -1154,9 +1150,8 @@ $function$;
 -- ---------------------------------------------------------------------------
 -- 7. The tables go.
 --
---    txn_leg_overrides held zero rows in every database, and nothing in the API
---    ever wrote one — its only mentions were a delete, an ANALYZE list and the
---    COALESCEs just removed. txn_header_overrides has been folded above.
+--    Nothing in the API ever wrote a txn_leg_overrides row — its only mentions
+--    were a delete, an ANALYZE list and the COALESCEs just removed. txn_header_overrides has been folded above.
 -- ---------------------------------------------------------------------------
 DROP TABLE IF EXISTS txn_leg_overrides;
 DROP TABLE IF EXISTS txn_header_overrides;

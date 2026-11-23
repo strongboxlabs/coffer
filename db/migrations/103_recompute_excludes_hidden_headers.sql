@@ -9,9 +9,8 @@
 -- override on the registers) removes it from view in the register
 -- (RegisterRepository filters `!rt.IsHidden`) — but the recompute
 -- function did NOT filter is_hidden, so the hidden row's amount kept
--- contributing to every downstream row's running balance. From the
--- user's perspective: "I deleted that transaction; why is the balance
--- still inflated?"
+-- contributing to every downstream row's running balance: a deleted
+-- transaction keeps moving the balance the user sees.
 --
 -- Two layers carry the hidden state:
 --   * txn_headers.is_hidden          (raw header column)

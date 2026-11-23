@@ -1,27 +1,32 @@
-import { useMemo, useState } from 'react';
-import { useMutation } from '@tanstack/react-query';
+import { useMemo, useRef, useState, type ReactNode } from 'react';
+import { useMutation } from '@/lib/mutation';
 
 import {
+    ApiError,
     createAccount,
     mergeCategory,
     reparentCategory,
     updateAccount,
 } from '@/lib/api';
-import type { AccountSummary, CategoryNode } from '@/lib/types';
+import type { AccountSummary, CategoryNode, RateUnavailable } from '@/lib/types';
+import { ExchangeRatesLink } from '@/components/ConversionNote';
+import { monthLabel } from '@/lib/calendar';
+import { formatLedgerDateLong } from '@/lib/dates';
 import { Button } from '@/components/ui/Button';
 import { FieldLabel } from '@/components/ui/FieldLabel';
 import { Modal } from '@/components/ui/Modal';
+import { pendingChoiceProps, pendingTextProps } from '@/components/ui/pending';
 import { AccountCategoryPicker } from '@/components/register/AccountCategoryPicker';
 import { errorMessage } from '@/lib/errorMessage';
 import { buildAccountPathMap } from '@/lib/accountPath';
 
-import { collectDescendantIds } from './categoryTree';
+import { canMergeAway, collectDescendantIds, eligibleMergeTarget } from './categoryTree';
 
 /**
  * Full `Parent/Child` path for a category, for use in flat prose.
  *
  * A modal has no tree around it. The user may have opened this from a row deep
- * in the hierarchy, and a real ledger has several same-named leaves under
+ * in the hierarchy, and a ledger can have same-named leaves under
  * different parents — so a bare name in a confirmation sentence can name the
  * wrong category convincingly. The manage-categories TREE behind the dialog is
  * the exception and keeps its leaf names: indentation answers it there.
@@ -50,11 +55,17 @@ const KIND_LABEL: Record<string, string> = {
     adjustment: 'Adjustment',
 };
 
+// A field whose save is in flight is pending (ADR-0023 §L): the save's success
+// closes the dialog, so a change made meanwhile would be dropped unseen, and it
+// looks as a disabled field does.
 const inputClass =
     'mt-1 w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm text-text ' +
-    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent';
+    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ' +
+    'disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50';
 
 const checkboxRowClass = 'mt-1 flex items-center gap-2 text-sm text-text';
+
+const checkboxClass = 'disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50';
 
 /** Eligibility for a parent / merge target: an active category of the
  *  given kind, excluding the supplied ids (the node + its own subtree, so
@@ -66,27 +77,6 @@ function eligibleCategory(
     return (a) =>
         a.accountType === 'category'
         && a.categoryKind === kind
-        && a.isActive
-        && !excludeIds.has(a.id);
-}
-
-/**
- * Merge targets, which — unlike parent targets — are NOT narrowed by kind.
- *
- * A merge across kinds is now the ONLY way to reclassify a category (ADR-0017:
- * the kind of an existing category is immutable, because flipping it silently
- * moves every posting in it between the spending and income totals for all of
- * its history). Filtering the target list by kind would leave no route at all.
- *
- * The merge is the better mechanism for exactly the reasons the flip is not: it
- * states how many transactions and children move, it deactivates the source
- * rather than destroying it, and reactivating undoes it.
- */
-function eligibleMergeTarget(
-    excludeIds: ReadonlySet<string>,
-): (a: AccountSummary) => boolean {
-    return (a) =>
-        a.accountType === 'category'
         && a.isActive
         && !excludeIds.has(a.id);
 }
@@ -137,8 +127,10 @@ export function CategoryCreateDialog({
         onError: (e) => setError(errorMessage(e, 'Could not create the category.')),
     });
 
+    // Enter in the name field presses Create, so the press holds it as a click
+    // does; an error stays until its retry's result replaces it (ADR-0023 §L).
+    const createRef = useRef<HTMLButtonElement | null>(null);
     function handleSave() {
-        setError(null);
         if (name.trim() === '') { setError('Name is required.'); return; }
         if (!parentLocked && !topLevel && parentId === null) {
             setError('Pick a parent category, or choose Top level.'); return;
@@ -155,9 +147,11 @@ export function CategoryCreateDialog({
 
                 <div>
                     <FieldLabel htmlFor="cat-create-name">Name</FieldLabel>
-                    <input id="cat-create-name" className={inputClass} value={name} autoFocus
+                    {/* Modal focuses the first field, this one. */}
+                    <input id="cat-create-name" className={inputClass} value={name}
                         onChange={(e) => setName(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === 'Enter') handleSave(); }} />
+                        onKeyDown={(e) => { if (e.key === 'Enter') createRef.current?.click(); }}
+                        {...pendingTextProps<HTMLInputElement>(createMut.isPending)} />
                 </div>
 
                 <div>
@@ -165,7 +159,9 @@ export function CategoryCreateDialog({
                     <select id="cat-create-kind" className={inputClass} value={kind}
                         disabled={parentLocked}
                         title={parentLocked ? 'A sub-category inherits its parent’s kind' : undefined}
-                        onChange={(e) => { setKind(e.target.value); setParentId(null); }}>
+                        {...pendingChoiceProps<HTMLSelectElement>(createMut.isPending, {
+                            onChange: (e) => { setKind(e.target.value); setParentId(null); },
+                        })}>
                         <option value="expense">Expense</option>
                         <option value="income">Income</option>
                         {/* mig 224 / ADR-0017. A valuation adjustment — marking a
@@ -188,8 +184,10 @@ export function CategoryCreateDialog({
                     ) : (
                         <>
                             <label className={checkboxRowClass}>
-                                <input type="checkbox" checked={topLevel}
-                                    onChange={(e) => setTopLevel(e.target.checked)} />
+                                <input type="checkbox" checked={topLevel} className={checkboxClass}
+                                    {...pendingChoiceProps<HTMLInputElement>(createMut.isPending, {
+                                        onChange: (e) => setTopLevel(e.target.checked),
+                                    })} />
                                 Top level (no parent)
                             </label>
                             <div className="mt-1">
@@ -200,6 +198,7 @@ export function CategoryCreateDialog({
                                     onChangeId={setParentId}
                                     placeholder="Pick a parent category…"
                                     disabled={topLevel}
+                                    pending={createMut.isPending}
                                 />
                             </div>
                         </>
@@ -212,12 +211,12 @@ export function CategoryCreateDialog({
 
                 <div className="mt-1 flex justify-end gap-2">
                     <Button type="button" variant="secondary" size="sm" onClick={onClose}
-                        disabled={createMut.isPending}>
+                        pending={createMut.isPending}>
                         Cancel
                     </Button>
-                    <Button type="button" variant="primary" size="sm" onClick={handleSave}
-                        disabled={createMut.isPending}>
-                        {createMut.isPending ? 'Creating…' : 'Create'}
+                    <Button ref={createRef} type="button" variant="primary" size="sm" onClick={handleSave}
+                        pending={createMut.isPending} pendingLabel="Creating…">
+                        Create
                     </Button>
                 </div>
             </div>
@@ -247,8 +246,10 @@ export function CategoryRenameDialog({ ledgerId, node, onClose, onSaved }: Categ
     });
 
     const trimmed = name.trim();
+    // Enter in the name field presses Save, so the press holds it as a click
+    // does; an error stays until its retry's result replaces it (ADR-0023 §L).
+    const saveRef = useRef<HTMLButtonElement | null>(null);
     function handleSave() {
-        setError(null);
         if (trimmed === '') { setError('Name is required.'); return; }
         if (trimmed === node.name) { onClose(); return; }
         renameMut.mutate();
@@ -262,21 +263,23 @@ export function CategoryRenameDialog({ ledgerId, node, onClose, onSaved }: Categ
                 </h2>
                 <div>
                     <FieldLabel htmlFor="cat-rename-name">Name</FieldLabel>
-                    <input id="cat-rename-name" className={inputClass} value={name} autoFocus
+                    {/* Modal focuses the first field, this one. */}
+                    <input id="cat-rename-name" className={inputClass} value={name}
                         onChange={(e) => setName(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === 'Enter') handleSave(); }} />
+                        onKeyDown={(e) => { if (e.key === 'Enter') saveRef.current?.click(); }}
+                        {...pendingTextProps<HTMLInputElement>(renameMut.isPending)} />
                 </div>
                 {error !== null ? (
                     <p role="alert" className="text-xs text-state-danger">{error}</p>
                 ) : null}
                 <div className="mt-1 flex justify-end gap-2">
                     <Button type="button" variant="secondary" size="sm" onClick={onClose}
-                        disabled={renameMut.isPending}>
+                        pending={renameMut.isPending}>
                         Cancel
                     </Button>
-                    <Button type="button" variant="primary" size="sm" onClick={handleSave}
-                        disabled={renameMut.isPending}>
-                        {renameMut.isPending ? 'Saving…' : 'Save'}
+                    <Button ref={saveRef} type="button" variant="primary" size="sm" onClick={handleSave}
+                        pending={renameMut.isPending} pendingLabel="Saving…">
+                        Save
                     </Button>
                 </div>
             </div>
@@ -326,8 +329,8 @@ export function CategoryMoveDialog({ ledgerId, node, accounts, onClose, onSaved 
     const needsPick = !topLevel && parentId === null;
     const unchanged = (topLevel ? null : parentId) === node.parentId;
 
+    // An error stays until its retry's result replaces it (ADR-0023 §L).
     function handleSave() {
-        setError(null);
         if (needsPick) { setError('Pick a parent category, or choose Top level.'); return; }
         moveMut.mutate();
     }
@@ -344,8 +347,10 @@ export function CategoryMoveDialog({ ledgerId, node, accounts, onClose, onSaved 
                 <div>
                     <FieldLabel>New parent</FieldLabel>
                     <label className={checkboxRowClass}>
-                        <input type="checkbox" checked={topLevel}
-                            onChange={(e) => setTopLevel(e.target.checked)} />
+                        <input type="checkbox" checked={topLevel} className={checkboxClass}
+                            {...pendingChoiceProps<HTMLInputElement>(moveMut.isPending, {
+                                onChange: (e) => setTopLevel(e.target.checked),
+                            })} />
                         Top level (no parent)
                     </label>
                     <div className="mt-1">
@@ -356,6 +361,7 @@ export function CategoryMoveDialog({ ledgerId, node, accounts, onClose, onSaved 
                             onChangeId={setParentId}
                             placeholder="Pick a parent category…"
                             disabled={topLevel}
+                            pending={moveMut.isPending}
                         />
                     </div>
                 </div>
@@ -364,12 +370,12 @@ export function CategoryMoveDialog({ ledgerId, node, accounts, onClose, onSaved 
                 ) : null}
                 <div className="mt-1 flex justify-end gap-2">
                     <Button type="button" variant="secondary" size="sm" onClick={onClose}
-                        disabled={moveMut.isPending}>
+                        pending={moveMut.isPending}>
                         Cancel
                     </Button>
                     <Button type="button" variant="primary" size="sm" onClick={handleSave}
-                        disabled={moveMut.isPending || unchanged}>
-                        {moveMut.isPending ? 'Moving…' : 'Move'}
+                        disabled={unchanged} pending={moveMut.isPending} pendingLabel="Moving…">
+                        Move
                     </Button>
                 </div>
             </div>
@@ -389,10 +395,28 @@ export interface CategoryMergeDialogProps {
     onSaved: () => void;
 }
 
+/**
+ * A merge refused for a missing rate (ADR-0114 D12): both categories have a target for
+ * the month in different currencies, and the rate that would add them is missing. In
+ * words, naming the month and the pair, and where to add the rate.
+ */
+function rateRefusal(missing: RateUnavailable, ledgerId: string): ReactNode {
+    const [y, m] = missing.date.split('-').map(Number);
+    return (
+        <>
+            Nothing was merged. Both categories have a budget target for {monthLabel(y!, m!)}, one
+            in {missing.fromCurrency} and one in {missing.toCurrency}, and there is
+            no {missing.fromCurrency} to {missing.toCurrency} rate for {formatLedgerDateLong(missing.date)} to
+            add them with. Add that rate, then merge again.{' '}
+            <ExchangeRatesLink ledgerId={ledgerId} />
+        </>
+    );
+}
+
 export function CategoryMergeDialog({ ledgerId, node, accounts, onClose, onSaved }: CategoryMergeDialogProps) {
     const categoryPath = useCategoryPath(accounts);
     const [targetId, setTargetId] = useState<string | null>(null);
-    const [error, setError] = useState<string | null>(null);
+    const [error, setError] = useState<ReactNode>(null);
 
     const excluded = useMemo(() => {
         const set = collectDescendantIds(node.id, accounts);
@@ -400,14 +424,18 @@ export function CategoryMergeDialog({ ledgerId, node, accounts, onClose, onSaved
         return set;
     }, [node.id, accounts]);
     const isEligible = useMemo(() => eligibleMergeTarget(excluded), [excluded]);
-    const hasTarget = useMemo(() => accounts.some(isEligible), [accounts, isEligible]);
+    // Asked of the same function the row menu asks, so the two cannot disagree about whether
+    // there is anywhere to merge to.
+    const hasTarget = useMemo(() => canMergeAway(node.id, accounts), [node.id, accounts]);
     const target = targetId !== null ? accounts.find((a) => a.id === targetId) ?? null : null;
     const kindChanges = target !== null && target.categoryKind !== node.categoryKind;
 
     const mergeMut = useMutation({
         mutationFn: () => mergeCategory(ledgerId, node.id, { targetId: targetId ?? '' }),
         onSuccess: () => { onSaved(); onClose(); },
-        onError: (e) => setError(errorMessage(e, 'Could not merge the category.')),
+        onError: (e) => setError(e instanceof ApiError && e.code === 'rate-unavailable' && e.rateUnavailable !== undefined
+            ? rateRefusal(e.rateUnavailable, ledgerId)
+            : errorMessage(e, 'Could not merge the category.')),
     });
 
     const targetName = targetId !== null
@@ -442,6 +470,7 @@ export function CategoryMergeDialog({ ledgerId, node, accounts, onClose, onSaved
                                     valueId={targetId}
                                     onChangeId={setTargetId}
                                     placeholder="Pick a category…"
+                                    pending={mergeMut.isPending}
                                 />
                             </div>
                         </div>
@@ -453,8 +482,20 @@ export function CategoryMergeDialog({ ledgerId, node, accounts, onClose, onSaved
                                     <> and <span className="font-medium text-text">{kids} sub-categor{kids === 1 ? 'y' : 'ies'}</span></>
                                 ) : null}{' '}
                                 into <span className="font-medium text-text">{targetName}</span>, then
-                                deactivates “{categoryPath(node.id, node.name)}”. This can be undone
-                                by reactivating it.
+                                deactivates “{categoryPath(node.id, node.name)}”. Reactivating it later
+                                makes it selectable again, but it comes back empty: nothing moves back.
+                            </p>
+                        ) : null}
+                        {targetName !== null ? (
+                            // The merge moves a number somebody typed (ADR-0099), so it says so before it
+                            // does: summed where both have a target for a month, and a target dropped
+                            // where it would sit under another for that month, because a category and
+                            // what is beneath it cannot both carry one.
+                            <p className="rounded border border-border bg-surface-muted/40 p-2 text-xs leading-relaxed text-text-muted">
+                                Budget targets move too. Where both categories have one for the same
+                                month they are added together. A category and what is beneath it cannot
+                                both have a target for a month, so where the merge would cause that, the
+                                target on the lower category is dropped.
                             </p>
                         ) : null}
                         {kindChanges && target !== null ? (
@@ -479,12 +520,12 @@ export function CategoryMergeDialog({ ledgerId, node, accounts, onClose, onSaved
 
                 <div className="mt-1 flex justify-end gap-2">
                     <Button type="button" variant="secondary" size="sm" onClick={onClose}
-                        disabled={mergeMut.isPending}>
+                        pending={mergeMut.isPending}>
                         Cancel
                     </Button>
                     <Button type="button" variant="primary" size="sm" onClick={() => mergeMut.mutate()}
-                        disabled={mergeMut.isPending || targetId === null}>
-                        {mergeMut.isPending ? 'Merging…' : 'Merge'}
+                        disabled={targetId === null} pending={mergeMut.isPending} pendingLabel="Merging…">
+                        Merge
                     </Button>
                 </div>
             </div>

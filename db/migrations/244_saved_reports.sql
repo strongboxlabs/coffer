@@ -151,8 +151,8 @@ BEGIN
         'txn_legs',                         (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_legs t WHERE t.ledger_id = p_ledger_id),
         'txn_leg_recon',                    (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_leg_recon t WHERE t.ledger_id = p_ledger_id),
         'lots',                             (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM lots t WHERE t.ledger_id = p_ledger_id),
-        -- mig 188: realized_gains is derived, but re-deriving it on restore cost
-        -- ~27s and overwrote the holdings/lots restored above. Keys on
+        -- mig 188: realized_gains is derived, but re-deriving it on restore walked
+        -- the whole ledger and overwrote the holdings/lots restored above. Keys on
         -- sell_leg_id (a captured txn_legs row) so it round-trips 1:1.
         'realized_gains',                   (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM realized_gains t WHERE t.ledger_id = p_ledger_id),
         'txn_header_originals',             (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_header_originals t WHERE t.ledger_id = p_ledger_id),

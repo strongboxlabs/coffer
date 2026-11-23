@@ -1,51 +1,51 @@
 import {
+    Fragment,
     useEffect,
     useMemo,
     useRef,
     useState,
-    type KeyboardEvent,
 } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 import { Link, useLocation, useNavigate, useParams } from '@tanstack/react-router';
 import {
     AlarmClock,
     ChevronDown,
     Cog,
-    FolderTree,
     LayoutDashboard,
     LineChart,
+    ListTree,
     LogOut,
-    Plus,
+    PanelLeftClose,
+    PanelLeftOpen,
     RefreshCw,
     Settings,
     ShieldCheck,
-    Tag,
     Target,
-    Wallet,
-    type LucideIcon,
     BarChart3,
     ChevronRight,
 } from 'lucide-react';
 
 import {
-    addAccountGroupMember,
-    createAccountGroup,
-    deleteAccountGroup,
-    fetchAccountGroups,
+    fetchAccountBalances,
+    fetchAccountFolders,
     fetchAccounts,
+    fetchAccountSubtotals,
     fetchCurrentUser,
     fetchFeedConnections,
     fetchVisibleLedgers,
-    patchAccountGroup,
-    removeAccountGroupMember,
     setAccountActive,
     syncAllConnections,
 } from '@/lib/api';
-import { accountTypeMeta, accountTypeOrder } from '@/lib/accountTypes';
+import { buildSections, formatTotal, type TypeSection } from '@/lib/accountTree';
 import { performLogout } from '@/lib/auth';
-import { invalidateLedgerRegister } from '@/lib/registerInvalidation';
+import { useLedgerRole } from '@/lib/useLedgerRole';
+import { formatCurrency } from '@/lib/money';
+import { invalidateHomeReads, invalidateLedgerRegister } from '@/lib/registerInvalidation';
+import { usePersistedDisclosure } from '@/lib/usePersistedDisclosure';
 import type {
-    AccountGroupSummary,
+    AccountBalance,
+    AccountFolder,
     AccountSummary,
     LedgerSummary,
 } from '@/lib/types';
@@ -55,43 +55,64 @@ import {
     SidebarHeader,
     SidebarNav,
     SidebarNavLink,
-    SidebarSection,
 } from '@/components/ui/SidebarLayout';
 import { IconButton } from '@/components/ui/IconButton';
-import { RowActionsButton } from '@/components/ui/RowActionsButton';
 import {
     ContextMenu,
     type ContextMenuAnchor,
-    type ContextMenuItem,
 } from '@/components/ui/ContextMenu';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
-import { Fragment } from 'react';
 import { PinnedReportsGroup, useHasReportPins } from './PinnedReportsGroup';
+import { SidebarAccounts } from './SidebarAccounts';
+import { SidebarResizeHandle } from './SidebarResizeHandle';
 import { AttentionDot } from '@/components/AttentionDot';
 import { useLedgerAttention } from '@/lib/useLedgerAttention';
+import { useSystemAttention } from '@/lib/useSystemAttention';
 
 // AuthedSidebar — left rail for every authed surface.
 //
-// User-curated "tabs" (migration 033): the strip below the ledger
-// picker holds an "All" tab (built-in, always first) plus 0..N
-// user-named tabs. Active tab filters the visible account list to
-// just that tab's members; "All" shows every account grouped by
-// type as before. Tab membership is per (user, ledger): a shared
-// ledger has potentially-different curations per user.
+// Top to bottom: the wordmark with the System gear and the collapse button;
+// the ledger picker; the ledger's destinations; then its accounts, one section
+// per account type, with folders nested inside each (FU-006) and a balance on
+// every row (FU-052). SidebarAccounts draws and edits that list.
 //
-// Two ways to mutate:
-//   • Right-click an account → "Add to <tab>" / "Remove from <tab>".
-//   • Right-click a user tab → "Rename" / "Delete".
-//   • "+" at the end of the strip → inline new-tab input.
-//
-// Active-tab state is in-memory (defaults to "All" every refresh).
-// Persisting last-active-tab is a follow-up.
+// The rail's shape is the reader's, per browser (FU-051, ADR-0057's amendment):
+// a handle on the right edge resizes it, and the header button or Ctrl+\
+// collapses it to a 56px column of icons. Both are remembered in localStorage,
+// and the width is applied before first paint by public/theme-init.js.
 
-interface AccountGroup {
-    label: string;
-    icon: LucideIcon;
-    accounts: readonly AccountSummary[];
+const DESTINATIONS = [
+    { to: '/ledgers/$ledgerId', label: 'Overview', icon: LayoutDashboard, suffix: '' },
+    { to: '/ledgers/$ledgerId/budget', label: 'Budget', icon: Target, suffix: '/budget' },
+    // Structure (ADR-0111): accounts, categories and tags, one entry with a tab each. It opens
+    // on Accounts. Exact on that path, because /accounts/<id> is a register, which is not
+    // Structure; the other two tabs are named so they light the entry too.
+    {
+        to: '/ledgers/$ledgerId/accounts', label: 'Structure', icon: ListTree, suffix: '/accounts',
+        exact: true, alsoUnder: ['/categories', '/tags'],
+    },
+    { to: '/ledgers/$ledgerId/reports', label: 'Reports', icon: BarChart3, suffix: '/reports' },
+    { to: '/ledgers/$ledgerId/securities', label: 'Securities', icon: LineChart, suffix: '/securities' },
+    { to: '/ledgers/$ledgerId/reminders', label: 'Reminders', icon: AlarmClock, suffix: '/reminders' },
+    { to: '/ledgers/$ledgerId/settings', label: 'Settings', icon: Settings, suffix: '/settings' },
+] as const;
+
+type Destination = (typeof DESTINATIONS)[number];
+
+function isActiveDestination(d: Destination, ledgerId: string, pathname: string): boolean {
+    const base = `/ledgers/${ledgerId}`;
+    const target = `${base}${d.suffix}`;
+    if (d.suffix === '') return pathname === base;
+    if ('exact' in d && d.exact) {
+        if (pathname === target) return true;
+        return 'alsoUnder' in d
+            && d.alsoUnder.some((s) => pathname === `${base}${s}` || pathname.startsWith(`${base}${s}/`));
+    }
+    return pathname === target || pathname.startsWith(`${target}/`);
 }
+
+/** The keyboard shortcut that collapses and expands the rail. */
+const TOGGLE_HINT = 'Ctrl+\\';
 
 export function AuthedSidebar() {
     const queryClient = useQueryClient();
@@ -130,6 +151,11 @@ export function AuthedSidebar() {
     // consumer of this key from a single request, which is what makes putting an
     // indicator on a component that renders on every page affordable.
     const attention = useLedgerAttention();
+    // What the INSTALLATION needs, behind the gear (admins only; ADR-0102 amended for ADR-0110).
+    const systemAttention = useSystemAttention();
+    const gearLabel = systemAttention.gearSentence
+        ? `System settings: ${systemAttention.gearSentence}`
+        : 'System settings';
     const thisLedger = attention.severityFor(ledgerId);
     const thisLedgerCount = attention.countFor(ledgerId);
 
@@ -151,39 +177,88 @@ export function AuthedSidebar() {
         onSuccess: () => {
             invalidateLedgerRegister(queryClient, ledgerId!);
             queryClient.invalidateQueries({ queryKey: ['feed-connections', ledgerId] });
-            queryClient.invalidateQueries({ queryKey: ['sync-runs', ledgerId] });
+            queryClient.invalidateQueries({ queryKey: ['ledger-operations', ledgerId] });
             queryClient.invalidateQueries({ queryKey: ['feed-connection-accounts', ledgerId] });
         },
     });
 
-    // Inactive-account lifecycle: when ON, the sidebar fetches with
-    // ?includeInactive=true so inactive rows surface alongside
-    // active ones (rendered greyed / strikethrough). Default OFF;
-    // session-scoped — resets on refresh (a per-user preference
-    // store is a separate follow-up).
+    // Collapsed to the icon rail, per browser: the same persisted flag the
+    // pinned-reports disclosure below uses (the hook reads it synchronously, so
+    // the first render is already the remembered shape). Its toggle serves the
+    // header button, the resize handle's Enter and Ctrl+\.
+    // The stored flag is "collapsed", so its default is false: expanded.
+    const [collapsed, toggleCollapsed] = usePersistedDisclosure('coffer.sidebar.collapsed', false);
+    // Ctrl+\ from anywhere, unless the reader is typing (a backslash in a memo
+    // is a backslash).
+    useEffect(() => {
+        function onKeyDown(e: KeyboardEvent) {
+            if (e.key !== '\\' || !(e.ctrlKey || e.metaKey) || e.altKey) return;
+            const el = e.target as HTMLElement | null;
+            const tag = el?.tagName;
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el?.isContentEditable) return;
+            e.preventDefault();
+            toggleCollapsed();
+        }
+        window.addEventListener('keydown', onKeyDown);
+        return () => window.removeEventListener('keydown', onKeyDown);
+    }, [toggleCollapsed]);
+    // The button that toggled unmounts with the shape it belonged to; hand
+    // focus to its counterpart rather than dropping it on the body. Only when
+    // the shape actually changed: comparing with the previous value, not a
+    // first-render flag, keeps a mount from taking focus even when StrictMode
+    // runs the effect twice.
+    const toggleRef = useRef<HTMLButtonElement | null>(null);
+    const prevCollapsed = useRef(collapsed);
+    useEffect(() => {
+        if (prevCollapsed.current === collapsed) return;
+        prevCollapsed.current = collapsed;
+        if (document.activeElement === null || document.activeElement === document.body) {
+            toggleRef.current?.focus();
+        }
+    }, [collapsed]);
+
+    // Inactive-account lifecycle: when ON, inactive rows surface alongside
+    // active ones (rendered greyed / strikethrough). Default OFF; session-scoped,
+    // resets on refresh. The list always carries inactive accounts, because a
+    // folder's or a section's total counts them either way (ADR-0085); this
+    // decides only which rows are drawn.
     const [showInactive, setShowInactive] = useState(false);
 
     // Collapsed by default: the rail belongs to the account list, and pinned
     // reports are a shortcut over it that must not push accounts down the
-    // moment someone pins a third thing. Not persisted — that is FU-007's
-    // per-(user, ledger) UI-state namespace, and a private version here is
-    // what that entry exists to prevent.
-    const [reportsOpen, setReportsOpen] = useState(false);
-    const hasPins = useHasReportPins(ledgerId ?? '');
+    // moment someone pins a third thing. Remembered per browser, as the rest of
+    // the rail's shape is.
+    const [reportsOpen, toggleReportsOpen] = usePersistedDisclosure('coffer.sidebar.reportsOpen', false);
+    const hasPins = useHasReportPins(ledgerId);
     const accountsQuery = useQuery({
-        // Key includes showInactive so toggling refetches via cache
-        // miss rather than reusing the stale active-only list.
-        queryKey: ['accounts', ledgerId, { includeInactive: showInactive }],
-        queryFn: () => fetchAccounts(ledgerId!, { includeInactive: showInactive }),
+        // The same cache the bank register reads (includeInactive: true).
+        queryKey: ['accounts', ledgerId, { includeInactive: true }],
+        queryFn: () => fetchAccounts(ledgerId!, { includeInactive: true }),
         enabled: ledgerId !== undefined,
     });
-    const groupsQuery = useQuery({
-        queryKey: ['account-groups', ledgerId],
-        queryFn: () => fetchAccountGroups(ledgerId!),
+    // Under the ['accounts', ledgerId] prefix, so every write that refreshes the
+    // account list refreshes the figures too.
+    const balancesQuery = useQuery({
+        queryKey: ['accounts', ledgerId, 'balances'],
+        queryFn: () => fetchAccountBalances(ledgerId!),
+        enabled: ledgerId !== undefined,
+    });
+    const foldersQuery = useQuery({
+        queryKey: ['account-folders', ledgerId],
+        queryFn: () => fetchAccountFolders(ledgerId!),
+        enabled: ledgerId !== undefined,
+    });
+    // The section and folder totals, converted on the server (ADR-0114 D7). Under the
+    // folders' key, so a folder write refreshes them, and refreshed with the home
+    // screen's reads by every write that refreshes the accounts (invalidateHomeReads).
+    const subtotalsQuery = useQuery({
+        queryKey: ['account-folders', ledgerId, 'subtotals'],
+        queryFn: () => fetchAccountSubtotals(ledgerId!),
         enabled: ledgerId !== undefined,
     });
 
-    const ledger = findById(ledgersQuery.data, ledgerId);
+    // Folders are ledger data: only an owner or an editor may change them.
+    const { ledger, canEdit } = useLedgerRole(ledgerId);
     // useMemo so the `?? []` fallback doesn't churn array
     // identity each render — eliminates a downstream useMemo /
     // useEffect dep-equality warning.
@@ -191,92 +266,31 @@ export function AuthedSidebar() {
         () => accountsQuery.data ?? [],
         [accountsQuery.data],
     );
-    const userGroups = useMemo<readonly AccountGroupSummary[]>(
-        () => groupsQuery.data ?? [],
-        [groupsQuery.data],
+    const folders = useMemo<readonly AccountFolder[]>(
+        () => foldersQuery.data ?? [],
+        [foldersQuery.data],
+    );
+    const balances = useMemo<ReadonlyMap<string, AccountBalance>>(
+        () => new Map((balancesQuery.data ?? []).map((b) => [b.accountId, b])),
+        [balancesQuery.data],
+    );
+    const sections = useMemo(
+        () => buildSections(accounts, folders, balances, subtotalsQuery.data, showInactive),
+        [accounts, folders, balances, subtotalsQuery.data, showInactive],
     );
 
-    // Active tab. null = the implicit "All" tab. Re-set to null
-    // when the ledger changes so we don't carry a stale group id
-    // across ledgers (and so we land on "All" by default per the
-    // design discussion).
-    const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
-    useEffect(() => { setActiveGroupId(null); }, [ledgerId]);
-    // If the active group is deleted (or its id is no longer in
-    // the fetched list), fall back to "All" — avoids the rail
-    // silently emptying after a delete.
-    useEffect(() => {
-        if (activeGroupId === null) return;
-        if (!userGroups.some((g) => g.id === activeGroupId)) {
-            setActiveGroupId(null);
-        }
-    }, [activeGroupId, userGroups]);
-
-    const activeGroup = userGroups.find((g) => g.id === activeGroupId) ?? null;
-
-    // Filter accounts to active tab's members when a user tab is
-    // selected; otherwise show all. Either way the account-type
-    // grouping (Banking / Credit / …) is applied below so the
-    // reading model is consistent across tabs.
-    const visibleAccounts = useMemo(() => {
-        if (activeGroup === null) return accounts;
-        const memberSet = new Set(activeGroup.memberAccountIds);
-        return accounts.filter((a) => memberSet.has(a.id));
-    }, [accounts, activeGroup]);
-
-    const groups = useMemo(
-        () => groupAccounts(visibleAccounts),
-        [visibleAccounts],
-    );
-
-    const invalidateGroups = () =>
-        queryClient.invalidateQueries({ queryKey: ['account-groups', ledgerId] });
-
-    const createMutation = useMutation({
-        mutationFn: (name: string) =>
-            createAccountGroup(ledgerId!, { name }),
-        onSuccess: (res) => {
-            invalidateGroups();
-            setActiveGroupId(res.id);
-        },
-    });
-    const renameMutation = useMutation({
-        mutationFn: (args: { groupId: string; name: string }) =>
-            patchAccountGroup(ledgerId!, args.groupId, { name: args.name }),
-        onSuccess: invalidateGroups,
-    });
-    const deleteMutation = useMutation({
-        mutationFn: (groupId: string) =>
-            deleteAccountGroup(ledgerId!, groupId),
-        onSuccess: invalidateGroups,
-    });
-    const addMemberMutation = useMutation({
-        mutationFn: (args: { groupId: string; accountId: string }) =>
-            addAccountGroupMember(ledgerId!, args.groupId, args.accountId),
-        onSuccess: invalidateGroups,
-    });
-    const removeMemberMutation = useMutation({
-        mutationFn: (args: { groupId: string; accountId: string }) =>
-            removeAccountGroupMember(ledgerId!, args.groupId, args.accountId),
-        onSuccess: invalidateGroups,
-    });
     // Inactive-account lifecycle: deactivate / reactivate flips
-    // accounts.is_active. Invalidates both the accounts list (so
-    // the deactivated row disappears from the default-filtered list)
-    // and the groups query (memberships are unchanged but balance
-    // roll-ups in A.5 read isActive on members).
+    // accounts.is_active. The shared prefix ['accounts', ledgerId] refreshes
+    // the list and the figures; folder membership is unchanged. The home
+    // screen's reads depend on it too, so they refresh beside it (ADR-0079).
     const setActiveMutation = useMutation({
         mutationFn: (args: { accountId: string; active: boolean }) =>
             setAccountActive(ledgerId!, args.accountId, args.active),
         onSuccess: () => {
-            // Invalidate both flavors of the accounts query (default
-            // active-only AND the includeInactive=true variant used
-            // by the sidebar's "Show inactive" toggle). The shared
-            // prefix ['accounts', ledgerId] catches both keys.
             queryClient.invalidateQueries({
                 queryKey: ['accounts', ledgerId],
             });
-            invalidateGroups();
+            invalidateHomeReads(queryClient, ledgerId!);
         },
     });
     // Confirm-dialog state for deactivation. Reactivation is silent
@@ -287,27 +301,11 @@ export function AuthedSidebar() {
     // refinement after this slice ships.
     const [deactivateConfirm, setDeactivateConfirm] = useState<AccountSummary | null>(null);
 
-    // Inline-edit state. `creatingTab` shows the "+ inline input";
-    // `editingGroupId` flips a single tab's label into rename mode.
-    const [creatingTab, setCreatingTab] = useState(false);
-    const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
-
-    // Two distinct context menus, one for accounts, one for tabs.
-    // Closing one closes both (only one is open at a time).
-    const [accountMenu, setAccountMenu] = useState<{
-        anchor: ContextMenuAnchor;
-        account: AccountSummary;
-    } | null>(null);
-    const [groupMenu, setGroupMenu] = useState<{
-        anchor: ContextMenuAnchor;
-        group: AccountGroupSummary;
-    } | null>(null);
     // Ledger-switch popover, anchored under the picker button.
     const [ledgerMenuAnchor, setLedgerMenuAnchor] = useState<ContextMenuAnchor | null>(null);
     // Anchor the switch-ledger dropdown under the whole picker row, not
     // the small chevron button that opens it.
     const ledgerPickerRef = useRef<HTMLDivElement | null>(null);
-    const closeMenus = () => { setAccountMenu(null); setGroupMenu(null); };
 
     const logoutMutation = useMutation({
         mutationFn: performLogout,
@@ -320,47 +318,116 @@ export function AuthedSidebar() {
     const displayName =
         userQuery.data?.displayName ?? userQuery.data?.username ?? '';
 
-    const accountMenuItems: readonly ContextMenuItem[] = accountMenu
-        ? buildAccountMenuItems(
-            accountMenu.account,
-            userGroups,
-            activeGroup,
-            (groupId, accountId_) => addMemberMutation.mutate({ groupId, accountId: accountId_ }),
-            (groupId, accountId_) => removeMemberMutation.mutate({ groupId, accountId: accountId_ }),
-            (account, active) => {
-                if (active) {
-                    // Reactivation is silent — never loses info.
-                    setActiveMutation.mutate({ accountId: account.id, active: true });
-                } else {
-                    setDeactivateConfirm(account);
-                }
-            },
-          )
-        : [];
+    const avatar = (
+        <span className="flex size-control-24px shrink-0 items-center justify-center rounded-full bg-accent text-[0.625rem] font-semibold text-text-inverse">
+            {displayName ? displayName[0]!.toUpperCase() : '·'}
+        </span>
+    );
 
-    const groupMenuItems: readonly ContextMenuItem[] = groupMenu
-        ? [
-            {
-                id: 'rename',
-                label: 'Rename',
-                onSelect: () => { setEditingGroupId(groupMenu.group.id); },
-            },
-            {
-                id: 'delete',
-                label: 'Delete',
-                danger: true,
-                onSelect: () => { deleteMutation.mutate(groupMenu.group.id); },
-            },
-          ]
-        : [];
+    if (collapsed) {
+        const activeType = accounts.find((a) => a.id === accountId)?.accountType;
+        return (
+            <Sidebar collapsed>
+                <SidebarHeader className="flex-col gap-1 px-1.5">
+                    {/* The dot rides on the logo's corner, as the merge badge
+                        rides on a provenance icon, so the logo stays in the
+                        column every rail icon is centred in. */}
+                    <Link
+                        to="/"
+                        aria-label="Coffer"
+                        title="Coffer"
+                        className="relative flex items-center rounded hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                    >
+                        <LineChart
+                            className="size-icon-md text-accent"
+                            strokeWidth={2.25}
+                            aria-hidden
+                        />
+                        <AttentionDot
+                            severity={attention.worst}
+                            context="Coffer"
+                            className="absolute -right-1 -top-1"
+                        />
+                    </Link>
+                    <IconButton
+                        ref={toggleRef}
+                        aria-label="Expand sidebar"
+                        title={`Expand sidebar (${TOGGLE_HINT})`}
+                        onClick={toggleCollapsed}
+                    >
+                        <PanelLeftOpen className="size-icon-sm" aria-hidden />
+                    </IconButton>
+                </SidebarHeader>
+
+                <SidebarNav>
+                    {ledgerId ? (
+                        <>
+                            <div className="mb-1 space-y-px">
+                                {DESTINATIONS.map((d) => {
+                                    const Icon = d.icon;
+                                    return (
+                                        <SidebarNavLink
+                                            key={d.label}
+                                            asChild
+                                            active={isActiveDestination(d, ledgerId, pathname)}
+                                            className="justify-center"
+                                        >
+                                            <Link to={d.to} params={{ ledgerId }} activeOptions={{ exact: true }} aria-label={d.label} title={d.label}>
+                                                {/* The dot on the icon's corner rather than
+                                                    beside it: a 56px rail has no room for both
+                                                    in a row, and beside it would push Settings'
+                                                    icon out of the column the others sit in. */}
+                                                <span className="relative flex shrink-0">
+                                                    <Icon className="size-icon-sm" aria-hidden />
+                                                    {d.suffix === '/settings' ? (
+                                                        <AttentionDot
+                                                            severity={thisLedger}
+                                                            count={thisLedgerCount}
+                                                            context="This ledger"
+                                                            className="absolute -right-1 -top-1"
+                                                        />
+                                                    ) : null}
+                                                </span>
+                                            </Link>
+                                        </SidebarNavLink>
+                                    );
+                                })}
+                            </div>
+                            {sections.length > 0 ? (
+                                <div className="mt-1 space-y-px border-t border-border/60 pt-1">
+                                    {sections.map((section) => (
+                                        <CollapsedSection
+                                            key={section.accountType}
+                                            section={section}
+                                            active={section.accountType === activeType}
+                                            onExpand={toggleCollapsed}
+                                        />
+                                    ))}
+                                </div>
+                            ) : null}
+                        </>
+                    ) : null}
+                </SidebarNav>
+
+                <SidebarFooter className="flex justify-center">
+                    <span title={displayName || 'Signed in'}>{avatar}</span>
+                </SidebarFooter>
+            </Sidebar>
+        );
+    }
 
     return (
-        <Sidebar>
+        <Sidebar
+            className="relative"
+            // The reader's width, set before paint by theme-init.js and live by
+            // the handle; with none set, the 224px token Sidebar uses.
+            style={{ width: 'var(--coffer-sidebar-width, var(--spacing-fixed-224px))' }}
+        >
             <SidebarHeader>
-                {/* The wordmark goes home (ADR-0090). It used to be an inert
-                    <span>, so the universal "click the logo" gesture did
-                    nothing — and since nothing else in this rail linked to `/`,
-                    the /system breadcrumb was the ONLY route back to the ledger
+                {/* The wordmark goes home (ADR-0090). As an inert <span> the
+                    universal "click the logo" gesture would do nothing — and
+                    since nothing else in this rail links to `/`, the /system
+                    breadcrumb would be the ONLY route back to the ledger
                     list. */}
                 <Link
                     to="/"
@@ -389,17 +456,42 @@ export function AuthedSidebar() {
                         className="ml-0.5"
                     />
                 </Link>
-                {/* System settings (ADR-0060) — deployment-wide: About
-                    (version info, ADR-0044) + admin Backups. Anchored to the
-                    app identity (the Coffer wordmark), NOT the user footer or
-                    the per-ledger Settings: it's the install's settings, not
-                    this ledger's or this user's. */}
-                <IconButton
-                    aria-label="System settings"
-                    onClick={() => navigate({ to: '/system' })}
-                >
-                    <Cog className="size-icon-sm" aria-hidden />
-                </IconButton>
+                <div className="flex items-center gap-0.5">
+                    {/* System settings (ADR-0060) — deployment-wide: About
+                        (version info, ADR-0044) + admin Backups. Anchored to the
+                        app identity (the Coffer wordmark), NOT the user footer or
+                        the per-ledger Settings: it's the install's settings, not
+                        this ledger's or this user's. */}
+                    {/* The gear answers for the install, as the wordmark answers for the ledgers:
+                        a failed backup, a job switched off, or a release waiting, drawn by the
+                        same dot. The sentence is the button's own label, so the dot is
+                        decorative and not read a second time. */}
+                    <span className="relative inline-flex">
+                        <IconButton
+                            aria-label={gearLabel}
+                            title={systemAttention.gearSentence ? gearLabel : undefined}
+                            onClick={() => navigate({ to: '/system' })}
+                        >
+                            <Cog className="size-icon-sm" aria-hidden />
+                        </IconButton>
+                        <span aria-hidden className="pointer-events-none absolute -right-0.5 -top-0.5">
+                            <AttentionDot
+                                severity={systemAttention.gear}
+                                context="System settings"
+                                sentence={gearLabel}
+                            />
+                        </span>
+                    </span>
+                    {/* The collapse button ADR-0021 Rule 1 always listed (FU-051). */}
+                    <IconButton
+                        ref={toggleRef}
+                        aria-label="Collapse sidebar"
+                        title={`Collapse sidebar (${TOGGLE_HINT})`}
+                        onClick={toggleCollapsed}
+                    >
+                        <PanelLeftClose className="size-icon-sm" aria-hidden />
+                    </IconButton>
+                </div>
             </SidebarHeader>
 
             {/* Ledger picker — two controls:
@@ -424,8 +516,6 @@ export function AuthedSidebar() {
                             className="flex min-w-0 flex-1 items-center gap-1.5 rounded px-2 py-1 text-xs font-semibold text-text hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
                             onClick={() => {
                                 const r = ledgerPickerRef.current?.getBoundingClientRect();
-                                setAccountMenu(null);
-                                setGroupMenu(null);
                                 setLedgerMenuAnchor(
                                     r ? { x: r.left, y: r.bottom } : { x: 0, y: 0 },
                                 );
@@ -450,8 +540,6 @@ export function AuthedSidebar() {
                         className="flex min-w-0 flex-1 items-center gap-1.5 rounded px-2 py-1 text-xs font-semibold text-text-subtle hover:bg-surface-hover hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
                         onClick={() => {
                             const r = ledgerPickerRef.current?.getBoundingClientRect();
-                            setAccountMenu(null);
-                            setGroupMenu(null);
                             setLedgerMenuAnchor(
                                 r ? { x: r.left, y: r.bottom } : { x: 0, y: 0 },
                             );
@@ -476,7 +564,7 @@ export function AuthedSidebar() {
                         }
                         title="Sync all bank connections"
                         onClick={() => syncAllMutation.mutate()}
-                        disabled={syncAllMutation.isPending}
+                        pending={syncAllMutation.isPending}
                     >
                         <RefreshCw
                             className={
@@ -495,24 +583,8 @@ export function AuthedSidebar() {
                     ⋯-to-hub path). The account list follows below. */}
                 {ledgerId ? (
                     <div className="mb-1 space-y-px">
-                        {([
-                            { to: '/ledgers/$ledgerId', label: 'Overview', icon: LayoutDashboard, suffix: '' },
-                            { to: '/ledgers/$ledgerId/budget', label: 'Budget', icon: Target, suffix: '/budget' },
-                            { to: '/ledgers/$ledgerId/accounts', label: 'Accounts', icon: Wallet, suffix: '/accounts', exact: true },
-                            { to: '/ledgers/$ledgerId/categories', label: 'Categories', icon: FolderTree, suffix: '/categories' },
-                            { to: '/ledgers/$ledgerId/tags', label: 'Tags', icon: Tag, suffix: '/tags' },
-                            { to: '/ledgers/$ledgerId/reports', label: 'Reports', icon: BarChart3, suffix: '/reports' },
-                            { to: '/ledgers/$ledgerId/securities', label: 'Securities', icon: LineChart, suffix: '/securities' },
-                            { to: '/ledgers/$ledgerId/reminders', label: 'Reminders', icon: AlarmClock, suffix: '/reminders' },
-                            { to: '/ledgers/$ledgerId/settings', label: 'Settings', icon: Settings, suffix: '/settings' },
-                        ] as const).map((d) => {
-                            const base = `/ledgers/${ledgerId}`;
-                            const target = `${base}${d.suffix}`;
-                            const active = d.suffix === ''
-                                ? pathname === base
-                                : 'exact' in d && d.exact
-                                    ? pathname === target
-                                    : pathname === target || pathname.startsWith(`${target}/`);
+                        {DESTINATIONS.map((d) => {
+                            const active = isActiveDestination(d, ledgerId, pathname);
                             const Icon = d.icon;
                             // The Reports row carries a disclosure for its
                             // pinned reports. A separate "Pinned" header was
@@ -525,7 +597,12 @@ export function AuthedSidebar() {
                                 <Fragment key={d.label}>
                                 <div className={isReports && hasPins ? 'relative' : undefined}>
                                 <SidebarNavLink asChild active={active}>
-                                    <Link to={d.to} params={{ ledgerId }}>
+                                    {/* Exact, because the router's own "active" is a prefix match: the
+                                        Overview's path begins every other page in the ledger and
+                                        /accounts begins every register, so each would be announced as
+                                        the current page on all of them. isActiveDestination decides
+                                        what is current; the router must not claim more. */}
+                                    <Link to={d.to} params={{ ledgerId }} activeOptions={{ exact: true }}>
                                         <Icon className="size-icon-sm shrink-0" aria-hidden />
                                         <span>{d.label}</span>
                                         {/* Only Settings carries it: everything this
@@ -551,7 +628,7 @@ export function AuthedSidebar() {
                                         type="button"
                                         aria-expanded={reportsOpen}
                                         aria-label={reportsOpen ? 'Hide pinned reports' : 'Show pinned reports'}
-                                        onClick={() => setReportsOpen((v) => !v)}
+                                        onClick={toggleReportsOpen}
                                         className="absolute inset-y-0 right-1 flex items-center rounded px-1 text-text-subtle hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                                     >
                                         {reportsOpen
@@ -562,8 +639,8 @@ export function AuthedSidebar() {
                                 </div>
                                 {/* Directly beneath Reports, which is the one
                                     destination it belongs to. Rendered after
-                                    the whole map it landed under Settings —
-                                    the last item — which read as pinned
+                                    the whole map it would land under Settings —
+                                    the last item — which reads as pinned
                                     reports being a settings thing. */}
                                 {isReports && reportsOpen ? (
                                     <PinnedReportsGroup ledgerId={ledgerId} pathname={pathname} />
@@ -574,61 +651,28 @@ export function AuthedSidebar() {
                     </div>
                 ) : null}
 
-                {/* The account section: filter tabs directly above the account
-                    list they filter, separated from the destinations nav above
-                    by a divider. */}
+                {/* The account list, separated from the destinations above by a
+                    divider. Keyed by ledger, so each ledger's open folders are
+                    its own. */}
                 {ledgerId ? (
                     <div className="mt-1 border-t border-border/60 pt-1">
-                        <TabStrip
-                            groups={userGroups}
-                            activeGroupId={activeGroupId}
-                            onSelect={(gid) => setActiveGroupId(gid)}
-                            editingGroupId={editingGroupId}
-                            onCommitRename={(gid, name) => {
-                                renameMutation.mutate({ groupId: gid, name });
-                                setEditingGroupId(null);
-                            }}
-                            onCancelRename={() => setEditingGroupId(null)}
-                            creatingTab={creatingTab}
-                            onStartCreate={() => setCreatingTab(true)}
-                            onCommitCreate={(name) => {
-                                createMutation.mutate(name);
-                                setCreatingTab(false);
-                            }}
-                            onCancelCreate={() => setCreatingTab(false)}
-                            onContextMenuGroup={(group, anchor) => {
-                                setAccountMenu(null);
-                                setGroupMenu({ anchor, group });
+                        <SidebarAccounts
+                            key={ledgerId}
+                            ledgerId={ledgerId}
+                            sections={sections}
+                            folders={folders}
+                            activeAccountId={accountId}
+                            canEdit={canEdit}
+                            onToggleActive={(account, active) => {
+                                if (active) {
+                                    // Reactivation is silent — never loses info.
+                                    setActiveMutation.mutate({ accountId: account.id, active: true });
+                                } else {
+                                    setDeactivateConfirm(account);
+                                }
                             }}
                         />
                     </div>
-                ) : null}
-                {ledgerId && activeGroup !== null && visibleAccounts.length === 0 ? (
-                    <div className="mx-3 mt-2 rounded border border-dashed border-border/60 px-2 py-1.5 text-[0.6875rem] italic leading-snug text-text-subtle">
-                        No accounts in this tab yet. Switch to <button
-                            type="button"
-                            className="not-italic font-medium text-accent hover:underline"
-                            onClick={() => setActiveGroupId(null)}
-                        >All</button>, select an account, and use its actions
-                        menu to add it here.
-                    </div>
-                ) : null}
-
-                {ledgerId && groups.length > 0 ? (
-                    <>
-                        {groups.map((group) => (
-                            <AccountGroupRows
-                                key={group.label}
-                                group={group}
-                                ledgerId={ledgerId}
-                                activeAccountId={accountId}
-                                onContextMenuAccount={(account, anchor) => {
-                                    setGroupMenu(null);
-                                    setAccountMenu({ anchor, account });
-                                }}
-                            />
-                        ))}
-                    </>
                 ) : null}
             </SidebarNav>
 
@@ -646,9 +690,7 @@ export function AuthedSidebar() {
                     <span>Show inactive accounts</span>
                 </label>
                 <div className="flex items-center gap-2">
-                    <span className="flex size-control-24px items-center justify-center rounded-full bg-accent text-[0.625rem] font-semibold text-text-inverse">
-                        {displayName ? displayName[0]!.toUpperCase() : '·'}
-                    </span>
+                    {avatar}
                     <span className="flex-1 truncate text-xs font-medium text-text">
                         {displayName || 'Signed in'}
                     </span>
@@ -664,27 +706,15 @@ export function AuthedSidebar() {
                     <IconButton
                         aria-label="Sign out"
                         onClick={() => logoutMutation.mutate()}
-                        disabled={logoutMutation.isPending}
+                        pending={logoutMutation.isPending}
                     >
                         <LogOut className="size-icon-sm" aria-hidden />
                     </IconButton>
                 </div>
             </SidebarFooter>
 
-            {accountMenu ? (
-                <ContextMenu
-                    anchor={accountMenu.anchor}
-                    items={accountMenuItems}
-                    onClose={closeMenus}
-                />
-            ) : null}
-            {groupMenu ? (
-                <ContextMenu
-                    anchor={groupMenu.anchor}
-                    items={groupMenuItems}
-                    onClose={closeMenus}
-                />
-            ) : null}
+            <SidebarResizeHandle onToggleCollapse={toggleCollapsed} />
+
             {ledgerMenuAnchor ? (
                 <ContextMenu
                     anchor={ledgerMenuAnchor}
@@ -745,400 +775,53 @@ export function AuthedSidebar() {
                     setDeactivateConfirm(null);
                 }}
                 onCancel={() => setDeactivateConfirm(null)}
-                confirmDisabled={setActiveMutation.isPending}
+                isConfirming={setActiveMutation.isPending}
             />
         </Sidebar>
     );
 }
 
-// --------------------------------------------------------------------
-// Tab strip
-// --------------------------------------------------------------------
-
-interface TabStripProps {
-    groups: readonly AccountGroupSummary[];
-    activeGroupId: string | null;
-    onSelect: (groupId: string | null) => void;
-    editingGroupId: string | null;
-    onCommitRename: (groupId: string, name: string) => void;
-    onCancelRename: () => void;
-    creatingTab: boolean;
-    onStartCreate: () => void;
-    onCommitCreate: (name: string) => void;
-    onCancelCreate: () => void;
-    onContextMenuGroup: (
-        group: AccountGroupSummary,
-        anchor: ContextMenuAnchor,
-    ) => void;
-}
-
-function TabStrip({
-    groups,
-    activeGroupId,
-    onSelect,
-    editingGroupId,
-    onCommitRename,
-    onCancelRename,
-    creatingTab,
-    onStartCreate,
-    onCommitCreate,
-    onCancelCreate,
-    onContextMenuGroup,
-}: TabStripProps) {
-    return (
-        <div
-            role="tablist"
-            aria-label="Account tabs"
-            className="flex flex-wrap items-center gap-1 border-b border-border/60 px-2 py-1.5"
-        >
-            <Tab
-                label="All"
-                active={activeGroupId === null}
-                onSelect={() => onSelect(null)}
-            />
-            {groups.map((g) =>
-                editingGroupId === g.id ? (
-                    <InlineTabInput
-                        key={g.id}
-                        initial={g.name}
-                        onCommit={(name) => onCommitRename(g.id, name)}
-                        onCancel={onCancelRename}
-                    />
-                ) : activeGroupId === g.id ? (
-                    // ADR-0021 Rule 10: the selected tab carries a visible way
-                    // into Rename / Delete. A tab strip wraps rather than
-                    // forming columns, so unlike the account rows this needs no
-                    // reserved slot — nothing below it shifts.
-                    <span key={g.id} className="inline-flex items-center gap-0.5">
-                        <Tab
-                            label={g.name}
-                            active
-                            onSelect={() => onSelect(g.id)}
-                            onContextMenu={(anchor) => onContextMenuGroup(g, anchor)}
-                        />
-                        <RowActionsButton
-                            size="sm"
-                            label={`Actions for tab ${g.name}`}
-                            onOpen={(anchor) => onContextMenuGroup(g, anchor)}
-                        />
-                    </span>
-                ) : (
-                    <Tab
-                        key={g.id}
-                        label={g.name}
-                        active={false}
-                        onSelect={() => onSelect(g.id)}
-                        onContextMenu={(anchor) => onContextMenuGroup(g, anchor)}
-                    />
-                ),
-            )}
-            {creatingTab ? (
-                <InlineTabInput
-                    initial=""
-                    placeholder="New tab name"
-                    onCommit={(name) => onCommitCreate(name)}
-                    onCancel={onCancelCreate}
-                />
-            ) : (
-                <button
-                    type="button"
-                    aria-label="New tab"
-                    title="New tab"
-                    onClick={onStartCreate}
-                    className="flex size-control-24px items-center justify-center rounded text-text-subtle hover:bg-surface-hover hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-                >
-                    <Plus className="size-icon-sm" aria-hidden />
-                </button>
-            )}
-        </div>
-    );
-}
-
-function Tab({
-    label,
+/**
+ * One account type on the collapsed rail: its icon, named with its total.
+ * There is no tooltip primitive, so `title` carries what the section would
+ * have shown at its top level. Choosing it opens the rail, where that section
+ * is.
+ */
+function CollapsedSection({
+    section,
     active,
-    onSelect,
-    onContextMenu,
+    onExpand,
 }: {
-    label: string;
+    section: TypeSection;
     active: boolean;
-    onSelect: () => void;
-    onContextMenu?: (anchor: ContextMenuAnchor) => void;
+    onExpand: () => void;
 }) {
+    const Icon = section.icon;
+    const total = formatTotal(section.total);
+    const name = total === '' ? section.label : `${section.label}, ${total}`;
+    const lines = [
+        name,
+        ...section.children.map((node) =>
+            node.kind === 'folder'
+                ? joinFigure(node.folder.name, formatTotal(node.total))
+                : joinFigure(
+                    node.account.name,
+                    node.balance === undefined
+                        ? ''
+                        : formatCurrency(node.balance.balance, node.balance.currencyCode),
+                )),
+    ];
     return (
-        <button
-            type="button"
-            role="tab"
-            aria-selected={active}
-            onClick={onSelect}
-            onContextMenu={(e) => {
-                if (!onContextMenu) return;
-                e.preventDefault();
-                onContextMenu({ x: e.clientX, y: e.clientY });
-            }}
-            className={
-                'rounded px-2 py-0.5 text-[0.6875rem] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ' +
-                (active
-                    ? 'bg-accent text-text-inverse'
-                    : 'text-text-muted hover:bg-surface-hover hover:text-text')
-            }
-        >
-            {label}
-        </button>
+        <SidebarNavLink asChild active={active} className="w-full justify-center">
+            <button type="button" aria-label={name} title={lines.join('\n')} onClick={onExpand}>
+                <Icon className="size-icon-sm shrink-0" aria-hidden />
+            </button>
+        </SidebarNavLink>
     );
 }
 
-function InlineTabInput({
-    initial,
-    placeholder,
-    onCommit,
-    onCancel,
-}: {
-    initial: string;
-    placeholder?: string;
-    onCommit: (name: string) => void;
-    onCancel: () => void;
-}) {
-    const [value, setValue] = useState(initial);
-    const inputRef = useRef<HTMLInputElement | null>(null);
-    useEffect(() => {
-        inputRef.current?.focus();
-        inputRef.current?.select();
-    }, []);
-    function commitOrCancel() {
-        const trimmed = value.trim();
-        if (trimmed.length === 0) onCancel();
-        else onCommit(trimmed);
-    }
-    function handleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
-        if (e.key === 'Enter') {
-            e.preventDefault();
-            commitOrCancel();
-        } else if (e.key === 'Escape') {
-            e.preventDefault();
-            onCancel();
-        }
-    }
-    return (
-        <input
-            ref={inputRef}
-            type="text"
-            value={value}
-            placeholder={placeholder}
-            onChange={(e) => setValue(e.target.value)}
-            onKeyDown={handleKeyDown}
-            onBlur={commitOrCancel}
-            className="h-control-24px w-fixed-96px rounded border border-accent bg-surface px-1.5 text-[0.6875rem] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-        />
-    );
-}
-
-// --------------------------------------------------------------------
-// Account groups + context menu items
-// --------------------------------------------------------------------
-
-function AccountGroupRows({
-    group,
-    ledgerId,
-    activeAccountId,
-    onContextMenuAccount,
-}: {
-    group: AccountGroup;
-    ledgerId: string;
-    activeAccountId: string | undefined;
-    onContextMenuAccount: (
-        account: AccountSummary,
-        anchor: ContextMenuAnchor,
-    ) => void;
-}) {
-    const Icon = group.icon;
-    return (
-        <>
-            <SidebarSection>
-                <span className="flex items-center gap-1.5">
-                    <Icon className="size-icon-xs" aria-hidden />
-                    {group.label}
-                </span>
-            </SidebarSection>
-            {/* Offset each category's accounts under a faint left rail
-                so the groups read as distinct blocks (ADR-0021). */}
-            <div className="mb-1 ml-2 space-y-px border-l border-border pl-1.5">
-            {group.accounts.map((account) => (
-                <div key={account.id} className="relative">
-                <SidebarNavLink
-                    asChild
-                    active={account.id === activeAccountId}
-                    // Denser account list (overrides SidebarNavLink's
-                    // default py-1) — the rail-grouped rows read fine
-                    // tighter and fit more accounts per screen.
-                    className="py-0.5"
-                >
-                    <Link
-                        to="/ledgers/$ledgerId/accounts/$accountId"
-                        params={{ ledgerId, accountId: account.id }}
-                        className="flex w-full items-center gap-2"
-                        onContextMenu={(e) => {
-                            e.preventDefault();
-                            onContextMenuAccount(account, {
-                                x: e.clientX,
-                                y: e.clientY,
-                            });
-                        }}
-                    >
-                        <span
-                            className="size-dot-xs rounded-full bg-text-subtle"
-                            aria-hidden
-                        />
-                        {/* Inactive accounts (surfaced only when the
-                            "Show inactive" toggle is on) render
-                            opacity-60 + strikethrough so the user can
-                            tell at a glance they're not in the
-                            default-active set. Active accounts render
-                            unchanged. */}
-                        <span className={
-                            'truncate ' +
-                            (account.isActive ? '' : 'opacity-60 line-through')
-                        }>
-                            {account.name}
-                        </span>
-                        {account.needsReviewCount > 0 ? (
-                            // Slice 2c.2: bank-feed review dot per
-                            // ADR-0021 — present-vs-absent signal
-                            // (not a number). Slate-teal accent on
-                            // the accent palette. Title carries the
-                            // count for screen readers + hover.
-                            <span
-                                className="ml-auto size-dot-sm shrink-0 rounded-full bg-accent"
-                                title={`${account.needsReviewCount} transaction${account.needsReviewCount === 1 ? '' : 's'} to review`}
-                                aria-label={`${account.needsReviewCount} transactions to review`}
-                            />
-                        ) : null}
-                        {/* Reserved slot for the row-actions kebab. Present on
-                            EVERY row so the names and review dots stay in one
-                            column, and sized from the same pinned token as the
-                            button, so it still lines up at every density. */}
-                        <span aria-hidden className="size-control-20px shrink-0" />
-                    </Link>
-                </SidebarNavLink>
-                {/* ADR-0021 Rule 10. Only the SELECTED row carries it: always
-                    visible where it is, so it is discoverable without being
-                    hover-only — the rule rejects affordances you have to
-                    already be hovering to find — and without putting a control
-                    on every row of a dense rail. Right-click still works
-                    everywhere, as the accelerator it was meant to be. */}
-                {account.id === activeAccountId ? (
-                    <RowActionsButton
-                        size="sm"
-                        label={`Actions for ${account.name}`}
-                        onOpen={(anchor) => onContextMenuAccount(account, anchor)}
-                        className="absolute inset-y-0 right-2 my-auto"
-                    />
-                ) : null}
-                </div>
-            ))}
-            </div>
-        </>
-    );
-}
-
-
-// --------------------------------------------------------------------
-// Account-type grouping — one section per account type (Banking / Cash /
-// Credit cards / Investments / Assets / Liabilities / Loans), labelled,
-// iconed, and ordered by the shared accountTypes metadata so this list
-// stays in lock-step with the Ledger Hub's account sections.
-// --------------------------------------------------------------------
-
-/** Build the context-menu items for an account row: which user
- *  tabs is it NOT yet in (= "Add to" entries), plus a "Remove from
- *  <currentTab>" item when viewing a user tab that contains it.
- *  Empty when there are no tabs at all — the menu UI guards on
- *  items.length and won't open. */
-function buildAccountMenuItems(
-    account: AccountSummary,
-    groups: readonly AccountGroupSummary[],
-    activeGroup: AccountGroupSummary | null,
-    onAdd: (groupId: string, accountId: string) => void,
-    onRemove: (groupId: string, accountId: string) => void,
-    onToggleActive: (account: AccountSummary, active: boolean) => void,
-): readonly ContextMenuItem[] {
-    const items: ContextMenuItem[] = [];
-    for (const g of groups) {
-        const isMember = g.memberAccountIds.includes(account.id);
-        if (isMember) continue;
-        items.push({
-            id: `add:${g.id}`,
-            label: `Add to "${g.name}"`,
-            onSelect: () => onAdd(g.id, account.id),
-        });
-    }
-    if (activeGroup && activeGroup.memberAccountIds.includes(account.id)) {
-        items.push({
-            id: `remove:${activeGroup.id}`,
-            label: `Remove from "${activeGroup.name}"`,
-            danger: true,
-            onSelect: () => onRemove(activeGroup.id, account.id),
-        });
-    }
-    // Inactive-account lifecycle: deactivate / reactivate toggle.
-    // System accounts (Holdings siblings, Uncategorized) are gated
-    // by the API; the menu item is hidden for them to avoid showing
-    // an option the user can't action. The toggle is always
-    // available on user-created accounts.
-    if (!account.isSystem) {
-        items.push({
-            id: 'toggle-active',
-            label: account.isActive ? 'Deactivate' : 'Reactivate',
-            danger: account.isActive,
-            onSelect: () => onToggleActive(account, !account.isActive),
-        });
-    }
-    if (items.length === 0) {
-        items.push({
-            id: 'noop',
-            label: 'No tabs available — create one with the + above',
-            disabled: true,
-            onSelect: () => {},
-        });
-    }
-    return items;
-}
-
-function groupAccounts(accounts: readonly AccountSummary[]): AccountGroup[] {
-    const byType = new Map<string, AccountSummary[]>();
-
-    for (const account of accounts) {
-        // System rows (Holdings siblings, Uncategorized) stay hidden;
-        // inactive rows surface here via the includeInactive fetch
-        // (mig 106 collapsed the old is_hidden flag into is_active).
-        if (account.isSystem) continue;
-        // `holding` is the system-side sibling of an investment account —
-        // fold it into Investments rather than grouping on its own.
-        const type =
-            account.accountType === 'holding'
-                ? 'investment'
-                : account.accountType;
-        // `category` rows are budget categories, not accounts.
-        if (type === 'category') continue;
-        const bucket = byType.get(type);
-        if (bucket) bucket.push(account);
-        else byType.set(type, [account]);
-    }
-
-    return [...byType.entries()]
-        .sort(([a], [b]) => accountTypeOrder(a) - accountTypeOrder(b))
-        .map(([type, members]) => {
-            const meta = accountTypeMeta(type);
-            return { label: meta.label, icon: meta.icon, accounts: members };
-        });
-}
-
-function findById<T extends { id: string }>(
-    items: readonly T[] | undefined,
-    id: string | undefined,
-): T | undefined {
-    if (!items || id === undefined) return undefined;
-    return items.find((i) => i.id === id);
+function joinFigure(name: string, figure: string): string {
+    return figure === '' ? name : `${name}, ${figure}`;
 }
 
 // Re-export the LedgerSummary type so other modules can import it

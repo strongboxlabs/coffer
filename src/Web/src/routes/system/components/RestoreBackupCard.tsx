@@ -1,6 +1,7 @@
 import { useEffect, useId, useState } from 'react';
 import { useNavigate } from '@tanstack/react-router';
-import { useMutation, useQuery } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 import { AlertTriangle } from 'lucide-react';
 
 import {
@@ -48,24 +49,23 @@ type RestoreState =
 /**
  * Shown from the moment a restore is accepted until the server is back.
  *
- * Two things this gets wrong if it is written carelessly, and both were got
- * wrong here first.
+ * Two things this gets wrong if it is written carelessly.
  *
- * It must SAY what happened, and only what the server SAYS happened. The first
- * version stated "wait a moment, then sign in" and never changed, so a completed
- * restore looked exactly like a hung one. The second polled the liveness probe
- * and then announced "Restore complete" — but the server answers after a FAILED
- * restore too, and one that failed in production and changed nothing was
- * reported as complete. The boot now records its outcome under the attempt id
- * the server handed back, and this reads that: applied, failed (nothing
- * changed), or — if nothing was recorded — unconfirmed, never success.
+ * It must SAY what happened, and only what the server SAYS happened. A static
+ * "wait a moment, then sign in" makes a completed restore look exactly like a
+ * hung one. Polling the liveness probe and then announcing "Restore complete"
+ * reports a restore that failed and changed nothing as complete, because the
+ * server answers after a FAILED restore too. So the boot records its outcome
+ * under the attempt id the server handed back, and this reads that: applied,
+ * failed (nothing changed), or — if nothing was recorded — unconfirmed, never
+ * success.
  *
- * A restore signs everyone out (FU-076). It used to bring every session back as it
- * was at backup time, so this notice asked /api/auth/me whether yours had survived —
- * and restoring a backup from before an incident handed the attacker's revoked
- * access back with it. Now every session, MCP token and OAuth grant in the restored
- * database is revoked and every pending invite removed, so there is nothing to ask:
- * the notice says so, and says what each person has to redo.
+ * A restore signs everyone out (FU-076). Bringing every session back as it was at
+ * backup time would hand a revoked attacker's access back to them whenever a
+ * backup from before the revocation is restored. So every session, MCP token and
+ * OAuth grant in the restored database is revoked and every pending invite
+ * removed, and there is nothing to ask /api/auth/me: the notice says so, and says
+ * what each person has to redo.
  */
 function RestoringNotice({ attemptId, onBack }: { attemptId: string; onBack: () => void }) {
     const navigate = useNavigate();
@@ -205,7 +205,7 @@ function RestoringNotice({ attemptId, onBack }: { attemptId: string; onBack: () 
  * passphrase, type the exact confirmation phrase, and the server stages the
  * archive and restarts to apply it. Destructive: it replaces ALL users,
  * ledgers, and data across the deployment, and signs everyone out. A
- * cross-install KEK mismatch (D4) is surfaced as a warning the admin must
+ * cross-install KEK mismatch (ADR-0071 D4) is surfaced as a warning the admin must
  * explicitly acknowledge.
  */
 export function RestoreBackupCard() {
@@ -374,8 +374,7 @@ export function RestoreBackupCard() {
         source !== null &&
         passphrase.length > 0 &&
         confirmOk &&
-        (!needsKekAck || kekResolved) &&
-        !restoreMutation.isPending;
+        (!needsKekAck || kekResolved);
 
     if (restartAttempt !== null) {
         return (
@@ -499,7 +498,7 @@ export function RestoreBackupCard() {
                         type="password"
                         autoComplete="off"
                         value={passphrase}
-                        disabled={restoreMutation.isPending}
+                        pending={restoreMutation.isPending}
                         onChange={(e) => setPassphrase(e.target.value)}
                     />
                 </div>
@@ -513,7 +512,7 @@ export function RestoreBackupCard() {
                         autoComplete="off"
                         placeholder={RESTORE_CONFIRM_PHRASE}
                         value={confirm}
-                        disabled={restoreMutation.isPending}
+                        pending={restoreMutation.isPending}
                         onChange={(e) => setConfirm(e.target.value)}
                     />
                 </div>
@@ -602,9 +601,10 @@ export function RestoreBackupCard() {
                 <div className="flex justify-end">
                     <Button
                         type="button"
-                        variant="primary"
+                        variant="danger"
                         disabled={!canSubmit}
-                        className="bg-state-danger hover:bg-state-danger/90"
+                        pending={restoreMutation.isPending}
+                        pendingLabel="Restoring…"
                         onClick={() =>
                             source &&
                             restoreMutation.mutate({
@@ -616,7 +616,7 @@ export function RestoreBackupCard() {
                             })
                         }
                     >
-                        {restoreMutation.isPending ? 'Restoring…' : 'Restore database'}
+                        Restore database
                     </Button>
                 </div>
             </PanelBody>

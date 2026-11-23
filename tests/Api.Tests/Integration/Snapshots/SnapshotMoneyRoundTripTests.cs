@@ -30,11 +30,12 @@ namespace Coffer.Api.Tests.Integration.Snapshots;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class SnapshotMoneyRoundTripTests
+public sealed class SnapshotMoneyRoundTripTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SnapshotMoneyRoundTripTests(PostgresFixture fixture) => _fixture = fixture;
+    public SnapshotMoneyRoundTripTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -53,7 +54,7 @@ public sealed class SnapshotMoneyRoundTripTests
 
     private async Task<Money> ReadMoneyAsync(Guid ledgerId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return new Money(
             LegAmount: await db.TxnLegs.AsNoTracking()
                 .Where(l => l.LedgerId == ledgerId).SumAsync(l => l.Amount),
@@ -73,11 +74,11 @@ public sealed class SnapshotMoneyRoundTripTests
     [MemberData(nameof(Boundary.Positions), MemberType = typeof(Boundary))]
     public async Task Snapshot_restore_returns_every_money_figure_identical(Boundary.Position p)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var security = await ledger.AddSecurityAsync("Bond Fund", "BFND");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<HttpResponseMessage> PostAsync(CreateInvestmentTransactionRequest req) =>

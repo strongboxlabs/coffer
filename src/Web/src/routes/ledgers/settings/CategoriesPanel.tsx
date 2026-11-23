@@ -1,7 +1,8 @@
-import { useMemo, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Link } from '@tanstack/react-router';
-import { ChevronDown, Plus, Scale, TrendingDown, TrendingUp } from 'lucide-react';
+import { useMemo, useRef, useState } from 'react';
+import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
+import { Link, useNavigate } from '@tanstack/react-router';
+import { Scale, TrendingDown, TrendingUp } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
 import { deleteCategory, fetchAccounts, fetchCategories } from '@/lib/api';
@@ -10,13 +11,35 @@ import { formatCurrency } from '@/lib/money';
 import { errorMessage } from '@/lib/errorMessage';
 import { cn } from '@/lib/cn';
 import { usePersistedDisclosure } from '@/lib/usePersistedDisclosure';
+import { useLedgerRole } from '@/lib/useLedgerRole';
 import { buildAccountPathMap } from '@/lib/accountPath';
-import { RowActionsButton } from '@/components/ui/RowActionsButton';
-import { Panel, PanelBody, PanelHead } from '@/components/ui/Panel';
+import { NO_RATE_LABEL, rateUnavailableTitle } from '@/lib/conversion';
+import type { RateUnavailable } from '@/lib/types';
+import { invalidateHomeReads } from '@/lib/registerInvalidation';
+import { Button } from '@/components/ui/Button';
+import { Panel } from '@/components/ui/Panel';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
+import { useRowRemovalFocus } from '@/components/ui/rowRemovalFocus';
 
-import { buildForest, flattenForest, type CategoryTreeNode } from './categoryTree';
+import { LedgerConversionNote } from '@/components/LedgerConversionNote';
+
+import { NoRate } from '../home/Money';
+import { DeactivateConfirm } from '../structure/DeactivateConfirm';
+import { normalizeQuery, rowLinkClass, transactionCountLabel } from '../structure/rowStyles';
+import { StructureGroupHeading } from '../structure/StructureGroupHeading';
+import { StructureBadge, StructureRow } from '../structure/StructureRow';
+import { ActionError, ListEmpty, ListError, ListLoading, ListNoMatches } from '../structure/StructureStates';
+import { StructureToolbar } from '../structure/StructureToolbar';
+import { useRowMenu } from '../structure/useRowMenu';
+import { useSetActive } from '../structure/useSetActive';
+import {
+    buildForest,
+    canMergeAway,
+    categoryIdsMatching,
+    flattenForest,
+    type CategoryTreeNode,
+} from './categoryTree';
 import {
     CategoryCreateDialog,
     CategoryMergeDialog,
@@ -30,14 +53,17 @@ import {
  * earnings read positive under the Income header.
  *
  * `adjustment` (mig 224) is deliberately NOT normalized, and the arm is written
- * out rather than left to fall through the ternary that used to be here. The
+ * out rather than left to fall through a default. The
  * other two kinds have a natural direction — money earned, money spent — and
  * the negation exists to make each read positive under its own header. An
  * adjustment has no such direction: marking a house up and reconciling a
  * retirement balance down are the same kind of entry with opposite signs.
  * Negating it would assert the income reading; leaving it signed states what
- * happened. Same NUMBER the ternary produced, now on purpose.
+ * happened.
  */
+/** The kinds the panel draws, each as its own section, in this order. */
+const SECTION_KINDS = ['income', 'expense', 'adjustment'] as const;
+
 function displayTotal(total: number, kind: string): number {
     switch (kind) {
         case 'income': return -total;
@@ -47,21 +73,31 @@ function displayTotal(total: number, kind: string): number {
 }
 
 /**
- * Settings → Categories (ADR-0017 / ADR-0068 Slice A). Manage the budget
+ * The Categories tab of Structure (ADR-0017 / ADR-0068 Slice A, ADR-0111). Manage the budget
  * categories that are otherwise only reachable inline in the transaction
  * editor: see the full income/expense hierarchy, create / rename / move /
- * merge / delete, with per-category usage counts. Categories ARE accounts
+ * merge / delete / deactivate, with per-category usage counts. Categories ARE accounts
  * (`account_type='category'`), so this reads the dedicated /categories
  * endpoint (hierarchy + usage) and writes through the accounts endpoints
- * (create/rename) plus the /categories hierarchy ops (move/merge/delete).
+ * (create/rename/active) plus the /categories hierarchy ops (move/merge/delete).
+ *
+ * The toolbar, the row, the menu and the states are the ones the other two tabs use. What is
+ * this list's own is the kind sections, which collapse and carry a total, and the tree.
  */
 export function CategoriesPanel({ ledgerId }: { ledgerId: string }) {
     const queryClient = useQueryClient();
+    const navigate = useNavigate();
+    const { canEdit } = useLedgerRole(ledgerId);
     const [showInactive, setShowInactive] = useState(false);
+    const [query, setQuery] = useState('');
 
     const categoriesQuery = useQuery({
         queryKey: ['categories', ledgerId, showInactive],
         queryFn: () => fetchCategories(ledgerId, { includeInactive: showInactive }),
+        // Ticking "Show inactive" changes the key. Keeping the rows already drawn until the new
+        // ones land means the list does not blink to a skeleton and the toolbar, with the box the
+        // reader is standing on, is not disabled under them.
+        placeholderData: keepPreviousData,
     });
     // The dialogs' parent / merge-target pickers reuse AccountCategoryPicker,
     // which wants the full ledger account list (it builds parent-name
@@ -70,8 +106,17 @@ export function CategoriesPanel({ ledgerId }: { ledgerId: string }) {
         queryKey: ['accounts', ledgerId],
         queryFn: () => fetchAccounts(ledgerId),
     });
-    const categories = useMemo(() => categoriesQuery.data ?? [], [categoriesQuery.data]);
+    const categories = useMemo(() => categoriesQuery.data?.categories ?? [], [categoriesQuery.data]);
     const accounts = useMemo(() => accountsQuery.data ?? [], [accountsQuery.data]);
+    // A category has no currency of its own: its lines carry the paying account's
+    // (ADR-0109 D9). Every figure here is converted into the ledger's reporting currency
+    // (ADR-0114 D7), which the categories read carries beside the rows, as the budget
+    // month does, so a figure never waits on another read and never wears a code stored
+    // on a category.
+    const ledgerCurrency = useMemo(
+        () => (categoriesQuery.data === undefined ? null : { code: categoriesQuery.data.currencyCode }),
+        [categoriesQuery.data],
+    );
 
     // The TREE below keeps its bare leaf names — indentation is the answer there.
     // These paths are for everything that leaves the tree: the confirm dialogs,
@@ -82,12 +127,26 @@ export function CategoriesPanel({ ledgerId }: { ledgerId: string }) {
     const categoryPaths = useMemo(() => buildAccountPathMap(accounts), [accounts]);
     const pathOf = (node: CategoryNode) => categoryPaths.get(node.id) ?? node.name;
 
+    // What a search keeps: the categories that match and every ancestor of one, so a match is
+    // never shown without the path to it. Null when nothing is being searched for.
+    const q = normalizeQuery(query);
+    const visible = useMemo(
+        () => (q === '' ? null : categoryIdsMatching(categories, q)),
+        [categories, q],
+    );
+    const shown = useMemo(
+        () => (visible === null ? categories : categories.filter((c) => visible.has(c.id))),
+        [categories, visible],
+    );
+
     // A category mutation ripples beyond the tree: names/active state feed
-    // the register chips + pickers (accounts) and the register itself
-    // (['register', …] is the ADR-0079 canonical key that reloads it).
+    // the register chips + pickers (accounts), the register itself
+    // (['register', …] is the ADR-0079 canonical key that reloads it) and the
+    // home screen and the budget, whose spending and review rows name categories.
     const onSaved = () => {
         void queryClient.invalidateQueries({ queryKey: ['categories', ledgerId] });
         void queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+        invalidateHomeReads(queryClient, ledgerId);
         void queryClient.invalidateQueries({ queryKey: ['register', ledgerId] });
     };
 
@@ -98,169 +157,171 @@ export function CategoriesPanel({ ledgerId }: { ledgerId: string }) {
         | { kind: 'merge'; node: CategoryNode };
     const [dialog, setDialog] = useState<DialogState | null>(null);
     const [deleteTarget, setDeleteTarget] = useState<CategoryNode | null>(null);
-    const [menu, setMenu] = useState<{ node: CategoryNode; x: number; y: number } | null>(null);
+    const [deactivating, setDeactivating] = useState<CategoryNode | null>(null);
+    const rowMenu = useRowMenu<CategoryNode>();
+    const setActive = useSetActive(ledgerId);
+    // A category deleted or merged away takes its row's kebab with it: focus goes
+    // to the next row's in the order drawn (each kind's tree, kind by kind), the
+    // previous row's, or New category (ADR-0023 §L). A row in a folded group has
+    // no kebab on the page and is passed over.
+    const newCategoryRef = useRef<HTMLButtonElement | null>(null);
+    const drawnOrder = useMemo(
+        () => SECTION_KINDS.flatMap((kind) =>
+            flattenForest(buildForest(shown.filter((c) => c.categoryKind === kind))).map((r) => r.node.id)),
+        [shown],
+    );
+    const rowControl = useRowRemovalFocus(drawnOrder, newCategoryRef);
 
     const deleteMut = useMutation({
         mutationFn: (id: string) => deleteCategory(ledgerId, id),
         onSuccess: () => { onSaved(); setDeleteTarget(null); },
     });
 
-    const menuItems = (node: CategoryNode): ContextMenuItem[] => {
-        const hasMergeTarget = categories.some(
-            (c) => c.categoryKind === node.categoryKind && c.id !== node.id,
-        );
-        return [
-            { id: 'add', label: 'Add sub-category',
-                onSelect: () => setDialog({ kind: 'create', presetParentId: node.id }) },
-            { id: 'rename', label: 'Rename',
-                onSelect: () => setDialog({ kind: 'rename', node }) },
-            { id: 'move', label: 'Move…',
-                onSelect: () => setDialog({ kind: 'move', node }) },
-            { id: 'merge', label: 'Merge…', disabled: !hasMergeTarget,
-                onSelect: () => setDialog({ kind: 'merge', node }) },
-            { id: 'delete', label: 'Delete', danger: true,
-                onSelect: () => setDeleteTarget(node) },
-        ];
-    };
+    const menuItems = (node: CategoryNode): ContextMenuItem[] => [
+        { id: 'open', label: 'Open register',
+            onSelect: () => void navigate({
+                to: '/ledgers/$ledgerId/accounts/$accountId',
+                params: { ledgerId, accountId: node.id },
+            }) },
+        // A sub-category of a category that cannot be chosen is not worth making.
+        ...(node.isActive
+            ? [{ id: 'add', label: 'Add sub-category',
+                onSelect: () => setDialog({ kind: 'create', presetParentId: node.id }) }]
+            : []),
+        { id: 'rename', label: 'Rename…',
+            onSelect: () => setDialog({ kind: 'rename', node }) },
+        { id: 'move', label: 'Move…',
+            onSelect: () => setDialog({ kind: 'move', node }) },
+        // Enabled by the rule the dialog's targets follow, so the menu never offers a merge
+        // that the dialog then says it has nothing to merge into.
+        { id: 'merge', label: 'Merge…', disabled: !canMergeAway(node.id, accounts),
+            onSelect: () => setDialog({ kind: 'merge', node }) },
+        node.isActive
+            ? { id: 'deactivate', label: 'Deactivate',
+                onSelect: () => { setActive.reset(); setDeactivating(node); } }
+            : { id: 'reactivate', label: 'Reactivate',
+                onSelect: () => setActive.mutate({ accountId: node.id, active: true }) },
+        { id: 'delete', label: 'Delete', danger: true,
+            onSelect: () => { deleteMut.reset(); setDeleteTarget(node); } },
+    ];
 
     const renderRow = (row: CategoryTreeNode) => {
         const { node, depth } = row;
-        // System categories (e.g. Uncategorized) have no user actions — the
-        // server rejects mutating them — so they aren't right-clickable.
-        const actionable = !node.isSystem;
         return (
-            <li
+            <StructureRow
                 key={node.id}
-                style={{ paddingLeft: `${0.5 + depth * 1.25}rem` }}
-                onContextMenu={actionable
-                    ? (e) => { e.preventDefault(); setMenu({ node, x: e.clientX, y: e.clientY }); }
-                    : undefined}
-                className={cn(
-                    'flex items-center justify-between gap-2 rounded py-1 pr-1.5 hover:bg-surface-hover',
-                )}
-            >
-                <div className="flex min-w-0 items-center gap-2">
+                depth={depth}
+                name={(
                     <Link
                         to="/ledgers/$ledgerId/accounts/$accountId"
                         params={{ ledgerId, accountId: node.id }}
                         title={`Open the ${pathOf(node)} register`}
-                        className={cn(
-                            'truncate text-sm hover:text-accent hover:underline',
-                            !node.isActive && 'text-text-subtle line-through',
-                        )}
+                        className={rowLinkClass(!node.isActive)}
                     >
                         {node.name}
                     </Link>
-                    {!node.isActive ? <Tag>Inactive</Tag> : null}
-                    {node.isSystem ? <Tag>System</Tag> : null}
-                </div>
-                <div className="flex shrink-0 items-center gap-3">
-                    <span
-                        className="text-[0.6875rem] tabular-nums text-text-subtle"
-                        title={`${node.transactionCount} transaction${node.transactionCount === 1 ? '' : 's'}`}
-                    >
-                        {node.transactionCount} txns
-                    </span>
-                    <span className="w-fixed-96px text-right text-sm tabular-nums text-text">
-                        {formatCurrency(displayTotal(node.total, node.categoryKind))}
-                    </span>
-                    {/* A placeholder keeps the money column aligned on rows
-                        that have no actions (system categories). */}
-                    {actionable ? (
-                        <RowActionsButton
-                            label={`Actions for ${pathOf(node)}`}
-                            onOpen={({ x, y }) => setMenu({ node, x, y })}
-                        />
-                    ) : (
-                        <span aria-hidden className="size-control-28px shrink-0" />
-                    )}
-                </div>
-            </li>
+                )}
+                badges={(
+                    <>
+                        {!node.isActive ? <StructureBadge>Inactive</StructureBadge> : null}
+                        {node.isSystem ? <StructureBadge>System</StructureBadge> : null}
+                    </>
+                )}
+                count={transactionCountLabel(node.transactionCount)}
+                // One category's own sum, converted; "no rate" when a leg needs a missing rate.
+                amount={ledgerCurrency === null
+                    ? null
+                    : node.total === null
+                        ? <NoRate missing={node.rateUnavailable ?? []} />
+                        : formatCurrency(displayTotal(node.total, node.categoryKind), ledgerCurrency.code)}
+                // System categories (e.g. Uncategorized) have no user actions — the server rejects
+                // mutating them — and nor does any row for a reader who cannot edit.
+                menu={!canEdit
+                    ? undefined
+                    : node.isSystem
+                        ? 'none'
+                        : { label: `Actions for ${pathOf(node)}`, onOpen: (anchor) => rowMenu.open(node, anchor) }}
+                menuControl={rowControl(node.id)}
+            />
         );
     };
 
+    const failed = categoriesQuery.isError;
+    const loading = categoriesQuery.isPending;
+    const sections = [
+        { kind: SECTION_KINDS[0], label: 'Income', icon: TrendingUp, iconClass: 'text-state-success' },
+        { kind: SECTION_KINDS[1], label: 'Expense', icon: TrendingDown, iconClass: 'text-state-danger' },
+        { kind: SECTION_KINDS[2], label: 'Adjustment', icon: Scale, iconClass: 'text-text-muted' },
+    ] as const;
+
     return (
-        <Panel>
-            <PanelHead>
-                <div className="flex w-full items-center justify-between gap-3">
-                    <span className="font-medium">Categories</span>
-                    <label className="flex items-center gap-1.5 text-xs text-text-muted">
-                        <input
-                            type="checkbox"
-                            checked={showInactive}
-                            onChange={(e) => setShowInactive(e.target.checked)}
-                        />
-                        Show inactive
-                    </label>
-                </div>
-            </PanelHead>
-            <PanelBody className="space-y-5">
-                {categoriesQuery.isPending ? (
-                    <p className="text-sm text-text-muted">Loading categories…</p>
-                ) : categoriesQuery.isError ? (
-                    <p role="alert" className="text-sm text-state-danger">
-                        {errorMessage(categoriesQuery.error, 'Could not load categories.')}
-                    </p>
-                ) : (
-                    <>
-                        <KindSection
-                            kind="income"
-                            label="Income"
-                            icon={TrendingUp}
-                            iconClass="text-state-success"
-                            categories={categories}
-                            renderRow={renderRow}
-                            ledgerId={ledgerId}
-                            onNew={() => setDialog({ kind: 'create', presetKind: 'income' })}
-                        />
-                        <KindSection
-                            kind="expense"
-                            label="Expense"
-                            icon={TrendingDown}
-                            iconClass="text-state-danger"
-                            categories={categories}
-                            renderRow={renderRow}
-                            ledgerId={ledgerId}
-                            onNew={() => setDialog({ kind: 'create', presetKind: 'expense' })}
-                        />
-                        {/* Mig 224's third kind. This screen rendered exactly two
-                            sections and filtered each on `categoryKind === kind`,
-                            so an adjustment category was fetched and then dropped
-                            — and the create dialog ON THIS SCREEN offers
-                            Adjustment, so you could make one and watch it vanish
-                            with no error and nowhere else in the UI listing it.
+        <div className="space-y-4">
+            {/* The one ledger-level note on converted totals (ADR-0114 D7): each
+                category's total combines the accounts its lines are paid from. */}
+            <LedgerConversionNote ledgerId={ledgerId} />
+            <StructureToolbar
+                noun="categories"
+                query={query}
+                onQuery={setQuery}
+                showInactive={showInactive}
+                onShowInactive={setShowInactive}
+                createLabel={canEdit ? 'New category' : undefined}
+                onCreate={canEdit ? () => setDialog({ kind: 'create' }) : undefined}
+                createRef={newCategoryRef}
+                disabled={failed}
+                pending={loading}
+            />
 
-                            Rendered ALWAYS, not only when the ledger has one.
-                            Conditional was tempting — mig 224 reclassifies
-                            nothing, so every existing install and every fresh
-                            demo has zero, and a permanently empty section is a
-                            real cost. But the per-section "New" buttons are the
-                            only create affordance here (there is no panel-level
-                            one), so a section that appears only once a category
-                            exists leaves no way to create the first one except
-                            opening Income → New and changing the dropdown. The
-                            empty state already reads "No adjustment categories
-                            yet", which is the honest thing for a kind most
-                            ledgers will never use. */}
-                        <KindSection
-                            kind="adjustment"
-                            label="Adjustment"
-                            icon={Scale}
-                            iconClass="text-text-muted"
-                            categories={categories}
-                            renderRow={renderRow}
-                            ledgerId={ledgerId}
-                            onNew={() => setDialog({ kind: 'create', presetKind: 'adjustment' })}
-                        />
-                    </>
-                )}
-            </PanelBody>
+            {/* Reactivating asks nothing, so it has no dialog to say it failed in. */}
+            {setActive.isError && setActive.variables?.active === true ? (
+                <ActionError message={errorMessage(setActive.error, 'Could not reactivate the category.')} />
+            ) : null}
 
-            {menu ? (
+            {failed ? (
+                <ListError
+                    message={errorMessage(categoriesQuery.error, 'Could not load categories.')}
+                    onRetry={() => void categoriesQuery.refetch()}
+                />
+            ) : loading ? (
+                <ListLoading noun="categories" />
+            ) : categories.length === 0 ? (
+                <ListEmpty
+                    message="No categories yet"
+                    hint="Categories say what each transaction was for. Start with a few and add more as you go."
+                    action={canEdit ? (
+                        <Button type="button" variant="primary" size="sm" onClick={() => setDialog({ kind: 'create' })}>
+                            New category
+                        </Button>
+                    ) : undefined}
+                />
+            ) : shown.length === 0 ? (
+                <ListNoMatches query={query} noun="category" onClear={() => setQuery('')} />
+            ) : (
+                sections.map((s) => (
+                    <KindSection
+                        key={s.kind}
+                        kind={s.kind}
+                        label={s.label}
+                        icon={s.icon}
+                        iconClass={s.iconClass}
+                        categories={shown}
+                        // The total is the kind's, over every category of it. A search shows part of
+                        // the tree, and a total of part of it would read as the whole.
+                        totalOf={visible === null ? categories : null}
+                        ledgerCurrency={ledgerCurrency}
+                        searching={visible !== null}
+                        renderRow={renderRow}
+                        ledgerId={ledgerId}
+                    />
+                ))
+            )}
+
+            {rowMenu.menu ? (
                 <ContextMenu
-                    anchor={{ x: menu.x, y: menu.y }}
-                    items={menuItems(menu.node)}
-                    onClose={() => setMenu(null)}
+                    anchor={rowMenu.menu.anchor}
+                    label={`Actions for ${pathOf(rowMenu.menu.row)}`}
+                    items={menuItems(rowMenu.menu.row)}
+                    onClose={rowMenu.close}
                 />
             ) : null}
 
@@ -301,6 +362,20 @@ export function CategoriesPanel({ ledgerId }: { ledgerId: string }) {
                 />
             ) : null}
 
+            {deactivating !== null ? (
+                <DeactivateConfirm
+                    kind="category"
+                    name={pathOf(deactivating)}
+                    isConfirming={setActive.isPending}
+                    error={setActive.isError ? errorMessage(setActive.error, 'Could not deactivate the category.') : null}
+                    onConfirm={() => setActive.mutate(
+                        { accountId: deactivating.id, active: false },
+                        { onSuccess: () => setDeactivating(null) },
+                    )}
+                    onCancel={() => { setActive.reset(); setDeactivating(null); }}
+                />
+            ) : null}
+
             {deleteTarget ? (
                 <DeleteCategoryConfirm
                     path={pathOf(deleteTarget)}
@@ -318,109 +393,108 @@ export function CategoriesPanel({ ledgerId }: { ledgerId: string }) {
                     onCancel={() => setDeleteTarget(null)}
                 />
             ) : null}
-        </Panel>
+        </div>
     );
 }
 
 /**
- * One kind's section: header (disclosure + icon + label + count, then total and
- * New) over the tree.
+ * One kind's section: a header (disclosure + icon + label + count, then the kind's total) over
+ * the tree, which is a panel of rows.
  *
- * COLLAPSIBLE because a real taxonomy is long. The demo alone has 78 expense
- * categories, so a third section below them sits about 2500px down and
+ * COLLAPSIBLE because a real taxonomy is long. The Demo's expense categories alone run to
+ * about eighty, so a third section below them sits about 2500px down and
  * reaching it means scrolling past everything — which is what made adding the
  * Adjustment section a nuisance rather than a fix. Collapsing is the general
- * answer: the same scroll is in the way of the Expense total, of New income,
- * and of anything else below the fold.
+ * answer: the same scroll is in the way of the Expense total and of anything else below the
+ * fold.
  *
- * The toggle is the heading only. The total and New sit OUTSIDE it, because a
- * button that both creates a category and collapses the list it lands in is a
- * trap — and nesting a button inside a button is invalid anyway.
+ * The toggle is the heading only. The total sits OUTSIDE it, because a button that both
+ * reads a figure and collapses the list is a trap.
  *
  * State persists per ledger via {@link usePersistedDisclosure}, the same hook
- * (and the same reasoning) as the hub sections.
+ * (and the same reasoning) as the hub sections. A kind with nothing to show is left out
+ * (there is no create button here to reach an empty one with: New category is the toolbar's,
+ * and its dialog asks for the kind), and a search opens every section it found something in.
  */
 function KindSection({
-    kind, label, icon: Icon, iconClass, categories, renderRow, onNew, ledgerId,
+    kind, label, icon: Icon, iconClass, categories, totalOf, ledgerCurrency, searching, renderRow, ledgerId,
 }: {
     kind: string;
     label: string;
     icon: LucideIcon;
     iconClass: string;
+    /** The categories to draw: all of them, or what a search kept. */
     categories: readonly CategoryNode[];
+    /** What the section's total is summed over, or null to leave the total off. */
+    totalOf: readonly CategoryNode[] | null;
+    /** The ledger's reporting currency, every total converted into it; null until the
+     *  categories read has answered. */
+    ledgerCurrency: { code: string } | null;
+    searching: boolean;
     renderRow: (row: CategoryTreeNode) => React.ReactNode;
-    onNew: () => void;
     ledgerId: string;
 }) {
-    // COLLAPSED until the user says otherwise. The screen then opens as three
-    // header rows carrying the three totals, and expanding one is a click —
-    // rather than opening on a taxonomy long enough that the section you came
-    // for is off-screen.
+    // COLLAPSED until the user says otherwise. The screen then opens as header rows carrying
+    // the totals, and expanding one is a click — rather than opening on a taxonomy long enough
+    // that the section you came for is off-screen.
     //
     // Uniform across the three kinds rather than "collapse the big one":
     // whatever row count would justify that rule is a number read off this
     // ledger, and a taxonomy that makes Income the long section is somebody's
     // ordinary ledger.
-    const [expanded, toggle] = usePersistedDisclosure(
+    const [stored, toggle] = usePersistedDisclosure(
         `coffer.categories.${ledgerId}.${kind}.expanded`, false);
+    const expanded = searching || stored;
     const bodyId = `categories-${kind}-body`;
-    const { rows, sectionTotal } = useMemo(() => {
-        const ofKind = categories.filter((c) => c.categoryKind === kind);
-        const rawSum = ofKind.reduce((sum, c) => sum + c.total, 0);
-        return {
-            rows: flattenForest(buildForest(ofKind)),
-            sectionTotal: displayTotal(rawSum, kind),
-        };
-    }, [categories, kind]);
+    const rows = useMemo(
+        () => flattenForest(buildForest(categories.filter((c) => c.categoryKind === kind))),
+        [categories, kind],
+    );
+    const sectionTotal = useMemo((): { amount: number; missing: RateUnavailable[] } | null => {
+        if (totalOf === null || ledgerCurrency === null) return null;
+        const ofKind = totalOf.filter((c) => c.categoryKind === kind);
+        // In the ledger's reporting currency, every total converted; a category whose
+        // total needs a missing rate makes the sum "no rate", never a partial sum
+        // (ADR-0114 D9).
+        const missing = ofKind.flatMap((c) => (c.total === null ? (c.rateUnavailable ?? []) : []));
+        if (ofKind.some((c) => c.total === null)) return { amount: 0, missing };
+        const rawSum = ofKind.reduce((sum, c) => sum + c.total!, 0);
+        return { amount: displayTotal(rawSum, kind), missing };
+    }, [totalOf, ledgerCurrency, kind]);
+
+    if (rows.length === 0) return null;
 
     return (
-        <section>
-            <div className="mb-1 flex items-center justify-between gap-2 border-b border-border pb-1">
-                <h3 className="min-w-0 flex-1 text-sm font-semibold text-text">
-                    <button
-                        type="button"
-                        onClick={toggle}
-                        aria-expanded={expanded}
-                        aria-controls={bodyId}
-                        className="flex w-full items-center gap-1.5 rounded text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1"
-                    >
-                        <ChevronDown
-                            className={cn(
-                                'size-icon-md shrink-0 text-text-muted transition-transform',
-                                expanded ? 'rotate-0' : '-rotate-90',
-                            )}
-                            aria-hidden
-                        />
-                        <Icon className={cn('size-icon-md shrink-0', iconClass)} aria-hidden />
-                        {label}
-                        <span className="text-xs font-normal text-text-subtle">({rows.length})</span>
-                    </button>
-                </h3>
-                <div className="flex items-center gap-3">
-                    <span
-                        className="text-sm font-semibold tabular-nums text-text"
-                        title={`Total ${label.toLowerCase()} across all ${label.toLowerCase()} categories`}
-                    >
-                        {formatCurrency(sectionTotal)}
-                    </span>
-                    <button
-                        type="button"
-                        onClick={onNew}
-                        className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-text-muted hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-                    >
-                        <Plus className="size-icon-sm" aria-hidden />
-                        New {label.toLowerCase()}
-                    </button>
-                </div>
-            </div>
+        <section className="space-y-1">
+            <StructureGroupHeading
+                label={label}
+                count={rows.length}
+                icon={<Icon className={cn('size-icon-md shrink-0', iconClass)} aria-hidden />}
+                total={sectionTotal !== null && ledgerCurrency !== null
+                    ? sectionTotal.missing.length > 0
+                        ? {
+                            // The marker's subtle colour, with the missing rates on hover.
+                            text: NO_RATE_LABEL,
+                            mixed: true,
+                            title: rateUnavailableTitle(sectionTotal.missing),
+                        }
+                        : {
+                            text: formatCurrency(sectionTotal.amount, ledgerCurrency.code),
+                            title: `Total ${label.toLowerCase()} across all ${label.toLowerCase()} categories`,
+                        }
+                    : undefined}
+                disclosure={{
+                    expanded,
+                    onToggle: toggle,
+                    controls: bodyId,
+                    // A search opens the section on its own, so there is nothing to toggle then.
+                    disabled: searching,
+                }}
+            />
             <div id={bodyId} hidden={!expanded}>
-                {rows.length === 0 ? (
-                    <p className="px-2 py-1 text-xs text-text-subtle">
-                        No {label.toLowerCase()} categories yet.
-                    </p>
-                ) : (
-                    <ul>{rows.map(renderRow)}</ul>
-                )}
+                <Panel>
+                    <ul className="divide-y divide-border">{rows.map(renderRow)}</ul>
+                </Panel>
             </div>
         </section>
     );
@@ -465,24 +539,20 @@ function DeleteCategoryConfirm({
                             , so deleting it would orphan them. Merge it into another category to fold those in.
                         </>
                     ) : (
-                        <>This permanently deletes the category. It has no transactions or sub-categories, so nothing else is affected.</>
+                        // The server counts transactions and sub-categories before it deletes and not
+                        // budget targets, which go with the category, so the line says so.
+                        <>
+                            This permanently deletes the category. It has no transactions or
+                            sub-categories, and any budget targets set on it go with it.
+                        </>
                     )}
                     {error !== null ? (
-                        <p className="mt-2 text-state-danger">{error}</p>
+                        <p role="alert" className="mt-2 text-state-danger">{error}</p>
                     ) : null}
                 </>
             }
             onConfirm={inUse ? onMergeInstead : onConfirmDelete}
             onCancel={onCancel}
         />
-    );
-}
-
-/** Tiny inline badge for the Inactive / System row markers. */
-function Tag({ children }: { children: React.ReactNode }) {
-    return (
-        <span className="shrink-0 rounded bg-surface-muted px-1.5 py-0.5 text-[0.625rem] font-medium uppercase tracking-wide text-text-subtle">
-            {children}
-        </span>
     );
 }

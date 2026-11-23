@@ -15,11 +15,12 @@ namespace Coffer.Api.Tests.Integration.Auth;
 /// credential change ends every other session.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class SessionListTests
+public sealed class SessionListTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SessionListTests(PostgresFixture fixture) => _fixture = fixture;
+    public SessionListTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static HttpClient ClientFor(ApiFactory factory, string cookie)
     {
@@ -30,7 +31,7 @@ public sealed class SessionListTests
 
     private async Task<List<Guid>> LiveSessionIdsAsync(Guid userId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.AuthSessions.Where(s => s.UserId == userId && s.RevokedAt == null)
             .Select(s => s.Id).ToListAsync();
     }
@@ -38,15 +39,15 @@ public sealed class SessionListTests
     [Fact]
     public async Task The_list_is_the_users_live_sessions_with_this_one_marked()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var other = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var other = await SyntheticLedger.CreateAsync(Db);
         var here = await ledger.IssueSessionCookieAsync();
         await ledger.IssueSessionCookieAsync();              // elsewhere
         await ledger.IssueSessionCookieAsync();              // will sit idle past the timeout
         await other.IssueSessionCookieAsync();               // someone else's
         var ids = await LiveSessionIdsAsync(ledger.UserId);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             // Idle past the 7-day timeout: no longer signs anyone in, so not listed.
             var newest = await db.AuthSessions.Where(s => s.UserId == ledger.UserId)
@@ -55,7 +56,7 @@ public sealed class SessionListTests
                 .ExecuteUpdateAsync(s => s.SetProperty(x => x.LastSeenAt, DateTime.UtcNow.AddDays(-8)));
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = ClientFor(factory, here);
         var list = await client.GetFromJsonAsync<List<AccountEndpoints.SessionView>>("/api/auth/sessions");
 
@@ -68,15 +69,15 @@ public sealed class SessionListTests
     [Fact]
     public async Task A_user_ends_one_of_their_sessions_and_not_someone_elses()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var other = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var other = await SyntheticLedger.CreateAsync(Db);
         var here = await ledger.IssueSessionCookieAsync();
         await ledger.IssueSessionCookieAsync();
         await other.IssueSessionCookieAsync();
         var mine = (await LiveSessionIdsAsync(ledger.UserId)).ToHashSet();
         var theirs = (await LiveSessionIdsAsync(other.UserId)).Single();
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = ClientFor(factory, here);
         var current = (await client.GetFromJsonAsync<List<AccountEndpoints.SessionView>>("/api/auth/sessions"))!
             .Single(s => s.Current).Id;
@@ -94,14 +95,14 @@ public sealed class SessionListTests
     [Fact]
     public async Task Removing_a_passkey_ends_every_other_session()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var keep = await ledger.AddCredentialAsync(nickname: "keep");
         var lost = await ledger.AddCredentialAsync(nickname: "lost");
         var here = await ledger.IssueSessionCookieAsync();
         await ledger.IssueSessionCookieAsync();
         await ledger.IssueSessionCookieAsync();
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService(_ => StepUpTestHelper.AcceptingWebAuthn());
         using var client = ClientFor(factory, here);
         var resp = await StepUpTestHelper.SendWithStepUpAsync(client,
@@ -117,12 +118,12 @@ public sealed class SessionListTests
     [Fact]
     public async Task Regenerating_recovery_codes_ends_every_other_session()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var key = await ledger.AddCredentialAsync(nickname: "key");
         var here = await ledger.IssueSessionCookieAsync();
         await ledger.IssueSessionCookieAsync();
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService(_ => StepUpTestHelper.AcceptingWebAuthn());
         using var client = ClientFor(factory, here);
         var resp = await StepUpTestHelper.SendWithStepUpAsync(client,

@@ -5,7 +5,7 @@ namespace Coffer.Api.Tests.Unit.Backup;
 /// <summary>
 /// Unit tests for the pure parts of <see cref="BackupService"/>. The
 /// pg_dump/pg_restore shell-out and the database swap are exercised end-to-end
-/// by the maintainer's restore drill, against the real images; here we lock
+/// by the restore drill, against the real images; here we lock
 /// down what the tools are handed.
 /// </summary>
 public sealed class BackupServiceTests
@@ -98,8 +98,8 @@ public sealed class BackupServiceTests
     [Fact]
     public void A_table_whose_data_is_absent_from_the_archive_is_reported()
     {
-        // The failure that went unseen for two months: the archive existed, was the
-        // right size, and held a table's definition without its rows.
+        // An archive can exist, be a plausible size, and hold a table's definition
+        // without its rows. The check names every such table.
         var missing = BackupService.TablesMissingData(
             TocWithData, ["public.accounts", "public.txn_header", "public.payees"]);
 
@@ -214,9 +214,9 @@ public sealed class BackupServiceTests
         // FORCE has a non-superuser terminate every other session first, and an
         // autovacuum worker counts as a superuser's: the drop then fails with
         // "permission denied to terminate process" whenever autovacuum is in the
-        // database — which a freshly loaded one draws within a minute. That race
-        // left abandoned restore databases behind. A plain DROP has Postgres cancel
-        // the worker itself.
+        // database — which a freshly loaded one draws within a minute — and the
+        // race leaves an abandoned restore database behind. A plain DROP has
+        // Postgres cancel the worker itself.
         var sql = BackupService.DropDatabaseSql("coffer_restore_20261010T154154");
         Assert.Equal("DROP DATABASE IF EXISTS \"coffer_restore_20261010T154154\";", sql);
         Assert.DoesNotContain("FORCE", sql, StringComparison.OrdinalIgnoreCase);
@@ -252,7 +252,7 @@ public sealed class BackupServiceTests
         Assert.Contains("ALTER DATABASE \"coffer\" OWNER TO coffer_service", unprovisioned.Explain());
         Assert.Contains("Nothing was changed", unprovisioned.Explain());
 
-        // Each of these used to fail only after the restart.
+        // Each of these would otherwise fail only after the restart.
         Assert.False(Ready(db: new string('d', BackupService.RestoreReadiness.MaxDatabaseNameLength + 1)).IsReady);
         Assert.True(Ready(db: new string('d', BackupService.RestoreReadiness.MaxDatabaseNameLength)).IsReady);
         Assert.False(Ready(db: "postgres").IsReady);

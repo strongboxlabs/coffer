@@ -2,29 +2,28 @@
  * The splits region of the bank editor: every leg of a multi-posting
  * transaction, plus the affordances for adding, reordering and fixing them.
  *
- * WHAT THIS REPLACED, AND WHY. Leg rows used to be appended to the editor on
- * the register's own eight-column template. That had three consequences which
- * only show up past about six splits, and the editor's real ceiling is
- * twenty-five:
+ * WHY ITS OWN GRID. Leg rows appended to the editor on the register's own
+ * eight-column template have three problems which only show up past about six
+ * splits, and the editor's real ceiling is twenty-five:
  *
- *   * THE EDITOR GREW WITHOUT BOUND. Twenty-five ~62px leg rows is ~1550px of
- *     form. The Save button sat below all of it, so the further down the split
- *     you worked the further away the way out became, and on a laptop the
- *     running total scrolled off the top of the screen — the one number you
+ *   * THE EDITOR GROWS WITHOUT BOUND. Twenty-five ~62px leg rows is ~1550px of
+ *     form. The Save button sits below all of it, so the further down the split
+ *     you work the further away the way out becomes, and on a laptop the
+ *     running total scrolls off the top of the screen — the one number you
  *     are watching while you type amounts.
  *
- *   * NOTHING NAMED A ROW. Validation was one wrapping sentence with up to
+ *   * NOTHING NAMES A ROW. Validation as one wrapping sentence with up to
  *     forty clauses ("Posting 4: amount is required. · Posting 11: pick a
- *     counterparty. · …") over rows that carried no visible number, so
- *     matching a clause to a row meant counting from the top.
+ *     counterparty. · …") over rows that carry no visible number means
+ *     matching a clause to a row by counting from the top.
  *
- *   * REORDER WAS DRAG-ONLY, and a drag highlighted the target ROW, which
- *     cannot express "between 2 and 3". Where the row landed depended on which
- *     direction you had dragged from — true, defensible, and impossible to
- *     predict from the highlight.
+ *   * DRAG-ONLY REORDER that highlights the target ROW cannot express
+ *     "between 2 and 3". Where the row lands depends on which direction you
+ *     dragged from — true, defensible, and impossible to predict from the
+ *     highlight.
  *
  * The fix is one move: give the legs their OWN grid. They have no register
- * counterpart to align with — columns 1-3 were empty on every leg row — so
+ * counterpart to align with — columns 1-3 are empty on every leg row — so
  * stepping out of the register template buys back three tracks of width, which
  * is enough to put category, memo and amount side by side instead of stacked.
  * A leg row is then 30px instead of ~62px, which makes a fixed-height scroll
@@ -50,26 +49,38 @@ import { formatCurrency } from '@/lib/money';
 import { cn } from '@/lib/cn';
 import { counterpartyWords, type CounterpartyKind, type CounterpartyWords } from '@/lib/counterparty';
 import type { AccountSummary, FrequentCounterpartiesResponse } from '@/lib/types';
+import { secondAmountCaption, type SecondAmountSide } from '@/lib/secondAmount';
 
 import type { PostingDraft } from '../postingDraft';
 import type { PostingIssue, PostingIssueKind } from '../validation';
 import type { TagDto } from '@/lib/types';
+import { Mixed } from '../../home/Money';
 import { PostingRowEditor } from './PostingRowEditor';
+import { InsertionLine } from '@/components/ui/InsertionLine';
+import { usePendingButtonProps } from '@/components/ui/pending';
+import { useRowRemovalFocus } from '@/components/ui/rowRemovalFocus';
 
 /**
  * The splits grid's own columns: `# · Category+Tags · Memo · Amount · actions`.
  *
- * BOTH middle tracks flex, 2:1 in the category's favour. The first cut gave
- * category a fixed 17rem and made memo the only flexible track, which on a wide
- * monitor meant a 272px category against a 1230px memo — a five-to-one split in
- * favour of the field that matters less. The category carries the account path
- * (parent and child, two names joined by a separator) and is what a reader
- * scans down the list; it is also where per-leg tag chips will
- * land when ADR-0009's header-level restriction is lifted, so it is the track
- * that needs room to grow. The memo keeps a 12rem floor because a typical
+ * BOTH middle tracks flex, 2:1 in the category's favour. A fixed 17rem
+ * category with memo as the only flexible track would, on a wide monitor, give a
+ * 272px category against a 1230px memo — a five-to-one split in favour of the
+ * field that matters less. The category carries the account path (parent and
+ * child, two names joined by a separator) and is what a reader scans down the
+ * list; it also holds the posting's own tag chips (ADR-0103), so it is the
+ * track that needs room to grow. The memo keeps a 12rem floor because a typical
  * payroll-tax line memo has to fit without scrolling inside its own box.
  */
 const LEG_COLS = '2rem minmax(16rem, 2fr) minmax(12rem, 1fr) 6.5rem 3.5rem';
+
+/**
+ * The columns while any line goes to a real account in another currency (ADR-0114 D14,
+ * the ADR-0025 2026-11-14 amendment): one 6.5rem track right of Amount for the second
+ * amount, captioned in the header the way Amount is. Memo gives up the width. Lines with
+ * no second amount leave the track empty.
+ */
+const LEG_COLS_SECOND = '2rem minmax(16rem, 2fr) minmax(12rem, 1fr) 6.5rem 6.5rem 3.5rem';
 
 /**
  * The whole region: sticky header, ~8.8 leg rows, sticky footer.
@@ -107,7 +118,7 @@ const VIEWPORT = 'max-h-fixed-344px';
  * alike, so the density axis moves both or neither. A right padding written as
  * a literal pixel count would be correct at 1x and wrong at the other two
  * settings — and spacingScale.test.ts bans that spelling outright, comments
- * included, which is how this very note first failed the suite.
+ * included.
  */
 const LABEL_INSET = 'border border-transparent px-2';
 
@@ -124,10 +135,26 @@ interface SplitsGridProps {
     frequent: FrequentCounterpartiesResponse | null;
     /** The ledger's tag dictionary, handed to each posting's tag field. */
     allTags: readonly TagDto[];
+    /** The total's currency: the one every line's Amount is in. */
     currency: string;
-    /** Sum of the posting amounts — informational (see the header note). */
-    total: number;
-    disabled: boolean;
+    /** The currency each line's Amount is typed and rounded in (ADR-0114 D14, D15). */
+    currencyOf: (posting: PostingDraft) => string;
+    /** Each line's second amount, from the shell's one predicate: null for a line
+     *  that has none (ADR-0114 D13, D14). */
+    sideOf: (posting: PostingDraft) => SecondAmountSide | null;
+    /** For a line's derived-rate prefill. */
+    ledgerId: string;
+    /** The entry's date, `yyyy-MM-dd`: the day a prefill's rate is for. */
+    date: string;
+    /** Sum of the posting amounts — informational (see the header note). The Amount
+     *  column only, in `currency`, never a second amount. Null when the lines are in
+     *  more than one currency, a category's split paid from accounts in different
+     *  ones: no figure adds currencies, and the footer shows the mixed marker
+     *  (ADR-0114 D7). */
+    total: number | null;
+    /** The editor's save is in flight: the legs' fields are disabled, and the
+     *  grid's buttons keep focus and refuse to act (pending.ts). */
+    pending: boolean;
     focusKey: string | null;
     onAutoFocused: () => void;
     onPatch: (key: string, fields: Partial<PostingDraft>) => void;
@@ -146,8 +173,12 @@ export function SplitsGrid({
     frequent,
     allTags,
     currency,
+    currencyOf,
+    sideOf,
+    ledgerId,
+    date,
     total,
-    disabled,
+    pending,
     focusKey,
     onAutoFocused,
     onPatch,
@@ -156,6 +187,7 @@ export function SplitsGrid({
     onReorder,
     onMove,
 }: SplitsGridProps) {
+    const pendingProps = usePendingButtonProps();
     const counterparty = counterpartyWords(counterpartyKind);
     const uid = useId();
     const viewportRef = useRef<HTMLDivElement | null>(null);
@@ -179,8 +211,7 @@ export function SplitsGrid({
      * `reorderPostings` splices the row out and re-inserts it at the target's
      * index, so a drop expresses "after you" when dragging down and "before
      * you" when dragging up. The insertion line has to say the same thing or
-     * it is lying about where the row will land — which is the whole defect it
-     * was added to fix.
+     * it is lying about where the row will land.
      */
     const dropsAfter = fromIdx >= 0 && overIdx > fromIdx;
     const showLineBefore = (i: number) => overIdx === i && !dropsAfter && fromIdx !== overIdx;
@@ -188,7 +219,26 @@ export function SplitsGrid({
 
     const endDrag = useCallback(() => setDrag(null), []);
 
+    // Remove split, chosen from a leg's own menu, takes the leg and its kebab
+    // away: focus goes to the next leg's kebab, the previous leg's, or Add
+    // split, never to the page, where the next Escape would no longer reach
+    // the editor (ADR-0023 §L).
+    const addRef = useRef<HTMLButtonElement | null>(null);
+    const actionsControl = useRowRemovalFocus(postings.map((p) => p.key), addRef);
 
+    // The second amount's column, while any line has one (ADR-0114 D14). Its header
+    // caption names a direction, Received or Sent, only when every such line shares it.
+    // Each line's direction follows its own Amount's sign, so two lines can go opposite
+    // ways, and either word would then be false for one of them: the caption then reads
+    // Other amount, which names no direction. Each field's accessible name and title
+    // still name its own direction.
+    const sides = postings.map((p) => sideOf(p));
+    const shown = sides.filter((side): side is SecondAmountSide => side !== null);
+    const hasSecond = shown.length > 0;
+    const sharedDirection = hasSecond && shown.every((s) => s.direction === shown[0]!.direction)
+        ? shown[0]!.direction
+        : null;
+    const cols = hasSecond ? LEG_COLS_SECOND : LEG_COLS;
 
     return (
         <>
@@ -210,8 +260,7 @@ export function SplitsGrid({
                     // be: ContextMenu closes itself on any capture-phase
                     // scroll, which is where that belongs, since every fixed
                     // menu in the app is stranded by a scroll, not just this
-                    // one. An earlier version of this comment claimed the
-                    // handler covered the menu. It never did.
+                    // one. This handler does not cover the menu.
                     onScroll={endDrag}
                     onDragLeave={(e) => {
                         // Only when the pointer leaves the viewport itself
@@ -232,7 +281,7 @@ export function SplitsGrid({
                         ref={headerRef}
                         aria-hidden
                         className="sticky top-0 z-20 grid items-center gap-2 bg-surface-header px-3 py-1 text-[0.625rem] uppercase tracking-wider text-text-muted shadow-[inset_0_-1px_0_var(--color-border)]"
-                        style={{ gridTemplateColumns: LEG_COLS }}
+                        style={{ gridTemplateColumns: cols }}
                     >
                         {/* Each label carries the same box model as the
                             control below it — see LABEL_INSET. The row number
@@ -242,6 +291,11 @@ export function SplitsGrid({
                         <span className={LABEL_INSET}>{counterparty.noun} · Tags</span>
                         <span className={LABEL_INSET}>Memo</span>
                         <span className={cn(LABEL_INSET, 'text-right')}>Amount</span>
+                        {hasSecond ? (
+                            <span className={cn(LABEL_INSET, 'text-right')}>
+                                {sharedDirection !== null ? secondAmountCaption(sharedDirection) : 'Other amount'}
+                            </span>
+                        ) : null}
                         <span />
                     </div>
 
@@ -265,14 +319,20 @@ export function SplitsGrid({
                                     counterpartyKind={counterpartyKind}
                                     frequent={frequent}
                                     allTags={allTags}
-                                    cols={LEG_COLS}
-                                    disabled={disabled}
+                                    currency={currencyOf(p)}
+                                    side={sides[idx] ?? null}
+                                    secondColumn={hasSecond}
+                                    ledgerId={ledgerId}
+                                    date={date}
+                                    cols={cols}
+                                    pending={pending}
                                     autoFocusAmount={p.key === focusKey}
                                     onAutoFocused={onAutoFocused}
                                     fieldId={(kind) => fieldId(p.key, kind)}
                                     dragging={drag?.from === p.key}
                                     onChange={(fields) => onPatch(p.key, fields)}
                                     onRemove={() => onRemove(p.key)}
+                                    actionsRef={actionsControl(p.key)}
                                     onMove={(delta) => onMove(p.key, delta)}
                                     onDragStart={() => setDrag({ from: p.key, over: null })}
                                     onDragEnd={endDrag}
@@ -301,16 +361,16 @@ export function SplitsGrid({
                         rows scroll UNDER it. */}
                     <div
                         className="sticky bottom-0 z-20 grid items-center gap-2 bg-surface-muted px-3 py-1 shadow-[inset_0_1px_0_var(--color-border)]"
-                        style={{ gridTemplateColumns: LEG_COLS }}
+                        style={{ gridTemplateColumns: cols }}
                     >
                         <span />
                         <button
+                            ref={addRef}
                             type="button"
-                            disabled={disabled}
-                            onClick={onAdd}
+                            {...pendingProps(pending, onAdd)}
                             aria-label="Add another posting"
                             title="Add another posting to this split"
-                            className="flex h-control-24px items-center justify-center gap-1 justify-self-start rounded border border-dashed border-border px-2 text-[0.6875rem] font-medium text-accent hover:border-accent hover:bg-accent-soft/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
+                            className="flex h-control-24px items-center justify-center gap-1 justify-self-start rounded border border-dashed border-border px-2 text-[0.6875rem] font-medium text-accent hover:border-accent hover:bg-accent-soft/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
                         >
                             <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
                                 <path d="M8 3.5v9M3.5 8h9" />
@@ -320,15 +380,17 @@ export function SplitsGrid({
                         <span className={cn(LABEL_INSET, 'text-[0.6875rem] text-text-subtle')}>
                             {postings.length} splits
                         </span>
+                        {/* The sum's hover only over a sum: "mixed" says its own. */}
                         <span
-                            title="Sum of postings (saved as the transaction total)"
+                            title={total === null ? undefined : 'Sum of postings (saved as the transaction total)'}
                             className={cn(
                                 LABEL_INSET,
                                 'text-right font-mono text-xs font-semibold tabular-nums text-text',
                             )}
                         >
-                            {formatCurrency(total, currency)}
+                            {total === null ? <Mixed /> : formatCurrency(total, currency)}
                         </span>
+                        {hasSecond ? <span /> : null}
                         <span />
                     </div>
                 </div>
@@ -339,22 +401,13 @@ export function SplitsGrid({
     );
 }
 
-/** Where the dragged row will land. */
-function InsertionLine() {
-    return (
-        <div aria-hidden className="relative h-fixed-2px bg-accent">
-            <span className="absolute -left-0.5 -top-0.5 size-fixed-8px rounded-full bg-accent" />
-        </div>
-    );
-}
-
 /**
  * The defects, grouped by what is wrong rather than listed per posting, with
  * each row number a link that focuses the field.
  *
  * Grouping is the difference between a sentence a reader can act on and one
- * they have to parse: eight blank amounts used to render as eight clauses
- * naming eight postings, which is the same information spread over a paragraph
+ * they have to parse: eight blank amounts listed per posting render as eight
+ * clauses naming eight postings, which is the same information spread over a paragraph
  * that wraps to three lines. "Enter an amount: 4, 7, 11" is one clause and the
  * numbers are the work queue.
  */
@@ -367,15 +420,30 @@ function SplitsIssueSummary({
     fieldId: (key: string, kind: PostingIssueKind) => string;
     counterparty: CounterpartyWords;
 }) {
-    if (issues.length === 0) return null;
-
-    // Rule order, not encounter order: the two groups keep the same left-to-
-    // right position whichever defect happens to appear first, so the strip
+    // Rule order, not encounter order: the two fixed groups keep the same left-
+    // to-right position whichever defect happens to appear first, so the strip
     // does not reshuffle itself while the user fixes rows.
-    const groups: readonly { kind: PostingIssueKind; label: string }[] = [
+    //
+    // A missing second amount follows them, one group per sentence, headed by the
+    // field's own sentence (its hint): the sentence names the currency, the account
+    // and which way the money went, so lines share a group only when all three agree
+    // (ADR-0114 D14). Those groups follow the current first line of each, the order
+    // the issues arrive in, so two of them can swap places when one group's first
+    // line is fixed and its later lines are not; the two fixed groups never move.
+    const fixed: readonly { kind: PostingIssueKind; label: string }[] = [
         { kind: 'amount', label: 'Enter an amount' },
         { kind: 'counterparty', label: `Pick ${counterparty.withArticle}` },
     ];
+    const secondLabels = [...new Set(issues.filter((i) => i.kind === 'second').map((i) => i.hint))];
+    const groups = [
+        ...fixed.map(({ kind, label }) => ({ kind, label, hits: issues.filter((i) => i.kind === kind) })),
+        ...secondLabels.map((label) => ({
+            kind: 'second' as const,
+            label,
+            hits: issues.filter((i) => i.kind === 'second' && i.hint === label),
+        })),
+    ].filter((g) => g.hits.length > 0);
+    if (groups.length === 0) return null;
 
     return (
         <div
@@ -386,11 +454,9 @@ function SplitsIssueSummary({
                 <path d="M8 4v5" />
                 <circle cx="8" cy="12" r="0.6" fill="currentColor" />
             </svg>
-            {groups.map(({ kind, label }) => {
-                const hits = issues.filter((i) => i.kind === kind);
-                if (hits.length === 0) return null;
+            {groups.map(({ kind, label, hits }) => {
                 return (
-                    <span key={kind} className="flex items-center gap-1">
+                    <span key={`${kind}:${label}`} className="flex items-center gap-1">
                         <strong className="font-semibold">{label}:</strong>
                         {hits.map((issue) => (
                             <button

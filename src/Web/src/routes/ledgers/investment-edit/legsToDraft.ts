@@ -1,4 +1,5 @@
 import type { LedgerInvestmentAction } from '@/lib/types';
+import { TRANSFER_AMOUNT_ACTIONS } from '@/lib/types/investment';
 import { toDateInputValue } from '@/lib/dates';
 import { seedTransactedAt, type InvestmentTxnDraft } from './validation';
 
@@ -34,7 +35,7 @@ export interface InvestmentLegView {
  * holdings-side leg (the one with `quantity != null`).
  *
  * For actions where the user-facing Amount field is computed
- * (Buy / Sell / BuyXfr / SellXfr / DivReinvest / DivXfr), the
+ * (Buy / Sell / BuyXfr / SellXfr / Reinvest / DividendXfr), the
  * inverter still sets `amount` from the absolute value of the cash
  * leg — keeps the displayed value consistent on initial render; the
  * orchestrator's per-field components recompute as the user edits.
@@ -53,10 +54,11 @@ export function legsToDraft(
         payee: string | null;
         memo: string | null;
         checkNumber: string | null;
-        /** Header-level tags (ADR-0009) as the register row carries them.
-         *  Optional so callers that only have the header's text fields still
-         *  typecheck; absent seeds an empty set, which on save would CLEAR the
-         *  header's tags — every live caller passes the row's `tags`. */
+        /** The event's tags as the register row carries them (on the
+         *  brokerage leg of a one-posting event, on the header of a
+         *  multi-posting one). Optional so callers that only have the
+         *  header's text fields still typecheck; absent seeds an empty set.
+         *  An edit sends tags only when they differ from what it opened with. */
         tags?: readonly string[];
     },
     legs: readonly InvestmentLegView[],
@@ -124,6 +126,13 @@ export function legsToDraft(
         }),
         categoryAccountId: incomeCategoryLeg?.accountId ?? null,
         transferAccountId: transferDestLeg?.accountId ?? null,
+        // The transfer account's own figure, as stored: on a transfer between
+        // currencies it is the second amount, and a saved transaction is never refilled
+        // (ADR-0114 D14). Seeded for a mirrored transfer too, where the editor neither
+        // shows nor sends it.
+        ...(transferDestLeg !== null && TRANSFER_AMOUNT_ACTIONS.includes(action)
+            ? { transferAmount: Math.abs(transferDestLeg.amount), transferAmountFixed: true }
+            : {}),
         feeAccountId: feeCategoryLeg?.accountId ?? null,
         feeAmount: feeCategoryLeg !== null
             ? Math.abs(feeCategoryLeg.amount)
@@ -150,10 +159,11 @@ function transferSharesToDraft(
         payee: string | null;
         memo: string | null;
         checkNumber: string | null;
-        /** Header-level tags (ADR-0009) as the register row carries them.
-         *  Optional so callers that only have the header's text fields still
-         *  typecheck; absent seeds an empty set, which on save would CLEAR the
-         *  header's tags — every live caller passes the row's `tags`. */
+        /** The event's tags as the register row carries them (on the
+         *  brokerage leg of a one-posting event, on the header of a
+         *  multi-posting one). Optional so callers that only have the
+         *  header's text fields still typecheck; absent seeds an empty set.
+         *  An edit sends tags only when they differ from what it opened with. */
         tags?: readonly string[];
     },
     legs: readonly InvestmentLegView[],

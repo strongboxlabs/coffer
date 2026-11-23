@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Reflection;
 using System.Text.RegularExpressions;
 
 using Coffer.Api.Ingest.Csv;
@@ -43,6 +45,58 @@ public sealed class CsvVocabularyParityTests
         Assert.Equal(4, mapping.MemoColumn);
         Assert.Equal(2, mapping.AmountColumn);
         Assert.True(mapping.AmountInvert);
+        // The example teaches the version to write. A version-1 example still validates,
+        // so only this catches one left behind, and it would teach a document with no
+        // decimal separator (ADR-0114 D15).
+        Assert.Equal(CsvMappingValidator.CurrentVersion, mapping.Version);
+        Assert.Contains("decimal_separator: point", document, StringComparison.Ordinal);
+        Assert.Equal(CsvDecimalSeparator.Point, mapping.DecimalSeparator);
+    }
+
+    [Fact]
+    public void The_decimal_separators_the_MCP_tool_lists_are_exactly_the_ones_accepted()
+    {
+        AssertSameVocabulary(
+            "the MCP tool description",
+            CsvMappingValidator.AcceptedDecimalSeparators,
+            Split(CsvMappingTools.DecimalSeparatorList));
+    }
+
+    [Fact]
+    public void Both_MCP_tools_that_take_a_document_teach_the_decimal_separator()
+    {
+        // validate_csv_mapping and save_csv_mapping both receive documents an agent
+        // composed, often without a sample, so both must say that version 2 requires
+        // the key, that a version-1 document reads with a point, and that an
+        // unreadable cell is reported per row (ADR-0114 D15).
+        foreach (var method in new[]
+                 {
+                     typeof(CsvMappingTools).GetMethod(nameof(CsvMappingTools.ValidateCsvMapping))!,
+                     typeof(McpWriteTools).GetMethod(nameof(McpWriteTools.SaveCsvMapping))!,
+                 })
+        {
+            var description = method.GetCustomAttribute<DescriptionAttribute>()!.Description;
+
+            Assert.Contains(CsvMappingTools.DecimalSeparatorList, description, StringComparison.Ordinal);
+            Assert.Contains("REQUIRED in version 2", description, StringComparison.Ordinal);
+            Assert.Contains("A version-1 document has no such key", description, StringComparison.Ordinal);
+            Assert.Contains("still reads every amount with a point", description, StringComparison.Ordinal);
+            Assert.Contains("per row as csv_row_unreadable", description, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void Every_decimal_separator_survives_the_round_trip_back_out()
+    {
+        // The form loads a saved layout by asking the server what it says, so a layout
+        // saved with a comma must reopen with a comma and never be guessed again.
+        foreach (var name in CsvMappingValidator.AcceptedDecimalSeparators)
+        {
+            var mapping = CsvMappingValidator.Validate(DocumentWith(separator: name), out var errors);
+
+            Assert.Empty(errors);
+            Assert.Equal(name, CsvMappingValidator.NameOf(mapping!.DecimalSeparator));
+        }
     }
 
     [Fact]
@@ -137,13 +191,15 @@ public sealed class CsvVocabularyParityTests
     }
 
     /// <summary>A valid document, varying only the part under test.</summary>
-    private static string DocumentWith(string delimiter = "tab", string? amount = null) =>
-        "version: 1\n"
+    private static string DocumentWith(
+        string delimiter = "tab", string? amount = null, string separator = "point") =>
+        $"version: {CsvMappingValidator.CurrentVersion}\n"
         + $"delimiter: {delimiter}\n"
         + "header_rows: 0\n"
         + "date:\n  column: 1\n  format: MM/dd/yyyy\n"
         + "payee:\n  column: 3\n"
-        + "amount:\n" + (amount ?? "  shape: signed\n  column: 2\n  invert: true") + "\n";
+        + "amount:\n" + (amount ?? "  shape: signed\n  column: 2\n  invert: true") + "\n"
+        + $"  decimal_separator: {separator}\n";
 
     /// <summary>
     /// Compare as sets, and say which way it drifted — "they differ" sends the reader

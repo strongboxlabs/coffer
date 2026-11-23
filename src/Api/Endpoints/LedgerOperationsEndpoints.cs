@@ -12,7 +12,8 @@ namespace Coffer.Api.Endpoints;
 /// <summary>
 /// Ledger-wide provider-activity timeline (ADR-0055 slice C). Reads every
 /// <c>ledger_operations</c> row across families (ingest + quote), filterable by
-/// provider + recency. The per-connection ingest log stays at <c>/sync-runs</c>.
+/// provider + recency. One run's errors and promotions are read at
+/// <c>/sync-runs/{runId}</c>, which serves a run of any family.
 /// </summary>
 public static class LedgerOperationsEndpoints
 {
@@ -74,14 +75,21 @@ public static class LedgerOperationsEndpoints
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
 
-        var family = await runs.FamilyForAsync(ledgerId, operationId, cancellationToken)
+        var kind = await runs.KindForAsync(ledgerId, operationId, cancellationToken)
             .ConfigureAwait(false);
-        if (family is null)
+        if (kind is null)
             return BusinessError.Problem("operation-not-found",
                 "No such operation on this ledger.");
-        if (!string.Equals(family, "ingest", StringComparison.Ordinal))
+        if (!string.Equals(kind.Family, "ingest", StringComparison.Ordinal))
             return BusinessError.Problem("operation-not-an-import",
-                "Only an import can be undone; this operation is '" + family + "'.");
+                "Only an import can be undone; this operation is '" + kind.Family + "'.");
+        // A Demo's marker shares the import family, but it records which examples were
+        // added; it created no transaction of its own. The examples' own import (the card
+        // statement) has its own row, which this endpoint accepts as it accepts any file
+        // import's.
+        if (string.Equals(kind.ProviderKey, LedgerOperationsRepository.DemoMarkerProviderKey, StringComparison.Ordinal))
+            return BusinessError.Problem("operation-not-an-import",
+                "Only an import can be undone; this operation records a Demo's examples.");
 
         var result = await bulk.UndoImportAsync(
             ledgerId, operationId, dryRun ?? false, cancellationToken).ConfigureAwait(false);

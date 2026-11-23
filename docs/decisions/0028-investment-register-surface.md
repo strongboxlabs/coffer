@@ -1,7 +1,10 @@
 # 0028 — Investment register surface
 
-* Status: Accepted
-* Date: 2026-05-20
+* Status: Accepted; Slot 6 amended 2026-11-14 and slots 7 and 8 2026-11-16 by [ADR-0114](0114-benchmarks-and-currency-conversion.md)
+  (on a transfer between currencies the transfer chip is followed by the other leg's
+  amount, muted; an amount and a fee follow the brokerage's currency's places,
+  not two, and a price shows at least those places and at most max(6, places))
+* Date: 2026-05-20 (amended 2026-10-21: check number under the Action chip; amended 2026-10-27 by [ADR-0108](0108-memo-and-tags-per-side.md): memo and tags per side, target splits no longer cluster; amended 2026-11-04: the Action chip shows ADR-0027's display words, and the Action sort orders by them)
 * Refines: ADR-0021 (Rule 6: bank register columns), ADR-0027 (action catalog)
 * Related: ADR-0019, ADR-0022, ADR-0025 (data shape this UI renders)
 
@@ -13,23 +16,22 @@ amount · balance). Investment accounts share the same scaffold but
 need a different surface because:
 
   - A single user-visible "event" maps to N postings (Buy+Fee
-    is 2 postings, DivXfr+Fee is 3). The bank's split-parent
+    is 2 postings, DividendXfr+Fee is 3). The bank's split-parent
     split-parent affordance is wrong here: the user thinks of a
     Buy as one row, not "buy plus fee, expand to see".
   - The Holdings sibling sub-account (ADR-0019) is structural
     noise on the brokerage register — the user bought a fund,
     not "transferred to the Holdings sub-account".
   - Investment-specific facts that bank rows don't carry need
-    real estate: action chip (Buy / Sell / Div / …), security ·
+    real estate: action chip (Buy / Sell / Dividend / …), security ·
     ticker · qty @ price, fee subtitle on amount, MD-meaningful
     check_number values (Auto / EXfr / Xfr / numeric).
   - Per ADR-0027, one transaction can carry **three** semantic
-    counterparties at once (DivXfr+Fee: income category +
+    counterparties at once (DividendXfr+Fee: income category +
     transfer destination + fee category). The bank's single
     "category chip" slot cannot represent this.
 
-Per memory `feedback_md_parity_not_visual`: parity with MD means
-the same *concepts*, designed within Ledger's system — not a
+Parity with MD means the same *concepts*, designed within Ledger's system — not a
 literal MD-register clone.
 
 ## Decision
@@ -47,6 +49,9 @@ literal MD-register clone.
 | 7 | security · qty @ price        | `minmax(5rem, 1fr)`  |
 | 8 | amount + fee subtitle         | 7rem                 |
 | 9 | cash balance                  | 6.5rem               |
+
+> **Amended 2026-10-21 (see the end of this ADR):** slot 4 is 7rem and carries the
+> check number on line 2; its header reads `Action · Check #`.
 
 Slot 6 gets the widest content allocation because it carries up
 to three chips. Description and Security flex with smaller
@@ -97,11 +102,10 @@ Renderer:
   - **Empty cell** when none of the five are set (e.g., an untagged
     solo Buy where the Holdings sibling is stripped).
 
-**No positional placeholders.** Earlier iterations used em-dashes
-on empty halves of line 1 and a "|" separator between category and
-transfer; both were dropped. Chip variant (color by account type)
-+ the Action column already carry the semantic distinction.
-Position is no longer a load-bearing cue inside slot 6.
+**No positional placeholders.** No em-dash on an empty half of line 1
+and no "|" separator between category and transfer. Chip variant (color
+by account type) + the Action column already carry the semantic
+distinction, so position is not a load-bearing cue inside slot 6.
 
 The column header reads `"Category | Transfer · Fee"` — the "|" in
 the header label is fine because it announces the three sub-slots;
@@ -132,8 +136,17 @@ fee leg — bank-style transfers don't carry brokerage fees.
 
 ### Date cell: check# under date on investment, tax-date on bank
 
+> **Amended 2026-10-21 (see the end of this ADR):** the check number now sits
+> under the Action chip, and the investment date cell shows the tax date like the
+> bank register's. The header reads `Date`, not `"Date · Check #"`.
+
 Investment rows are always two-line cells (security carries
-`qty @ price` on line 2; amount carries `fee $X.XX` on line 2).
+`qty @ price` on line 2; amount carries `fee` and the fee's amount on line 2).
+*(Amended 2026-11-16, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D15: these figures follow the brokerage's
+currency, not two places. The price is formatted by `formatPrice`, with at least the
+currency's places and at most max(6, places) (settled by Claude, 2026-11-16); the
+amount and the fee are money, formatted by `formatCurrency` at the currency's minor
+units.)*
 Using the date cell's line 2 for `check_number` keeps the row's
 vertical rhythm uniform AND surfaces MD's investment-specific
 marker values (Auto / EXfr / Xfr / numeric) that would otherwise
@@ -188,9 +201,9 @@ in the register has a single, documented source.
 | (status badge, slot 2) | `header.status` ↦ `cleared` / `reconciling` / `uncleared` |
 | **Date** (line 1 of slot 3) | `header.postedAt` |
 | **Check #** (line 2 of slot 3) | `header.checkNumber` — shown when non-null |
-| **Action** (slot 4) | `header.action` ↦ `ACTION_LABEL[]` |
+| **Action** (slot 4) | `header.action` ↦ `ACTION_LABEL[]`, ADR-0027's display word (Buy, Dividend, Reinvest, DividendXfr, …), the one table the editor's picker also reads *(2026-11-04)*. The column's sort orders by that word, alphabetically, not by the stored value: the server sorts, since the register loads in pages, and reads the same table (`investmentActionWords.json`, which the SPA imports and the API embeds); a derived `Xfr` is its own word, and a row with no action sorts as empty. The keyset is the word, then the header's `seq` and the entry key, as for every column *(2026-11-04)* |
 | **Payee** (line 1 of slot 5) | `header.payee` |
-| **Memo** (line 2 of slot 5) | `header.memo` — shown when non-null |
+| **Memo** (line 2 of slot 5) | `header.memo` — shown when non-null. *(2026-10-27, ADR-0108 D1, D5: the stored `notes_memo` of the row's leg: the event's one memo, which sits on the brokerage leg of a one-posting event and on the header of a multi-posting one.)* |
 | **Amount** (line 1 of slot 8) | `SUM(leg.amount)` across this account's legs of the header — order-independent. This is the NET cash the event moved through the sleeve, **not** the trade value; see "Two numbers are both called Amount" below |
 | **Settled** (line 2 of slot 8, conditional) | `\|SUM(security-role legs)\|`, else `\|SUM(transfer-role legs)\|`, else null — ADR-0073 D1's authoritative money. Rendered only when **Amount is exactly 0** and the value does not merely restate the fee |
 | **Balance** (slot 9) | brokerage cash balance **after the whole transaction** completes. Impl: `txn_header_account_balances.balance_after` keyed by `(header_id, brokerage_account_id)`, surfaced through `resolved_transactions.balance_after`. Per ADR-0034 there is one value per `(header, account)`, no posting-leg picker. |
@@ -198,37 +211,37 @@ in the register has a single, documented source.
 #### Two numbers are both called Amount
 
 This ADR and [ADR-0073](0073-investment-amount-authoritative.md) each define
-"Amount", and they define it as different numbers. Both were right in their own
-scope and nobody reconciled them, so the register shipped a column that
-contradicted the editor behind it.
+"Amount", and they define it as different numbers. Each is right in its own
+scope; unreconciled, the register's column contradicts the editor behind it.
 
 * **ADR-0073 D1 (write path)** — for `buy` / `sell` / `buyx` / `sellx` /
   `dividend_reinvest`, the request's `Amount` **is the money**: the settled
-  cash, 2dp, stored directly on the cash + holdings legs.
+  cash, at the brokerage's currency's places, stored directly on the cash + holdings
+  legs. *(Amended 2026-11-16: it was 2dp for every currency; ADR-0073 D1 now follows
+  [ADR-0114](0114-benchmarks-and-currency-conversion.md) D15.)*
 * **ADR-0028 (this ADR, read path)** — the register's Amount is the SUM of this
   account's legs: the net the event moved through the brokerage sleeve.
 
 They agree on a plain Buy, where one leg carries the money. They disagree
 whenever an event is **cash-neutral** — income +X against security −X on one
-sleeve — and that is not an edge case: on a real ledger, a large share of the
-brokerage entries net to zero. Every one rendered a zero amount while the
-editor, reading the same header, showed the trade value.
+sleeve — and that is not an edge case: it is a whole class of brokerage
+entry. Every one renders a zero net amount while the
+editor, reading the same header, shows the trade value.
 
 The resolution is that BOTH numbers are real and neither replaces the other.
 The register keeps its net as Amount — it is the figure the Balance column
 accumulates, and breaking that correspondence would be worse than the problem —
 and the settled value appears beneath it, but only when the net is zero and
 therefore says nothing. The projected field is called `SettledAmount` because
-ADR-0073 already calls it settled; inventing a third word for one number is how
-this drift started.
+ADR-0073 already calls it settled; a third word for one number would reopen
+this drift.
 
 One trap worth stating, because it is invisible until it renders: on a sale
 whose proceeds a fee exactly consumes, the settled amount EQUALS the fee, and
-both want the same subtitle line. A real ledger has many entries of that
-shape, across `sell`, `sellx` **and** `buy`. The fee wins the line, and the
+both want the same subtitle line. The shape is not confined to one action:
+`sell`, `sellx` **and** `buy` can all carry it. The fee wins the line, and the
 suppression is keyed on the values being equal rather than on the action — an
-action list would have covered the sells somebody noticed and silently missed
-the rest.
+action list covers only the actions it names and silently misses the rest.
 
 `divx` has no security-role leg at all (the security is pinned to the income
 leg), which is why the derivation falls through to the transfer role rather
@@ -284,9 +297,15 @@ Legend:
 
 ### Refinement (2026-06): bank-shape target-splits use the split-parent UI
 
+> *Superseded 2026-10-27 (ADR-0108 D14).* The opposite side of a split no longer
+> groups: each line of a split that originates elsewhere is its own read-only row
+> in this register, as on the bank register, and the client-side re-grouping pass
+> (`regroupTargetSplits`) is deleted. Only the account a split belongs to shows it
+> as a split parent. The section below records the earlier treatment.
+
 The original decision said the investment register "can never reach
 the split-parent code path" — true for **investment events** (Buy+Fee,
-DivReinvest, …), which still collapse to ONE flat row. But ADR-0036's
+Reinvest, …), which still collapse to ONE flat row. But ADR-0036's
 target-split clusters proved an exception:
 
   - When a header that **originates elsewhere** (a paycheck, a manual
@@ -359,19 +378,76 @@ caps moved to `TagValidation` and are now enforced on both surfaces.
 The per-leg `TagsPlaceholder` in the bank splits grid is unaffected: it
 is still a reserved layout slot, and per-leg tags still do not exist.
 
+> *Amended 2026-10-27 (ADR-0108 D1, D5).* Three statements above no longer hold. Tags
+> are placed like the memo: an event shows one tag set, on its brokerage leg
+> when it has one posting and on the header when it has several, and its other
+> rows show it inherited. The register reads the stored presentation (the
+> `txn_legs.notes_*` columns and `txn_leg_note_tags`, migration 264), not the
+> header's tags; the resolved view's `tags` subquery was dropped in migration
+> 266. `HeaderTags` is gone: every write of memo and tags goes through the write
+> primitive (`AnnotationPlanner`, persisted by `AnnotationWriter`). Per-leg tags
+> exist since [ADR-0103](0103-tags-at-both-levels.md), and `TagsPlaceholder`
+> was replaced by `TagSelect`.
+
+## Amendment, 2026-10-21 — the check number sits under the Action chip
+
+**The "Date cell" decision above no longer describes the register.** When the tax date
+became a real, editable field (2026-08, migration 189 made `transacted_at` NOT NULL),
+line 2 of the date cell went to the tax date on the investment register too, as it is
+on the bank register, and the check number moved to line 2 of the Action cell (slot 4).
+That is where it reads as what it is: MD's `Auto` / `EXfr` / `Xfr`, a QIF action word
+on a QIF-origin row (ADR-0027, 2026-10-21 amendment), or a plain cheque number, each a
+qualifier on the action rather than on the date.
+
+As built:
+
+- **Slot 3** is the date, with `tax YYYY-MM-DD` on line 2 when the tax date differs
+  (`investmentStrategy.renderDateSubLabel`, the bank register's `taxDateSubLabel`).
+- **Slot 4** is the action chip, with `header.checkNumber` on line 2 when non-null
+  (`investmentStrategy.renderActionSubLabel`). *(2026-10-28, ADR-0108 D15: a read-only
+  row's "↗ Split" or "↗ Investment" badge sits on a line of its own above the chip, no
+  longer in front of the payee in slot 5.)*
+- **The column headers read `Date` and `Action · Check #`.** The Action header names
+  the check number it now carries (2026-10-21, with this amendment).
+  `"Date · Check #"` is not shown anywhere, and the `dateHeader` strategy field
+  described above went with the strategy dispatch (2026-06 update).
+- **Slot 4 is 7rem, not 6rem.** The chips alone fit in 6rem; the `Action · Check #`
+  label truncates there. No other track changed.
+- **An unset action shows a neutral `—` chip.** A txn or split-parent row with no
+  action and no ingest hint renders the same default-variant chip an action label
+  uses, reading `—` (titled "No action"), instead of an empty line 1. Without it the
+  chip line collapses and the check number rises to line 1, so the column reads ragged;
+  with it the check number always sits on line 2, flush left under the chip. An
+  ingest hint still shows its own warn chip. Split-leg rows keep a blank action cell:
+  a leg carries no check number, so it has no line 2 to hold.
+
+So in the grid table, slot 4 is 7rem; in the header-level field table, **Check #** is
+line 2 of slot 4, not of slot 3, line 2 of slot 3 is the tax date, and **Action** is
+`—` when unset. The "Strategy-pattern surface" section's `renderDateSubLabel` returns
+the tax date, not `txn.checkNumber`.
+
+## Amendment, 2026-11-14 — Slot 6: the other leg's amount on a transfer between currencies ([ADR-0114](0114-benchmarks-and-currency-conversion.md) D14)
+
+On an Xfr, BuyXfr, SellXfr or DividendXfr whose transfer account is a real account in
+another currency than the brokerage, the transfer chip on line 1 of slot 6 is followed
+by the other leg's amount, muted, in the app's format (the symbol, no plus), as the bank
+register shows it after the account chip ([ADR-0021](0021-ui-layout-and-principles.md) Rule 6, 2026-11-14 amendment). A
+long account name truncates, and the amount stays whole. A same-currency or category
+transfer, and every other chip, is unchanged.
+
 ## Consequences
 
-  - The investment register reaches the split-parent code path for
-    bank-shape **target-split clusters** (above); true investment
-    events still collapse to ONE flat row. A future per-leg drill-down
-    on a genuine brokerage event (e.g. expanding a Buy+Fee) would still
-    need a distinct affordance, not a reuse of this target-split path.
+  - The investment register reached the split-parent code path for
+    bank-shape **target-split clusters** (above) until 2026-10-27, when
+    ADR-0108 D14 removed the clustering; true investment events still
+    collapse to ONE flat row. A future per-leg drill-down on a genuine
+    brokerage event (e.g. expanding a Buy+Fee) would still need a
+    distinct affordance.
   - Slot 6's three-chip shape relies on `posting_role` being
     populated correctly by the importer (migration 057's trigger
     enforces). A non-investment leg with `posting_role IS NULL`
     that somehow ended up on a brokerage register would render
-    as a blank slot 6 — by design (no inference fallback per the
-    `feedback_constraints_over_workarounds` rule).
+    as a blank slot 6 — by design (no inference fallback).
   - Bank rows' tax-date sub-label is now best understood as a
     placeholder for the systemic tax-date treatment captured in
     follow-ups.md, not the final UX.

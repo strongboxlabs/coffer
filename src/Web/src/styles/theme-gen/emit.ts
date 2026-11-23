@@ -3,9 +3,9 @@
  *
  * Every block restates EVERY token. A partial block only works while the
  * attribute lives on <html>; the moment a preview nests one inside a different
- * theme, the tokens it omits are inherited from whatever it is sitting in. That
- * shipped twice — light-hc defined 39 of 43 and rendered as a light/dark hybrid
- * inside the Appearance screen.
+ * theme, the tokens it omits are inherited from whatever it is sitting in — a
+ * block missing a few tokens renders as a light/dark hybrid inside the
+ * Appearance screen.
  *
  * Selectors are compound on purpose (`[data-theme][data-accent]`), which means
  * both attributes must land on the SAME element. Splitting them across a parent

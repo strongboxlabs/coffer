@@ -13,54 +13,49 @@ namespace Coffer.Api.Tests.Integration.Stress;
 /// depends on.
 /// </summary>
 /// <remarks>
-/// <para>This test exists because a measurement corrected a wrong belief.
-/// Migration 188 was written on the reading that the FIFO walk's nested loops were
-/// where a slow restore on a real ledger spent its time. Measured on the 200-holding
-/// fixture it came out at
-/// <b>0.3s</b> — because that fixture gives each holding only 22 events, and the
-/// walk re-queries the open-lot set once per event, so its cost grows with
-/// events × open-lots WITHIN a holding rather than with holding count. Migration
-/// 188's decision still stands on its own (don't re-derive what the payload
-/// carries, and don't do provably dead work), but its attribution of the time did
-/// not survive contact with a number.</para>
-/// <para>At depth the whole-ledger walk measures ~2.3s (20 holdings, 500 events
-/// each, 8000 lots) — 7.7× the breadth figure for a comparable transaction count,
-/// which confirms events-per-holding is the axis. But the number that decides
-/// whether optimising the walk is worth doing is the narrowed one, because the
-/// write interceptors call it per touched position on every transaction write:
-/// that is <b>~0.1s</b>. So hoisting the open-lot query out of the per-event loop
-/// was demoted from "the fix" to "not currently worth the risk" by these numbers.
-/// No performance bound is asserted; the numbers are the output.</para>
+/// <para>The walk re-queries the open-lot set once per event, so its cost grows
+/// with events × open-lots WITHIN a holding rather than with holding count. On
+/// <c>StressLedger.Scale.Default</c> (200 holdings, 22 events each) the whole-ledger
+/// walk took <b>0.3s</b>; on <c>Scale.Deep</c> (20 holdings, 500 events each,
+/// 8000 lots) it took ~2.3s, 7.7× the breadth figure for a comparable transaction
+/// count, which is what makes events-per-holding the axis. Those figures predate
+/// the seed's five extra event shapes per holding (27 and 505 events, 8060 lots on
+/// <c>Scale.Deep</c>), a change of about 1% in the walk's input on Deep.</para>
+/// <para>The number that decides whether optimising the walk is worth doing is the
+/// narrowed one, because the write interceptors call it per touched position on
+/// every transaction write: on <c>Scale.Deep</c> that is <b>~0.1s</b>, which does not justify the risk
+/// of hoisting the open-lot query out of the per-event loop. No performance bound
+/// is asserted; the numbers are the output.</para>
 /// <para>Kept as a regression tripwire: if a future change makes the walk
 /// superlinear, the printed figures move sharply and the reconciliation assertion
 /// below catches any correctness slip that came with it.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class FifoRecomputeCostTests
+public sealed class FifoRecomputeCostTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
     private readonly ITestOutputHelper _output;
 
     public FifoRecomputeCostTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
         _output = output;
     }
 
     [Fact]
     public async Task Fifo_recompute_cost_scales_with_events_per_holding_not_holding_count()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var scale = StressLedger.Scale.Deep;
 
-        var seedElapsed = await StressLedger.SeedAsync(_fixture, ledger, scale);
+        var seedElapsed = await StressLedger.SeedAsync(Db, ledger, scale);
         // The seed itself runs one whole-ledger recompute, so this already includes
         // a full walk at depth — worth printing alongside.
         _output.WriteLine(
             $"seed:    {seedElapsed.TotalSeconds,7:F1}s  " +
-            $"({scale.Holdings} holdings x {scale.BuysPerHolding + scale.SellsPerHolding} events)");
+            $"({scale.Holdings} holdings x " +
+            $"{scale.BuysPerHolding + scale.SellsPerHolding + StressLedger.Scale.ShapeEventsPerHolding} events)");
 
-        await using var db = _fixture.NewServiceFactory().Create();
+        await using var db = Db.NewServiceFactory().Create();
         db.Database.SetCommandTimeout(600);
 
         var lots = await db.Database.SqlQuery<int>(
@@ -69,10 +64,10 @@ public sealed class FifoRecomputeCostTests
             $"SELECT count(*)::int AS \"Value\" FROM realized_gains WHERE ledger_id = {ledger.LedgerId}").SingleAsync();
         _output.WriteLine($"seeded:  {lots:N0} lots, {gains:N0} realized gains");
 
-        Assert.Equal(scale.Holdings * scale.BuysPerHolding, lots);
+        Assert.Equal(scale.TotalLots, lots);
         Assert.True(gains > 0, "no realized_gains — the disposals closed no lots, so the walk was not exercised");
 
-        // Whole-ledger: what restore used to run, and what a bulk import runs.
+        // Whole-ledger: what a bulk import runs.
         var wholeLedger = Stopwatch.StartNew();
         await db.Database.ExecuteSqlInterpolatedAsync(
             $"SELECT recompute_holdings_cost_basis({ledger.LedgerId})");
@@ -81,7 +76,7 @@ public sealed class FifoRecomputeCostTests
 
         // Single (account, security): what EVERY transaction write pays, since the
         // interceptors narrow the recompute to the touched position. This is the
-        // number that decides whether the follow-up is worth doing.
+        // number that decides whether optimising the walk is worth doing.
         var one = await db.Database.SqlQuery<Guid>($"""
             SELECT h.security_id AS "Value"
               FROM holdings h

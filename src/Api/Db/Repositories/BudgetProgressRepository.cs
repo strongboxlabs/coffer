@@ -13,18 +13,25 @@ namespace Coffer.Api.Db.Repositories;
 /// already computes spend by category with the right posting selection, sign
 /// normalisation and tree rollup, and its own header says it exists so that
 /// "BOTH the MCP tools and a future in-app Reports" share one engine rather than
-/// growing a parallel one. Until now it had no REST caller at all — the app
-/// computed this and would only show it to an MCP client.</para>
+/// growing a parallel one. This is its REST caller, so the app shows what it
+/// computes, not only an MCP client.</para>
 ///
 /// <para><b>Two calls, both with <see cref="ReportTimeBucket.None"/>.</b> One
 /// wider call bucketed by month would be one round trip instead of two, and is
 /// deliberately not what this does. A bucketed call derives its period label
-/// from SQL date parts evaluated in the DATABASE SESSION timezone, and nothing
-/// in this repo sets one — it agrees with the C# UTC convention only because
-/// postgres defaults to UTC. With <c>None</c> there is no label: the half-open
-/// <c>[from, to)</c> bounds passed here define the window and the boundary is
-/// unambiguous. Two round trips for a screen load is a cheap price for removing
-/// a whole class of off-by-one-month bug.</para>
+/// from SQL date parts evaluated in the DATABASE SESSION timezone, which agrees
+/// with the C# UTC convention only because the connection pins the session to
+/// UTC (AppUserDbConnectionInterceptor). With <c>None</c> there is no label: the
+/// half-open <c>[from, to)</c> bounds passed here define the window, and the
+/// boundary does not depend on that pin. Two round trips for a screen load is a
+/// cheap price for removing a whole class of off-by-one-month bug.</para>
+///
+/// <para><b>The means read the daily cells.</b> A ledger younger than the window
+/// averages each day of the month over the window's months it already existed in on
+/// that day (<see cref="MonthsAveragedByDay"/>), so every mean — a row's typical, the
+/// total's, the daily profile — is taken from the same per-day leaf cells, over the
+/// same [from, to) bounds. With the whole window the count is one number and each
+/// mean is the window total over the window's length exactly, as before.</para>
 /// </remarks>
 public sealed class BudgetProgressRepository
 {
@@ -37,32 +44,6 @@ public sealed class BudgetProgressRepository
         _reporting = reporting;
         _db = db;
         _clock = clock;
-    }
-
-    /// <summary>
-    /// The ledger's display currency, derived the same way the overview derives
-    /// it — first distinct currency across the net-worth-relevant accounts, and
-    /// a "mixed" flag when they disagree.
-    ///
-    /// <para>Deliberately NOT obtained by calling <see cref="OverviewRepository"/>,
-    /// which would be the obvious reuse and is the wrong trade: it computes every
-    /// account balance and prices the whole holdings book, and this needs a
-    /// three-letter string. Duplicating a one-line derivation is cheaper than
-    /// making the budget page cost as much as the dashboard.</para>
-    /// </summary>
-    private async Task<(string Code, bool Mixed)> DisplayCurrencyAsync(
-        Guid ledgerId, CancellationToken cancellationToken)
-    {
-        var codes = await _db.Accounts.AsNoTracking()
-            .Where(a => a.LedgerId == ledgerId
-                        && (AccountClassifier.AssetTypes.Contains(a.AccountType)
-                            || AccountClassifier.LiabilityTypes.Contains(a.AccountType)))
-            .Select(a => a.CurrencyCode)
-            .Distinct()
-            .ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
-
-        return (codes.Count > 0 ? codes[0] : "USD", codes.Count > 1);
     }
 
     /// <summary>
@@ -155,10 +136,22 @@ public sealed class BudgetProgressRepository
     /// arithmetic so that the month the user picked and the month queried cannot
     /// disagree.
     /// </param>
+    public Task<BudgetProgressDto> GetAsync(
+        Guid ledgerId,
+        DateTime monthStartUtc,
+        int windowMonths,
+        CancellationToken cancellationToken = default) =>
+        GetAsync(ledgerId, monthStartUtc, windowMonths, today: null, cancellationToken);
+
+    /// <inheritdoc cref="GetAsync(Guid, DateTime, int, CancellationToken)"/>
+    /// <param name="today">The caller's local date (<see cref="ScheduledBoundary"/>),
+    /// which places "day D of N" and splits off the scheduled rows; null for the
+    /// register's fallback.</param>
     public async Task<BudgetProgressDto> GetAsync(
         Guid ledgerId,
         DateTime monthStartUtc,
         int windowMonths,
+        DateOnly? today,
         CancellationToken cancellationToken = default)
     {
         if (windowMonths < 1) throw new ArgumentOutOfRangeException(nameof(windowMonths));
@@ -192,21 +185,60 @@ public sealed class BudgetProgressRepository
             Rollup = true,
         }, cancellationToken).ConfigureAwait(false);
 
-        // Divide by the WINDOW LENGTH, never by the number of months that
-        // happened to return a cell. A single mattress bought once in three
-        // months is a third of a mattress a month, not a mattress a month — and
-        // dividing by "months with data" is exactly how a one-off becomes a
-        // permanent expectation.
-        // A NEGATIVE trailing total is real and has to be dropped, not scaled.
+        // ── The months each day of the month averages over ───────────────
+        //
+        // Divide by the window's months the LEDGER EXISTED IN, never by the number
+        // of months that happened to return a cell. A single mattress bought once
+        // in three months is a third of a mattress a month, not a mattress a month —
+        // and dividing by "months with data" is exactly how a one-off becomes a
+        // permanent expectation. But a month before the ledger's first transaction
+        // is not a month of no spending, it is no history at all: dividing by it
+        // makes a young ledger's usual a fraction of what it spends. So each day of
+        // the month divides by the window's months in which the ledger already
+        // existed on that day (MonthsAveragedByDay), and every figure below that
+        // averages the window uses the same count.
+        var dailyWindow = await DailyAsync(
+            ledgerId, windowStartUtc, monthStartUtc, cancellationToken).ConfigureAwait(false);
+
+        var windowFirstDay = DateOnly.FromDateTime(windowStartUtc);
+        var firstTransaction = await LedgerHistoryStart
+            .FirstTransactionDayAsync(_db, ledgerId, cancellationToken).ConfigureAwait(false);
+        var monthsAveraged = MonthsAveragedByDay(firstTransaction, windowFirstDay, windowMonths);
+
+        var categoryTree = await _db.Accounts.AsNoTracking()
+            .Where(a => a.LedgerId == ledgerId && a.AccountType == "category")
+            .Select(a => new { a.Id, a.ParentId, a.Name })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var parentOf = categoryTree.ToDictionary(c => c.Id, c => c.ParentId);
+
+        // A NEGATIVE trailing mean is real and has to be dropped, not scaled.
         // Refunds land as credits in an expense category, so a category whose
         // only recent activity was a return sums below zero. Treated as a
         // "normal" it is nonsense in both directions: you cannot overspend a
         // negative budget, and every month with any spending at all would show
         // as over. Null means "no usable history", which the UI already knows
         // how to render.
-        var typicalByCategory = history.Rows
-            .Where(r => r.GroupId is not null && r.Amount > 0m)
-            .ToDictionary(r => r.GroupId!.Value, r => r.Amount / windowMonths);
+        // A category whose window, or a descendant's, holds a day that needs a missing
+        // rate has no usable mean: it is null, named, never a mean of what converted
+        // (ADR-0114 D9). Rolled up the tree, as the means are.
+        var missing = new Dictionary<Guid, List<RateUnavailable>>();
+        void Miss(Guid category, IEnumerable<RateUnavailable> why)
+        {
+            var cur = (Guid?)category;
+            for (var guard = 0; cur is { } node && guard < 100; guard++)
+            {
+                if (!missing.TryGetValue(node, out var list)) missing[node] = list = [];
+                foreach (var w in why) if (!list.Contains(w)) list.Add(w);
+                cur = parentOf.TryGetValue(node, out var p) ? p : null;
+            }
+        }
+        foreach (var cell in dailyWindow.Where(c => c.RateUnavailable is not null))
+            Miss(cell.CategoryId, cell.RateUnavailable!);
+        var windowConverted = dailyWindow.Where(c => c.Amount is not null).ToList();
+
+        var typicalByCategory = MeanByCategory(windowConverted, parentOf, monthsAveraged)
+            .Where(kv => kv.Value > 0m && !missing.ContainsKey(kv.Key))
+            .ToDictionary(kv => kv.Key, kv => kv.Value);
 
         // Union both sides: a category can have spend this month and no history
         // (new), or history and no spend this month (stopped). Both are rows the
@@ -217,7 +249,10 @@ public sealed class BudgetProgressRepository
 
         var actualByCategory = actual.Rows
             .Where(r => r.GroupId is not null)
-            .ToDictionary(r => r.GroupId!.Value, r => r.Amount);
+            .ToDictionary(r => r.GroupId!.Value, r => (r.Amount, r.RateUnavailable));
+        var actualMissing = actual.Rows
+            .Where(r => r.GroupId is not null && r.RateUnavailable is not null)
+            .ToDictionary(r => r.GroupId!.Value, r => r.RateUnavailable!);
 
         // ── Stored targets, and the D1a mark ────────────────────────────
         //
@@ -228,46 +263,77 @@ public sealed class BudgetProgressRepository
         // all still has to render as a row, or setting a target on a quiet
         // category would look like the write failed.
         var monthFirst = DateOnly.FromDateTime(monthStartUtc);
-        var targets = await _db.BudgetTargets.AsNoTracking()
+        var typedTargets = await _db.BudgetTargets.AsNoTracking()
             .Where(t => t.LedgerId == ledgerId && t.TargetMonth == monthFirst)
-            .ToDictionaryAsync(t => t.CategoryId, t => t.Amount, cancellationToken)
+            .Select(t => new { t.CategoryId, t.Amount, t.CurrencyCode })
+            .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        var categoryTree = await _db.Accounts.AsNoTracking()
-            .Where(a => a.LedgerId == ledgerId && a.AccountType == "category")
-            .Select(a => new { a.Id, a.ParentId, a.Name })
-            .ToListAsync(cancellationToken).ConfigureAwait(false);
-        var parentOf = categoryTree.ToDictionary(c => c.Id, c => c.ParentId);
+        // A target keeps the currency it was typed in (ADR-0114 D12). One typed in
+        // another than the reporting currency converts like any combined figure: a past
+        // month at the rate for its last day, the current month (and a future one) at
+        // the latest rate. A missing rate makes the target, and every mark built on it,
+        // null and named.
+        var reporting = await DisplayCurrency.ForLedgerAsync(_db, ledgerId, cancellationToken).ConfigureAwait(false);
+        var localTodayForRates = ScheduledBoundary.Today(today, _clock);
+        var lookup = new ExchangeRateLookup(_db, _clock);
+        var needs = lookup.NewNeeds();
+        var targetDay = monthFirst.AddMonths(1) <= localTodayForRates
+            ? RateDay.Of(monthFirst.AddMonths(1).AddDays(-1), needs.ServerToday)
+            : RateDay.Latest();
+        foreach (var t in typedTargets) targetDay.Declare(needs, t.CurrencyCode, reporting);
+        var rates = await lookup.LoadAsync(ledgerId, needs, cancellationToken).ConfigureAwait(false);
+        var targets = new Dictionary<Guid, decimal>();
+        foreach (var t in typedTargets)
+        {
+            var rate = targetDay.Read(rates, t.CurrencyCode, reporting);
+            if (rate.Unavailable is { } why) Miss(t.CategoryId, [why]);
+            else targets[t.CategoryId] = ConvertedTotal.Round(t.Amount * rate.Rate!.Value);
+        }
+        // Every typed category, converted or not: a target that could not convert is
+        // still a row, with its figures null and named.
+        var targeted = typedTargets.Select(t => t.CategoryId).ToHashSet();
+        var targetCurrency = typedTargets.ToDictionary(t => t.CategoryId, t => t.CurrencyCode);
 
         // A targeted category that neither spent this month nor has history is
         // still a row: the user typed a number against it and expects to see it.
         foreach (var c in categoryTree)
-            if (targets.ContainsKey(c.Id) && !names.ContainsKey(c.Id))
+            if (targeted.Contains(c.Id) && !names.ContainsKey(c.Id))
                 names[c.Id] = (c.Name, c.ParentId);
 
         var delta = MarkDeltaByAncestor(parentOf, targets, typicalByCategory);
 
         var rows = names
-            .Select(kv => new BudgetCategoryRow(
-                CategoryId: kv.Key,
-                Name: kv.Value.Name,
-                ParentId: kv.Value.ParentId,
-                Actual: actualByCategory.TryGetValue(kv.Key, out var a) ? a : 0m,
-                // Null, not zero, when there is no history. A new category
-                // showing "typically 0" reads as infinitely over budget.
-                Typical: typicalByCategory.TryGetValue(kv.Key, out var t) ? t : null,
-                Target: targets.TryGetValue(kv.Key, out var tg) ? tg : null,
-                Mark: MarkFor(kv.Key, targets, typicalByCategory, delta)))
-            .OrderByDescending(r => r.Actual)
+            .Select(kv =>
+            {
+                var why = RateReasons.Of(
+                    actualMissing.GetValueOrDefault(kv.Key) ?? [],
+                    missing.GetValueOrDefault(kv.Key) ?? []);
+                return new BudgetCategoryRow(
+                    CategoryId: kv.Key,
+                    Name: kv.Value.Name,
+                    ParentId: kv.Value.ParentId,
+                    Actual: actualByCategory.TryGetValue(kv.Key, out var a) ? a.Amount : 0m,
+                    // Null, not zero, when there is no history. A new category
+                    // showing "typically 0" reads as infinitely over budget.
+                    Typical: typicalByCategory.TryGetValue(kv.Key, out var t) ? t : null,
+                    Target: targets.TryGetValue(kv.Key, out var tg) ? tg : null,
+                    // Stored or not, whether or not it converted: the client cannot
+                    // tell an unconverted target from none by Target alone.
+                    TargetCurrencyCode: targetCurrency.GetValueOrDefault(kv.Key),
+                    // A mark built on a figure that could not convert has no value.
+                    Mark: missing.ContainsKey(kv.Key) ? null : MarkFor(kv.Key, targets, typicalByCategory, delta),
+                    RateUnavailable: why.Count > 0 ? why : null);
+            })
+            .OrderByDescending(r => r.Actual ?? 0m)
             .ThenBy(r => r.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(r => r.CategoryId)
             .ToList();
 
         // Totals come from the RESULT totals, not from summing the rows: with
         // Rollup the parent rows are subtotals and re-summing them double-counts
         // every descendant. ReportResult.Total is documented as the true sum of
         // the underlying postings for exactly this reason.
-        var (currencyCode, mixedCurrency) =
-            await DisplayCurrencyAsync(ledgerId, cancellationToken).ConfigureAwait(false);
 
         // ── The two daily series the hero draws ──────────────────────────
         //
@@ -279,25 +345,47 @@ public sealed class BudgetProgressRepository
         var dailyActual = await DailyAsync(
             ledgerId, monthStartUtc, monthEndUtc, cancellationToken).ConfigureAwait(false);
 
-        var dailyWindow = await DailyAsync(
-            ledgerId, windowStartUtc, monthStartUtc, cancellationToken).ConfigureAwait(false);
-
-        // Collapse the window's real dates onto a day-of-month profile, divided
-        // by the window length — the same rule as `typical`, for the same
-        // reason: divide by months that HAD spend and one big day becomes a
-        // permanent feature of the shape.
+        // Collapse the window's real dates onto a day-of-month profile, each day
+        // divided by the months it averages over — the same rule as `typical`, for
+        // the same reason: divide by months that HAD spend and one big day becomes
+        // a permanent feature of the shape.
         var normal = dailyWindow
             .GroupBy(c => (c.CategoryId, c.Day))
-            .Select(g => new BudgetDailyCell(
-                g.Key.CategoryId, g.Key.Day, g.Sum(c => c.Amount) / windowMonths))
+            .Select(g =>
+            {
+                var why = RateReasons.Of([.. g.Where(c => c.RateUnavailable is not null).Select(c => c.RateUnavailable!)]);
+                return why.Count > 0
+                    ? new BudgetDailyCell(g.Key.CategoryId, g.Key.Day, null, why)
+                    : new BudgetDailyCell(
+                        g.Key.CategoryId, g.Key.Day, g.Sum(c => c.Amount!.Value) / monthsAveraged[g.Key.Day]);
+            })
             .ToList();
 
+        // The ledger-wide usual, on the same footing as Total: the leaf cells
+        // before any rollup, so no subtotal is counted twice. Null when any of them
+        // needs a missing rate.
+        var windowWhy = RateReasons.Of([.. dailyWindow.Where(c => c.RateUnavailable is not null).Select(c => c.RateUnavailable!)]);
+        decimal? typicalTotal = windowWhy.Count > 0 ? null : MeanOf(windowConverted, monthsAveraged);
+
         var daysInMonth = DateTime.DaysInMonth(monthStartUtc.Year, monthStartUtc.Month);
-        var nowUtc = _clock.GetUtcNow().UtcDateTime;
+        var localToday = ScheduledBoundary.Today(today, _clock);
+        var monthFirstDay = DateOnly.FromDateTime(monthStartUtc);
         var elapsed =
-            nowUtc >= monthEndUtc ? daysInMonth              // a past month is whole
-            : nowUtc < monthStartUtc ? 0                     // a future month has not started
-            : nowUtc.Day;                                    // the current month, so far
+            localToday >= monthFirstDay.AddMonths(1) ? daysInMonth   // a past month is whole
+            : localToday < monthFirstDay ? 0                         // a future month has not started
+            : localToday.Day;                                        // the current month, so far
+
+        // The month stays whole (ADR-0109 D10; ADR-0099's 2026-10-31 amendment): the
+        // actual counts the rows the register shows as Scheduled. This is their part
+        // of it, from the same daily cells, so no reader subtracts one figure from
+        // another to find it:
+        // every day after the caller's today, which is all of a future month and
+        // none of a past one.
+        var scheduledCells = dailyActual
+            .Where(c => monthFirstDay.AddDays(c.Day - 1) > localToday)
+            .ToList();
+        var scheduledWhy = RateReasons.Of([.. scheduledCells.Where(c => c.RateUnavailable is not null).Select(c => c.RateUnavailable!)]);
+        decimal? scheduledTotal = scheduledWhy.Count > 0 ? null : scheduledCells.Sum(c => c.Amount!.Value);
 
         // Only asked when the month is empty — see the DTO. Bounded to two
         // years so an empty FUTURE month does not scan all history.
@@ -311,15 +399,97 @@ public sealed class BudgetProgressRepository
             WindowMonths: windowMonths,
             Rows: rows,
             ActualTotal: actual.Total,
-            TypicalTotal: history.Total <= 0m ? null : history.Total / windowMonths,
-            CurrencyCode: currencyCode,
-            MixedCurrency: mixedCurrency,
+            TypicalTotal: typicalTotal is { } tt && tt > 0m ? tt : null,
+            CurrencyCode: reporting,
             DaysInMonth: daysInMonth,
             ElapsedDays: elapsed,
             DailyActual: dailyActual,
             DailyNormal: normal,
-            LatestMonthWithSpending: latestWithSpending);
+            LatestMonthWithSpending: latestWithSpending,
+            ScheduledTotal: scheduledTotal,
+            // Only when the ledger began inside the window (or later): the labels
+            // that name the window then say what was averaged instead.
+            HistoryFrom: firstTransaction is { } first && first > windowFirstDay ? first : null,
+            RateUnavailable: RateReasons.Of(actual.RateUnavailable ?? [], windowWhy, scheduledWhy) is { Count: > 0 } all
+                ? all
+                : null);
     }
+
+    /// <summary>
+    /// How many of the window's months each day of the month averages over: the
+    /// months in which the ledger already existed on that day, counting from its
+    /// first transaction of any kind, at least one and at most the window's length.
+    /// Indexed by day of the month, 1 to 31; index 0 is unused.
+    /// </summary>
+    /// <remarks>
+    /// <para>A ledger with no transactions averages the whole window: it has nothing
+    /// to average either way, and its labels name the whole window.</para>
+    /// <para>A day a window month does not have (the 31st of a 30-day month) is read
+    /// as that month's last day, so a month the ledger existed in by its end counts
+    /// for it. With the whole window every month counts for every day, which is the
+    /// window's length; this keeps a young ledger on the same footing.</para>
+    /// <para>At least one, because a day of the month that no window month reached
+    /// has no spend to divide; the count only has to be a number.</para>
+    /// </remarks>
+    internal static int[] MonthsAveragedByDay(DateOnly? firstTransaction, DateOnly windowFirstDay, int windowMonths)
+    {
+        var byDay = new int[32];
+        for (var day = 1; day <= 31; day++)
+        {
+            var months = 0;
+            for (var k = 0; k < windowMonths; k++)
+            {
+                var month = windowFirstDay.AddMonths(k);
+                var date = new DateOnly(
+                    month.Year, month.Month, Math.Min(day, DateTime.DaysInMonth(month.Year, month.Month)));
+                if (firstTransaction is not { } first || first <= date) months++;
+            }
+            byDay[day] = Math.Max(months, 1);
+        }
+        return byDay;
+    }
+
+    /// <summary>
+    /// The mean month of every category over the window: each leaf cell over the
+    /// months its day averages, rolled up the category tree as the summaries roll
+    /// their rows up, so a parent's mean is its subtree's.
+    /// </summary>
+    /// <remarks>
+    /// The cells are summed per category and count first and divided once per
+    /// count, so with the whole window, one count for every day, a category's mean
+    /// is its window total over the window's length exactly.
+    /// </remarks>
+    private static Dictionary<Guid, decimal> MeanByCategory(
+        IEnumerable<BudgetDailyCell> windowCells,
+        IReadOnlyDictionary<Guid, Guid?> parentOf,
+        IReadOnlyList<int> monthsAveraged)
+    {
+        var sums = new Dictionary<(Guid Category, int Months), decimal>();
+        foreach (var cell in windowCells)
+        {
+            var months = monthsAveraged[cell.Day];
+            var cur = (Guid?)cell.CategoryId;
+            // The rollup's depth guard: a parent_id cycle should be impossible.
+            for (var guard = 0; cur is { } node && guard < 100; guard++)
+            {
+                var key = (node, months);
+                // Only converted cells reach here (the caller drops the rest).
+                var amount = cell.Amount!.Value;
+                sums[key] = sums.TryGetValue(key, out var acc) ? acc + amount : amount;
+                cur = parentOf.TryGetValue(node, out var p) ? p : null;
+            }
+        }
+        return sums
+            .GroupBy(kv => kv.Key.Category)
+            .ToDictionary(g => g.Key, g => g.Sum(kv => kv.Value / kv.Key.Months));
+    }
+
+    /// <summary>The mean month of every leaf cell together: <see cref="MeanByCategory"/>
+    /// without the tree.</summary>
+    private static decimal MeanOf(IEnumerable<BudgetDailyCell> windowCells, IReadOnlyList<int> monthsAveraged) =>
+        windowCells
+            .GroupBy(c => monthsAveraged[c.Day])
+            .Sum(g => g.Sum(c => c.Amount!.Value) / g.Key);
 
     /// <summary>
     /// The latest month at or before <paramref name="beforeUtc"/> with any
@@ -342,7 +512,8 @@ public sealed class BudgetProgressRepository
 
         // Periods are "yyyy-MM", so ordinal comparison IS chronological order.
         return result.Rows
-            .Where(x => x.Period is not null && x.Amount > 0m)
+            // A month whose spending needs a missing rate still has spending.
+            .Where(x => x.Period is not null && (x.Amount > 0m || x.RateUnavailable is not null))
             .Select(x => x.Period!)
             .DefaultIfEmpty(null!)
             .Max();
@@ -379,7 +550,7 @@ public sealed class BudgetProgressRepository
             if (row.GroupId is null || row.Period is null) continue;
             // "yyyy-MM-dd" — the day is the last two characters.
             if (!int.TryParse(row.Period.AsSpan(8, 2), out var day)) continue;
-            cells.Add(new BudgetDailyCell(row.GroupId.Value, day, row.Amount));
+            cells.Add(new BudgetDailyCell(row.GroupId.Value, day, row.Amount, row.RateUnavailable));
         }
         return cells;
     }

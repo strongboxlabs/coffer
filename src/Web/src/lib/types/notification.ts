@@ -70,6 +70,24 @@ export interface LedgerAttention {
 }
 
 /**
+ * Mirror of API `OutstandingProblemDto` — one subject still outstanding on a ledger.
+ * The same query behind {@link LedgerAttention}, so a ledger lists exactly as many
+ * rows as its attention count.
+ */
+export interface OutstandingProblem {
+    /** The subject, with its trailing separator: `backup.`, `feed-sync.`. */
+    subjectKey: string;
+    topic: string;
+    eventKey: string;
+    /** The latest problem's: 'warning' | 'critical'. */
+    severity: string;
+    summary: string;
+    latestAt: string;
+    /** The earliest problem since the subject's last all-clear. */
+    firstUnresolvedAt: string;
+}
+
+/**
  * A ledger's notification settings: its own delivery targets, and nothing else.
  * There is no mode — migration 214 retired 'inherit'. An empty list means this
  * ledger reports nowhere, which the panel has to say out loud.
@@ -84,4 +102,28 @@ export interface LedgerNotificationSettings {
      *  ever read "Never". `monitorCoverage` cannot express these: it is keyed on the jobs
      *  that run, so a switch on a job that does not run matches no key at all. */
     monitorsWatchingNothing: string[];
+}
+
+/**
+ * Mirror of API `SystemAttentionSubjectDto` — one deployment-scope subject outstanding on the
+ * INSTALLATION (ADR-0102, amended for ADR-0110), as `LedgerAttention` is for a ledger.
+ */
+export interface SystemAttentionSubject {
+    /** The subject without its separator: `backup`, `upgrade`. */
+    subject: string;
+    /** 'warning' | 'critical' — the latest event's, as for every subject. */
+    severity: string;
+    since: string;
+}
+
+/**
+ * Mirror of API `SystemAttentionDto` — what the System-settings gear and the System tabs draw.
+ * Admin-only on the wire: a non-admin's request is refused, and the reader never asks.
+ */
+export interface SystemAttention {
+    /** The highest severity beneath the gear, or null for none: one dot per surface. */
+    worst: string | null;
+    subjects: SystemAttentionSubject[];
+    /** The release announced as available while the `upgrade` subject stands. */
+    upgradeVersion: string | null;
 }

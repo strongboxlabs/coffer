@@ -4,8 +4,8 @@
 --
 -- A security transaction records an execution price (txn_legs.unit_price =
 -- |cash| / |shares|), but no code path wrote that price into security_prices.
--- A held-but-unfed security (a dormant 401(k), a ticker the quote provider
--- doesn't cover) then had price history only from the one-time import seed, so
+-- A held-but-unfed security (a plan-internal fund, a ticker the quote
+-- provider doesn't cover) then had price history only from the one-time import seed, so
 -- the mig-172 as-of feeder fell back to the last trade price (its tier-2) or,
 -- absent even that, valued the holding at 0 — understating net-worth history
 -- and returns.

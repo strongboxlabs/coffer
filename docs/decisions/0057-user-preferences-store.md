@@ -1,6 +1,6 @@
 # 0057 — User preferences store
 
-* Status: Accepted
+* Status: Accepted; amended 2026-10-20 by [ADR-0106](0106-folders-replace-tabs.md) (the rail's shape is per browser); amended 2026-10-31 by [ADR-0109](0109-overview-is-an-attention-first-home.md) (the dashboard document is an exception to D2 and D3)
 * Date: 2026-06-22
 * Related: ADR-0056 (overview dashboard — first consumer), ADR-0020
   (multi-ledger / RLS), ADR-0013 (auth / users), ADR-0055 (typed-record ↔ jsonb
@@ -116,3 +116,56 @@ value so it syncs across devices.
   sync, retiring the device-local fallback.
 - One round trip per namespace; the always-populated GET keeps default logic on
   the server (single source of truth).
+
+## Amendment, 2026-10-20 — the rail's shape is per browser (ADR-0106)
+
+The directive above says every preference is per ledger. The sidebar's width, its
+collapsed state and which of its folders are open are the first state built since
+then that the directive does not fit, and they live in `localStorage`, per browser,
+not in this store:
+
+- **Width belongs to the screen.** Per ledger, the rail would change width with
+  every ledger switch, and would have no row to read before a ledger exists.
+- **It has to apply before first paint.** This store answers after the page has
+  rendered, so a collapsed rail would draw open and then snap shut.
+  `theme-init.js` applies it early, as it does theme, accent and density, which
+  were already per device for the same reason.
+- **A layout choice should be the same on every ledger.**
+
+So the rule is now: how the app's own chrome is laid out is per browser;
+preferences about a ledger's content (`quotes`, `dashboard`) stay here, per user
+and ledger. Appearance, the TBD above, was already built per device in the same
+way (ADR-0021 Rule 4).
+
+FU-007 (remember the last sidebar tab), which this store was to carry, closed as
+won't-do when ADR-0106 removed tabs.
+
+## Amendment, 2026-10-31 — the dashboard document checks its structure, not its vocabulary (ADR-0109)
+
+The `dashboard` namespace is an exception to D2 and D3. The home screen's widget
+catalog (each widget's key, title, default column and visibility, and each setting's
+default and allowed values) is interface knowledge, so the SPA owns it and resolves
+every default. A typed record and validator per widget would put that knowledge in the
+API and make every new widget an API change.
+
+- **PUT checks structure and bounds only**, against a typed version 2 record used for
+  validation alone: `version` is 2; `columns` and each widget's `key` and `column` are
+  non-empty strings of at most 64 characters, and its `id` at most 128; every setting
+  value is a boolean, number, string, null or array of strings; the document is at most
+  `PreferencesEndpoints.MaxDashboardLength` characters, the same cap as a CSV mapping's,
+  and at most 16 levels deep. The
+  caps are far above a real layout and independent of the catalog. A version 1 body is
+  refused. Blank and duplicate ids are dropped, the first occurrence winning.
+- **GET returns the stored document as stored**, version 1 or 2, not a defaulted value,
+  plus the row's `updated_at` as `updatedAt`. With no row it returns an empty document
+  and `updatedAt: null`. The SPA's resolver fills every default, and migrates a version
+  1 document.
+- **PUT is a compare-and-swap** on that `updatedAt`, compared at microsecond precision:
+  null means no row may exist, and a value must equal the stored row's. Anything else is
+  refused with 422 `dashboard-prefs-stale`. It returns the saved document with its new
+  `updatedAt`. The write is a dashboard-only method, so the shared upsert the `quotes`
+  namespace uses is unchanged.
+- **DELETE** removes the row, which resets the layout to the default. Like GET and PUT,
+  it is open to every member: a layout is the reader's own view, not ledger data.
+
+`quotes` keeps D2 and D3 as written.

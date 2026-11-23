@@ -5,11 +5,13 @@ using Coffer.Importer.Moneydance.Mappers;
 
 namespace Coffer.Importer.Moneydance.Db;
 
+/// <summary>The tag names for one header (<paramref name="IsHeader"/>) or one leg of an import batch.</summary>
+public sealed record ImportTagSet(Guid TargetId, bool IsHeader, IReadOnlyList<string> Names);
+
 /// <summary>
-/// Dapper-backed gateway to <c>tags</c> and <c>txn_header_tags</c>. Tags are
-/// modelled at the transaction level (per ADR-0009); the importer aggregates
-/// any per-split tags up to the parent transaction during the
-/// <see cref="Mappers.TransactionMapper"/> step.
+/// Dapper-backed gateway to <c>tags</c>, <c>txn_header_tags</c> and
+/// <c>txn_leg_tags</c>. Which header or leg a Moneydance tag lands on is the
+/// mappers' plan (<see cref="Mappers.MoneydanceNotes"/>); this persists it.
 /// </summary>
 public sealed class TagsRepository
 {
@@ -21,108 +23,156 @@ public sealed class TagsRepository
     }
 
     /// <summary>
-    /// Resolve a tag by name within a ledger, inserting it if absent. Returns
-    /// the tag's id. Idempotent across re-runs because
-    /// <c>(ledger_id, name)</c> is unique per ADR-0020 Phase A.
+    /// Resolve tag names to ids within a ledger in a single round trip, creating
+    /// the ones that do not exist. Returns an id for every given name (after
+    /// <see cref="TagName.Normalize"/>), keyed by that name.
     /// </summary>
-    public async Task<Guid> EnsureTagAsync(Guid ledgerId, string name, CancellationToken cancellationToken = default)
-    {
-        // Normalized here too, though TransactionMapper already has. This is a
-        // backstop against a caller that did not: the column is bare TEXT with
-        // no CHECK, so an over-length name reaching this line would be stored.
-        if (TagName.Normalize(name) is not { } normalized)
-            throw new ArgumentException("Tag name must not be empty.", nameof(name));
-        name = normalized;
-
-        const string sql = """
-            INSERT INTO tags (id, ledger_id, name) VALUES (gen_random_uuid(), @ledgerId, @name)
-            ON CONFLICT (ledger_id, name) DO UPDATE SET name = EXCLUDED.name
-            RETURNING id;
-            """;
-        var command = new CommandDefinition(sql, new { ledgerId, name }, cancellationToken: cancellationToken);
-        return await _connection.ExecuteScalarAsync<Guid>(command).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Replace the set of tags attached to a transaction with the supplied
-    /// set. Used by the importer so re-runs reflect the source-of-truth tag
-    /// list rather than accreting old tags.
-    /// </summary>
-    public async Task SetTagsForHeaderAsync(
-        Guid ledgerId,
-        Guid headerId,
-        IReadOnlyCollection<Guid> tagIds,
-        CancellationToken cancellationToken = default)
-    {
-        const string deleteSql = "DELETE FROM txn_header_tags WHERE header_id = @headerId;";
-        await _connection.ExecuteAsync(new CommandDefinition(
-            deleteSql, new { headerId }, cancellationToken: cancellationToken)).ConfigureAwait(false);
-
-        if (tagIds.Count == 0) return;
-
-        const string insertSql = """
-            INSERT INTO txn_header_tags (header_id, tag_id, ledger_id)
-            VALUES (@TransactionId, @TagId, @LedgerId)
-            ON CONFLICT DO NOTHING;
-            """;
-        var rows = tagIds.Select(tagId =>
-            new { TransactionId = headerId, TagId = tagId, LedgerId = ledgerId }).ToList();
-        await _connection.ExecuteAsync(new CommandDefinition(
-            insertSql, rows, cancellationToken: cancellationToken)).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Resolve a set of tag names to ids within a ledger in a single round
-    /// trip. Inserts any missing names and returns every name's id (existing
-    /// on conflict, new on insert). Idempotent across re-runs because
-    /// <c>(ledger_id, name)</c> is unique per ADR-0020 Phase A.
-    /// </summary>
+    /// <remarks>
+    /// <para><b>One key.</b> Two names are the same tag when the database's
+    /// <c>tag_name_key</c> says so (case and surrounding white space folded), the
+    /// one definition every name lookup shares; nothing here folds a name.</para>
+    /// <para><b>Which tag.</b> A key matching an existing tag resolves to it (the
+    /// earliest created, then the lowest id, should several ever share it). A new key
+    /// is created once, spelled as its first occurrence in <paramref name="names"/>.</para>
+    /// <para><b>Conflict target.</b> The per-ledger unique index on the key
+    /// (<c>uq_tags_name_key_per_ledger</c>, migration 264): a name another writer
+    /// created in between, in any spelling, is not inserted again, and is read back
+    /// by its key in a second statement, which sees it.</para>
+    /// </remarks>
     public async Task<IReadOnlyDictionary<string, Guid>> EnsureTagsAsync(
         Guid ledgerId,
-        IReadOnlyCollection<string> names,
+        IReadOnlyList<string> names,
         CancellationToken cancellationToken = default)
     {
-        if (names.Count == 0)
-            return new Dictionary<string, Guid>(StringComparer.Ordinal);
+        ArgumentNullException.ThrowIfNull(names);
 
         // Distinct AFTER normalizing: two source names that truncate to the
-        // same 64 characters are one tag from here on, and de-duplicating
-        // before the cut would send both to the INSERT and have the second
-        // fall through the ON CONFLICT for nothing.
-        var trimmed = names
-            .Select(TagName.Normalize)
-            .Where(n => n is not null)
-            .Select(n => n!)
-            .Distinct(StringComparer.Ordinal)
-            .ToArray();
-        if (trimmed.Length == 0)
+        // same 64 characters are one name from here on. Order is kept, because
+        // it decides the spelling a new tag is created with.
+        var normalized = new List<string>(names.Count);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var name in names)
+            if (TagName.Normalize(name) is { } n && seen.Add(n))
+                normalized.Add(n);
+        if (normalized.Count == 0)
             return new Dictionary<string, Guid>(StringComparer.Ordinal);
 
         const string sql = """
             WITH input AS (
-                SELECT unnest(@names::text[]) AS name
+                SELECT n.name, n.ord, public.tag_name_key(n.name) AS key
+                  FROM unnest(@names::text[]) WITH ORDINALITY AS n(name, ord)
+            ),
+            wanted AS (
+                SELECT DISTINCT ON (i.key) i.key, i.name
+                  FROM input i
+                 ORDER BY i.key, i.ord
+            ),
+            existing AS (
+                SELECT DISTINCT ON (public.tag_name_key(t.name)) public.tag_name_key(t.name) AS key, t.id
+                  FROM tags t
+                 WHERE t.ledger_id = @ledgerId
+                   AND public.tag_name_key(t.name) IN (SELECT w.key FROM wanted w)
+                 ORDER BY public.tag_name_key(t.name), t.created_at, t.id
             ),
             inserted AS (
                 INSERT INTO tags (id, ledger_id, name)
-                SELECT gen_random_uuid(), @ledgerId, name FROM input
-                ON CONFLICT (ledger_id, name) DO NOTHING
+                SELECT gen_random_uuid(), @ledgerId, w.name
+                  FROM wanted w
+                 WHERE NOT EXISTS (SELECT 1 FROM existing e WHERE e.key = w.key)
+                ON CONFLICT (ledger_id, (public.tag_name_key(name))) DO NOTHING
                 RETURNING id, name
+            ),
+            resolved AS (
+                SELECT e.key, e.id FROM existing e
+                UNION ALL
+                SELECT public.tag_name_key(n.name), n.id FROM inserted n
             )
-            SELECT id, name FROM inserted
-            UNION ALL
-            SELECT t.id, t.name FROM tags t
-            JOIN input ON input.name = t.name
-            WHERE t.ledger_id = @ledgerId
-              AND NOT EXISTS (SELECT 1 FROM inserted i WHERE i.name = t.name);
+            SELECT i.name, r.id
+              FROM input i
+              JOIN resolved r ON r.key = i.key;
             """;
 
         var command = new CommandDefinition(sql,
-            new { ledgerId, names = trimmed }, cancellationToken: cancellationToken);
-        var rows = await _connection.QueryAsync<(Guid Id, string Name)>(command).ConfigureAwait(false);
+            new { ledgerId, names = normalized.ToArray() }, cancellationToken: cancellationToken);
+        var rows = await _connection.QueryAsync<(string Name, Guid Id)>(command).ConfigureAwait(false);
         var result = new Dictionary<string, Guid>(StringComparer.Ordinal);
         foreach (var row in rows)
             result[row.Name] = row.Id;
+
+        // A name whose insert met the key index (created by another writer after this
+        // statement's snapshot) is read back by key; this statement sees it.
+        var unresolved = normalized.Where(n => !result.ContainsKey(n)).ToArray();
+        if (unresolved.Length > 0)
+        {
+            var reread = new CommandDefinition("""
+                SELECT n.name, t.id
+                  FROM unnest(@names::text[]) AS n(name)
+                  JOIN LATERAL (
+                        SELECT x.id FROM tags x
+                         WHERE x.ledger_id = @ledgerId AND public.tag_name_key(x.name) = public.tag_name_key(n.name)
+                         ORDER BY x.created_at, x.id
+                         LIMIT 1) t ON TRUE;
+                """, new { ledgerId, names = unresolved }, cancellationToken: cancellationToken);
+            foreach (var row in await _connection.QueryAsync<(string Name, Guid Id)>(reread).ConfigureAwait(false))
+                result[row.Name] = row.Id;
+        }
+
+        // Fail closed: a name with no id would drop its links silently.
+        if (normalized.FirstOrDefault(n => !result.ContainsKey(n)) is { } missing)
+            throw new InvalidOperationException(
+                $"The tag name '{missing}' resolved to no tag in ledger {ledgerId}; the import is stopped.");
         return result;
+    }
+
+    /// <summary>
+    /// Link each header and leg of an import batch to its tag names, creating the tags
+    /// that do not exist yet. <paramref name="sets"/> is in the batch's encounter order,
+    /// which decides the spelling a new name is created with.
+    /// </summary>
+    /// <remarks>
+    /// Fails closed: a name that resolves to no tag stops the import instead of
+    /// silently dropping the link.
+    /// </remarks>
+    public async Task LinkImportedAsync(
+        Guid ledgerId,
+        IReadOnlyList<ImportTagSet> sets,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(sets);
+        var names = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var set in sets)
+            foreach (var name in set.Names)
+                if (seen.Add(name)) names.Add(name);
+        if (names.Count == 0) return;
+
+        var tagIdByName = await EnsureTagsAsync(ledgerId, names, cancellationToken).ConfigureAwait(false);
+
+        Guid IdOf(string name) => TagName.Normalize(name) is { } normalized && tagIdByName.TryGetValue(normalized, out var id)
+            ? id
+            : throw new InvalidOperationException($"The tag name '{name}' resolved to no tag; the import is stopped.");
+
+        var headerIds = new HashSet<Guid>();
+        var headerLinks = new List<(Guid HeaderId, Guid TagId)>();
+        var legIds = new HashSet<Guid>();
+        var legLinks = new List<(Guid LegId, Guid TagId)>();
+        foreach (var set in sets)
+        {
+            if (set.Names.Count == 0) continue;
+            if (set.IsHeader)
+            {
+                headerIds.Add(set.TargetId);
+                foreach (var name in set.Names) headerLinks.Add((set.TargetId, IdOf(name)));
+            }
+            else
+            {
+                legIds.Add(set.TargetId);
+                foreach (var name in set.Names) legLinks.Add((set.TargetId, IdOf(name)));
+            }
+        }
+
+        await BulkSetTagsAsync(ledgerId, headerIds, headerLinks, cancellationToken).ConfigureAwait(false);
+        await BulkSetLegTagsAsync(ledgerId, legIds, legLinks, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>

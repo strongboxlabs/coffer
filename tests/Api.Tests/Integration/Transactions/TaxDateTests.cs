@@ -16,22 +16,21 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// actually read.
 /// </summary>
 /// <remarks>
-/// <para>This surface had NO server-side test coverage at all before migration 189,
-/// which is how a real defect stayed invisible: on the bank PATCH an ABSENT field
-/// means "leave this column alone", and before migration 230 a NULL one meant the
-/// same, so a client sending null to CLEAR a tax date cleared nothing. A
-/// payload-level assertion cannot see that — only reading back through the view
-/// can.</para>
+/// <para>On the bank PATCH an ABSENT field means "leave this column alone"; if a
+/// NULL meant the same, a client sending null to CLEAR a tax date would clear
+/// nothing (migration 230 makes presence decide). A payload-level assertion cannot
+/// see that — only reading back through the view can.</para>
 /// <para>Migration 189 makes the base column NOT NULL and stores "no distinct tax
 /// date" as the posted date, so clearing is expressed by sending the posted date
 /// rather than a null. These tests pin that.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class TaxDateTests
+public sealed class TaxDateTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public TaxDateTests(PostgresFixture fixture) => _fixture = fixture;
+    public TaxDateTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -47,7 +46,7 @@ public sealed class TaxDateTests
     /// </summary>
     private async Task<DateTime> ResolvedTransactedAtAsync(Guid headerId)
     {
-        await using var db = _fixture.NewServiceFactory().Create();
+        await using var db = Db.NewServiceFactory().Create();
         return await db.Database
             .SqlQuery<DateTime>($"""
                 SELECT DISTINCT transacted_at AS "Value"
@@ -60,11 +59,11 @@ public sealed class TaxDateTests
     [Fact]
     public async Task Create_without_a_tax_date_stores_the_posted_date()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var category = await ledger.AddCategoryAsync("groceries");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var posted = new DateTime(2026, 1, 2, 0, 0, 0, DateTimeKind.Utc);
@@ -88,11 +87,11 @@ public sealed class TaxDateTests
     [Fact]
     public async Task Patch_sets_a_distinct_tax_date()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var category = await ledger.AddCategoryAsync("dividends");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var posted = new DateTime(2026, 1, 2, 0, 0, 0, DateTimeKind.Utc);
@@ -119,11 +118,11 @@ public sealed class TaxDateTests
     [Fact]
     public async Task Clearing_a_tax_date_means_sending_the_posted_date()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var category = await ledger.AddCategoryAsync("dividends");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var posted = new DateTime(2026, 1, 2, 0, 0, 0, DateTimeKind.Utc);
@@ -152,11 +151,11 @@ public sealed class TaxDateTests
     [Fact]
     public async Task Patching_without_a_tax_date_leaves_the_existing_one_alone()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var category = await ledger.AddCategoryAsync("dividends");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var posted = new DateTime(2026, 1, 2, 0, 0, 0, DateTimeKind.Utc);
@@ -174,11 +173,10 @@ public sealed class TaxDateTests
 
         // OMITTING a field means "leave this column alone" — the bank PATCH is
         // not wholesale, so an edit to the payee must not disturb the tax date.
-        // This used to be expressed as "null means leave alone", which is what
-        // made a null-to-clear client silently no-op; since migration 230 the
-        // request decides on PRESENCE, so the no-op case is the omitted one and
-        // an explicit null is a 422 on this column (it is NOT NULL). Pinned
-        // deliberately rather than left as folklore.
+        // "Null means leave alone" would make a null-to-clear client silently
+        // no-op; since migration 230 the request decides on PRESENCE, so the
+        // no-op case is the omitted one and an explicit null is a 422 on this
+        // column (it is NOT NULL).
         var patch = await client.PatchAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/transactions/{headerId}",
             new PatchTransactionRequest { Payee = "Renamed" });
@@ -205,11 +203,11 @@ public sealed class TaxDateTests
     [Fact]
     public async Task Investment_patch_omitting_the_tax_date_clears_it_to_the_posted_date()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var posted = new DateTime(2026, 1, 2, 12, 0, 0, DateTimeKind.Utc);
@@ -230,8 +228,7 @@ public sealed class TaxDateTests
         var headerId = (await create.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("headerId").GetGuid();
         Assert.Equal(taxDate, await ResolvedTransactedAtAsync(headerId));
 
-        // A PATCH that changes only the memo, with no TransactedAt — exactly the
-        // payload the web editor used to send.
+        // A PATCH that changes only the memo, with no TransactedAt.
         var patch = await client.PatchAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/investment-transactions/{headerId}",
             new PatchInvestmentTransactionRequest
@@ -259,11 +256,11 @@ public sealed class TaxDateTests
     [Fact]
     public async Task Investment_patch_carrying_the_tax_date_preserves_it()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var posted = new DateTime(2026, 1, 2, 12, 0, 0, DateTimeKind.Utc);

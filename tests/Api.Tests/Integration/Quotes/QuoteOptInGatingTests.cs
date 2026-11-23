@@ -15,25 +15,26 @@ namespace Coffer.Api.Tests.Integration.Quotes;
 /// always runs.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class QuoteOptInGatingTests
+public sealed class QuoteOptInGatingTests : DatabaseTest
 {
     private const string ExternalKey = "spy-external";
 
-    private readonly PostgresFixture _fixture;
-
-    public QuoteOptInGatingTests(PostgresFixture fixture) => _fixture = fixture;
+    public QuoteOptInGatingTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     [Fact]
     public async Task Opt_in_provider_skipped_without_pref_runs_when_enabled()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedHeldSecurityAsync(ledger);
 
         // Case 1: no pref → external provider is skipped, holdings still runs.
         {
             var holdings = new SpyPullProvider(SimpleFinHoldingsQuoteProvider.Key, requiresOptIn: false);
             var external = new SpyPullProvider(ExternalKey, requiresOptIn: true);
-            await using var db = _fixture.NewDbContext();
+            await using var db = Db.NewDbContext();
             var orchestrator = new QuoteOrchestrator(
                 db,
                 new IQuotePullProvider[] { holdings, external },
@@ -48,7 +49,7 @@ public sealed class QuoteOptInGatingTests
         }
 
         // Case 2: enable the external provider in the user's quotes pref → it runs.
-        await using (var seed = _fixture.NewDbContext())
+        await using (var seed = Db.NewDbContext())
         {
             await new UserPreferencesRepository(seed, TimeProvider.System).SetQuotesAsync(
                 ledger.UserId, ledger.LedgerId,
@@ -57,7 +58,7 @@ public sealed class QuoteOptInGatingTests
         {
             var holdings = new SpyPullProvider(SimpleFinHoldingsQuoteProvider.Key, requiresOptIn: false);
             var external = new SpyPullProvider(ExternalKey, requiresOptIn: true);
-            await using var db = _fixture.NewDbContext();
+            await using var db = Db.NewDbContext();
             var orchestrator = new QuoteOrchestrator(
                 db,
                 new IQuotePullProvider[] { holdings, external },
@@ -74,7 +75,7 @@ public sealed class QuoteOptInGatingTests
     [Fact]
     public async Task Egress_provider_excludes_non_public_quote_symbol()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
 
         // A public security (bare ticker — always public) and a private / feed-only
@@ -87,7 +88,7 @@ public sealed class QuoteOptInGatingTests
         await ledger.AddHoldingAsync(brokerage.HoldingsAccountId!.Value, privateId, 5m, 500m);
 
         // Enable the external (egress) provider so it actually runs.
-        await using (var seed = _fixture.NewDbContext())
+        await using (var seed = Db.NewDbContext())
         {
             await new UserPreferencesRepository(seed, TimeProvider.System).SetQuotesAsync(
                 ledger.UserId, ledger.LedgerId,
@@ -96,7 +97,7 @@ public sealed class QuoteOptInGatingTests
 
         var holdings = new SpyPullProvider(SimpleFinHoldingsQuoteProvider.Key, requiresOptIn: false);
         var external = new SpyPullProvider(ExternalKey, requiresOptIn: true);
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var orchestrator = new QuoteOrchestrator(
             db,
             new IQuotePullProvider[] { holdings, external },

@@ -3,8 +3,8 @@
 #
 # Fresh installs get this from docker-compose.yml's POSTGRES_INITDB_ARGS
 # (--auth-local/--auth-host=scram-sha-256). But initdb runs exactly once, on the
-# first boot of an empty data directory, so an install created before that landed
-# keeps initdb's defaults in its PGDATA:
+# first boot of an empty data directory, so a PGDATA initialised without those
+# flags keeps initdb's defaults:
 #
 #   local all all           trust
 #   host  all all 127.0.0.1 trust
@@ -51,7 +51,7 @@ BACKUP="$HBA.pre-harden"
 die() { echo "[harden-pg-hba] ERROR: $*" >&2; exit 1; }
 info() { echo "[harden-pg-hba] $*"; }
 
-read_env() { grep -E "^$1=" "$env_path" 2>/dev/null | head -1 | cut -d= -f2- || true; }
+read_env() { grep -E "^$1=" "$env_path" 2>/dev/null | sed -n 1p | cut -d= -f2- || true; }
 
 # Credentials come from the secret files (docker-compose `secrets:`), falling
 # back to .env for an install that predates the move. Reading only .env would

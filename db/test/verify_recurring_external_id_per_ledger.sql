@@ -1,6 +1,6 @@
 -- Verify uq_recurring_external_id is PER-LEDGER (migration 162), not global.
 -- The rule: a Moneydance reminder external_id must be unique WITHIN a ledger
--- (idempotent re-import of that ledger's feed), but the SAME external_id must be
+-- (the per-ledger dedup key inside one seeding import), but the SAME external_id must be
 -- allowed in a DIFFERENT ledger — otherwise importing the same MD export into a
 -- second ledger collides (the bug this migration fixes). NULL external_ids
 -- (manual reminders) are exempt via the partial index.
@@ -27,7 +27,7 @@ INSERT INTO recurring_transactions (ledger_id, external_id, start_date)
 VALUES ('dddddddd-1111-1111-1111-dddddddddddd', 'md-reminder-1', DATE '2026-01-01');
 
 -- Test 2 (reject): the same external_id AGAIN in ledger A must still violate the
--- index — within-ledger idempotency is preserved.
+-- index — the per-ledger dedup key holds.
 DO $$
 BEGIN
     BEGIN

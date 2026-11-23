@@ -9,7 +9,7 @@
 `accounts.is_active` exists for **one** purpose: the inactive-account lifecycle — hide closed accounts from pickers and the sidebar by default (a *presentation* concern). It leaked into reporting: the current net-worth (`OverviewRepository`) and `net_worth_history` (`AccountsReportingRepository`) queries filtered `WHERE is_active`, and `net_worth_history` compounded it by treating the *current* active set as static across the whole window.
 
 Consequences:
-- **Historical undercount.** An account open during period T but since closed (e.g. a 401(k) rolled over mid-window) was dropped from **every** historical point — the as-of feeder was never even asked to value it. Net-worth history understated reality for as long as the account had been closed (found on a real ledger as a large spurious step when the closed account "disappeared").
+- **Historical undercount.** An account open during period T but since closed was dropped from **every** historical point — the as-of feeder was never even asked to value it. Net-worth history understated reality for as long as the account had been closed (it shows as a spurious step at the point the closed account "disappears").
 - **Current undercount.** A closed account still holding value was excluded from *current* net worth too.
 
 There is no valid reason to exclude a closed account from a valuation: a report reflects what value existed (then or now); whether an account is currently surfaced in the UI is irrelevant to what it is worth.

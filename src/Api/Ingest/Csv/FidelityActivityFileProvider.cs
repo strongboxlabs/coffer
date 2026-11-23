@@ -84,9 +84,9 @@ public sealed class FidelityActivityFileProvider : IFileProvider
                 AccountId: null));
         }
 
-        // Scanned ONCE. This was RecordAt(qif, i) inside the loop, which re-split the
-        // whole document per row: quadratic in rows, and eager, so the early return
-        // saved nothing. A 5 MB export — which the endpoint's own cap admits — is ~20000
+        // Scanned ONCE. RecordAt(qif, i) inside the loop would re-split the whole
+        // document per row: quadratic in rows, and eager, so an early return would
+        // save nothing. A 5 MB export — which the endpoint's own cap admits — is ~20000
         // rows over ~120000 lines, i.e. billions of substring allocations in one request.
         var records = QifRecords(converted.Qif);
 

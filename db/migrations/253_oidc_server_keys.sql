@@ -2,9 +2,9 @@
 --
 -- They were two plaintext files under data/openiddict (signing.pem, encryption.key), on
 -- the data volume but outside the database, so no backup carried them: restored onto a
--- new host, every MCP token failed with ID2004 and every connector had to re-authorize.
+-- new host, every MCP token fails with ID2004 and every connector has to re-authorize.
 -- The files were also written 0644 and non-atomically, so a crash mid-write of
--- signing.pem bricked boot (FU-069).
+-- signing.pem can leave boot unable to start (FU-069).
 --
 -- Now sealed under the master KEK, like the backup passphrase and the Drive token, so a
 -- backup takes them, rotation re-wraps them and post-restore reconciliation replaces a

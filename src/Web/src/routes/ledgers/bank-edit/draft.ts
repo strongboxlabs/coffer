@@ -1,6 +1,7 @@
 import { toDateInputValue, todayInputValue } from '@/lib/dates';
 
 import { emptyDraft, prefillToDraft, seedToDraft, type PostingDraft } from './postingDraft';
+import type { NotesBaseline } from './notesBody';
 import type { TxnRowMode } from '../TxnRowEdit';
 
 /**
@@ -81,12 +82,30 @@ export function seedTransactedAt(mode: TxnRowMode): string {
 }
 
 /**
- * Slice 2c.6b: tag set. In edit mode seeds from the row's current tags; in new
- * mode starts empty. The save handler sends `tags: <this list>` so the server's
- * replace-semantics produces exactly this membership.
+ * The Tags field. In edit mode seeds from this side's own tags (a one-split)
+ * or the transaction's (a split); in new mode from the Duplicate prefill, else
+ * empty.
  */
 export function seedTags(mode: TxnRowMode): readonly string[] {
-    return mode.kind === 'new' ? [] : mode.tags;
+    return mode.kind === 'new' ? (mode.prefill?.tags ?? []) : mode.tags;
+}
+
+/**
+ * What a save compares against to decide which notes changed. Taken from the
+ * mode, so it is the values the editor opened with, whatever the user then
+ * typed. Idempotent, unlike `seedPostings`: it mints no keys.
+ */
+export function seedNotesBaseline(mode: TxnRowMode): NotesBaseline {
+    return { memo: seedMemo(mode), tags: seedTags(mode) };
+}
+
+/**
+ * True when nothing is stored for what the editor holds: a create, which the
+ * server measures the tag limit from zero for and which sends every value that
+ * is not blank. A stored template edited through the create form is not one.
+ */
+export function seedIsCreate(mode: TxnRowMode): boolean {
+    return mode.kind === 'new' && mode.prefillIsStored !== true;
 }
 
 /**
@@ -96,13 +115,23 @@ export function seedTags(mode: TxnRowMode): readonly string[] {
  * Duplicate seeds 1..N postings (single row = N=1, split = N); the form opens
  * with one empty posting when there is no prefill, because a single row is just
  * the N=1 case and there is no separate "convert to split" path.
+ *
+ * `currency` is the source posting's (the editor's `currency`): each amount is seeded
+ * at its places, keeping every digit a stored figure carries beyond them (ADR-0114 D15).
+ * `currencyOf` gives a counterparty's currency, the places a stored or copied second
+ * amount is seeded at (ADR-0114 D14); without it the second amount pads nothing.
  */
-export function seedPostings(mode: TxnRowMode): PostingDraft[] {
+export function seedPostings(
+    mode: TxnRowMode,
+    currency: string | null,
+    currencyOf: (accountId: string | null) => string | null = () => null,
+): PostingDraft[] {
     if (mode.kind === 'new') {
         const seeds = mode.prefill?.postings;
         return seeds && seeds.length > 0
-            ? seeds.map((p) => prefillToDraft(p))
+            ? seeds.map((p) => prefillToDraft(
+                p, currency, mode.prefillIsStored === true, currencyOf(p.counterpartyAccountId)))
             : [emptyDraft()];
     }
-    return mode.postings.map((s) => seedToDraft(s));
+    return mode.postings.map((s) => seedToDraft(s, currency, currencyOf(s.counterpartyAccountId)));
 }

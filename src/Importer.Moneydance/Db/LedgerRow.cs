@@ -6,9 +6,8 @@ namespace Coffer.Importer.Moneydance.Db;
 /// <c>ledger_id</c>, derived tables inherit transitively.
 /// </summary>
 /// <remarks>
-/// There is deliberately no well-known "default" ledger id (ADR-0088). Migration
-/// 014 used to seed one at …0001 and callers fell back to it when no ledger was
-/// named; migration 186 drops that row, so every caller now has to say which
+/// There is deliberately no well-known "default" ledger id (ADR-0088): migration
+/// 186 drops the …0001 row migration 014 seeds, so every caller has to say which
 /// ledger it means. <see cref="SystemUserId"/> is a different thing and still
 /// real — the seeded system *user*, not a ledger.
 /// </remarks>
@@ -19,8 +18,8 @@ public sealed record LedgerRow(
 {
     /// <summary>
     /// The bootstrap "system" user (migration 014) — a service identity, not a
-    /// human. The CLI importer grants it ownership of any ledger it creates.
-    /// UI-driven imports pass the importing human's id instead so the ledger is
+    /// human. The reconcile diagnostic's scratch ledger, which never commits, is
+    /// created under it. Imports pass the importing human's id so the ledger is
     /// owned by the person who created it (ADR-0071 D2).
     /// </summary>
     public static readonly Guid SystemUserId =

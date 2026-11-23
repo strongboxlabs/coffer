@@ -26,8 +26,9 @@ public sealed class DriveClientHelpersTests
     [Fact]
     public async Task A_listing_is_read_through_every_page_not_just_the_first()
     {
-        // Before: one page of 1000 and the next-page token ignored, so a folder of 1001
-        // looked 1000 files long and the mirror acted on a remote set it had not fully seen.
+        // Reading one page of 1000 and ignoring the next-page token would make a folder of
+        // 1001 look 1000 files long, and the mirror would act on a remote set it had not
+        // fully seen.
         var all = await DrivePaging.ReadAllAsync(
             Pages(([1, 2], "t1"), ([3, 4], "t2"), ([5], null)), default);
 

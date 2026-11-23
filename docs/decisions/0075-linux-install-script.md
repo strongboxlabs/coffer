@@ -1,7 +1,9 @@
 # 0075 — Self-contained Linux install script
 
 Status: Accepted — amended by [ADR-0094](0094-restore-is-ui-only-and-the-kek-has-no-env-channel.md): the installer no
-longer asks "restoring a backup?" and no longer writes a master key into `.env`.
+longer asks "restoring a backup?" and no longer writes a master key into `.env`; amended by
+[ADR-0110](0110-upgrade-from-the-app.md): `install.sh` is a callable contract, and a private
+fork's tokens may be held on the host.
 Date: 2026-07-10
 Relates: [ADR-0059](0059-deployment-packaging.md), [ADR-0060](0060-whole-db-backup-and-admin-role.md), [ADR-0071](0071-install-provisioning-ui-import-authed-restore.md)
 
@@ -15,6 +17,8 @@ from source — neither is a public installer. An operator had to hand-write a
 > `provision.sh` was retired by [ADR-0088](0088-setup-asks-one-question.md);
 > ledger state is now chosen on the setup form. Nothing else here changes — this
 > ADR's installer never called it.
+>
+> *Amended 2026-11-19:* setup no longer chooses any ledger state. Every install starts on an empty hub, where a Demo is added ([ADR-0115](0115-the-demo-is-generated-imported-and-seeded-from-the-hub.md)). The installer is unaffected.
 
 ## Decisions
 
@@ -64,10 +68,11 @@ rebuilds the latest release on fresh base images and replaces its record, so pat
 runtimes reach installs between releases.
 
 *Amended 2026-10-20 (0.123.0):* the upgrade is one command, `bash ~/coffer/upgrade.sh
-[version]`. Upgrading meant fetching that release's `install.sh` by hand, with a token for
-a private fork. The first production upgrade to 0.122.0 changed the tag in `.env`
-instead and crash-looped, because that skipped the volume hand-over the release's
-`install.sh` does.
+[version]`. Without it, upgrading means fetching that release's `install.sh` by hand, with
+a token for a private fork. Changing the tag in `.env` instead skips the volume hand-over
+the release's `install.sh` does, and from 0.122.0 the API then refuses to start and the
+container restarts in a loop ([ADR-0059](0059-deployment-packaging.md), 2026-10-20
+amendment).
 - `install.sh` now puts `scripts/upgrade.sh` in the install directory on every run, by
   rename, so the running copy is never overwritten. It also records `COFFER_REPO` in
   `.env`.
@@ -78,6 +83,22 @@ instead and crash-looped, because that skipped the volume hand-over the release'
   takes the two tokens from the environment, or prompts for them.
 
 An install from before 0.123.0 has no `upgrade.sh`, and is upgraded once by hand.
+
+*Amended 2026-10-31 ([ADR-0110](0110-upgrade-from-the-app.md)):* the upgrade can also be started
+from the app. A host script, `app-upgrades.sh`, runs from the install user's crontab and runs
+`upgrade.sh` for a request the app left in a mailbox volume.
+- `install.sh` is a callable contract. `COFFER_UNATTENDED=1` runs an in-place upgrade to the
+  named release with no prompt and no sudo. The run checks everything before it changes
+  anything (the fetched compose resolves, the image pulls) and exits 10 when that fails with
+  nothing changed, 11 on a failure before the first change, 12 after it and 14 when the
+  readiness wait times out. `upgrade.sh` adds 13, a fetched `install.sh` without the contract
+  marker. `coffer-phase:` lines say where a run is.
+- `.env.bak` and `docker-compose.yml.bak` stay one generation, but a run that did not finish no
+  longer replaces them, so repeating a failed run keeps the state before the first attempt.
+- `install.sh` puts `app-upgrades.sh` in the install directory, installs its cron line when the
+  host can run it, and never re-enables a host where it was disabled.
+- The two tokens above ("stored nowhere") may now be stored on the host, in `upgrades/secrets/`,
+  by `app-upgrades.sh set-token`, for a fork that wants upgrades from the app.
 
 ### D2 — Interactive; localhost or domain only (no bare IP)
 
@@ -101,8 +122,8 @@ takes its origin (default `https://mcp.<domain>`), written to `.env` as
 host — is an allowed WebAuthn origin; without it, sign-in on an MCP subdomain
 fails with an origin mismatch even though `RpId` (the parent domain) already
 covers the subdomain. The subdomain's DNS / reverse-proxy stays the operator's
-job (ADR-0059). Provisioning it here is the fix for that gap — the first cut only
-wired `Origins__0`.
+job (ADR-0059). Provisioning it here closes that gap; wiring only `Origins__0`
+leaves it open.
 
 ### D3 — Local secret generation + wipe option
 

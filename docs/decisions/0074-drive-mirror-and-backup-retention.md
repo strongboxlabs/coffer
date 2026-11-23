@@ -10,8 +10,7 @@ ADR-0062 gave the Google Drive backup destination its **own** retention (GFS tie
 on `drive_sync`), pruned independently of local backups. Combined with a separate
 count-based local retention (`ApiOptions`, startup-only), the two sets diverged
 **by design** — the Drive folder was an independent archive, not a copy of what
-the app shows. In practice that produced a folder the user couldn't reconcile
-with the app's backup list:
+the app shows. Such a folder cannot be reconciled with the app's backup list:
 
 - **orphans** — Drive's GFS kept tiers local had already pruned, and a local
   delete never propagated to Drive;
@@ -19,8 +18,7 @@ with the app's backup list:
   (it only stripped `.cofferbak`), so they accumulated forever;
 - **uncorrelatable names** — no way to line a Drive file up with a UI row.
 
-The user's requirement was simple: **the folder should equal the app's backup
-list.** Separately, retention was startup-only config — no way to change it
+The requirement: **the folder equals the app's backup list.** Separately, retention was startup-only config — no way to change it
 without a redeploy, and no UI.
 
 ## Decisions
@@ -49,7 +47,7 @@ single source of truth: `BackupManager` resolves it and hands it to `BackupStore
 at prune time (no longer a startup `ApiOptions` value) and — since Drive mirrors
 local — it transitively governs the Drive folder too. Replaces the former
 `ApiOptions.Retention*` config. The 3-tier GFS model is kept (not simplified to
-keep-last-N), per the user's choice.
+keep-last-N).
 
 ### D3 — Restore resets the Drive connection
 
@@ -65,15 +63,15 @@ is KEK-unusable across installs anyway.
 
 (Note: the authed-admin restore already validates the backup's KEK fingerprint vs
 the install's KEK and warns on mismatch — ADR-0071 D4. That check is *not* on the
-CLI / bootstrap restore paths, which is how a dev clone can silently land on a
-mismatched KEK.)
+CLI / bootstrap restore paths, so a dev clone restored through them can land on a
+mismatched KEK without a warning.)
 
 ## Consequences
 
 - The Drive folder always equals the app's backup list (to within the latest
   sync). The first mirror after upgrading sweeps pre-existing extras — legacy
   formats, orphans, and any deeper history Drive held beyond local — a clean
-  sweep the user explicitly chose.
+  sweep. *(Reversed by the 2026-10-16 amendment below.)*
 - Changing the retention policy takes effect on the next backup, for both local
   and Drive.
 - The `drive_sync` "phantom" / uncorrelatable-name issues (the parked ADR-0062
@@ -82,10 +80,10 @@ mismatched KEK.)
 
 ## Amendment — 2026-10-16: the mirror deletes only what this install put there
 
-D1's delete rule — remove every Drive file whose id is not a current local backup — had
-one guard, skip when the local set is empty, and it never fired: the mirror runs straight
+D1's delete rule — remove every Drive file whose id is not a current local backup — has
+one guard, skip when the local set is empty, and it cannot fire: the mirror runs straight
 after a backup, so the set always holds that backup. Point the backup directory at a new
-volume, or mount an empty one, and the next backup left one local file and deleted every
+volume, or mount an empty one, and the next backup leaves one local file and deletes every
 older Drive copy (FU-064). The off-site history is exactly what such a mistake should not
 be able to reach.
 
@@ -101,9 +99,8 @@ The last condition is what an emptied or swapped folder meets: the other Drive c
 still count toward the policy, so only the genuinely aged ones go. Deleting a backup in
 the UI still removes its Drive copy at the next sync, as before.
 
-**What this reverses, by the maintainer's choice of 2026-10-16:** D1 swept strays and
-legacy `*.ledgrbak` files, and the Consequences below call that "a clean sweep the user
-explicitly chose". Those files are now left alone, because "never delete what this install
+**What this reverses:** D1 swept strays and legacy `*.ledgrbak`
+files, the "clean sweep" in the Consequences above. Those files are now left alone, because "never delete what this install
 did not upload" admits no exception for them; the mirror logs how many it left. The
 connection that created them is gone, and a restore or a disconnect clears the list, so a
 later connection never deletes on an earlier one's word.

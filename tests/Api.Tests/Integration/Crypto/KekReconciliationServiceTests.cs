@@ -19,18 +19,17 @@ namespace Coffer.Api.Tests.Integration.Crypto;
 /// <remarks>
 /// "Foreign" material is sealed under a DIFFERENT key from the fixture's (32 zero
 /// bytes), which is what a cross-install restore produces. Unlike
-/// <see cref="KekRotationServiceTests"/> — which deliberately reuses the fixture
-/// bytes so it can't disturb other tests' ledgers in the shared database — these
-/// tests must use genuinely different key material, because trial-decrypt failure
-/// IS the behaviour. That's safe because reconciliation only ever touches rows it
-/// cannot open, and every other test's rows are wrapped under the fixture key.
+/// <see cref="KekRotationServiceTests"/>, which reuses the fixture bytes, these tests
+/// must use genuinely different key material, because trial-decrypt failure IS the
+/// behaviour.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class KekReconciliationServiceTests
+public sealed class KekReconciliationServiceTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public KekReconciliationServiceTests(PostgresFixture fixture) => _fixture = fixture;
+    public KekReconciliationServiceTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     /// <summary>The key the app runs under — ApiFactory pins 32 zero bytes.</summary>
     private static MasterKey LocalKey => new(new byte[32], "v1");
@@ -47,7 +46,7 @@ public sealed class KekReconciliationServiceTests
     }
 
     private KekReconciliationService NewService() => new(
-        _fixture.NewServiceFactory(),
+        Db.NewServiceFactory(),
         new LedgerKeyService(LocalKey),
         NullLogger<KekReconciliationService>.Instance, TimeProvider.System);
 
@@ -59,7 +58,7 @@ public sealed class KekReconciliationServiceTests
     /// </summary>
     private async Task SetBackupPassphraseAsync(MasterKey sealUnder, string passphrase)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var job = await db.GlobalScheduledJobs
             .SingleOrDefaultAsync(j => j.JobType == GlobalJobTypes.Backup);
         if (job is null)
@@ -83,7 +82,7 @@ public sealed class KekReconciliationServiceTests
     private async Task<Guid> InsertLedgerAsync(MasterKey wrapUnder, string kekId)
     {
         var id = Guid.NewGuid();
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         db.Ledgers.Add(new LedgerRow
         {
             Id = id,
@@ -107,7 +106,7 @@ public sealed class KekReconciliationServiceTests
         var result = await NewService().ReconcileAsync();
 
         Assert.True(result.LedgersRekeyed >= 1);
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.Ledgers.AsNoTracking().SingleAsync(l => l.Id == ledgerId);
         Assert.Equal("v1", row.LekKekId);
         // The point of minting rather than nulling: the ledger stays fully
@@ -120,12 +119,12 @@ public sealed class KekReconciliationServiceTests
     {
         var ledgerId = await InsertLedgerAsync(LocalKey, "v1");
         byte[] before;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             before = (await db.Ledgers.AsNoTracking().SingleAsync(l => l.Id == ledgerId)).WrappedLek!;
 
         await NewService().ReconcileAsync();
 
-        await using var after = _fixture.NewDbContext();
+        await using var after = Db.NewDbContext();
         var row = await after.Ledgers.AsNoTracking().SingleAsync(l => l.Id == ledgerId);
         Assert.Equal(before, row.WrappedLek);
     }
@@ -138,7 +137,7 @@ public sealed class KekReconciliationServiceTests
         // connection until the next sync failed.
         var ledgerId = await InsertLedgerAsync(ForeignKey, "source-v1");
         var connectionId = Guid.NewGuid();
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             db.FeedConnections.Add(new FeedConnectionRow
             {
@@ -156,7 +155,7 @@ public sealed class KekReconciliationServiceTests
         var result = await NewService().ReconcileAsync();
 
         Assert.True(result.FeedConnectionsNeedingReauth >= 1);
-        await using var check = _fixture.NewDbContext();
+        await using var check = Db.NewDbContext();
         var conn = await check.FeedConnections.AsNoTracking().SingleAsync(f => f.Id == connectionId);
         Assert.Null(conn.AccessUrlCiphertext);
         Assert.Equal("needs_reauth", conn.Status);
@@ -175,7 +174,7 @@ public sealed class KekReconciliationServiceTests
         var result = await NewService().ReconcileAsync();
 
         Assert.True(result.BackupPassphraseCleared);
-        await using var check = _fixture.NewDbContext();
+        await using var check = Db.NewDbContext();
         var after = await check.GlobalScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.JobType == GlobalJobTypes.Backup);
         Assert.Null(after.PassphraseCiphertext);
@@ -190,7 +189,7 @@ public sealed class KekReconciliationServiceTests
         var result = await NewService().ReconcileAsync();
 
         Assert.False(result.BackupPassphraseCleared);
-        await using var check = _fixture.NewDbContext();
+        await using var check = Db.NewDbContext();
         var after = await check.GlobalScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.JobType == GlobalJobTypes.Backup);
         Assert.NotNull(after.PassphraseCiphertext);
@@ -202,10 +201,11 @@ public sealed class KekReconciliationServiceTests
     [Fact]
     public async Task An_empty_passphrase_is_nothing_sealed_here_as_it_is_to_rotation()
     {
-        // FU-095: rotation leaves an empty ciphertext alone; reconciliation took it for an
-        // unopenable one, cleared it, disabled the schedule and reported a lost secret.
+        // FU-095: rotation leaves an empty ciphertext alone, and so must reconciliation —
+        // taking it for an unopenable one would clear it, disable the schedule and report
+        // a lost secret.
         await SetBackupPassphraseAsync(LocalKey, "placeholder");
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var job = await db.GlobalScheduledJobs.SingleAsync(j => j.JobType == GlobalJobTypes.Backup);
             job.PassphraseCiphertext = [];
@@ -215,7 +215,7 @@ public sealed class KekReconciliationServiceTests
         var result = await NewService().ReconcileAsync();
 
         Assert.False(result.BackupPassphraseCleared);
-        await using var check = _fixture.NewDbContext();
+        await using var check = Db.NewDbContext();
         var after = await check.GlobalScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.JobType == GlobalJobTypes.Backup);
         Assert.NotNull(after.PassphraseCiphertext);
@@ -225,7 +225,7 @@ public sealed class KekReconciliationServiceTests
     // --- OAuth server keys (FU-069) ----------------------------------------
 
     private Coffer.Api.Auth.OpenIddictKeyMaterial NewOauthKeys() => new(
-        _fixture.NewServiceFactory(), TimeProvider.System,
+        Db.NewServiceFactory(), TimeProvider.System,
         NullLogger<Coffer.Api.Auth.OpenIddictKeyMaterial>.Instance);
 
     private static string NoLegacyKeys =>
@@ -234,7 +234,8 @@ public sealed class KekReconciliationServiceTests
     [Fact]
     public async Task Discards_oauth_server_keys_sealed_under_another_key_so_the_boot_after_mints_a_pair()
     {
-        await using (var db = _fixture.NewDbContext())
+        // The template carries the pair a first boot stores; these tests seal their own.
+        await using (var db = Db.NewDbContext())
             await db.OidcServerKeys.ExecuteDeleteAsync();
         Assert.True(await NewOauthKeys().LoadAsync(new LedgerKeyService(ForeignKey), NoLegacyKeys));
 
@@ -242,7 +243,7 @@ public sealed class KekReconciliationServiceTests
 
         Assert.True(result.OauthKeysDiscarded);
         Assert.True(result.AnythingChanged);
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             Assert.False(await db.OidcServerKeys.AnyAsync());
         // The boot load that follows reconciliation finds no pair and stores one that opens.
         Assert.True(await NewOauthKeys().LoadAsync(new LedgerKeyService(LocalKey), NoLegacyKeys));
@@ -251,17 +252,17 @@ public sealed class KekReconciliationServiceTests
     [Fact]
     public async Task Keeps_oauth_server_keys_this_install_opens()
     {
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             await db.OidcServerKeys.ExecuteDeleteAsync();
         Assert.True(await NewOauthKeys().LoadAsync(new LedgerKeyService(LocalKey), NoLegacyKeys));
         byte[] before;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             before = (await db.OidcServerKeys.AsNoTracking().SingleAsync()).SigningKeyCiphertext;
 
         var result = await NewService().ReconcileAsync();
 
         Assert.False(result.OauthKeysDiscarded);
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             Assert.Equal(before, (await db.OidcServerKeys.AsNoTracking().SingleAsync()).SigningKeyCiphertext);
     }
 

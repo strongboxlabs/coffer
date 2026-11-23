@@ -3,7 +3,9 @@
     <Project Path="src/Api/Api.csproj" />
     <Project Path="src/Importer.Moneydance/Importer.Moneydance.csproj" />
     <Project Path="src/Importer.Moneydance.Cli/Importer.Moneydance.Cli.csproj" />
+    <Project Path="src/Coffer.Domain.Annotations/Coffer.Domain.Annotations.csproj" />
     <Project Path="src/Coffer.Domain.Investment/Coffer.Domain.Investment.csproj" />
+    <Project Path="src/Coffer.Domain.Money/Coffer.Domain.Money.csproj" />
     <Project Path="src/Coffer.Domain.Reminders/Coffer.Domain.Reminders.csproj" />
   </Folder>
   <Folder Name="/tests/">

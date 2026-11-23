@@ -40,10 +40,10 @@ describe('ScheduleControl — timezone display honesty (C)', () => {
 });
 
 describe('ScheduleControl — job health', () => {
-    // Every case here is DISABLED. That is deliberate: the control used to gate all
-    // run information behind `enabled && nextRunAt`, so a job the scheduler switched
-    // off rendered nothing at all — the one state worth showing was the one state
-    // hidden. A health test written with `enabled: true` would pass against that bug.
+    // Every case here is DISABLED. That is deliberate: gating all run information
+    // behind `enabled && nextRunAt` would render nothing for a job the scheduler
+    // switched off — hiding the one state worth showing. A health test written with
+    // `enabled: true` would pass against that.
     const off = {
         enabled: false, hourLocal: 19, minuteLocal: 0, timezone: 'UTC', nextRunAt: null,
     };
@@ -78,10 +78,9 @@ describe('ScheduleControl — job health', () => {
         // from the loaded state. So the wait anchors on a time that differs from the
         // 19:00 the control falls back to while the query is unresolved.
         //
-        // Without that wait this test cannot fail. It was shipped that way, and a
-        // mutation widening the failure branch to `|| !schedule.enabled` — which
-        // renders "Switched off automatically after 0 failed runs" over a job the
-        // operator turned off by hand — left it green.
+        // Without that wait this test cannot fail: widening the failure branch to
+        // `|| !schedule.enabled` — which renders "Switched off automatically after 0
+        // failed runs" over a job the operator turned off by hand — would leave it green.
         renderControl({
             ...off, hourLocal: 6, minuteLocal: 30,
             consecutiveFailures: 0, disabledReason: null,
@@ -184,7 +183,7 @@ describe('ScheduleControl — a job switched on elsewhere', () => {
      * Reminder auto-post. Ticking "Auto-post / N days before" on a reminder IS the
      * opt-in, and the API turns the job on when a reminder first asks for it. A second
      * checkbox here would be a switch the user has to go and find before their first
-     * tick did anything — the original defect, one level up.
+     * tick did anything — the two-switch defect ADR-0097 removes, one level up.
      */
     it('offers no on/off checkbox, only the time', async () => {
         renderControl(
@@ -204,10 +203,10 @@ describe('ScheduleControl — a job switched on elsewhere', () => {
      * disabled state: it runs because a reminder asked to be auto-posted and stops
      * because none does.
      *
-     * A "Turn back on" control shipped here briefly, and appeared for jobs nobody had
-     * ever turned on — GET synthesizes `enabled: false` when no row exists, so
-     * "configured and off" and "never configured" were indistinguishable. The button was
-     * built for a state that should not exist; deleting the state deleted the bug.
+     * A "Turn back on" control would appear for jobs nobody had ever turned on — GET
+     * synthesizes `enabled: false` when no row exists, so "configured and off" and
+     * "never configured" are indistinguishable. Such a button serves a state that
+     * should not exist; the job has no disabled state instead.
      */
     it('offers no way to switch it on or off, even when the stored row is off', async () => {
         renderControl(
@@ -220,17 +219,17 @@ describe('ScheduleControl — a job switched on elsewhere', () => {
 
         // findByDisplayValue, NOT findByLabelText: the input renders on the pending frame
         // too, with the 19:00 fallback, so waiting on the label proves nothing about the
-        // loaded state and both assertions below would be vacuous. Verified by mutation.
+        // loaded state and both assertions below would be vacuous.
         expect(await screen.findByDisplayValue('05:00')).toBeTruthy();
         expect(screen.queryByRole('checkbox')).toBeNull();
         expect(screen.queryByRole('button', { name: /turn back on/i })).toBeNull();
     });
 
     /*
-     * And setting a time must never write `enabled: false`. That is the bug that made
-     * this worse than cosmetic: adjusting the time before any auto-post reminder existed
-     * created a DISABLED row, and since a reminder only creates the schedule when absent
-     * — never flipping an existing one — auto-post could then never turn itself on.
+     * And setting a time must never write `enabled: false`. Adjusting the time before
+     * any auto-post reminder exists would otherwise create a DISABLED row, and since a
+     * reminder only creates the schedule when absent — never flipping an existing one —
+     * auto-post could then never turn itself on.
      */
     it('saves a time change as enabled, even when the stored row says off', async () => {
         const { saved } = renderControl(

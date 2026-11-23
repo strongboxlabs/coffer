@@ -10,7 +10,7 @@ using Coffer.Api.Errors;
 namespace Coffer.Api.Endpoints;
 
 /// <summary>
-/// Starts a fresh passkey tap for one sensitive action (2026-10-12 audit, M2). The
+/// Starts a fresh passkey tap for one sensitive action (ADR-0105 D1). The
 /// client runs the returned ceremony and sends the result in the
 /// <see cref="StepUpGuard.HeaderName"/> header of the request it is approving.
 /// </summary>

@@ -21,13 +21,11 @@ namespace Coffer.Api.Tests.Integration.Accounts;
 /// ledger must 422.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class SecuritiesEndpointsTests
+public sealed class SecuritiesEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SecuritiesEndpointsTests(PostgresFixture fixture)
+    public SecuritiesEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -48,15 +46,15 @@ public sealed class SecuritiesEndpointsTests
         // OWNS its day — posting a second price for the same (security, day)
         // REPLACES the first in place (no duplicate row, no 4xx), rather than
         // rejecting as it did under the timestamp-keyed model.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var securityId = await ledger.AddSecurityAsync(name: "Index Fund A", ticker: "IDXA");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var basePath = $"/api/ledgers/{ledger.LedgerId}/securities/{securityId}/prices";
 
         var first = await client.PostAsJsonAsync(basePath,
-            new { price = 200m, priceDate = new DateOnly(2026, 5, 1) });
+            new { price = 200m, priceDate = new DateOnly(2026, 5, 1), currencyCode = "USD" });
         Assert.Equal(HttpStatusCode.Created, first.StatusCode);
 
         // Same day, different price → replace in place.
@@ -64,7 +62,7 @@ public sealed class SecuritiesEndpointsTests
             new { price = 211.50m, priceDate = new DateOnly(2026, 5, 1) });
         Assert.Equal(HttpStatusCode.Created, second.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var rows = await db.SecurityPrices.AsNoTracking()
             .Where(p => p.SecurityId == securityId)
             .ToListAsync();
@@ -79,14 +77,14 @@ public sealed class SecuritiesEndpointsTests
     {
         // The prices table shows where each price came from (security_prices.source)
         // so SimpleFIN-derived rows are distinguishable from manual / imported ones.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var securityId = await ledger.AddSecurityAsync(name: "Index Fund A", ticker: "IDXA");
         await ledger.AddSecurityPriceAsync(
             securityId, 200m, new DateTime(2026, 4, 1), source: PriceSource.Import);
         await ledger.AddSecurityPriceAsync(
             securityId, 211m, new DateTime(2026, 5, 1), source: PriceSource.Simplefin);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var resp = await client.GetAsync(
             $"/api/ledgers/{ledger.LedgerId}/securities/{securityId}/prices");
@@ -107,12 +105,12 @@ public sealed class SecuritiesEndpointsTests
         // float noise can't be stored — the DB rounds on write regardless of the
         // producer. A value carrying single-precision noise out to 12dp lands
         // at 4dp, with the noise rounded away.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var securityId = await ledger.AddSecurityAsync(name: "Index Fund A", ticker: "IDXA");
         await ledger.AddSecurityPriceAsync(
             securityId, 3.450000047684m, new DateTime(2026, 5, 1), source: PriceSource.Import);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var price = await db.SecurityPrices.AsNoTracking()
             .Where(p => p.SecurityId == securityId)
             .SingleAsync();
@@ -122,7 +120,7 @@ public sealed class SecuritiesEndpointsTests
     [Fact]
     public async Task List_returns_catalog_with_total_quantity_and_latest_price()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var idxa = await ledger.AddSecurityAsync(
             name: "Index Fund A", ticker: "IDXA", assetClass: "equity");
@@ -132,7 +130,7 @@ public sealed class SecuritiesEndpointsTests
         await ledger.AddSecurityPriceAsync(idxa, 200m, new DateTime(2026, 4, 1));
         await ledger.AddSecurityPriceAsync(idxa, 225m, new DateTime(2026, 5, 1));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.GetAsync(
@@ -157,12 +155,12 @@ public sealed class SecuritiesEndpointsTests
     [Fact]
     public async Task List_search_filters_case_insensitive_substring()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await ledger.AddSecurityAsync(name: "Index Fund A", ticker: "IDXA");
         await ledger.AddSecurityAsync(name: "Money Market Fund A", ticker: "MMFA");
         await ledger.AddSecurityAsync(name: "Broad Market ETF B",    ticker: "ETFB");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // "fund" matches both IDXA and MMFA by name; ETFB doesn't.
@@ -185,7 +183,7 @@ public sealed class SecuritiesEndpointsTests
     [Fact]
     public async Task GetById_returns_hero_data_plus_recent_prices()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var idxa = await ledger.AddSecurityAsync(
             name: "IDXA Fund", ticker: "IDXA", assetClass: "equity");
@@ -197,7 +195,7 @@ public sealed class SecuritiesEndpointsTests
                 idxa, 200m + i, new DateTime(2026, 4, 1).AddDays(i));
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.GetAsync(
@@ -226,11 +224,11 @@ public sealed class SecuritiesEndpointsTests
         // test exercises the API gate too — `security-not-in-ledger`
         // 422 surfaces explicitly rather than the silent 404 a generic
         // "not found" would.
-        var ledgerA = await SyntheticLedger.CreateAsync(_fixture);
-        var ledgerB = await SyntheticLedger.CreateAsync(_fixture);
+        var ledgerA = await SyntheticLedger.CreateAsync(Db);
+        var ledgerB = await SyntheticLedger.CreateAsync(Db);
         var secInB = await ledgerB.AddSecurityAsync(name: "B-only", ticker: "BONLY");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledgerA);
 
         // Ledger A's user requesting ledger B's security via ledger A's
@@ -247,8 +245,8 @@ public sealed class SecuritiesEndpointsTests
     [Fact]
     public async Task Create_inserts_and_returns_new_id()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -274,8 +272,8 @@ public sealed class SecuritiesEndpointsTests
     [Fact]
     public async Task Create_rejects_empty_name()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -290,8 +288,8 @@ public sealed class SecuritiesEndpointsTests
     [Fact]
     public async Task Create_rejects_invalid_asset_class()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -310,10 +308,10 @@ public sealed class SecuritiesEndpointsTests
     [Fact]
     public async Task Create_rejects_duplicate_ticker_case_insensitive_within_ledger()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await ledger.AddSecurityAsync(name: "First", ticker: "IDXA");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Lowercase ticker — the partial unique index keys on LOWER(ticker)
@@ -332,11 +330,11 @@ public sealed class SecuritiesEndpointsTests
     {
         // The whole point of migration 048's per-ledger uniqueness:
         // ledger A and ledger B can each hold STKA.
-        var ledgerA = await SyntheticLedger.CreateAsync(_fixture);
-        var ledgerB = await SyntheticLedger.CreateAsync(_fixture);
+        var ledgerA = await SyntheticLedger.CreateAsync(Db);
+        var ledgerB = await SyntheticLedger.CreateAsync(Db);
         await ledgerA.AddSecurityAsync(name: "Stock A", ticker: "STKA");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var clientB = await AuthedClientAsync(factory, ledgerB);
 
         var response = await clientB.PostAsJsonAsync(
@@ -348,10 +346,10 @@ public sealed class SecuritiesEndpointsTests
     [Fact]
     public async Task Patch_renames_security_and_returns_204()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var sec = await ledger.AddSecurityAsync(name: "Old name", ticker: "OLD");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.PatchAsJsonAsync(
@@ -369,10 +367,10 @@ public sealed class SecuritiesEndpointsTests
     [Fact]
     public async Task Patch_deactivate_flips_is_active()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var sec = await ledger.AddSecurityAsync(name: "Retiring", ticker: "RIP");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.PatchAsJsonAsync(
@@ -389,11 +387,11 @@ public sealed class SecuritiesEndpointsTests
     [Fact]
     public async Task Patch_rejects_cross_ledger_security()
     {
-        var ledgerA = await SyntheticLedger.CreateAsync(_fixture);
-        var ledgerB = await SyntheticLedger.CreateAsync(_fixture);
+        var ledgerA = await SyntheticLedger.CreateAsync(Db);
+        var ledgerB = await SyntheticLedger.CreateAsync(Db);
         var secInB = await ledgerB.AddSecurityAsync(name: "B-only", ticker: "BONLY");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var clientA = await AuthedClientAsync(factory, ledgerA);
 
         var response = await clientA.PatchAsJsonAsync(
@@ -410,8 +408,8 @@ public sealed class SecuritiesEndpointsTests
     {
         // ADR-0054 D2: "not public" only makes sense with a quote symbol to keep
         // private — a bare ticker is always public. Mirrors the mig-156 CHECK.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -432,8 +430,8 @@ public sealed class SecuritiesEndpointsTests
     public async Task Create_allows_private_quote_symbol_and_round_trips()
     {
         // A 529-style feed-only symbol: quote symbol set, marked not public.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -459,10 +457,10 @@ public sealed class SecuritiesEndpointsTests
     public async Task Patch_rejects_marking_not_public_without_quote_symbol()
     {
         // A ticker-only security can't be marked non-public — the ticker is public.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var sec = await ledger.AddSecurityAsync(name: "Ticker only", ticker: "TCK");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.PatchAsJsonAsync(
@@ -479,10 +477,10 @@ public sealed class SecuritiesEndpointsTests
     {
         // Set the quote symbol AND mark it non-public in a single PATCH — the guard
         // sees the freshly-applied symbol (order matters), so this succeeds.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var sec = await ledger.AddSecurityAsync(name: "College Plan 529", ticker: "TCK");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.PatchAsJsonAsync(
@@ -500,8 +498,8 @@ public sealed class SecuritiesEndpointsTests
     [Fact]
     public async Task ListTransactions_returns_404_equivalent_for_unknown_security()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.GetAsync(
@@ -515,18 +513,18 @@ public sealed class SecuritiesEndpointsTests
     /// <summary>
     /// The per-security transactions list (and its total-count badge) must
     /// apply the SAME visibility predicate the register + holdings use: exclude
-    /// hidden (override OR raw column) and merged-away headers. Regression for
-    /// the leak where an import-overlap duplicate the user hid still showed on
-    /// the security Detail page as a phantom second buy and inflated the count.
+    /// hidden and merged-away headers. Otherwise an import-overlap duplicate the
+    /// user hid would still show on the security Detail page as a phantom second
+    /// buy and inflate the count.
     /// </summary>
     [Fact]
     public async Task ListTransactions_excludes_hidden_and_merged_legs_from_list_and_count()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("ETFA", ticker: "ETFA");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> BuyAsync(int month, decimal shares)
@@ -552,10 +550,8 @@ public sealed class SecuritiesEndpointsTests
         var merged = await BuyAsync(3, 30m);
 
         // Both ways a leg leaves the register's visibility — each must be
-        // excluded here too. There used to be a third case here, "hidden via
-        // txn_header_overrides.is_hidden", which migration 230 retired: nothing
-        // ever wrote that column but a test fixture, so the case it covered was
-        // unreachable.
+        // excluded here too. (Migration 230 retired
+        // txn_header_overrides.is_hidden, so there is no third way.)
         await ledger.HideTransactionAsync(hidden);                  // txn_headers.is_hidden
         await ledger.MarkTransactionMergedAsync(merged, visible);   // txn_headers.is_merged_into
 

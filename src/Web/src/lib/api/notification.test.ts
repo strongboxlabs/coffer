@@ -8,12 +8,11 @@ import {
 /**
  * These mock `fetch`, not the api client, on purpose.
  *
- * Every notification mutation shipped double-encoded: the client wrapped its body in
- * JSON.stringify and `request()` stringifies again, so the server received a JSON
- * *string* where it expected an object and answered 400. Nothing in the suite caught
- * it, because the panel tests mock these very functions — the wire format was
- * untestable by construction. Asserting on what crosses the wire is the only version
- * of this test that could have failed.
+ * A client that wraps its body in JSON.stringify double-encodes it, because
+ * `request()` stringifies again: the server receives a JSON *string* where it expects
+ * an object and answers 400. The panel tests mock these very functions, so they cannot
+ * see the wire format. Asserting on what crosses the wire is the only version of this
+ * test that can fail.
  */
 describe('notification api client wire format', () => {
     let calls: Array<{ url: string; init: RequestInit }>;

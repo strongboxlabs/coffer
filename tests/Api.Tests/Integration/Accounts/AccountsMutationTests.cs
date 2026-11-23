@@ -20,11 +20,12 @@ namespace Coffer.Api.Tests.Integration.Accounts;
 /// reads are scoped by the test's ledger id.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class AccountsMutationTests
+public sealed class AccountsMutationTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AccountsMutationTests(PostgresFixture fixture) => _fixture = fixture;
+    public AccountsMutationTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -43,8 +44,8 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Create_bank_account_returns_201_and_appears_in_list()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -75,8 +76,8 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Create_investment_account_materializes_system_holdings_sibling_hidden_from_list()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -87,7 +88,7 @@ public sealed class AccountsMutationTests
         var created = await resp.Content.ReadFromJsonAsync<AccountSummary>();
         Assert.NotNull(created!.HoldingsAccountId);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var sibling = await db.Accounts.AsNoTracking()
             .SingleAsync(a => a.Id == created.HoldingsAccountId);
         Assert.True(sibling.IsSystem);
@@ -108,8 +109,8 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Create_category_enforces_the_category_kind_invariant()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var url = $"/api/ledgers/{ledger.LedgerId}/accounts";
 
@@ -137,11 +138,10 @@ public sealed class AccountsMutationTests
     {
         // ADR-0017. Flipping a kind does not edit a label — it retroactively moves
         // every posting in the category between the spending and income totals, for
-        // as far back as the ledger goes, with no record. Until this rule it was the
-        // one UNGUARDED path to that rewrite, reachable by touching a dropdown,
-        // while the safe route (merge) was the one the code refused.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        // as far back as the ledger goes, with no record. Without this rule that
+        // rewrite would be one dropdown change away, with no guard at all.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var cat = await ledger.AddCategoryAsync("Groceries", "expense");
         var url = $"/api/ledgers/{ledger.LedgerId}/accounts/{cat.Id}";
@@ -161,7 +161,7 @@ public sealed class AccountsMutationTests
         // the obvious way to get this rule wrong.
         var rename = await client.PatchAsJsonAsync(url,
             new UpdateAccountRequest { Name = "Food shopping", CategoryKind = "expense" });
-        Assert.Equal(HttpStatusCode.NoContent, rename.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, rename.StatusCode);
     }
 
     [Fact]
@@ -170,8 +170,8 @@ public sealed class AccountsMutationTests
         // mig 224 widened the CHECK; this is the half that makes it reachable. The
         // database accepted 'adjustment' before this and the API did not, so the
         // kind existed and nobody could create one.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var created = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/accounts",
@@ -191,7 +191,7 @@ public sealed class AccountsMutationTests
         // The mirror of the rule above. With the flip refused, refusing a cross-kind
         // merge too would leave NO way to reclassify a category — including the case
         // the adjustment kind exists for, a valuation entry mis-filed as an expense.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var wrong = await ledger.AddCategoryAsync("Adjustment", "expense");
         var right = await ledger.AddCategoryAsync("Valuation", "adjustment");
@@ -199,7 +199,7 @@ public sealed class AccountsMutationTests
             bank.Id, wrong.Id, -42_000m, new DateTime(2026, 4, 18, 0, 30, 0, DateTimeKind.Utc),
             payee: "markup");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var merge = await client.PostAsJsonAsync(
@@ -210,7 +210,7 @@ public sealed class AccountsMutationTests
 
         // The posting now belongs to the adjustment-kind category, which is what
         // "reclassified" means here.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var moved = await db.TxnLegs.AsNoTracking()
             .CountAsync(l => l.LedgerId == ledger.LedgerId && l.AccountId == right.Id);
         Assert.Equal(1, moved);
@@ -219,8 +219,8 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Create_rejects_blank_name_unknown_type_and_bad_currency()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var url = $"/api/ledgers/{ledger.LedgerId}/accounts";
 
@@ -238,18 +238,49 @@ public sealed class AccountsMutationTests
     }
 
     [Fact]
+    public async Task Account_currency_follows_the_one_currency_code_rule()
+    {
+        // CurrencyCodes is shared with the price paths: trimmed, upper-cased, three
+        // characters. A blank currency is USD on create and invalid on update.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+        var url = $"/api/ledgers/{ledger.LedgerId}/accounts";
+        var patchUrl = $"{url}/{bank.Id}";
+
+        var blankCreate = await client.PostAsJsonAsync(url,
+            new CreateAccountRequest { Name = "Savings", AccountType = "bank", CurrencyCode = "  " });
+        Assert.Equal(HttpStatusCode.Created, blankCreate.StatusCode);
+        var longCreate = await client.PostAsJsonAsync(url,
+            new CreateAccountRequest { Name = "Other", AccountType = "bank", CurrencyCode = "EURO" });
+        Assert.Equal(BusinessError.Codes.AccountCurrencyInvalid, await ErrorCodeAsync(longCreate));
+
+        Assert.Equal(BusinessError.Codes.AccountCurrencyInvalid,
+            await ErrorCodeAsync(await client.PatchAsJsonAsync(patchUrl, new UpdateAccountRequest { CurrencyCode = "  " })));
+        Assert.Equal(BusinessError.Codes.AccountCurrencyInvalid,
+            await ErrorCodeAsync(await client.PatchAsJsonAsync(patchUrl, new UpdateAccountRequest { CurrencyCode = "EURO" })));
+        var normalized = await client.PatchAsJsonAsync(patchUrl, new UpdateAccountRequest { CurrencyCode = " eur " });
+        Assert.Equal(HttpStatusCode.OK, normalized.StatusCode);
+
+        var list = (await client.GetFromJsonAsync<List<AccountSummary>>(url))!;
+        Assert.Equal("EUR", Assert.Single(list, a => a.Id == bank.Id).CurrencyCode);
+        Assert.Equal("USD", Assert.Single(list, a => a.Name == "Savings").CurrencyCode);
+    }
+
+    [Fact]
     public async Task Update_edits_general_attributes()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var patch = await client.PatchAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/accounts/{bank.Id}",
             new UpdateAccountRequest { Name = "Renamed Checking", InstitutionName = "Bank Y", IsActive = false });
-        Assert.Equal(HttpStatusCode.NoContent, patch.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, patch.StatusCode);
 
         var list = await client.GetFromJsonAsync<List<AccountSummary>>(
             $"/api/ledgers/{ledger.LedgerId}/accounts?includeInactive=true");
@@ -267,10 +298,10 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Update_rejects_a_system_account()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // The Holdings sibling is system-managed → not user-editable.
@@ -284,10 +315,10 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Update_with_no_fields_returns_patch_empty()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var patch = await client.PatchAsJsonAsync(
@@ -300,10 +331,10 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Create_rejects_when_ledger_not_visible_to_caller()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var resp = await bobClient.PostAsJsonAsync(
@@ -313,7 +344,7 @@ public sealed class AccountsMutationTests
         Assert.Equal(BusinessError.Codes.LedgerNotVisible, await ErrorCodeAsync(resp));
 
         // And nothing was created in Alice's ledger.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Equal(0, await db.Accounts.AsNoTracking()
             .CountAsync(a => a.LedgerId == alice.LedgerId && a.Name == "Intruder"));
     }
@@ -321,8 +352,8 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Create_get_detail_and_edit_round_trip_metadata()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var baseUrl = $"/api/ledgers/{ledger.LedgerId}/accounts";
 
@@ -345,7 +376,7 @@ public sealed class AccountsMutationTests
         // PATCH: an empty string clears (notes → null); other fields set.
         var patch = await client.PatchAsJsonAsync($"{baseUrl}/{id}",
             new UpdateAccountRequest { Notes = "", AccountNumber = "99" });
-        Assert.Equal(HttpStatusCode.NoContent, patch.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, patch.StatusCode);
 
         var after = await client.GetFromJsonAsync<AccountDetail>($"{baseUrl}/{id}");
         Assert.Null(after!.Notes);                 // cleared by ""
@@ -356,8 +387,8 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Get_detail_rejects_unknown_account_in_ledger()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync(
@@ -378,10 +409,10 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Loan_account_requires_terms_and_round_trips_them()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var interest = await ledger.AddCategoryAsync("mortgage-interest", "expense");
         var escrow = await ledger.AddBankAccountAsync("escrow");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var url = $"/api/ledgers/{ledger.LedgerId}/accounts";
 
@@ -420,11 +451,11 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Loan_managed_payment_reminder_sets_up_links_and_reads_back()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var interest = await ledger.AddCategoryAsync("mortgage-interest", "expense");
         var escrow = await ledger.AddBankAccountAsync("escrow");
         var checking = await ledger.AddBankAccountAsync("checking");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var url = $"/api/ledgers/{ledger.LedgerId}/accounts";
 
@@ -463,10 +494,10 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Loan_payment_reminder_rejects_a_non_bank_source()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var interest = await ledger.AddCategoryAsync("mortgage-interest", "expense");
         var escrow = await ledger.AddBankAccountAsync("escrow");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var url = $"/api/ledgers/{ledger.LedgerId}/accounts";
 
@@ -487,9 +518,9 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Editing_loan_terms_updates_the_row()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var interest = await ledger.AddCategoryAsync("mortgage-interest", "expense");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var url = $"/api/ledgers/{ledger.LedgerId}/accounts";
 
@@ -508,7 +539,7 @@ public sealed class AccountsMutationTests
                 InterestAccountId = interest.Id, PaymentIsComputed = false, FixedPayment = 4000m,
             },
         });
-        Assert.Equal(HttpStatusCode.NoContent, patch.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, patch.StatusCode);
 
         var detail = await client.GetFromJsonAsync<AccountDetail>($"{url}/{id}");
         Assert.Equal(4.25m, detail!.LoanTerms!.AnnualInterestRate);
@@ -520,8 +551,8 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Loan_terms_validation_and_type_guards()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var url = $"/api/ledgers/{ledger.LedgerId}/accounts";
 
@@ -559,8 +590,8 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Opening_balance_round_trips_and_categories_must_be_zero()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var url = $"/api/ledgers/{ledger.LedgerId}/accounts";
 
@@ -585,14 +616,15 @@ public sealed class AccountsMutationTests
     [Fact]
     public async Task Loan_payment_preview_computes_principal_interest_and_total()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
             $"/api/ledgers/{ledger.LedgerId}/accounts/loan-payment-preview",
             new LoanPaymentPreviewRequest
             {
+                CurrencyCode = "USD",
                 OriginalPrincipal = 500000m, AnnualInterestRate = 4.00m,
                 PaymentCount = 360, PaymentsPerYear = 12, EscrowAmount = 500.00m,
                 PaymentIsComputed = true,

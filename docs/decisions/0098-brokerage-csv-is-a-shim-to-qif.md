@@ -1,6 +1,8 @@
 # 0098 — a brokerage CSV provider is a shim to QIF
 
-* Status: Accepted
+* Status: Accepted; amended 2026-11-16 by [ADR-0114](0114-benchmarks-and-currency-conversion.md) (money's destination scale
+  is its account currency's places; the shim emits cash amounts exactly, and one finer
+  than that is rounded once, at the ingest write, and the row is marked as rounded)
 * Date: 2026-09-12
 * Related: ADR-0031 (ingest-provider pattern; this narrows its Phase 6),
   ADR-0042 (QIF file importer — the path this delegates to),
@@ -28,8 +30,8 @@ settles is *what such a provider is*.
 
 The obvious reading of Phase 6 — and what ADR-0031's own wording implied — is that each
 provider parses its institution's file and emits `IngestedTransaction`s carrying Coffer
-action hints, exactly as the generic provider does. That was built first, for Fidelity,
-and is not what shipped.
+action hints, exactly as the generic provider does. That design is rejected (see
+*Rejected*).
 
 ## Decision
 
@@ -54,13 +56,13 @@ emitting Coffer hints directly is a second copy of it — then a third, one per 
 each drifting independently, each able to corrupt a ledger alone. The shim keeps one
 copy and makes every brokerage after the first a question of format.
 
-**The bespoke version was not merely longer — it was wrong, in two places the QIF path
-already had right.** This is the substantive argument, not a tidiness one.
+**A bespoke provider is not merely longer — it gets wrong two things the QIF path
+already has right.** This is the substantive argument, not a tidiness one.
 
-* A **cash rollover** became a `transfer` hint. Through QIF it becomes `XIn`, which takes
+* A **cash rollover** becomes a `transfer` hint. Through QIF it becomes `XIn`, which takes
   the BANK shape: cash arriving in a brokerage account is not a security transaction, and
-  the bespoke provider was asserting that it was.
-* An **in-kind ACAT** became a transfer too. Through QIF it becomes `ShrsIn`, which
+  the bespoke provider asserts that it is.
+* An **in-kind ACAT** becomes a transfer too. Through QIF it becomes `ShrsIn`, which
   `QifFileProvider` deliberately maps to plain `buy` rather than `buyx` — because `buyx`
   requires an asset counter-account and dead-ends every row whose real counterpart is an
   expense. That reasoning is recorded in that provider. A bespoke provider overrides such
@@ -71,9 +73,8 @@ came from and the QIF record it became, on `txn_headers.provider_raw_payload`. A
 converted format otherwise loses the trail exactly when it is wanted — when a number
 looks wrong. The user is never shown QIF; they pick a CSV and get transactions.
 
-This costs the ORCHESTRATOR a line, not just the shim: `RunFileAsync` had never written
-`provider_raw_payload`, because until the shims no file provider populated it — OFX and
-QIF both pass null. A shim that builds the trail and an insert that ignores it look
+This costs the ORCHESTRATOR a line, not just the shim: `RunFileAsync` writes
+`provider_raw_payload`, which OFX and QIF both pass as null. A shim that builds the trail and an insert that ignores it look
 identical from every test that stops at the provider's return value, which is where the
 provider tests and the converter tests both stop. The end-to-end tests read the column
 back out of the database for that reason.
@@ -84,10 +85,9 @@ than pooled with genuine QIF imports from elsewhere.
 
 ## What a brokerage shim owns
 
-The format, and only the format. For Fidelity's "Activity & Orders" export, all of it
-learned from real files rather than documentation:
+The format, and only the format. For Fidelity's "Activity & Orders" export:
 
-* **Columns by NAME.** A real export orders them `Type,Price ($),Quantity`; the
+* **Columns by NAME.** The export orders them `Type,Price ($),Quantity`; the
   widely-cited reference implementation expects `Type,Quantity,Price ($)`. By position,
   a share count becomes a unit price.
 * **Finding the table at both ends.** Blank lines precede the header; legal prose
@@ -102,12 +102,12 @@ learned from real files rather than documentation:
   belongs; a money-fund CUSIP riding along on a zero-amount cash row.
 * **The verb rules**, which are a joint function of the action sentence, the type cell,
   and the SIGNS of quantity and amount — in a specific order, because `DIVIDEND` must be
-  tested before `REINVEST`. The sign fallbacks are not a safety net: most of the
-  distinct actions in a real export reach them, and `PURCHASE INTO CORE ACCOUNT` contains
-  neither "BUY" nor "BOUGHT".
+  tested before `REINVEST`. The sign fallbacks are not a safety net: they are the rule
+  for every action whose sentence names no verb the rules test for —
+  `PURCHASE INTO CORE ACCOUNT` contains neither "BUY" nor "BOUGHT".
 * **A rule may only read the VERB PHRASE, never the whole sentence.** The action cell
   carries the fund's name, so a substring test reads the security by accident. Testing for
-  `TAX`/`FEE` this way classified every purchase and reinvestment of a tax-exempt or
+  `TAX`/`FEE` this way classifies every purchase and reinvestment of a tax-exempt or
   tax-free fund as a miscellaneous expense — posting the cash with the wrong sign and
   dropping the shares. The rules are guarded by the row's SHAPE (a fee has no shares)
   rather than by more words.
@@ -121,12 +121,27 @@ Share counts and unit prices are therefore emitted at the decimal's full scale a
 once, by the destination column — `ingest_shares` is NUMERIC(28,8), and the
 `txn_legs.quantity` a row grows into is NUMERIC(25,12), both widened deliberately by
 migration 043 for fractional shares. Formatting them like cash ("0.####", four places)
-rounded a real holding of under a thousandth of a unit up to a whole thousandth, an
-overstatement carried into cost basis, lots and realized gain — and erased entirely any
+rounds a holding of under a thousandth of a unit up to a whole thousandth, an
+overstatement carried into cost basis, lots and realized gain — and erases entirely any
 holding smaller than half of the fourth decimal place.
 
 This is the general form of the rule already recorded for money: round at the destination's
 scale, never before it.
+
+### Amendment, 2026-11-16 — money at its currency's minor units ([ADR-0114](0114-benchmarks-and-currency-conversion.md))
+
+For money the destination's scale is no longer a column's: it is the account currency's
+own minor units, 0, 2 or 3 places (ADR-0114 D15). `FidelityActivityToQif` emits cash
+amounts exactly. It formats them with `"0.####"` today, which rounds a finer cell before
+ingest; emitted exactly, the one rounding is at the ingest write, and the Review note
+shows the CSV cell's figure unrounded, in the row's stored sign (ADR-0114 D15) (settled
+by Claude, 2026-11-16). A cash amount the shim hands on is read by `QifFileProvider`
+under its rules ([ADR-0042](0042-qif-file-importer.md), amendment of this date), and one
+finer than the account's currency is rounded once, half away from zero, when the row is
+written ([ADR-0031](0031-ingest-provider-pattern.md) §2). The figure as sent is kept,
+and the row lands needing review, marked as rounded. The row's external id is hashed
+from the amount as parsed, before that rounding (ADR-0042). Share counts and unit prices
+are not money and are unaffected.
 
 ## Consequences
 
@@ -158,17 +173,17 @@ the right place for it, and is the point.
 quantity, price, fee). The action is not in a column; it is derived from free text and
 two signs. A declarative mapping cannot express that without becoming a rule engine.
 
-**A bespoke provider per brokerage emitting Coffer hints.** Built first, and rejected for
-the reasons under *Why* — one copy of the action mapping per brokerage, and two
+**A bespoke provider per brokerage emitting Coffer hints.** Rejected for the reasons
+under *Why* — one copy of the action mapping per brokerage, and two
 already-settled decisions silently overridden.
 
 **Sniffing the brokerage from the file.** Rejected above: it cannot state its own
 boundary, and a wrong guess is invisible where a wrong selection is not.
 
 **A cash-balance cross-check**, carried over from the reference implementation, which
-trusts the running balance over the institution's stated amount. Implemented, then
-disproved by a real export: Fidelity settles a dividend and its sweep into the core fund
-together and stamps both rows with the balance after the pair, so the within-pair delta
-is always zero. It rewrote every amount in a valid file to zero. Removed rather than
-softened to a warning — a check that cannot distinguish a mis-parse from normal
+trusts the running balance over the institution's stated amount. The format rules it
+out: Fidelity settles a dividend and its sweep into the core fund together and stamps
+both rows with the balance after the pair, so the within-pair delta is always zero and
+the check would rewrite every amount in a valid file to zero. Not softened to a warning
+either — a check that cannot distinguish a mis-parse from normal
 settlement grouping has nothing to warn about.

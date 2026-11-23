@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text.Json;
 
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.EntityFrameworkCore;
 
 using Coffer.Api.Contracts;
 using Coffer.Api.Db.Repositories;
@@ -21,15 +22,16 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// whole or dropping entries silently.</para>
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class BudgetTargetEndpointTests
+public sealed class BudgetTargetEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public BudgetTargetEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public BudgetTargetEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private async Task<(HttpClient Client, ApiFactory Factory)> ClientForAsync(SyntheticLedger ledger)
     {
-        var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var factory = new ApiFactory(Db).WithoutDevAuth();
         var cookie = await ledger.IssueSessionCookieAsync();
         var client = factory.CreateClient(
             new WebApplicationFactoryClientOptions { HandleCookies = false });
@@ -40,7 +42,7 @@ public sealed class BudgetTargetEndpointTests
     [Fact]
     public async Task Putting_a_target_shows_up_in_the_next_progress_read()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var food = await ledger.AddCategoryAsync("Food");
         var (client, factory) = await ClientForAsync(ledger);
         await using var _ = factory;
@@ -62,7 +64,7 @@ public sealed class BudgetTargetEndpointTests
     [Fact]
     public async Task A_conflicting_target_is_refused_and_the_detail_names_the_other_category()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var taxes = await ledger.AddCategoryAsync("Taxes");
         var federal = await ledger.AddCategoryAsync("Federal", parentId: taxes.Id);
         var (client, factory) = await ClientForAsync(ledger);
@@ -87,7 +89,7 @@ public sealed class BudgetTargetEndpointTests
     [Fact]
     public async Task Deleting_is_idempotent_and_returns_the_row_to_its_normal()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var food = await ledger.AddCategoryAsync("Food");
         foreach (var m in new[] { 1, 2, 3 })
@@ -117,7 +119,7 @@ public sealed class BudgetTargetEndpointTests
     [Fact]
     public async Task A_fill_applies_what_it_can_and_reports_what_it_skipped()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var taxes = await ledger.AddCategoryAsync("Taxes");
         var federal = await ledger.AddCategoryAsync("Federal", parentId: taxes.Id);
         var food = await ledger.AddCategoryAsync("Food");
@@ -150,7 +152,7 @@ public sealed class BudgetTargetEndpointTests
         // The CHECK would catch it, but as a 23514 surfacing through the pipeline —
         // which is not an answer a UI can render. 422, not 400: BusinessError.Problem
         // has a single status and every refusal in this app arrives that way.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var food = await ledger.AddCategoryAsync("Food");
         var (client, factory) = await ClientForAsync(ledger);
         await using var _ = factory;
@@ -170,7 +172,7 @@ public sealed class BudgetTargetEndpointTests
         // Accepting "2026-04-17" would silently pick a bucket the caller did not
         // name. The column CHECK only permits the first of a month, so a client
         // sending a date is confused about the contract and should hear so.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var food = await ledger.AddCategoryAsync("Food");
         var (client, factory) = await ClientForAsync(ledger);
         await using var _ = factory;
@@ -191,7 +193,7 @@ public sealed class BudgetTargetEndpointTests
         // descendants. A list of the row's DIRECT postings would not add up to
         // the number the reader just clicked, which is the question they are
         // asking by expanding it.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var food = await ledger.AddCategoryAsync("Food");
         var groceries = await ledger.AddCategoryAsync("Groceries", parentId: food.Id);
@@ -224,8 +226,8 @@ public sealed class BudgetTargetEndpointTests
     [Fact]
     public async Task Another_users_ledger_is_not_writable()
     {
-        var mine = await SyntheticLedger.CreateAsync(_fixture);
-        var stranger = await SyntheticLedger.CreateAsync(_fixture);
+        var mine = await SyntheticLedger.CreateAsync(Db);
+        var stranger = await SyntheticLedger.CreateAsync(Db);
         var food = await mine.AddCategoryAsync("Food");
 
         // Authenticated as the stranger, writing at MY ledger's id.
@@ -241,5 +243,114 @@ public sealed class BudgetTargetEndpointTests
             resp.StatusCode is HttpStatusCode.UnprocessableEntity or HttpStatusCode.NotFound
                 or HttpStatusCode.Forbidden,
             $"expected the write to be refused, got {(int)resp.StatusCode}");
+    }
+
+    // ---- a typed target at its currency's places (ADR-0114 D15) -------------------------
+
+    /// <summary>The refusal's code, currency, places and field.</summary>
+    private static async Task<(string? Code, string? Currency, int Places, string? Field)> PlacesRefusalAsync(
+        HttpResponseMessage response)
+    {
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.True(response.StatusCode == HttpStatusCode.UnprocessableEntity, $"{(int)response.StatusCode}: {body}");
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        return (root.GetProperty("code").GetString(), root.GetProperty("currencyCode").GetString(),
+            root.GetProperty("places").GetInt32(), root.GetProperty("field").GetString());
+    }
+
+    private async Task<Dictionary<Guid, decimal>> StoredTargetsAsync(Guid ledgerId, DateOnly month)
+    {
+        await using var db = Db.NewDbContext();
+        return await db.BudgetTargets.AsNoTracking()
+            .Where(t => t.LedgerId == ledgerId && t.TargetMonth == month)
+            .ToDictionaryAsync(t => t.CategoryId, t => t.Amount);
+    }
+
+    [Fact]
+    public async Task A_typed_target_finer_than_the_reporting_currency_is_refused_and_writes_nothing()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db, currencyCode: "JPY");
+        var food = await ledger.AddCategoryAsync("Food", currencyCode: "JPY");
+        var (client, factory) = await ClientForAsync(ledger);
+        await using var _ = factory;
+        using var __ = client;
+        var url = $"/api/ledgers/{ledger.LedgerId}/budget/targets";
+
+        Assert.Equal(("amount-places-exceed-currency", "JPY", 0, "amount"),
+            await PlacesRefusalAsync(await client.PutAsJsonAsync(url, new SetBudgetTargetRequest(food.Id, "2026-04", 10.5m))));
+        Assert.Empty(await StoredTargetsAsync(ledger.LedgerId, new DateOnly(2026, 4, 1)));
+
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await client.PutAsJsonAsync(url, new SetBudgetTargetRequest(food.Id, "2026-04", 10m))).StatusCode);
+        Assert.Equal(10m, (await StoredTargetsAsync(ledger.LedgerId, new DateOnly(2026, 4, 1)))[food.Id]);
+    }
+
+    [Fact]
+    public async Task A_three_place_reporting_currency_takes_a_three_place_target()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db, currencyCode: "KWD");
+        var food = await ledger.AddCategoryAsync("Food", currencyCode: "KWD");
+        var (client, factory) = await ClientForAsync(ledger);
+        await using var _ = factory;
+        using var __ = client;
+
+        Assert.Equal(HttpStatusCode.NoContent, (await client.PutAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/budget/targets", new SetBudgetTargetRequest(food.Id, "2026-04", 1.234m))).StatusCode);
+        Assert.Equal(1.234m, (await StoredTargetsAsync(ledger.LedgerId, new DateOnly(2026, 4, 1)))[food.Id]);
+    }
+
+    [Fact]
+    public async Task A_stored_target_that_does_not_fit_passes_when_retyped_unchanged_and_is_refused_when_changed()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db, currencyCode: "JPY");
+        var food = await ledger.AddCategoryAsync("Food", currencyCode: "JPY");
+        var month = new DateOnly(2026, 4, 1);
+        await using (var seed = Db.NewDbContext())
+        {
+            // Two places stamped with a whole-unit currency: what the stamping migration
+            // leaves on a target typed before each currency kept its own places.
+            seed.BudgetTargets.Add(new Coffer.Api.Db.Entities.BudgetTargetRow
+            {
+                LedgerId = ledger.LedgerId, CategoryId = food.Id, TargetMonth = month,
+                Amount = 10.50m, CurrencyCode = "JPY",
+                CreatedAt = new DateTime(2026, 4, 1, 0, 0, 0, DateTimeKind.Utc),
+                UpdatedAt = new DateTime(2026, 4, 1, 0, 0, 0, DateTimeKind.Utc),
+            });
+            await seed.SaveChangesAsync();
+        }
+        var (client, factory) = await ClientForAsync(ledger);
+        await using var _ = factory;
+        using var __ = client;
+        var url = $"/api/ledgers/{ledger.LedgerId}/budget/targets";
+
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await client.PutAsJsonAsync(url, new SetBudgetTargetRequest(food.Id, "2026-04", 10.50m))).StatusCode);
+        Assert.Equal(("amount-places-exceed-currency", "JPY", 0, "amount"),
+            await PlacesRefusalAsync(await client.PutAsJsonAsync(url, new SetBudgetTargetRequest(food.Id, "2026-04", 10.55m))));
+        Assert.Equal(10.50m, (await StoredTargetsAsync(ledger.LedgerId, month))[food.Id]);
+    }
+
+    [Fact]
+    public async Task A_fill_with_one_entry_finer_than_its_currency_is_refused_whole()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db, currencyCode: "JPY");
+        var food = await ledger.AddCategoryAsync("Food", currencyCode: "JPY");
+        var rent = await ledger.AddCategoryAsync("Rent", currencyCode: "JPY");
+        var (client, factory) = await ClientForAsync(ledger);
+        await using var _ = factory;
+        using var __ = client;
+
+        var resp = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/budget/targets/fill",
+            new FillBudgetTargetsRequest("2026-04", new[]
+            {
+                new BudgetTargetEntry(food.Id, 250m),
+                new BudgetTargetEntry(rent.Id, 900.5m),
+            }));
+
+        Assert.Equal(("amount-places-exceed-currency", "JPY", 0, "entries[1].amount"), await PlacesRefusalAsync(resp));
+        // The entry that fits is not written either.
+        Assert.Empty(await StoredTargetsAsync(ledger.LedgerId, new DateOnly(2026, 4, 1)));
     }
 }

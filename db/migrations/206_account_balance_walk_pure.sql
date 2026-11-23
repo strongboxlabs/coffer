@@ -6,18 +6,16 @@
 -- by `LegDerivedRecomputeInterceptor` on every EF save. Any write that bypasses
 -- the ChangeTracker — raw SQL, Dapper, ExecuteUpdateAsync, a human at a psql
 -- prompt — skips it, and the stored totals silently diverge from what the legs
--- say. That is not hypothetical: a one-off data scrub on a real ledger reshaped
--- in-kind transfers on several accounts, correctly recomputed the FIFO side, and
--- never touched balances. The register showed wrong figures on those accounts for
--- months, and it surfaced only because the balance health check happened to be run.
+-- say. A repair script that reshapes rows and recomputes the FIFO side but not
+-- balances leaves wrong figures in the register on every account it touches, and
+-- they show only when the balance health check is run.
 --
--- The reason it stayed invisible is that there was no way to ASK. The only
--- implementation of the running-sum rules lived inside
--- `fn_recompute_balances_for_account`, which DELETEs and INSERTs — so the only
--- way to find out whether a stored balance was right was to overwrite it. The
--- health check "worked" by recomputing everything and diffing against a snapshot
--- taken beforehand: a diagnostic that healed thousands of rows as a side effect of
--- being asked a question.
+-- Before this migration there was no way to ASK. The only implementation of the
+-- running-sum rules lived inside `fn_recompute_balances_for_account`, which
+-- DELETEs and INSERTs — so the only way to find out whether a stored balance was
+-- right was to overwrite it. The health check recomputed everything and diffed
+-- against a snapshot taken beforehand: a diagnostic that healed every divergent
+-- row as a side effect of being asked a question.
 --
 -- WHAT. Split calculation from persistence, the way migration 202 did for the
 -- FIFO walk:
@@ -137,8 +135,7 @@ $$ LANGUAGE plpgsql;
 -- returns. Same source, unnested: the consistency check needs one ROW per
 -- disposal because that is the grain `realized_gains` stores, and mig 205 rounds
 -- each row as it is written. Comparing a rounded SUM against a SUM of rounded
--- rows differs by a cent per disposal and would make the check cry wolf -- an
--- ad-hoc query made exactly that mistake while diagnosing this.
+-- rows differs by a cent per disposal and would make the check cry wolf.
 -- ---------------------------------------------------------------------------
 CREATE FUNCTION realized_gains_walk(
     p_account_id  UUID,

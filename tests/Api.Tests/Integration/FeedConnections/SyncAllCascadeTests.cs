@@ -19,9 +19,9 @@ namespace Coffer.Api.Tests.Integration.FeedConnections;
 /// <c>SyncAllAsync</c>'s own doc comment promises this: "per-connection failures
 /// shouldn't cascade — a 403 on one bank just records needs_reauth for that connection
 /// and the loop continues." A <c>SimpleFinException</c> — unreachable host, non-2xx,
-/// malformed payload — escaped <c>RunPullAsync</c> and unwound the whole loop, so every
-/// connection after the failing one was silently never attempted. The response carried no
-/// entry for them at all, so nothing said they had been skipped.
+/// malformed payload — that escapes <c>RunPullAsync</c> unwinds the whole loop, so every
+/// connection after the failing one is silently never attempted. The response carries no
+/// entry for them at all, so nothing says they were skipped.
 /// </para>
 /// <para>
 /// This matters more once sync is scheduled: five days of one flaky bank would trip the
@@ -30,19 +30,20 @@ namespace Coffer.Api.Tests.Integration.FeedConnections;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class SyncAllCascadeTests
+public sealed class SyncAllCascadeTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SyncAllCascadeTests(PostgresFixture fixture) => _fixture = fixture;
+    public SyncAllCascadeTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     /// <summary>A ledger with a wrapped LEK, which a feed connection needs to seal its
     /// access URL. Same shape as FeedConnectionsEndpointsTests' own helper.</summary>
     private async Task<SyntheticLedger> LedgerWithLekAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var keys = _fixture.NewLedgerKeyService();
-        await using var db = _fixture.NewDbContext();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var keys = Db.NewLedgerKeyService();
+        await using var db = Db.NewDbContext();
         var row = await db.Ledgers.SingleAsync(l => l.Id == ledger.LedgerId);
         row.WrappedLek = keys.CreateWrappedLek();
         row.LekKekId = keys.CurrentKekId;
@@ -120,7 +121,7 @@ public sealed class SyncAllCascadeTests
         var ledger = await LedgerWithLekAsync();
         var seen = new HashSet<string>(StringComparer.Ordinal);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientFaultingOn("broken", seen));
         using var client = await AuthedClientAsync(factory, ledger);
 
@@ -142,14 +143,14 @@ public sealed class SyncAllCascadeTests
         var response = await client.PostAsync(
             $"/api/ledgers/{ledger.LedgerId}/sync-all", content: null);
 
-        // Not a 500. The whole request used to fail on the first faulting bank.
+        // Not a 500: one faulting bank must not fail the whole request.
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
         var body = await response.Content.ReadFromJsonAsync<JsonElement>();
         var entries = body.GetProperty("connections").EnumerateArray().ToList();
 
-        // BOTH connections have an entry — the second one used to be missing entirely,
-        // so nothing even said it had been skipped.
+        // BOTH connections have an entry — a missing one would mean nothing even
+        // says it was skipped.
         Assert.Equal(2, entries.Count);
         Assert.True(body.GetProperty("hadAnyFailure").GetBoolean());
 
@@ -163,7 +164,7 @@ public sealed class SyncAllCascadeTests
         var ledger = await LedgerWithLekAsync();
         var seen = new HashSet<string>(StringComparer.Ordinal);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientFaultingOn("broken", seen));
         using var client = await AuthedClientAsync(factory, ledger);
 

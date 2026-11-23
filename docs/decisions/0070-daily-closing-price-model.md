@@ -10,8 +10,8 @@
 ## Context
 
 `security_prices` was **timestamp-keyed**: `price_date TIMESTAMPTZ`, `UNIQUE (security_id,
-price_date)` on the exact timestamp. So multiple rows per calendar day were allowed, and
-in practice happened:
+price_date)` on the exact timestamp. So multiple rows per calendar day are allowed, and
+the writers produce them:
 
 - **Yahoo** (scheduled refresh) writes the EOD close at **midnight UTC** — one clean row/day.
 - **SimpleFIN** holdings writes the brokerage's **`balance-date`** (Unix *seconds* — an
@@ -92,11 +92,10 @@ balance-date); the collapse to a calendar day happens once, at persist.
 
 ### D8 — `price` precision: NUMERIC(19,4), matching high/low
 `security_prices.price` was `NUMERIC(25,12)` while its own `high` / `low` were
-`NUMERIC(19,4)`. That 12dp scale let single-precision **float noise** be stored — a
+`NUMERIC(19,4)`. That 12dp scale lets single-precision **float noise** be stored — a
 two-decimal close written back with a long tail of noise digits after its true
-decimals — in historical `fetch`
-(pre-split SimpleFIN) and `import` (MD seed) rows; the true values are clean, the tail is
-representation noise from a producer that went through a 32-bit float. Migration 155
+decimals — by any producer that goes through a 32-bit float, as the pre-split
+SimpleFIN `fetch` path and the MD-seed `import` path could. Migration 155
 constrains `price` to **`NUMERIC(19,4)`** (matching high/low): the `numeric->numeric` cast
 rounds every existing value to 4dp (scrubbing the noise) and the DB now **enforces** 4dp,
 so no writer can reintroduce it. 4dp is ample for valuation — the high/low band already

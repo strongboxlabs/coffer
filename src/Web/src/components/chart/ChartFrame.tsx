@@ -2,6 +2,8 @@ import type { ReactNode } from 'react';
 
 import { cn } from '@/lib/cn';
 
+import { hideLabelBelow, hideLastBelow, labelLength, labelSpacings } from './axisLabels';
+
 /**
  * The box a chart draws in, and the rules drawn over it.
  *
@@ -21,11 +23,17 @@ import { cn } from '@/lib/cn';
 export const VIEWBOX = { width: 600, height: 180 } as const;
 
 export function ChartFrame({
-    children, overlay, heightClass, ariaLabel, gutter = false,
+    children, overlay, underlay, heightClass, ariaLabel, gutter = false,
     width = VIEWBOX.width, height = VIEWBOX.height,
 }: {
     /** SVG marks, already positioned. */
     children: ReactNode;
+    /**
+     * HTML drawn BENEATH the marks, positioned in percentages: the gridlines a
+     * value is read against, which a bar must cover rather than be struck
+     * through by.
+     */
+    underlay?: ReactNode;
     /**
      * HTML drawn over the chart, positioned in PERCENTAGES.
      *
@@ -55,6 +63,7 @@ export function ChartFrame({
             {/* The PLOT, inset from the gutter. Marks and overlay share this
                 box, so a rule at 40% and a bar at 40% land on the same line. */}
             <div className={cn('absolute inset-y-0 right-0', gutter ? 'left-fixed-40px' : 'left-0')}>
+                {underlay}
                 <svg
                     viewBox={`0 0 ${width} ${height}`}
                     preserveAspectRatio="none"
@@ -75,7 +84,9 @@ export function ChartFrame({
  * a target, the zero line.
  *
  * HTML rather than SVG, for the reason in `overlay` above. Give it a `label`
- * only where the surrounding UI does not already say what it is.
+ * only where the surrounding UI does not already say what it is. The label sits
+ * at the start: a cumulative line starts at zero there, and what is drawn after
+ * today (a projection, a scheduled bill) is at the end.
  */
 export function Rule({
     atPercent, label, tone = 'subtle',
@@ -94,7 +105,7 @@ export function Rule({
             style={{ top: `${atPercent}%` }}
         >
             {label !== undefined ? (
-                <span className="absolute -top-4 right-0 bg-surface px-1 text-[0.625rem] text-text-muted">
+                <span className="absolute -top-4 left-0 bg-surface px-1 text-[0.625rem] text-text-muted">
                     {label}
                 </span>
             ) : null}
@@ -118,12 +129,18 @@ export function Rule({
  * says which side of nothing a bar is on.
  */
 export function ValueAxis({
-    tickValues, toPercent, format,
+    tickValues, toPercent, format, zeroRule = true,
 }: {
     tickValues: readonly number[];
     /** Value to a percentage of the frame's height. */
     toPercent: (value: number) => number;
     format: (value: number) => string;
+    /**
+     * Draw zero's rule here. A chart that puts the axis beneath its marks draws
+     * zero over them instead (`ZeroRule` in the overlay), so the line a sign is
+     * read against is never hidden by a bar that hangs from it.
+     */
+    zeroRule?: boolean;
 }) {
     return (
         <>
@@ -133,7 +150,7 @@ export function ValueAxis({
                     aria-hidden
                     className={cn(
                         'pointer-events-none absolute inset-x-0 border-t',
-                        t === 0 ? 'border-text-subtle' : 'border-border/60 border-dashed',
+                        t === 0 ? (zeroRule ? 'border-text-subtle' : 'border-transparent') : 'border-border/60 border-dashed',
                     )}
                     style={{ top: `${toPercent(t)}%` }}
                 >
@@ -155,6 +172,18 @@ export function ValueAxis({
     );
 }
 
+/** Zero's rule, solid, for an overlay over the marks (see ValueAxis's `zeroRule`). */
+export function ZeroRule({ atPercent }: { atPercent: number }) {
+    return (
+        <div
+            aria-hidden
+            data-zero-rule
+            className="pointer-events-none absolute inset-x-0 border-t border-text-subtle"
+            style={{ top: `${atPercent}%` }}
+        />
+    );
+}
+
 /** A vertical rule at `atPercent` of the width — today, a period boundary. */
 export function Marker({ atPercent }: { atPercent: number }) {
     return (
@@ -167,16 +196,38 @@ export function Marker({ atPercent }: { atPercent: number }) {
 }
 
 /**
- * Tick labels under a chart, evenly spaced.
+ * The last label, centred on its column while it fits there, and otherwise moved
+ * back by what it is wider than its column, so it ends at the plot's edge: `cqw`
+ * is its column's width, a percentage its own.
+ */
+const LAST_INSIDE = 'translate-x-[min(0px,calc(50cqw_-_50%))]';
+
+/**
+ * Tick labels under a chart, one cell per column, each label centred under the
+ * column it names. `labels` holds one entry per column, in order.
+ *
+ * No label overlaps another at any width. Each column is a container, and each
+ * label is drawn only while its column is wide enough for it at the widest
+ * spacing it belongs to (axisLabels.ts): as the chart narrows the labels thin to
+ * every second, fourth and so on, evenly spaced from the first, with the last
+ * period's label drawn too while the axis (a container too) has room for it and
+ * the first. A label never wraps. The first may run into the
+ * gutter, which is empty under the plot; the last sits at its column's end when
+ * it is wider than its column, so it never runs past the plot's edge.
  *
  * Deliberately NOT inside the SVG: text in a `preserveAspectRatio="none"`
  * viewBox is stretched with the box, so the same label is condensed in a wide
  * chart and smeared in a narrow one. As HTML it keeps the page's type scale.
+ * The columns are the plot's own bands (equal width, as `band` lays them out),
+ * so a label can never drift from its column at any width.
  */
 export function AxisLabels({
     labels, gutter = false,
 }: { labels: readonly string[]; gutter?: boolean }) {
     if (labels.length === 0) return null;
+    const spacings = labelSpacings(labels.length);
+    const length = labelLength(labels);
+    const last = labels.length - 1;
     // `mt-3`, not `mt-1`. The value axis puts its lowest label just inside the
     // frame's bottom edge, and at mt-1 the first period label sat under it —
     // close enough that the two overlapped and "2025-11" rendered as "25-11".
@@ -187,13 +238,26 @@ export function AxisLabels({
     return (
         <div
             aria-hidden
+            data-axis-labels
             className={cn(
-                'mt-3 flex justify-between text-[0.625rem] text-text-subtle',
+                '@container/axis mt-3 grid shrink-0 text-[0.625rem] text-text-subtle',
                 gutter ? 'ml-fixed-40px' : undefined,
             )}
+            style={{ gridTemplateColumns: `repeat(${labels.length}, minmax(0, 1fr))` }}
         >
             {labels.map((l, i) => (
-                <span key={`${l}_${i}`}>{l}</span>
+                <span key={i} data-axis-column className="@container/period flex min-w-0 justify-center">
+                    <span
+                        data-axis-label
+                        className={cn(
+                            'shrink-0 whitespace-nowrap tabular-nums',
+                            hideLabelBelow(length, spacings[i]!),
+                            i === last && last > 0 && [hideLastBelow(length, labels.length), LAST_INSIDE],
+                        )}
+                    >
+                        {l}
+                    </span>
+                </span>
             ))}
         </div>
     );

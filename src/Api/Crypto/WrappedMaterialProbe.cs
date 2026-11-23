@@ -36,22 +36,42 @@ public static class WrappedMaterialProbe
     private const string UndefinedTable = "42P01";
 
     /// <summary>
-    /// Every place a KEK-wrapped value can live. <c>KekRotationService</c> rotates
-    /// exactly this set, so the two must be kept in step — a new wrapped column
-    /// needs an entry here or a key-less boot could silently orphan it.
+    /// Every place a KEK-wrapped value can live: the same columns
+    /// <c>KekRotationService</c> re-wraps and <c>KekReconciliationService</c> clears.
+    /// A wrapped column missing here is one a key-less boot would orphan silently, so
+    /// <c>MasterKeySealedColumnsTests</c> fails when the schema holds a master-sealed
+    /// column that this list, rotation or reconciliation does not read.
     /// </summary>
     private static readonly Func<AppDbContext, bool>[] Checks =
     [
+        // Each check is the rule rotation and reconciliation select by, so the three agree on
+        // what is sealed. A ledger key is present or null. The passphrase and the Drive token
+        // count only when non-empty: reconciliation clears them to null, and an empty value
+        // is nothing either service opens, so a key minted over it orphans nothing.
         db => db.Ledgers.Any(l => l.WrappedLek != null),
-        db => db.GlobalScheduledJobs.Any(j => j.PassphraseCiphertext != null),
-        db => db.DriveSync.Any(d => d.OauthCiphertext != null),
+        db => db.GlobalScheduledJobs.Any(j => j.PassphraseCiphertext != null && j.PassphraseCiphertext.Length > 0),
+        db => db.DriveSync.Any(d => d.OauthCiphertext != null && d.OauthCiphertext.Length > 0),
 
-        // Delivery target URLs, both scopes. Length > 0 rather than a null check
+        // Delivery targets' sealed settings (URL and token), both scopes. Length > 0
+        // rather than a null check
         // because config_ciphertext is BYTEA NOT NULL: reconciliation empties it to
         // retire a blob this install cannot open, and an empty array is "no wrapped
         // material here", not "wrapped material of length zero".
         db => db.NotificationSubscribers.Any(t => t.ConfigCiphertext.Length > 0),
         db => db.LedgerNotificationSubscribers.Any(t => t.ConfigCiphertext.Length > 0),
+
+        // The OAuth server's signing and encryption keys (mig 253). Every boot seals a
+        // pair once migrations have run if none is stored, so any install that has
+        // booted once holds wrapped material and a key-less boot refuses: minting a
+        // fresh key would leave MCP sign-in unable to open its own keys. Both columns are
+        // BYTEA NOT NULL and reconciliation deletes the row rather than emptying it, so
+        // Length > 0 is the same "no wrapped material" rule as the delivery targets above.
+        db => db.OidcServerKeys.Any(k =>
+            k.SigningKeyCiphertext.Length > 0 || k.EncryptionKeyCiphertext.Length > 0),
+
+        // The private-fork release token (mig 269, ADR-0110). BYTEA NOT NULL, and no row means
+        // no token, so any row with Length > 0 is wrapped material a fresh key would orphan.
+        db => db.UpgradeRepoToken.Any(t => t.TokenCiphertext.Length > 0),
     ];
 
     /// <summary>

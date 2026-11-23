@@ -1,5 +1,11 @@
 import { useEffect, useId, useRef, useState } from 'react';
 
+import {
+    dismissOnEscape,
+    happenedInside,
+    useDismissOnPageEscape,
+    useReturnFocusOnClose,
+} from '@/components/ui/popoverDismissal';
 import type { RegisterStatusCounts } from '@/lib/api/register';
 import { REGISTER_STATUS_VIEWS, type StatusFilter } from './registerStatus';
 
@@ -40,22 +46,33 @@ export function RegisterStatusMenu({ statusFilter, onChange, counts }: RegisterS
     };
     const [open, setOpen] = useState(false);
     const rootRef = useRef<HTMLDivElement>(null);
+    const toggleRef = useRef<HTMLButtonElement>(null);
 
     // Close on outside click.
     useEffect(() => {
         if (!open) return;
         const onDoc = (e: MouseEvent) => {
-            if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+            if (rootRef.current && !happenedInside(e, rootRef.current)) setOpen(false);
         };
         document.addEventListener('mousedown', onDoc);
         return () => document.removeEventListener('mousedown', onDoc);
     }, [open]);
 
+    // Esc closes it too, from the menu or from the page, and focus goes back
+    // to the toggle however it closes (ADR-0023 §L).
+    useDismissOnPageEscape(open, () => setOpen(false));
+    useReturnFocusOnClose(open, toggleRef);
+
     const activeLabel = LABEL_BY_VALUE.get(statusFilter) ?? 'All';
 
     return (
-        <div ref={rootRef} className="relative shrink-0">
+        <div
+            ref={rootRef}
+            className="relative shrink-0"
+            onKeyDown={(e) => { if (open) dismissOnEscape(e, () => setOpen(false)); }}
+        >
             <button
+                ref={toggleRef}
                 type="button"
                 onClick={() => setOpen((v) => !v)}
                 aria-expanded={open}

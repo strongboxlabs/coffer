@@ -1,6 +1,6 @@
 # 0022 — Transactions normalize into headers and legs
 
-* Status: Accepted (complete)
+* Status: Accepted (complete; Rules 3 and 6 amended by [ADR-0108](0108-memo-and-tags-per-side.md), 2026-10-27: memo and tags are per side); Rule 2 amended 2026-11-14 by [ADR-0114](0114-benchmarks-and-currency-conversion.md) (a posting between two real accounts in different currencies carries both amounts and does not sum to zero)
 * Date: 2026-05-11
 * Supersedes: [ADR-0019](0019-symmetric-postings.md)
 * Refines: [ADR-0017](0017-account-discriminator.md), [ADR-0018](0018-investment-and-cross-account-translation.md)
@@ -11,8 +11,7 @@
 > `merge_candidates.{incoming,existing}_txn_id` → `*_header_id`, then
 > dropped the legacy `transactions` / `transaction_overrides` /
 > `transaction_tags` tables plus the ADR-0019 symmetric-pair trigger.
-> Investment lots write through `BulkReplaceLotsAsync` (thousands of lots
-> populated on a large real-world ledger). JIT-off on `coffer_app` stays
+> Investment lots write through `InsertLotsAsync`. JIT-off on `coffer_app` stays
 > (PR \#45) — the new view's join count keeps the plan above
 > `jit_above_cost`, so the role-level override is the right call for
 > now; see the perf follow-up below for paths to retire it.
@@ -40,25 +39,24 @@ state that doesn't have a per-leg meaning:
   the incoming feed event, not its legs.
 - **Group memo.** MD's `txn.memo` ("Electronic/ACH Credit") is the event's
   own descriptor, distinct from each leg's per-split memo (the earning
-  or deduction that split records). Until 2026-05-11 the importer threw it away because
-  no column carried it; surfacing it on `leg_index=0` only created a
-  semantic asymmetry (`feed_memo` would mean different things on different
-  legs of the same event).
+  or deduction that split records). The ADR-0019 schema had no column to
+  carry it, so the importer dropped it, and carrying it on `leg_index=0`
+  would have created a semantic asymmetry (`feed_memo` meaning different
+  things on different legs of the same event). Rule 1 gives it
+  `txn_headers.memo`.
 
 Each future group-level field would have needed its own column on
 `transactions` (duplicated N times) or a side table that grew alongside
-the main one. The denormalized shape was a 250-line patch with a long
-trail; the right answer is to model the envelope where it belongs.
+the main one. The right answer is to model the envelope where it belongs.
 
-A spot-check after PR \#41's perf work confirmed a secondary benefit:
-the RLS chain `transactions → accounts → user_ledger_grants` produced a
-plan with 134 inlined functions that triggered ~500ms of JIT compilation
-per query. Hoisting `ledger_id` directly onto the header collapses that
+A secondary benefit: the RLS chain `transactions → accounts →
+user_ledger_grants` compiles to a plan with a large number of inlined
+functions, and JIT-compiling them costs more than the query itself. Hoisting `ledger_id` directly onto the header collapses that
 chain to one hop on header reads and two on leg reads.
 
-The user's product call: **normalize into a `txn_headers` row for the
-event and `txn_legs` rows for the per-account postings; pay the
-migration cost once.**
+The decision: **normalize into a `txn_headers` row for the event and
+`txn_legs` rows for the per-account postings; pay the migration cost
+once.**
 
 ## Decision
 
@@ -131,7 +129,8 @@ CREATE TABLE txn_legs (
 
 The unique `(header_id, posting_index, account_id)` plus a CHECK that
 each posting_index appears exactly twice within a header enforces the
-two-legs-per-posting invariant. "Other side of this leg":
+two-legs-per-posting invariant. *(Amended 2026-11-14: no CHECK or trigger
+enforces it; see the amendment below.)* "Other side of this leg":
 
 ```sql
 SELECT * FROM txn_legs
@@ -140,6 +139,19 @@ WHERE header_id = $1 AND posting_index = $2 AND id != $3;
 
 One row by invariant. Same expressiveness as ADR-0019's
 `counterparty_id` lookup, derived structurally rather than denormalized.
+
+### Amendment, 2026-11-14 — Rule 2: a posting between currencies carries both amounts ([ADR-0114](0114-benchmarks-and-currency-conversion.md) D13)
+
+"Their `amount` values sum to zero" holds for every posting whose two accounts share a
+currency, and for every posting with a category leg. It does not hold for a posting
+between two real accounts in different currencies. That posting carries both amounts,
+each leg in its own account's currency, with opposite, nonzero signs. No rate is stored on
+it, and there is no exchange step or gain or loss line for the currency move. The second
+amount is required: a missing, zero or same-signed second amount is refused. A category
+leg still carries the real side's amount negated, because a category holds no money of
+its own (ADR-0114 D5). The two-legs-per-posting shape and the "other side of this leg"
+lookup are unchanged. No CHECK, trigger or constraint enforces the two-leg cardinality or
+a posting's sum (ADR-0032); the writers keep both by construction.
 
 ### Rule 3 — Header memo and leg memo are distinct fields
 
@@ -154,6 +166,17 @@ when the user expands a multi-split entry.
 For a single-leg event, `leg_memo` is typically NULL and the register
 falls back to header memo — same UX as today's coffee row. For a
 multi-split, both columns carry value and both render where appropriate.
+
+*Amended 2026-10-27 (ADR-0108 D1, D5): memo and tags are per side.* A transaction
+with one posting has no header memo. Each side's leg holds its own, and a
+side without one shows the other side's. On a multi-split the header memo is
+the transaction's and is shown only in the register of the account the
+transaction was split from; a line there with no memo of its own shows
+blank, never the header's. The other side of a line shows that line's own
+memo, else its other leg's. An investment event shows one memo: its
+brokerage leg's on one posting, the header's on several. What a register shows is computed when a writer
+saves and stored per leg (`txn_legs.notes_*`, migration 264); readers read
+that, not these two columns.
 
 ### Rule 4 — Investment metadata lives on the leg
 
@@ -196,6 +219,14 @@ COALESCE in the view picks override over feed value as before.
 a multi-split paycheck's "vacation" tag applies to every leg by virtue
 of being on the header.
 
+*Amended 2026-10-27 (ADR-0108 D1, D2, D5): tags are placed like the memo.* Header tags
+exist only on a transaction with several postings, and are in play only on
+the side it was split from, where they count for every line; each line also
+carries its own (`txn_leg_tags`, [ADR-0103](0103-tags-at-both-levels.md)). A
+one-posting transaction's tags are per side, on its legs. The tags a row
+shows and filters on are stored per leg in `txn_leg_note_tags` (migration
+264).
+
 ### Rule 7 — `txn_group_id` is gone
 
 The header *is* the group. Single-split events and multi-split events
@@ -228,23 +259,21 @@ CREATE POLICY leg_via_header ON txn_legs
 `txn_legs` reads need two (`header_id → txn_headers.ledger_id →
 user_ledger_grants`). Both are shorter than the
 `transactions → accounts → user_ledger_grants` chain in ADR-0020 Phase D,
-which is what triggered the JIT regression patched in PR \#41.
+whose JIT compile cost is what `jit = off` on `coffer_app` avoids.
 
-**Phase 2 update (2026-05-12):** Measured after the cut-over. The new
-`register_entry_keys` walks `resolved_transactions`, which under
-ADR-0022 joins txn_headers + txn_legs + 2 override tables +
-self-LEFT-JOIN on legs for the counterparty + accounts + the
-`account_path` recursive function. Postgres compiles ~256 functions
-per query (vs 134 in the old shape — *more*, not less), so JIT
-compilation still dominates wall time. Spot-check:
+**Phase 2 update (2026-05-12):** The new `register_entry_keys` walks `resolved_transactions`, which under
+ADR-0022 joins txn_headers + txn_legs + a self-LEFT-JOIN on legs
+for the counterparty + accounts + the `account_path` recursive
+function. With JIT on, Postgres compiles
+every expression in that wide plan before the query starts, so JIT
+compilation, not execution, still dominates the wall time of a
+`register_entry_keys` call with JIT on.
 
-  register_entry_keys via psql, JIT on:  ~800ms
-  register_entry_keys via psql, JIT off: ~150ms
-  Full HTTP request, JIT off:            ~450ms warm
-
-PR \#45 restored the `ALTER ROLE coffer_app SET jit = off` workaround.
-The simpler RLS chain still helped — pre-ADR-0022 register reads
-were ~1.6s warm, post are ~450ms — but the JIT cost moved from the
+`ALTER ROLE coffer_app SET jit = off` therefore stays (PR \#45).
+*(2026-10-27: `register_entry_keys` was dropped in migration 266; the register
+keys its entries in `RegisterQuery`. The `jit = off` setting is unaffected.)*
+The simpler RLS chain still stands — each row's policy check walks a
+shorter chain than before ADR-0022 — but the JIT cost moved from the
 RLS subqueries to the view's join structure rather than vanishing.
 Future ADR could simplify the view (denormalise counterparty?), raise
 `jit_above_cost` cluster-wide, or move some joins into the
@@ -254,10 +283,10 @@ RegisterRepository LINQ surface.
 the question is now closed — `jit = off` *stays*. ADR-0046 removed every
 per-row correlated subquery, after which the windowed page no longer
 trips JIT (so the role setting is a no-op there), but the full-account
-scan still trips it (282 functions) for ~70-100 ms of compile with no
+scan can still trip it and pays the compile with no
 execution benefit. Lifting the override would only regress reports;
-counterparty denorm measured cheap (~2 ms, won't do). It is the
-deliberate, measured optimum, not a workaround. See ADR-0046's close-out.
+counterparty denorm is cheap by structure (won't do). It is
+deliberate configuration, not a workaround. See ADR-0046's close-out.
 
 ## Consequences
 
@@ -273,27 +302,24 @@ deliberate, measured optimum, not a workaround. See ADR-0046's close-out.
   importer, the view, the API, and the UI all stop branching on
   `txn_group_id IS NULL`.
 - RLS plans collapse. Header reads are a single subquery hop. The
-  hoped-for elimination of the JIT-off workaround didn't materialize
-  (see Phase 2 update above) — the JIT cost moved from the RLS
-  subqueries to the view's join structure — but warm-register latency
-  dropped from ~1.6s to ~450ms anyway.
+  JIT-off setting stays (see Phase 2 update above): the JIT cost moved
+  from the RLS subqueries to the view's join structure.
 - "Other side of this leg" is structural, not denormalized. No
   symmetric-pair trigger needed to enforce that A↔B references stay in
   sync — they do by construction.
 
 **Negative**
 
-- Migration cost was real. Phase 1 shipped as PRs \#44 (schema +
-  importer + API EF + tests) and \#46 (investment importer port);
-  ~1700 LOC across ~30 files. Phase 2 (drops + lots/merge_candidates
-  FK retarget) is still pending. ADR-0019's `counterparty_id` /
-  `txn_group_id` / `leg_index` columns remain on the legacy
-  `transactions` table — the new tables don't carry them — but the
-  table itself is unused by the read path.
+- Migration cost is real: Phase 1 (schema + importer + API EF + tests,
+  and the investment importer port) is ~1700 LOC across ~30 files.
+  Phase 2 (migration 025) drops the legacy `transactions` table, and
+  with it ADR-0019's `counterparty_id` / `txn_group_id` / `leg_index`
+  columns; the new tables never carried them.
 - Row count shifts. A simple coffee txn is now 3 rows (1 header + 2
-  legs) where ADR-0019 had 2. Real-export expansion: an N-txn export →
-  N headers + ~4N legs (a buy expands to a brokerage-cash + holdings
-  pair; a divr to four legs) after both importer phases (the legs
+  legs) where ADR-0019 had 2. Expansion: an N-txn export → N headers +
+  at least 2N legs, more for splits and investments (a buy expands to a
+  brokerage-cash + holdings pair; a divr to four legs) after both
+  importer phases (the legs
   count is higher than the prior row count because
   each posting now has two leg rows whereas ADR-0019's "single-split"
   events had two `transactions` rows that played both roles).
@@ -323,10 +349,9 @@ deliberate, measured optimum, not a workaround. See ADR-0046's close-out.
 
 Two-phase, **not** the big-bang originally planned. Justified because:
 
-1. No production envs. The user's local DB and CI's per-run fixture are
-   the only places this data exists.
-2. The re-import path is well-exercised (3 reimports this session). Time
-   cost: a few tens of seconds for a large export.
+1. No deployed installs to migrate: only development and CI's per-run
+   databases held this schema.
+2. The re-import path is well-exercised, and a re-import is cheap.
 3. A phased dual-write would add 2-3× the migration work for migration
    mechanics that nobody benefits from.
 
@@ -346,8 +371,7 @@ Two-phase, **not** the big-bang originally planned. Justified because:
 
 **Phase 2 (shipped 2026-05-12, migration 025):**
 - Retargeted `lots.transaction_id` → `lots.leg_id` (FK to
-  `txn_legs(id)`). Investment-importer lot insertion re-enabled;
-  thousands of lots on a large real-world ledger.
+  `txn_legs(id)`). Investment-importer lot insertion re-enabled.
 - Retargeted `merge_candidates.{incoming,existing}_txn_id` →
   `*_header_id` (FK to `txn_headers(id)`) for the future sync
   pipeline.
@@ -366,7 +390,7 @@ Phase 2 truncated existing `lots` and `merge_candidates` data on
 the way in — those tables held references to the legacy
 `transactions` ids that wouldn't survive the drop. The investment
 importer's re-import repopulates lots; `merge_candidates` is a
-short-lived review queue with no production data.
+short-lived review queue, not ledger data.
 
 ## Alternatives considered
 
@@ -383,7 +407,7 @@ short-lived review queue with no production data.
   Rejected.
 - **Co-opt `leg_index=0`'s row as the parent.** No new table; leg 0's
   fields mean "parent metadata," other legs mean "leg metadata." Same
-  asymmetry surfaced when we tried to put header memo on leg 0 alone:
+  asymmetry as putting header memo on leg 0 alone:
   `feed_memo` would carry different concepts depending on `leg_index`,
   and leg 0's own per-leg memo would have nowhere to live. Rejected.
 - **Full double-entry textbook model with explicit debits/credits.**

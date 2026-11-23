@@ -1,16 +1,20 @@
+using System.Linq.Expressions;
 using System.Text.Json;
 
 using Microsoft.EntityFrameworkCore;
 
 using Coffer.Api.Contracts;
 using Coffer.Api.Db.Entities;
+using Coffer.Api.Db.Presentation;
+using Coffer.Domain.Annotations;
 using Coffer.Domain.Investment;
 
 namespace Coffer.Api.Db.Repositories;
 
 /// <summary>
 /// Server-side register filter (mig 164). Every field is optional; a null
-/// field is a no-op predicate. Pushed into <c>register_entry_keys</c> so the
+/// field is a no-op predicate. Pushed into the entry query
+/// (<see cref="RegisterQuery"/>) so the
 /// windowed keyset cursor walks only matching entries (client-side filtering
 /// can't — it only sees the loaded window). <see cref="Status"/> folds the
 /// former client-side status tabs server-side: <c>cleared</c> / <c>uncleared</c>
@@ -23,7 +27,14 @@ public sealed record RegisterFilter(
     string? Search = null,
     DateOnly? DateFrom = null,
     DateOnly? DateTo = null,
+    /// <summary>
+    /// The least magnitude, inclusive, of the amount the entry's row shows on its
+    /// account: the header's net there for an entry keyed by its header, the leg's own
+    /// amount for an entry keyed by its leg, as <see cref="Direction"/> reads it. The
+    /// amount sort orders by the same amount.
+    /// </summary>
     decimal? AmountMin = null,
+    /// <summary>The greatest magnitude, inclusive, of that same amount.</summary>
     decimal? AmountMax = null,
     Guid? SecurityId = null,
     string? Tag = null,
@@ -40,7 +51,17 @@ public sealed record RegisterFilter(
     /// the rest of the app reports a substantial total against it. Off by default: a plain
     /// account register must keep planning and paging exactly as it did.
     /// </remarks>
-    bool IncludeSubcategories = false)
+    bool IncludeSubcategories = false,
+    /// <summary>
+    /// Cash-flow direction, by the sign of the amount the entry's row shows on its
+    /// account: the header's net there for an entry keyed by its header, the leg's own
+    /// amount for an entry keyed by its leg. Inflow above zero, outflow below it, a zero
+    /// amount in neither. Not the page's scroll direction
+    /// (<see cref="RegisterRepository.DirectionBefore"/>). Only the ledger-wide entries
+    /// (<see cref="RegisterRepository.GetLedgerPageAsync"/>) set it; the register
+    /// endpoints never do.
+    /// </summary>
+    TransactionDirection Direction = TransactionDirection.All)
 {
     public static readonly RegisterFilter None = new();
 
@@ -52,6 +73,7 @@ public sealed record RegisterFilter(
         || AmountMin is not null || AmountMax is not null
         || SecurityId is not null || Tag is not null || CategoryId is not null
         || !string.IsNullOrWhiteSpace(Status)
+        || Direction != TransactionDirection.All
         // Widening to the subtree changes which entries exist, so the scroll
         // rail's buckets must be rebuilt rather than reused from the narrow
         // view. That is a CACHE-KEY concern, not a UI one: the web deliberately
@@ -62,12 +84,14 @@ public sealed record RegisterFilter(
 
     /// <summary>Compact, stable key for cache-keying the scroll-track buckets
     /// per filter (the date rail must re-derive when the filter narrows the
-    /// set). Excludes Today — status intent already varies the key.</summary>
+    /// set). Excludes Today — status intent already varies the key. A direction
+    /// adds one part only when set, so every key without one is unchanged.</summary>
     public string Fingerprint =>
         IsActive
             ? string.Join('|', IncludeSubcategories ? "sub" : null,
                 Search, DateFrom, DateTo, AmountMin, AmountMax,
                 SecurityId, Tag, CategoryId, Status)
+              + (Direction == TransactionDirection.All ? string.Empty : "|" + Direction)
             : string.Empty;
 }
 
@@ -75,7 +99,7 @@ public sealed record RegisterFilter(
 /// Register display ordering (mig 166). <see cref="Column"/> is one of the
 /// whitelisted sort dimensions — <c>date</c> / <c>amount</c> / <c>payee</c> /
 /// <c>category</c> on any register, plus <c>security</c> / <c>shares</c> /
-/// <c>price</c> / <c>action</c> on investment registers — and the SQL function
+/// <c>price</c> / <c>action</c> on investment registers — and the entry query
 /// falls back to <c>date</c> for anything else. <see cref="Descending"/>
 /// defaults true (newest / largest first), matching the pre-sort behavior.
 /// Sort is display-order only: it never affects counts or select-all (both are
@@ -85,17 +109,18 @@ public sealed record RegisterSort(string Column, bool Descending)
 {
     public static readonly RegisterSort Default = new("date", Descending: true);
 
-    /// <summary>Wire value for the SQL function's <c>p_sort_dir</c>.</summary>
+    /// <summary>The direction's wire spelling, <c>asc</c> or <c>desc</c>.</summary>
     public string Dir => Descending ? "desc" : "asc";
 }
 
 /// <summary>
 /// Per-status entry counts for one account's register, respecting the active
 /// NON-status filter (search / date / amount / category / tag / security).
-/// Drives the status dropdown's count badges. Counts are per-header — the same
-/// unit as the scroll-rail buckets and the "N matches" chip — so the numbers
-/// reconcile with each other. `needs_review` overlaps the recon buckets (it's
-/// the bank-feed flag, a separate dimension), so the buckets don't sum to All.
+/// Drives the status dropdown's count badges. Counts are per entry, as the page
+/// groups rows — the same unit as the scroll-rail buckets and the "N matches"
+/// chip — so the numbers reconcile with each other and with the rows.
+/// `needs_review` overlaps the recon buckets (it's the bank-feed flag, a
+/// separate dimension), so the buckets don't sum to All.
 /// </summary>
 public sealed record RegisterStatusCounts(
     int All,
@@ -119,11 +144,11 @@ public sealed record RegisterStatusCounts(
 /// </summary>
 /// <remarks>
 /// <para>The two queries that drive this — entry-key paging and row
-/// fetching — live in Postgres functions
-/// (<c>register_entry_keys</c> / <c>register_entry_rows</c>, migration
-/// 019). This file is just the C# adapter: typed input, opaque-cursor
-/// codec, and assembly of the flat row stream into
-/// <see cref="RegisterEntryDto"/> values.</para>
+/// fetching — are LINQ over <see cref="RegisterQuery"/>, which filters and
+/// keys every leg through the memo-and-tags rule
+/// (<see cref="Coffer.Domain.Annotations.MemoTagRules"/>). This file adds the
+/// typed input, the opaque-cursor codec, and the assembly of the flat row
+/// stream into <see cref="RegisterEntryDto"/> values.</para>
 ///
 /// <para>The cursor returned in <see cref="RegisterPage.NextCursor"/>
 /// is an opaque base64url-encoded JSON string carrying
@@ -140,8 +165,9 @@ public sealed class RegisterRepository
 
     /// <summary>
     /// The account scope for a register query: the account and — when the
-    /// filter asks — its descendants. Null means "every account in this
-    /// ledger", which is what a ledger-wide read passes.
+    /// filter asks — its descendants. Every register is one account's; the
+    /// ledger-wide entries (<see cref="GetLedgerPageAsync"/>) are many registers'
+    /// first entries read together, not a register of the ledger.
     /// </summary>
     /// <remarks>
     /// Migration 226 widened the register functions from one account id to a
@@ -154,15 +180,14 @@ public sealed class RegisterRepository
     /// with the budget's expanded row and the reparent guard, which needed the
     /// same answer. The round trip happens only when the toggle is on.
     /// </remarks>
-    private async Task<Guid[]?> ResolveScopeAsync(
-        Guid? accountId, Guid ledgerId, RegisterFilter filter,
+    private async Task<Guid[]> ResolveScopeAsync(
+        Guid accountId, Guid ledgerId, RegisterFilter filter,
         CancellationToken cancellationToken)
     {
-        if (accountId is not { } id) return null;
-        if (!filter.IncludeSubcategories) return [id];
+        if (!filter.IncludeSubcategories) return [accountId];
 
         var scope = await CategoryTree
-            .DescendantsAsync(_db, ledgerId, id, includeRoot: true, cancellationToken)
+            .DescendantsAsync(_db, ledgerId, accountId, includeRoot: true, cancellationToken)
             .ConfigureAwait(false);
         return [.. scope];
     }
@@ -178,16 +203,15 @@ public sealed class RegisterRepository
     /// returns entries strictly older than the cursor (the
     /// downward / older scroll); <c>"after"</c> returns entries
     /// strictly newer than the cursor (the upward / newer scroll).
-    /// The Postgres function uses these strings directly — keep
-    /// them in lockstep with migration 031.
+    /// The SPA sends these strings as they are.
     /// </summary>
     public const string DirectionBefore = "before";
     public const string DirectionAfter = "after";
 
     /// <summary>
-    /// Fetch one page of resolved-transaction entries for
-    /// <paramref name="ledgerId"/>, optionally narrowed to a single
-    /// <paramref name="accountId"/> within that ledger.
+    /// Fetch one page of resolved-transaction entries of
+    /// <paramref name="accountId"/>'s register in <paramref name="ledgerId"/>
+    /// (with its descendants when the filter asks).
     ///
     /// <para>Three call shapes:</para>
     /// <list type="bullet">
@@ -205,20 +229,20 @@ public sealed class RegisterRepository
     ///   </item>
     ///   <item>
     ///     <description><c>startingAtHeaderId=Y</c> → resolve that
-    ///     header to its entry-key tuple, return a page anchored at
-    ///     the focused entry (focused entry at index 0,
-    ///     <paramref name="limit"/>-1 entries strictly older after
+    ///     header to its first entry in display order, return a page
+    ///     anchored at the focused entry (focused entry at index 0,
+    ///     <paramref name="limit"/>-1 entries strictly past it after
     ///     it). Used by the "Show other side" navigation arrival
     ///     path.</description>
     ///   </item>
     /// </list>
     ///
     /// Rows that are merged away or user-hidden are filtered out
-    /// (by the Postgres function, not here).
+    /// (by <see cref="RegisterQuery"/>).
     /// </summary>
     public async Task<RegisterPage> GetPageAsync(
         Guid ledgerId,
-        Guid? accountId,
+        Guid accountId,
         string? cursor,
         string direction,
         Guid? startingAtHeaderId,
@@ -247,24 +271,32 @@ public sealed class RegisterRepository
         //   * empty: most-recent page (no cursor, direction='before').
         RegisterCursor? reference;
         var includeAnchorEntry = false;
-        if (startingAtHeaderId.HasValue)
+        if (startingAtHeaderId is { } anchorHeaderId)
         {
-            reference = await ResolveCursorForHeaderAsync(
-                ledgerId, scope, startingAtHeaderId.Value, hidden, cancellationToken)
+            // The header's first entry in display order: its one entry on a side
+            // that groups by header, its first line on an opposite side (the other
+            // lines follow it on the page).
+            var anchor = await RegisterQuery.FirstEntryOfHeaderAsync(
+                    _db, RegisterQuery.InScope(_db, scope, hidden), anchorHeaderId, s, cancellationToken)
                 .ConfigureAwait(false);
             // Header gone / hidden / out-of-scope ⇒ empty page (unchanged).
-            if (reference is null)
+            if (anchor is null)
                 return new RegisterPage([], CursorForOlder: null, CursorForNewer: null);
             // The header exists — pin it ONLY if it matches the active filter
-            // (ADR-0076). If the filter excludes it, drop the anchor and fall
-            // through to the most-recent FILTERED page: a stale ?focus= under a
-            // filter, or a post-save edit that moved the row out of the filter,
-            // shows the filtered list — not the non-matching row, not an empty
-            // page.
-            if (await AnchorMatchesFilterAsync(
-                    ledgerId, accountId, startingAtHeaderId.Value, hidden, f, cancellationToken)
-                    .ConfigureAwait(false))
+            // (ADR-0076), and then at its first entry that matches. If the filter
+            // excludes it, drop the anchor and fall through to the most-recent
+            // FILTERED page: a stale ?focus= under a filter, or a post-save edit that
+            // moved the row out of the filter, shows the filtered list — not the
+            // non-matching row, not an empty page.
+            var pinned = f.IsActive
+                ? await RegisterQuery.FirstEntryOfHeaderAsync(
+                        _db, RegisterQuery.Filtered(_db, scope, ledgerId, hidden, f, TodayOf(f)),
+                        anchorHeaderId, s, cancellationToken)
+                    .ConfigureAwait(false)
+                : anchor;
+            if (pinned is not null)
             {
+                reference = new RegisterCursor { PostedAt = pinned.PostedAt, Seq = pinned.Seq, EntryKey = pinned.EntryKey };
                 includeAnchorEntry = true;
                 direction = DirectionBefore;
             }
@@ -285,23 +317,20 @@ public sealed class RegisterRepository
         var q1Limit = includeAnchorEntry ? limit - 1 : limit + 1;
         // Widened to the category's descendants when the caller asked; the
         // identity case for every ordinary account register.
-        var entryKeys = await _db.RegisterEntryKeys(
-                scope,
-                ledgerId,
-                reference?.EntryKey,
-                reference?.Seq,
-                direction,
-                q1Limit,
-                hidden,
-                f.Search, f.DateFrom, f.DateTo, f.AmountMin, f.AmountMax,
-                f.SecurityId, f.Tag, f.CategoryId, f.Status, f.Today,
-                s.Column, s.Dir)
-            .AsNoTracking()
-            .ToListAsync(cancellationToken)
+        var entryKeys = await RegisterQuery.EntryKeysAsync(
+                _db, scope, ledgerId, reference?.EntryKey, reference?.Seq, direction, q1Limit, hidden,
+                f, TodayOf(f), s, cancellationToken)
             .ConfigureAwait(false);
 
+        // The extra key is the one farthest from the cursor. The keys come back in display
+        // order, so for 'before' it is the last and for 'after' the first; the page keeps
+        // the keys next to its cursor either way, or a scroll toward newer entries would
+        // skip the one just past the window's edge.
         var hasMoreInDirection = !includeAnchorEntry && entryKeys.Count > limit;
-        if (hasMoreInDirection) entryKeys = entryKeys.GetRange(0, limit);
+        if (hasMoreInDirection)
+            entryKeys = direction == DirectionAfter
+                ? entryKeys.GetRange(entryKeys.Count - limit, limit)
+                : entryKeys.GetRange(0, limit);
 
         if (includeAnchorEntry && reference is not null)
         {
@@ -317,80 +346,7 @@ public sealed class RegisterRepository
         if (entryKeys.Count == 0)
             return new RegisterPage([], CursorForOlder: null, CursorForNewer: null);
 
-        // Q2 — fetch every row belonging to those entries via LINQ
-        // over the resolved_transactions view. EF.Constant inlines
-        // the entry-keys array as SQL literals so Postgres sees the
-        // selectivity at plan time.
-        var keysArray = entryKeys.Select(k => k.EntryKey).ToArray();
-
-        IQueryable<ResolvedTransactionView> query = _db.ResolvedTransactions
-            .AsNoTracking()
-            .Where(rt => rt.IsHidden == hidden && rt.IsMergedInto == null)
-            // ADR-0036: entry_key is asymmetric — header_id on the
-            // originating side, leg id on the target side. Match
-            // either, then the account filter narrows down. UUID
-            // collision between header_id and an unrelated leg id
-            // would be astronomical; an OR on the same array is
-            // simpler than re-computing the CASE in LINQ.
-            .Where(rt => EF.Constant(keysArray).Contains(rt.HeaderId)
-                      || EF.Constant(keysArray).Contains(rt.Id));
-
-        // THE SAME SCOPE THE SQL USED. This narrowed to a single account,
-        // which silently undid the subtree: the SQL returned the descendants'
-        // entries and this discarded every row that was not on the parent
-        // itself, so a widened query produced an empty page and the feature
-        // looked inert rather than broken.
-        if (scope is not null)
-        {
-            var inScope = scope;
-            query = query.Where(rt => EF.Constant(inScope).Contains(rt.AccountId));
-        }
-        else
-        {
-            query = query.Where(rt =>
-                _db.Accounts.Any(a => a.Id == rt.AccountId && a.LedgerId == ledgerId));
-        }
-
-        // Q2 ordering mirrors Q1's entry ordering (ADR-0034 v2: the
-        // canonical (posted_at, seq) pair). AssembleEntries buckets
-        // contiguous same-entry rows so leg ordering within an entry
-        // is by LegIndex ASC. The SQL function's outer SELECT always
-        // returns (posted_at DESC, seq DESC) regardless of direction,
-        // so Q2's static DESC sort lines up.
-        var rows = await query
-            .OrderByDescending(rt => rt.PostedAt)
-            .ThenByDescending(rt => rt.HeaderSeq)
-            .ThenBy(rt => rt.LegIndex)
-            .ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
-
-        // Q1 (register_entry_keys) is authoritative for entry ORDER. Q2's
-        // static (posted_at DESC) hydration order doesn't match under a
-        // non-date sort, and even under date sort Q1 adds the entry_key
-        // tiebreaker (mig 166). Reorder the hydrated rows to Q1's key order;
-        // OrderBy is stable, so an entry's legs stay contiguous and in their
-        // (posted_at, seq, leg_index) order — AssembleEntries then emits
-        // entries in exactly the order Q1 returned.
-        //
-        // A row maps to the Q1 entry whose key is its header_id (a normal entry)
-        // OR its leg id (an ADR-0036 target split) — the same OR-match Q2 used to
-        // fetch it. EntryKeyOf can't do this lookup: for a normal entry Q1 returns
-        // header_id, while EntryKeyOf returns txn_group_id ?? id, which need not
-        // be equal — so keying on it misses every row and the sort is lost.
-        var q1Order = new Dictionary<Guid, int>(entryKeys.Count);
-        for (var idx = 0; idx < entryKeys.Count; idx++)
-            q1Order[entryKeys[idx].EntryKey] = idx;
-        int Q1PositionOf(ResolvedTransactionView rt) =>
-            q1Order.TryGetValue(rt.HeaderId, out var p) ? p
-            : q1Order.TryGetValue(rt.Id, out var p2) ? p2
-            : int.MaxValue;
-        var orderedRows = rows.OrderBy(Q1PositionOf).ToList();
-
-        var holdingsByAccount = await GetHoldingsSiblingMapAsync(orderedRows, cancellationToken)
-            .ConfigureAwait(false);
-        var legTagsByLegId = await GetLegTagMapAsync(orderedRows, cancellationToken)
-            .ConfigureAwait(false);
-        var entries = AssembleEntries(orderedRows, holdingsByAccount, legTagsByLegId);
+        var entries = await EntriesOfAsync(scope, hidden, entryKeys, cancellationToken).ConfigureAwait(false);
 
         // Cursor calc:
         //   * cursorForOlder: if there's more older history available
@@ -460,238 +416,393 @@ public sealed class RegisterRepository
     }
 
     /// <summary>
-    /// Resolve a header id to its register-entry cursor tuple
-    /// (<see cref="RegisterCursor.PostedAt"/>, <see cref="RegisterCursor.Seq"/>,
-    /// <see cref="RegisterCursor.EntryKey"/>). Returns <c>null</c> when the
-    /// header is hidden, merged away, or doesn't belong to the ledger/account
-    /// scope — i.e. it isn't a visible entry, and the caller returns an empty
-    /// page. Filter-matching is a SEPARATE concern
-    /// (<see cref="AnchorMatchesFilterAsync"/>): an existing anchor the active
-    /// filter excludes still resolves here but is not pinned. Used by the
-    /// starting_at path to anchor a page on the focused header.
+    /// Every entry <paramref name="headerId"/> has in
+    /// <paramref name="accountId"/>'s register, in the order and grouping the
+    /// page shows them (the default sort). The save routes hand these back so
+    /// the SPA replaces that header's rows in its window in place — no full
+    /// window refresh, no scroll-jolt.
     /// </summary>
-    private async Task<RegisterCursor?> ResolveCursorForHeaderAsync(
-        Guid ledgerId,
-        // The SCOPE, not one account: "start at this header" has to work when
-        // the header sits on a descendant of the category being viewed.
-        Guid[]? scope,
-        Guid headerId,
-        bool hidden,
-        CancellationToken cancellationToken)
-    {
-        IQueryable<ResolvedTransactionView> query = _db.ResolvedTransactions
-            .AsNoTracking()
-            .Where(rt => rt.HeaderId == headerId
-                && rt.IsHidden == hidden
-                && rt.IsMergedInto == null);
-
-        // THE SAME SCOPE THE SQL USED. This narrowed to a single account,
-        // which silently undid the subtree: the SQL returned the descendants'
-        // entries and this discarded every row that was not on the parent
-        // itself, so a widened query produced an empty page and the feature
-        // looked inert rather than broken.
-        if (scope is not null)
-        {
-            var inScope = scope;
-            query = query.Where(rt => EF.Constant(inScope).Contains(rt.AccountId));
-        }
-        else
-        {
-            query = query.Where(rt =>
-                _db.Accounts.Any(a => a.Id == rt.AccountId && a.LedgerId == ledgerId));
-        }
-
-        // Group by header_id (ADR-0034 v2: entry_key is always h.id) and pull
-        // MAX(posted_at) / MAX(header_seq) — the same shape the SQL function
-        // emits. One entry per header on the account; ledger-wide collapses
-        // cleanly because every leg of one header shares posted_at/seq.
-        var match = await query
-            .GroupBy(rt => rt.HeaderId)
-            .Select(g => new
-            {
-                EntryKey = g.Key,
-                PostedAt = g.Max(rt => rt.PostedAt),
-                Seq = g.Max(rt => rt.HeaderSeq),
-            })
-            .FirstOrDefaultAsync(cancellationToken)
-            .ConfigureAwait(false);
-
-        if (match is null) return null;
-        return new RegisterCursor
-        {
-            PostedAt = match.PostedAt,
-            Seq = match.Seq,
-            EntryKey = match.EntryKey,
-        };
-    }
-
-    /// <summary>
-    /// True when <paramref name="headerId"/> matches the active
-    /// <paramref name="filter"/> — checked THROUGH the shared
-    /// <c>register_filtered_entries</c> primitive (ADR-0076), so a
-    /// focused/anchored row the filter excludes is not pinned and there's no
-    /// re-derived LINQ filter to drift. An inactive filter matches everything
-    /// (no query). The header is assumed to exist + be in scope already
-    /// (<see cref="ResolveCursorForHeaderAsync"/> ran first).
-    /// </summary>
-    private async Task<bool> AnchorMatchesFilterAsync(
-        Guid ledgerId,
-        Guid? accountId,
-        Guid headerId,
-        bool hidden,
-        RegisterFilter filter,
-        CancellationToken cancellationToken)
-    {
-        if (!filter.IsActive) return true;
-        var scope = await ResolveScopeAsync(accountId, ledgerId, filter, cancellationToken)
-            .ConfigureAwait(false);
-        return await _db.RegisterFilteredEntries(
-                scope, ledgerId, hidden,
-                filter.Search, filter.DateFrom, filter.DateTo, filter.AmountMin, filter.AmountMax,
-                filter.SecurityId, filter.Tag, filter.CategoryId, filter.Status, filter.Today)
-            .AsNoTracking()
-            .Where(rt => rt.HeaderId == headerId)
-            .AnyAsync(cancellationToken)
-            .ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Fetch the resolved <see cref="RegisterEntryDto"/> for a single
-    /// header, scoped to one account. Used by the PATCH endpoint to
-    /// hand the freshly-saved row back to the SPA so it can patch the
-    /// register in place via <c>mutateEntries</c> — no full window
-    /// refresh, no scroll-jolt.
-    /// </summary>
-    /// <returns><c>null</c> when the header has no source-side leg on
-    /// the supplied account, or when every row is filtered out by the
-    /// view's <c>is_hidden</c> / <c>is_merged_into</c> guards.</returns>
-    public async Task<RegisterEntryDto?> GetEntryForHeaderAsync(
+    /// <remarks>
+    /// A header is one entry on the side it belongs to (a split's parent, an
+    /// event) and one entry per line on an opposite side, so a save made from a
+    /// category register can come back as several entries.
+    /// </remarks>
+    /// <returns>Empty when the header has no visible leg on the account.</returns>
+    public async Task<IReadOnlyList<RegisterEntryDto>> GetEntriesForHeaderAsync(
         Guid headerId,
         Guid accountId,
         CancellationToken cancellationToken = default)
     {
-        // Mirror the same row-level filters + ordering the windowed
-        // fetch uses (RegisterEndpoint → resolved_transactions). The
-        // leg_index ASC tiebreaker keeps split legs in posting-index
-        // order so the SPA's split-parent rendering preserves the
-        // user's reorder on the next render.
-        var rows = await _db.ResolvedTransactions
-            .AsNoTracking()
-            .Where(rt => rt.HeaderId == headerId && rt.AccountId == accountId)
-            .Where(rt => !rt.IsHidden && rt.IsMergedInto == null)
-            .OrderBy(rt => rt.LegIndex)
+        Guid[] scope = [accountId];
+        var entryKeys = await RegisterQuery.EntriesOfHeaderAsync(
+                _db, RegisterQuery.InScope(_db, scope, hidden: false), headerId, RegisterSort.Default, cancellationToken)
+            .ConfigureAwait(false);
+        return entryKeys.Count == 0
+            ? []
+            : await EntriesOfAsync(scope, hidden: false, entryKeys, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The row each header in <paramref name="headerIds"/> shows in
+    /// <paramref name="accountId"/>'s register, keyed by header: its first entry there
+    /// in the default order, read and assembled exactly as the page does it.
+    /// </summary>
+    /// <remarks>
+    /// For a reader that presents a header as its register row without being the
+    /// register (the investment merge candidates), so that every figure it shows is the
+    /// row's own rather than a second reading of the legs that could disagree with it.
+    /// A header with no visible leg on the account is absent, and so is one whose entry
+    /// there is a split group, which has no single row.
+    /// </remarks>
+    public async Task<IReadOnlyDictionary<Guid, RegisterRowDto>> GetRowsForHeadersAsync(
+        IReadOnlyCollection<Guid> headerIds,
+        Guid accountId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(headerIds);
+        var rows = new Dictionary<Guid, RegisterRowDto>();
+        if (headerIds.Count == 0) return rows;
+
+        Guid[] scope = [accountId];
+        var entryKeys = await RegisterQuery.EntriesOfHeadersAsync(
+                _db, RegisterQuery.InScope(_db, scope, hidden: false), [.. headerIds.Distinct()],
+                RegisterSort.Default, cancellationToken)
+            .ConfigureAwait(false);
+        if (entryKeys.Count == 0) return rows;
+
+        var entries = await EntriesOfAsync(scope, hidden: false, entryKeys, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var entry in entries)
+        {
+            if (entry.Txn is { } row) rows.TryAdd(row.HeaderId, row);
+        }
+        return rows;
+    }
+
+    /// <summary>
+    /// The entries <paramref name="entryKeys"/> name, in that order (the page's Q2): every
+    /// row of each, with the entry key the key query grouped it under and the memo and
+    /// tags the rule shows for it, read from the scope the keys came from.
+    /// </summary>
+    private async Task<IReadOnlyList<RegisterEntryDto>> EntriesOfAsync(
+        Guid[] scope, bool hidden, IReadOnlyList<RegisterEntryKeyRow> entryKeys, CancellationToken cancellationToken)
+    {
+        var keyed = await KeyedRowsAsync(scope, hidden, [.. entryKeys.Select(k => k.EntryKey)], cancellationToken)
+            .ConfigureAwait(false);
+
+        // The keys are authoritative for entry ORDER: the rows' static (posted_at
+        // DESC) hydration order doesn't match under a non-date sort, and even under
+        // date sort the keys add the entry-key tiebreaker. Reorder the rows to the
+        // keys' order; OrderBy is stable, so an entry's legs stay contiguous and in
+        // their leg_index order, and AssembleEntries emits entries exactly in the
+        // order the keys came in.
+        var order = new Dictionary<Guid, int>(entryKeys.Count);
+        for (var idx = 0; idx < entryKeys.Count; idx++)
+            order[entryKeys[idx].EntryKey] = idx;
+        var orderedRows = keyed.OrderBy(r => order.GetValueOrDefault(r.EntryKey, int.MaxValue)).ToList();
+
+        return await AssembleAsync(orderedRows, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Every row of the entries <paramref name="keys"/> name in <paramref name="scope"/>,
+    /// each with the entry key the key query grouped it under and the memo and tags the
+    /// rule shows for it, in the rows' date order (posted_at, seq DESC, leg_index): the
+    /// statement behind every page of entries.
+    /// </summary>
+    private async Task<List<PageRow>> KeyedRowsAsync(
+        Guid[] scope, bool hidden, Guid[] keys, CancellationToken cancellationToken)
+    {
+        // THE SAME SCOPE the keys used (a narrower one would drop a category subtree's
+        // descendants and leave the page empty). EF.Constant inlines the keys as SQL
+        // literals so Postgres sees the selectivity at plan time. A key is a header
+        // id (a side that groups by header) or a leg id (each line of an opposite
+        // side); matching either keeps the fetch on an index, and the row's own entry
+        // key then picks exactly the entries asked for.
+        // The two matches are read apart and put together: one OR over the header and
+        // the leg is a filter over every leg of the scope, each alone an index lookup.
+        var inScope = RegisterQuery.InScope(_db, scope, hidden);
+        return await inScope.Where(l => EF.Constant(keys).Contains(l.Row.HeaderId))
+            .Concat(inScope.Where(l => EF.Constant(keys).Contains(l.Row.Id)
+                                       && !EF.Constant(keys).Contains(l.Row.HeaderId)))
+            .Where(l => EF.Constant(keys).Contains(l.EntryKey))
+            .OrderByDescending(l => l.Row.PostedAt)
+            .ThenByDescending(l => l.Row.HeaderSeq)
+            .ThenBy(l => l.Row.LegIndex)
+            .Select(PageRowOf(_db))
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
-
-        if (rows.Count == 0) return null;
-
-        var holdingsByAccount = await GetHoldingsSiblingMapAsync(rows, cancellationToken)
-            .ConfigureAwait(false);
-        var legTagsByLegId = await GetLegTagMapAsync(rows, cancellationToken)
-            .ConfigureAwait(false);
-        var entries = AssembleEntries(rows, holdingsByAccount, legTagsByLegId);
-        return entries.Count > 0 ? entries[0] : null;
     }
+
+    /// <summary>
+    /// The newest register entries across the ledger: one page, newest first, of the
+    /// entries of every account a person reads (not a category, not a holdings sibling,
+    /// active and inactive alike), each drawn exactly as its own account's register draws
+    /// it, with that account and its currency.
+    /// </summary>
+    /// <remarks>
+    /// <para>An entry is what an account's register shows as one row (ADR-0108 D14): on
+    /// the side a header belongs to, the header, a split as one group; on every other
+    /// side each line on its own; so a transfer between two of the accounts is an entry
+    /// on each. Each is read and assembled by the register's own statements, from its own
+    /// account's legs, so a row here is the row its register shows.</para>
+    /// <para>The register's filter narrows the entries before the page is cut, as it does
+    /// on a register: <paramref name="needsReview"/> is the register's
+    /// <c>needs_review</c> status; <paramref name="direction"/> keeps the entries whose
+    /// row shows an amount above or below zero on their account (<see cref="RegisterFilter.Direction"/>);
+    /// <paramref name="today"/>, when given, leaves out the entries dated after
+    /// it, the ones the register calls Scheduled. Unlike the register there is no
+    /// cursor: this is a first page, with whether more entries match.</para>
+    /// <para>The needs-review page reads its keys in one statement, which the
+    /// needs-review index serves. Every other page reads the ledger's newest headers
+    /// first and then the entries of those alone
+    /// (<see cref="RegisterQuery.FirstEntryKeysOnAccountsByHeaderAsync"/>), since one
+    /// statement over every leg in scope aggregates them all before the cut. Both give
+    /// the same page. Every statement reads one snapshot, so the batches, the keys and
+    /// the rows agree.</para>
+    /// </remarks>
+    public Task<LedgerEntriesPage> GetLedgerPageAsync(
+        Guid ledgerId,
+        bool needsReview,
+        TransactionDirection direction,
+        DateOnly? today,
+        int limit,
+        CancellationToken cancellationToken = default) =>
+        GetLedgerPageAsync(ledgerId, needsReview, direction, today, limit, byHeader: !needsReview, cancellationToken);
+
+    /// <summary>
+    /// <see cref="GetLedgerPageAsync(Guid, bool, TransactionDirection, DateOnly?, int, CancellationToken)"/>
+    /// with the caller choosing how it is read: <paramref name="byHeader"/> reads the
+    /// keys from the newest headers in batches, otherwise in one statement over every
+    /// leg in scope. The page is the same either way; a test holds the two to that.
+    /// </summary>
+    internal async Task<LedgerEntriesPage> GetLedgerPageAsync(
+        Guid ledgerId,
+        bool needsReview,
+        TransactionDirection direction,
+        DateOnly? today,
+        int limit,
+        bool byHeader,
+        CancellationToken cancellationToken)
+    {
+        await using var snapshot = await ReadSnapshot.BeginAsync(_db, cancellationToken).ConfigureAwait(false);
+        var accounts = await _db.Accounts.AsNoTracking()
+            .Where(a => a.LedgerId == ledgerId && a.AccountType != "category")
+            .Where(AccountsRepository.NotAHoldingsSibling(_db, ledgerId))
+            .Select(a => new { a.Id, a.CurrencyCode })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (accounts.Count == 0) return new LedgerEntriesPage([], HasMore: false);
+
+        Guid[] scope = [.. accounts.Select(a => a.Id)];
+        var filter = new RegisterFilter(
+            DateTo: today,
+            Status: needsReview ? "needs_review" : null,
+            Today: today,
+            Direction: direction);
+        // One past the page, to know whether more follow.
+        var keys = byHeader
+            ? await RegisterQuery.FirstEntryKeysOnAccountsByHeaderAsync(
+                    _db, scope, ledgerId, limit + 1, filter, TodayOf(filter), cancellationToken)
+                .ConfigureAwait(false)
+            : await RegisterQuery.FirstEntryKeysOnAccountsAsync(
+                    _db, scope, ledgerId, limit + 1, filter, TodayOf(filter), cancellationToken)
+                .ConfigureAwait(false);
+        var hasMore = keys.Count > limit;
+        if (hasMore) keys = keys.GetRange(0, limit);
+        if (keys.Count == 0) return new LedgerEntriesPage([], HasMore: false);
+
+        var rows = await KeyedRowsAsync(scope, hidden: false, [.. keys.Select(k => k.EntryKey)], cancellationToken)
+            .ConfigureAwait(false);
+        // In the keys' order, as the register's page does. A key read for one account
+        // can name an entry on another account of the scope too (the same header on
+        // both brokerages of an in-kind transfer); only the entries the keys name stay.
+        var order = new Dictionary<(Guid AccountId, Guid EntryKey), int>(keys.Count);
+        for (var idx = 0; idx < keys.Count; idx++)
+            order[(keys[idx].AccountId, keys[idx].EntryKey)] = idx;
+        var orderedRows = rows
+            .Where(r => order.ContainsKey((r.Row.AccountId, r.EntryKey)))
+            .OrderBy(r => order[(r.Row.AccountId, r.EntryKey)])
+            .ToList();
+        var entries = await AssembleAsync(orderedRows, cancellationToken).ConfigureAwait(false);
+
+        var currencyOf = accounts.ToDictionary(a => a.Id, a => a.CurrencyCode);
+        return new LedgerEntriesPage(
+            [.. entries.Select(e =>
+            {
+                var accountId = (e.Txn ?? e.Legs![0]).AccountId;
+                return new LedgerEntryDto(accountId, currencyOf[accountId], e);
+            })],
+            hasMore);
+    }
+
+    /// <summary>
+    /// A view row (without the view's own memo and tag columns), the register entry it
+    /// belongs to, and the notes the rule shows for it.
+    /// </summary>
+    private sealed class PageRow
+    {
+        public ResolvedTransactionView Row { get; init; } = null!;
+        public Guid EntryKey { get; init; }
+        public LegKind Kind { get; init; }
+        public bool IsReadOnly { get; init; }
+        public string? Memo { get; init; }
+        public bool MemoInherited { get; init; }
+        public string? InheritedMemo { get; init; }
+        public Guid? InheritFromAccountId { get; init; }
+        public bool TagsInherited { get; init; }
+        public string? HeaderMemo { get; init; }
+        public bool HeaderInPlay { get; init; }
+        public string[]? Tags { get; init; }
+        public string[]? InheritedTags { get; init; }
+        public string[]? HeaderTags { get; init; }
+    }
+
+    /// <summary>
+    /// A register leg as the page reads it: the stored presentation's memo and flags,
+    /// and its three tag sets (shown, inherited, the transaction's) through
+    /// <see cref="StoredNotesQuery.TagNamesOf"/>, in one statement with the rows.
+    /// </summary>
+    private static Expression<Func<RegisterLeg, PageRow>> PageRowOf(AppDbContext db)
+    {
+        var shownNames = StoredNotesQuery.TagNamesOf(db, StoredNotesQuery.Shown);
+        var inheritedNames = StoredNotesQuery.TagNamesOf(db, StoredNotesQuery.Inherited);
+        var headerNames = StoredNotesQuery.TagNamesOf(db, StoredNotesQuery.TransactionLevel);
+        var withoutNotes = StoredNotesQuery.WithoutNotes;
+        Expression<Func<RegisterLeg, PageRow>> row = l => new PageRow
+        {
+            Row = withoutNotes.Inline(l.Row),
+            EntryKey = l.EntryKey,
+            Kind = l.Shown.Kind,
+            IsReadOnly = l.Shown.IsReadOnly,
+            Memo = l.Shown.Memo,
+            MemoInherited = l.Shown.MemoInherited,
+            InheritedMemo = l.Shown.InheritedMemo,
+            InheritFromAccountId = l.Shown.InheritFromAccountId,
+            TagsInherited = l.Shown.TagsInherited,
+            HeaderMemo = l.Shown.InPlayHeaderMemo,
+            HeaderInPlay = l.Shown.InPlayHeaderTagHeaderId != null,
+            Tags = shownNames.Inline(l.NotesLegId),
+            InheritedTags = inheritedNames.Inline(l.NotesLegId),
+            HeaderTags = headerNames.Inline(l.NotesLegId),
+        };
+        return row.Expand();
+    }
+
+    /// <summary>The page's rows, with the lookups the projection needs, as entries: each
+    /// row with the currencies of its figures, and a category's balance converted into the
+    /// ledger's reporting currency (<see cref="RegisterMoney"/>).</summary>
+    private async Task<IReadOnlyList<RegisterEntryDto>> AssembleAsync(
+        IReadOnlyList<PageRow> rows, CancellationToken cancellationToken)
+    {
+        var holdingsByAccount = await GetHoldingsSiblingMapAsync(rows.Select(r => r.Row).ToList(), cancellationToken)
+            .ConfigureAwait(false);
+        var money = await RegisterMoney.LoadAsync(
+                _db, _clock, [.. rows.Select(r => RegisterMoney.Of(r.Row))], cancellationToken)
+            .ConfigureAwait(false);
+        return [.. money.Apply(AssembleEntries(rows, holdingsByAccount)).Select(e => e with
+        {
+            Txn = e.Txn is null ? null : OtherLegAcrossCurrencies(e.Txn),
+            Legs = e.Legs is null ? null : [.. e.Legs.Select(OtherLegAcrossCurrencies)],
+        })];
+    }
+
+    /// <summary>
+    /// The other leg's figure as a row reads it between two real accounts, before the
+    /// row's currency is known: the view's <c>counterparty_amount</c> and
+    /// <c>counterparty_currency_code</c>, or null on a category row and on a row whose
+    /// other side is a category or absent, which mirror (ADR-0114 D13).
+    /// </summary>
+    private static (decimal? Amount, string? CurrencyCode) OtherLegBetweenRealAccounts(ResolvedTransactionView r) =>
+        r.AccountType != CategoryType && r.CounterpartyAccountType is not (null or CategoryType)
+            ? (r.CounterpartyAmount, r.CounterpartyCurrencyCode)
+            : (null, null);
+
+    private const string CategoryType = "category";
+
+    /// <summary>
+    /// <paramref name="row"/>, its currency set, with the other leg's figure kept only on a
+    /// transfer between currencies (ADR-0114 D14, "The register row"): the counterparty
+    /// chip's, and on an investment event the transfer slot's (ADR-0028 Slot 6). On a
+    /// transfer in one currency the other leg is this one negated, so it is dropped.
+    /// </summary>
+    private static RegisterRowDto OtherLegAcrossCurrencies(RegisterRowDto row)
+    {
+        var shown = AcrossCurrencies(row.CounterpartyCurrencyCode, row.CurrencyCode)
+            ? row
+            : row with { CounterpartyAmount = null, CounterpartyCurrencyCode = null };
+        return shown is InvestmentRowDto investment
+               && !AcrossCurrencies(investment.TransferCurrencyCode, investment.CurrencyCode)
+            ? investment with { TransferAmount = null, TransferCurrencyCode = null }
+            : shown;
+    }
+
+    private static bool AcrossCurrencies(string? other, string own) =>
+        other is not null && !string.Equals(other, own, StringComparison.Ordinal);
 
     // ---------------------------------------------------------------
     // Row → entry assembly
     // ---------------------------------------------------------------
 
     /// <summary>
-    /// Walk the rows (sorted by entry_key, then leg_index ASC per
-    /// the function) and bucket them by <see cref="EntryKeyOf"/>.
-    /// Single-row buckets emit as <c>kind="txn"</c>; multi-row
-    /// buckets as <c>kind="group"</c> with legs in the order returned.
+    /// Walk the rows (in entry order, then leg_index ASC) and bucket
+    /// contiguous rows of one entry key on one account. Single-row buckets emit as
+    /// <c>kind="txn"</c>; multi-row buckets as <c>kind="group"</c> with legs in
+    /// the order returned.
     ///
-    /// <para>ADR-0036: the entry-key derivation is asymmetric.
-    /// ORIGINATING-side rows (this account is touched by every
-    /// posting of the header) bucket under <c>header_id</c> — all
-    /// legs of the header on this account collapse into one entry,
-    /// rendering as a split-parent or as the investment aggregator's
-    /// collapse target. TARGET-side rows (this account is touched by
-    /// some but not all postings) bucket under <c>leg_id</c> — each
-    /// posting becomes its own entry; the SPA's split-counter
-    /// affordance keeps them read-only via the existing
-    /// TxnGroupId != null detection on the row.</para>
+    /// <para>The key is the one the page's entry query grouped the row under
+    /// (<see cref="Coffer.Domain.Annotations.LegPresentation.GroupsByHeader"/>):
+    /// the header on the split side and on an event's investment side, where all
+    /// of the header's legs on this account form one entry (a split-parent, or
+    /// the investment aggregator's collapse target); the leg on an opposite side,
+    /// where each line is its own entry. No posting count decides it.</para>
     ///
     /// <para>ADR-0080: an entry on an INVESTMENT account is collapsed
     /// server-side into ONE aggregated event row via
     /// <see cref="InvestmentEventProjector"/> (both single- and
     /// multi-leg — the projector subsumes the SPA's former
     /// <c>aggregateLegs</c> + <c>normalizeSingleLeg</c>). Investment
-    /// entries therefore never emit a <c>group</c>; the SPA's only
-    /// remaining pass is the target-split regroup (a cross-page render
-    /// affordance). Every row of an entry shares one account (originating
-    /// entries are single-account by construction; target entries are
-    /// single-leg), so one holdings-sibling lookup per entry suffices.</para>
+    /// entries therefore never emit a <c>group</c>. Every row of an entry
+    /// shares one account, so one holdings-sibling lookup per entry suffices.</para>
+    ///
+    /// <para>The account is part of the bucket: on a page across several accounts
+    /// (<see cref="GetLedgerPageAsync"/>) one key can be an entry on two of them, an
+    /// in-kind share transfer's header on both brokerages. A register's own page has
+    /// one account per key, so there it changes nothing.</para>
     /// </summary>
-    /// <summary>
-    /// Per-posting tag names for the rows on this page (ADR-0103, mig 243).
-    /// </summary>
-    /// <remarks>
-    /// One query for the page, keyed by leg id, mirroring
-    /// <c>GetHoldingsSiblingMapAsync</c>. Bounded by the page rather than the
-    /// ledger, and legs with no tags are simply absent — the projector defaults
-    /// them to an empty array, so the DTO's "never null" contract holds without
-    /// a row per leg.
-    /// </remarks>
-    private async Task<IReadOnlyDictionary<Guid, IReadOnlyList<string>>> GetLegTagMapAsync(
-        IReadOnlyList<ResolvedTransactionView> rows,
-        CancellationToken cancellationToken)
-    {
-        var legIds = rows.Select(r => r.Id).Distinct().ToArray();
-        if (legIds.Length == 0)
-            return new Dictionary<Guid, IReadOnlyList<string>>();
-
-        var pairs = await (
-            from lt in _db.TxnLegTags.AsNoTracking()
-            where legIds.Contains(lt.LegId)
-            join t in _db.Tags.AsNoTracking() on lt.TagId equals t.Id
-            select new { lt.LegId, t.Name })
-            .ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
-
-        return pairs
-            .GroupBy(x => x.LegId)
-            .ToDictionary(
-                g => g.Key,
-                g => (IReadOnlyList<string>)g
-                    .Select(x => x.Name)
-                    .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
-                    .ToList());
-    }
-
     private static IReadOnlyList<RegisterEntryDto> AssembleEntries(
-        IReadOnlyList<ResolvedTransactionView> rows,
-        IReadOnlyDictionary<Guid, Guid?> holdingsByAccount,
-        IReadOnlyDictionary<Guid, IReadOnlyList<string>> legTagsByLegId)
+        IReadOnlyList<PageRow> rows,
+        IReadOnlyDictionary<Guid, Guid?> holdingsByAccount)
     {
         var entries = new List<RegisterEntryDto>();
         var i = 0;
         while (i < rows.Count)
         {
-            var entryKey = EntryKeyOf(rows[i]);
+            var entryKey = rows[i].EntryKey;
+            var accountId = rows[i].Row.AccountId;
             var groupEnd = i;
-            while (groupEnd < rows.Count && EntryKeyOf(rows[groupEnd]) == entryKey)
+            while (groupEnd < rows.Count && rows[groupEnd].EntryKey == entryKey
+                   && rows[groupEnd].Row.AccountId == accountId)
                 groupEnd++;
 
             var span = groupEnd - i;
-            if (rows[i].AccountType == "investment")
+            var first = rows[i].Row;
+            if (first.AccountType == "investment")
             {
                 // Collapse the entry's legs into one investment event (ADR-0080).
-                var legs = new List<ResolvedTransactionView>(span);
+                var legs = new List<PageRow>(span);
                 for (var j = i; j < groupEnd; j++) legs.Add(rows[j]);
-                holdingsByAccount.TryGetValue(rows[i].AccountId, out var holdingsSibling);
+                holdingsByAccount.TryGetValue(first.AccountId, out var holdingsSibling);
                 entries.Add(RegisterEntryDto.ForTxn(ProjectInvestmentEvent(legs, holdingsSibling)));
             }
             else if (span == 1)
             {
-                entries.Add(RegisterEntryDto.ForTxn(Project(rows[i], legTagsByLegId)));
+                entries.Add(RegisterEntryDto.ForTxn(Project(rows[i])));
             }
             else
             {
                 var legs = new List<RegisterRowDto>(span);
-                for (var j = i; j < groupEnd; j++) legs.Add(Project(rows[j], legTagsByLegId));
+                for (var j = i; j < groupEnd; j++) legs.Add(Project(rows[j]));
                 entries.Add(RegisterEntryDto.ForGroup(entryKey, legs));
             }
             i = groupEnd;
@@ -707,19 +818,28 @@ public sealed class RegisterRepository
     /// supplies the summed amount, running balance, security identity, and the
     /// category / transfer / fee slots.
     /// </summary>
+    /// <remarks>
+    /// The one row stands for the whole entry, so it carries what the entry's
+    /// transaction row shows: an event's side shows its header on every leg already,
+    /// and an action-less split on its split side shows the transaction's memo and
+    /// tags (the fields the rule fills where the header is in play), as the bank
+    /// register's split parent does.
+    /// </remarks>
     private static InvestmentRowDto ProjectInvestmentEvent(
-        IReadOnlyList<ResolvedTransactionView> legs,
+        IReadOnlyList<PageRow> legs,
         Guid? holdingsSibling)
     {
         var canonical = legs[0];
         var projection = InvestmentEventProjector.ProjectEvent(
-            legs.Select(InvestmentEventLegMapping.ToEventLeg).ToList(), holdingsSibling);
+            legs.Select(l => InvestmentEventLegMapping.ToEventLeg(l.Row)).ToList(), holdingsSibling);
+        var notes = NotesOf(canonical);
+        if (canonical.Kind == LegKind.SplitSide)
+            notes = notes with { Memo = notes.HeaderMemo, Tags = notes.HeaderTags ?? [] };
 
-        return ProjectInvestment(canonical) with
+        return WithNotes(ProjectInvestment(canonical.Row), notes) with
         {
             Amount = projection.Amount,
             BalanceAfter = projection.BalanceAfter,
-            HasOverrides = projection.HasOverrides,
             // The synthesized row reads as the header itself, not a child.
             LegIndex = 0,
             CounterpartyId = projection.CounterpartyId,
@@ -737,6 +857,16 @@ public sealed class RegisterRepository
             TransferAccountId = projection.TransferAccountId,
             TransferAccountName = projection.TransferAccountName,
             TransferAccountType = projection.TransferAccountType,
+            // The slot legs' other sides between real accounts (ADR-0114 D14);
+            // OtherLegAcrossCurrencies keeps them only across currencies.
+            CounterpartyAmount = projection.CounterpartyAccountType is (null or CategoryType)
+                ? null : projection.CounterpartyAmount,
+            CounterpartyCurrencyCode = projection.CounterpartyAccountType is (null or CategoryType)
+                ? null : projection.CounterpartyCurrencyCode,
+            TransferAmount = projection.TransferAccountType is (null or CategoryType)
+                ? null : projection.TransferAmount,
+            TransferCurrencyCode = projection.TransferAccountType is (null or CategoryType)
+                ? null : projection.TransferCurrencyCode,
             FeeAmount = projection.FeeAmount,
             SettledAmount = projection.SettledAmount,
             FeeCategoryId = projection.FeeCategoryId,
@@ -775,17 +905,6 @@ public sealed class RegisterRepository
         new Dictionary<Guid, Guid?>();
 
     /// <summary>
-    /// ADR-0036 asymmetric entry-key derivation. See class-level note
-    /// on <see cref="AssembleEntries"/> for the full rationale.
-    /// Mirrors the CASE expression in <c>register_entry_keys</c>
-    /// (mig 108) so SPA pagination and entry assembly agree.
-    /// </summary>
-    private static Guid EntryKeyOf(ResolvedTransactionView row) =>
-        row.AccountPostingsOnHeader < row.HeaderTotalPostings
-            ? row.Id
-            : (row.TxnGroupId ?? row.Id);
-
-    /// <summary>
     /// Project a view row to the discriminated-union DTO (ADR-0030 §2),
     /// branching on the owning account's domain (mig 119
     /// <c>account_type</c>): <c>'investment'</c> → <see cref="InvestmentRowDto"/>,
@@ -793,26 +912,83 @@ public sealed class RegisterRepository
     /// account-scoped register read paths, whose response is therefore
     /// homogeneous (one account = one kind).
     /// </summary>
-    private static RegisterRowDto Project(
-        ResolvedTransactionView r,
-        IReadOnlyDictionary<Guid, IReadOnlyList<string>> legTags) =>
-        r.AccountType == "investment"
-            ? ProjectInvestment(r)
-            : ProjectBank(r, legTags.GetValueOrDefault(r.Id, Array.Empty<string>()));
+    private static RegisterRowDto Project(PageRow row) =>
+        row.Row.AccountType == "investment"
+            ? WithNotes(ProjectInvestment(row.Row), NotesOf(row))
+            : WithNotes(ProjectBank(row.Row), NotesOf(row));
 
-    private static BankRowDto ProjectBank(
-        ResolvedTransactionView r, IReadOnlyList<string> legTags) => new()
+    /// <summary>The memo-and-tags fields of a register row, as the rule presents them.</summary>
+    private sealed record RowNotes(
+        LegKind Kind,
+        bool IsReadOnly,
+        string? Memo,
+        IReadOnlyList<string> Tags,
+        bool MemoInherited,
+        bool TagsInherited,
+        string? InheritedMemo,
+        IReadOnlyList<string> InheritedTags,
+        Guid? InheritFromAccountId,
+        string? HeaderMemo,
+        IReadOnlyList<string>? HeaderTags);
+
+    private static RowNotes NotesOf(PageRow r) => new(
+        r.Kind,
+        r.IsReadOnly,
+        r.Memo,
+        Listed(r.Tags),
+        r.MemoInherited,
+        r.TagsInherited,
+        r.InheritedMemo,
+        Listed(r.InheritedTags),
+        r.InheritFromAccountId,
+        r.HeaderMemo,
+        r.HeaderInPlay ? Listed(r.HeaderTags) : null);
+
+    /// <summary>
+    /// Tag names as the statement listed them, in the database's order for names
+    /// (<see cref="StoredNotesQuery.TagNamesOf"/>); an absent set is empty.
+    /// </summary>
+    private static IReadOnlyList<string> Listed(string[]? names) =>
+        names is null or { Length: 0 } ? Array.Empty<string>() : names;
+
+    private static T WithNotes<T>(T row, RowNotes notes) where T : RegisterRowDto => row with
+    {
+        Memo = notes.Memo,
+        Tags = notes.Tags,
+        MemoInherited = notes.MemoInherited,
+        TagsInherited = notes.TagsInherited,
+        InheritedMemo = notes.InheritedMemo,
+        InheritedTags = notes.InheritedTags,
+        InheritFromAccountId = notes.InheritFromAccountId,
+        HeaderMemo = notes.HeaderMemo,
+        HeaderTags = notes.HeaderTags,
+        NotesKind = NotesKinds.Of(notes.Kind),
+        IsReadOnly = notes.IsReadOnly,
+    };
+
+    /// <summary>
+    /// The bank's figure from the row's originals (ADR-0114 D15), as text in the invariant
+    /// culture so every digit the sidecar keeps reaches the client, a trailing zero
+    /// included; null where the row has none. The same on every leg of a header, so a
+    /// register row, an investment event and an entries-page row all carry it.
+    /// </summary>
+    private static string? OriginalAmountOf(ResolvedTransactionView r) => AsSent(r.OriginalAmount);
+
+    /// <summary>A bank's figure as invariant text, every digit kept; null for none.</summary>
+    private static string? AsSent(decimal? figure) =>
+        figure?.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>A bank row's non-notes fields; <see cref="WithNotes"/> adds the rest.</summary>
+    private static BankRowDto ProjectBank(ResolvedTransactionView r) => new()
     {
         Id = r.Id,
         AccountId = r.AccountId,
         Payee = r.Payee,
-        Memo = r.Memo,
         Amount = r.Amount,
         PostedAt = r.PostedAt,
         TransactedAt = r.TransactedAt,
         Status = r.Status,
         IsHidden = r.IsHidden,
-        HasOverrides = r.HasOverrides,
         BalanceAfter = r.BalanceAfter,
         Origin = r.Origin,
         IsPending = r.IsPending,
@@ -824,17 +1000,20 @@ public sealed class RegisterRepository
         CounterpartyAccountId = r.CounterpartyAccountId,
         CounterpartyAccountName = r.CounterpartyAccountName,
         CounterpartyAccountType = r.CounterpartyAccountType,
-        Tags = r.Tags,
+        CounterpartyAmount = OtherLegBetweenRealAccounts(r).Amount,
+        CounterpartyCurrencyCode = OtherLegBetweenRealAccounts(r).CurrencyCode,
+        Tags = Array.Empty<string>(),
         HeaderId = r.HeaderId,
         ClearedAt = r.ClearedAt,
         ClearedByUserId = r.ClearedByUserId,
         CreatedAt = r.CreatedAt,
-        LegMemo = r.LegMemo,
-        LegTags = legTags,
-        HeaderMemo = r.HeaderMemo,
         OnlineMatchFitid = r.OnlineMatchFitid,
         OnlineMatchFiId = r.OnlineMatchFiId,
         NeedsReview = r.NeedsReview,
+        OriginalAmount = OriginalAmountOf(r),
+        RoundedAtImport = r.AmountRoundedAtImport,
+        ReviewClearedAmount = AsSent(r.ReviewClearedAmount),
+        ReviewClearedByMatch = r.ReviewClearedByMatch,
         ProviderRawPayload = r.ProviderRawPayload,
         HeaderAccountNetAmount = r.HeaderAccountNetAmount,
         ProviderKey = r.ProviderKey,
@@ -845,18 +1024,17 @@ public sealed class RegisterRepository
         HeaderTotalPostings = r.HeaderTotalPostings,
     };
 
+    /// <summary>An investment row's non-notes fields; <see cref="WithNotes"/> adds the rest.</summary>
     private static InvestmentRowDto ProjectInvestment(ResolvedTransactionView r) => new()
     {
         Id = r.Id,
         AccountId = r.AccountId,
         Payee = r.Payee,
-        Memo = r.Memo,
         Amount = r.Amount,
         PostedAt = r.PostedAt,
         TransactedAt = r.TransactedAt,
         Status = r.Status,
         IsHidden = r.IsHidden,
-        HasOverrides = r.HasOverrides,
         BalanceAfter = r.BalanceAfter,
         Origin = r.Origin,
         IsPending = r.IsPending,
@@ -868,16 +1046,20 @@ public sealed class RegisterRepository
         CounterpartyAccountId = r.CounterpartyAccountId,
         CounterpartyAccountName = r.CounterpartyAccountName,
         CounterpartyAccountType = r.CounterpartyAccountType,
-        Tags = r.Tags,
+        CounterpartyAmount = OtherLegBetweenRealAccounts(r).Amount,
+        CounterpartyCurrencyCode = OtherLegBetweenRealAccounts(r).CurrencyCode,
+        Tags = Array.Empty<string>(),
         HeaderId = r.HeaderId,
         ClearedAt = r.ClearedAt,
         ClearedByUserId = r.ClearedByUserId,
         CreatedAt = r.CreatedAt,
-        LegMemo = r.LegMemo,
-        HeaderMemo = r.HeaderMemo,
         OnlineMatchFitid = r.OnlineMatchFitid,
         OnlineMatchFiId = r.OnlineMatchFiId,
         NeedsReview = r.NeedsReview,
+        OriginalAmount = OriginalAmountOf(r),
+        RoundedAtImport = r.AmountRoundedAtImport,
+        ReviewClearedAmount = AsSent(r.ReviewClearedAmount),
+        ReviewClearedByMatch = r.ReviewClearedByMatch,
         ProviderRawPayload = r.ProviderRawPayload,
         HeaderAccountNetAmount = r.HeaderAccountNetAmount,
         ProviderKey = r.ProviderKey,
@@ -989,8 +1171,8 @@ public sealed class RegisterRepository
     /// in memory after the SQL pull because EF Core's GroupBy
     /// projection with both a Count and an Ordered-First selector
     /// doesn't translate cleanly; the distinct set is bounded by
-    /// the account's lifetime entry count (tens of thousands on a
-    /// large real-world ledger), and the SPA fetches once per register session +
+    /// the account's lifetime entry count (large for a long-kept
+    /// account), and the SPA fetches once per register session +
     /// caches via TanStack Query. Acceptable for v1; revisit if
     /// portfolio-scale accounts make the round-trip painful.</para>
     /// </remarks>
@@ -998,10 +1180,13 @@ public sealed class RegisterRepository
     /// Verify-and-heal pass over every balance row in a ledger.
     /// Snapshots the current <c>txn_header_account_balances</c>
     /// values, runs <c>fn_recompute_balances_for_account</c> for
-    /// every account that has at least one leg, then diffs. Each
-    /// row that changed indicates the stored balance was stale at
-    /// snapshot time; the recompute side-effect has already
-    /// corrected it.
+    /// every account that has at least one leg or one stored row, then
+    /// diffs. Each row that changed indicates the stored balance was
+    /// stale at snapshot time, each row the recompute wrote that the
+    /// snapshot did not hold was missing, and each snapshot row the
+    /// recompute removed was one the walk does not produce (migration
+    /// 277: a recompute clears every stored row in its window); the
+    /// recompute side-effect has already corrected all three.
     /// </summary>
     /// <remarks>
     /// <para>This is the verify-and-heal pattern: detection is the
@@ -1010,10 +1195,14 @@ public sealed class RegisterRepository
     /// no-op). One round-trip per account; cost scales linearly
     /// with the ledger's account count.</para>
     ///
-    /// <para>Run inside a single SERIALIZABLE transaction so the
-    /// snapshot and the recompute don't interleave with concurrent
-    /// API writes (which would make the diff include the user's
-    /// in-flight changes as false-positive drift).</para>
+    /// <para><b>Not isolated.</b> The snapshot, each account's
+    /// recompute and the re-read are separate statements in no
+    /// transaction, and its caller (the <c>balances</c> projection's
+    /// repair, <c>LedgerConsistencyRepository.RewriteAsync</c>) opens none. A
+    /// save that commits while a repair runs can therefore appear in
+    /// that repair's report as drift, a changed value or a missing
+    /// row; a repair run again afterwards reports nothing for it,
+    /// because the save recomputed its own rows.</para>
     /// </remarks>
     public async Task<BalanceHealthReport> VerifyAndHealBalancesAsync(
         Guid ledgerId,
@@ -1028,14 +1217,18 @@ public sealed class RegisterRepository
             .ConfigureAwait(false);
         var snapshotByKey = snapshot.ToDictionary(b => (b.AccountId, b.HeaderId), b => b.BalanceAfter);
 
-        // Distinct accounts with at least one leg in this ledger.
-        var accountIds = await _db.TxnLegs
-            .AsNoTracking()
-            .Where(l => l.LedgerId == ledgerId)
-            .Select(l => l.AccountId)
-            .Distinct()
-            .ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
+        // Distinct accounts with at least one leg in this ledger, and those with a stored
+        // row and no leg, whose every row is one the walk does not produce: the
+        // recompute clears them.
+        var accountIds = (await _db.TxnLegs
+                .AsNoTracking()
+                .Where(l => l.LedgerId == ledgerId)
+                .Select(l => l.AccountId)
+                .Distinct()
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false))
+            .Union(snapshot.Select(b => b.AccountId))
+            .ToList();
 
         // Recompute each account from the earliest possible anchor
         // so every balance row is rebuilt. Iterates the EF-bound TVF
@@ -1063,54 +1256,77 @@ public sealed class RegisterRepository
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
+        // Every row the recompute stores is one it found wrong or one it found missing:
+        // a row it wrote that the snapshot did not hold was healed as much as one whose
+        // value it changed.
         var drifted = new List<BalanceHealthDriftDto>();
         foreach (var row in current)
         {
-            if (snapshotByKey.TryGetValue((row.AccountId, row.HeaderId), out var before)
-                && before != row.BalanceAfter)
-            {
-                drifted.Add(new BalanceHealthDriftDto(
-                    AccountId: row.AccountId,
-                    AccountName: row.AccountName,
-                    HeaderId: row.HeaderId,
-                    PostedAt: row.PostedAt,
-                    StoredBefore: before,
-                    RecomputedAfter: row.BalanceAfter,
-                    Diff: row.BalanceAfter - before));
-            }
+            var wasStored = snapshotByKey.TryGetValue((row.AccountId, row.HeaderId), out var before);
+            if (wasStored && before == row.BalanceAfter) continue;
+            drifted.Add(Drift(
+                row.AccountId, row.AccountName, row.HeaderId, row.PostedAt,
+                wasStored ? before : null, row.BalanceAfter));
         }
+
+        // A snapshot row the recompute removed was one the walk does not produce. One whose
+        // header has gone since went with it, and is not reported.
+        var kept = current.Select(r => (r.AccountId, r.HeaderId)).ToHashSet();
+        var removed = await NotDerivedAsync(
+                snapshot.Where(b => !kept.Contains((b.AccountId, b.HeaderId)))
+                    .Select(b => (b.AccountId, b.HeaderId, b.BalanceAfter))
+                    .ToList(),
+                cancellationToken)
+            .ConfigureAwait(false);
+        drifted.AddRange(removed);
 
         return new BalanceHealthReport(
             Healthy: drifted.Count == 0,
             AccountsChecked: accountIds.Count,
-            RowsChecked: current.Count,
+            RowsChecked: current.Count + removed.Count,
             DriftedCount: drifted.Count,
             Drifted: drifted);
     }
 
     /// <summary>
-    /// Check every stored running balance against the pure walk — WITHOUT
-    /// writing anything.
+    /// Check every running balance the pure walk produces against its stored row —
+    /// WITHOUT writing anything. A stored row that disagrees, a walked row with no
+    /// stored row, and a stored row the walk does not produce are all drift.
     /// </summary>
     /// <remarks>
     /// The counterpart to <see cref="VerifyAndHealBalancesAsync"/>, which heals
-    /// as a side effect of checking. That was the only option while the sole
-    /// implementation of the running-sum rules lived inside the recompute's
-    /// DELETE + INSERT: the only way to learn whether a balance was right was to
-    /// overwrite it. In practice it meant asking a diagnostic question silently
-    /// rewrote thousands of rows.
+    /// as a side effect of checking. With the running-sum rules implemented only
+    /// inside the recompute's DELETE + INSERT, the only way to learn whether a
+    /// balance is right would be to overwrite it, so asking a diagnostic question
+    /// would silently rewrite every row it checked.
     /// <para>
-    /// Migration 206 extracted <c>account_balance_walk</c>, so the question can
-    /// now be asked directly. Same rules as the writer — one implementation, so
+    /// Migration 206 extracts <c>account_balance_walk</c>, so the question can be
+    /// asked directly. Same rules as the writer — one implementation, so
     /// this cannot drift from what a repair would produce — seeded from the
     /// account's opening balance rather than from stored state, since stored
     /// state is precisely what is under test.
+    /// </para>
+    /// <para>
+    /// The walk also says which rows belong: a stored row it does not produce, on a header
+    /// it skips (a template, a hidden or merged-away header, one with no line on the
+    /// account) or on an account with no line at all, is one no write path leaves and
+    /// every reader that follows the walk ignores. It is reported as
+    /// <see cref="BalanceHealthDriftDto.NotDerived"/>, and the balances repair removes it.
+    /// The set is the stored rows less the walked ones, so no second list of the headers
+    /// the walk skips is kept here.
     /// </para>
     /// </remarks>
     public async Task<BalanceHealthReport> CheckBalancesAsync(
         Guid ledgerId,
         CancellationToken cancellationToken = default)
     {
+        // The stored rows and every account's walk read one state: a header saved
+        // between them would otherwise be walked and not yet stored, and read as missing.
+        // A caller's transaction below REPEATABLE READ would give each read its own, so
+        // the check refuses to run in one rather than join it.
+        await using var snapshot = await ReadSnapshot.BeginAsync(_db, cancellationToken, requireRepeatableRead: true)
+            .ConfigureAwait(false);
+
         var accounts = await _db.Accounts.AsNoTracking()
             .Where(a => a.LedgerId == ledgerId
                         && _db.TxnLegs.Any(l => l.AccountId == a.Id && l.LedgerId == ledgerId))
@@ -1131,6 +1347,7 @@ public sealed class RegisterRepository
 
         var drifted = new List<BalanceHealthDriftDto>();
         var rowsChecked = 0;
+        var walkedKeys = new HashSet<(Guid AccountId, Guid HeaderId)>();
         foreach (var account in accounts)
         {
             var walked = await _db
@@ -1142,28 +1359,89 @@ public sealed class RegisterRepository
             foreach (var row in walked)
             {
                 rowsChecked++;
-                if (stored.TryGetValue((account.Id, row.HeaderId), out var before)
-                    && before != row.BalanceAfter)
-                {
-                    drifted.Add(new BalanceHealthDriftDto(
-                        AccountId: account.Id,
-                        AccountName: account.Name,
-                        HeaderId: row.HeaderId,
-                        PostedAt: row.PostedAt,
-                        StoredBefore: before,
-                        RecomputedAfter: row.BalanceAfter,
-                        Diff: row.BalanceAfter - before));
-                }
+                walkedKeys.Add((account.Id, row.HeaderId));
+                // The recompute stores every row the walk yields, so a walked row with
+                // no stored row is drift as much as a stored row that disagrees: a
+                // recompute that should have written it did not run.
+                var isStored = stored.TryGetValue((account.Id, row.HeaderId), out var before);
+                if (isStored && before == row.BalanceAfter) continue;
+                drifted.Add(Drift(
+                    account.Id, account.Name, row.HeaderId, row.PostedAt,
+                    isStored ? before : null, row.BalanceAfter));
             }
         }
+
+        // The stored rows the walk did not produce, read in the same state.
+        var notDerived = await NotDerivedAsync(
+                stored.Where(s => !walkedKeys.Contains(s.Key))
+                    .Select(s => (s.Key.AccountId, s.Key.HeaderId, s.Value))
+                    .ToList(),
+                cancellationToken)
+            .ConfigureAwait(false);
+        drifted.AddRange(notDerived);
 
         return new BalanceHealthReport(
             Healthy: drifted.Count == 0,
             AccountsChecked: accounts.Count,
-            RowsChecked: rowsChecked,
+            RowsChecked: rowsChecked + notDerived.Count,
             DriftedCount: drifted.Count,
             Drifted: drifted);
     }
+
+    /// <summary>
+    /// The drift rows for stored running balances the walk does not produce, with each
+    /// row's account name and its header's date, in date order. A row whose header is
+    /// gone is left out: its row went with it.
+    /// </summary>
+    private async Task<List<BalanceHealthDriftDto>> NotDerivedAsync(
+        IReadOnlyList<(Guid AccountId, Guid HeaderId, decimal Stored)> rows, CancellationToken cancellationToken)
+    {
+        if (rows.Count == 0) return [];
+        Guid[] headerIds = [.. rows.Select(r => r.HeaderId).Distinct()];
+        Guid[] accountIds = [.. rows.Select(r => r.AccountId).Distinct()];
+        var postedAt = await _db.TxnHeaders.AsNoTracking()
+            .Where(h => headerIds.Contains(h.Id))
+            .Select(h => new { h.Id, h.PostedAt })
+            .ToDictionaryAsync(h => h.Id, h => h.PostedAt, cancellationToken)
+            .ConfigureAwait(false);
+        var names = await _db.Accounts.AsNoTracking()
+            .Where(a => accountIds.Contains(a.Id))
+            .Select(a => new { a.Id, a.Name })
+            .ToDictionaryAsync(a => a.Id, a => a.Name, cancellationToken)
+            .ConfigureAwait(false);
+        return rows
+            .Where(r => postedAt.ContainsKey(r.HeaderId))
+            .Select(r => new BalanceHealthDriftDto(
+                AccountId: r.AccountId,
+                AccountName: names.GetValueOrDefault(r.AccountId, "(account)"),
+                HeaderId: r.HeaderId,
+                PostedAt: postedAt[r.HeaderId],
+                StoredBefore: r.Stored,
+                RecomputedAfter: 0m,
+                Diff: -r.Stored,
+                Reason: ConsistencyReasons.NotDerived))
+            .OrderBy(d => d.PostedAt)
+            .ThenBy(d => d.AccountId)
+            .ThenBy(d => d.HeaderId)
+            .ToList();
+    }
+
+    /// <summary>
+    /// One drifted row, for the check and the repair alike: <paramref name="stored"/> is
+    /// the stored balance, or null when no row is stored, which reads as 0.
+    /// </summary>
+    private static BalanceHealthDriftDto Drift(
+        Guid accountId, string accountName, Guid headerId, DateTime postedAt,
+        decimal? stored, decimal walked) =>
+        new(
+            AccountId: accountId,
+            AccountName: accountName,
+            HeaderId: headerId,
+            PostedAt: postedAt,
+            StoredBefore: stored ?? 0m,
+            RecomputedAfter: walked,
+            Diff: walked - (stored ?? 0m),
+            Reason: stored is null ? ConsistencyReasons.NotStored : ConsistencyReasons.ValueDiffers);
 
     /// <summary>
     /// Return every leg of the given header across ALL accounts, in
@@ -1178,12 +1456,16 @@ public sealed class RegisterRepository
         Guid headerId,
         CancellationToken cancellationToken = default)
     {
-        var rows = await _db.ResolvedTransactions
+        // The editor loads a transaction from this read, so a merged-away header has no
+        // legs here, as an id that does not exist has none (MergedAway).
+        var live = _db.TxnHeaders.NotMergedAway();
+        var rows = await StoredNotesQuery.RegisterLegs(_db)
             .AsNoTracking()
-            .Where(rt => rt.HeaderId == headerId
-                     && _db.TxnHeaders.Any(h => h.Id == headerId && h.LedgerId == ledgerId))
-            .OrderBy(rt => rt.LegIndex)
-            .ThenBy(rt => rt.Id)
+            .Where(l => l.Row.HeaderId == headerId
+                     && live.Any(h => h.Id == headerId && h.LedgerId == ledgerId))
+            .OrderBy(l => l.Row.LegIndex)
+            .ThenBy(l => l.Row.Id)
+            .Select(PageRowOf(_db))
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
         // ADR-0030 §2: the editor-reload path returns the FULL leg shape
@@ -1193,7 +1475,15 @@ public sealed class RegisterRepository
         // / fee) legs too. Account-type discrimination would drop those
         // fields on the bank-domain off-account legs and break the
         // editor, so this path projects all legs as InvestmentRowDto.
-        return rows.Select(ProjectInvestment).ToList();
+        // Each leg's notes are what its own account's register shows for it,
+        // as stored, the same fields a register row carries; its currencies and
+        // balance are what that register shows too.
+        var money = await RegisterMoney.LoadAsync(
+                _db, _clock, [.. rows.Select(r => RegisterMoney.Of(r.Row))], cancellationToken)
+            .ConfigureAwait(false);
+        return rows
+            .Select(r => (InvestmentRowDto)OtherLegAcrossCurrencies(money.Apply(WithNotes(ProjectInvestment(r.Row), NotesOf(r)))))
+            .ToList();
     }
 
     /// <summary>
@@ -1212,6 +1502,9 @@ public sealed class RegisterRepository
     /// was deleted, or doesn't touch this account) are silently
     /// absent — the SPA leaves those entries unchanged. Empty input
     /// returns an empty list without querying.
+    /// <para>The balance is the one the register row shows: a category's converted into
+    /// the ledger's reporting currency (<see cref="RegisterMoney"/>), so a refresh after a
+    /// save never puts back a figure summed across currencies.</para>
     /// </remarks>
     public async Task<IReadOnlyList<HeaderBalanceDto>> GetBalancesForHeadersAsync(
         Guid ledgerId,
@@ -1221,14 +1514,30 @@ public sealed class RegisterRepository
     {
         if (headerIds.Count == 0) return Array.Empty<HeaderBalanceDto>();
         var ids = headerIds.ToArray();
-        return await _db.TxnHeaderAccountBalances
-            .AsNoTracking()
-            .Where(b => b.LedgerId == ledgerId
-                     && b.AccountId == accountId
-                     && EF.Constant(ids).Contains(b.HeaderId))
-            .Select(b => new HeaderBalanceDto(b.HeaderId, b.BalanceAfter, b.NetAmount))
+        var stored = await (
+                from b in _db.TxnHeaderAccountBalances.AsNoTracking()
+                join h in _db.TxnHeaders.AsNoTracking() on b.HeaderId equals h.Id
+                join a in _db.Accounts.AsNoTracking() on b.AccountId equals a.Id
+                where b.LedgerId == ledgerId
+                      && b.AccountId == accountId
+                      && EF.Constant(ids).Contains(b.HeaderId)
+                select new { b.HeaderId, b.BalanceAfter, b.NetAmount, h.PostedAt, h.Seq, a.AccountType })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
+        if (stored.Count == 0 || stored[0].AccountType != "category")
+            return [.. stored.Select(b => new HeaderBalanceDto(b.HeaderId, b.BalanceAfter, b.NetAmount))];
+
+        // A category's balance combines accounts: read as its register reads it.
+        var money = await RegisterMoney.LoadAsync(_db, _clock,
+                [.. stored.Select(b => new RegisterMoney.Row(accountId, true, null, null, b.HeaderId, b.PostedAt, b.Seq))],
+                cancellationToken)
+            .ConfigureAwait(false);
+        return [.. stored.Select(b =>
+        {
+            var shown = money.BalanceOf(accountId, b.HeaderId, b.BalanceAfter);
+            return new HeaderBalanceDto(b.HeaderId, shown.Amount, b.NetAmount,
+                shown.Unavailable.Count > 0 ? shown.Unavailable : null);
+        })];
     }
 
     public async Task<IReadOnlyList<IndexBucketDto>> GetIndexBucketsAsync(
@@ -1240,22 +1549,21 @@ public sealed class RegisterRepository
     {
         var f = filter ?? RegisterFilter.None;
 
-        // One filter definition (mig 167 / ADR-0076): the rail reads the SAME
-        // register_filtered_entries primitive the page composes over, so the
-        // date buckets reflect exactly the filtered set the register shows.
+        // One filter definition (ADR-0076): the rail reads the SAME
+        // RegisterQuery.Filtered the page composes over, so the date buckets
+        // reflect exactly the filtered set the register shows.
         var bucketScope = await ResolveScopeAsync(accountId, ledgerId, f, cancellationToken)
             .ConfigureAwait(false);
-        var headerTuples = await _db.RegisterFilteredEntries(
-                bucketScope, ledgerId, hidden,
-                f.Search, f.DateFrom, f.DateTo, f.AmountMin, f.AmountMax,
-                f.SecurityId, f.Tag, f.CategoryId, f.Status, f.Today)
-            .AsNoTracking()
-            .Select(rt => new { rt.HeaderId, rt.PostedAt, rt.HeaderSeq })
+        // One row per entry, as the page groups them: a header is one entry on the
+        // side it belongs to and one per line on an opposite side. The entry's legs
+        // share the header's date and sequence.
+        var entryTuples = await RegisterQuery.Filtered(_db, bucketScope, ledgerId, hidden, f, TodayOf(f))
+            .Select(l => new { l.EntryKey, l.Row.HeaderId, l.Row.PostedAt, l.Row.HeaderSeq })
             .Distinct()
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        return headerTuples
+        return entryTuples
             .GroupBy(x => new { x.PostedAt.Year, x.PostedAt.Month })
             .Select(g =>
             {
@@ -1274,11 +1582,11 @@ public sealed class RegisterRepository
 
     /// <summary>
     /// Per-status entry counts for one account (the status dropdown badges),
-    /// respecting the active NON-status filter. Reuses the ONE filter helper
-    /// (<see cref="ApplyRegisterFilterPredicates"/>) for the non-status
+    /// respecting the active NON-status filter. Reuses the ONE filter
+    /// (<see cref="RegisterQuery.Filtered"/>) for the non-status
     /// dimensions, then buckets by status in-memory mirroring the SPA's
     /// resolveRowStatus precedence (scheduled &gt; pending &gt; recon status).
-    /// Per-header — the same unit as the buckets / "N matches" chip.
+    /// Per entry — the same unit as the page, the buckets and the "N matches" chip.
     /// </summary>
     public async Task<RegisterStatusCounts> GetStatusCountsAsync(
         Guid ledgerId,
@@ -1289,44 +1597,37 @@ public sealed class RegisterRepository
         // Status is what we bucket, so strip it; the rest narrow every count.
         var f = (filter ?? RegisterFilter.None) with { Status = null };
 
-        // Both visibility sides via the shared filter primitive (mig 167 /
-        // ADR-0076). It filters is_hidden = p_hidden, so the Hidden bucket is a
-        // second call; the visible entries feed the recon / scheduled /
-        // needs-review buckets. One row per entry (per header — the projected
-        // fields are header-constant, so DISTINCT collapses each header's legs;
-        // a header appears iff any of its legs matched the per-leg filter).
+        // Both visibility sides via the shared filter (ADR-0076). It keeps one
+        // visibility side per call, so the Hidden bucket is a second call; the
+        // visible entries feed the recon / scheduled / needs-review buckets. One
+        // row per entry as the page groups them (an entry appears iff any of its
+        // legs matched the per-leg filter); an entry whose legs differ in a status
+        // field is counted once, by its first line, the one an investment event's
+        // row is built from.
         var countScope = await ResolveScopeAsync(accountId, ledgerId, f, cancellationToken)
             .ConfigureAwait(false);
-        var entries = await _db.RegisterFilteredEntries(
-                countScope, ledgerId, hidden: false,
-                f.Search, f.DateFrom, f.DateTo, f.AmountMin, f.AmountMax,
-                f.SecurityId, f.Tag, f.CategoryId, f.Status, f.Today)
-            .AsNoTracking()
-            .Select(rt => new
+        var rows = await RegisterQuery.Filtered(_db, countScope, ledgerId, hidden: false, f, TodayOf(f))
+            .Select(l => new
             {
-                rt.HeaderId,
-                rt.PostedAt,
-                rt.Status,
-                rt.IsPending,
-                rt.NeedsReview,
+                l.EntryKey,
+                l.Row.LegIndex,
+                l.Row.Id,
+                l.Row.PostedAt,
+                l.Row.Status,
+                l.Row.IsPending,
+                l.Row.NeedsReview,
             })
-            .Distinct()
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
-
-        var hiddenCount = await _db.RegisterFilteredEntries(
-                countScope, ledgerId, hidden: true,
-                f.Search, f.DateFrom, f.DateTo, f.AmountMin, f.AmountMax,
-                f.SecurityId, f.Tag, f.CategoryId, f.Status, f.Today)
-            .AsNoTracking()
-            .Select(rt => rt.HeaderId)
+        var entries = rows.OrderBy(r => r.LegIndex).ThenBy(r => r.Id).DistinctBy(r => r.EntryKey).ToList();
+        var hiddenCount = await RegisterQuery.Filtered(_db, countScope, ledgerId, hidden: true, f, TodayOf(f))
+            .Select(l => l.EntryKey)
             .Distinct()
             .CountAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        var today = (f.Today ?? DateOnly.FromDateTime(_clock.GetUtcNow().UtcDateTime))
-            .ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
-        var tomorrow = today.AddDays(1);
+        // The one boundary the balances share (ScheduledBoundary).
+        var scheduledFrom = ScheduledBoundary.ScheduledFrom(f.Today, _clock);
 
         int all = 0, cleared = 0, uncleared = 0, reconciling = 0,
             scheduled = 0, needsReview = 0;
@@ -1338,7 +1639,7 @@ public sealed class RegisterRepository
             if (e.NeedsReview) needsReview++;
             // Precedence: scheduled (future-dated) wins, then pending drops out
             // of the recon buckets, then the persisted recon status.
-            if (e.PostedAt >= tomorrow) { scheduled++; continue; }
+            if (ScheduledBoundary.IsScheduled(e.PostedAt, scheduledFrom)) { scheduled++; continue; }
             if (e.IsPending) continue;
             switch (e.Status)
             {
@@ -1350,5 +1651,13 @@ public sealed class RegisterRepository
         return new RegisterStatusCounts(all, cleared, uncleared, reconciling,
             scheduled, needsReview, hiddenCount);
     }
+
+    /// <summary>
+    /// The caller's date for the SQL filter, resolved by the one fallback
+    /// (<see cref="ScheduledBoundary.Today"/>) rather than left to
+    /// <c>COALESCE(p_today, CURRENT_DATE)</c>, so the rows, the badges and every
+    /// current balance read the same date when the caller sends none.
+    /// </summary>
+    private DateOnly TodayOf(RegisterFilter f) => ScheduledBoundary.Today(f.Today, _clock);
 
 }

@@ -7,9 +7,9 @@
 -- through the API process: read the jsonb → materialise the whole payload as one
 -- string → JsonSerializer.Deserialize into an in-memory object graph several times
 -- larger still → re-serialise → gzip. Under the API container's mem_limit this
--- OOMs once a ledger's payload gets large (observed on a large real ledger:
--- OutOfMemoryException, auto-snapshots silently failing every night while the
--- daily whole-DB BACKUP — pg_dump, streamed — kept working).
+-- OOMs once a ledger's payload gets large, and it fails quietly: the
+-- OutOfMemoryException leaves the auto-snapshot missing while the daily
+-- whole-DB BACKUP — pg_dump, streamed — keeps working.
 --
 -- Fix: keep the payload entirely server-side. A new `content_json` (jsonb) column
 -- holds the in-scope graph captured by fn_ledger_snapshot_payload; Postgres TOAST-

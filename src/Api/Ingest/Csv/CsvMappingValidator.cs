@@ -38,8 +38,23 @@ namespace Coffer.Api.Ingest.Csv;
 /// </remarks>
 public static class CsvMappingValidator
 {
-    /// <summary>The only schema version this validator understands.</summary>
-    public const int CurrentVersion = 1;
+    /// <summary>The schema version a new document is written in.</summary>
+    /// <remarks>
+    /// <para>Version 2 (ADR-0114 D15) requires <c>amount.decimal_separator</c>. It is a new
+    /// version, not an optional key, because a document valid before would now be
+    /// rejected: a layout written without a sample has to say which separator its file
+    /// uses, since nothing else can.</para>
+    /// <para><see cref="LegacyVersion"/> stays accepted forever. Stored layouts are
+    /// re-validated on every use, so refusing it would break every layout saved before
+    /// version 2 existed.</para>
+    /// </remarks>
+    public const int CurrentVersion = 2;
+
+    /// <summary>
+    /// The version before the decimal separator: no <c>amount.decimal_separator</c> key,
+    /// and every amount reads with a point, the only reading it ever had (ADR-0114 D15).
+    /// </summary>
+    public const int LegacyVersion = 1;
 
     private static readonly IReadOnlyDictionary<string, CsvDelimiter> Delimiters =
         new Dictionary<string, CsvDelimiter>(StringComparer.Ordinal)
@@ -56,6 +71,15 @@ public static class CsvMappingValidator
             ["signed"] = CsvAmountShape.Signed,
             ["debit_credit"] = CsvAmountShape.DebitCredit,
         };
+
+    private static readonly IReadOnlyDictionary<string, CsvDecimalSeparator> DecimalSeparators =
+        new Dictionary<string, CsvDecimalSeparator>(StringComparer.Ordinal)
+        {
+            ["point"] = CsvDecimalSeparator.Point,
+            ["comma"] = CsvDecimalSeparator.Comma,
+        };
+
+    private const string DecimalSeparatorKey = "decimal_separator";
 
     private static readonly string[] RootKeys =
         ["version", "delimiter", "header_rows", "footer_rows", "date", "payee", "memo", "amount"];
@@ -76,6 +100,12 @@ public static class CsvMappingValidator
     public static IReadOnlyCollection<string> AcceptedAmountShapes { get; } = [.. Shapes.Keys];
 
     /// <summary>
+    /// The decimal separators <c>amount.decimal_separator</c> may name (ADR-0114 D15).
+    /// See <see cref="AcceptedDelimiters"/>.
+    /// </summary>
+    public static IReadOnlyCollection<string> AcceptedDecimalSeparators { get; } = [.. DecimalSeparators.Keys];
+
+    /// <summary>
     /// The name a document would spell this delimiter with.
     /// </summary>
     /// <remarks>
@@ -87,6 +117,9 @@ public static class CsvMappingValidator
 
     /// <summary>The name a document would spell this amount shape with.</summary>
     public static string NameOf(CsvAmountShape shape) => NameIn(Shapes, shape);
+
+    /// <summary>The name a document would spell this decimal separator with.</summary>
+    public static string NameOf(CsvDecimalSeparator separator) => NameIn(DecimalSeparators, separator);
 
     private static string NameIn<T>(IReadOnlyDictionary<string, T> table, T value)
         where T : struct, Enum
@@ -200,10 +233,11 @@ public static class CsvMappingValidator
         RejectUnknownKeys(root, "", RootKeys, problems);
 
         var version = RequiredInt(root, "version", "", problems);
-        if (version is not null && version != CurrentVersion)
+        if (version is not null && version != LegacyVersion && version != CurrentVersion)
         {
             problems.Add(new CsvMappingError("version", LineOf(root, "version"),
-                $"Unsupported version {version}. This build understands version {CurrentVersion}."));
+                $"Unsupported version {version}. This build understands version {LegacyVersion} "
+                + $"and version {CurrentVersion}; write new documents as version {CurrentVersion}."));
         }
 
         var delimiter = RequiredEnum(root, "delimiter", "", Delimiters, problems);
@@ -219,7 +253,7 @@ public static class CsvMappingValidator
         var (dateColumn, dateFormat) = ReadDate(root, problems);
         var payeeColumn = ReadColumnBlock(root, "payee", required: true, problems);
         var memoColumn = ReadColumnBlock(root, "memo", required: false, problems);
-        var amount = ReadAmount(root, problems);
+        var amount = ReadAmount(root, version, problems);
 
         // A file cannot hold a date and an amount in the same field, and reading one as
         // the other is the failure this catches before it reaches money.
@@ -257,7 +291,8 @@ public static class CsvMappingValidator
             AmountColumn: amount.AmountColumn,
             AmountInvert: amount.Invert,
             DebitColumn: amount.DebitColumn,
-            CreditColumn: amount.CreditColumn);
+            CreditColumn: amount.CreditColumn,
+            DecimalSeparator: amount.DecimalSeparator!.Value);
     }
 
     // ----- blocks -------------------------------------------------------------
@@ -278,8 +313,7 @@ public static class CsvMappingValidator
             // use fails on EVERY line at import time, which reads as "the file is broken"
             // rather than "the mapping is".
             //
-            // A round-trip probe alone is not enough, and the test that caught this is
-            // worth keeping in mind: .NET treats unknown characters in a multi-character
+            // A round-trip probe alone is not enough: .NET treats unknown characters in a multi-character
             // format as LITERALS, so `nonsense` renders to a fixed string and parses
             // straight back. Self-consistent, and not a date format. What actually makes
             // a string one is that it can express a day, a month and a year — so that is
@@ -342,12 +376,26 @@ public static class CsvMappingValidator
     }
 
     private readonly record struct AmountBlock(
-        CsvAmountShape? Shape, int? AmountColumn, bool Invert, int? DebitColumn, int? CreditColumn);
+        CsvAmountShape? Shape, int? AmountColumn, bool Invert, int? DebitColumn, int? CreditColumn,
+        CsvDecimalSeparator? DecimalSeparator);
 
-    private static AmountBlock ReadAmount(YamlMappingNode root, List<CsvMappingError> problems)
+    private static AmountBlock ReadAmount(
+        YamlMappingNode root, int? version, List<CsvMappingError> problems)
     {
         var block = RequiredMap(root, "amount", problems);
         if (block is null) return default;
+
+        // ADR-0114 D15. A version-2 document must name its separator: a layout written
+        // without a sample has nothing else to say it, and a guess at import time would
+        // read a decimal comma as a thousands separator, silently. A version-1 document
+        // never had the key, so there it is an unknown key like any other, and the
+        // document reads with a point. A missing or unsupported version is already
+        // reported; the key is then accepted where present and not demanded, so the
+        // version error is not buried under a consequence of itself.
+        var separatorAllowed = version != LegacyVersion;
+        CsvDecimalSeparator? separator = version == LegacyVersion
+            ? CsvDecimalSeparator.Point
+            : ReadDecimalSeparator(block, required: version == CurrentVersion, problems);
 
         var shapeText = RequiredString(block, "shape", "amount", problems);
         CsvAmountShape? shape =
@@ -365,26 +413,55 @@ public static class CsvMappingValidator
         switch (shape)
         {
             case CsvAmountShape.Signed:
-                RejectUnknownKeys(block, "amount", ["shape", "column", "invert"], problems);
+                RejectUnknownKeys(block, "amount",
+                    separatorAllowed
+                        ? ["shape", "column", "invert", DecimalSeparatorKey]
+                        : ["shape", "column", "invert"],
+                    problems);
                 return new AmountBlock(
                     shape,
                     RequiredColumn(block, "column", "amount", problems),
                     OptionalBool(block, "invert", "amount", problems) ?? false,
-                    null, null);
+                    null, null, separator);
 
             case CsvAmountShape.DebitCredit:
-                RejectUnknownKeys(block, "amount", ["shape", "debit_column", "credit_column"], problems);
+                RejectUnknownKeys(block, "amount",
+                    separatorAllowed
+                        ? ["shape", "debit_column", "credit_column", DecimalSeparatorKey]
+                        : ["shape", "debit_column", "credit_column"],
+                    problems);
                 return new AmountBlock(
                     shape,
                     null, false,
                     RequiredColumn(block, "debit_column", "amount", problems),
-                    RequiredColumn(block, "credit_column", "amount", problems));
+                    RequiredColumn(block, "credit_column", "amount", problems),
+                    separator);
 
             default:
                 // Shape unknown, so per-shape key checking would produce noise on top of
                 // the real error. Report nothing further about this block.
                 return default;
         }
+    }
+
+    /// <summary>
+    /// <c>amount.decimal_separator</c>, read against its table (ADR-0114 D15). Null when
+    /// it is missing while <paramref name="required"/>, or is not a name, each reported;
+    /// <see cref="CsvDecimalSeparator.Point"/> when it is absent and not required.
+    /// </summary>
+    private static CsvDecimalSeparator? ReadDecimalSeparator(
+        YamlMappingNode block, bool required, List<CsvMappingError> problems)
+    {
+        if (!required && !TryGet(block, DecimalSeparatorKey, out _)) return CsvDecimalSeparator.Point;
+
+        var text = RequiredString(block, DecimalSeparatorKey, "amount", problems);
+        if (text is null) return null;
+        if (DecimalSeparators.TryGetValue(text, out var separator)) return separator;
+
+        // Named from the table, so the message cannot outlive the vocabulary.
+        problems.Add(new CsvMappingError("amount." + DecimalSeparatorKey, LineOf(block, DecimalSeparatorKey),
+            $"'{text}' is not a decimal separator. Use one of: {string.Join(", ", DecimalSeparators.Keys)}."));
+        return null;
     }
 
 

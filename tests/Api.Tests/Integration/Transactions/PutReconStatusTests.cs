@@ -19,13 +19,11 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// per-account independence of a transfer.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class PutReconStatusTests
+public sealed class PutReconStatusTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public PutReconStatusTests(PostgresFixture fixture)
+    public PutReconStatusTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -41,13 +39,13 @@ public sealed class PutReconStatusTests
 
     private async Task<Seed> SeedAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
         var (fromLegId, _) = await ledger.AddTransactionPairAsync(
             bank.Id, groceries.Id, -25m,
             new DateTime(2026, 5, 13, 12, 0, 0, DateTimeKind.Utc));
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var headerId = await db.TxnLegs.AsNoTracking()
             .Where(l => l.Id == fromLegId)
             .Select(l => l.HeaderId)
@@ -62,7 +60,7 @@ public sealed class PutReconStatusTests
     /// the default 'uncleared' with no overlay row).</summary>
     private async Task<TxnLegReconRow?> ReconAsync(Guid legId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.TxnLegRecon.AsNoTracking()
             .FirstOrDefaultAsync(r => r.LegId == legId);
     }
@@ -71,7 +69,7 @@ public sealed class PutReconStatusTests
     public async Task Put_marks_as_cleared_and_writes_audit_pair()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PutAsJsonAsync(
@@ -90,7 +88,7 @@ public sealed class PutReconStatusTests
     public async Task Put_marks_as_reconciling_without_audit_pair()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PutAsJsonAsync(
@@ -109,7 +107,7 @@ public sealed class PutReconStatusTests
     public async Task Put_uncleared_after_cleared_resets_the_audit_pair()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var first = await client.PutAsJsonAsync(
@@ -136,20 +134,20 @@ public sealed class PutReconStatusTests
     {
         // ADR-0082 core: a transfer cleared in one account stays uncleared in
         // the other — status is per-account, not per-header.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("checking");
         var savings = await ledger.AddBankAccountAsync("savings");
         var (checkingLegId, savingsLegId) = await ledger.AddTransactionPairAsync(
             checking.Id, savings.Id, -100m,
             new DateTime(2026, 5, 13, 12, 0, 0, DateTimeKind.Utc), payee: "transfer");
         Guid headerId;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             headerId = await db.TxnLegs.AsNoTracking()
                 .Where(l => l.Id == checkingLegId).Select(l => l.HeaderId).SingleAsync();
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Clear it in checking only.
@@ -159,7 +157,7 @@ public sealed class PutReconStatusTests
         Assert.Equal(HttpStatusCode.NoContent, resp.StatusCode);
 
         // The resolved view (per-leg) shows cleared on checking, uncleared on savings.
-        await using var db2 = _fixture.NewDbContext();
+        await using var db2 = Db.NewDbContext();
         var checkingStatus = await db2.ResolvedTransactions.AsNoTracking()
             .Where(rt => rt.HeaderId == headerId && rt.AccountId == checking.Id)
             .Select(rt => rt.Status).FirstAsync();
@@ -174,7 +172,7 @@ public sealed class PutReconStatusTests
     public async Task Put_with_invalid_status_returns_422()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PutAsJsonAsync(
@@ -192,7 +190,7 @@ public sealed class PutReconStatusTests
         var seedA = await SeedAsync();
         var seedB = await SeedAsync();
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seedA.Ledger);
 
         // Ledger A's user addressing ledger B's header via A's URL: no leg on

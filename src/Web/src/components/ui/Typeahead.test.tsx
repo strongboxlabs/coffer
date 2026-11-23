@@ -13,8 +13,9 @@ import { Typeahead } from './Typeahead';
 //   * Enter without a highlight does NOT call onChange — the event
 //     bubbles to the parent form.
 //   * Clicking an item commits it via onChange.
-//   * Escape closes the popover and bubbles up (parent form gets to
-//     handle it for cancel-row).
+//   * Escape with the list showing closes it and stops there (handled,
+//     not bubbled), keeping focus and text; with no list showing it
+//     bubbles to the parent form, whose Escape cancels the row.
 //   * Tab with a highlight commits AND lets focus advance naturally
 //     (no preventDefault, so the next focusable receives focus).
 //   * Custom getSearchableText drives the filter (compound-path use).
@@ -108,19 +109,83 @@ describe('Typeahead', () => {
         expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
     });
 
-    it('Escape closes the popover and bubbles to the parent', async () => {
+    it('Escape with the list showing closes it, keeps focus and text, and stops there', async () => {
+        const onParentKeyDown = vi.fn();
+        render(<Harness items={ITEMS} onParentKeyDown={onParentKeyDown} />);
+        const user = userEvent.setup();
+        // The native event, to read how the Escape left the component.
+        const seen: KeyboardEvent[] = [];
+        const capture = (e: KeyboardEvent) => { if (e.key === 'Escape') seen.push(e); };
+        document.addEventListener('keydown', capture, true);
+
+        const input = screen.getByRole('combobox');
+        await user.type(input, 'o');
+        expect(screen.getByRole('listbox')).toBeInTheDocument();
+        await user.keyboard('{Escape}');
+        document.removeEventListener('keydown', capture, true);
+
+        expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+        expect(input).toHaveFocus();
+        expect(input).toHaveValue('o');
+        // Marked handled, for the editor and Modal that read the flag.
+        expect(seen).toHaveLength(1);
+        expect(seen[0]!.defaultPrevented).toBe(true);
+        // And stopped: the parent saw the typing but not this Escape.
+        const parentEvents = onParentKeyDown.mock.calls.map(([e]) => e.key as string);
+        expect(parentEvents).toContain('o');
+        expect(parentEvents).not.toContain('Escape');
+    });
+
+    it('Escape with no list showing reaches the parent, unhandled', async () => {
         const onParentKeyDown = vi.fn();
         render(<Harness items={ITEMS} onParentKeyDown={onParentKeyDown} />);
         const user = userEvent.setup();
 
-        await user.click(screen.getByRole('combobox'));   // opens
+        // Focused (the field counts itself open), but nothing matches, so no
+        // list is on screen: this Escape is the form's.
+        await user.type(screen.getByRole('combobox'), 'zzz');
+        expect(screen.getByRole('combobox')).toHaveValue('zzz');
+        expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
         await user.keyboard('{Escape}');
 
-        // Popover closed.
+        const escapes = onParentKeyDown.mock.calls
+            .map(([e]) => e as React.KeyboardEvent)
+            .filter((e) => e.key === 'Escape');
+        expect(escapes).toHaveLength(1);
+        expect(escapes[0]!.defaultPrevented).toBe(false);
+    });
+
+    it('announces the list as expanded only while it is on screen', async () => {
+        render(<Harness items={ITEMS} />);
+        const user = userEvent.setup();
+        const input = screen.getByRole('combobox');
+
+        await user.type(input, 'o');
+        expect(screen.getByRole('listbox')).toBeInTheDocument();
+        expect(input).toHaveAttribute('aria-expanded', 'true');
+
+        // Still focused, but nothing matches: no list, so not expanded.
+        await user.type(input, 'zzz');
+        expect(input).toHaveFocus();
         expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
-        // Escape reached the parent — that's the cancel-row hook.
-        const parentEvents = onParentKeyDown.mock.calls.map(([e]) => e.key as string);
-        expect(parentEvents).toContain('Escape');
+        expect(input).toHaveAttribute('aria-expanded', 'false');
+    });
+
+    it('the Escape after the one that closed the list reaches the parent', async () => {
+        const onParentKeyDown = vi.fn();
+        render(<Harness items={ITEMS} onParentKeyDown={onParentKeyDown} />);
+        const user = userEvent.setup();
+
+        await user.type(screen.getByRole('combobox'), 'o');
+        expect(screen.getByRole('listbox')).toBeInTheDocument();
+        await user.keyboard('{Escape}');
+        expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+        await user.keyboard('{Escape}');
+
+        const escapes = onParentKeyDown.mock.calls
+            .map(([e]) => e.key as string)
+            .filter((k) => k === 'Escape');
+        expect(escapes).toHaveLength(1);
     });
 
     it('Tab with a highlight commits AND lets focus advance to the next focusable', async () => {

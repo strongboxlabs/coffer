@@ -11,16 +11,17 @@ namespace Coffer.Api.Tests.Integration.Backup;
 
 /// <summary>
 /// What the browser reads after a restore's restart (ADR-0061, amended
-/// 2026-10-09): the outcome the boot recorded, by attempt id. Before this, the
-/// browser took "/healthz answers" for success, and a restore that failed in
-/// production and changed nothing was reported as complete.
+/// 2026-10-09): the outcome the boot recorded, by attempt id. "/healthz answers" is
+/// not success: a restore that fails and changes nothing still restarts into a
+/// healthy app, so taking the health check for the outcome reports it complete.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class RestoreOutcomeEndpointTests
+public sealed class RestoreOutcomeEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public RestoreOutcomeEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public RestoreOutcomeEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     [Fact]
     public async Task Answers_the_recorded_outcome_for_its_own_attempt_only()
@@ -30,7 +31,7 @@ public sealed class RestoreOutcomeEndpointTests
             attempt, "failed", new DateTime(2026, 10, 9, 17, 50, 46, DateTimeKind.Utc),
             PreviousDatabase: null, Error: "database \"coffer\" is being accessed by other users"));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();   // anonymous
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();   // anonymous
         using var client = factory.CreateClient();
 
         var resp = await client.GetAsync($"/api/restore-outcome/{attempt}");
@@ -49,7 +50,7 @@ public sealed class RestoreOutcomeEndpointTests
     {
         // The fixture provisions the service role as db/init does; the function
         // must say so, and say exactly which half is missing when one is.
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         var row = await db.RestoreReadiness().SingleAsync();
         Assert.Equal("coffer_service", row.RoleName);
         Assert.True(row.CanCreateDatabases);

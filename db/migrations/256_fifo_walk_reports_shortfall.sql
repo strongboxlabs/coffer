@@ -14,11 +14,11 @@
 -- their entire proceeds. No error anywhere. The API even defines
 -- `investment-txn-insufficient-shares`, and nothing has ever returned it.
 --
--- The editor's lot preview could not stand in for a guard either: it read the
--- `lots` table, which FIFO drains IN PLACE, so it only ever knew today. Editing a
--- years-old sale on a since-closed account showed "no open lots" and a false
--- "exceeds open position" warning on every historical edit, while a real oversell
--- through the same editor went through unremarked.
+-- The editor's lot preview cannot stand in for a guard either: it reads the
+-- `lots` table, which FIFO drains IN PLACE, so it only knows today. Editing a
+-- past sale on a position closed since shows "no open lots" and a false
+-- "exceeds open position" warning, while a real oversell through the same
+-- editor goes through unremarked.
 --
 -- WHAT CHANGES
 -- ------------
@@ -26,8 +26,8 @@
 --     not match, summed — and p_exclude_header_id, which leaves one header's legs
 --     out of the stream. Nothing else about the walk moves: the body is ported
 --     MECHANICALLY from its current definition (migration 230) with four
---     asserted edits, because migration 202's first draft ported a superseded
---     definition and silently dropped three behaviours.
+--     asserted edits, because porting a superseded definition silently drops
+--     behaviours (see 202).
 --
 --   * holdings_fifo_shortfall(account, security) — the writer's question: how
 --     short is this position now? The API asks it before and after a save and
@@ -39,8 +39,8 @@
 --
 --   * holdings_fifo_shortfalls(ledger) — the consistency report's question:
 --     which positions are short already? A sale accepted before this migration,
---     or written by an importer, stays short, and it overstates its gain. Decided
---     2026-10-20 that those are REPORTED, not repaired: the purchase they are
+--     or written by an importer, stays short, and it overstates its gain. Those
+--     are REPORTED, not repaired: the purchase they are
 --     missing is not in the data, so any repair would invent a cost basis.
 --
 -- WHY THE WRITER REFUSES "WORSE", NOT "SHORT"
@@ -337,4 +337,5 @@ COMMENT ON FUNCTION holdings_fifo_shortfalls(uuid) IS
 COMMENT ON FUNCTION holdings_fifo_open_lots(uuid, uuid, timestamp with time zone, uuid) IS
     'Mig 256. Open FIFO lots of one (holdings account, security) as of an instant, '
     'optionally without one header — what was available to a sale being edited. '
-    'Drives the editor''s lot preview, which used to read today''s lots table.';
+    'Drives the editor''s lot preview. The lots table is drained in place and holds '
+    'only the current position, so the preview reads the walk instead.';

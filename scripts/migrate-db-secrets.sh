@@ -44,7 +44,7 @@ info() { echo "[migrate-db-secrets] $*"; }
 mkdir -p "$SECRETS_DIR"
 chmod 700 "$SECRETS_DIR" 2>/dev/null || true
 
-read_env() { grep -E "^$1=" "$ENV_FILE" | head -1 | cut -d= -f2- || true; }
+read_env() { grep -E "^$1=" "$ENV_FILE" | sed -n 1p | cut -d= -f2- || true; }
 
 # secret_file <env-var> <secret-name>
 # Writes the value from .env into the secret file. Never prints the value.
@@ -101,11 +101,11 @@ else
     # — the .env lines are already commented and the files below are non-empty —
     # so the recovery window has served its purpose.
     #
-    # Leaving it forever was the actual behaviour, and it defeated the migration:
-    # the whole point is that a password in a file beside the compose file is
-    # less exposed than one in .env, and .env.pre-secrets is a cleartext copy of
-    # all three sitting in the same directory. Two docs told the operator to
-    # delete it by hand. Nothing checked whether they had.
+    # Leaving it forever would defeat the migration: the whole point is that a
+    # password in a file beside the compose file is less exposed than one in
+    # .env, and .env.pre-secrets is a cleartext copy of all three sitting in the
+    # same directory. Asking the operator to delete it by hand leaves nothing
+    # checking that they did.
     if [ -f "$ENV_FILE.pre-secrets" ]; then
         complete=1
         for f in postgres_password coffer_service_password coffer_app_password; do

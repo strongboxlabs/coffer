@@ -10,7 +10,9 @@
 >
 > The snapshot half's scope list is also drifted: the live whitelist is
 > `LedgerSnapshotPayload`, which excludes `ledgers`, names
-> `user_account_groups` / `user_account_group_members`, carries `txn_header_originals`
+> `account_folders` / `account_folder_members` (migration 258, ADR-0106; until then
+> it named the tab tables `user_account_groups` / `user_account_group_members`, which
+> that migration dropped), carries `txn_header_originals`
 > rather than the dropped override tables, and includes `security_splits` and the
 > recurring-transaction tables that this ADR omits.
 * Date: 2026-06-08
@@ -18,11 +20,11 @@
 
 ## Context
 
-Coffer stores the user's complete financial history. Three real failure modes the user has flagged:
+Coffer stores the user's complete financial history. Three failure modes:
 
-1. **Disaster recovery.** Self-hosted Postgres data lost (disk failure, accidental `DROP`, container blown away). Without an off-host backup, the ledger is gone — the Moneydance JSON the user bootstrapped from is now months stale.
+1. **Disaster recovery.** Self-hosted Postgres data lost (disk failure, accidental `DROP`, container blown away). Without an off-host backup, the ledger is gone — the Moneydance JSON a ledger was bootstrapped from goes stale.
 2. **Pre-risk safety net.** "I'm about to do a giant import / a destructive operation / a schema migration — let me grab a snapshot first so I can roll back if it goes sideways."
-3. **Data portability.** "I want my data in a format I can read / archive / move outside Coffer." Matches the user-bound-IO posture (memory: "import/export/backup/restore are user-bound API endpoints").
+3. **Data portability.** "I want my data in a format I can read / archive / move outside Coffer." Matches the user-bound-IO posture: import/export/backup/restore are user-bound API endpoints.
 
 A single mechanism can't serve all three well — DR wants off-host encrypted blobs, pre-risk wants cheap server-side checkpoints with one-click rollback, portability wants a readable file format. We split them into two tracks with shared internals.
 
@@ -33,18 +35,18 @@ Two distinct user-facing concepts, sharing the same JSON-walker engine:
 ### Snapshots — operational, server-side, capped
 
 * **Purpose:** pre-risk safety net + lightweight rollback. Never leaves the host.
-* **Schedule:** opt-in **daily** auto per ledger (a `snapshot` row in `scheduled_jobs`, mig 136), run by the shared `SchedulerService`, plus user-initiated. (Superseded the original fixed-weekly design, which was a **no-op**: the worker ran under the RLS app role with no request user and saw no ledgers — zero auto-snapshots in practice. The shared worker uses the service role.)
+* **Schedule:** opt-in **daily** auto per ledger (a `snapshot` row in `scheduled_jobs`, mig 136), run by the shared `SchedulerService`, plus user-initiated. (Supersedes the original fixed-weekly design, which was a **no-op**: the worker ran under the RLS app role with no request user, so it saw no ledgers and took no snapshots. The shared worker uses the service role.)
 * **Retention:** hard cap of 5 total per ledger. Auto-snaps evict the oldest auto-snap on creation; user-initiated ("manual") snaps survive until the user explicitly deletes one. If all 5 slots hold manual snaps, the auto-snap is **skipped** (logged + surfaced on the snapshots panel — "Auto-snap skipped: 5 manual snapshots in pool"); manual creation at the cap is **refused** with a clear error ("delete a snapshot first").
-* **Scope (in):** the user-curated ledger graph. The list as first written here (`accounts`, `account_groups`, `securities`, `txn_headers`, `txn_legs`, `tags`, …) went stale within weeks and is deliberately not repeated: the captured set is `fn_ledger_snapshot_part_names()` in the database, and `SchemaDriftGuardTests` fails when a ledger-scoped table is in neither it nor an exclusion list with a reason. "Ledger-scoped" means carrying `ledger_id` **or reaching such a table through a foreign key** (2026-10-09, migration 247): `security_components` had no `ledger_id`, so the guard never saw it, and every restore cascaded through it and lost it.
+* **Scope (in):** the user-curated ledger graph. The list as first written here (`accounts`, `account_groups`, `securities`, `txn_headers`, `txn_legs`, `tags`, …) is stale and deliberately not repeated: the captured set is `fn_ledger_snapshot_part_names()` in the database, and `SchemaDriftGuardTests` fails when a ledger-scoped table is in neither it nor an exclusion list with a reason. "Ledger-scoped" means carrying `ledger_id` **or reaching such a table through a foreign key** (2026-10-09, migration 247): `security_components` has no `ledger_id`, so a guard keyed on that column alone misses it, and a restore cascades through it and loses it.
 * **Scope (out):** operational state — `feed_connections` and their credential ciphertexts, the run log (`sync_runs` / `sync_run_errors` then, `ledger_operations` / `ledger_operation_errors` now), `auth_sessions`, `bootstrap_tokens`, `schema_migrations`. (`sync_run_promotions`, now `ledger_operation_promotions`, was listed here too; its CASCADE from `txn_headers` meant every restore erased it anyway, and since migration 247 it is captured — a promotion describes a transaction and rolls back with one.) Also out: `txn_header_account_balances` (the materialized balance table from mig 089) — re-derived on restore via `fn_recompute_balances_for_account` for each restored account, avoiding stale-balance risk.
 * **Restore:** in-place replace on the same ledger. Wrapped in one Postgres transaction (`BEGIN` → delete the ledger's current rows in the in-scope tables → bulk-INSERT from snapshot payload → recompute balances → `COMMIT`). If anything fails, the original ledger state is intact; no half-restored visibility.
-* **Restore invariants (2026-10-09, migration 247, after a prod restore failed).** A restore deletes every captured row and re-inserts it, in chunks since migration 193, so three things must hold, and `SchemaDriftGuardTests` checks each against the catalog rather than trusting a fixture to happen to exercise it:
-  1. **Every reference between captured tables is satisfied by the insert order, or deferrable.** A self-reference never is — a row can point into a later chunk of its own table — so `txn_headers.is_merged_into`, `accounts.parent_id` and `accounts.holdings_account_id` are `DEFERRABLE INITIALLY DEFERRED`, as mig 124 did for the recurring-template cycle.
+* **Restore invariants (2026-10-09, migration 247).** A restore deletes every captured row and re-inserts it, in chunks since migration 193, so three things must hold, and `SchemaDriftGuardTests` checks each against the catalog rather than trusting a fixture to happen to exercise it:
+  1. **Every reference between captured tables is satisfied by the insert order, or deferred** (`DEFERRABLE INITIALLY DEFERRED`: the restore defers nothing by name, so a key that is only `DEFERRABLE` is checked at each insert; the guard reads `condeferred` since migration 302). A self-reference never is — a row can point into a later chunk of its own table — so `txn_headers.is_merged_into`, `accounts.parent_id` and `accounts.holdings_account_id` are `DEFERRABLE INITIALLY DEFERRED`, as mig 124 did for the recurring-template cycle. So is `account_folders.parent_id` (migration 258, ADR-0106), a folder inside a folder.
   2. **No table outside the snapshot references a captured row.** Otherwise "excluded" is false: the delete cascades into it, nulls its link, or blocks the restore.
-  3. **Every reference from a captured row out of the snapshot is classified.** If an app path can delete the parent, the restore applies the FK's own `ON DELETE` action to the restored row (`fn_ledger_snapshot_reconcile_external_refs` — today only `accounts.feed_connection_id`); if none can, the guard records that as an assumption.
-  4. **A capture is one moment, and both directions check themselves.** Capture and restore run at REPEATABLE READ and the functions refuse anything lower: at READ COMMITTED every statement of a capture saw its own moment, so a sync landing between the headers and the legs produced a snapshot holding legs without their header. Capture counts the rows it writes per table against the live count in the same snapshot; restore compares the ledger's rows per table afterwards with the rows it inserted. Either mismatch rolls the operation back.
-  5. **What a snapshot holds does not depend on who asked.** Manual capture and restore run through the service role after the API's own access and owner checks, as the scheduled snapshot always did; under the caller's RLS another member's private saved reports, pins and account groups were neither captured nor restored.
-  6. **One create per ledger at a time.** The five-snapshot cap is checked before the capture transaction, so two concurrent creates both passed it and left six. Creates take a per-ledger SESSION advisory lock (`snapshot_ledger_lock`, migration 247) before that check and hold it until the capture commits — a lock taken inside the REPEATABLE READ transaction would come after its snapshot, and the count it guards would already be stale. Twelve concurrent creates leave exactly five; without the lock, more (5 of 5 runs).
+  3. **Every reference from a captured row out of the snapshot is classified.** If an app path can delete the parent, the restore applies the FK's own `ON DELETE` action to the restored row (`fn_ledger_snapshot_reconcile_external_refs` — `accounts.feed_connection_id`, and the three references to the run log below); if none can, the guard records that as an assumption. *Amended 2026-11-19 (migration 302):* the run log was classified here as a parent no app path deletes, but audit retention prunes `ledger_operations` past its window, so a snapshot holding an imported row's run stamp (`txn_headers.ledger_operation_id`) or a promotion (`ledger_operation_promotions`, two FKs to the run) of a pruned run could not be restored. Those three FKs are now `DEFERRABLE INITIALLY DEFERRED`, as `accounts.feed_connection_id` is, and the restore clears a stamp whose run is gone (`SET NULL`) and deletes a promotion whose run is gone (`CASCADE`), as the prune did to the live rows; its row-count check expects the snapshot's promotions less the ones it deleted.
+  4. **A capture is one moment, and both directions check themselves.** Capture and restore run at REPEATABLE READ and the functions refuse anything lower: at READ COMMITTED every statement of a capture sees its own moment, so a sync landing between the headers and the legs produces a snapshot holding legs without their header. Capture counts the rows it writes per table against the live count in the same snapshot; restore compares the ledger's rows per table afterwards with the rows it inserted. Either mismatch rolls the operation back.
+  5. **What a snapshot holds does not depend on who asked.** Manual capture and restore run through the service role after the API's own access and owner checks, as the scheduled snapshot always did; under the caller's RLS another member's private saved reports, pins and account groups would be neither captured nor restored.
+  6. **One create per ledger at a time.** The five-snapshot cap is checked before the capture transaction, so without a lock two concurrent creates can both pass it and leave six. Creates take a per-ledger SESSION advisory lock (`snapshot_ledger_lock`, migration 247) before that check and hold it until the capture commits — a lock taken inside the REPEATABLE READ transaction would come after its snapshot, and the count it guards would already be stale. `SnapshotsTests.Concurrent_creates_never_exceed_the_cap` fires twelve concurrent creates and pins exactly five.
   The fidelity guard seeds every captured table — a second member's private rows and a row whose id is the all-zero uuid included — captures at one row per chunk, and compares each table's full content before and after.
 * **Schema-version compatibility (Phase 1):** refuse restore when the snapshot's `schema_version` differs from the live DB. Clear error message. Forward-migration of older snapshots is a separate ADR.
 * **Failure handling for auto-snap:** the shared scheduler logs a per-ledger failure and continues; `next_run_at` still advances, so the next day's run starts fresh. No retry within a tick.
@@ -110,6 +112,8 @@ CREATE INDEX idx_ledger_snapshots_ledger_created
 
 The 5-cap eviction rule lives in `LedgerSnapshotsRepository` (auto-evict-auto-first is non-trivial enough that a DB constraint would be uglier than the LINQ).
 
+*Amended 2026-11-02:* the panel does not show `content_size_uncompressed`. That column is the length of the payload's JSON text, recorded at capture, and it reads as several times what a snapshot costs: the database compresses what it stores, and a backup, which is compressed and leaves snapshots out, sat beside it as if the two were the same measure. The panel shows the bytes the snapshot occupies as stored (`ledger_snapshot_stored_sizes`, migration 271). The "N MB before compression" label this section and ADR-0087 describe never reached the screen.
+
 Backups don't get a DB table — they're streamed-on-demand artifacts that exist only as files outside the system.
 
 ### UI surface
@@ -128,13 +132,13 @@ Snapshots/backup work belongs in **per-ledger** settings because they're per-led
 3. **Passphrase-derived encryption for backups.** Drive (or any off-host destination) is untrusted storage. The passphrase is the one thing the user must safeguard separately.
 4. **Manual-at-cap refuses, doesn't evict.** Manual snaps are explicit intent; silent eviction would surprise the user.
 5. **Re-derive balances on restore.** Don't back up `txn_header_account_balances`; rebuild via `fn_recompute_balances_for_account` after the row insert.
-6. **Refuse cross-version restore — and this is the settled posture, not a phase.** Written here as "Phase 1", which read as a staging post on the way to forward-migration. It is not. A snapshot is an *undo* for something you are about to do — a bulk edit, an import — and it is restored minutes later on the same build. The cross-version case is what **backups** are for, and they are the answer the Snapshots panel gives in as many words. Decided 2026-09-25; see "Out of scope" below.
+6. **Refuse cross-version restore — and this is the settled posture, not a phase.** It is not a staging post on the way to forward-migration. A snapshot is an *undo* for something you are about to do — a bulk edit, an import — and it is restored minutes later on the same build. The cross-version case is what **backups** are for, and they are the answer the Snapshots panel gives in as many words. See "Out of scope" below.
 7. **Phase 1 = manual backups only.** No scheduled Drive backups in v1. Same backup engine; scheduling + Drive auth land later.
 
 ## Out of scope (deferred)
 
 * **Google Drive integration** — OAuth, token storage, upload/download, scheduling. Phase 2 of the backups track.
-* **Forward-migration on restore** — **not a goal** (2026-09-25). This used to read "own ADR, needed when schema drift becomes a real pain point", which invited someone to build it the first time a snapshot went stale. Two reasons it stays out. A snapshot's job is undoing something you just did, on the build you are running; the tool for surviving an upgrade is a backup, which is what the Snapshots panel tells you to take. And the cost compounds — migration 188 made the version guard load-bearing for *correctness*, dropping the realized-gains recompute and capturing the derived rows in the payload because "restore REFUSES a cross-schema-version restore … so the derivation logic cannot have changed in between". Lifting the guard means reworking what 188 captured, to buy a capability nobody asked for. The UI no longer offers Restore on a retired snapshot (`SnapshotSummaryDto.Restorable`), so the staleness is visible rather than discovered at restore time.
+* **Forward-migration on restore** — **not a goal** (2026-09-25). Two reasons it stays out. A snapshot's job is undoing something you just did, on the build you are running; the tool for surviving an upgrade is a backup, which is what the Snapshots panel tells you to take. And the cost compounds — migration 188 made the version guard load-bearing for *correctness*, dropping the realized-gains recompute and capturing the derived rows in the payload because "restore REFUSES a cross-schema-version restore … so the derivation logic cannot have changed in between". Lifting the guard means reworking what 188 captured, to buy a capability nobody asked for. The UI no longer offers Restore on a retired snapshot (`SnapshotSummaryDto.Restorable`), so the staleness is visible rather than discovered at restore time.
 * **Merge-into-existing-ledger restore** — never going to ship; merge semantics for a backup are a swamp.
 * **Cross-ledger / whole-system backup** — operator concern (the sysadmin runs `pg_dump`); Coffer's surface stays user-bound per ledger.
 * **Backup file portability between Coffer versions** — implies forward-migration (above) and a backwards-compatibility contract we're not ready to commit to.
@@ -145,5 +149,29 @@ Snapshots/backup work belongs in **per-ledger** settings because they're per-led
 * **One mechanism couldn't serve all three failure modes.** DR needs off-host + encrypted, pre-risk wants in-DB + one-click, portability wants readable. Two tracks with shared internals threads all three without bloating either surface.
 * **The passphrase-derived key for backups is the only design that holds.** Master-KEK-in-the-backup means the file IS the keys (lose it = lose all secrets). No-secrets-in-backup means post-restore the user re-OAuths every feed, breaking the 5-minute recovery target. Passphrase is the right hop: one human-rememberable secret, off-host storage is untrusted by default, recovery from total loss is bounded by network speed.
 * **Identity out of scope keeps restore simple.** Trying to back up WebAuthn credentials introduces real complexity (device-tied state, authenticator availability) for no real benefit on a new machine.
-* **Re-derive balances on restore** is structurally cleaner than backing them up. The materialized balance table is derivable from `txn_legs`; backing it up risks divergence between the materialised values and the underlying legs (a class of bug we've already seen from triggers).
+* **Re-derive balances on restore** is structurally cleaner than backing them up. The materialized balance table is derivable from `txn_legs`; backing it up risks divergence between the materialised values and the underlying legs (the class of bug triggers are prone to, ADR-0032).
 * **5-cap with auto-evicts-auto-first** matches the user's mental model: "the safety snapshot I made is the important one; system housekeeping shouldn't quietly delete it."
+
+## Amendment — 2026-10-25: every captured table is chunked on its primary key, and the stored memo-and-tags presentation is captured
+
+**Chunk key.** The snapshot writer (`fn_snapshot_write_part`, migration 264) keyset-chunks
+every captured table on its **primary key, whatever its shape**, read from the catalog. Each
+chunk resumes strictly after the last key the previous one wrote, compared as a row value, so a
+composite key such as `(leg_id, tag_id)` resumes inside one parent's rows and every chunk but
+the last holds exactly the chunk size. Until 264 the writer chunked only a table with a column
+named `id` and wrote every other captured table as one aggregate under a row ceiling: that
+holds a whole table of the ledger in one value, in the backend that already runs closest to
+its memory limit. That path and its ceiling are gone, and a captured table without a primary
+key is refused rather than written whole. `SchemaDriftGuardTests` holds every captured table
+to having a primary key and, capturing at one row per chunk, to one chunk per row.
+
+**The stored presentation is captured and copied back verbatim.** The memo-and-tags rule's
+output is stored per leg (`txn_legs.notes_*`, which ride along with the legs) and per leg and
+tag (`txn_leg_note_tags`, a captured table of its own, inserted after `txn_legs` and `tags`).
+A restore copies both back as they were and does not recompute them. That is sound for the
+reason migration 188 gave for `realized_gains`: a restore refuses a snapshot whose
+`schema_version` differs from the live database (decision 6), so the rule that computed the
+restored values is the rule this database runs. A change to the rule ships as a numbered C#
+recompute step, which changes the schema version and so retires the older snapshots.
+`SchemaDriftGuardTests`' round trip fingerprints both, and a restore of a payload whose stored
+values are not what the rule computes must bring back exactly the payload's values.

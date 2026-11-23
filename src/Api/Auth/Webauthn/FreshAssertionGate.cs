@@ -15,7 +15,7 @@ namespace Coffer.Api.Auth.Webauthn;
 /// <summary>
 /// "Prove a human with an enrolled authenticator is here right now" — the step-up
 /// every deployment-secret disclosure, and every action that grants lasting access or
-/// replaces data, sits behind (ADR-0092 D2, D7; 2026-10-12 audit, M2).
+/// replaces data, sits behind (ADR-0092 D2, D7; ADR-0105 D1).
 /// </summary>
 /// <remarks>
 /// <para>The session cookie only proves an admin authenticated some time in the
@@ -29,9 +29,9 @@ namespace Coffer.Api.Auth.Webauthn;
 /// asserting credential belongs to the caller, <b>predates the session</b>, and the
 /// authenticator <b>verified the user</b> (PIN or biometric).</para>
 ///
-/// <para><b>Why "predates the session".</b> Enrolling a passkey used to need only the
-/// cookie, so a stolen cookie could enrol a software key and then pass every step-up
-/// with it — the gate checked that the credential was the caller's, and it was.
+/// <para><b>Why "predates the session".</b> If enrolling a passkey needs only the
+/// cookie, a stolen cookie can enrol a software key and then pass every step-up
+/// with it — a gate that checks only that the credential is the caller's passes it.
 /// Accepting only passkeys enrolled at or before the session began means a cookie
 /// can never manufacture its own way through. A passkey added during this session
 /// works from the next sign-in made with it. (<c>&lt;=</c>, not <c>&lt;</c>: setup and

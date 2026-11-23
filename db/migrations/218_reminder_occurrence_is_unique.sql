@@ -6,8 +6,8 @@
 -- committed?" with a SELECT, and inserts if it finds nothing. At READ COMMITTED two
 -- callers both read nothing and both insert, and there is no constraint behind them —
 -- the only index on those columns is mig 124's NON-unique (recurring_transaction_id,
--- ledger_id). Today the only caller is a person clicking Fire, so the window is small
--- and nobody has hit it. Reminder auto-post makes the second caller a timer, and the
+-- ledger_id). With a person clicking Fire as the only caller the window is small.
+-- Reminder auto-post makes the second caller a timer, and the
 -- thing being duplicated is a financial transaction.
 --
 -- Worse than a race in the abstract: FireAsync's idempotency SELECT and its skip check
@@ -88,8 +88,7 @@ END $$;
 --   * NOT is_recurring_template — belt and braces. A template is linked the OTHER
 --     way, by recurring_transactions.template_header_id, and its own
 --     recurring_transaction_id is NULL, so the IS NOT NULL predicate above already
---     excludes it today. Verified, not assumed: a test asserts the template's stamp is
---     null, because this predicate was written believing the opposite. It stays so that
+--     excludes it today, and a test asserts the template's stamp is null. It stays so that
 --     stamping templates later — a reasonable change, it would make the link
 --     symmetric — cannot silently make every series unfireable at its first occurrence.
 CREATE UNIQUE INDEX uq_txn_headers_recurring_occurrence

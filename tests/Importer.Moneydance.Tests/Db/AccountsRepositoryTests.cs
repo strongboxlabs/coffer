@@ -4,13 +4,11 @@ using Coffer.Importer.Moneydance.Db;
 namespace Coffer.Importer.Moneydance.Tests.Db;
 
 [Collection(DbCollection.Name)]
-public sealed class AccountsRepositoryTests
+public sealed class AccountsRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AccountsRepositoryTests(PostgresFixture fixture)
+    public AccountsRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static AccountRow Bank(string externalId, string name = "test bank") =>
@@ -76,8 +74,7 @@ public sealed class AccountsRepositoryTests
     [Fact]
     public async Task Upsert_round_trips_account_metadata()
     {
-        await using var connection = _fixture.OpenConnection();
-        await TruncateAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var repo = new AccountsRepository(connection);
         // Mig 106 collapsed is_hidden into is_active — MD's `hide`
@@ -109,8 +106,7 @@ public sealed class AccountsRepositoryTests
     [Fact]
     public async Task Upsert_persists_the_account_start_date()
     {
-        await using var connection = _fixture.OpenConnection();
-        await TruncateAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var repo = new AccountsRepository(connection);
         var row = Bank("md-bank-opened") with { OpenedOn = new DateOnly(2018, 3, 14) };
@@ -124,8 +120,7 @@ public sealed class AccountsRepositoryTests
     [Fact]
     public async Task Reimport_backfills_a_missing_start_date()
     {
-        await using var connection = _fixture.OpenConnection();
-        await TruncateAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var repo = new AccountsRepository(connection);
         // First run predates the importer reading date_created — opened_on NULL.
@@ -143,8 +138,7 @@ public sealed class AccountsRepositoryTests
     [Fact]
     public async Task Reimport_does_not_overwrite_a_start_date_already_set_in_coffer()
     {
-        await using var connection = _fixture.OpenConnection();
-        await TruncateAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var repo = new AccountsRepository(connection);
         await repo.UpsertByExternalIdAsync(
@@ -166,8 +160,7 @@ public sealed class AccountsRepositoryTests
     [Fact]
     public async Task Upsert_inserts_a_bank_account()
     {
-        await using var connection = _fixture.OpenConnection();
-        await TruncateAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var repo = new AccountsRepository(connection);
         var row = Bank("md-bank-1", "Example Bank Checking") with { OpeningBalance = 2468.10m };
@@ -187,8 +180,7 @@ public sealed class AccountsRepositoryTests
     [Fact]
     public async Task Upsert_persists_category_with_kind()
     {
-        await using var connection = _fixture.OpenConnection();
-        await TruncateAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var repo = new AccountsRepository(connection);
         var row = Category("md-cat-1", "expense", "Groceries");
@@ -204,8 +196,7 @@ public sealed class AccountsRepositoryTests
     [Fact]
     public async Task UpdateParent_links_a_child_category_to_its_parent()
     {
-        await using var connection = _fixture.OpenConnection();
-        await TruncateAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var repo = new AccountsRepository(connection);
         var parentId = await repo.UpsertByExternalIdAsync(Category("md-parent", "expense", "Bills"));
@@ -224,8 +215,7 @@ public sealed class AccountsRepositoryTests
     {
         // The accounts_parent_only_for_categories CHECK constraint fires on
         // any attempt to set parent_id on a non-category row.
-        await using var connection = _fixture.OpenConnection();
-        await TruncateAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var repo = new AccountsRepository(connection);
         var parentBank = await repo.UpsertByExternalIdAsync(Bank("md-bank-parent"));
@@ -238,7 +228,7 @@ public sealed class AccountsRepositoryTests
     [Fact]
     public async Task Upsert_rejects_row_with_empty_external_id()
     {
-        await using var connection = _fixture.OpenConnection();
+        await using var connection = Db.OpenConnection();
         var repo = new AccountsRepository(connection);
 
         await Assert.ThrowsAsync<ArgumentException>(() => repo.UpsertByExternalIdAsync(
@@ -248,8 +238,7 @@ public sealed class AccountsRepositoryTests
     [Fact]
     public async Task EnsureHoldingsSibling_creates_system_account_and_wires_brokerage()
     {
-        await using var connection = _fixture.OpenConnection();
-        await TruncateAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var repo = new AccountsRepository(connection);
         var brokerageId = await repo.UpsertByExternalIdAsync(
@@ -285,8 +274,7 @@ public sealed class AccountsRepositoryTests
     [Fact]
     public async Task EnsureHoldingsSibling_is_idempotent()
     {
-        await using var connection = _fixture.OpenConnection();
-        await TruncateAsync(connection);
+        await using var connection = Db.OpenConnection();
 
         var repo = new AccountsRepository(connection);
         var brokerageId = await repo.UpsertByExternalIdAsync(Brokerage("md-broker"));
@@ -298,10 +286,5 @@ public sealed class AccountsRepositoryTests
         var siblingCount = await connection.ExecuteScalarAsync<int>(
             "SELECT COUNT(*) FROM accounts WHERE is_system = TRUE;");
         Assert.Equal(1, siblingCount);
-    }
-
-    private static async Task TruncateAsync(Npgsql.NpgsqlConnection connection)
-    {
-        await connection.ExecuteAsync("TRUNCATE accounts CASCADE;");
     }
 }

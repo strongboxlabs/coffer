@@ -1,13 +1,14 @@
 import type { BudgetProgress, BudgetTransactionPage } from '../types/budget';
 import { request } from './_request';
+import { withToday } from './_today';
 
 /**
  * One month's spend per category beside the mean of the trailing complete
- * months — the first REST caller of the reporting aggregation, which until now
- * was reachable only from the MCP tools.
+ * months — a REST caller of the reporting aggregation the MCP tools also use.
  *
- * `month` is `yyyy-MM`; omitting it reports the current month. `windowMonths`
- * defaults to 3 server-side.
+ * `month` is `yyyy-MM`; omitting it reports the user's current month. The user's
+ * local date always rides along: it places "day D of N" and splits off the rows
+ * the register shows as Scheduled. `windowMonths` defaults to 3 server-side.
  */
 export function fetchBudgetProgress(
     ledgerId: string,
@@ -17,9 +18,9 @@ export function fetchBudgetProgress(
     const params = new URLSearchParams();
     if (month) params.set('month', month);
     if (windowMonths !== undefined) params.set('window', String(windowMonths));
-    const qs = params.toString();
+    withToday(params);
     return request<BudgetProgress>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/budget/progress${qs ? `?${qs}` : ''}`,
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/budget/progress?${params.toString()}`,
     );
 }
 
@@ -73,6 +74,11 @@ export interface BudgetTargetEntryResult {
     conflictingCategoryName: string | null;
 }
 
+/** Body of a fill: entries from the average, or a copy of a stored month. */
+export type FillBudgetTargetsRequest =
+    | { month: string; entries: BudgetTargetEntry[] }
+    | { month: string; copyFromMonth: string };
+
 export interface FillBudgetTargetsResponse {
     applied: number;
     skipped: BudgetTargetEntryResult[];
@@ -82,6 +88,12 @@ export interface FillBudgetTargetsResponse {
  * POST /api/ledgers/{ledgerId}/budget/targets/fill — many targets for one
  * month, in one transaction. Backs "copy last month" and "fill from average".
  *
+ * Two shapes (ADR-0114 D12). Fill from average sends `entries`, each stored in the
+ * ledger's reporting currency. Copy last month sends `copyFromMonth` (`yyyy-MM`)
+ * and no entries: the server copies that month's stored targets, each with the
+ * amount and currency it was typed in; a source month with no targets applies 0.
+ * Sending both, or a malformed `copyFromMonth`, is 422 `budget-range-invalid`.
+ *
  * Answers 200 with a count and the entries it SKIPPED rather than failing the
  * batch on the first conflict: refusing all thirty because one is illegal is
  * worse than applying twenty-nine and naming the one that was not. Show the
@@ -90,7 +102,7 @@ export interface FillBudgetTargetsResponse {
  */
 export function fillBudgetTargets(
     ledgerId: string,
-    body: { month: string; entries: BudgetTargetEntry[] },
+    body: FillBudgetTargetsRequest,
 ): Promise<FillBudgetTargetsResponse> {
     return request<FillBudgetTargetsResponse>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/budget/targets/fill`,

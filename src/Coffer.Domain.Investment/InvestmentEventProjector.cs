@@ -2,9 +2,8 @@ namespace Coffer.Domain.Investment;
 
 /// <summary>
 /// Collapses the legs of one investment header (on one account) into a single
-/// investment-event projection — the ONE server-side copy of the aggregation
-/// that was previously duplicated in the SPA's <c>investmentAggregator.ts</c>
-/// (ADR-0080). Both the register read and the MCP <c>activity</c> tool consume
+/// investment-event projection — the ONE server-side copy of the aggregation,
+/// not duplicated in the SPA (ADR-0080). Both the register read and the MCP <c>activity</c> tool consume
 /// it, so the "what is this investment event" question has a single answer.
 /// </summary>
 /// <remarks>
@@ -15,7 +14,7 @@ namespace Coffer.Domain.Investment;
 ///     (the leg the balance trigger processed last for this account).</item>
 ///   <item><b>Security · ticker · name · qty@price</b> — the <c>security</c>-role
 ///     leg that carries a quantity (the holdings side of the posting). Falls back
-///     to any leg's security id/ticker/name for the qty=0 shapes (Div/DivXfr/Misc,
+///     to any leg's security id/ticker/name for the qty=0 shapes (Dividend/DividendXfr/Misc,
 ///     where MD pins the security on the cash leg); qty@price stay null there.</item>
 ///   <item><b>Category / transfer / fee slots</b> — the <c>income</c> / <c>transfer</c>
 ///     / <c>fee</c>-role leg respectively (MD guarantees at most one per role per
@@ -58,7 +57,6 @@ public static class InvestmentEventProjector
         decimal amountSum = 0;
         decimal? lastBalance = canonical.BalanceAfter;
         var highestLegIndex = canonical.LegIndex;
-        var hasAnyOverride = false;
         InvestmentEventLeg? qtyPriceLeg = null;
         Guid? securityIdFallback = null;
         string? securityTickerFallback = null;
@@ -80,7 +78,6 @@ public static class InvestmentEventProjector
         foreach (var leg in legs)
         {
             amountSum += leg.Amount;
-            if (leg.HasOverrides) hasAnyOverride = true;
 
             // Balance after the WHOLE event = balance_after on the highest
             // LegIndex leg. Order-independent semantic; the index pick is the
@@ -148,7 +145,6 @@ public static class InvestmentEventProjector
         return new InvestmentEventProjection(
             Amount: amountSum,
             BalanceAfter: lastBalance,
-            HasOverrides: hasAnyOverride,
             CounterpartyId: counterpartyLeg?.CounterpartyId ?? canonical.CounterpartyId,
             SecurityId: securityId,
             SecurityTicker: securityTicker,
@@ -178,6 +174,12 @@ public static class InvestmentEventProjector
             // "no settled amount" is not "settled nothing".
             SettledAmount: anySecurity ? Math.Abs(securitySum)
                 : anyTransfer ? Math.Abs(transferSum)
-                : null);
+                : null,
+            // Each slot leg's other side as stored (ADR-0114 D13, D14): the caller shows
+            // it only on a transfer between currencies.
+            CounterpartyAmount: counterpartyLeg?.CounterpartyAmount,
+            CounterpartyCurrencyCode: counterpartyLeg?.CounterpartyCurrencyCode,
+            TransferAmount: transferLeg?.CounterpartyAmount,
+            TransferCurrencyCode: transferLeg?.CounterpartyCurrencyCode);
     }
 }

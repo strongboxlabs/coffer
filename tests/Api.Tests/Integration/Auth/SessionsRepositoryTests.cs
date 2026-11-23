@@ -9,13 +9,11 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Auth;
 
 [Collection(ApiCollection.Name)]
-public sealed class SessionsRepositoryTests
+public sealed class SessionsRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SessionsRepositoryTests(PostgresFixture fixture)
+    public SessionsRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static byte[] FreshHash()
@@ -28,9 +26,9 @@ public sealed class SessionsRepositoryTests
     [Fact]
     public async Task Insert_round_trips_every_field()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new SessionsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new SessionsRepository(Db.NewServiceFactory(), TimeProvider.System);
         var hash = FreshHash();
         var expiresAt = DateTime.UtcNow.AddDays(30);
 
@@ -49,9 +47,9 @@ public sealed class SessionsRepositoryTests
     [Fact]
     public async Task Insert_rejects_a_hash_thats_not_32_bytes()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new SessionsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new SessionsRepository(Db.NewServiceFactory(), TimeProvider.System);
 
         await Assert.ThrowsAsync<ArgumentException>(() => repo.InsertAsync(
             ledger.UserId, new byte[16], null, DateTime.UtcNow.AddDays(1), SessionAuthMethods.Passkey));
@@ -60,9 +58,9 @@ public sealed class SessionsRepositoryTests
     [Fact]
     public async Task GetActiveByHash_returns_the_row_when_active_and_unexpired()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new SessionsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new SessionsRepository(Db.NewServiceFactory(), TimeProvider.System);
         var hash = FreshHash();
 
         await repo.InsertAsync(ledger.UserId, hash, null, DateTime.UtcNow.AddDays(30), SessionAuthMethods.Passkey);
@@ -75,9 +73,9 @@ public sealed class SessionsRepositoryTests
     [Fact]
     public async Task GetActiveByHash_returns_null_for_expired_session()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new SessionsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new SessionsRepository(Db.NewServiceFactory(), TimeProvider.System);
         var hash = FreshHash();
 
         await repo.InsertAsync(
@@ -90,9 +88,9 @@ public sealed class SessionsRepositoryTests
     [Fact]
     public async Task GetActiveByHash_returns_null_for_revoked_session()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new SessionsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new SessionsRepository(Db.NewServiceFactory(), TimeProvider.System);
         var hash = FreshHash();
 
         var inserted = await repo.InsertAsync(
@@ -105,9 +103,9 @@ public sealed class SessionsRepositoryTests
     [Fact]
     public async Task GetActiveByHash_returns_null_for_unknown_hash()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new SessionsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new SessionsRepository(Db.NewServiceFactory(), TimeProvider.System);
 
         Assert.Null(await repo.GetActiveByHashAsync(FreshHash()));
     }
@@ -115,9 +113,9 @@ public sealed class SessionsRepositoryTests
     [Fact]
     public async Task GetActiveByHash_returns_null_for_wrong_size_hash()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new SessionsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new SessionsRepository(Db.NewServiceFactory(), TimeProvider.System);
 
         Assert.Null(await repo.GetActiveByHashAsync(new byte[16]));
     }
@@ -125,9 +123,9 @@ public sealed class SessionsRepositoryTests
     [Fact]
     public async Task BumpLastSeen_updates_timestamp_visibly()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new SessionsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new SessionsRepository(Db.NewServiceFactory(), TimeProvider.System);
         var hash = FreshHash();
 
         var inserted = await repo.InsertAsync(
@@ -148,17 +146,17 @@ public sealed class SessionsRepositoryTests
     /// leaves the original <c>revoked_at</c> in place.
     /// </summary>
     /// <remarks>
-    /// This test asserted nothing at all: it called Revoke twice and passed as long
-    /// as neither call threw. The property that actually matters lives in the
-    /// repository's `RevokedAt == null` predicate — drop it and the second call
-    /// re-stamps `revoked_at` to a later time, silently rewriting when the session
-    /// was revoked. Nothing threw, so the old test could not tell the difference.
+    /// Calling Revoke twice and passing as long as neither call throws asserts
+    /// nothing. The property that actually matters lives in the repository's
+    /// `RevokedAt == null` predicate — drop it and the second call re-stamps
+    /// `revoked_at` to a later time, silently rewriting when the session was
+    /// revoked, without anything throwing.
     /// </remarks>
     [Fact]
     public async Task Revoke_is_idempotent()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var repo = new SessionsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var repo = new SessionsRepository(Db.NewServiceFactory(), TimeProvider.System);
 
         var inserted = await repo.InsertAsync(
             ledger.UserId, FreshHash(), null, DateTime.UtcNow.AddDays(30), SessionAuthMethods.Passkey);
@@ -169,7 +167,7 @@ public sealed class SessionsRepositoryTests
 
         await repo.RevokeAsync(inserted.Id);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var firstRevokedAt = (await db.AuthSessions.AsNoTracking()
             .SingleAsync(s => s.Id == inserted.Id)).RevokedAt;
         Assert.NotNull(firstRevokedAt);
@@ -178,7 +176,7 @@ public sealed class SessionsRepositoryTests
         await Task.Delay(20);
         await repo.RevokeAsync(inserted.Id);   // second call: must be a no-op
 
-        await using var db2 = _fixture.NewDbContext();
+        await using var db2 = Db.NewDbContext();
         var after = await db2.AuthSessions.AsNoTracking()
             .SingleAsync(s => s.Id == inserted.Id);
         Assert.Equal(firstRevokedAt, after.RevokedAt);
@@ -191,9 +189,9 @@ public sealed class SessionsRepositoryTests
     [Fact]
     public async Task RevokeAllForUser_revokes_only_active_sessions()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new SessionsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new SessionsRepository(Db.NewServiceFactory(), TimeProvider.System);
 
         for (var i = 0; i < 3; i++)
             await repo.InsertAsync(ledger.UserId, FreshHash(), null,

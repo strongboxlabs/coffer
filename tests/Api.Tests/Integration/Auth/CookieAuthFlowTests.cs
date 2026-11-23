@@ -13,19 +13,17 @@ namespace Coffer.Api.Tests.Integration.Auth;
 /// before the WebAuthn ceremonies (PR 3.4) wire up production registrations.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class CookieAuthFlowTests
+public sealed class CookieAuthFlowTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public CookieAuthFlowTests(PostgresFixture fixture)
+    public CookieAuthFlowTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     [Fact]
     public async Task DevLogin_issues_a_cookie_session_for_the_system_user()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var response = await client.PostAsync("/api/auth/dev-login", content: null);
@@ -43,7 +41,7 @@ public sealed class CookieAuthFlowTests
     [Fact]
     public async Task Logout_clears_the_cookie_and_invalidates_the_session()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         // CreateClient defaults to HandleCookies=true, so Set-Cookie from
         // /dev-login automatically rides on the subsequent /logout request
         // — same behaviour as a real browser.
@@ -70,7 +68,7 @@ public sealed class CookieAuthFlowTests
     [Fact]
     public async Task Logout_without_a_session_cookie_still_returns_200()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var response = await client.PostAsync("/api/auth/logout", content: null);

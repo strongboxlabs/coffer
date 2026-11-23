@@ -15,15 +15,16 @@ namespace Coffer.Api.Tests.Integration.Scheduling;
 /// </summary>
 /// <remarks>
 /// The rows are built the way a pre-252 install left them — <c>last_success_at</c> NULL —
-/// and the statements run inside a transaction that is rolled back, so the shared test
-/// database keeps no trace and no other test's rows are touched.
+/// and the statements run inside a transaction that is rolled back, so they leave nothing
+/// behind for the rest of the test to read.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ScheduleLastSuccessBackfillTests
+public sealed class ScheduleLastSuccessBackfillTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ScheduleLastSuccessBackfillTests(PostgresFixture fixture) => _fixture = fixture;
+    public ScheduleLastSuccessBackfillTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static IReadOnlyList<string> BackfillStatements()
     {
@@ -56,10 +57,10 @@ public sealed class ScheduleLastSuccessBackfillTests
         var statements = BackfillStatements();
         Assert.Equal(2, statements.Count);   // scheduled_jobs and global_scheduled_jobs
 
-        var a = await SyntheticLedger.CreateAsync(_fixture);
-        var b = await SyntheticLedger.CreateAsync(_fixture);
-        var c = await SyntheticLedger.CreateAsync(_fixture);
-        await using (var seed = _fixture.NewDbContext())
+        var a = await SyntheticLedger.CreateAsync(Db);
+        var b = await SyntheticLedger.CreateAsync(Db);
+        var c = await SyntheticLedger.CreateAsync(Db);
+        await using (var seed = Db.NewDbContext())
         {
             seed.ScheduledJobs.AddRange(
                 // A clean last run.
@@ -81,7 +82,7 @@ public sealed class ScheduleLastSuccessBackfillTests
             await seed.SaveChangesAsync();
         }
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await using var tx = await db.Database.BeginTransactionAsync();
         foreach (var statement in statements)
             await db.Database.ExecuteSqlRawAsync(statement);
@@ -106,7 +107,8 @@ public sealed class ScheduleLastSuccessBackfillTests
     public async Task The_backfill_is_a_function_of_the_rows_alone()
     {
         // No now(), no randomness: run twice over the same rows, the same answer. A
-        // backfill that stamped the clock failed the restore drill once (2026-10-15).
+        // backfill that reads the clock is not replayable, so a restore drill that
+        // re-runs it produces different rows from the original install.
         Assert.All(BackfillStatements(), s =>
         {
             Assert.DoesNotContain("now()", s, StringComparison.OrdinalIgnoreCase);

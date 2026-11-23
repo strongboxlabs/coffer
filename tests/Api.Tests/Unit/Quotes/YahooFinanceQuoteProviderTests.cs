@@ -48,25 +48,26 @@ public sealed class YahooFinanceQuoteProviderTests
         new(
             Guid.NewGuid(),
             Array.Empty<byte>(),
-            securities.Select(s => new QuoteSecurityRef(s.Id, s.Ticker, "USD")).ToList());
+            securities.Select(s => new QuoteSecurityRef(s.Id, s.Ticker)).ToList());
 
     private static HttpResponseMessage Ok(string json) =>
         new(HttpStatusCode.OK) { Content = new StringContent(json, Encoding.UTF8, "application/json") };
 
     /// <summary>Build a chart response with parallel timestamp[]/close[]
     /// arrays. A null entry in <paramref name="closes"/> emits JSON null.</summary>
-    private static string ChartJson(long[] timestamps, decimal?[] closes)
+    private static string ChartJson(long[] timestamps, decimal?[] closes, string? currency = "USD")
     {
         static string Num(decimal? d) =>
             d is null ? "null" : d.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
         var ts = string.Join(",", timestamps);
         var cl = string.Join(",", closes.Select(Num));
+        var currencyProperty = currency is null ? string.Empty : $"\"currency\": \"{currency}\", ";
         return $$"""
             {
               "chart": {
                 "result": [
                   {
-                    "meta": { "currency": "USD", "symbol": "ETFA" },
+                    "meta": { {{currencyProperty}}"symbol": "ETFA" },
                     "timestamp": [{{ts}}],
                     "indicators": { "quote": [ { "close": [{{cl}}] } ] }
                   }
@@ -201,5 +202,115 @@ public sealed class YahooFinanceQuoteProviderTests
         Assert.Equal(2, result.Quotes.Count);
         Assert.Contains(result.Quotes, q => q.SecurityId == a && q.Price == 11m);
         Assert.Contains(result.Quotes, q => q.SecurityId == b && q.Price == 22m);
+    }
+
+    // ---- currency (ADR-0114 D5) ---------------------------------------------------
+
+    [Fact]
+    public async Task PullAsync_stamps_the_currency_the_response_names()
+    {
+        // The defect: every quote was stored as USD whatever the symbol traded in.
+        var secId = Guid.NewGuid();
+        var provider = ProviderFor(_ =>
+            Ok(ChartJson(new[] { 1779537600L }, new decimal?[] { 41.25m }, currency: "EUR")));
+
+        var result = await provider.PullAsync(ContextFor((secId, "FUNDE")), CancellationToken.None);
+
+        var entry = Assert.Single(result.Quotes);
+        Assert.Equal("EUR", entry.CurrencyCode);
+        Assert.Equal(41.25m, entry.Price);
+        Assert.Empty(result.Errors);
+    }
+
+    [Theory]
+    [InlineData("GBp", "GBP", "1234.5", "12.345")]
+    [InlineData("ZAc", "ZAR", "8150", "81.5")]
+    [InlineData("ILA", "ILS", "2702.37", "27.0237")]
+    public async Task PullAsync_stores_a_minor_unit_quote_in_its_major_unit(
+        string quoted, string major, string closeText, string expectedText)
+    {
+        var close = decimal.Parse(closeText, System.Globalization.CultureInfo.InvariantCulture);
+        var expected = decimal.Parse(expectedText, System.Globalization.CultureInfo.InvariantCulture);
+        var secId = Guid.NewGuid();
+        var provider = ProviderFor(_ =>
+            Ok(ChartJson(new[] { 1779537600L }, new decimal?[] { close }, currency: quoted)));
+
+        var result = await provider.PullAsync(ContextFor((secId, "MINOR")), CancellationToken.None);
+
+        var entry = Assert.Single(result.Quotes);
+        Assert.Equal(major, entry.CurrencyCode);
+        Assert.Equal(expected, entry.Price);
+    }
+
+    [Fact]
+    public async Task PullAsync_rounds_a_minor_unit_quote_once_after_dividing()
+    {
+        // A pence quote finer than the column divides to pounds still finer, and is rounded
+        // once to the column's scale. Rounding the pence to 4dp first and dividing would
+        // leave a figure past that scale for the column to round again.
+        var secId = Guid.NewGuid();
+        var provider = ProviderFor(_ =>
+            Ok(ChartJson(new[] { 1779537600L }, new decimal?[] { 1234.56789m }, currency: "GBp")));
+
+        var result = await provider.PullAsync(ContextFor((secId, "MINOR")), CancellationToken.None);
+
+        Assert.Equal(12.3457m, Assert.Single(result.Quotes).Price);
+    }
+
+    [Theory]
+    [InlineData("XYz")]   // a lower-case-suffixed minor unit the table does not list
+    [InlineData("gbp")]   // the right letters in the wrong case
+    [InlineData("US")]    // not three letters
+    [InlineData("USDT")]
+    [InlineData("U$D")]
+    public async Task PullAsync_fails_an_unrecognised_currency_closed(string currency)
+    {
+        var secId = Guid.NewGuid();
+        var provider = ProviderFor(_ =>
+            Ok(ChartJson(new[] { 1779537600L }, new decimal?[] { 100m }, currency: currency)));
+
+        var result = await provider.PullAsync(ContextFor((secId, "ODD")), CancellationToken.None);
+
+        Assert.Empty(result.Quotes);
+        var err = Assert.Single(result.Errors);
+        Assert.Equal(secId, err.SecurityId);
+        Assert.Equal("ODD", err.Ticker);
+        Assert.Equal("currency-unknown", err.Code);
+    }
+
+    [Fact]
+    public async Task PullAsync_fails_a_missing_currency_closed()
+    {
+        var secId = Guid.NewGuid();
+        var provider = ProviderFor(_ =>
+            Ok(ChartJson(new[] { 1779537600L }, new decimal?[] { 100m }, currency: null)));
+
+        var result = await provider.PullAsync(ContextFor((secId, "NOCCY")), CancellationToken.None);
+
+        Assert.Empty(result.Quotes);
+        var err = Assert.Single(result.Errors);
+        Assert.Equal(secId, err.SecurityId);
+        Assert.Equal("currency-missing", err.Code);
+    }
+
+    [Fact]
+    public async Task PullAsync_fails_one_symbol_closed_and_still_prices_the_next()
+    {
+        var a = Guid.NewGuid();
+        var b = Guid.NewGuid();
+        var provider = ProviderFor(req =>
+        {
+            var sym = req.RequestUri!.AbsolutePath.Split('/')[^1];
+            return Ok(ChartJson(new[] { 1779537600L }, new decimal?[] { 10m },
+                currency: sym == "AAA" ? null : "CAD"));
+        });
+
+        var result = await provider.PullAsync(
+            ContextFor((a, "AAA"), (b, "BBB")), CancellationToken.None);
+
+        var entry = Assert.Single(result.Quotes);
+        Assert.Equal(b, entry.SecurityId);
+        Assert.Equal("CAD", entry.CurrencyCode);
+        Assert.Equal(a, Assert.Single(result.Errors).SecurityId);
     }
 }

@@ -2,10 +2,12 @@ import { describe, expect, it } from 'vitest';
 
 import { postingIssues, validatePostings } from './validation';
 import { emptyDraft, prefillToDraft, seedToDraft, type PostingDraft } from './postingDraft';
+import { secondAmountSide, type SecondAmountContext } from './secondAmount';
+import type { AccountSummary } from '@/lib/types';
 
 /**
- * The point of extracting the pure tier: these rules used to need a 1600-line
- * render to exercise at all. Structured to match
+ * The point of the pure tier: these rules can be exercised without rendering
+ * the editor. Structured to match
  * `investment-edit/validation.test.ts` so a reviewer reads both the same way —
  * a complete-object factory spread-overridden per case, a happy path asserted
  * as empty, and messages matched by regex rather than exact string so a copy
@@ -16,6 +18,8 @@ const draft = (over: Partial<PostingDraft> = {}): PostingDraft => ({
     key: 'k1',
     legId: null,
     tags: [],
+    tagBaseline: 0,
+    stored: null,
     counterpartyId: 'cat-1',
     amount: '-12.50',
     legMemo: '',
@@ -111,13 +115,13 @@ describe('validatePostings', () => {
                 counterpartyAccountId: 'cat-1',
                 amount: -40.25,
                 legMemo: null,
-            });
+            }, 'USD');
             expect(seeded.amount).toBe('-40.25');
             expect(validatePostings([seeded])).toEqual([]);
         });
 
         it('passes a draft built from a duplicate prefill', () => {
-            const filled = prefillToDraft({ counterpartyAccountId: 'cat-1', amount: 12 });
+            const filled = prefillToDraft({ counterpartyAccountId: 'cat-1', amount: 12 }, 'USD');
             // A prefill has no legId — the server INSERTs it.
             expect(filled.legId).toBeNull();
             expect(validatePostings([filled])).toEqual([]);
@@ -202,5 +206,123 @@ describe('postingIssues — the structured form the splits grid marks rows from'
             expect(issue.hint.length).toBeLessThan(40);
             expect(issue.hint).not.toMatch(/Posting \d/);
         }
+    });
+});
+
+// ADR-0114 D13: a posting between real accounts in different currencies carries the other
+// account's own figure, required and nonzero. One predicate decides which postings do.
+describe('the second amount', () => {
+    const acct = (id: string, over: Partial<AccountSummary>): AccountSummary => ({
+        id, ledgerId: 'l', parentId: null, name: id, accountType: 'bank', categoryKind: null,
+        currencyCode: 'USD', isActive: true, isSystem: false, feedConnectionId: null,
+        needsReviewCount: 0, holdingsAccountId: null, isTradeCommission: false, ...over,
+    });
+    const accounts = [
+        acct('usd-bank', { name: 'Test USD Bank' }),
+        acct('eur-bank', { name: 'Test EUR Bank', currencyCode: 'EUR' }),
+        acct('usd-savings', { name: 'Test USD Savings' }),
+        acct('groceries', { name: 'Groceries', accountType: 'category', categoryKind: 'expense' }),
+        acct('eur-category', { name: 'Fees', accountType: 'category', categoryKind: 'expense', currencyCode: 'EUR' }),
+    ];
+    const ctx = (sourceAccountId: string, currency: string): SecondAmountContext => ({
+        sourceAccountId, accounts, currency,
+        accountName: (id) => accounts.find((a) => a.id === id)!.name,
+    });
+    const onUsd = (p: PostingDraft) => secondAmountSide(p, ctx('usd-bank', 'USD'));
+
+    it('asks for the amount that arrived, blank or zero, in the board\'s sentence', () => {
+        const blank = draft({ counterpartyId: 'eur-bank', amount: '-100.00', otherAmount: '' });
+        expect(validatePostings([blank], onUsd)).toEqual(['Enter the amount in EUR that arrived in Test EUR Bank.']);
+        const zero = draft({ counterpartyId: 'eur-bank', amount: '-100.00', otherAmount: '0', otherFixed: true });
+        expect(validatePostings([zero], onUsd)).toEqual(['Enter the amount in EUR that arrived in Test EUR Bank.']);
+    });
+
+    it('turns the sentence round for money the other account sent', () => {
+        const p = draft({ counterpartyId: 'eur-bank', amount: '90.00' });
+        expect(validatePostings([p], onUsd)).toEqual(['Enter the amount in EUR that left Test EUR Bank.']);
+    });
+
+    it('accepts a filled second amount', () => {
+        const p = draft({ counterpartyId: 'eur-bank', amount: '-100.00', otherAmount: '90.00' });
+        expect(validatePostings([p], onUsd)).toEqual([]);
+    });
+
+    it('numbers a split line\'s sentence by its posting, as the other split messages are (ADR-0114 D14)', () => {
+        const postings = [
+            draft({ key: 'a', counterpartyId: 'groceries', amount: '-40.00' }),
+            draft({ key: 'b', counterpartyId: 'eur-bank', amount: '-100.00' }),
+            draft({ key: 'c', counterpartyId: 'eur-bank', amount: '25.00' }),
+        ];
+        const issues = postingIssues(postings, 'category', onUsd);
+        expect(issues).toEqual([
+            expect.objectContaining({
+                key: 'b', n: 2, kind: 'second',
+                message: 'Posting 2: enter the amount in EUR that arrived in Test EUR Bank.',
+                hint: 'Enter the amount in EUR that arrived in Test EUR Bank',
+            }),
+            expect.objectContaining({
+                key: 'c', n: 3, kind: 'second',
+                message: 'Posting 3: enter the amount in EUR that left Test EUR Bank.',
+                hint: 'Enter the amount in EUR that left Test EUR Bank',
+            }),
+        ]);
+        // The Save button's title lists the same sentences.
+        expect(validatePostings(postings, onUsd)).toEqual([
+            'Posting 2: enter the amount in EUR that arrived in Test EUR Bank.',
+            'Posting 3: enter the amount in EUR that left Test EUR Bank.',
+        ]);
+    });
+
+    it('lets a pair left exactly as it was seeded keep a zero', () => {
+        // A mirrored zero pair a move landed across currencies; the server checks only
+        // what a write changes.
+        const p = seedToDraft(
+            { legId: 'l1', counterpartyAccountId: 'eur-bank', amount: 0, legMemo: null, counterpartyAmount: 0 },
+            'USD', 'EUR');
+        expect(validatePostings([p], onUsd)).toEqual([]);
+        expect(validatePostings([{ ...p, amount: '-5.00' }], onUsd)).toHaveLength(1);
+    });
+
+    it('judges a copied zero pair, which is a new write, and exempts a stored template edited in place', () => {
+        // Duplicate, or Post on a reminder: the copy has no stored leg, so the server
+        // judges the pair, and the zero is refused with the same sentence (board ED-4).
+        const pair = { legId: 'l1', counterpartyAccountId: 'eur-bank', amount: 0, legMemo: null, counterpartyAmount: 0 };
+        const copied = prefillToDraft(pair, 'USD', false, 'EUR');
+        expect(validatePostings([copied], onUsd)).toContain('Enter the amount in EUR that arrived in Test EUR Bank.');
+        const template = prefillToDraft(pair, 'USD', true, 'EUR');
+        expect(validatePostings([template], onUsd)).toEqual([]);
+    });
+
+    it('refuses a zero Amount on a posting between currencies, outside a stored pair left alone', () => {
+        // ADR-0114 D13: neither amount of the pair can be zero. The same rule's existing
+        // sentence; a zero stays legal on any other posting.
+        const typed = draft({ counterpartyId: 'eur-bank', amount: '0', otherAmount: '5', otherFixed: true });
+        expect(postingIssues([typed], 'category', onUsd)).toEqual([expect.objectContaining({
+            kind: 'amount', message: 'Posting 1: amount is required.', hint: 'Enter an amount for this split',
+        })]);
+        expect(validatePostings([draft({ counterpartyId: 'groceries', amount: '0' })], onUsd)).toEqual([]);
+        const stored = seedToDraft(
+            { legId: 'l1', counterpartyAccountId: 'eur-bank', amount: 0, legMemo: null, counterpartyAmount: 5 },
+            'USD', 'EUR');
+        expect(validatePostings([stored], onUsd)).toEqual([]);
+        expect(validatePostings([{ ...stored, otherAmount: '6.00' }], onUsd)).toEqual(['Posting 1: amount is required.']);
+    });
+
+    it('asks for nothing toward a category or an account in the same currency', () => {
+        expect(validatePostings([draft({ counterpartyId: 'groceries' })], onUsd)).toEqual([]);
+        expect(validatePostings([draft({ counterpartyId: 'usd-savings' })], onUsd)).toEqual([]);
+    });
+
+    it('asks for nothing from a foreign-currency source to a category', () => {
+        const onEur = (p: PostingDraft) => secondAmountSide(p, ctx('eur-bank', 'EUR'));
+        expect(onEur(draft({ counterpartyId: 'groceries' }))).toBeNull();
+        expect(validatePostings([draft({ counterpartyId: 'groceries' })], onEur)).toEqual([]);
+    });
+
+    it('asks for nothing on a category\'s own register, where every leg mirrors the paying account', () => {
+        // The source is the category; the editor's currency is the paying account's.
+        const onCategory = (p: PostingDraft) => secondAmountSide(p, ctx('eur-category', 'USD'));
+        expect(onCategory(draft({ counterpartyId: 'eur-bank' }))).toBeNull();
+        expect(validatePostings([draft({ counterpartyId: 'eur-bank' })], onCategory)).toEqual([]);
     });
 });

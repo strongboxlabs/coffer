@@ -6,6 +6,8 @@ import type {
     NotificationProvider,
     NotificationSubscribersResponse,
     LedgerNotificationSettings,
+    OutstandingProblem,
+    SystemAttention,
     SystemEvent,
 } from '../types/notification';
 
@@ -31,6 +33,11 @@ export function createNotificationSubscriber(body: {
     minSeverity: string;
     /** Required for a heartbeat provider, rejected for a message one. */
     monitors?: string;
+    /**
+     * A topic filter for a message target. Omitted means every topic EXCEPT the opt-in ones, which a
+     * target receives only by naming them (ADR-0110: `upgrade`).
+     */
+    topics?: string[];
 }): Promise<unknown> {
     return request<unknown>('/api/admin/notifications/subscribers', {
         method: 'POST',
@@ -64,6 +71,17 @@ export function fetchSystemEvents(): Promise<SystemEvent[]> {
 export function fetchLedgerEvents(ledgerId: string, limit = 20): Promise<SystemEvent[]> {
     return request<SystemEvent[]>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/notifications/events?limit=${limit}`,
+    );
+}
+
+/**
+ * GET /api/ledgers/{id}/notifications/outstanding — this ledger's outstanding problems,
+ * one row per subject, critical first. Fetch only when the attention count is above 0:
+ * a ledger with nothing outstanding has nothing to list.
+ */
+export function fetchOutstandingProblems(ledgerId: string): Promise<OutstandingProblem[]> {
+    return request<OutstandingProblem[]>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/notifications/outstanding`,
     );
 }
 
@@ -127,4 +145,15 @@ export function deleteLedgerNotificationSubscriber(
         + `${encodeURIComponent(subscriberId)}`,
         { method: 'DELETE' },
     );
+}
+
+/**
+ * GET /api/admin/notifications/attention — the deployment-scope subjects still outstanding, behind
+ * the System-settings gear and the System tabs (ADR-0102, amended for ADR-0110).
+ *
+ * Admin-only. The server runs the lazy release check first, so with the automatic check on this one
+ * read, made from any page, is what lets an available release be noticed at all.
+ */
+export function fetchSystemAttention(): Promise<SystemAttention> {
+    return request<SystemAttention>('/api/admin/notifications/attention');
 }

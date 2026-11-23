@@ -8,6 +8,7 @@ using Microsoft.EntityFrameworkCore;
 using Coffer.Api.Contracts;
 using Coffer.Api.Db.Entities;
 using Coffer.Api.Tests.Integration.Infra;
+using Coffer.Domain.Money;
 
 namespace Coffer.Api.Tests.Integration.Transactions;
 
@@ -30,13 +31,11 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// </list>
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class InvestmentTransactionsEndpointsTests
+public sealed class InvestmentTransactionsEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public InvestmentTransactionsEndpointsTests(PostgresFixture fixture)
+    public InvestmentTransactionsEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(
@@ -62,7 +61,7 @@ public sealed class InvestmentTransactionsEndpointsTests
 
     private async Task<InvestmentSeed> SeedAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var securityId = await ledger.AddSecurityAsync("Index ETF A", ticker: "ETFA");
         var incomeCategory = await ledger.AddCategoryAsync("Dividends", kind: "income");
@@ -84,7 +83,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Post_buy_creates_header_legs_and_lot()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var postedAt = new DateTime(2026, 5, 21, 12, 0, 0, DateTimeKind.Utc);
@@ -104,7 +103,7 @@ public sealed class InvestmentTransactionsEndpointsTests
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         var headerId = await ReadHeaderIdAsync(response);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == headerId);
         Assert.Equal("buy", header.Action);
@@ -130,16 +129,16 @@ public sealed class InvestmentTransactionsEndpointsTests
     }
 
     [Fact]
-    public async Task Post_buy_honors_authoritative_amount_and_derives_2dp_money_and_price()
+    public async Task Post_buy_honors_authoritative_amount_and_derives_the_price_from_it()
     {
-        // ADR-0073: the request Amount is the real settled cash (2dp) and is
-        // authoritative — the cash + holdings legs carry it EXACTLY, and
-        // unit_price is DERIVED from it (amount ÷ |shares|), not the reverse.
-        // A rounded wire price times a three-decimal share count gives a
-        // four-decimal product that misses the settled total; the real total must
-        // win, and no sub-cent amount may land on a leg.
+        // ADR-0073: the request Amount is the real settled cash, at the brokerage's
+        // places (two here, ADR-0114 D15), and is authoritative — the cash + holdings
+        // legs carry it EXACTLY, and unit_price is DERIVED from it (amount ÷
+        // |shares|), not the reverse. A rounded wire price times a three-decimal
+        // share count gives a four-decimal product that misses the settled total; the
+        // real total must win, and no amount finer than the currency may land on a leg.
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -157,18 +156,18 @@ public sealed class InvestmentTransactionsEndpointsTests
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         var headerId = await ReadHeaderIdAsync(response);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId).ToListAsync();
         var cashLeg = legs.Single(l => l.AccountId == seed.BrokerageId);
         var holdingsLeg = legs.Single(l => l.AccountId == seed.HoldingsId);
 
-        // Authoritative amount, exact to the cent — not the price × shares product.
+        // Authoritative amount, exactly as typed — not the price × shares product.
         Assert.Equal(-94.05m, cashLeg.Amount);
         Assert.Equal(94.05m, holdingsLeg.Amount);
-        // Money is exactly 2 decimals (no sub-cent).
-        Assert.Equal(cashLeg.Amount, Math.Round(cashLeg.Amount, 2));
-        Assert.Equal(holdingsLeg.Amount, Math.Round(holdingsLeg.Amount, 2));
+        // Money fits the brokerage's currency exactly.
+        Assert.True(CurrencyMinorUnits.Fits(cashLeg.Amount, "USD"));
+        Assert.True(CurrencyMinorUnits.Fits(holdingsLeg.Amount, "USD"));
         // Price is derived from the amount at 6dp display precision.
         Assert.Equal(
             Math.Round(94.05m / 2.345m, 6, MidpointRounding.AwayFromZero),
@@ -177,14 +176,15 @@ public sealed class InvestmentTransactionsEndpointsTests
     }
 
     [Fact]
-    public async Task Post_buy_without_amount_rounds_price_times_shares_to_cents()
+    public async Task Post_buy_without_amount_rounds_price_times_shares_at_the_brokerages_places()
     {
-        // Fallback path (no Amount supplied): principal = round(price × |shares|, 2)
-        // so a product with a sub-cent tail (a share count ending in a half, at
-        // a price whose last cent digit is odd) still lands on the leg at
-        // exactly 2 decimals (ADR-0073) — never sub-cent.
+        // Fallback path (no Amount supplied): principal = price × |shares|, a
+        // computed figure rounded once at the brokerage's places, half away from
+        // zero (ADR-0114 D15), so a product finer than the currency (a share count
+        // ending in a half, at a price whose last minor-unit digit is odd) still
+        // lands on the leg fitting its two places.
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -201,13 +201,13 @@ public sealed class InvestmentTransactionsEndpointsTests
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         var headerId = await ReadHeaderIdAsync(response);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var cashLeg = await db.TxnLegs.AsNoTracking()
             .SingleAsync(l => l.HeaderId == headerId && l.AccountId == seed.BrokerageId);
-        // The product ends in exactly half a cent → rounded away from zero to the
-        // next cent, never stored sub-cent.
+        // The product ends in exactly half a minor unit → rounded away from zero to
+        // the next one, never stored finer than the currency.
         Assert.Equal(-1017.83m, cashLeg.Amount);
-        Assert.Equal(cashLeg.Amount, Math.Round(cashLeg.Amount, 2));
+        Assert.True(CurrencyMinorUnits.Fits(cashLeg.Amount, "USD"));
     }
 
     [Fact]
@@ -219,7 +219,7 @@ public sealed class InvestmentTransactionsEndpointsTests
         // security_id mapping so the NEXT sync of the same ticker
         // auto-resolves without prompting.
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -238,7 +238,7 @@ public sealed class InvestmentTransactionsEndpointsTests
             });
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var mapping = await db.ProviderSecurityMappings.AsNoTracking()
             .SingleOrDefaultAsync(m =>
                 m.LedgerId == seed.Ledger.LedgerId
@@ -256,7 +256,7 @@ public sealed class InvestmentTransactionsEndpointsTests
         // Re-saving with a DIFFERENT security overwrites (user
         // re-linked the ticker).
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var requestBody = new CreateInvestmentTransactionRequest
@@ -280,7 +280,7 @@ public sealed class InvestmentTransactionsEndpointsTests
             $"/api/ledgers/{seed.Ledger.LedgerId}/investment-transactions", requestBody);
         Assert.Equal(HttpStatusCode.Created, second.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var mappings = await db.ProviderSecurityMappings.AsNoTracking()
             .Where(m => m.LedgerId == seed.Ledger.LedgerId
                         && m.ProviderKey == "simplefin"
@@ -302,7 +302,7 @@ public sealed class InvestmentTransactionsEndpointsTests
         // We trigger the gate by sending a transfer (no SecurityId
         // required by the action) but still passing a provider hint.
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -320,7 +320,7 @@ public sealed class InvestmentTransactionsEndpointsTests
             });
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var mappings = await db.ProviderSecurityMappings.AsNoTracking()
             .Where(m => m.LedgerId == seed.Ledger.LedgerId)
             .ToListAsync();
@@ -341,7 +341,7 @@ public sealed class InvestmentTransactionsEndpointsTests
         // proper investment-shape in place (header_id stays, FITID
         // preserved, ingest_action_hint stays as audit metadata).
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         // Seed a bank-shape sync row: header with origin='simplefin',
@@ -352,22 +352,21 @@ public sealed class InvestmentTransactionsEndpointsTests
         var uncategorized = await seed.Ledger.AddCategoryAsync(
             "Uncategorized", kind: "expense");
         var bankShapeHeaderId = Guid.NewGuid();
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
-            db.TxnHeaders.Add(new TxnHeaderRow
-            {
-                Id = bankShapeHeaderId,
-                LedgerId = seed.Ledger.LedgerId,
-                Origin = "online_import",
-                ProviderKey = "simplefin",
-                Payee = "YOU BOUGHT ACME INDEX FUND S&P 500 ETF (ETFA) Cash",
-                PostedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc),                IsPending = false,
-                NeedsReview = true,
-                // mig 105: SimpleFIN id lands on external_id;
-                // OFX columns aren't written by SimpleFIN.
-                ExternalId = "fitid-upgrade-1",
-                IngestActionHint = "buy",
-            });
+            // mig 105: SimpleFIN id lands on external_id; OFX columns aren't
+            // written by SimpleFIN. Owned by the account it was imported into.
+            var feedRow = TxnHeaderRow.NewIngested(
+                bankShapeHeaderId, seed.Ledger.LedgerId, seed.BrokerageId,
+                origin: "online_import", externalId: "fitid-upgrade-1");
+            feedRow.ProviderKey = "simplefin";
+            feedRow.Payee = "YOU BOUGHT ACME INDEX FUND S&P 500 ETF (ETFA) Cash";
+            feedRow.PostedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc);
+            feedRow.TransactedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc);
+            feedRow.IsPending = false;
+            feedRow.NeedsReview = true;
+            feedRow.IngestActionHint = "buy";
+            db.TxnHeaders.Add(feedRow);
             db.TxnLegs.Add(new TxnLegRow
             {
                 Id = Guid.NewGuid(),
@@ -388,6 +387,8 @@ public sealed class InvestmentTransactionsEndpointsTests
             });
             await db.SaveChangesAsync();
         }
+        // Written past every writer: store the presentation as the upgrade's backfill does.
+        await seed.Ledger.RecomputeNotesAsync(bankShapeHeaderId);
 
         // PATCH it via /investment-transactions with the upgrade
         // payload — same shape the editor sends when the user
@@ -412,7 +413,7 @@ public sealed class InvestmentTransactionsEndpointsTests
         // Verify: header now carries action='buy'; FITID +
         // ingest_action_hint preserved; legs reshape to investment-
         // shape with posting_role='security'.
-        await using var verify = _fixture.NewDbContext();
+        await using var verify = Db.NewDbContext();
         var header = await verify.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == bankShapeHeaderId);
         Assert.Equal("buy", header.Action);
@@ -454,25 +455,24 @@ public sealed class InvestmentTransactionsEndpointsTests
         // via PATCH. Without this, those rows would be stranded in
         // the brokerage register with no upgrade path.
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var uncategorized = await seed.Ledger.AddCategoryAsync(
             "Uncategorized G3", kind: "expense");
         var headerId = Guid.NewGuid();
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
-            db.TxnHeaders.Add(new TxnHeaderRow
-            {
-                Id = headerId,
-                LedgerId = seed.Ledger.LedgerId,
-                Origin = "online_import",
-                ProviderKey = "simplefin",      // feed-imported
-                Payee = "ACME BALANCED FUND CL A",
-                PostedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc),                NeedsReview = true,
-                ExternalId = "fitid-gap-fix",
-                // NOTE: NO ingest_action_hint — classifier didn't match.
-            });
+            var feedRow = TxnHeaderRow.NewIngested(
+                headerId, seed.Ledger.LedgerId, seed.BrokerageId,
+                origin: "online_import", externalId: "fitid-gap-fix");
+            feedRow.ProviderKey = "simplefin";      // feed-imported
+            feedRow.Payee = "ACME BALANCED FUND CL A";
+            feedRow.PostedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc);
+            feedRow.TransactedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc);
+            feedRow.NeedsReview = true;
+            // NOTE: NO ingest_action_hint — classifier didn't match.
+            db.TxnHeaders.Add(feedRow);
             db.TxnLegs.Add(new TxnLegRow
             {
                 Id = Guid.NewGuid(),
@@ -493,6 +493,8 @@ public sealed class InvestmentTransactionsEndpointsTests
             });
             await db.SaveChangesAsync();
         }
+        // Written past every writer: store the presentation as the upgrade's backfill does.
+        await seed.Ledger.RecomputeNotesAsync(headerId);
 
         var patchResp = await client.PatchAsJsonAsync(
             $"/api/ledgers/{seed.Ledger.LedgerId}/investment-transactions/{headerId}",
@@ -507,7 +509,7 @@ public sealed class InvestmentTransactionsEndpointsTests
             });
         Assert.Equal(HttpStatusCode.NoContent, patchResp.StatusCode);
 
-        await using var verify = _fixture.NewDbContext();
+        await using var verify = Db.NewDbContext();
         var header = await verify.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == headerId);
         Assert.Equal("buy", header.Action);
@@ -526,22 +528,20 @@ public sealed class InvestmentTransactionsEndpointsTests
         // ordinary bank-shape headers. Only headers with the
         // classifier hint get the upgrade pass.
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var uncategorized = await seed.Ledger.AddCategoryAsync(
             "Uncategorized 2", kind: "expense");
         var bankHeaderId = Guid.NewGuid();
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
-            db.TxnHeaders.Add(new TxnHeaderRow
-            {
-                Id = bankHeaderId,
-                LedgerId = seed.Ledger.LedgerId,
-                Origin = "manual",
-                Payee = "Coffee shop",
-                PostedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc), TransactedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc),                // NOTE: NO ingest_action_hint set.
-            });
+            var header = TxnHeaderRow.NewTransaction(bankHeaderId, seed.Ledger.LedgerId, seed.BrokerageId);
+            header.Payee = "Coffee shop";
+            header.PostedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc);
+            header.TransactedAt = new DateTime(2026, 5, 22, 12, 0, 0, DateTimeKind.Utc);
+            // NOTE: NO ingest_action_hint set.
+            db.TxnHeaders.Add(header);
             db.TxnLegs.Add(new TxnLegRow
             {
                 Id = Guid.NewGuid(),
@@ -562,6 +562,8 @@ public sealed class InvestmentTransactionsEndpointsTests
             });
             await db.SaveChangesAsync();
         }
+        // Written past every writer: store the presentation as the upgrade's backfill does.
+        await seed.Ledger.RecomputeNotesAsync(bankHeaderId);
 
         var patchResp = await client.PatchAsJsonAsync(
             $"/api/ledgers/{seed.Ledger.LedgerId}/investment-transactions/{bankHeaderId}",
@@ -580,7 +582,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Post_buy_with_fee_includes_commission_in_lot_unit_cost()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
         await seed.Ledger.SetIsTradeCommissionAsync(seed.BrokerageId, isOn: true);
 
@@ -601,7 +603,7 @@ public sealed class InvestmentTransactionsEndpointsTests
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         var headerId = await ReadHeaderIdAsync(response);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId).ToListAsync();
         // sec pair (cash + holdings) + fee pair (cash + category) = 4 legs.
@@ -620,7 +622,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Post_sell_creates_disposing_holdings_delta_no_new_lot()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         // Seed an open lot to sell from.
@@ -641,7 +643,7 @@ public sealed class InvestmentTransactionsEndpointsTests
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         var headerId = await ReadHeaderIdAsync(response);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var holdingsLeg = await db.TxnLegs.AsNoTracking()
             .SingleAsync(l => l.HeaderId == headerId && l.AccountId == seed.HoldingsId);
         Assert.Equal(-5m, holdingsLeg.Quantity);
@@ -655,7 +657,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Post_dividend_cash_creates_income_pair()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -673,7 +675,7 @@ public sealed class InvestmentTransactionsEndpointsTests
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         var headerId = await ReadHeaderIdAsync(response);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId).ToListAsync();
         Assert.Equal(2, legs.Count);
@@ -689,7 +691,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Post_dividend_reinvest_creates_income_and_sec_pairs()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -708,7 +710,7 @@ public sealed class InvestmentTransactionsEndpointsTests
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         var headerId = await ReadHeaderIdAsync(response);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId)
             .OrderBy(l => l.PostingIndex).ThenBy(l => l.Id)
@@ -727,7 +729,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Post_transfer_creates_xfr_pair_no_fee_allowed()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -744,7 +746,7 @@ public sealed class InvestmentTransactionsEndpointsTests
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         var headerId = await ReadHeaderIdAsync(response);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId).ToListAsync();
         Assert.Equal(2, legs.Count);
@@ -755,7 +757,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Post_misc_expense_uses_income_role_with_negative_cash()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -772,7 +774,7 @@ public sealed class InvestmentTransactionsEndpointsTests
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         var headerId = await ReadHeaderIdAsync(response);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId).ToListAsync();
         Assert.Equal(2, legs.Count);
@@ -786,7 +788,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Post_rejects_unknown_action()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -806,7 +808,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Post_rejects_non_investment_brokerage_account()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         // Use the bank account id (not investment) as the brokerage.
@@ -830,7 +832,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Post_buy_rejects_missing_shares()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -853,7 +855,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Post_rejects_fee_amount_without_fee_account()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -879,7 +881,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Get_lots_returns_open_lots_ordered_ascending_by_acquired_at()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var older = await SeedOpenLotAsync(seed,
@@ -905,7 +907,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Get_lots_rejects_non_investment_account()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         // Use the bank account (not investment).
@@ -921,7 +923,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Patch_reshapes_a_buy_into_a_buy_with_fee()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var createResponse = await client.PostAsJsonAsync(
@@ -953,7 +955,7 @@ public sealed class InvestmentTransactionsEndpointsTests
             });
         Assert.Equal(HttpStatusCode.NoContent, patchResponse.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var legs = await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId).ToListAsync();
         // sec pair + new fee pair = 4 legs.
@@ -965,7 +967,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Patch_rejects_bank_header_with_cross_topic_code()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         // Create a bank transaction (action=null on header).
@@ -1005,7 +1007,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Delete_hard_deletes_manual_investment_txn()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var createResponse = await client.PostAsJsonAsync(
@@ -1026,7 +1028,7 @@ public sealed class InvestmentTransactionsEndpointsTests
         var payload = await deleteResponse.Content.ReadFromJsonAsync<DeleteTransactionResponse>();
         Assert.Equal("hard-deleted", payload!.Kind);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var exists = await db.TxnHeaders.AsNoTracking()
             .AnyAsync(h => h.Id == headerId);
         Assert.False(exists);
@@ -1038,7 +1040,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Bank_post_rejects_investment_source_account()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var response = await client.PostAsJsonAsync(
@@ -1064,7 +1066,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Bank_patch_rejects_investment_header_with_cross_topic_code()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var createResponse = await client.PostAsJsonAsync(
@@ -1091,7 +1093,7 @@ public sealed class InvestmentTransactionsEndpointsTests
     public async Task Bank_delete_rejects_investment_header_with_cross_topic_code()
     {
         var seed = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, seed.Ledger);
 
         var createResponse = await client.PostAsJsonAsync(
@@ -1140,7 +1142,7 @@ public sealed class InvestmentTransactionsEndpointsTests
         DateTime? acquiredAt = null)
     {
         var asOf = acquiredAt ?? new DateTime(2023, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
 
         // Upsert holding for (holdings sibling, security).
         var holding = await db.Holdings
@@ -1163,14 +1165,13 @@ public sealed class InvestmentTransactionsEndpointsTests
 
         // Seed a header + leg so the lot's leg_id FK resolves.
         var headerId = Guid.NewGuid();
-        db.TxnHeaders.Add(new TxnHeaderRow
-        {
-            Id = headerId,
-            LedgerId = seed.Ledger.LedgerId,
-            Origin = "manual",
-            Action = "buy",
-            PostedAt = asOf, TransactedAt = asOf,
-        });
+        // A buy is owned by its brokerage, the one account on its every posting (mig 263);
+        // the holdings account carries the shares but is not a brokerage.
+        var header = TxnHeaderRow.NewTransaction(headerId, seed.Ledger.LedgerId, seed.BrokerageId);
+        header.Action = "buy";
+        header.PostedAt = asOf;
+        header.TransactedAt = asOf;
+        db.TxnHeaders.Add(header);
         var legId = Guid.NewGuid();
         db.TxnLegs.Add(new TxnLegRow
         {
@@ -1212,6 +1213,10 @@ public sealed class InvestmentTransactionsEndpointsTests
         });
 
         await db.SaveChangesAsync();
+        // Written past every writer: store the presentation as the upgrade's backfill does.
+        await seed.Ledger.RecomputeNotesAsync(headerId);
+        // The seed writes its owner by hand; hold it to what a writer would choose.
+        await OriginatingAccountCheck.AssertHoldsAsync(Db, seed.Ledger.LedgerId);
         return lotId;
     }
 }

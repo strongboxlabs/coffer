@@ -37,9 +37,8 @@ public static class JobTypes
 /// <para>
 /// It also makes the handler untestable in the one way that matters. A test cannot place
 /// "today" anywhere, so a due-ness assertion either drifts with the wall clock or is
-/// written against whatever today happens to be — and this repo has already shipped one
-/// vacuous test of exactly that shape (see <c>SchedulesRepositoryDstTests</c>, whose
-/// remarks record the endpoint version passing with the fix deleted).
+/// written against whatever today happens to be — a vacuous test that passes with the
+/// fix deleted.
 /// </para>
 /// <para>
 /// The runner already holds both values — the <c>nowUtc</c> that decided due-ness and the

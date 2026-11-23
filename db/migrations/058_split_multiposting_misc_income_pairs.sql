@@ -2,24 +2,22 @@
 -- 058 — split multi-posting MiscInc events into single-posting pairs
 -- =============================================================================
 --
--- MD's automated brokerage-statement import path produced "Change in
--- Market Value …" events as multi-posting MiscInc headers (each carries
--- 2 postings that net to zero on both the brokerage and the Adjustment
--- category — bookkeeping wash entries for unrealized-gain tracking).
--- The pattern:
+-- A MiscInc header can carry two postings that net to zero on both the
+-- brokerage and one category (a bookkeeping wash entry). The pattern:
 --
---   Posting 0:  brokerage  -X  ↔  Adjustment  +X    (expense flow)
---   Posting 1:  brokerage  +X  ↔  Adjustment  -X    (income flow)
+--   Posting 0:  brokerage  -X  ↔  category  +X    (expense flow)
+--   Posting 1:  brokerage  +X  ↔  category  -X    (income flow)
 --   Net: zero on both sides.
 --
--- A4's MiscInc editor exposes single-posting events only (matching MD's
--- own MiscInc UI workflow — multi-posting is a side-effect of automated
--- import, not user-creatable). Rather than build complexity into the
+-- A4's MiscInc editor exposes single-posting events only, on the reading
+-- that multi-posting MiscInc is an import side-effect rather than a
+-- user-creatable shape (migration 061 reverses this migration and 059:
+-- the shape is a standard MD `inc` txn). Rather than build complexity into the
 -- editor to round-trip these compound events, split them into 2
 -- separate MiscInc headers: one for each posting. Net cash effect on
 -- the brokerage stays zero (same as today).
 --
--- "I hate dropping data" — no data is dropped. Each original event
+-- No data is dropped. Each original event
 -- becomes two single-posting events on the same posted_at, with payee
 -- suffixed `(expense)` / `(income)` to disambiguate, and external_id
 -- suffixed `:e` / `:i` so re-import preserves identity.

@@ -1,243 +1,191 @@
+using System.Globalization;
+
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Npgsql;
 using Testcontainers.PostgreSql;
-using Xunit;
+using Xunit.Abstractions;
 
+using Coffer.Api.Auth;
+using Coffer.Api.Backup;
 using Coffer.Api.Configuration;
 using Coffer.Api.Crypto;
 using Coffer.Api.Db;
 using Coffer.Api.Migrations;
+using Coffer.Api.Notifications;
 
 namespace Coffer.Api.Tests.Integration.Infra;
 
 /// <summary>
-/// Spins up a Postgres 16 container shared across the API integration
-/// tests, mints the same two roles the production docker-init script
-/// creates (<c>coffer_service</c>, <c>coffer_app</c>), then applies every
-/// <c>db/migrations/*.sql</c> file once via the same DbUp runner that
-/// <c>Program.cs</c> uses in production. Repository tests get a
-/// migrated DB without paying the cost of booting an HTTP host;
-/// endpoint tests boot via <see cref="ApiFactory"/> and DbUp's
-/// <c>__schema_migrations</c> journal makes the second run a no-op.
+/// One Postgres 16 container per test process, the two roles production's
+/// <c>db/init/00-init-roles.sh</c> creates, and a migrated, settled template that every
+/// test's own database is cloned from.
 /// </summary>
 /// <remarks>
-/// Three role identities at play:
-/// <list type="bullet">
-///   <item><description><b>The container superuser</b> — what
-///   Testcontainers configures via <see cref="PostgreSqlBuilder.WithUsername"/>.
-///   Used only to bootstrap the two application roles; not exposed to
-///   tests.</description></item>
-///   <item><description><b>coffer_service</b> — BYPASSRLS, owns the
-///   tables that DbUp creates (a prereq for ENABLE ROW LEVEL SECURITY
-///   in migration 017). <see cref="ServiceConnectionString"/>
-///   surfaces this for <see cref="SyntheticLedger"/> and other
-///   cross-cutting test setup.</description></item>
-///   <item><description><b>coffer_app</b> — no BYPASSRLS. The
-///   <see cref="ApiFactory"/> wires this into <c>Api:ConnectionString</c>
-///   so the API under test exercises the same RLS path production
-///   does.</description></item>
+/// <para><b>Once per process</b>, in <see cref="InitializeAsync"/>:</para>
+/// <list type="number">
+///   <item><description>Provision the roles cluster-wide
+///   (<see cref="TestDatabaseCluster.ProvisionRolesAsync"/>): <c>coffer_service</c>
+///   (BYPASSRLS, CREATEDB), <c>coffer_app</c> (no BYPASSRLS, <c>jit = off</c>, as
+///   db/init sets it). Role settings are cluster-wide so every clone has them;
+///   <c>RoleSettingsMirrorInitScriptTests</c> holds them equal to the script.</description></item>
+///   <item><description>Leave nothing in the maintenance database (<c>postgres</c>) or
+///   in <c>template1</c> a test could share: the request role cannot connect to either,
+///   and the service role (which production's migration runner connects to
+///   <c>postgres</c> with) can create nothing there.</description></item>
+///   <item><description>Create <see cref="TestDatabaseCluster.TemplateName"/>, owned by
+///   the fixture's superuser so no role a test runs as can unlock it, and migrate it as
+///   <c>coffer_service</c> through the same DbUp runner production uses, so the service
+///   role owns every table.</description></item>
+///   <item><description>Settle the writes a host makes on its first boot, through the
+///   app's own code, so a host booted on a clone writes nothing at boot: the OAuth key
+///   pair (sealed under the fixture key every host runs with) and the backup-age
+///   monitor's first alert, which throttles its repeats for
+///   <see cref="BackupAgeMonitor.RepeatAfter"/> (see
+///   <see cref="EnsureFirstBootAlertStillThrottles"/>).</description></item>
+///   <item><description>ANALYZE, clear every pool, and lock it:
+///   <c>IS_TEMPLATE true ALLOW_CONNECTIONS false</c>.</description></item>
 /// </list>
+/// <para><b>Once per test</b>, <see cref="CreateDatabaseAsync"/> clones the template
+/// (<see cref="DatabaseTest"/> calls it). The fixture exposes no connection string and
+/// no context: the only way to a database is a test's own <see cref="TestDatabase"/>.
+/// </para>
+/// <para><b>What stays shared</b> between the tests of one process: the container, the
+/// roles and their settings, process environment variables, and anything a test changes
+/// cluster-wide (which it must put back).</para>
 /// </remarks>
 public sealed class PostgresFixture : IAsyncLifetime
 {
     private const string ServicePassword = "test-service-password";
     private const string AppPassword     = "test-app-password";
 
+    /// <summary>Slack under <see cref="BackupAgeMonitor.RepeatAfter"/> for the length of
+    /// one test and for the container's clock against the host's.</summary>
+    internal static readonly TimeSpan FirstBootAlertMargin = TimeSpan.FromHours(1);
+
+    private readonly IMessageSink _diagnostics;
+
+    /// <param name="diagnostics">xunit's message sink, which the end-of-run cleanup
+    /// failure is written to in full (<see cref="TestDatabaseCluster.DisposeAsync"/>).</param>
+    public PostgresFixture(IMessageSink diagnostics) => _diagnostics = diagnostics;
+
     private readonly PostgreSqlContainer _container = new PostgreSqlBuilder("postgres:16")
-        .WithDatabase("coffer_api_test")
+        .WithDatabase(TestDatabaseCluster.MaintenanceDatabase)
         .WithUsername("coffer")
         .WithPassword("coffer_api_test")
-        // Bump max_connections from the Postgres default 100 to 400 as
-        // headroom. The PRIMARY bound on connection use is the per-pool
-        // MaxPoolSize cap in BuildConnectionString (the default-100 pools
-        // multiplied across ApiFactory hosts + the fixture's global pools
-        // were what exhausted the server); this ceiling is just slack above
-        // that bounded footprint so a transient disposal overlap can't trip
-        // the "53300: remaining connection slots ... SUPERUSER" error.
+        // Headroom over the Postgres default of 100. The primary bound on connection
+        // use is the per-pool MaxPoolSize in BuildConnectionString; this is slack
+        // above that bounded footprint so a transient disposal overlap cannot trip
+        // "53300: remaining connection slots are reserved for ... SUPERUSER".
         .WithCommand("-c", "max_connections=400")
         .Build();
 
-    /// <summary>
-    /// Connection string for <c>coffer_service</c> (BYPASSRLS). Used by
-    /// <see cref="SyntheticLedger"/> for cross-cutting setup writes
-    /// and by the API's <c>ServiceDbContextFactory</c> in tests.
-    /// </summary>
-    public string ServiceConnectionString { get; private set; } = string.Empty;
+    private TestDatabaseCluster? _cluster;
+    private TestDatabaseCredentials? _credentials;
+
+    /// <summary>The clone, check and drop machinery, for the tests that test it. It
+    /// hands out no connection: its own sessions run as a role only it can log in as.</summary>
+    internal TestDatabaseCluster Cluster =>
+        _cluster ?? throw new InvalidOperationException("The fixture has not started.");
 
     /// <summary>
-    /// Connection string for <c>coffer_app</c> (no BYPASSRLS). Used by
-    /// the API's runtime <c>AppDbContext</c>. Issuing raw SQL on this
-    /// connection won't see anything until <c>SET app.user_id</c>
-    /// runs — that's the production RLS path.
+    /// The template's content, table by table, as it was locked: what every clone
+    /// starts from. See <see cref="TestDatabaseCluster.FingerprintAsync"/>.
     /// </summary>
-    public string AppConnectionString { get; private set; } = string.Empty;
+    internal IReadOnlyDictionary<string, string> TemplateFingerprint => Cluster.TemplateFingerprint;
 
-    /// <summary>The container superuser — for tests that must change what the
-    /// service role is allowed to do (and put it back), as an operator would.</summary>
-    public string SuperuserConnectionString { get; private set; } = string.Empty;
+    /// <summary>When the template's first backup alert (<c>backup.none</c>) was written,
+    /// by the server's clock.</summary>
+    internal DateTime FirstBootAlertAt { get; private set; }
 
     public async Task InitializeAsync()
     {
         await _container.StartAsync().ConfigureAwait(false);
 
-        // Bootstrap the two application roles before running
-        // migrations. Mirrors the production db/init/00-init-roles.sh
-        // step — the same passwords, the same GRANTs, the same
-        // CREATE/USAGE schema privileges.
-        var superuserConnectionString = _container.GetConnectionString();
-        SuperuserConnectionString = superuserConnectionString;
-        await ProvisionRolesAsync(superuserConnectionString).ConfigureAwait(false);
+        var superuser = _container.GetConnectionString();
+        _cluster = await TestDatabaseCluster.StartAsync(superuser, _diagnostics).ConfigureAwait(false);
+        _credentials = new TestDatabaseCredentials(
+            service: BuildConnectionString(superuser, TestDatabaseCluster.ServiceRole, ServicePassword),
+            app: BuildConnectionString(superuser, TestDatabaseCluster.AppRole, AppPassword),
+            superuser: BuildConnectionString(superuser, username: null, password: null));
 
-        ServiceConnectionString = BuildConnectionString(
-            superuserConnectionString, username: "coffer_service", password: ServicePassword);
-        AppConnectionString = BuildConnectionString(
-            superuserConnectionString, username: "coffer_app", password: AppPassword);
-
-        // Apply migrations as coffer_service so DbUp-created tables are
-        // owned by it, which is the precondition for ENABLE ROW LEVEL
-        // SECURITY in migration 017.
-        var migrationsDirectory = MigrationsDirectoryLocator.Locate(AppContext.BaseDirectory);
-        MigrationRunner.Run(ServiceConnectionString, migrationsDirectory, NullLogger.Instance);
+        await _cluster.ProvisionRolesAsync(ServicePassword, AppPassword).ConfigureAwait(false);
+        await BuildTemplateAsync(_cluster, _credentials).ConfigureAwait(false);
     }
 
     public async Task DisposeAsync()
     {
-        await _container.DisposeAsync().ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// A connection string for a database on this container that has **no Coffer
-    /// schema** — created on demand and left empty. Models the state the API
-    /// actually boots into on a fresh install: Postgres reachable, migrations not
-    /// yet applied, so none of the app's tables exist.
-    /// </summary>
-    /// <remarks>
-    /// Needed because <see cref="ServiceConnectionString"/> points at the migrated
-    /// shared database, which can never represent "virgin". Uses the same
-    /// service-role credentials so callers exercise the production connection
-    /// shape. Idempotent — repeated calls reuse the same empty database.
-    /// </remarks>
-    public string EmptyDatabaseConnectionString(string databaseName = "coffer_empty_probe")
-    {
-        using (var admin = new NpgsqlConnection(_container.GetConnectionString()))
+        // Both end-of-run checks report, whichever fails.
+        var failures = new List<Exception>();
+        try
         {
-            admin.Open();
-            using var exists = new NpgsqlCommand(
-                "SELECT 1 FROM pg_database WHERE datname = @n", admin);
-            exists.Parameters.AddWithValue("n", databaseName);
-            if (exists.ExecuteScalar() is null)
+            try { AssertEveryHostWasDisposed(); }
+            catch (Exception e) { failures.Add(e); }
+            try
             {
-                // CREATE DATABASE can't be parameterized and won't run inside a
-                // transaction; the name is a hard-coded default or test-supplied,
-                // never user input, but quote it anyway.
-                using var create = new NpgsqlCommand(
-                    $"CREATE DATABASE \"{databaseName.Replace("\"", "\"\"")}\"", admin);
-                create.ExecuteNonQuery();
+                if (_cluster is not null) await _cluster.DisposeAsync().ConfigureAwait(false);
             }
+            catch (Exception e) { failures.Add(e); }
         }
-
-        // Schema privileges are PER DATABASE, so the GRANTs ProvisionRolesAsync
-        // applied to the main database don't reach this one — without these, the
-        // service role gets "42501: permission denied for schema public" the
-        // moment a caller tries to migrate it. Same grants as production's
-        // db/init/00-init-roles.sh.
-        var adminToNewDb = new NpgsqlConnectionStringBuilder(_container.GetConnectionString())
+        finally
         {
-            Database = databaseName,
-        }.ConnectionString;
-        using (var grant = new NpgsqlConnection(adminToNewDb))
-        {
-            grant.Open();
-            using var cmd = new NpgsqlCommand(
-                """
-                GRANT CREATE, USAGE ON SCHEMA public TO coffer_service;
-                GRANT USAGE          ON SCHEMA public TO coffer_app;
-                -- Extensions need superuser, so create them here rather than
-                -- letting 001_extensions.sql try as coffer_service. This mirrors
-                -- production, where they are install-managed and outlive a
-                -- restore (a restore builds a new database; see BackupService); the
-                -- migration's IF NOT EXISTS then no-ops.
-                CREATE EXTENSION IF NOT EXISTS pg_trgm;
-                CREATE EXTENSION IF NOT EXISTS pgcrypto;
-                """, grant);
-            cmd.ExecuteNonQuery();
+            await _container.DisposeAsync().ConfigureAwait(false);
         }
-
-        return new NpgsqlConnectionStringBuilder(ServiceConnectionString)
-        {
-            Database = databaseName,
-        }.ConnectionString;
+        if (failures.Count == 1) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(failures[0]);
+        if (failures.Count > 1) throw new AggregateException(failures);
     }
 
     /// <summary>
-    /// Open a raw <see cref="NpgsqlConnection"/> bound to the
-    /// service-role connection string. Kept for tests that need
-    /// direct SQL without an EF context (e.g. TRUNCATE between
-    /// fixture tests, raw <c>SET app.user_id</c> dance, …).
+    /// Every <see cref="ApiFactory"/> the run built was disposed: one that was not keeps its
+    /// host for the rest of the run.
     /// </summary>
-    public NpgsqlConnection OpenServiceConnection()
+    private static void AssertEveryHostWasDisposed()
     {
-        var connection = new NpgsqlConnection(ServiceConnectionString);
-        connection.Open();
-        return connection;
+        var left = ApiFactory.NotDisposed;
+        if (left.Count > 0)
+            throw new Xunit.Sdk.XunitException(
+                $"At the end of the run, {left.Count} test host(s) were never disposed; each keeps its "
+                + "host for the rest of the run. Built by:\n  "
+                + string.Join("\n  ", left.GroupBy(t => t).Select(g => g.Count() == 1 ? g.Key : $"{g.Key} (x{g.Count()})")));
     }
 
     /// <summary>
-    /// Construct a fresh <see cref="AppDbContext"/> bound to the
-    /// service-role connection string. Used by
-    /// <see cref="SyntheticLedger"/> for cross-cutting setup writes
-    /// (creating ledgers for multiple users, seeding transactions
-    /// across ledgers, …).
+    /// Clone the template into a new database for the test <paramref name="output"/>
+    /// belongs to, and say so in that test's output.
     /// </summary>
-    /// <remarks>
-    /// <b>Not the production shape.</b> This builds bare options — no recompute
-    /// interceptors — and is a raw SEEDING handle for arranging rows directly.
-    /// <see cref="NewServiceFactory"/> is what production uses, and anything
-    /// asserting that a write recomputed its derived state must go through that,
-    /// or it proves nothing.
-    /// </remarks>
-    public AppDbContext NewServiceDbContext()
+    internal Task<TestDatabase> CreateDatabaseAsync(ITestOutputHelper output)
     {
-        var options = new DbContextOptionsBuilder<AppDbContext>()
-            .UseNpgsql(ServiceConnectionString)
-            .Options;
-        return new AppDbContext(options);
+        ArgumentNullException.ThrowIfNull(output);
+        return CreateDatabaseAsync(TestDatabaseCluster.TestNameOf(output), output.WriteLine);
     }
 
     /// <summary>
-    /// Backward-compatibility alias for <see cref="NewServiceDbContext"/>.
-    /// Pre-PR-3.8 tests called this name; they ran against the single
-    /// pre-split role which had de facto BYPASSRLS. The service role
-    /// is the right successor — RLS doesn't apply, so the tests'
-    /// existing assertions keep working.
+    /// Clone the template into a new database owned by <paramref name="owner"/>, for a class
+    /// fixture that holds one database for every test of its class, and say so through
+    /// <paramref name="log"/>.
     /// </summary>
-    public AppDbContext NewDbContext() => NewServiceDbContext();
-
-    /// <summary>
-    /// Build a <see cref="ServiceDbContextFactory"/> bound to this
-    /// fixture's service-role connection string. Repository unit /
-    /// integration tests that construct a repo directly (without the
-    /// full DI graph) inject this so the repo's internal
-    /// <c>_serviceFactory.Create()</c> resolves to a context against
-    /// the test container.
-    /// </summary>
-    public ServiceDbContextFactory NewServiceFactory()
+    /// <remarks>The caller disposes it when its class ends, which runs the same end-of-test
+    /// checks a test's own database gets. No test of that class may also be a
+    /// <see cref="DatabaseTest"/>: its end would find the fixture's sessions in a database
+    /// that is not its own.</remarks>
+    internal async Task<TestDatabase> CreateDatabaseAsync(string owner, Action<string> log)
     {
-        var options = Options.Create(new ApiOptions
-        {
-            ConnectionString = AppConnectionString,
-            ServiceConnectionString = ServiceConnectionString,
-        });
-        return ServiceFactoryFor(options);
+        ArgumentNullException.ThrowIfNull(log);
+        var cluster = Cluster;
+        EnsureFirstBootAlertStillThrottles(FirstBootAlertAt, TimeProvider.System.GetUtcNow().UtcDateTime);
+        var name = TestDatabaseCluster.NewName();
+        var ms = await cluster.CloneTemplateAsync(name, owner).ConfigureAwait(false);
+        log(string.Create(CultureInfo.InvariantCulture, $"db {name} clone {ms:F0} ms"));
+        return new TestDatabase(cluster, _credentials!, name, owner);
     }
 
     /// <summary>
     /// A <see cref="ServiceDbContextFactory"/> wired the way PRODUCTION wires it.
     /// </summary>
     /// <remarks>
-    /// One place, so the test shape cannot drift from Program.cs. The three
+    /// One place, so the test shape cannot drift from Program.cs. The four
     /// recompute interceptors are passed because production passes them: a factory
     /// built without them hands back a context that saves without recomputing, and
     /// a test asserting a recomputed balance over that is asserting the bug rather
@@ -245,118 +193,158 @@ public sealed class PostgresFixture : IAsyncLifetime
     /// ChangeTracker for its own surface and does nothing when it finds none — so
     /// callers that never touch legs pay an in-memory loop over their own entries.
     /// </remarks>
-    public static ServiceDbContextFactory ServiceFactoryFor(IOptions<ApiOptions> options) =>
+    public static ServiceDbContextFactory ServiceFactoryFor(
+        IOptions<ApiOptions> options, params IInterceptor[] extra) =>
         new(options,
             new LegDerivedRecomputeInterceptor(
                 NullLogger<LegDerivedRecomputeInterceptor>.Instance),
             new HoldingsRecomputeInterceptor(),
-            new TradePriceFromLegInterceptor());
+            new TradePriceFromLegInterceptor(),
+            new LegNotesRecomputeInterceptor(),
+            extra);
 
     /// <summary>
-    /// Test-side master KEK + LedgerKeyService for repository unit
-    /// tests that construct a <see cref="LedgersRepository"/>
-    /// directly. The key bytes are deterministic across tests (32
-    /// zero bytes) — non-secret by intent; we just need a stable
-    /// MasterKey value so wrapped LEKs round-trip across the same
-    /// process. ADR-0026.
+    /// The fixture's master key: 32 zero bytes, the same key <see cref="ApiFactory"/>
+    /// pins for every host, non-secret by intent, so material wrapped in one place opens
+    /// in another (ADR-0026).
     /// </summary>
-    public Coffer.Api.Crypto.LedgerKeyService NewLedgerKeyService()
+    internal static LedgerKeyService FixtureKeys() => new(new MasterKey(new byte[32], id: "test"));
+
+    /// <summary>
+    /// Fail with a clear message when the template's first backup alert has aged past
+    /// the monitor's throttle window, rather than let every host from then on write a
+    /// new one at boot.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>The issue.</b> A host booted on a clone writes nothing at boot only
+    /// because the template carries the backup-age monitor's <c>backup.none</c> alert,
+    /// and the monitor stays quiet for <see cref="BackupAgeMonitor.RepeatAfter"/> after
+    /// it. The row's time is the server's <c>now()</c> at template build, and the
+    /// throttle compares it with the host's clock, so the guarantee holds for a bounded
+    /// time after the process starts. The host's clock cannot be pinned for the monitor
+    /// alone: it is the app's one <see cref="TimeProvider"/>.</para>
+    /// <para><b>The handling.</b> Every clone checks the bound first, with
+    /// <see cref="FirstBootAlertMargin"/> of slack, and refuses past it.</para>
+    /// </remarks>
+    internal static void EnsureFirstBootAlertStillThrottles(DateTime alertAtUtc, DateTime nowUtc)
     {
-        var key = new Coffer.Api.Crypto.MasterKey(new byte[32], id: "test");
-        return new Coffer.Api.Crypto.LedgerKeyService(key);
+        var age = nowUtc - alertAtUtc;
+        if (age >= BackupAgeMonitor.RepeatAfter - FirstBootAlertMargin)
+            throw new InvalidOperationException(string.Format(CultureInfo.InvariantCulture,
+                "The template's first backup alert is {0:F1} h old, within {1:F0} h of BackupAgeMonitor.RepeatAfter "
+                + "({2:F0} h): a host booted on a clone would now write a new alert at boot. Start a new test "
+                + "process, which builds a new template.",
+                age.TotalHours, FirstBootAlertMargin.TotalHours, BackupAgeMonitor.RepeatAfter.TotalHours));
+    }
+
+    private async Task BuildTemplateAsync(TestDatabaseCluster cluster, TestDatabaseCredentials credentials)
+    {
+        var template = TestDatabaseCluster.TemplateName;
+        await cluster.CreateTemplateAsync().ConfigureAwait(false);
+
+        var serviceTemplate = credentials.Service(template);
+        var appTemplate = credentials.App(template);
+        try
+        {
+            // As coffer_service, so DbUp-created tables are owned by it: the precondition
+            // for ENABLE ROW LEVEL SECURITY in migration 017.
+            MigrationRunner.Run(TestDatabaseCluster.ForMigrationRunner(serviceTemplate),
+                MigrationsDirectoryLocator.Locate(AppContext.BaseDirectory), NullLogger.Instance);
+
+            await SettleFirstBootAsync(serviceTemplate, appTemplate).ConfigureAwait(false);
+
+            await using (var connection = new NpgsqlConnection(serviceTemplate))
+            {
+                await connection.OpenAsync().ConfigureAwait(false);
+                await using var alert = new NpgsqlCommand(
+                    "SELECT max(occurred_at) FROM system_events WHERE event_key = 'backup.none'", connection);
+                FirstBootAlertAt = (DateTime)(await alert.ExecuteScalarAsync().ConfigureAwait(false))!;
+            }
+
+            await cluster.SealTemplateAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            await cluster.LockTemplateAsync().ConfigureAwait(false);
+        }
     }
 
     /// <summary>
-    /// Construct a fresh <see cref="AppDbContext"/> bound to the
-    /// app-role connection string, with an explicit <c>app.user_id</c>
-    /// pre-set on the connection via a custom interceptor that
-    /// applies the supplied value once at open. Use this when a test
-    /// needs to exercise the RLS path directly (without going through
-    /// the HTTP pipeline).
+    /// The writes a host makes the first time it boots on a database, made once here
+    /// through the app's own code, so no clone's host makes them.
     /// </summary>
-    public AppDbContext NewAppDbContextAsUser(Guid userId)
+    private static async Task SettleFirstBootAsync(string service, string app)
     {
-        var options = new DbContextOptionsBuilder<AppDbContext>()
-            .UseNpgsql(AppConnectionString)
-            .AddInterceptors(new FixedUserConnectionInterceptor(userId))
-            .Options;
-        return new AppDbContext(options);
+        var factory = ServiceFactoryFor(Options.Create(new ApiOptions
+        {
+            ConnectionString = app,
+            ServiceConnectionString = service,
+        }));
+
+        // The OAuth server key pair, sealed under the fixture key every host runs with,
+        // through the loader boot calls. A legacy directory of its own, empty, so it
+        // generates the pair rather than importing anything.
+        var legacy = Directory.CreateTempSubdirectory("coffer-template-oauth-").FullName;
+        var backups = Directory.CreateTempSubdirectory("coffer-template-backups-").FullName;
+        try
+        {
+            var material = new OpenIddictKeyMaterial(
+                factory, TimeProvider.System, NullLogger<OpenIddictKeyMaterial>.Instance);
+            if (!await material.LoadAsync(FixtureKeys(), legacy).ConfigureAwait(false))
+                throw new InvalidOperationException("The OAuth key pair did not load into the template.");
+
+            // The backup-age monitor's first alert ("no backup exists"). The scheduler
+            // runs the monitor on every tick, the first one at boot, and the alert
+            // throttles its own repeats on this row; without it every host would write
+            // one.
+            var publisher = new NotificationPublisher(
+                factory, FixtureKeys(), Array.Empty<INotificationSubscriber>(),
+                NullLogger<NotificationPublisher>.Instance, TimeProvider.System);
+            var store = new BackupStore(backups, NullLogger<BackupStore>.Instance,
+                partSizeBytes: 1024 * 1024, TimeProvider.System);
+            await new BackupAgeMonitor(store, publisher, TimeProvider.System).CheckAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            TestDatabaseCluster.ClearPool(service);
+            TestDatabaseCluster.ClearPool(app);
+            try { Directory.Delete(legacy, recursive: true); } catch (IOException) { }
+            try { Directory.Delete(backups, recursive: true); } catch (IOException) { }
+        }
     }
 
-    private static async Task ProvisionRolesAsync(string superuserConnectionString)
-    {
-        await using var connection = new NpgsqlConnection(superuserConnectionString);
-        await connection.OpenAsync().ConfigureAwait(false);
-        await using var cmd = connection.CreateCommand();
-        cmd.CommandText = $@"
--- Match the production db/init/00-init-roles.sh bootstrap: install
--- the non-trusted extensions as the superuser up-front so the
--- migration runner (running as coffer_service, a non-superuser) can
--- run its CREATE EXTENSION IF NOT EXISTS as a no-op.
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
-DO $Init$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'coffer_service') THEN
-        CREATE ROLE coffer_service LOGIN BYPASSRLS PASSWORD '{ServicePassword}';
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'coffer_app') THEN
-        CREATE ROLE coffer_app LOGIN NOBYPASSRLS PASSWORD '{AppPassword}';
-    END IF;
-END $Init$;
-GRANT CREATE, USAGE ON SCHEMA public TO coffer_service;
-GRANT USAGE          ON SCHEMA public TO coffer_app;
-
--- Restore-by-swap privileges (migration 246), as db/init grants them.
-ALTER ROLE coffer_service CREATEDB;
-ALTER DATABASE ""{new NpgsqlConnectionStringBuilder(superuserConnectionString).Database}"" OWNER TO coffer_service;
-";
-        await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
-    }
-
-    private static string BuildConnectionString(string superuserConnectionString, string username, string password)
+    private static string BuildConnectionString(string superuserConnectionString, string? username, string? password)
     {
         var builder = new NpgsqlConnectionStringBuilder(superuserConnectionString)
         {
-            Username = username,
-            Password = password,
-            // Bound each Npgsql pool so total server connections stay
-            // well under the container's max_connections REGARDLESS of how
-            // many test classes the suite grows to. Without a cap, every
-            // ApiFactory host's data source AND the fixture's process-global
-            // pools (NewServiceDbContext / NewAppDbContextAsUser reuse the
-            // global pool keyed on this string) each default to 100, and
-            // Npgsql holds idle connections for 300s — longer than the whole
-            // suite runs — so connections accumulate and never prune mid-run.
-            // The symptom was a non-deterministic "53300: remaining
-            // connection slots are reserved for roles with the SUPERUSER
-            // attribute" from a later test's startup (coffer_service is a
-            // non-superuser) once the suite crossed a connection-count
-            // threshold. Capping the pool + a short idle lifetime keeps the
-            // footprint flat as the suite scales; the tests are serialized in
-            // one collection, so a modest ceiling is ample.
+            // Bound each Npgsql pool so total server connections stay well under the
+            // container's max_connections however many tests a process runs. Npgsql
+            // pools are process-global, keyed on the connection string, and default to
+            // 100; a short idle lifetime keeps the footprint flat. Tests run one at a
+            // time in one collection, so a modest ceiling is ample.
             MaxPoolSize = 40,
             ConnectionIdleLifetime = 10,
 
-            // Mirrors production's DbSessionTimeZone, which pins this on the
-            // connection string rather than issuing a SET. It has to be the
-            // same MECHANISM and not merely the same value: a fixture that
-            // reached UTC another way would let a regression in the real pin
-            // pass the whole suite. Testcontainers' postgres image defaults to
-            // UTC, so without this the tests would agree by luck.
+            // Mirrors production's DbSessionTimeZone, which pins this on the connection
+            // string rather than issuing a SET. It has to be the same MECHANISM and not
+            // merely the same value: a fixture that reached UTC another way would let a
+            // regression in the real pin pass the whole suite. Testcontainers' postgres
+            // image defaults to UTC, so without this the tests would agree by luck.
             Timezone = Coffer.Api.Configuration.DbSessionTimeZone.Zone,
         };
+        if (username is not null)
+        {
+            builder.Username = username;
+            builder.Password = password;
+        }
         return builder.ConnectionString;
     }
 }
 
 /// <summary>
-/// xUnit collection that shares a single <see cref="PostgresFixture"/>
-/// across every API integration test class. The migrations run once
-/// when the first test in the collection asks <see cref="ApiFactory"/>
-/// for an <c>HttpClient</c>; subsequent tests reuse the now-migrated
-/// database.
+/// xUnit collection that shares a single <see cref="PostgresFixture"/> (one container,
+/// one template) across every API integration test class of a process. Its members run
+/// one at a time; each test still gets its own database (<see cref="DatabaseTest"/>).
 /// </summary>
 [CollectionDefinition(Name)]
 public sealed class ApiCollection : ICollectionFixture<PostgresFixture>

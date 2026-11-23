@@ -37,4 +37,19 @@ public sealed record QuoteRunOutcome(
     /// "couldn't refresh" pill so the user knows which positions
     /// stayed stale.</summary>
     IReadOnlyList<Guid> SecuritiesUnresolved,
-    IReadOnlyList<QuoteError> Errors);
+    IReadOnlyList<QuoteError> Errors,
+    /// <summary>Securities whose currency a Yahoo read confirmed for the first time this
+    /// run (ADR-0114 D5, amendment), by a fetch or by the one-time currency pass.</summary>
+    int CurrenciesConfirmed = 0,
+    /// <summary>Fetch rows whose currency this run re-stamped to the one Yahoo named; their
+    /// prices change only when converted out of a minor unit.</summary>
+    int RowsRestamped = 0)
+{
+    /// <summary>Exchange-rate days this run stored (ADR-0114 D11): new days only, since a
+    /// stored day is never rewritten. Zero on a run that does not fetch market series (the
+    /// post-sync pull) or whose user has not turned Frankfurter on.</summary>
+    public int RatesInserted { get; init; }
+
+    /// <summary>Benchmark growth days this run stored (ADR-0114 D11), new days only.</summary>
+    public int BenchmarkDaysInserted { get; init; }
+}

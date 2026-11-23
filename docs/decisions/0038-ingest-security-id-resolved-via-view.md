@@ -22,9 +22,8 @@ provider_key, provider_security_id)` is the authoritative
 `→ security_id` map. Storing the resolved id on the header is a
 denormalized snapshot of that relation.
 
-The denormalization is observable as a cluster of follow-on debt
-that surfaced during the OFX investment-prefill slice
-(migrations 113 / 114):
+The denormalization produces a cluster of follow-on debt, which the
+OFX investment-prefill rail (migrations 113 / 114) exercises:
 
 1. **Out-of-date snapshots after a mapping changes.** Every Accept
    of a never-before-seen ticker writes a new mapping row. Headers
@@ -135,8 +134,8 @@ from "stored on the header" to "resolved by the view."
   securities, balances). Adding an eighth on
   `provider_security_mappings(ledger_id, provider_key,
   provider_security_id)` — which is a covered UNIQUE constraint —
-  is a small index seek per row. Real-data register pages
-  (a few thousand rows, paged 30 at a time) won't notice.
+  is a small index seek per row. A register page is bounded by
+  its page size, so it won't notice.
 * **No "snapshot of what the user mapped at ingest time" column.**
   Headers ingested before a mapping existed used to show
   `ingest_security_id = NULL`; after the user mapped the ticker
@@ -169,12 +168,12 @@ relation the view now joins.
 ## Alternatives considered
 
 * **Keep the column, drop the repo-layer backfill, accept a brief
-  stale-id window after Accept.** Rejected: the stale window was
-  the user-visible bug that motivated the rethink. Trading "the
-  picker is briefly blank" for less code isn't an improvement.
+  stale-id window after Accept.** Rejected: the stale window is
+  itself a user-visible bug. Trading "the picker is briefly blank"
+  for less code isn't an improvement.
 
 * **Materialized view refreshed on mapping change.** Adds caching
-  for no measurable gain on real-data sizes; the JOIN cost we'd
+  for no measurable gain at register-page sizes; the JOIN cost we'd
   be avoiding is already inside the view, which is itself reads
   on every register query. Recomputing the materialization on
   every mapping change is the backfill problem renamed.

@@ -5,9 +5,8 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Reporting;
 
 /// <summary>
-/// Migration 201 added <c>account_balance_as_of_instants</c>: the mig-199 balances
-/// for many instants in one pass. It is the second half of what let the TWR
-/// boundary cap be deleted, and every balance a returns report uses now comes
+/// Migration 201's <c>account_balance_as_of_instants</c>: the mig-199 balances
+/// for many instants in one pass. Every balance a returns report uses comes
 /// through it, so it is only acceptable if it is output-identical.
 /// </summary>
 /// <remarks>
@@ -15,15 +14,16 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// hinges entirely on ordering — effective date, then real-rows-before-instants,
 /// then <c>seq</c> — and the posted-at OVERRIDE (mig 173) is the case that makes
 /// ordering non-obvious: an override can move a header's effective date without
-/// changing its position in <c>seq</c>. That is what disproved an earlier attempt
-/// to denormalise this ordering, so it gets its own case here.
+/// changing its position in <c>seq</c>, which rules out denormalising this
+/// ordering, so it gets its own case here.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class AccountBalanceAsOfInstantsBatchingTests
+public sealed class AccountBalanceAsOfInstantsBatchingTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AccountBalanceAsOfInstantsBatchingTests(PostgresFixture fixture) => _fixture = fixture;
+    public AccountBalanceAsOfInstantsBatchingTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Utc(int y, int m, int d, int h = 0) =>
         new(y, m, d, h, 0, 0, DateTimeKind.Utc);
@@ -37,7 +37,7 @@ public sealed class AccountBalanceAsOfInstantsBatchingTests
     /// </summary>
     private async Task AssertAgreeAtAllAsync(Guid ledgerId, Guid[] accountIds, params DateTime[] instants)
     {
-        await using var conn = _fixture.OpenServiceConnection();
+        await using var conn = Db.OpenServiceConnection();
         foreach (var t in instants)
         {
             var expected = (await conn.QueryAsync<BalanceRow>(
@@ -69,7 +69,7 @@ public sealed class AccountBalanceAsOfInstantsBatchingTests
     [Fact]
     public async Task Batching_is_invariant_across_a_transaction_history()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var other = await ledger.AddBankAccountAsync("Savings");
 
@@ -90,14 +90,14 @@ public sealed class AccountBalanceAsOfInstantsBatchingTests
     }
 
     /// <summary>
-    /// The case that has already broken one attempt at this: an override moves a
+    /// The case that breaks a naive fill: an override moves a
     /// header's effective date without moving it in seq order, so a fill keyed on
     /// anything but the effective date lands on the wrong balance.
     /// </summary>
     [Fact]
     public async Task Batched_honors_a_posted_at_override()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var other = await ledger.AddBankAccountAsync("Savings");
 
@@ -118,7 +118,7 @@ public sealed class AccountBalanceAsOfInstantsBatchingTests
     [Fact]
     public async Task Batched_falls_back_to_opening_balance_and_covers_untouched_accounts()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var funded = await ledger.AddBankAccountAsync("Opened With Money");
         var untouched = await ledger.AddBankAccountAsync("Never Used");
         var other = await ledger.AddBankAccountAsync("Savings");

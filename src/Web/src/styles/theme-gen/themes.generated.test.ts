@@ -17,8 +17,7 @@ const GENERATED = join(import.meta.dirname, '..', 'themes.generated.css');
  * comments claim the values are solved and audited, and they would not be.
  *
  * AA — every combination the model can produce must clear 4.5:1 on every pair
- * the register renders. This is a floor, not a design check. Every visual defect
- * in this theme work so far passed an audit like this one; what it catches is
+ * the register renders. This is a floor, not a design check: what it catches is
  * illegibility, not whether a colour belongs.
  */
 describe('generated theme CSS', () => {

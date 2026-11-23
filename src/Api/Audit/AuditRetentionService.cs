@@ -123,8 +123,8 @@ public sealed class AuditRetentionService : BackgroundService
                 .Where(r => r.OccurredAt < eventCutoff)
                 .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
 
-            // admin_audit_events is deliberately NOT pruned (ADR-0092 D2, migration
-            // 191). The two tables above are high-volume operational records; key
+            // admin_audit_events is deliberately NOT pruned (ADR-0092 Consequences,
+            // migration 191). The two tables above are high-volume operational records; key
             // access is the opposite — a handful of rows per install, whose whole
             // value is that they are old. Don't add it here.
 

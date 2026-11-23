@@ -6,9 +6,9 @@ namespace Coffer.Importer.Moneydance.Pipeline;
 /// <summary>
 /// Post-import sanity checks. Runs against the DB after every import
 /// step completes; verifies structural invariants that aren't all
-/// enforced by DB CHECKs/triggers. Warn-only by default — failures
-/// don't roll back the data, but they surface and the process exits
-/// with a non-zero code so scripts can detect issues.
+/// enforced by DB CHECKs/triggers. Warn-only — failures don't roll back
+/// the data; the API reports each failed check, with its summary, on the
+/// import job's status and logs its name.
 /// </summary>
 public sealed class ImportValidator
 {
@@ -19,7 +19,20 @@ public sealed class ImportValidator
         _connection = connection;
     }
 
-    public sealed record CheckResult(string Name, bool Passed, string? Message);
+    /// <summary>One check's outcome. A failed check says what failed twice, for two
+    /// readers: <paramref name="Message"/> in the importer's own terms, for whoever
+    /// diagnoses it, and <paramref name="Summary"/> in plain words, for the person who
+    /// ran the import (see <see cref="CheckSummaries"/>). A passed check carries neither.</summary>
+    public sealed record CheckResult(string Name, bool Passed, string? Message, string? Summary)
+    {
+        public static CheckResult Pass(string name) => new(name, true, null, null);
+
+        public static CheckResult Fail(string name, string message, string summary) =>
+            new(name, false, message, summary);
+    }
+
+    /// <summary>The most offending values a check names; past it, the summary says "at least".</summary>
+    private const int Sample = 5;
 
     public sealed record ValidationReport(IReadOnlyList<CheckResult> Checks)
     {
@@ -38,6 +51,7 @@ public sealed class ImportValidator
             await CheckInvestmentActionConformanceAsync(ledgerId, cancellationToken),
             await CheckHeaderBalanceAsync(ledgerId, cancellationToken),
             await CheckHeaderHasLegsAsync(ledgerId, cancellationToken),
+            await CheckOriginatingAccountAsync(ledgerId, cancellationToken),
             await CheckLotsReferenceExistingLegsAsync(ledgerId, cancellationToken),
         };
 
@@ -62,26 +76,36 @@ public sealed class ImportValidator
     /// external_id (drift signal: a re-import created a fresh row
     /// instead of upserting). Same-name-different-extid groups pass
     /// (MD has multiple categories with the same leaf name under
-    /// different parents — legitimate).
+    /// different parents — legitimate). System rows are left out: they
+    /// never carry an external_id (the Holdings siblings, the
+    /// Uncategorized category), so one sharing a name with a Moneydance
+    /// account — the user's own category named "Uncategorized" — is not drift.
     /// </summary>
     private async Task<CheckResult> CheckAccountNameUniquenessAsync(Guid ledgerId, CancellationToken ct)
     {
+        // One past the sample, so the summary knows whether there are more than it names.
         const string sql = """
-            SELECT name || ' / ' || account_type AS conflict
+            SELECT name AS Name, account_type AS Type
             FROM accounts
             WHERE ledger_id = @LedgerId
+              AND NOT is_system
             GROUP BY name, account_type
             HAVING COUNT(*) > 1
                AND COUNT(*) FILTER (WHERE external_id IS NULL) > 0
-            LIMIT 5;
+            ORDER BY name, account_type
+            LIMIT @Limit;
             """;
-        var conflicts = (await _connection.QueryAsync<string>(
-            new CommandDefinition(sql, new { LedgerId = ledgerId }, cancellationToken: ct))).ToList();
+        var found = (await _connection.QueryAsync<(string Name, string Type)>(
+            new CommandDefinition(sql, new { LedgerId = ledgerId, Limit = Sample + 1 }, cancellationToken: ct))).ToList();
+        if (found.Count == 0) return CheckResult.Pass("account-name-uniqueness");
 
-        return conflicts.Count == 0
-            ? new CheckResult("account-name-uniqueness", true, null)
-            : new CheckResult("account-name-uniqueness", false,
-                $"{conflicts.Count}+ dup-name groups with at least one null external_id; sample: {string.Join(", ", conflicts)}");
+        var conflicts = found.Take(Sample).ToList();
+        var more = found.Count > Sample;
+        return CheckResult.Fail("account-name-uniqueness",
+            $"{conflicts.Count}{(more ? "+" : "")} dup-name groups with at least one null external_id; sample: "
+            + string.Join(", ", conflicts.Select(c => $"{c.Name} / {c.Type}")),
+            CheckSummaries.DuplicateAccountNames(
+                conflicts.Select(c => c.Name).Distinct(StringComparer.Ordinal).ToList(), more));
     }
 
     /// <summary>
@@ -100,50 +124,77 @@ public sealed class ImportValidator
                   'dividend_cash', 'dividend_reinvest', 'divx',
                   'transfer', 'misc'
               )
-            GROUP BY action LIMIT 5;
+            GROUP BY action ORDER BY action LIMIT @Limit;
             """;
-        var offCatalog = (await _connection.QueryAsync<string>(
-            new CommandDefinition(sql, new { LedgerId = ledgerId }, cancellationToken: ct))).ToList();
+        var found = (await _connection.QueryAsync<string>(
+            new CommandDefinition(sql, new { LedgerId = ledgerId, Limit = Sample + 1 }, cancellationToken: ct))).ToList();
+        if (found.Count == 0) return CheckResult.Pass("investment-action-conformance");
 
-        return offCatalog.Count == 0
-            ? new CheckResult("investment-action-conformance", true, null)
-            : new CheckResult("investment-action-conformance", false,
-                $"Off-catalog action(s): {string.Join(", ", offCatalog)}");
+        var offCatalog = found.Take(Sample).ToList();
+        var more = found.Count > Sample;
+        return CheckResult.Fail("investment-action-conformance",
+            $"Off-catalog action(s): {string.Join(", ", offCatalog)}{(more ? ", …" : "")}",
+            CheckSummaries.UnusableActions(offCatalog, more));
     }
 
     /// <summary>
-    /// Double-entry invariant: every header's legs must sum to zero
-    /// (ADR-0019). No exemptions.
+    /// Double-entry invariant (ADR-0019, ADR-0114 D13): a transfer between
+    /// currencies passes when its two amounts are nonzero and opposite in
+    /// sign, and every other leg of a header is summed and must come to zero.
     ///
-    /// <para>The prior version checked per-posting AND excluded any
-    /// posting that contained a zero-amount leg, on the premise that
-    /// share-class-exchange / basis-distribution shapes legitimately
-    /// carry a zero cash leg "by design". That premise was wrong: it
-    /// masked the self-referential <c>buysellxfr</c> bug (ADR-0053) where
-    /// the importer zeroed the sell proceeds, leaving the header unbalanced
-    /// by the full trade amount. The exemption is removed — with the mapper
-    /// fixed, every header balances, so this is an unconditional per-header
-    /// sum.</para>
+    /// <para>A two-amount pair is a posting (<c>header_id</c>,
+    /// <c>posting_index</c>) of exactly two legs, both on real accounts (not
+    /// <c>account_type = 'category'</c>), whose <c>currency_code</c>s differ.
+    /// It keeps each account's own figure (ADR-0114 D13), so it is left out of
+    /// its header's sum. A posting with a category leg is never a pair, whatever
+    /// currency the category carries, because a category leg mirrors the real
+    /// side; a Holdings sibling shares its brokerage's currency, so its posting
+    /// never is one either. Reminder templates are checked like every other
+    /// header.</para>
+    ///
+    /// <para>No exemption for a posting that contains a zero-amount leg.
+    /// Share-class-exchange / basis-distribution shapes do not need one, and
+    /// an exemption would mask a mapper that zeroes sell proceeds — the
+    /// self-referential <c>buysellxfr</c> shape (ADR-0053), which leaves the
+    /// header unbalanced by the full trade amount. A pair with a zero side
+    /// fails for the same reason. Every correctly mapped header balances, so
+    /// the sum over the legs outside a pair is unconditional.</para>
     /// </summary>
     private async Task<CheckResult> CheckHeaderBalanceAsync(Guid ledgerId, CancellationToken ct)
     {
         const string sql = """
-            SELECT COUNT(*) FROM (
-                SELECT l.header_id
+            WITH postings AS (
+                SELECT l.header_id,
+                       COUNT(*) = 2
+                         AND bool_and(a.account_type <> 'category')
+                         AND MIN(a.currency_code) <> MAX(a.currency_code) AS is_pair,
+                       MIN(l.amount) AS low,
+                       MAX(l.amount) AS high,
+                       SUM(l.amount) AS total
                 FROM txn_legs l
                 JOIN txn_headers h ON h.id = l.header_id
+                JOIN accounts a ON a.id = l.account_id
                 WHERE h.ledger_id = @LedgerId
-                GROUP BY l.header_id
-                HAVING ABS(SUM(l.amount)) > 0.0001
+                GROUP BY l.header_id, l.posting_index
+            )
+            SELECT COUNT(*) FROM (
+                SELECT header_id
+                FROM postings
+                GROUP BY header_id
+                HAVING ABS(COALESCE(SUM(total) FILTER (WHERE NOT is_pair), 0)) > 0.0001
+                    OR bool_or(is_pair AND NOT (low < 0 AND high > 0))
             ) s;
             """;
         var unbalanced = await _connection.ExecuteScalarAsync<int>(
             new CommandDefinition(sql, new { LedgerId = ledgerId }, cancellationToken: ct));
 
         return unbalanced == 0
-            ? new CheckResult("header-balance", true, null)
-            : new CheckResult("header-balance", false,
-                $"{unbalanced} header(s) whose legs do not sum to zero (double-entry violation)");
+            ? CheckResult.Pass("header-balance")
+            : CheckResult.Fail("header-balance",
+                $"{unbalanced} header(s) whose legs do not sum to zero outside a transfer between currencies, "
+                + "or whose transfer between currencies lacks two nonzero amounts of opposite sign "
+                + "(double-entry violation)",
+                CheckSummaries.Unbalanced(unbalanced));
     }
 
     /// <summary>
@@ -161,8 +212,36 @@ public sealed class ImportValidator
             new CommandDefinition(sql, new { LedgerId = ledgerId }, cancellationToken: ct));
 
         return orphans == 0
-            ? new CheckResult("header-has-legs", true, null)
-            : new CheckResult("header-has-legs", false, $"{orphans} header(s) with no legs");
+            ? CheckResult.Pass("header-has-legs")
+            : CheckResult.Fail("header-has-legs", $"{orphans} header(s) with no legs",
+                CheckSummaries.WithoutLines(orphans));
+    }
+
+    /// <summary>
+    /// The originating-account invariants of migration 263 (see
+    /// <see cref="OriginatingAccountInvariants"/>), over what the import wrote. The
+    /// home account satisfies all of them by construction, which is what this proves.
+    /// The message counts the headers and tallies the clauses they break.
+    /// </summary>
+    private async Task<CheckResult> CheckOriginatingAccountAsync(Guid ledgerId, CancellationToken ct)
+    {
+        const string sql = $"""
+            SELECT v.clause, count(*)::integer AS headers
+              FROM ({OriginatingAccountInvariants.ViolationsSql}) v
+             GROUP BY v.clause
+             ORDER BY v.clause;
+            """;
+        var broken = (await _connection.QueryAsync<(string Clause, int Headers)>(
+            new CommandDefinition(sql, new { LedgerId = ledgerId }, cancellationToken: ct))).ToList();
+        if (broken.Count == 0) return CheckResult.Pass("originating-account");
+
+        var headers = await _connection.ExecuteScalarAsync<int>(new CommandDefinition(
+            $"SELECT count(DISTINCT v.header_id)::integer FROM ({OriginatingAccountInvariants.ViolationsSql}) v",
+            new { LedgerId = ledgerId }, cancellationToken: ct));
+        return CheckResult.Fail("originating-account",
+            $"{headers} header(s) whose originating account breaks an invariant (migration 263): "
+            + string.Join(", ", broken.Select(b => $"{b.Clause} {b.Headers}")),
+            CheckSummaries.WithoutOwner(headers));
     }
 
     /// <summary>
@@ -182,18 +261,21 @@ public sealed class ImportValidator
             new CommandDefinition(sql, new { LedgerId = ledgerId }, cancellationToken: ct));
 
         return orphans == 0
-            ? new CheckResult("lots-reference-existing-legs", true, null)
-            : new CheckResult("lots-reference-existing-legs", false,
-                $"{orphans} lot(s) reference a non-existent leg_id");
+            ? CheckResult.Pass("lots-reference-existing-legs")
+            : CheckResult.Fail("lots-reference-existing-legs",
+                $"{orphans} lot(s) reference a non-existent leg_id",
+                CheckSummaries.LotsWithoutLine(orphans));
     }
 
     /// <summary>
     /// MD account count vs imported account count parity. The caller supplies
     /// the count of MD accounts RESOLVED into the ledger (created OR adopted —
-    /// <c>ImportContext.AccountByMdId</c>); we compare it to the count of
-    /// accounts with a <c>moneydance</c>-source junction row. Using the resolved
-    /// count (not the newly-inserted count) keeps the check correct on a
-    /// seed-only re-import, where every account is adopted and nothing is
+    /// <c>ImportContext.AccountByMdId</c>) less those resolved onto the system
+    /// Uncategorized (<c>ImportContext.MdIdsOnUncategorized</c>), which share a
+    /// Coffer-native row and have no junction of their own; we compare it to
+    /// the count of accounts with a <c>moneydance</c>-source junction row. Using
+    /// the resolved count (not the newly-inserted count) keeps the check correct
+    /// on a seed-only re-import, where every account is adopted and nothing is
     /// inserted.
     /// </summary>
     private async Task<CheckResult> CheckAccountCountParityAsync(Guid ledgerId, int expectedMdAccountCount, CancellationToken ct)
@@ -206,8 +288,9 @@ public sealed class ImportValidator
             new CommandDefinition(sql, new { LedgerId = ledgerId }, cancellationToken: ct));
 
         return actual == expectedMdAccountCount
-            ? new CheckResult("account-count-parity", true, null)
-            : new CheckResult("account-count-parity", false,
-                $"MD export had {expectedMdAccountCount} accounts; DB has {actual} with moneydance-source junction");
+            ? CheckResult.Pass("account-count-parity")
+            : CheckResult.Fail("account-count-parity",
+                $"MD export had {expectedMdAccountCount} accounts; DB has {actual} with moneydance-source junction",
+                CheckSummaries.AccountCount(expectedMdAccountCount, actual));
     }
 }

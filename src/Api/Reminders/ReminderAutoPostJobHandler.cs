@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using Coffer.Api.Db;
 using Coffer.Api.Db.Repositories;
 using Coffer.Api.Notifications;
+using Coffer.Api.Quotes.MarketSeries;
 using Coffer.Api.Scheduling;
 using Coffer.Domain.Reminders;
 
@@ -48,6 +49,14 @@ namespace Coffer.Api.Reminders;
 /// auto-disable — which is the entire reason ADR-0097 made auto-post a job type instead
 /// of a tick-riding monitor.
 /// </para>
+/// <para>
+/// <b>A fire refused because the ledger was being written is deferred, not failed.</b>
+/// The fire takes the ledger's write lock first (migration 275), and another write held
+/// past the wait refuses it with nothing written: the occurrence is still due, the next
+/// run posts it, and the backlog announcement counts it meanwhile. The run reports it as
+/// Degraded (DidNothing when nothing posted), never a throw, so a busy ledger never walks
+/// the job toward the auto-disable.
+/// </para>
 /// </remarks>
 public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
 {
@@ -57,14 +66,19 @@ public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
     private readonly ReminderAutoPostLimits _limits;
     private readonly ILogger<ReminderAutoPostJobHandler> _logger;
     private readonly TimeProvider _clock;
+    private readonly MarketSeriesBackfill? _backfill;
 
+    /// <param name="backfill">Started when the run's posts move a needed series' start
+    /// earlier (ADR-0114 D11). Null only in tests that construct the handler by hand and
+    /// assert nothing of the market series.</param>
     public ReminderAutoPostJobHandler(
         ServiceDbContextFactory factory,
         RecurrenceExpander expander,
         NotificationPublisher publisher,
         ILogger<ReminderAutoPostJobHandler> logger,
         TimeProvider clock,
-        ReminderAutoPostLimits? limits = null)
+        ReminderAutoPostLimits? limits = null,
+        MarketSeriesBackfill? backfill = null)
     {
         _factory = factory;
         _expander = expander;
@@ -72,6 +86,7 @@ public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
         _logger = logger;
         _clock = clock;
         _limits = limits ?? ReminderAutoPostLimits.Default;
+        _backfill = backfill;
     }
 
     public string JobType => JobTypes.ReminderAutoPost;
@@ -89,6 +104,7 @@ public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
         var today = clock.LocalToday();
 
         AutoPostScanResult scan;
+        NeededStarts? startsBefore = null;
         await using (var scanDb = _factory.Create())
         {
             scan = await NewRepository(scanDb)
@@ -96,6 +112,11 @@ public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
                     ledgerId, today, _limits.CatchUpDays, _limits.MaxAutoCommitDaysBefore,
                     cancellationToken)
                 .ConfigureAwait(false);
+            // ADR-0114 D11: an occurrence posted before the ledger's earliest day moves the
+            // starts earlier, as a fire by hand does; read before the posts that can move them.
+            if (_backfill is not null && scan.Due.Count > 0)
+                startsBefore = await NeededFxPairs.StartsAsync(scanDb, ledgerId, cancellationToken)
+                    .ConfigureAwait(false);
         }
 
         // Investment-shape series are excluded from auto-post in this slice. Firing one
@@ -103,12 +124,62 @@ public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
         // (FireInvestmentAsync exists for the edited case). Excluded LOUDLY via the
         // backlog event rather than silently ignored — a user who set acdays on an
         // investment reminder is owed the same honesty the UI failed to give them.
+        //
+        // A series whose template has no lines is excluded the same way. Firing it is
+        // refused, so trying would fail the run every time, and it is announced by name
+        // because only the user can fix it: give it its lines, or delete it.
+        //
+        // So is a bank series whose template has a line on an inactive account: a new
+        // transaction never lands on a retired account, so firing it is refused too, and
+        // only the user can resolve it, by reactivating the account or editing the
+        // reminder. An investment series is already excluded as investment, whatever its
+        // accounts, so it is not also named here.
+        //
+        // So is a series whose fire would write a figure finer than its currency, a template
+        // line's own or a loan's stored escrow or fixed payment (ADR-0114 D15): the fire
+        // refuses it, so it can never post until the reminder or the loan terms are edited,
+        // and it is named because only the user can edit it to fit.
+        //
+        // So is a managed loan series whose payment would cross currencies (ADR-0114 D13,
+        // ADR-0097): the fire refuses it, and it is named, as one that uses an inactive
+        // account is, because only the user can resolve it.
         var eligible = new List<AutoPostCandidate>();
         var excludedInvestment = 0;
+        var excludedNoLines = 0;
+        var noLinesSeries = new Dictionary<Guid, string?>();
+        var excludedInactive = 0;
+        var inactiveSeries = new Dictionary<Guid, string?>();
+        var excludedUnfit = 0;
+        var unfitSeries = new Dictionary<Guid, string?>();
+        var excludedLoanAcross = 0;
+        var loanAcrossSeries = new Dictionary<Guid, string?>();
         foreach (var c in scan.Due)
         {
-            if (c.IsInvestmentShape) { excludedInvestment++; continue; }
-            eligible.Add(c);
+            switch (c.ExcludedReason)
+            {
+                case AutoPostExclusion.NoLines:
+                    excludedNoLines++;
+                    noLinesSeries[c.ReminderId] = c.Payee;
+                    break;
+                case AutoPostExclusion.Investment:
+                    excludedInvestment++;
+                    break;
+                case AutoPostExclusion.InactiveAccount:
+                    excludedInactive++;
+                    inactiveSeries[c.ReminderId] = c.Payee;
+                    break;
+                case AutoPostExclusion.LoanAcrossCurrencies:
+                    excludedLoanAcross++;
+                    loanAcrossSeries[c.ReminderId] = c.Payee;
+                    break;
+                case AutoPostExclusion.TemplateAmountDoesNotFit:
+                    excludedUnfit++;
+                    unfitSeries[c.ReminderId] = c.Payee;
+                    break;
+                default:
+                    eligible.Add(c);
+                    break;
+            }
         }
 
         // The cap is applied AFTER the exclusions, so permanently-ineligible candidates
@@ -118,6 +189,10 @@ public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
 
         var posted = 0;
         var resolvedByHand = 0;
+        var refusedUnfit = 0;
+        var refusedLoanAcross = 0;
+        var estimateUnavailable = 0;
+        var refusedBusy = 0;
         var failed = 0;
         Exception? firstFailure = null;
 
@@ -129,13 +204,58 @@ public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
                 await using var fireDb = _factory.Create();
                 var result = await NewRepository(fireDb)
                     .FireAsync(
-                        ledgerId, candidate.ReminderId, candidate.OccurrenceDate,
-                        configuredByUserId, ReminderCatchUp.LeaveEarlierOpen, cancellationToken)
+                        ledgerId, candidate.ReminderId, candidate.OccurrenceDate, cancellationToken)
                     .ConfigureAwait(false);
 
                 if (result.Outcome == RemindersRepository.FireOutcome.Ok)
                 {
                     posted++;
+                }
+                else if (result.Outcome == RemindersRepository.FireOutcome.TemplateAmountDoesNotFit)
+                {
+                    // A figure stored before each currency kept its own places, and finer than
+                    // its currency allows (ADR-0114 D15). The fire is a new write, so it is
+                    // refused: nothing posts a figure that does not fit. The scan sets such a
+                    // series aside by the fire's own predicate, so this is the backstop for a
+                    // series that changed between the scan and the fire. Not the schedule
+                    // failing, so not counted toward the auto-disable, and not a person
+                    // acting on the slot either: it is counted with the excluded ones, stays
+                    // due until it is edited, and the consistency check lists it. It is
+                    // named with the excluded ones too.
+                    refusedUnfit++;
+                    unfitSeries[candidate.ReminderId] = candidate.Payee;
+                    _logger.LogWarning(
+                        "Auto-post refused series {Series} occurrence {Date}: a template amount has more "
+                        + "decimal places than {Currency} allows.",
+                        candidate.ReminderId, candidate.OccurrenceDate, result.UnfitCurrencyCode);
+                }
+                else if (result.Outcome == RemindersRepository.FireOutcome.LoanAcrossCurrencies)
+                {
+                    // The backstop for a managed loan series whose account changed currency
+                    // between the scan and the fire (ADR-0114 D13): refused, nothing written.
+                    // Like the places backstop above, not the schedule failing and not a
+                    // person acting on the slot: counted and named with the excluded ones,
+                    // and it stays due.
+                    refusedLoanAcross++;
+                    loanAcrossSeries[candidate.ReminderId] = candidate.Payee;
+                    _logger.LogWarning(
+                        "Auto-post refused series {Series} occurrence {Date}: the loan is in {Loan} and the "
+                        + "payment would use an account in {Other}.",
+                        candidate.ReminderId, candidate.OccurrenceDate,
+                        result.LoanCurrencies?.LoanCurrency, result.LoanCurrencies?.OtherCurrency);
+                }
+                else if (result.Outcome == RemindersRepository.FireOutcome.EstimateUnavailableForFire)
+                {
+                    // The series estimates its amount and has no estimate for this
+                    // occurrence: no history yet, or, on a transfer between currencies, no
+                    // derived rate for its due date (ADR-0114 D13, ADR-0097). Nothing is
+                    // written and the occurrence stays due for the next run. Not a person
+                    // acting on the slot, and not the schedule failing either, so never a
+                    // step toward the auto-disable: it is counted under its own key.
+                    estimateUnavailable++;
+                    _logger.LogInformation(
+                        "Auto-post left series {Series} occurrence {Date} due: its estimate is unavailable.",
+                        candidate.ReminderId, candidate.OccurrenceDate);
                 }
                 else
                 {
@@ -153,6 +273,18 @@ public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
             {
                 throw;
             }
+            catch (Exception ex) when (LedgerWriteLock.IsBusy(ex))
+            {
+                // Another write to the ledger held its write lock past the wait (migration
+                // 275). The fire's transaction rolled back, so the occurrence is neither
+                // posted nor marked: it is still due, and the next run posts it. Ordinary
+                // activity on the ledger, not the schedule failing, so it is not counted
+                // toward the auto-disable either.
+                refusedBusy++;
+                _logger.LogInformation(
+                    ex, "Auto-post deferred series {Series} occurrence {Date}: the ledger was being written.",
+                    candidate.ReminderId, candidate.OccurrenceDate);
+            }
             catch (Exception ex)
             {
                 failed++;
@@ -167,18 +299,36 @@ public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
             }
         }
 
+        // As the schedule's user, under that user's consent, as the scheduled quote refresh
+        // fetches. A read that fails is logged and starts nothing: it never costs the run.
+        if (posted > 0 && _backfill is not null && startsBefore is { } before)
+        {
+            await using var startsDb = _factory.Create();
+            await _backfill.StartIfEarlierAsync(
+                    startsDb, ledgerId, configuredByUserId, before, cancellationToken, "scheduled")
+                .ConfigureAwait(false);
+        }
+
         await AnnounceBacklogAsync(
-                ledgerId, scan.TooOldToPost, deferredByCap, excludedInvestment, cancellationToken)
+                ledgerId, scan.TooOldToPost, deferredByCap, refusedBusy, excludedInvestment,
+                excludedNoLines, noLinesSeries.Values.ToList(),
+                excludedInactive, inactiveSeries.Values.ToList(),
+                excludedUnfit + refusedUnfit, unfitSeries.Values.ToList(),
+                excludedLoanAcross + refusedLoanAcross, loanAcrossSeries.Values.ToList(),
+                estimateUnavailable,
+                cancellationToken)
             .ConfigureAwait(false);
 
         if (failed == 0)
         {
-            if (posted > 0 || resolvedByHand > 0)
+            if (posted > 0 || resolvedByHand > 0 || refusedUnfit > 0 || refusedLoanAcross > 0)
             {
                 _logger.LogInformation(
-                    "Auto-post posted {Posted} occurrence(s) for ledger {Ledger}.", posted, ledgerId);
+                    "Auto-post posted {Posted} occurrence(s) for ledger {Ledger}; {Unfit} refused for a template "
+                    + "amount that does not fit its currency; {LoanAcross} refused for a loan payment across "
+                    + "currencies.", posted, ledgerId, refusedUnfit, refusedLoanAcross);
             }
-            return JobRunOutcome.Ok();
+            return SettledOutcome(posted, refusedBusy, refusedUnfit, refusedLoanAcross, toPost.Count);
         }
 
         // Nothing landed and something broke: THROW. This is the only path to the
@@ -188,15 +338,64 @@ public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
         if (posted == 0)
         {
             throw new InvalidOperationException(
-                $"Auto-post posted nothing: all {failed} due occurrence(s) failed. "
+                $"Auto-post posted nothing: {NotPosted(failed, refusedBusy, toPost.Count)} "
                 + "See the server log for per-occurrence detail.",
                 firstFailure);
         }
 
         return JobRunOutcome.Degraded(
-            $"{failed} of {toPost.Count} due occurrence(s) did not post. "
-            + "See the server log for per-occurrence detail.");
+            $"{NotPosted(failed, refusedBusy, toPost.Count)} See the server log for per-occurrence detail.");
     }
+
+    /// <summary>
+    /// The outcome of a run in which no fire failed: Ok when every fire it tried landed,
+    /// else Degraded with counts, and DidNothing when nothing posted at all, which leaves
+    /// <c>last_success_at</c> where it was.
+    /// </summary>
+    /// <remarks>
+    /// Three refusals leave part of the work undone without a failure, so none is a throw
+    /// toward the auto-disable: a fire deferred because the ledger was being written (the
+    /// next run posts it), the backstop refusal of a figure that does not fit its currency
+    /// (ADR-0114 D15), which stays due until it is edited, and the backstop refusal of a
+    /// managed loan payment across currencies (ADR-0114 D13), which stays due until its
+    /// accounts are in the loan's currency. A series the scan set aside is not counted
+    /// here: like every exclusion it is announced in the backlog event and is not the
+    /// run's health.
+    /// </remarks>
+    internal static JobRunOutcome SettledOutcome(
+        int posted, int refusedBusy, int refusedUnfit, int refusedLoanAcross, int due)
+    {
+        if (refusedBusy == 0 && refusedUnfit == 0 && refusedLoanAcross == 0) return JobRunOutcome.Ok();
+
+        var message = string.Join(" ", new[]
+        {
+            refusedBusy == 0 ? null
+                : $"{refusedBusy} of {due} due occurrence(s) were not posted because another change "
+                  + "to this ledger was still being saved. The next run posts them.",
+            refusedUnfit == 0 ? null
+                : $"{refusedUnfit} of {due} due occurrence(s) were not posted because a figure has more "
+                  + "decimal places than its currency uses. They stay due until the figure is edited to fit.",
+            refusedLoanAcross == 0 ? null
+                : $"{refusedLoanAcross} of {due} due occurrence(s) were not posted because a loan payment "
+                  + "would use an account in another currency than the loan's. They stay due until it does not.",
+        }.Where(s => s is not null));
+        return posted > 0 ? JobRunOutcome.Degraded(message) : JobRunOutcome.DidNothing(message);
+    }
+
+    /// <summary>
+    /// How many of the run's <paramref name="due"/> occurrences failed, and how many were
+    /// deferred because the ledger was being written, for a run in which at least one
+    /// failed.
+    /// </summary>
+    /// <remarks>Both counts, because they ask different things of the reader: a failure is
+    /// in the server log, and a deferred occurrence is still due and the next run posts it.
+    /// An occurrence a person acted on between the scan and the fire is neither.</remarks>
+    private static string NotPosted(int failed, int deferredBusy, int due) =>
+        $"{failed} of {due} due occurrence(s) failed"
+        + (deferredBusy == 0
+            ? "."
+            : $", and {deferredBusy} {(deferredBusy == 1 ? "was" : "were")} deferred because another change "
+              + $"to this ledger was still being saved (the next run posts {(deferredBusy == 1 ? "it" : "them")}).");
 
     /// <summary>
     /// A reminders repository over one worker-owned context.
@@ -210,7 +409,7 @@ public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
     /// constructing them here is enough and makes the role explicit at the call site.
     /// </remarks>
     private RemindersRepository NewRepository(AppDbContext db) =>
-        new(db, _expander, new InvestmentTransactionsRepository(db), new TransactionsRepository(db, _clock));
+        new(db, _expander, new InvestmentTransactionsRepository(db, _clock), new TransactionsRepository(db, _clock), _clock);
 
     /// <summary>
     /// Publish, or clear, the standing "this run left occurrences behind" warning.
@@ -233,17 +432,33 @@ public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
     /// </para>
     /// </remarks>
     private async Task AnnounceBacklogAsync(
-        Guid ledgerId, int tooOld, int deferredByCap, int excludedInvestment,
+        Guid ledgerId, int tooOld, int deferredByCap, int deferredBusy, int excludedInvestment,
+        int excludedNoLines, IReadOnlyList<string?> noLinesNames,
+        int excludedInactive, IReadOnlyList<string?> inactiveNames,
+        int notFitting, IReadOnlyList<string?> notFittingNames,
+        int loanAcross, IReadOnlyList<string?> loanAcrossNames,
+        int estimateUnavailable,
         CancellationToken cancellationToken)
     {
-        var total = tooOld + deferredByCap + excludedInvestment;
+        var total = tooOld + deferredByCap + deferredBusy + excludedInvestment + excludedNoLines + excludedInactive
+                    + notFitting + loanAcross + estimateUnavailable;
 
         var (severity, key, summary) = total == 0
             ? (NotificationSeverity.Info, "reminder-backlog.clear",
                "Every reminder due for automatic posting was posted.")
             : (NotificationSeverity.Warning, "reminder-backlog.deferred",
                $"{total} reminder occurrence(s) were not posted automatically and are "
-               + "waiting for you on the calendar.");
+               + "waiting for you on the calendar."
+               + NamedSentence(noLinesNames, "they have no lines",
+                   "Edit each to give it its lines, or delete it.")
+               + NamedSentence(inactiveNames, "they use an inactive account",
+                   "Reactivate the account, or edit each to use an active one.")
+               // ADR-0097's 2026-11-14 amendment: named as those that use an inactive account are.
+               + NamedSentence(loanAcrossNames, "they use an account in another currency than their loan's",
+                   "Use accounts in the loan's currency, or enter each payment as a transfer with both amounts.")
+               // ADR-0114 D15 (decided by the owner, 2026-11-18): named as the others are.
+               + NamedSentence(notFittingNames, "a figure has more decimal places than its currency uses",
+                   "Edit each reminder, or its loan's terms, so every figure fits its currency."));
 
         // Counts, never dates. This is delivered to whatever URL a ledger holder
         // configured and is readable by every grant holder; a payment schedule is not
@@ -254,7 +469,23 @@ public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
             {
                 ["older_than_catch_up_window"] = tooOld.ToString(),
                 ["over_per_run_cap"] = deferredByCap.ToString(),
+                // Refused by the ledger write lock's busy refusal this run; still due, and
+                // posted by the next run.
+                ["ledger_busy"] = deferredBusy.ToString(),
                 ["investment_series_not_supported"] = excludedInvestment.ToString(),
+                ["template_has_no_lines"] = excludedNoLines.ToString(),
+                ["template_uses_inactive_account"] = excludedInactive.ToString(),
+                // Set aside by the scan, or refused by the fire's backstop, because a figure
+                // the fire would write has more places than its currency (ADR-0114 D15).
+                ["template_amount_does_not_fit"] = notFitting.ToString(),
+                // Set aside by the scan, or refused by the fire's backstop, because a managed
+                // loan payment would use an account in another currency than the loan's
+                // (ADR-0114 D13, ADR-0097).
+                ["managed_loan_across_currencies"] = loanAcross.ToString(),
+                // Refused by the fire because the series' estimate is unavailable for the
+                // occurrence: no history yet, or no derived rate for its due date between
+                // currencies (ADR-0114 D13, ADR-0097). Still due, tried by the next run.
+                ["estimate_unavailable"] = estimateUnavailable.ToString(),
             };
 
         try
@@ -283,5 +514,32 @@ public sealed class ReminderAutoPostJobHandler : IScheduledJobHandler
             // not a reason to report that transactions failed to post when they posted.
             _logger.LogError(ex, "Auto-post could not publish its backlog event.");
         }
+    }
+
+    /// <summary>
+    /// The sentence naming the reminders that cannot be posted for one reason (their
+    /// template has no lines, uses an inactive account, is a loan payment across
+    /// currencies, or has a figure finer than its currency) and what the user can do, or
+    /// nothing when there are none.
+    /// </summary>
+    /// <remarks>
+    /// Named, unlike the other reasons, because the fix is by hand and per reminder: the
+    /// calendar shows the occurrence but not why it never posts. It is the name the
+    /// reminders list shows, with no date or amount, so the payment schedule the counts
+    /// above keep off the wire stays off it; the consistency monitor names positions on the
+    /// same channel for the same reason. At most three are listed per reason, so a ledger
+    /// with many does not turn the summary into a list.
+    /// </remarks>
+    private static string NamedSentence(IReadOnlyList<string?> names, string because, string fix)
+    {
+        if (names.Count == 0) return string.Empty;
+        var shown = names
+            .Select(n => string.IsNullOrWhiteSpace(n) ? "Untitled reminder" : n)
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .Take(3)
+            .Select(n => $"\"{n}\"");
+        return $" {names.Count} reminder(s) cannot be posted because {because} ("
+               + string.Join("; ", shown) + (names.Count > 3 ? "; ..." : "")
+               + $"). {fix}";
     }
 }

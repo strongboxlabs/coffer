@@ -30,6 +30,29 @@ public sealed class SchedulesRepository
         return row is null ? null : ToDto(row);
     }
 
+    /// <summary>Every configured schedule on the ledger, by job type. A job type with no
+    /// row is absent; the caller supplies its default.</summary>
+    public async Task<Dictionary<string, ScheduleDto>> ListAsync(
+        Guid ledgerId, CancellationToken cancellationToken = default)
+    {
+        var rows = await _db.ScheduledJobs.AsNoTracking()
+            .Where(j => j.LedgerId == ledgerId)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return rows.ToDictionary(r => r.JobType, ToDto, StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// Whether this (ledger, job_type) schedule has a row, enabled or not: what
+    /// <see cref="EnsureCreatedEnabledAsync"/> leaves alone, and what the consistency
+    /// check's <c>reminder_auto_post</c> projection asks of a ledger whose reminders ask
+    /// to be auto-posted.
+    /// </summary>
+    public Task<bool> ExistsAsync(
+        Guid ledgerId, string jobType, CancellationToken cancellationToken = default) =>
+        _db.ScheduledJobs.AsNoTracking()
+            .AnyAsync(j => j.LedgerId == ledgerId && j.JobType == jobType, cancellationToken);
+
     /// <summary>
     /// Create this (ledger, job_type) schedule ENABLED if it does not exist yet, and
     /// leave it exactly as it is if it does. Returns whether a row was created.
@@ -66,12 +89,9 @@ public sealed class SchedulesRepository
         DateTime nowUtc,
         CancellationToken cancellationToken = default)
     {
-        var exists = await _db.ScheduledJobs
-            .AnyAsync(j => j.LedgerId == ledgerId && j.JobType == jobType, cancellationToken)
-            .ConfigureAwait(false);
-        if (exists) return false;
+        if (await ExistsAsync(ledgerId, jobType, cancellationToken).ConfigureAwait(false)) return false;
 
-        _db.ScheduledJobs.Add(new ScheduledJobRow
+        var row = new ScheduledJobRow
         {
             LedgerId = ledgerId,
             JobType = jobType,
@@ -82,10 +102,35 @@ public sealed class SchedulesRepository
             NextRunAt = DailyScheduleTiming.NextRunUtc(hourLocal, 0, null, nowUtc),
             ConfiguredByUserId = configuredByUserId,
             UpdatedAt = nowUtc,
-        });
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        return true;
+        };
+        _db.ScheduledJobs.Add(row);
+        try
+        {
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (DbUpdateException ex) when (IsDuplicateSchedule(ex))
+        {
+            // Another writer created the row between the read above and this insert: a
+            // reminder save and a consistency Repair can both find it absent. The row exists,
+            // which is all this asks, and it is left as that writer made it. Inside a caller's
+            // transaction EF's savepoint around the save rolls back only this insert, so the
+            // caller's transaction can still commit.
+            _db.Entry(row).State = EntityState.Detached;
+            return false;
+        }
     }
+
+    /// <summary>
+    /// Is this the primary key refusing a second row for the same (ledger, job_type)?
+    /// Named on the constraint, so a duplicate on anything else still fails the save.
+    /// </summary>
+    private static bool IsDuplicateSchedule(DbUpdateException ex) =>
+        ex.InnerException is Npgsql.PostgresException
+        {
+            SqlState: Npgsql.PostgresErrorCodes.UniqueViolation,
+            ConstraintName: "pk_scheduled_jobs",
+        };
 
     /// <summary>Upsert the (ledger, job_type) schedule; <c>next_run_at</c>
     /// recomputed when enabled, cleared when disabled.</summary>
@@ -115,11 +160,11 @@ public sealed class SchedulesRepository
         // nowhere else.
         //
         // It is not cosmetic. consecutive_failures is a streak the scheduler compares
-        // against DisableAfterConsecutiveFailures, and it survived a re-enable — so a
-        // job auto-disabled at five came back still holding five, and the next single
-        // failure computed six and switched it straight off again. Re-enabling granted
-        // one attempt, not five, and the log line that says "re-enable it once the cause
-        // is fixed" promised otherwise.
+        // against DisableAfterConsecutiveFailures. Surviving a re-enable, a job
+        // auto-disabled at five would come back still holding five, and the next single
+        // failure would compute six and switch it straight off again: re-enabling would
+        // grant one attempt, not five, against the log line that says "re-enable it once
+        // the cause is fixed".
         //
         // Narrow on purpose: not on every upsert, because changing the time on an
         // already-enabled failing job must not launder its state, and not on disable,

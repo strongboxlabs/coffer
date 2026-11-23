@@ -9,9 +9,9 @@ export const SETTINGS_TAB_IDS = [
     'snapshots',
     'feeds',
     'quotes',
+    'rates',
     'notifications',
     'activity',
-    'dashboard',
     'layouts',
 ] as const;
 
@@ -23,11 +23,15 @@ export const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; label: string }> = 
     { id: 'snapshots', label: 'Snapshots' },
     { id: 'feeds', label: 'Bank feeds' },
     { id: 'quotes', label: 'Quotes' },
+    // After Quotes (ADR-0114 D10): the rates the ledger's totals convert at, which the
+    // conversion note under a page header links to.
+    { id: 'rates', label: 'Exchange rates' },
     // Before Activity: Activity is the log of what happened, this is where you
     // say who gets told about it.
     { id: 'notifications', label: 'Notifications' },
     { id: 'activity', label: 'Activity' },
-    { id: 'dashboard', label: 'Dashboard' },
+    // No Dashboard tab: the Overview is customised in place (edit mode), and an old
+    // ?tab=dashboard link falls through to General like any unknown tab.
     // After Bank feeds conceptually, but last in the strip: it is the
     // rarest visit of the lot — you come here to prune, not to set up.
     { id: 'layouts', label: 'Import layouts' },

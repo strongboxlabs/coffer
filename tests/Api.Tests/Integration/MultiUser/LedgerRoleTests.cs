@@ -23,22 +23,23 @@ namespace Coffer.Api.Tests.Integration.MultiUser;
 /// asserted here; the trigger is dev-validated.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class LedgerRoleTests
+public sealed class LedgerRoleTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public LedgerRoleTests(PostgresFixture fixture) => _fixture = fixture;
+    public LedgerRoleTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     [Fact]
     public async Task Viewer_reads_but_cannot_write_while_editor_and_owner_write()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var account = await ledger.AddBankAccountAsync("checking");
         var viewerId = await ledger.AddMemberAsync("viewer");
         var editorId = await ledger.AddMemberAsync("editor");
 
         // Viewer: SELECT is allowed — the _read policy passes for any grant.
-        await using (var viewerDb = _fixture.NewAppDbContextAsUser(viewerId))
+        await using (var viewerDb = Db.NewAppDbContextAsUser(viewerId))
         {
             Assert.True(await viewerDb.Accounts.AnyAsync(a => a.Id == account.Id));
 
@@ -52,7 +53,7 @@ public sealed class LedgerRoleTests
         }
 
         // Editor: the same write lands.
-        await using (var editorDb = _fixture.NewAppDbContextAsUser(editorId))
+        await using (var editorDb = Db.NewAppDbContextAsUser(editorId))
         {
             var affected = await editorDb.Accounts
                 .Where(a => a.Id == account.Id)
@@ -61,7 +62,7 @@ public sealed class LedgerRoleTests
         }
 
         // Owner: also writes.
-        await using (var ownerDb = _fixture.NewAppDbContextAsUser(ledger.UserId))
+        await using (var ownerDb = Db.NewAppDbContextAsUser(ledger.UserId))
         {
             var affected = await ownerDb.Accounts
                 .Where(a => a.Id == account.Id)
@@ -74,10 +75,10 @@ public sealed class LedgerRoleTests
     public async Task Members_hide_system_and_enforce_at_least_one_human_owner()
     {
         // A synthetic ledger has two owners: the test user + the system identity.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var viewerId = await ledger.AddMemberAsync("viewer");
         var repo = new LedgersRepository(
-            _fixture.NewDbContext(), _fixture.NewServiceFactory(), _fixture.NewLedgerKeyService(), TimeProvider.System);
+            Db.NewDbContext(), Db.NewServiceFactory(), Db.NewLedgerKeyService(), TimeProvider.System);
 
         // The system service identity is hidden; the human owner + viewer show, and
         // exactly one HUMAN owner is counted.
@@ -115,9 +116,9 @@ public sealed class LedgerRoleTests
     [Fact]
     public async Task Admin_user_management_lists_hides_system_and_toggles_flags()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var second = await ledger.AddMemberAsync("viewer");
-        var repo = new UsersRepository(_fixture.NewDbContext(), _fixture.NewServiceFactory());
+        var repo = new UsersRepository(Db.NewDbContext(), Db.NewServiceFactory());
 
         // The ledger owner appears as a non-admin, non-disabled user with ≥1 ledger;
         // the synthetic system identity is hidden.

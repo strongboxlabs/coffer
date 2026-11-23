@@ -2,22 +2,22 @@
 -- 234 — one deterministic definition of "the day's trade price", and the
 --       writer starts using it.
 --
--- Two defects, found by running migration 232's check against a real ledger.
+-- Two defects, each of which migration 232's check reports as drift.
 --
 -- 1. THE RULE WAS NOT DETERMINISTIC. "The last trade of the day by h.seq" has
 --    no tie-break, and ONE header can carry many security legs at different
---    prices (a share transfer moves each lot at its own basis). Found on a real
---    ledger: several legs on one seq at several distinct prices, where the stored
---    row held one and the check expected another. DISTINCT ON picks arbitrarily
+--    prices (a share transfer moves each lot at its own basis). So several legs
+--    on one seq can carry several distinct prices, the stored row holding one and
+--    the check expecting another. DISTINCT ON picks arbitrarily
 --    among ties, so the two sides were not disagreeing about the data — they
 --    were disagreeing about which coin flip to believe, and a repair could
 --    re-report the same day forever without converging.
 --
 -- 2. THE WRITER NEVER APPLIED THE RULE. TradePriceFromLegInterceptor upserted
 --    the price of whatever leg the save touched, without looking at the other
---    legs on that day. Correcting a leg of hundreds of shares therefore wrote its
---    price, while the checker — correctly applying the rule — derived the price
---    of a fractional-share fee fragment posted later the same day. Both were right by
+--    legs on that day. Correcting one leg therefore wrote its price, while the
+--    checker — correctly applying the rule — could derive the price of another
+--    leg posted later the same day, down to a fractional-share fee fragment. Both were right by
 --    their own rule. That is not drift; it is two different rules.
 --
 -- So the rule moves HERE, once, and everything else calls it:
@@ -30,7 +30,7 @@
 --   * h.seq       — the day's LAST trade, unchanged (ADR-0084).
 --   * abs(amount) — among legs sharing a header, the largest by value is the
 --                   most representative; a fragment worth cents should not
---                   outrank a five-figure execution merely by sharing its header.
+--                   outrank a full execution merely by sharing its header.
 --   * l.id        — a total order, so the answer can never vary between two
 --                   runs over identical data. Without it the first two columns
 --                   still tie whenever one header holds two legs of equal value.

@@ -20,17 +20,18 @@ namespace Coffer.Api.Tests.Integration.Notifications;
 /// so a restarted process does not start over.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ConsistencyStateTests
+public sealed class ConsistencyStateTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ConsistencyStateTests(PostgresFixture fixture) => _fixture = fixture;
+    public ConsistencyStateTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private ConsistencyMonitor NewMonitor() => new(
-        _fixture.NewServiceFactory(),
+        Db.NewServiceFactory(),
         new NotificationPublisher(
-            _fixture.NewServiceFactory(),
-            _fixture.NewLedgerKeyService(),
+            Db.NewServiceFactory(),
+            Db.NewLedgerKeyService(),
             Array.Empty<INotificationSubscriber>(),
             NullLogger<NotificationPublisher>.Instance, TimeProvider.System),
         NullLogger<ConsistencyMonitor>.Instance, TimeProvider.System);
@@ -38,9 +39,9 @@ public sealed class ConsistencyStateTests
     [Fact]
     public async Task A_check_records_its_verdict_and_when_it_ran()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
-        await using (var db = _fixture.NewServiceDbContext())
+        await using (var db = Db.NewServiceDbContext())
         {
             // No row at all is the third state — "nobody has looked at this" —
             // and it must be distinguishable from a healthy verdict, not merely
@@ -51,7 +52,7 @@ public sealed class ConsistencyStateTests
 
         await NewMonitor().CheckAllAsync();
 
-        await using (var db = _fixture.NewServiceDbContext())
+        await using (var db = Db.NewServiceDbContext())
         {
             var state = await db.LedgerConsistencyStates.AsNoTracking()
                 .FirstOrDefaultAsync(r => r.LedgerId == ledger.LedgerId);
@@ -70,13 +71,13 @@ public sealed class ConsistencyStateTests
     [Fact]
     public async Task A_ledger_checked_recently_is_skipped_on_the_next_pass()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var monitor = NewMonitor();
 
         await monitor.CheckAllAsync();
 
         DateTime? first;
-        await using (var db = _fixture.NewServiceDbContext())
+        await using (var db = Db.NewServiceDbContext())
         {
             first = (await db.LedgerConsistencyStates.AsNoTracking()
                 .SingleAsync(r => r.LedgerId == ledger.LedgerId)).LastCheckedAt;
@@ -88,7 +89,7 @@ public sealed class ConsistencyStateTests
         // twice a day (FU-045).
         await monitor.CheckAllAsync();
 
-        await using (var db = _fixture.NewServiceDbContext())
+        await using (var db = Db.NewServiceDbContext())
         {
             var again = (await db.LedgerConsistencyStates.AsNoTracking()
                 .SingleAsync(r => r.LedgerId == ledger.LedgerId)).LastCheckedAt;
@@ -99,13 +100,13 @@ public sealed class ConsistencyStateTests
     [Fact]
     public async Task A_ledger_last_checked_beyond_the_cadence_is_checked_again()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var monitor = NewMonitor();
         await monitor.CheckAllAsync();
 
         // Age the recorded check past the cadence. Asserting the skip alone would
         // pass against a monitor that had simply stopped working.
-        await using (var db = _fixture.NewServiceDbContext())
+        await using (var db = Db.NewServiceDbContext())
         {
             var state = await db.LedgerConsistencyStates
                 .SingleAsync(r => r.LedgerId == ledger.LedgerId);
@@ -116,7 +117,7 @@ public sealed class ConsistencyStateTests
 
         await monitor.CheckAllAsync();
 
-        await using (var db = _fixture.NewServiceDbContext())
+        await using (var db = Db.NewServiceDbContext())
         {
             var state = await db.LedgerConsistencyStates.AsNoTracking()
                 .SingleAsync(r => r.LedgerId == ledger.LedgerId);
@@ -135,11 +136,11 @@ public sealed class ConsistencyStateTests
         // is the one that proves the three-valued logic lands on DUE and not on the
         // silent opposite. Ageing the timestamp (the test above) would pass either
         // way.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var monitor = NewMonitor();
         await monitor.CheckAllAsync();
 
-        await using (var db = _fixture.NewServiceDbContext())
+        await using (var db = Db.NewServiceDbContext())
         {
             var state = await db.LedgerConsistencyStates
                 .SingleAsync(r => r.LedgerId == ledger.LedgerId);
@@ -150,7 +151,7 @@ public sealed class ConsistencyStateTests
 
         await monitor.CheckAllAsync();
 
-        await using (var db = _fixture.NewServiceDbContext())
+        await using (var db = Db.NewServiceDbContext())
         {
             var state = await db.LedgerConsistencyStates.AsNoTracking()
                 .SingleAsync(r => r.LedgerId == ledger.LedgerId);
@@ -167,10 +168,10 @@ public sealed class ConsistencyStateTests
         // and forgot the verdict would leave `healthy = true` standing as a claim
         // about data nothing had checked — and it would READ as a green light,
         // which is the failure direction that matters.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await NewMonitor().CheckAllAsync();
 
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         var state = await db.LedgerConsistencyStates
             .SingleAsync(r => r.LedgerId == ledger.LedgerId);
         state.LastCheckedAt = null;   // verdict deliberately left behind

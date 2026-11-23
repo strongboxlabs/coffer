@@ -25,11 +25,12 @@ namespace Coffer.Api.Tests.Integration.Reminders;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ReminderOccurrenceUniquenessUpgradeTests
+public sealed class ReminderOccurrenceUniquenessUpgradeTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ReminderOccurrenceUniquenessUpgradeTests(PostgresFixture fixture) => _fixture = fixture;
+    public ReminderOccurrenceUniquenessUpgradeTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private const string Mig218 = "218_reminder_occurrence_is_unique.sql";
 
@@ -39,7 +40,7 @@ public sealed class ReminderOccurrenceUniquenessUpgradeTests
     private async Task<(string ConnectionString, string WorkDir)> FreshInstallBefore218Async(string dbName)
     {
         var work = Directory.CreateTempSubdirectory("coffer-mig218-").FullName;
-        var cs = _fixture.EmptyDatabaseConnectionString(dbName);
+        var cs = Db.EmptyDatabaseConnectionString(dbName);
         UpgradeRehearsal.RunStaged(cs, UpgradeRehearsal.StageBefore(Mig218, work));
         return (cs, work);
     }
@@ -55,8 +56,7 @@ public sealed class ReminderOccurrenceUniquenessUpgradeTests
     /// <para>
     /// No account is needed, but NOT because source_account_id is gone — 124 dropped it
     /// and 125 put it back, 126 again idempotently. It is nullable, which is why a seed
-    /// can omit it. (An earlier version of this comment said it had been dropped, which
-    /// reached the right conclusion for the wrong reason.)
+    /// can omit it.
     /// </para>
     /// </remarks>
     private static async Task SeedSeriesAsync(string connectionString)

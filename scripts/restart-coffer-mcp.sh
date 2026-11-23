@@ -2,9 +2,10 @@
 #
 # Recover a wedged Coffer MCP connection (Linux / macOS / WSL).
 #
-# Claude Desktop / Gemini reach the remote Coffer MCP server through a local
-# `npx mcp-remote` Node proxy. That proxy occasionally hangs (dead socket to the
-# CDN), and then every MCP call times out even though the server is fine. This:
+# For an MCP client that reaches the Coffer MCP server through a local
+# `npx mcp-remote` Node proxy. When that proxy's connection to the server dies
+# without the proxy noticing, every MCP call times out while the server itself
+# is healthy. Use this when MCP calls time out. It:
 #   1. lists + kills the mcp-remote proxy process(es) for this server,
 #   2. health-checks the server's public OAuth discovery endpoint so you can tell
 #      "hung proxy" (server answers) from "server actually down",
@@ -57,7 +58,7 @@ targets=()
 for row in "${rows[@]}"; do
     pid="${row%% *}"
     args="${row#* }"
-    if [ "$ALL_PROXIES" -eq 1 ] || printf '%s' "$args" | grep -qiF "$SERVER"; then
+    if [ "$ALL_PROXIES" -eq 1 ] || grep -qiF "$SERVER" <<<"$args"; then
         targets+=("$pid")
         yellow "  PID ${pid}: ${args:0:150}"
     fi
@@ -80,7 +81,8 @@ else
 fi
 
 # 2) Is the SERVER up, or just the proxy? ---------------------------------
-# Any HTTP response (even 401/404) means the server + CDN are reachable, so the
+# Any HTTP response (even 401/404) means the server, and any proxy or CDN in front
+# of it, is reachable, so the
 # timeout was the local proxy. Only a connection failure points at the server.
 cyan ""
 cyan "== 2. server health =="
@@ -91,13 +93,13 @@ code="$(curl -sS -o "$body" -w '%{http_code}' --max-time 15 "$discovery" 2>/dev/
 
 if [ "$code" = "000" ]; then
     yellow "  Connection FAILED to ${discovery} (timeout, DNS, or refused)."
-    yellow "  -> server/network problem. Check Traefik / the container, not the proxy."
+    yellow "  -> server/network problem. Check the reverse proxy / the container, not the local proxy."
 elif grep -qiE 'just a moment|enable javascript|challenge-platform' "$body"; then
     yellow "  Reachable (HTTP ${code}) but got a CDN bot-challenge page instead of JSON."
-    yellow "  -> the MCP subdomain may have lost its DNS-only (grey-cloud) setting in Cloudflare."
+    yellow "  -> exempt the MCP host from the CDN's challenge (on Cloudflare: make its DNS record DNS-only)."
 else
     green "  Server reachable: HTTP ${code} from ${discovery}"
-    green "  -> server + CDN are up; the timeout was the local proxy (now killed). A 401/404 here is fine."
+    green "  -> the server is up; the timeout was the local proxy (now killed). A 401/404 here is fine."
 fi
 
 # 3) Optional: clear cached OAuth token -----------------------------------
@@ -119,5 +121,5 @@ fi
 # 4) Next step ------------------------------------------------------------
 cyan ""
 cyan "== Done =="
-cyan "Fully quit the MCP client (Claude Desktop: tray -> Quit) and reopen it"
+cyan "Fully quit the MCP client (a tray app: tray -> Quit, not just close the window) and reopen it"
 cyan "so it spawns a fresh mcp-remote proxy against ${SERVER}."

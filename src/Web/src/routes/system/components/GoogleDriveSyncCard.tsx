@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useEffect, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import {
     disconnectDrive,
@@ -12,6 +13,9 @@ import type { DriveSyncStatus } from '@/lib/types';
 import { Button } from '@/components/ui/Button';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { Panel, PanelBody } from '@/components/ui/Panel';
+import { usePendingChoiceProps } from '@/components/ui/pending';
+import { PendingLabel } from '@/components/ui/PendingLabel';
+import { useFocusHandOff } from '@/components/ui/rowRemovalFocus';
 
 import { ConnectDriveDialog } from './ConnectDriveDialog';
 
@@ -30,6 +34,8 @@ const STALE_AFTER_MS = 25 * 60 * 60 * 1000;
  */
 export function GoogleDriveSyncCard() {
     const queryClient = useQueryClient();
+    // The sync switch writes: it holds from the change (pending.ts).
+    const pendingChoiceProps = usePendingChoiceProps();
     const statusQuery = useQuery({ queryKey: DRIVE_KEY, queryFn: fetchDriveSyncStatus });
     const status = statusQuery.data;
 
@@ -37,6 +43,12 @@ export function GoogleDriveSyncCard() {
     const [disconnectOpen, setDisconnectOpen] = useState(false);
     const [actionError, setActionError] = useState<string | null>(null);
     const [returnNotice, setReturnNotice] = useState<{ ok: boolean; text: string } | null>(null);
+    // A landed disconnect swaps the connected controls for Connect Google Drive:
+    // Disconnect, which the confirm gave focus back to, hands it on to Connect
+    // (ADR-0023 §L). The confirm names Connect too, for a status read that takes
+    // Disconnect away while the confirm is still open.
+    const connectRef = useRef<HTMLButtonElement | null>(null);
+    const disconnectHandOff = useFocusHandOff(() => connectRef.current);
 
     function refresh() {
         queryClient.invalidateQueries({ queryKey: DRIVE_KEY });
@@ -146,9 +158,10 @@ export function GoogleDriveSyncCard() {
                             <input
                                 type="checkbox"
                                 checked={status.enabled}
-                                disabled={busy}
-                                onChange={(e) => enableMutation.mutate(e.target.checked)}
-                                className="size-icon-md rounded border-border text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                                className="size-icon-md rounded border-border text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
+                                {...pendingChoiceProps<HTMLInputElement>(busy, {
+                                    onChange: (e) => enableMutation.mutate(e.target.checked),
+                                })}
                             />
                             <span>Keep Google Drive in sync after each new backup</span>
                         </label>
@@ -161,12 +174,12 @@ export function GoogleDriveSyncCard() {
 
                         <div className="flex flex-wrap items-center gap-1.5">
                             <Button type="button" variant="primary" size="sm"
-                                onClick={() => uploadMutation.mutate()} disabled={busy}
+                                onClick={() => uploadMutation.mutate()} pending={busy}
                                 title="Make the Drive folder match your local backups now — upload missing, remove extras">
-                                {uploadMutation.isPending ? 'Syncing…' : 'Sync to Drive now'}
+                                <PendingLabel pending={uploadMutation.isPending} label="Sync to Drive now" pendingLabel="Syncing…" />
                             </Button>
-                            <Button type="button" variant="ghost" size="sm"
-                                onClick={() => setDisconnectOpen(true)} disabled={busy}
+                            <Button ref={disconnectHandOff} type="button" variant="ghost" size="sm"
+                                onClick={() => setDisconnectOpen(true)} pending={busy}
                                 className="text-state-danger hover:bg-state-danger-soft">
                                 Disconnect
                             </Button>
@@ -174,7 +187,7 @@ export function GoogleDriveSyncCard() {
                     </>
                 ) : (
                     <div>
-                        <Button type="button" variant="primary" size="sm" onClick={() => setConnectOpen(true)}>
+                        <Button ref={connectRef} type="button" variant="primary" size="sm" onClick={() => setConnectOpen(true)}>
                             Connect Google Drive
                         </Button>
                     </div>
@@ -205,6 +218,7 @@ export function GoogleDriveSyncCard() {
                 body="Coffer will revoke its access at Google, forget the stored token and stop syncing. Backups already in Drive are left untouched. You can reconnect any time."
                 confirmLabel="Disconnect"
                 isConfirming={disconnectMutation.isPending}
+                fallbackFocusRef={connectRef}
                 onConfirm={() => disconnectMutation.mutate()}
                 onCancel={() => setDisconnectOpen(false)}
             />

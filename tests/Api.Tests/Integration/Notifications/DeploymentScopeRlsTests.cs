@@ -11,17 +11,16 @@ namespace Coffer.Api.Tests.Integration.Notifications;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Migration 207 created <c>notification_subscribers</c> and <c>system_events</c> and
-/// enabled RLS on neither, so <c>coffer_app</c> had full CRUD on both through mig 017's
-/// ALTER DEFAULT PRIVILEGES. One of them stores sealed delivery URLs (ADR-0096 D8).
-/// Found on a real database before migration 213: a non-admin app identity
-/// could UPDATE a delivery target. One row affected, no error.
+/// Without RLS on <c>notification_subscribers</c> and <c>system_events</c>,
+/// <c>coffer_app</c> has full CRUD on both through mig 017's ALTER DEFAULT PRIVILEGES,
+/// and a non-admin app identity can UPDATE a delivery target: one row affected, no
+/// error. One of them stores sealed delivery URLs (ADR-0096 D8). Migration 213 enables
+/// RLS on both.
 /// </para>
 /// <para>
-/// There was no live escalation — the admin endpoints carry RequireAdmin — but this repo
-/// treats RLS as the backstop and the filter as the primary check, and 0.65.0 shipped
-/// ledger notification endpoints with the filter missing entirely. A credentials table
-/// is the last place to depend on an attribute being present.
+/// The admin endpoints carry RequireAdmin, but this repo treats RLS as the backstop and
+/// the filter as the primary check, because an endpoint can lose its filter. A
+/// credentials table is the last place to depend on an attribute being present.
 /// </para>
 /// <para>
 /// Proved the way LedgerRoleTests proves its RLS: under an RLS-scoped <c>coffer_app</c>
@@ -31,19 +30,16 @@ namespace Coffer.Api.Tests.Integration.Notifications;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class DeploymentScopeRlsTests
+public sealed class DeploymentScopeRlsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public DeploymentScopeRlsTests(PostgresFixture fixture) => _fixture = fixture;
+    public DeploymentScopeRlsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private async Task<(Guid AdminId, Guid PlainId, Guid TargetId)> SeedAsync()
     {
-        await using var db = _fixture.NewServiceDbContext();
-
-        // Deployment-scope tables are not isolated by a per-test ledger, so clear them
-        // (the engineering-standards §5.2 exception for global tables).
-        await db.NotificationSubscribers.ExecuteDeleteAsync();
+        await using var db = Db.NewServiceDbContext();
 
         var suffix = Guid.NewGuid().ToString("N")[..8];
         var admin = new UserRow { Id = Guid.NewGuid(), Username = "adm-" + suffix, DisplayName = "adm", IsAdmin = true };
@@ -66,7 +62,7 @@ public sealed class DeploymentScopeRlsTests
     {
         var (adminId, plainId, targetId) = await SeedAsync();
 
-        await using (var plainDb = _fixture.NewAppDbContextAsUser(plainId))
+        await using (var plainDb = Db.NewAppDbContextAsUser(plainId))
         {
             // Invisible: the row holds a sealed delivery URL, and the list of targets is
             // a map of someone's integrations even without the URLs themselves.
@@ -85,7 +81,7 @@ public sealed class DeploymentScopeRlsTests
         // The same statements as an admin: the policy has to DISCRIMINATE, not merely
         // deny. If these also returned zero the table would just be inaccessible, and
         // the admin panel would be broken rather than protected.
-        await using (var adminDb = _fixture.NewAppDbContextAsUser(adminId))
+        await using (var adminDb = Db.NewAppDbContextAsUser(adminId))
         {
             Assert.True(await adminDb.NotificationSubscribers.AnyAsync(t => t.Id == targetId));
             Assert.Equal(1, await adminDb.NotificationSubscribers
@@ -99,10 +95,12 @@ public sealed class DeploymentScopeRlsTests
     {
         var (adminId, plainId, _) = await SeedAsync();
 
-        await using (var seed = _fixture.NewServiceDbContext())
+        var seededId = Guid.NewGuid();
+        await using (var seed = Db.NewServiceDbContext())
         {
             seed.SystemEvents.Add(new SystemEventRow
             {
+                Id = seededId,
                 Severity = "info",
                 Topic = "backup",
                 EventKey = "backup.succeeded",
@@ -112,12 +110,14 @@ public sealed class DeploymentScopeRlsTests
             await seed.SaveChangesAsync();
         }
 
-        await using (var plainDb = _fixture.NewAppDbContextAsUser(plainId))
+        await using (var plainDb = Db.NewAppDbContextAsUser(plainId))
             Assert.False(await plainDb.SystemEvents.AnyAsync());
 
-        await using (var adminDb = _fixture.NewAppDbContextAsUser(adminId))
+        await using (var adminDb = Db.NewAppDbContextAsUser(adminId))
         {
-            Assert.True(await adminDb.SystemEvents.AnyAsync());
+            // The row this test seeded, not merely any row: the template carries the
+            // backup monitor's first alert, which would satisfy a bare AnyAsync.
+            Assert.True(await adminDb.SystemEvents.AnyAsync(e => e.Id == seededId));
 
             // Read-only even for an admin: the publisher writes it on the service role,
             // and nothing user-facing has business amending an audit trail. Same

@@ -10,8 +10,8 @@ Opening the gear landed on `/system` with a breadcrumb reading
 **All ledgers / System**, and the only way back to the ledger list was clicking
 that crumb.
 
-Three separate problems, one of which was invented by the fix attempts and is
-recorded here so it is not tried again.
+Three separate problems. A tempting fix that is worse than all three is recorded
+under "Rejected" below.
 
 **1. The breadcrumb asserted a parent that does not exist.** `/system` is a
 *sibling* of `/` in the router — both children of `authedRoute` — and its scope
@@ -25,8 +25,9 @@ universal click-the-logo gesture did nothing. That left a breadcrumb crumb as th
 only way to reach `/` — navigation smuggled into a location indicator.
 
 **3. `All ledgers` was hardcoded in 11 page files** with no shared helper, so the
-label and the implied hierarchy were re-decided per page. That is how `/system`
-and `/account/security` drifted into claiming a parent in the first place.
+label and the implied hierarchy were re-decided per page, and nothing kept a page
+from claiming a parent it does not have, as `/system` and `/account/security` do
+in problem 1.
 
 `/` also called itself two different things at once: **"All ledgers"** in the
 crumb and **"Your ledgers"** in the heading directly below it.
@@ -59,21 +60,21 @@ crumb and **"Your ledgers"** in the heading directly below it.
    contract the per-ledger settings route has used since ADR-0069: absent or
    invalid → About, carried as a clean URL with no `?tab`.
 
-## What was tried and rejected
+## Rejected
 
-**Hiding the ledger section of the rail on non-ledger pages.** The reasoning was
-that the rail says "you are inside Demo" while `/system` says "deployment-wide
-settings", so the ledger chrome should disappear. Three attempts, all worse than
+**Hiding the ledger section of the rail on non-ledger pages.** The rail says
+"you are inside Demo" while `/system` says "deployment-wide settings", which
+argues for removing the ledger chrome there. Each way of doing it is worse than
 the problem:
 
 - Replacing it with an install-wide rail listing About / Backups / MCP / Users
-  **duplicated the page's own tabs** — the same four items twice on one screen,
+  **duplicates the page's own tabs** — the same four items twice on one screen,
   beside a mostly-empty column.
-- Blanking it left the user card floating up under the header (the footer is not
-  pinned; it followed the collapsed nav) and left "Show inactive accounts" — a
+- Blanking it leaves the user card floating up under the header (the footer is not
+  pinned; it follows the collapsed nav) and leaves "Show inactive accounts" — a
   per-ledger account filter — sitting on a deployment page.
-- Hiding the ledger *picker* along with it **stranded ledger management**:
-  "Manage ledgers…" lives in that dropdown, so `/system` ended up with no route
+- Hiding the ledger *picker* along with it **strands ledger management**:
+  "Manage ledgers…" lives in that dropdown, so `/system` ends up with no route
   to ledgers at all.
 
 The rail's `ledgerId` falls back to last-viewed, then first-visible, and
@@ -81,8 +82,8 @@ The rail's `ledgerId` falls back to last-viewed, then first-visible, and
 documented why: so "the destinations + account nav stay put" on non-ledger
 surfaces. That is a deliberate trade-off — a stable rail over a strictly honest
 one — and it was made before this ADR. **The rail is left exactly as it was.**
-The complaints that started this (no first-class entry, nonsense breadcrumb) were
-both fixable without touching it.
+Both problems that matter here (no first-class entry, nonsense breadcrumb) are
+fixable without touching it.
 
 ## Consequences
 

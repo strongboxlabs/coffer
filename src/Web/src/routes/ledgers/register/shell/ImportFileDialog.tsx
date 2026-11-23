@@ -3,7 +3,8 @@ import { formatBytes } from '@/lib/format';
 /** This dialog has always shown MB to two decimals. */
 const formatBytes2 = (b: number) => formatBytes(b, 2);
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import {
     importCsv,
@@ -26,6 +27,7 @@ import { CsvMappingStep, type CsvMappingChoice } from './CsvMappingStep';
 import { BROKERAGES, brokerageFor, type Brokerage } from './brokerages';
 import { EMPTY_CSV_DRAFT, type CsvDraft } from './csvDraft';
 import { errorMessage } from '@/lib/errorMessage';
+import { invalidateHomeReads } from '@/lib/registerInvalidation';
 
 /**
  * File-import wizard for the register surface. One affordance for
@@ -67,8 +69,8 @@ export function ImportFileDialog({
      * Fires after a successful UNDO, for the same reason `onImported` exists: the
      * windowed register does not re-read on cache invalidation, it re-reads when the
      * page calls `register.refresh()`. The dialog cannot do that itself, and inventing
-     * a query key here is how the first attempt silently did nothing at all —
-     * `['transactions', ledgerId]` is not a key anything registers.
+     * a query key here silently does nothing at all — `['transactions', ledgerId]`
+     * is not a key anything registers.
      */
     onUndone: () => void;
     /**
@@ -102,8 +104,8 @@ export function ImportFileDialog({
     const [csvMapping, setCsvMapping] = useState<CsvMappingChoice | null>(null);
     // The wizard's own answers live HERE, not inside the step, because the dialog
     // renders its steps conditionally: moving to the preview unmounts the wizard, and
-    // every answer with it. Back from a bad preview used to land on the file picker
-    // with nothing kept, so there was no route back to the mapping that caused it.
+    // every answer with it. Held in the step, Back from a bad preview would land on the
+    // file picker with nothing kept, and no route back to the mapping that caused it.
     const [csvDraft, setCsvDraft] = useState<CsvDraft>(EMPTY_CSV_DRAFT);
     // Preselected from what this account last imported with, so saying "this account is
     // at that brokerage" is a once-only act. A single supported brokerage is still SHOWN
@@ -123,12 +125,16 @@ export function ImportFileDialog({
                 // that brokerage's provider; there is no mapping to choose.
                 if (accountKind === 'investment') {
                     if (brokerage === null) throw new Error('Choose the brokerage this file came from.');
-                    return brokerage.preview(ledgerId, file);
+                    return brokerage.preview(ledgerId, file, accountId);
                 }
                 if (csvMapping === null) throw new Error('Choose or write a mapping first.');
                 return previewCsv(ledgerId, file, csvMapping);
             }
-            return isQif(file) ? previewQif(ledgerId, file) : previewOfx(ledgerId, file);
+            // The target account goes with the preview, so the server reads the file
+            // under that account's currency as the import will (ADR-0114 D15).
+            return isQif(file)
+                ? previewQif(ledgerId, file, accountId)
+                : previewOfx(ledgerId, file, accountId);
         },
         onSuccess: (preview) => {
             const importable = preview.accounts.filter(canImport);
@@ -167,8 +173,9 @@ export function ImportFileDialog({
             // would reload the window a second time; and we drop the old dead
             // ['index-buckets', …] typo (the real key is register-index-buckets,
             // which onImported already invalidates). Just refresh the sibling
-            // caches the dialog reaches directly.
+            // caches the dialog reaches directly, and the home screen's reads.
             queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+            invalidateHomeReads(queryClient, ledgerId);
             queryClient.invalidateQueries({ queryKey: ['holdings', ledgerId, accountId] });
             setStep({ name: 'result', result });
             onImported(result);
@@ -248,6 +255,9 @@ export function ImportFileDialog({
     // the single scroll region: header and footer stay pinned and the
     // primary button is always reachable, however many accounts or
     // warnings the file produces. The cap subtracts the backdrop's p-4.
+    // Each body is `relative`, so it is the containing block of what it
+    // scrolls (ADR-0021 Rule 1): `sr-only` text in it would otherwise add
+    // to the overlay's scroll range and move the whole dialog.
     return (
         <Modal
             open
@@ -322,9 +332,10 @@ export function ImportFileDialog({
                         // Keeps the draft. A mapping belongs to a FILE, not to a
                         // position in the dialog, and picking a file is the only thing
                         // that invalidates one — so that is the only place it is
-                        // cleared. Clearing here as well made the rule unfalsifiable:
-                        // every route to the picker went through this handler, so
-                        // deleting the real rule changed nothing a test could see.
+                        // cleared. Clearing here as well would make the rule
+                        // unfalsifiable: every route to the picker goes through this
+                        // handler, so deleting the real rule would change nothing a
+                        // test can see.
                         setStep({ name: 'pick' });
                         clearAttempt();
                     }}
@@ -381,7 +392,7 @@ function isQif(file: File): boolean {
 /**
  * A delimited file — one that needs a mapping to be readable at all.
  *
- * Extension only, and .csv is NOT a promise about commas: the first real target file is
+ * Extension only, and .csv is NOT a promise about commas: a bank export can be
  * tab-separated with a .csv name. What the extension decides is which PATH the dialog
  * takes; the delimiter itself comes from the mapping.
  */
@@ -428,7 +439,7 @@ function PickStep({
 
     return (
         <>
-            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
+            <div className="relative min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
                 <p className="text-sm text-text-muted">
                     {accountKind === 'investment'
                         ? 'Choose a statement file exported from your brokerage or '
@@ -442,8 +453,8 @@ function PickStep({
 
                 <div>
                     {/* The prose above describes the control but is not tied to it,
-                        so this input had no accessible name — nothing to announce
-                        beyond "file upload button". */}
+                        so without aria-label this input has no accessible name —
+                        nothing to announce beyond "file upload button". */}
                     <input
                         ref={fileInputRef}
                         type="file"
@@ -522,9 +533,11 @@ function PickStep({
                     // Refused HERE rather than at preview time. Uploading only to be
                     // told "choose the brokerage" is a round trip whose answer was
                     // already on screen.
-                    disabled={file === null || previewing || needsBrokerage}
+                    disabled={file === null || needsBrokerage}
+                    pending={previewing}
+                    pendingLabel="Uploading…"
                 >
-                    {previewing ? 'Uploading…' : 'Upload & preview →'}
+                    Upload & preview →
                 </Button>
             </footer>
         </>
@@ -558,7 +571,7 @@ function PreviewStep({
         && accountsByImportable.unsupported.length === 0;
     return (
         <>
-            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
+            <div className="relative min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
                 {preview.accounts.length === 0 ? (
                     <p className="text-sm text-state-danger" role="alert">
                         The file contained no recognizable account blocks.
@@ -665,15 +678,15 @@ function PreviewStep({
                     variant="primary"
                     size="sm"
                     onClick={onImport}
-                    disabled={selectedProviderId === null || importing}
+                    disabled={selectedProviderId === null}
+                    pending={importing}
+                    pendingLabel="Importing…"
                 >
-                    {importing
-                        ? 'Importing…'
-                        : selected !== undefined
-                            ? `Import ${selected.transactionCount} txn${
-                                selected.transactionCount === 1 ? '' : 's'
-                            } →`
-                            : 'Import →'}
+                    {selected !== undefined
+                        ? `Import ${selected.transactionCount} txn${
+                            selected.transactionCount === 1 ? '' : 's'
+                        } →`
+                        : 'Import →'}
                 </Button>
             </footer>
         </>
@@ -720,7 +733,7 @@ function ResultStep({
     if (undone !== null) {
         return (
             <>
-                <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-4 text-sm">
+                <div className="relative min-h-0 flex-1 space-y-2 overflow-y-auto p-4 text-sm">
                     <p>
                         Undone. <strong>{undone.deleted}</strong> transaction
                         {undone.deleted === 1 ? '' : 's'} removed from{' '}
@@ -747,7 +760,7 @@ function ResultStep({
 
     return (
         <>
-            <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-4 text-sm">
+            <div className="relative min-h-0 flex-1 space-y-2 overflow-y-auto p-4 text-sm">
                 <p>
                     <span className="text-state-success">✓</span> Imported{' '}
                     <strong>{imported}</strong> transaction
@@ -768,8 +781,8 @@ function ResultStep({
                     </li>
                 </ul>
                 {/* state-warning, not state-warn: there is no --color-state-warn
-                    token, so this box previously rendered with no border colour and
-                    no background — an invisible warning panel. */}
+                    token, so `state-warn` renders with no border colour and no
+                    background — an invisible warning panel. */}
                 {result.errors.length > 0 ? (
                     <div className="rounded border border-state-warning/40 bg-state-warning-soft px-3 py-2 text-xs">
                         <p className="font-medium">
@@ -808,9 +821,9 @@ function ResultStep({
                                     never used to refuse. */}
                                 {/* No "N of them have been edited" line. This dialog is
                                     the one that just did the import, so there has been
-                                    no chance to edit anything — the count was reliably
-                                    zero and the sentence only ever added doubt to an
-                                    action the user had just chosen. */}
+                                    no chance to edit anything — the count is reliably
+                                    zero and the sentence would only add doubt to an
+                                    action the user has just chosen. */}
                             </>
                         )}
                     </div>
@@ -839,7 +852,7 @@ function ResultStep({
                                 type="button"
                                 variant="ghost"
                                 size="sm"
-                                disabled={commit.isPending}
+                                pending={commit.isPending}
                                 onClick={() => { preview.reset(); commit.reset(); }}
                             >
                                 Keep them
@@ -848,10 +861,11 @@ function ResultStep({
                                 type="button"
                                 variant="danger"
                                 size="sm"
-                                disabled={commit.isPending}
+                                pending={commit.isPending}
+                                pendingLabel="Removing…"
                                 onClick={() => commit.mutate()}
                             >
-                                {commit.isPending ? 'Removing…' : 'Confirm undo'}
+                                Confirm undo
                             </Button>
                         </>
                     ) : (
@@ -859,10 +873,12 @@ function ResultStep({
                             type="button"
                             variant="ghost"
                             size="sm"
-                            disabled={preview.isPending || imported === 0}
+                            disabled={imported === 0}
+                            pending={preview.isPending}
+                            pendingLabel="Checking…"
                             onClick={() => preview.mutate()}
                         >
-                            {preview.isPending ? 'Checking…' : 'Undo this import'}
+                            Undo this import
                         </Button>
                     )}
                     <Button type="button" variant="ghost" size="sm" onClick={onImportAnother}>

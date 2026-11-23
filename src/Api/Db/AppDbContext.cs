@@ -11,10 +11,9 @@ namespace Coffer.Api.Db;
 /// ADR-0005 (as realigned in PR 3.6.5 and PR 3.7), the API runs on EF
 /// Core end-to-end: routine CRUD, transactional inserts,
 /// <c>ExecuteUpdate</c>/<c>ExecuteDelete</c> for set-based mutations,
-/// view-backed reads, and the register-query keyset pagination — which is a
-/// Postgres function (<c>register_entry_keys</c>) bound through
-/// <c>HasDbFunction</c>, not a library. Dapper stays in the importer for its
-/// bulk-insert hot path.
+/// view-backed reads, and the register-query keyset pagination, which is LINQ
+/// over the view (<c>RegisterQuery</c>), not a library. Dapper stays in the
+/// importer for its bulk-insert hot path.
 /// </summary>
 /// <remarks>
 /// <para>Schema is owned by the SQL files under <c>db/migrations/</c>;
@@ -40,10 +39,74 @@ public sealed class AppDbContext : DbContext
     {
     }
 
+    /// <summary>
+    /// A save, and on any failure the end of the transaction the stored-notes
+    /// interceptor opened for it: EF reports a concurrency failure without raising
+    /// <c>SaveChangesFailed</c>, which would otherwise leave this context inside that
+    /// transaction, and its next save in it uncommitted (<see cref="LegNotesRecomputeInterceptor.EndFailedSave"/>).
+    /// </summary>
+    /// <remarks>A save that lost a race for a new tag's name (the tag's unique index
+    /// refused it) re-reads the name and saves once more
+    /// (<see cref="TagDictionary.ReResolvePendingAsync"/>); any other failure, and a
+    /// second refusal, is the caller's.</remarks>
+    public override int SaveChanges(bool acceptAllChangesOnSuccess)
+    {
+        try
+        {
+            return SaveOnce(acceptAllChangesOnSuccess);
+        }
+        catch (DbUpdateException ex) when (TagDictionary.IsNameConflict(ex))
+        {
+            if (!TagDictionary.ReResolvePendingAsync(this, CancellationToken.None).GetAwaiter().GetResult()) throw;
+            return SaveOnce(acceptAllChangesOnSuccess);
+        }
+    }
+
+    private int SaveOnce(bool acceptAllChangesOnSuccess)
+    {
+        try
+        {
+            return base.SaveChanges(acceptAllChangesOnSuccess);
+        }
+        catch
+        {
+            LegNotesRecomputeInterceptor.EndFailedSave(this);
+            throw;
+        }
+    }
+
+    /// <inheritdoc cref="SaveChanges(bool)"/>
+    public override async Task<int> SaveChangesAsync(bool acceptAllChangesOnSuccess, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await SaveOnceAsync(acceptAllChangesOnSuccess, cancellationToken).ConfigureAwait(false);
+        }
+        catch (DbUpdateException ex) when (TagDictionary.IsNameConflict(ex))
+        {
+            if (!await TagDictionary.ReResolvePendingAsync(this, cancellationToken).ConfigureAwait(false)) throw;
+            return await SaveOnceAsync(acceptAllChangesOnSuccess, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<int> SaveOnceAsync(bool acceptAllChangesOnSuccess, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            await LegNotesRecomputeInterceptor.EndFailedSaveAsync(this).ConfigureAwait(false);
+            throw;
+        }
+    }
+
     public DbSet<UserRow> Users => Set<UserRow>();
     public DbSet<WebAuthnCredentialRow> WebAuthnCredentials => Set<WebAuthnCredentialRow>();
     public DbSet<SessionRow> AuthSessions => Set<SessionRow>();
     public DbSet<McpAccessTokenRow> McpAccessTokens => Set<McpAccessTokenRow>();
+    public DbSet<OAuthConnectionMetaRow> OAuthConnectionMeta => Set<OAuthConnectionMetaRow>();
     public DbSet<McpToolInvocationRow> McpToolInvocations => Set<McpToolInvocationRow>();
     public DbSet<BootstrapTokenRow> BootstrapTokens => Set<BootstrapTokenRow>();
     public DbSet<InviteRow> Invites => Set<InviteRow>();
@@ -51,9 +114,10 @@ public sealed class AppDbContext : DbContext
     public DbSet<RecoveryCodeRow> RecoveryCodes => Set<RecoveryCodeRow>();
     public DbSet<LedgerRow> Ledgers => Set<LedgerRow>();
     public DbSet<UserLedgerGrantRow> UserLedgerGrants => Set<UserLedgerGrantRow>();
-    public DbSet<UserAccountGroupRow> UserAccountGroups => Set<UserAccountGroupRow>();
-    public DbSet<UserAccountGroupMemberRow> UserAccountGroupMembers => Set<UserAccountGroupMemberRow>();
     public DbSet<AccountRow> Accounts => Set<AccountRow>();
+    // Sidebar folders (mig 258, FU-006). Read and written through AccountFoldersRepository.
+    internal DbSet<AccountFolderRow> AccountFolders => Set<AccountFolderRow>();
+    internal DbSet<AccountFolderMemberRow> AccountFolderMembers => Set<AccountFolderMemberRow>();
 
     // Investment surface (read-only at this layer; the importer owns
     // writes through Dapper). Internal — the Portfolio View / holdings
@@ -64,6 +128,13 @@ public sealed class AppDbContext : DbContext
     internal DbSet<SecurityComponentRow> SecurityComponents => Set<SecurityComponentRow>();
     internal DbSet<HoldingRow> Holdings => Set<HoldingRow>();
     internal DbSet<SecurityPriceRow> SecurityPrices => Set<SecurityPriceRow>();
+    // The outside market series (mig 280, ADR-0114 D6): a ledger's benchmark symbols,
+    // their daily growth, exchange rates and how far each pair's fetches have covered.
+    internal DbSet<LedgerBenchmarkRow> LedgerBenchmarks => Set<LedgerBenchmarkRow>();
+    internal DbSet<BenchmarkGrowthRow> BenchmarkGrowth => Set<BenchmarkGrowthRow>();
+    internal DbSet<FxRateRow> FxRates => Set<FxRateRow>();
+    internal DbSet<FxPairCoverageRow> FxPairCoverage => Set<FxPairCoverageRow>();
+    internal DbSet<BenchmarkCoverageRow> BenchmarkCoverage => Set<BenchmarkCoverageRow>();
     // Per-acquisition lot audit (migration 049). The recompute function
     // (migration 056) owns the writes — the API endpoint queries open
     // lots for the editor's FIFO preview (ADR-0029).
@@ -109,6 +180,8 @@ public sealed class AppDbContext : DbContext
     internal DbSet<TxnLegReconRow> TxnLegRecon => Set<TxnLegReconRow>();
     internal DbSet<TxnHeaderTagRow> TxnHeaderTags => Set<TxnHeaderTagRow>();
     internal DbSet<TxnLegTagRow> TxnLegTags => Set<TxnLegTagRow>();
+    // Migration 264: what the memo-and-tags rule produces per leg, stored at write time.
+    internal DbSet<TxnLegNoteTagRow> TxnLegNoteTags => Set<TxnLegNoteTagRow>();
     internal DbSet<TagRow> Tags => Set<TagRow>();
     internal DbSet<SavedReportRow> SavedReports => Set<SavedReportRow>();
     internal DbSet<ReportPinRow> ReportPins => Set<ReportPinRow>();
@@ -145,6 +218,10 @@ public sealed class AppDbContext : DbContext
     /// <summary>oidc_server_keys (mig 253, FU-069) — the OAuth server's signing and
     /// encryption keys, sealed under the master KEK. Singleton; service-role only.</summary>
     internal DbSet<OidcServerKeysRow> OidcServerKeys => Set<OidcServerKeysRow>();
+
+    /// <summary>upgrade_repo_token (mig 269, ADR-0110) — the private-fork release token,
+    /// sealed under the master KEK. Singleton; service-role only.</summary>
+    internal DbSet<UpgradeRepoTokenRow> UpgradeRepoToken => Set<UpgradeRepoTokenRow>();
 
     /// <summary>backup_settings (mig 161, ADR-0074) — deployment-wide singleton
     /// backup retention policy (GFS tiers). Service-role only.</summary>
@@ -197,6 +274,7 @@ public sealed class AppDbContext : DbContext
     /// the COALESCE-with-overrides logic is centralised in SQL.
     /// </summary>
     internal DbSet<ResolvedTransactionView> ResolvedTransactions => Set<ResolvedTransactionView>();
+    internal DbSet<StoredLegNotesView> StoredLegPresentations => Set<StoredLegNotesView>();
 
     /// <summary>account_current_balances view (migration 133) — current balance per account.</summary>
     internal DbSet<AccountCurrentBalanceView> AccountCurrentBalances => Set<AccountCurrentBalanceView>();
@@ -281,6 +359,19 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.LastUsedAt).HasColumnName("last_used_at");
             b.Property(x => x.ExpiresAt).HasColumnName("expires_at");
             b.Property(x => x.RevokedAt).HasColumnName("revoked_at");
+            b.HasOne<UserRow>().WithMany()
+                .HasForeignKey(x => x.UserId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<OAuthConnectionMetaRow>(b =>
+        {
+            b.ToTable("oauth_connection_meta");
+            b.HasKey(x => x.AuthorizationId);
+            b.Property(x => x.AuthorizationId).HasColumnName("authorization_id");
+            b.Property(x => x.UserId).HasColumnName("user_id");
+            b.Property(x => x.Label).HasColumnName("label");
+            b.Property(x => x.LastUsedAt).HasColumnName("last_used_at");
             b.HasOne<UserRow>().WithMany()
                 .HasForeignKey(x => x.UserId)
                 .OnDelete(DeleteBehavior.Cascade);
@@ -388,6 +479,8 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.WrappedLek).HasColumnName("wrapped_lek");
             b.Property(x => x.LekKekId).HasColumnName("lek_kek_id");
             b.Property(x => x.LekCreatedAt).HasColumnName("lek_created_at");
+            // Migration 280 (ADR-0114 D7): the reporting currency.
+            b.Property(x => x.CurrencyCode).HasColumnName("currency_code");
         });
 
         modelBuilder.Entity<UserLedgerGrantRow>(b =>
@@ -415,43 +508,40 @@ public sealed class AppDbContext : DbContext
                 .OnDelete(DeleteBehavior.Cascade);
         });
 
-        // user_account_groups + user_account_group_members (migration
-        // 033) — user-curated sidebar tabs. FKs declared so EF orders
-        // inserts/deletes correctly and ON DELETE CASCADE matches the
-        // SQL-side behaviour.
-        modelBuilder.Entity<UserAccountGroupRow>(b =>
+        // account_folders + account_folder_members (mig 258) — sidebar folders.
+        // Every column named explicitly, for the reason stated on FeedCsvMappingRow
+        // below. The database references compose on (id, ledger_id, account_type);
+        // EF is told the simple shape only so it orders inserts and deletes of
+        // tracked rows correctly.
+        modelBuilder.Entity<AccountFolderRow>(b =>
         {
-            b.ToTable("user_account_groups");
+            b.ToTable("account_folders");
             b.HasKey(x => x.Id);
             b.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
-            b.Property(x => x.UserId).HasColumnName("user_id");
             b.Property(x => x.LedgerId).HasColumnName("ledger_id");
+            b.Property(x => x.AccountType).HasColumnName("account_type");
             b.Property(x => x.Name).HasColumnName("name");
-            b.Property(x => x.SortOrder).HasColumnName("sort_order");
+            b.Property(x => x.ParentId).HasColumnName("parent_id");
             b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
 
-            b.HasOne<UserRow>()
+            b.HasOne<AccountFolderRow>()
                 .WithMany()
-                .HasForeignKey(x => x.UserId)
-                .OnDelete(DeleteBehavior.Cascade);
-            b.HasOne<LedgerRow>()
-                .WithMany()
-                .HasForeignKey(x => x.LedgerId)
+                .HasForeignKey(x => x.ParentId)
                 .OnDelete(DeleteBehavior.Cascade);
         });
 
-        modelBuilder.Entity<UserAccountGroupMemberRow>(b =>
+        modelBuilder.Entity<AccountFolderMemberRow>(b =>
         {
-            b.ToTable("user_account_group_members");
-            b.HasKey(x => new { x.GroupId, x.AccountId });
-            b.Property(x => x.GroupId).HasColumnName("group_id");
+            b.ToTable("account_folder_members");
+            b.HasKey(x => x.AccountId);
             b.Property(x => x.AccountId).HasColumnName("account_id");
             b.Property(x => x.LedgerId).HasColumnName("ledger_id");
-            b.Property(x => x.AddedAt).HasColumnName("added_at").ValueGeneratedOnAdd();
+            b.Property(x => x.FolderId).HasColumnName("folder_id");
+            b.Property(x => x.AccountType).HasColumnName("account_type");
 
-            b.HasOne<UserAccountGroupRow>()
+            b.HasOne<AccountFolderRow>()
                 .WithMany()
-                .HasForeignKey(x => x.GroupId)
+                .HasForeignKey(x => x.FolderId)
                 .OnDelete(DeleteBehavior.Cascade);
             b.HasOne<AccountRow>()
                 .WithMany()
@@ -551,6 +641,9 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.FailingProjections).HasColumnName("failing_projections");
             b.Property(x => x.LastRepairedAt).HasColumnName("last_repaired_at");
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at").ValueGeneratedOnAdd();
+            // The system column every write changes, so a save against the version it
+            // read fails when another writer saved in between (ConsistencyVerdicts).
+            b.Property(x => x.Version).HasColumnName("xmin").HasColumnType("xid").IsRowVersion();
             b.HasOne<LedgerRow>().WithMany()
                 .HasForeignKey(x => x.LedgerId)
                 .OnDelete(DeleteBehavior.Cascade);
@@ -603,6 +696,7 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.Message).HasColumnName("message");
             b.Property(x => x.SimpleFinConnectionId).HasColumnName("simplefin_connection_id");
             b.Property(x => x.SimpleFinAccountId).HasColumnName("simplefin_account_id");
+            b.Property(x => x.ProviderKey).HasColumnName("provider_key");
             b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
             b.HasOne<LedgerOperationRow>().WithMany()
                 .HasForeignKey(x => x.LedgerOperationId)
@@ -716,7 +810,7 @@ public sealed class AppDbContext : DbContext
 
         // loan_terms (migration 127, ADR-0050). The importer seeds it (Dapper);
         // the API reads it to compute the loan split AND (slice 3) writes it from
-        // the account editor — "import seeds once, Coffer owns it" (D10). Writes
+        // the account editor — "import seeds once, Coffer owns it" (ADR-0050 D10). Writes
         // go through Add (insert) / ExecuteUpdateAsync (update); the create path
         // saves the loan account BEFORE its terms, so the (account_id, ledger_id)
         // FK is satisfied without an EF navigation (the interest/escrow FKs point
@@ -861,6 +955,18 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.CreatedAt).HasColumnName("created_at");
         });
 
+        // upgrade_repo_token (mig 269, ADR-0110): the private-fork release token, master-KEK-sealed.
+        // Service-role only.
+        modelBuilder.Entity<UpgradeRepoTokenRow>(b =>
+        {
+            b.ToTable("upgrade_repo_token");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever();
+            b.Property(x => x.TokenCiphertext).HasColumnName("token_ciphertext");
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+            b.Property(x => x.UpdatedBy).HasColumnName("updated_by");
+        });
+
         // backup_settings (mig 161, ADR-0074): singleton retention policy that
         // governs local pruning + the Drive mirror. Service-role only.
         modelBuilder.Entity<BackupSettingsRow>(b =>
@@ -883,6 +989,8 @@ public sealed class AppDbContext : DbContext
             b.HasKey(x => x.ArtifactId);
             b.Property(x => x.ArtifactId).HasColumnName("artifact_id");
             b.Property(x => x.PinnedByUserId).HasColumnName("pinned_by_user_id");
+            b.Property(x => x.Kind).HasColumnName("kind");
+            b.Property(x => x.Label).HasColumnName("label");
             b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
             b.HasOne<UserRow>().WithMany().HasForeignKey(x => x.PinnedByUserId)
                 .OnDelete(DeleteBehavior.SetNull);
@@ -977,8 +1085,8 @@ public sealed class AppDbContext : DbContext
             b.ToTable("feed_csv_mappings");
             b.HasKey(x => x.Id);
             // Every column named explicitly. EF's default would emit "DefinitionYaml",
-            // and a missing HasColumnName has silently broken every write to a table in
-            // this repo before.
+            // which matches no column in the snake_case schema, so a missing
+            // HasColumnName fails every write to the table.
             b.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
             b.Property(x => x.LedgerId).HasColumnName("ledger_id");
             b.Property(x => x.Name).HasColumnName("name");
@@ -993,14 +1101,16 @@ public sealed class AppDbContext : DbContext
             b.ToTable("budget_targets");
             b.HasKey(x => x.Id);
             // Every column named explicitly, for the reason stated on
-            // FeedCsvMappingRow above: EF's default would emit "TargetMonth", and a
-            // missing HasColumnName has silently broken every write to a table in
-            // this repo before.
+            // FeedCsvMappingRow above: EF's default would emit "TargetMonth", which
+            // matches no column in the snake_case schema, so a missing HasColumnName
+            // fails every write to the table.
             b.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
             b.Property(x => x.LedgerId).HasColumnName("ledger_id");
             b.Property(x => x.CategoryId).HasColumnName("category_id");
             b.Property(x => x.TargetMonth).HasColumnName("target_month");
             b.Property(x => x.Amount).HasColumnName("amount");
+            // Migration 280 (ADR-0114 D12): the currency the amount was typed in.
+            b.Property(x => x.CurrencyCode).HasColumnName("currency_code");
             b.Property(x => x.CreatedAt).HasColumnName("created_at");
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at");
         });
@@ -1053,6 +1163,8 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.QuoteSymbol).HasColumnName("quote_symbol");
             b.Property(x => x.AutoPrice).HasColumnName("auto_price");
             b.Property(x => x.QuoteSymbolPublic).HasColumnName("quote_symbol_public");
+            // ADR-0114 D5 (mig 300).
+            b.Property(x => x.QuoteCurrencyConfirmedAt).HasColumnName("quote_currency_confirmed_at");
             b.Property(x => x.ShareDecimals).HasColumnName("share_decimals");
             b.Property(x => x.ExternalId).HasColumnName("external_id");
             b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
@@ -1194,6 +1306,94 @@ public sealed class AppDbContext : DbContext
                 .OnDelete(DeleteBehavior.Cascade);
         });
 
+        // The outside market series (mig 280, ADR-0114 D6). Every column named
+        // explicitly, for the reason stated on FeedCsvMappingRow above. Each ledger_id
+        // references ledgers(id) ON DELETE CASCADE; none of the four references another
+        // ledger table (benchmark_growth outlives the benchmark it was fetched for).
+        modelBuilder.Entity<LedgerBenchmarkRow>(b =>
+        {
+            b.ToTable("ledger_benchmarks");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
+            b.Property(x => x.LedgerId).HasColumnName("ledger_id");
+            b.Property(x => x.Symbol).HasColumnName("symbol");
+            b.Property(x => x.Name).HasColumnName("name");
+            b.Property(x => x.CurrencyCode).HasColumnName("currency_code");
+            b.Property(x => x.Position).HasColumnName("position");
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
+            b.HasOne<LedgerRow>().WithMany()
+                .HasForeignKey(x => x.LedgerId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<BenchmarkGrowthRow>(b =>
+        {
+            b.ToTable("benchmark_growth");
+            b.HasKey(x => new { x.LedgerId, x.Symbol, x.GrowthDate });
+            b.Property(x => x.LedgerId).HasColumnName("ledger_id");
+            b.Property(x => x.Symbol).HasColumnName("symbol");
+            // A DateOnly against a `date` column, as security_prices.price_date.
+            b.Property(x => x.GrowthDate).HasColumnName("growth_date");
+            b.Property(x => x.Growth).HasColumnName("growth");
+            b.Property(x => x.Source).HasColumnName("source");
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
+            b.HasOne<LedgerRow>().WithMany()
+                .HasForeignKey(x => x.LedgerId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<FxRateRow>(b =>
+        {
+            b.ToTable("fx_rates");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
+            b.Property(x => x.LedgerId).HasColumnName("ledger_id");
+            b.Property(x => x.FromCurrency).HasColumnName("from_currency");
+            b.Property(x => x.ToCurrency).HasColumnName("to_currency");
+            b.Property(x => x.RateDate).HasColumnName("rate_date");
+            b.Property(x => x.Rate).HasColumnName("rate");
+            b.Property(x => x.Source).HasColumnName("source");
+            b.Property(x => x.Upstream).HasColumnName("upstream");
+            b.Property(x => x.EnteredByUserId).HasColumnName("entered_by_user_id");
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
+            b.HasOne<LedgerRow>().WithMany()
+                .HasForeignKey(x => x.LedgerId)
+                .OnDelete(DeleteBehavior.Cascade);
+            // fx_rates.entered_by_user_id → users(id) ON DELETE SET NULL: a manual rate
+            // outlives its author and stays manual.
+            b.HasOne<UserRow>().WithMany()
+                .HasForeignKey(x => x.EnteredByUserId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        modelBuilder.Entity<FxPairCoverageRow>(b =>
+        {
+            b.ToTable("fx_pair_coverage");
+            b.HasKey(x => new { x.LedgerId, x.FromCurrency, x.ToCurrency });
+            b.Property(x => x.LedgerId).HasColumnName("ledger_id");
+            b.Property(x => x.FromCurrency).HasColumnName("from_currency");
+            b.Property(x => x.ToCurrency).HasColumnName("to_currency");
+            b.Property(x => x.FetchedFromDate).HasColumnName("fetched_from_date");
+            b.Property(x => x.FetchedThroughDate).HasColumnName("fetched_through_date");
+            b.HasOne<LedgerRow>().WithMany()
+                .HasForeignKey(x => x.LedgerId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // Keyed by symbol with no reference to ledger_benchmarks: kept after a removal.
+        modelBuilder.Entity<BenchmarkCoverageRow>(b =>
+        {
+            b.ToTable("benchmark_coverage");
+            b.HasKey(x => new { x.LedgerId, x.Symbol });
+            b.Property(x => x.LedgerId).HasColumnName("ledger_id");
+            b.Property(x => x.Symbol).HasColumnName("symbol");
+            b.Property(x => x.FetchedFromDate).HasColumnName("fetched_from_date");
+            b.Property(x => x.FetchedThroughDate).HasColumnName("fetched_through_date");
+            b.HasOne<LedgerRow>().WithMany()
+                .HasForeignKey(x => x.LedgerId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
         // ADR-0031 Phase 3a: per-provider security id → securities.id
         // map. Composite FK (security_id, ledger_id) per migration 049
         // pattern so the row's ledger_id stays coherent with the
@@ -1322,6 +1522,9 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.IngestUnitPrice).HasColumnName("ingest_unit_price");
             b.Property(x => x.IngestFee).HasColumnName("ingest_fee");
             b.Property(x => x.IngestAmount).HasColumnName("ingest_amount");
+            // Migration 301 (ADR-0114 D15): why a promote-on-clear held the row for review.
+            b.Property(x => x.ReviewClearedAmount).HasColumnName("review_cleared_amount").HasColumnType("numeric");
+            b.Property(x => x.ReviewClearedByMatch).HasColumnName("review_cleared_by_match");
             // Migration 114 — OFX security ticker hint (provider_id
             // string used to record the provider_security_mapping
             // on Accept, so future ingests auto-resolve).
@@ -1371,6 +1574,14 @@ public sealed class AppDbContext : DbContext
             b.HasOne<RecurringTransactionRow>().WithMany()
                 .HasForeignKey(x => x.RecurringTransactionId)
                 .OnDelete(DeleteBehavior.SetNull);
+            // Mig 263: the account the transaction was entered from. DB enforces the
+            // composite (originating_account_id, ledger_id) → accounts(id, ledger_id)
+            // ON DELETE RESTRICT; EF models the single-column nav, which also orders
+            // a new account's INSERT before a header that names it.
+            b.Property(x => x.OriginatingAccountId).HasColumnName("originating_account_id");
+            b.HasOne<AccountRow>().WithMany()
+                .HasForeignKey(x => x.OriginatingAccountId)
+                .OnDelete(DeleteBehavior.Restrict);
         });
 
         modelBuilder.Entity<RecurringTransactionRow>(b =>
@@ -1475,8 +1686,8 @@ public sealed class AppDbContext : DbContext
             // DB-owned: it omits them from INSERT (the DB default of 1
             // applies) and never emits them in UPDATE — the recompute fn
             // (fn_recompute_posting_counts_for_header) is the sole writer.
-            // EF only ever READS these (e.g. the originating predicate in
-            // BulkTransactionsRepository.BuildSelectionQuery).
+            // EF only ever READS these (e.g. the posting-count check in
+            // LedgerConsistencyRepository).
             b.Property(x => x.AccountPostingsOnHeader)
                 .HasColumnName("account_postings_on_header")
                 .ValueGeneratedOnAddOrUpdate();
@@ -1484,6 +1695,22 @@ public sealed class AppDbContext : DbContext
                 .HasColumnName("header_total_postings")
                 .ValueGeneratedOnAddOrUpdate();
             b.Property(x => x.CreatedAt).HasColumnName("created_at").ValueGeneratedOnAdd();
+
+            // The stored memo-and-tags presentation (mig 264), insert-only: a stamped
+            // leg is inserted with its values (LegNotes.Stamp), and setting one on a
+            // leg already saved throws instead of writing it. Every update is LegNotes'.
+            const Microsoft.EntityFrameworkCore.Metadata.PropertySaveBehavior insertOnly =
+                Microsoft.EntityFrameworkCore.Metadata.PropertySaveBehavior.Throw;
+            b.Property(x => x.NotesKind).HasColumnName("notes_kind").HasConversion<string>().Metadata.SetAfterSaveBehavior(insertOnly);
+            b.Property(x => x.NotesIsReadOnly).HasColumnName("notes_is_read_only").Metadata.SetAfterSaveBehavior(insertOnly);
+            b.Property(x => x.NotesGroupsByHeader).HasColumnName("notes_groups_by_header").Metadata.SetAfterSaveBehavior(insertOnly);
+            b.Property(x => x.NotesMemo).HasColumnName("notes_memo").Metadata.SetAfterSaveBehavior(insertOnly);
+            b.Property(x => x.NotesMemoInherited).HasColumnName("notes_memo_inherited").Metadata.SetAfterSaveBehavior(insertOnly);
+            b.Property(x => x.NotesInheritedMemo).HasColumnName("notes_inherited_memo").Metadata.SetAfterSaveBehavior(insertOnly);
+            b.Property(x => x.NotesInheritFromAccountId).HasColumnName("notes_inherit_from_account_id").Metadata.SetAfterSaveBehavior(insertOnly);
+            b.Property(x => x.NotesTagsInherited).HasColumnName("notes_tags_inherited").Metadata.SetAfterSaveBehavior(insertOnly);
+            b.Property(x => x.NotesHeaderMemo).HasColumnName("notes_header_memo").Metadata.SetAfterSaveBehavior(insertOnly);
+            b.Property(x => x.NotesHeaderInPlay).HasColumnName("notes_header_in_play").Metadata.SetAfterSaveBehavior(insertOnly);
 
             b.HasOne<TxnHeaderRow>().WithMany()
                 .HasForeignKey(x => x.HeaderId)
@@ -1537,6 +1764,10 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.TransactedAt).HasColumnName("transacted_at");
             b.Property(x => x.CheckNumber).HasColumnName("check_number");
             b.Property(x => x.CapturedAt).HasColumnName("captured_at").ValueGeneratedOnAdd();
+            // Migration 301 (ADR-0114 D15): the bank's figure, unbounded numeric so it is
+            // kept exactly, and whether an import rounded it.
+            b.Property(x => x.Amount).HasColumnName("amount").HasColumnType("numeric");
+            b.Property(x => x.RoundedAtImport).HasColumnName("rounded_at_import");
             b.HasOne<TxnHeaderRow>().WithMany()
                 .HasForeignKey(x => x.HeaderId)
                 .OnDelete(DeleteBehavior.Cascade);
@@ -1656,6 +1887,47 @@ public sealed class AppDbContext : DbContext
                 .OnDelete(DeleteBehavior.Cascade);
         });
 
+        // txn_leg_note_tags (mig 264): the tags of the rule's output per leg, read
+        // here, written only by LegNotes (through its own context). Keyless here, so
+        // this model cannot track, add or remove one. The per-leg values are
+        // txn_legs.notes_* columns, which TxnLegRow maps insert-only (above); readers
+        // read them through resolved_transactions below.
+        // The stored presentation of every leg straight off txn_legs, keyless and read
+        // as a view, so this model can neither write it nor confuse it with TxnLegRow:
+        // a search narrows by the stored memos before it joins anything, and a reader
+        // with no view row for a leg (a reminder's template) reads it here (mig 264).
+        modelBuilder.Entity<StoredLegNotesView>(b =>
+        {
+            b.HasNoKey();
+            b.ToView("txn_legs");
+            b.Property(x => x.LegId).HasColumnName("id");
+            b.Property(x => x.HeaderId).HasColumnName("header_id");
+            b.Property(x => x.LedgerId).HasColumnName("ledger_id");
+            b.Property(x => x.AccountId).HasColumnName("account_id");
+            b.Property(x => x.PostingIndex).HasColumnName("posting_index");
+            b.Property(x => x.Kind).HasColumnName("notes_kind").HasConversion<string>();
+            b.Property(x => x.GroupsByHeader).HasColumnName("notes_groups_by_header");
+            b.Property(x => x.Memo).HasColumnName("notes_memo");
+            b.Property(x => x.MemoInherited).HasColumnName("notes_memo_inherited");
+            b.Property(x => x.TagsInherited).HasColumnName("notes_tags_inherited");
+            b.Property(x => x.HeaderMemo).HasColumnName("notes_header_memo");
+            b.Property(x => x.HeaderInPlay).HasColumnName("notes_header_in_play");
+        });
+
+        modelBuilder.Entity<TxnLegNoteTagRow>(b =>
+        {
+            b.ToTable("txn_leg_note_tags");
+            b.HasNoKey();
+            b.Property(x => x.LegId).HasColumnName("leg_id");
+            b.Property(x => x.TagId).HasColumnName("tag_id");
+            b.Property(x => x.HeaderId).HasColumnName("header_id");
+            b.Property(x => x.LedgerId).HasColumnName("ledger_id");
+            b.Property(x => x.Shown).HasColumnName("shown");
+            b.Property(x => x.InPlay).HasColumnName("in_play");
+            b.Property(x => x.Inherited).HasColumnName("inherited");
+            b.Property(x => x.TransactionLevel).HasColumnName("transaction_level");
+        });
+
         // resolved_transactions: COALESCE(overrides, feed) view from
         // migration 005. Keyless because writes are forbidden — the
         // importer and API only INSERT into the underlying tables.
@@ -1666,13 +1938,11 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.Id).HasColumnName("id");
             b.Property(x => x.AccountId).HasColumnName("account_id");
             b.Property(x => x.Payee).HasColumnName("payee");
-            b.Property(x => x.Memo).HasColumnName("memo");
             b.Property(x => x.Amount).HasColumnName("amount");
             b.Property(x => x.PostedAt).HasColumnName("posted_at");
             b.Property(x => x.TransactedAt).HasColumnName("transacted_at");
             b.Property(x => x.Status).HasColumnName("status");
             b.Property(x => x.IsHidden).HasColumnName("is_hidden");
-            b.Property(x => x.HasOverrides).HasColumnName("has_overrides");
             b.Property(x => x.BalanceAfter).HasColumnName("balance_after");
             b.Property(x => x.Origin).HasColumnName("origin");
             b.Property(x => x.IsPending).HasColumnName("is_pending");
@@ -1688,17 +1958,14 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.CounterpartyAccountId).HasColumnName("counterparty_account_id");
             b.Property(x => x.CounterpartyAccountName).HasColumnName("counterparty_account_name");
             b.Property(x => x.CounterpartyAccountType).HasColumnName("counterparty_account_type");
-            b.Property(x => x.Tags).HasColumnName("tags");
             // Migration 028: unconditional header identity.
             b.Property(x => x.HeaderId).HasColumnName("header_id");
             // Migration 030: cleared-transition audit, paired with the
             // normalized 3-state status column.
             b.Property(x => x.ClearedAt).HasColumnName("cleared_at");
             b.Property(x => x.ClearedByUserId).HasColumnName("cleared_by_user_id");
-            // Migration 032 (ADR-0025): raw leg-vs-header memo split
-            // for the SPA editor + display.
-            b.Property(x => x.LegMemo).HasColumnName("leg_memo");
-            b.Property(x => x.HeaderMemo).HasColumnName("header_memo");
+            // The view's own memo and tag columns are gone (mig 266): what a row
+            // shows is the stored presentation, mapped below.
             // Migration 034: OFX online-match state projected
             // straight from the header (no override layer).
             b.Property(x => x.OnlineMatchFitid).HasColumnName("online_match_fitid");
@@ -1751,12 +2018,44 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.HeaderTotalPostings).HasColumnName("header_total_postings");
             // Mig 119 (ADR-0030 §2): register-row discriminant.
             b.Property(x => x.AccountType).HasColumnName("account_type");
+            // Mig 264: the stored memo-and-tags presentation of the row's leg and of
+            // the posting's other leg. The kind is stored by name.
+            b.Property(x => x.NotesKind).HasColumnName("notes_kind").HasConversion<string>();
+            b.Property(x => x.NotesIsReadOnly).HasColumnName("notes_is_read_only");
+            b.Property(x => x.NotesGroupsByHeader).HasColumnName("notes_groups_by_header");
+            b.Property(x => x.NotesMemo).HasColumnName("notes_memo");
+            b.Property(x => x.NotesMemoInherited).HasColumnName("notes_memo_inherited");
+            b.Property(x => x.NotesInheritedMemo).HasColumnName("notes_inherited_memo");
+            b.Property(x => x.NotesInheritFromAccountId).HasColumnName("notes_inherit_from_account_id");
+            b.Property(x => x.NotesTagsInherited).HasColumnName("notes_tags_inherited");
+            b.Property(x => x.NotesHeaderMemo).HasColumnName("notes_header_memo");
+            b.Property(x => x.NotesHeaderInPlay).HasColumnName("notes_header_in_play");
+            b.Property(x => x.CounterpartyNotesKind).HasColumnName("counterparty_notes_kind").HasConversion<string>();
+            b.Property(x => x.CounterpartyNotesIsReadOnly).HasColumnName("counterparty_notes_is_read_only");
+            b.Property(x => x.CounterpartyNotesGroupsByHeader).HasColumnName("counterparty_notes_groups_by_header");
+            b.Property(x => x.CounterpartyNotesMemo).HasColumnName("counterparty_notes_memo");
+            b.Property(x => x.CounterpartyNotesMemoInherited).HasColumnName("counterparty_notes_memo_inherited");
+            b.Property(x => x.CounterpartyNotesInheritedMemo).HasColumnName("counterparty_notes_inherited_memo");
+            b.Property(x => x.CounterpartyNotesInheritFromAccountId).HasColumnName("counterparty_notes_inherit_from_account_id");
+            b.Property(x => x.CounterpartyNotesTagsInherited).HasColumnName("counterparty_notes_tags_inherited");
+            b.Property(x => x.CounterpartyNotesHeaderMemo).HasColumnName("counterparty_notes_header_memo");
+            b.Property(x => x.CounterpartyNotesHeaderInPlay).HasColumnName("counterparty_notes_header_in_play");
+            // Mig 301 (ADR-0114 D15): the originals sidecar's bank figure and rounded mark,
+            // and (ADR-0114 D14) the posting's other leg's amount and account currency.
+            b.Property(x => x.OriginalAmount).HasColumnName("original_amount").HasColumnType("numeric");
+            b.Property(x => x.AmountRoundedAtImport).HasColumnName("amount_rounded_at_import");
+            b.Property(x => x.CounterpartyAmount).HasColumnName("counterparty_amount");
+            b.Property(x => x.CounterpartyCurrencyCode).HasColumnName("counterparty_currency_code");
+            // Mig 301 (ADR-0114 D15): why a promote-on-clear held the header for review.
+            b.Property(x => x.ReviewClearedAmount).HasColumnName("review_cleared_amount").HasColumnType("numeric");
+            b.Property(x => x.ReviewClearedByMatch).HasColumnName("review_cleared_by_match");
         });
 
         // account_current_balances (migration 133): one row per account with
         // its current balance (latest balance_after, opening-balance fallback).
-        // Keyless view — the single definition of "current balance" shared by
-        // the overview and HoldingsRepository (ADR-0056 slice 1).
+        // Keyless. Since mig 259 the same shape is what account_balances_as_of_now
+        // returns, which is what the API reads (AccountBalancesAsOfNow below): the
+        // view is that function at the register's fallback date (ADR-0056).
         modelBuilder.Entity<AccountCurrentBalanceView>(b =>
         {
             b.HasNoKey();
@@ -1767,22 +2066,11 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.Balance).HasColumnName("balance");
         });
 
-        // register_entry_keys (migration 019) result type. Configured
-        // as a keyless query type so EF can materialize the (posted_at,
-        // entry_key) projection. No ToFunction/ToTable here — the TVF
-        // binding below (HasDbFunction) is the sole entry point; doubling
-        // up causes a half-built model and an NRE in CreateColumnExpression
-        // during translation.
-        modelBuilder.Entity<RegisterEntryKeyRow>(b =>
-        {
-            b.HasNoKey();
-            b.Property(x => x.PostedAt).HasColumnName("posted_at");
-            b.Property(x => x.Seq).HasColumnName("seq");
-            b.Property(x => x.EntryKey).HasColumnName("entry_key");
-        });
-
-        // ledger_payee_suggestions (migration 027) result type. Same
-        // keyless-query-type pattern as RegisterEntryKeys.
+        // ledger_payee_suggestions (migration 027) result type. Configured as
+        // a keyless query type so EF can materialize the projection. No
+        // ToFunction/ToTable here — the TVF binding below (HasDbFunction) is
+        // the sole entry point; doubling up causes a half-built model and an
+        // NRE in CreateColumnExpression during translation.
         modelBuilder.Entity<PayeeSuggestionRow>(b =>
         {
             b.HasNoKey();
@@ -1803,6 +2091,8 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.Reason).HasColumnName("reason");
             b.Property(x => x.AccountId).HasColumnName("account_id");
             b.Property(x => x.HeaderId).HasColumnName("header_id");
+            b.Property(x => x.ExpectedCurrency).HasColumnName("expected_currency");
+            b.Property(x => x.StoredCurrency).HasColumnName("stored_currency");
         });
 
         // fn_unbacked_price_dates (migration 241) result type.
@@ -1823,7 +2113,7 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.HoldingValue).HasColumnName("holding_value");
         });
 
-        // fn_trade_price_reseed (migration 234) result type.
+        // fn_trade_price_reseed (migrations 234, 274) result type.
         modelBuilder.Entity<TradePriceReseedRow>(b =>
         {
             b.HasNoKey();
@@ -1858,6 +2148,35 @@ public sealed class AppDbContext : DbContext
         {
             b.HasNoKey();
             b.Property(x => x.Locked).HasColumnName("locked");
+        });
+
+        // fn_ledger_write_lock / fn_ledger_write_session_lock / _unlock (migration 275)
+        // result types: the lock is the call's effect (LedgerWriteLock takes it).
+        modelBuilder.Entity<LedgerWriteLockRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.Locked).HasColumnName("locked");
+        });
+        modelBuilder.Entity<LedgerWriteUnlockRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.Unlocked).HasColumnName("unlocked");
+        });
+
+        // fn_lock_txn_headers (migration 264) result type: the count is incidental, the
+        // call takes the headers' row locks in id order for a notes recompute.
+        modelBuilder.Entity<TxnHeaderLockRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.Locked).HasColumnName("locked");
+        });
+
+        // fn_trade_price_accounts (migration 274) result type: the accounts whose
+        // currency the trade-price rule can read for a set of (security, day) pairs.
+        modelBuilder.Entity<TradePriceAccountRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.AccountId).HasColumnName("account_id");
         });
 
         // reminder_estimate_samples (migration 220): the size and sum of one series'
@@ -1895,11 +2214,11 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.AccountId).HasColumnName("account_id");
         });
 
-        // security_price_upsert_from_trade (migration 177, ADR-0084) result
-        // type. Rank-gated upsert of a `trade`-source price per (security, day);
-        // returns the input security_id so EF has a typed projection. The
-        // TradePriceFromLegInterceptor invokes this post-save for every EF write
-        // that lands an investment trade leg.
+        // security_price_upsert_from_trade (migrations 177, 274, ADR-0084) result
+        // type. Rank-gated upsert of a `trade`-source price per (security, day), in
+        // the currency given; returns the input security_id so EF has a typed
+        // projection. Writers reach it through fn_trade_price_reseed; the trade-price
+        // repair calls it through this binding.
         modelBuilder.Entity<SecurityPriceUpsertFromTradeRow>(b =>
         {
             b.HasNoKey();
@@ -1918,6 +2237,29 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.SecurityId).HasColumnName("security_id");
             b.Property(x => x.Quantity).HasColumnName("quantity");
             b.Property(x => x.CostBasis).HasColumnName("cost_basis");
+        });
+        // Migration 259 — positions held as of now, with today's price.
+        modelBuilder.Entity<HoldingsAsOfNowRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.AccountId).HasColumnName("account_id");
+            b.Property(x => x.SecurityId).HasColumnName("security_id");
+            b.Property(x => x.Quantity).HasColumnName("quantity");
+            b.Property(x => x.CostBasis).HasColumnName("cost_basis");
+            b.Property(x => x.Price).HasColumnName("price");
+            b.Property(x => x.PriceDate).HasColumnName("price_date");
+            // Migration 281 — the currency of that price.
+            b.Property(x => x.PriceCurrency).HasColumnName("price_currency");
+        });
+        // Migration 259 — the price a current value is computed at.
+        modelBuilder.Entity<SecurityPriceAsOfNowRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.SecurityId).HasColumnName("security_id");
+            b.Property(x => x.Price).HasColumnName("price");
+            b.Property(x => x.PriceDate).HasColumnName("price_date");
+            // Migration 281 — the currency of that price.
+            b.Property(x => x.PriceCurrency).HasColumnName("price_currency");
         });
         // Migration 206 — the PURE running-balance walk. Keyless: it writes
         // nothing, so a consistency check can ask what a balance should be
@@ -1957,6 +2299,27 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.Quantity).HasColumnName("quantity");
             b.Property(x => x.UnitCost).HasColumnName("unit_cost");
         });
+        // Migration 282 — a cost basis lot by lot, for a figure converted at each lot's
+        // acquisition date (ADR-0114 D7).
+        modelBuilder.Entity<OpenLotAsOfRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.AccountId).HasColumnName("account_id");
+            b.Property(x => x.SecurityId).HasColumnName("security_id");
+            b.Property(x => x.AcquiredAt).HasColumnName("acquired_at");
+            b.Property(x => x.Quantity).HasColumnName("quantity");
+            b.Property(x => x.Cost).HasColumnName("cost");
+        });
+        modelBuilder.Entity<RealizedGainLotRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.AccountId).HasColumnName("account_id");
+            b.Property(x => x.SecurityId).HasColumnName("security_id");
+            b.Property(x => x.SellLegId).HasColumnName("sell_leg_id");
+            b.Property(x => x.AcquiredAt).HasColumnName("acquired_at");
+            b.Property(x => x.Quantity).HasColumnName("quantity");
+            b.Property(x => x.Cost).HasColumnName("cost");
+        });
         modelBuilder.Entity<HoldingsFifoShortfallRow>(b =>
         {
             b.HasNoKey();
@@ -1987,6 +2350,8 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.Quantity).HasColumnName("quantity");
             b.Property(x => x.MarketValue).HasColumnName("market_value");
             b.Property(x => x.PricedFrom).HasColumnName("priced_from");
+            // Migration 281 — the currency of the price used; null at cost basis.
+            b.Property(x => x.PriceCurrency).HasColumnName("price_currency");
         });
 
         // ledger_snapshot_payload (migration 111) result type. Returns
@@ -2039,6 +2404,14 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.Unlocked).HasColumnName("unlocked");
         });
 
+        // ledger_snapshot_stored_sizes (migration 271) result type.
+        modelBuilder.Entity<SnapshotStoredSizeRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.SnapshotId).HasColumnName("snapshot_id");
+            b.Property(x => x.StoredBytes).HasColumnName("stored_bytes");
+        });
+
         // ledger_delete (migration 141) result type — input ledger_id echoed.
         modelBuilder.Entity<LedgerDeleteRow>(b =>
         {
@@ -2046,11 +2419,26 @@ public sealed class AppDbContext : DbContext
             b.Property(x => x.LedgerId).HasColumnName("ledger_id");
         });
 
-        // Table-valued function binding for migration 019. EF Core
-        // translates the instance-method invocation on AppDbContext
-        // into a `SELECT * FROM register_entry_keys(...)` call. The
-        // method body is unreachable — the .NET runtime never executes
-        // it; it exists only as a LINQ-translation anchor.
+        // Migration 263 result types: tag_name_keys (one key per requested name) and
+        // saved_reports_repoint_tag (reports changed, and those the caller can see).
+        modelBuilder.Entity<TagNameKeyRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.Name).HasColumnName("name");
+            b.Property(x => x.Key).HasColumnName("key");
+        });
+        modelBuilder.Entity<SavedReportsRepointTagRow>(b =>
+        {
+            b.HasNoKey();
+            b.Property(x => x.Repointed).HasColumnName("repointed");
+            b.Property(x => x.RepointedVisible).HasColumnName("repointed_visible");
+        });
+
+        // Table-valued function bindings. EF Core translates each
+        // instance-method invocation on AppDbContext into a
+        // `SELECT * FROM fn(...)` call. The method bodies are unreachable — the
+        // .NET runtime never executes them; they exist only as LINQ-translation
+        // anchors.
         // GetMethod(name, types) only matches public methods; our
         // translation anchor is internal so we pass BindingFlags
         // explicitly.
@@ -2062,43 +2450,64 @@ public sealed class AppDbContext : DbContext
                     types: new[] { typeof(Guid), typeof(DateOnly) })!)
             .HasName("reminder_occurrence_lock");
 
+        // Migration 275 — the ledger write lock, in its transaction and session forms.
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(LedgerWriteLockFn), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(int) })!)
+            .HasName("fn_ledger_write_lock");
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(LedgerWriteSessionLockFn), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(int) })!)
+            .HasName("fn_ledger_write_session_lock");
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(LedgerWriteSessionUnlockFn), InternalInstance,
+                    types: new[] { typeof(Guid) })!)
+            .HasName("fn_ledger_write_session_unlock");
+
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(LockTxnHeaders), InternalInstance,
+                    types: new[] { typeof(Guid[]) })!)
+            .HasName("fn_lock_txn_headers");
+
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(LockTags), InternalInstance,
+                    types: new[] { typeof(Guid[]) })!)
+            .HasName("fn_lock_tags");
+
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(LockAccounts), InternalInstance,
+                    types: new[] { typeof(Guid[]) })!)
+            .HasName("fn_lock_accounts");
+
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(TradePriceAccounts), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(Guid[]), typeof(DateOnly[]) })!)
+            .HasName("fn_trade_price_accounts");
+
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(LockTradePriceAccounts), InternalInstance,
+                    types: new[] { typeof(Guid[]), typeof(bool) })!)
+            .HasName("fn_lock_trade_price_accounts");
+
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(LockSecurities), InternalInstance,
+                    types: new[] { typeof(Guid[]) })!)
+            .HasName("fn_lock_securities");
+
         modelBuilder
             .HasDbFunction(typeof(AppDbContext)
                 .GetMethod(nameof(ReminderEstimateSamples), InternalInstance,
                     types: new[] { typeof(Guid), typeof(Guid?) })!)
             .HasName("reminder_estimate_samples");
-
-        modelBuilder
-            .HasDbFunction(typeof(AppDbContext)
-                .GetMethod(nameof(RegisterEntryKeys), InternalInstance,
-                    types: new[] { typeof(Guid[]), typeof(Guid),
-                                   typeof(Guid?), typeof(long?),
-                                   typeof(string),
-                                   typeof(int), typeof(bool),
-                                   // Filters (mig 164).
-                                   typeof(string), typeof(DateOnly?), typeof(DateOnly?),
-                                   typeof(decimal?), typeof(decimal?), typeof(Guid?),
-                                   typeof(string), typeof(Guid?), typeof(string),
-                                   typeof(DateOnly?),
-                                   // Sort (mig 166).
-                                   typeof(string), typeof(string) })!)
-            .HasName("register_entry_keys");
-
-        // Migration 167 — see RegisterFilteredEntries method below. The shared
-        // register-filter primitive: returns the resolved_transactions rows
-        // matching the filter. register_entry_keys composes over it in SQL, and
-        // the rail buckets + status counts call it here — one filter definition
-        // (ADR-0076). Returns the ResolvedTransactionView type already mapped
-        // ToView above; a TVF over a view-mapped entity is a supported pattern.
-        modelBuilder
-            .HasDbFunction(typeof(AppDbContext)
-                .GetMethod(nameof(RegisterFilteredEntries), InternalInstance,
-                    types: new[] { typeof(Guid[]), typeof(Guid), typeof(bool?),
-                                   typeof(string), typeof(DateOnly?), typeof(DateOnly?),
-                                   typeof(decimal?), typeof(decimal?), typeof(Guid?),
-                                   typeof(string), typeof(Guid?), typeof(string),
-                                   typeof(DateOnly?) })!)
-            .HasName("register_filtered_entries");
 
         modelBuilder
             .HasDbFunction(typeof(AppDbContext)
@@ -2127,11 +2536,11 @@ public sealed class AppDbContext : DbContext
         modelBuilder
             .HasDbFunction(typeof(AppDbContext)
                 .GetMethod(nameof(UnbackedPriceSecurities), InternalInstance,
-                    types: new[] { typeof(Guid) })!)
+                    types: new[] { typeof(Guid), typeof(DateTime) })!)
             .HasName("fn_unbacked_price_securities");
 
         // Migration 241 — the one-pass form. Anything covering a whole price
-        // history uses this; the per-row predicate is 54x dearer.
+        // history uses this; the per-row predicate rescans the legs once per price.
         modelBuilder
             .HasDbFunction(typeof(AppDbContext)
                 .GetMethod(nameof(UnbackedPriceDates), InternalInstance,
@@ -2159,14 +2568,13 @@ public sealed class AppDbContext : DbContext
                     types: new[] { typeof(Guid), typeof(Guid) })!)
             .HasName("recompute_holdings_for_account_security");
 
-        // Migration 177 — see SecurityPriceUpsertFromTrade method below. TVF
-        // wrapper over the rank-gated `trade`-source price upsert so the
-        // TradePriceFromLegInterceptor can invoke it via LINQ post-save
-        // (ADR-0084 D2), a sibling of the holdings recompute above.
+        // Migrations 177, 274 — see SecurityPriceUpsertFromTrade method below. TVF
+        // wrapper over the rank-gated `trade`-source price upsert, which the
+        // trade-price repair calls with the day's price and currency (ADR-0084 D2).
         modelBuilder
             .HasDbFunction(typeof(AppDbContext)
                 .GetMethod(nameof(SecurityPriceUpsertFromTrade), InternalInstance,
-                    types: new[] { typeof(Guid), typeof(Guid), typeof(DateOnly), typeof(decimal) })!)
+                    types: new[] { typeof(Guid), typeof(Guid), typeof(DateOnly), typeof(decimal), typeof(string) })!)
             .HasName("security_price_upsert_from_trade");
 
         // Migration 200 — the instant-SET form of the holdings feeder. A caller
@@ -2192,6 +2600,23 @@ public sealed class AppDbContext : DbContext
                 .GetMethod(nameof(HoldingsCostBasisAsOf), InternalInstance,
                     types: new[] { typeof(Guid), typeof(DateTime), typeof(Guid[]) })!)
             .HasName("holdings_cost_basis_as_of");
+        // Migration 259 — the current values, each cut at the register's Scheduled
+        // boundary (ScheduledBoundary.ScheduledFrom).
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(AccountBalancesAsOfNow), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(DateTime) })!)
+            .HasName("account_balances_as_of_now");
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(HoldingsAsOfNow), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(DateTime), typeof(Guid[]) })!)
+            .HasName("holdings_as_of_now");
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(SecurityPricesAsOfNow), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(DateTime), typeof(Guid[]) })!)
+            .HasName("security_prices_as_of_now");
 
         // Migration 256 — open lots as of an instant, and what disposals could
         // not match. Both answered by the same holdings_fifo_walk the writer
@@ -2201,6 +2626,17 @@ public sealed class AppDbContext : DbContext
                 .GetMethod(nameof(HoldingsFifoOpenLots), InternalInstance,
                     types: new[] { typeof(Guid), typeof(Guid), typeof(DateTime), typeof(Guid?) })!)
             .HasName("holdings_fifo_open_lots");
+        // Migration 282 — the lots behind a cost basis and a realized gain.
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(HoldingsOpenLotsAsOf), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(DateTime), typeof(Guid[]) })!)
+            .HasName("holdings_open_lots_as_of");
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(RealizedGainLots), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(Guid[]) })!)
+            .HasName("realized_gain_lots");
         modelBuilder
             .HasDbFunction(typeof(AppDbContext)
                 .GetMethod(nameof(HoldingsFifoShortfall), InternalInstance,
@@ -2260,7 +2696,7 @@ public sealed class AppDbContext : DbContext
                     types: new[] { typeof(Guid), typeof(string) })!)
             .HasName("ledger_snapshot_restore");
 
-        // Migration 179 — server-side snapshot payload (OOM fix). Capture into
+        // Migration 179 — server-side snapshot payload. Capture into
         // content_json + restore from the stored row, without the payload ever
         // crossing into managed memory.
         modelBuilder
@@ -2291,6 +2727,13 @@ public sealed class AppDbContext : DbContext
                     types: new[] { typeof(Guid), typeof(Guid) })!)
             .HasName("ledger_snapshot_restore_stored");
 
+        // Migration 271 — what each snapshot of a ledger occupies as stored.
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(LedgerSnapshotStoredSizes), InternalInstance,
+                    types: new[] { typeof(Guid) })!)
+            .HasName("ledger_snapshot_stored_sizes");
+
         // Migration 141 — see LedgerDelete below. TVF wrapper over the void
         // fn_ledger_delete (complete FK-ordered wipe of one ledger). ADR-0020.
         modelBuilder
@@ -2298,6 +2741,26 @@ public sealed class AppDbContext : DbContext
                 .GetMethod(nameof(LedgerDelete), InternalInstance,
                     types: new[] { typeof(Guid) })!)
             .HasName("ledger_delete");
+
+        // Migration 263 — see TagNameKey, TagNameKeys and SavedReportsRepointTag below.
+        // The key is STRICT: NULL in, NULL out, so its nullability is its argument's,
+        // and a comparison of two keys over NOT NULL names needs no NULL arm.
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(TagNameKey), BindingFlags.Static | BindingFlags.NonPublic,
+                    types: new[] { typeof(string) })!)
+            .HasName("tag_name_key")
+            .HasParameter("name").PropagatesNullability();
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(TagNameKeys), InternalInstance,
+                    types: new[] { typeof(string[]) })!)
+            .HasName("tag_name_keys");
+        modelBuilder
+            .HasDbFunction(typeof(AppDbContext)
+                .GetMethod(nameof(SavedReportsRepointTag), InternalInstance,
+                    types: new[] { typeof(Guid), typeof(Guid), typeof(Guid) })!)
+            .HasName("saved_reports_repoint_tag");
     }
 
     // -- Postgres TVF translation anchor ----------------------------------------
@@ -2306,84 +2769,6 @@ public sealed class AppDbContext : DbContext
     // signature mirrors the function's parameter list. The runtime
     // body is never invoked — every call site reaches EF's expression
     // translator instead.
-
-    /// <summary>
-    /// Maps to <c>register_entry_keys(p_account_ids, p_ledger_id,
-    /// p_cursor_entry_key, p_cursor_seq, p_direction, p_limit, …,
-    /// p_sort_column, p_sort_dir)</c> (migrations 097 / 164 / 166).
-    /// Returns one row per register entry in the requested sort order —
-    /// the outer SELECT in the SQL function re-sorts for a uniform
-    /// consumer shape regardless of the fetch <paramref name="direction"/>
-    /// (<c>"before"</c> = entries past the cursor in display order;
-    /// <c>"after"</c> = entries before it). Mig 166: the cursor is the
-    /// boundary entry's KEY (<paramref name="cursorEntryKey"/>) — the
-    /// function derives that entry's sort value internally, so the opaque
-    /// cursor stays sort-agnostic and entry_key is the final tiebreaker
-    /// (total order). <paramref name="sortColumn"/> is whitelisted
-    /// server-side (unknown ⇒ date); <paramref name="sortDir"/> is
-    /// <c>"asc"</c> / <c>"desc"</c>.
-    /// </summary>
-    internal IQueryable<RegisterEntryKeyRow> RegisterEntryKeys(
-        // A SET since mig 226. One account passes an array of one; a category
-        // passes itself and its descendants, which is the only way a rollup
-        // parent's register can show anything — its money is all on its
-        // children. Null still means "every account in the ledger".
-        Guid[]? accountIds,
-        Guid ledgerId,
-        Guid? cursorEntryKey,
-        long? cursorSeq,
-        string direction,
-        int limit,
-        bool hidden,
-        // Filters (mig 164). All null ⇒ no-op, so the plain register is
-        // unchanged. Positional to match the SQL function's arg order.
-        string? search,
-        DateOnly? dateFrom,
-        DateOnly? dateTo,
-        decimal? amountMin,
-        decimal? amountMax,
-        Guid? securityId,
-        string? tag,
-        Guid? categoryId,
-        string? status,
-        DateOnly? today,
-        // Sort (mig 166). Display-order only; whitelisted server-side.
-        string sortColumn,
-        string sortDir) =>
-        FromExpression(() =>
-            RegisterEntryKeys(accountIds, ledgerId, cursorEntryKey, cursorSeq, direction, limit, hidden,
-                search, dateFrom, dateTo, amountMin, amountMax, securityId, tag, categoryId, status, today,
-                sortColumn, sortDir));
-
-    /// <summary>
-    /// Maps to <c>register_filtered_entries(p_account_ids, p_ledger_id,
-    /// p_hidden, …filters…)</c> (migration 167 / ADR-0076) — the single
-    /// definition of the register filter predicate. Returns the
-    /// <c>resolved_transactions</c> rows matching the filter (per-leg; an entry
-    /// appears iff any of its legs match). <c>register_entry_keys</c> composes
-    /// over it in SQL for the windowed page; this LINQ anchor lets the rail
-    /// buckets and status counts share the same predicate instead of
-    /// re-deriving it. A single-SELECT STABLE SQL function, so it inlines into
-    /// the caller's plan (no barrier).
-    /// </summary>
-    internal IQueryable<ResolvedTransactionView> RegisterFilteredEntries(
-        // A SET since mig 226; see RegisterEntryKeys above.
-        Guid[]? accountIds,
-        Guid ledgerId,
-        bool? hidden,
-        string? search,
-        DateOnly? dateFrom,
-        DateOnly? dateTo,
-        decimal? amountMin,
-        decimal? amountMax,
-        Guid? securityId,
-        string? tag,
-        Guid? categoryId,
-        string? status,
-        DateOnly? today) =>
-        FromExpression(() =>
-            RegisterFilteredEntries(accountIds, ledgerId, hidden, search, dateFrom, dateTo,
-                amountMin, amountMax, securityId, tag, categoryId, status, today));
 
     /// <summary>
     /// Maps to <c>ledger_payee_suggestions(p_ledger_id, p_limit)</c>
@@ -2402,40 +2787,10 @@ public sealed class AppDbContext : DbContext
     /// <c>Reason</c> null where the stored state agrees — so one scan yields
     /// both the examined count and the disagreements. A day a <c>fetch</c> or
     /// <c>manual</c> price legitimately outranks always reads as consistent,
-    /// which is the whole reason a naive row-presence check could not be
-    /// shipped.
+    /// which is the whole reason a naive row-presence check is not enough.
     /// </summary>
     internal IQueryable<TradePriceCheckRow> TradePriceCheck(Guid ledgerId) =>
         FromExpression(() => TradePriceCheck(ledgerId));
-
-    /// <summary>
-    /// Maps to <c>fn_trade_price_reseed(p_ledger_id, p_security_id, p_day)</c>
-    /// (migration 234). Derives the day's price by the one rule and rank-gates it
-    /// into <c>security_prices</c>, returning the price written or NULL.
-    /// </summary>
-    /// <remarks>
-    /// The writer's entry point: callers name the (security, day) they touched
-    /// rather than a price. Before this, <c>TradePriceFromLegInterceptor</c>
-    /// upserted the price of whatever leg the save happened to touch, so editing
-    /// one leg could seed a figure the rule would never have chosen — and the
-    /// consistency check, correctly applying the rule, reported the difference as
-    /// drift. It was not drift; the two sides were running different rules.
-    /// </remarks>
-    /// <summary>
-    /// Maps to <c>fn_unbacked_price_securities(p_ledger_id)</c> (migration 240).
-    /// One row per security holding prices nothing derives — advisory, never a
-    /// finding: the table records no link to the transaction that wrote a price,
-    /// so this is inferred, and ADR-0084 D4 keeps some of them on purpose.
-    /// </summary>
-    /// <summary>
-    /// Maps to <c>fn_price_is_unbacked(ledger, security, date, source)</c>
-    /// (migration 240): the row claims a trade produced it and none currently
-    /// does. Advisory — see <see cref="UnbackedPriceSecurities"/>.
-    /// </summary>
-    [DbFunction("fn_price_is_unbacked")]
-    internal static bool PriceIsUnbacked(
-        Guid ledgerId, Guid securityId, DateOnly priceDate, string source) =>
-        throw new InvalidOperationException("Only callable inside an EF query.");
 
     /// <summary>
     /// Maps to <c>fn_unbacked_price_dates(ledger, security)</c> (migration 241):
@@ -2447,9 +2802,39 @@ public sealed class AppDbContext : DbContext
         Guid ledgerId, Guid securityId) =>
         FromExpression(() => UnbackedPriceDates(ledgerId, securityId));
 
-    internal IQueryable<UnbackedPriceSecurityRow> UnbackedPriceSecurities(Guid ledgerId) =>
-        FromExpression(() => UnbackedPriceSecurities(ledgerId));
+    /// <summary>
+    /// Maps to <c>fn_unbacked_price_securities(ledger, scheduled_from)</c> (migration
+    /// 240, 259, 273): the advisory list, each security's holding valued as the portfolio
+    /// card values it on the caller's today (<see cref="HoldingsAsOfNow"/>). One row per
+    /// security holding prices nothing derives — advisory, never a finding: the table
+    /// records no link to the transaction that wrote a price, so this is inferred, and
+    /// ADR-0084 D4 keeps some of them on purpose.
+    /// </summary>
+    internal IQueryable<UnbackedPriceSecurityRow> UnbackedPriceSecurities(
+        Guid ledgerId, DateTime scheduledFrom) =>
+        FromExpression(() => UnbackedPriceSecurities(ledgerId, scheduledFrom));
 
+    /// <summary>
+    /// Maps to <c>fn_trade_price_reseed(p_ledger_id, p_security_id, p_day)</c>
+    /// (migrations 234, 274). Derives the day's price and its currency by the one rule
+    /// and rank-gates them into <c>security_prices</c>, returning the price written or
+    /// NULL.
+    /// </summary>
+    /// <remarks>
+    /// The writer's entry point: callers name the (security, day) they touched
+    /// rather than a price. Upserting the price of whatever leg the save touches
+    /// would let editing one leg seed a figure the rule would never choose — and
+    /// the consistency check, correctly applying the rule, would report the
+    /// difference as drift when the two sides are simply running different rules.
+    /// <para>It locks <c>FOR SHARE</c> every account whose currency the rule can read for
+    /// the day (<see cref="TradePriceAccounts"/>) before it reads the price and currency it
+    /// writes (migration 274), so a re-derivation waits for a brokerage's currency edit or
+    /// a trade-price repair in flight and writes what it commits, and an edit or a repair
+    /// that starts later waits for the re-derivation's transaction. Callers reach it
+    /// through <see cref="Repositories.TradePriceRecomputeService"/>, which first locks the
+    /// accounts of every day it re-derives in one statement (the lock order:
+    /// <see cref="LockTradePriceAccounts"/>).</para>
+    /// </remarks>
     internal IQueryable<TradePriceReseedRow> TradePriceReseed(
         Guid ledgerId, Guid securityId, DateOnly day) =>
         FromExpression(() => TradePriceReseed(ledgerId, securityId, day));
@@ -2510,6 +2895,143 @@ public sealed class AppDbContext : DbContext
         FromExpression(() => ReminderOccurrenceLock(recurringTransactionId, occurrenceDate));
 
     /// <summary>
+    /// Maps to <c>fn_ledger_write_lock(p_ledger_id, p_wait_ms)</c> (migration 275): the
+    /// ledger write lock, transaction-scoped.
+    /// </summary>
+    /// <remarks>Taken through <see cref="LedgerWriteLock.BeginLedgerWriteAsync"/>, which
+    /// opens the transaction it must come first in and answers a wait past
+    /// <paramref name="waitMs"/> as <see cref="LedgerWriteBusyException"/>.</remarks>
+    internal IQueryable<LedgerWriteLockRow> LedgerWriteLockFn(Guid ledgerId, int waitMs) =>
+        FromExpression(() => LedgerWriteLockFn(ledgerId, waitMs));
+
+    /// <summary>
+    /// Maps to <c>fn_ledger_write_session_lock(p_ledger_id, p_wait_ms)</c> (migration 275):
+    /// the ledger write lock held by this session until
+    /// <see cref="LedgerWriteSessionUnlockFn"/> releases it.
+    /// </summary>
+    /// <remarks>Taken through <see cref="LedgerWriteLock.HoldLedgerWriteSessionAsync"/>.</remarks>
+    internal IQueryable<LedgerWriteLockRow> LedgerWriteSessionLockFn(Guid ledgerId, int waitMs) =>
+        FromExpression(() => LedgerWriteSessionLockFn(ledgerId, waitMs));
+
+    /// <summary>Maps to <c>fn_ledger_write_session_unlock(p_ledger_id)</c> (migration 275).</summary>
+    internal IQueryable<LedgerWriteUnlockRow> LedgerWriteSessionUnlockFn(Guid ledgerId) =>
+        FromExpression(() => LedgerWriteSessionUnlockFn(ledgerId));
+
+    /// <summary>
+    /// Maps to <c>fn_lock_txn_headers(p_header_ids)</c> in migration 264: row locks on the
+    /// headers, taken in id order and held until the caller's transaction ends.
+    /// </summary>
+    /// <remarks>What a notes recompute (<see cref="LegNotes"/>) takes before it reads the
+    /// rule's inputs. In id order so two recomputes over overlapping headers cannot each
+    /// hold one the other waits for. Must be enumerated inside a transaction.</remarks>
+    internal IQueryable<TxnHeaderLockRow> LockTxnHeaders(Guid[] headerIds) =>
+        FromExpression(() => LockTxnHeaders(headerIds));
+
+    /// <summary>
+    /// Maps to <c>fn_lock_tags(p_tag_ids)</c> in migration 264: <c>FOR UPDATE</c> row locks
+    /// on the tags, in id order, held until the caller's transaction ends.
+    /// </summary>
+    /// <remarks>What a writer that deletes or merges tags takes before it reads which
+    /// headers carry them: no link to a locked tag can be added until it commits, and one
+    /// another request is adding is committed (and read) first. Must be enumerated inside
+    /// a READ COMMITTED transaction.</remarks>
+    internal IQueryable<TxnHeaderLockRow> LockTags(Guid[] tagIds) =>
+        FromExpression(() => LockTags(tagIds));
+
+    /// <summary>
+    /// Maps to <c>fn_lock_accounts(p_account_ids)</c> in migration 264: <c>FOR UPDATE</c>
+    /// row locks on the accounts, in id order, held until the caller's transaction ends.
+    /// </summary>
+    /// <remarks>What a writer that moves every leg off an account, or changes what the
+    /// stored-notes rule reads of it, takes before it reads which headers have legs there:
+    /// no leg on a locked account can be added until it commits. No trade-price path takes
+    /// it: its <c>FOR UPDATE</c> excludes the <c>KEY SHARE</c> a new line takes on its
+    /// account, so it would wait for every trade in flight on the account, and those
+    /// trades' re-derivations would wait for it. The trade-price paths take
+    /// <see cref="LockTradePriceAccounts"/>, which states their lock order. Must be
+    /// enumerated inside a READ COMMITTED transaction.</remarks>
+    internal IQueryable<TxnHeaderLockRow> LockAccounts(Guid[] accountIds) =>
+        FromExpression(() => LockAccounts(accountIds));
+
+    /// <summary>
+    /// Maps to <c>fn_trade_price_accounts(p_ledger_id, p_security_ids, p_days)</c>
+    /// (migration 274): every account whose currency the trade-price rule can read for the
+    /// given (security, UTC day) pairs, the two arrays read in step, whichever execution
+    /// of each day the rule picks: its brokerages, and an account no brokerage names.
+    /// </summary>
+    internal IQueryable<TradePriceAccountRow> TradePriceAccounts(
+        Guid ledgerId, Guid[] securityIds, DateOnly[] days) =>
+        FromExpression(() => TradePriceAccounts(ledgerId, securityIds, days));
+
+    /// <summary>
+    /// Maps to <c>fn_lock_trade_price_accounts(p_account_ids, p_for_write)</c> (migration
+    /// 274): row locks on the accounts, in id order, held until the caller's transaction
+    /// ends; <c>FOR NO KEY UPDATE</c> when <paramref name="forWrite"/>, else
+    /// <c>FOR SHARE</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>The lock order every path that writes a trade price into a committed ledger,
+    /// or a currency the trade-price rule reads, follows (migration 274's header). The
+    /// importer's seed is outside it: it writes only into the ledger its own transaction
+    /// creates, which no other session sees until it commits. Before it comes the ledger
+    /// write lock (<see cref="LedgerWriteLock"/>, migration 275), which every such path
+    /// that can recompute balances or holdings, and every repair, takes first.</para>
+    /// <list type="number">
+    ///   <item><description><c>merge_securities</c> only, first: the source security
+    ///   (<see cref="LockSecurities"/>), before it reads the source's
+    ///   lines.</description></item>
+    ///   <item><description>The accounts whose currency the rule reads for the days the
+    ///   path derives (<see cref="TradePriceAccounts"/>), with the account a currency edit
+    ///   writes, in one call, in id order: <c>FOR SHARE</c> for a re-derivation (a trade's
+    ///   save, a hide or merge, the bulk delete and restore,
+    ///   <c>merge_securities</c>, a currency edit's own re-derivation:
+    ///   <see cref="Repositories.TradePriceRecomputeService"/>) and for the
+    ///   holdings-currency repair; <c>FOR NO KEY UPDATE</c> for a brokerage's currency edit
+    ///   and the trade-price repair.</description></item>
+    ///   <item><description>A brokerage's holdings account row, which a currency edit and
+    ///   the holdings-currency repair update once its brokerage is locked. No trade-price
+    ///   path locks one: the rule never reads its currency.</description></item>
+    ///   <item><description><c>security_prices</c> rows, through the rank-gated upsert, in
+    ///   (ledger, security, day) order
+    ///   (<see cref="Repositories.TradePriceRecomputeService.InWriteOrder"/>) by the
+    ///   re-derivation and the trade-price repair.</description></item>
+    /// </list>
+    /// <para>Then the path reads what it writes from, and reads the set of accounts again,
+    /// locking any that joined it (<see cref="Repositories.TradePriceLocks"/>). Neither
+    /// mode excludes the <c>KEY SHARE</c> a new line takes, so no lock here waits for a
+    /// trade's insert; <c>FOR SHARE</c> excludes <c>FOR NO KEY UPDATE</c> and an
+    /// <c>UPDATE</c> of the account, so a re-derivation and a currency edit or a
+    /// trade-price repair wait for each other here, and re-derivations do not. Two paths
+    /// that hold one ledger's write lock never reach this step at once, so within a ledger
+    /// re-derivations take turns before it. For a re-derivation in a transaction that took
+    /// no ledger write lock, the steps above, the price rows' one write order included, are
+    /// what keep it from a cycle.</para>
+    /// <para>No deadlock forms between two writers of one ledger that take its write lock,
+    /// and the timing windows the row-lock order alone leaves (a security merge racing a
+    /// re-dated trade, two saves re-deriving the same day) do not open between them. A
+    /// transaction that row-locks the same accounts without the ledger write lock can still
+    /// deadlock with one of them; Postgres then cancels one request, which writes nothing,
+    /// and a retry succeeds. That is an accepted limit.</para>
+    /// <para>Must be enumerated inside a READ COMMITTED transaction.</para>
+    /// </remarks>
+    internal IQueryable<TxnHeaderLockRow> LockTradePriceAccounts(Guid[] accountIds, bool forWrite) =>
+        FromExpression(() => LockTradePriceAccounts(accountIds, forWrite));
+
+    /// <summary>
+    /// Maps to <c>fn_lock_securities(p_security_ids)</c> (migration 274): <c>FOR UPDATE</c>
+    /// row locks on the securities, in id order, held until the caller's transaction ends.
+    /// </summary>
+    /// <remarks>What <c>merge_securities</c> takes on the source before it reads which lines
+    /// are the source's: a line, holdings row or price row another request adds for it
+    /// takes <c>KEY SHARE</c> on the security, which <c>FOR UPDATE</c> excludes, so one in
+    /// flight is waited for and read, and one that starts later waits for the merge, as
+    /// <see cref="LockTags"/> and <see cref="LockAccounts"/> serve a tag or category merge.
+    /// The first step of the trade-price lock order (<see cref="LockTradePriceAccounts"/>).
+    /// Must be enumerated inside a READ COMMITTED transaction.</remarks>
+    internal IQueryable<TxnHeaderLockRow> LockSecurities(Guid[] securityIds) =>
+        FromExpression(() => LockSecurities(securityIds));
+
+    /// <summary>
     /// Maps to <c>reminder_estimate_samples(p_ledger_id, p_recurring_transaction_id)</c>
     /// in migration 220 — the last N committed, non-hidden occurrences of each estimating
     /// series, as a count and a sum.
@@ -2566,22 +3088,23 @@ public sealed class AppDbContext : DbContext
 
     /// <summary>
     /// Maps to <c>security_price_upsert_from_trade(p_ledger_id, p_security_id,
-    /// p_day, p_price)</c> (migration 177, ADR-0084). Rank-gated upsert of a
-    /// <c>trade</c>-source closing price for the (security, UTC-day): inserts
-    /// when the day is empty, overwrites an existing <c>import</c>/<c>simplefin</c>/
-    /// <c>trade</c> row, and leaves a truer <c>fetch</c>/<c>manual</c> price
-    /// untouched. A non-positive price is a no-op. Returns the input security id
-    /// so EF has a typed projection; callers discard it.
+    /// p_day, p_price, p_currency_code)</c> (migrations 177, 274, ADR-0084).
+    /// Rank-gated upsert of a <c>trade</c>-source closing price for the
+    /// (security, UTC-day), in the currency given: inserts when the day is empty,
+    /// overwrites an existing <c>import</c>/<c>simplefin</c>/<c>trade</c> row, and
+    /// leaves a truer <c>fetch</c>/<c>manual</c> price untouched. A non-positive
+    /// price is a no-op. Returns the input security id so EF has a typed
+    /// projection; callers discard it.
     /// </summary>
     /// <remarks>
-    /// Invoked post-save by the <see cref="TradePriceFromLegInterceptor"/> for
-    /// every EF write that lands an investment trade leg; see
-    /// <see cref="Repositories.TradePriceRecomputeService"/>. A function call
-    /// (not a trigger, ADR-0032) so it can't re-fire the interceptors.
+    /// The writers' entry point is <see cref="TradePriceReseed"/>, which calls this
+    /// in SQL with the price and currency the rule names. The trade-price repair
+    /// calls it with the figures the check derived from the same rule. A function
+    /// call (not a trigger, ADR-0032) so it can't re-fire the interceptors.
     /// </remarks>
     internal IQueryable<SecurityPriceUpsertFromTradeRow> SecurityPriceUpsertFromTrade(
-        Guid ledgerId, Guid securityId, DateOnly day, decimal price) =>
-        FromExpression(() => SecurityPriceUpsertFromTrade(ledgerId, securityId, day, price));
+        Guid ledgerId, Guid securityId, DateOnly day, decimal price, string currencyCode) =>
+        FromExpression(() => SecurityPriceUpsertFromTrade(ledgerId, securityId, day, price, currencyCode));
 
     /// <summary>
     /// Maps to
@@ -2623,6 +3146,43 @@ public sealed class AppDbContext : DbContext
         Guid ledgerId, DateTime asOf, Guid[]? accountIds) =>
         FromExpression(() => HoldingsCostBasisAsOf(ledgerId, asOf, accountIds));
 
+    /// <summary>
+    /// Maps to <c>account_balances_as_of_now(p_ledger_id, p_scheduled_from)</c>
+    /// (migration 259) — every account's current balance: the latest
+    /// <c>balance_after</c> among the rows before <paramref name="scheduledFrom"/>, the
+    /// register's Scheduled boundary (<see cref="Repositories.ScheduledBoundary"/>),
+    /// opening-balance fallback. Read through <c>AccountBalancesRepository</c>.
+    /// </summary>
+    internal IQueryable<AccountCurrentBalanceView> AccountBalancesAsOfNow(
+        Guid ledgerId, DateTime scheduledFrom) =>
+        FromExpression(() => AccountBalancesAsOfNow(ledgerId, scheduledFrom));
+
+    /// <summary>
+    /// Maps to <c>holdings_as_of_now(p_ledger_id, p_scheduled_from, p_account_ids)</c>
+    /// (migration 259) — every position held on the caller's today, per
+    /// (holdings-account, security): quantity, FIFO cost basis, and the price
+    /// <see cref="SecurityPricesAsOfNow"/> gives. The read behind every current value;
+    /// the <c>holdings</c> projection also counts trades and splits the register calls
+    /// Scheduled. <paramref name="scheduledFrom"/> is that boundary
+    /// (<see cref="Repositories.ScheduledBoundary"/>); <paramref name="accountIds"/>
+    /// null means the whole ledger.
+    /// </summary>
+    internal IQueryable<HoldingsAsOfNowRow> HoldingsAsOfNow(
+        Guid ledgerId, DateTime scheduledFrom, Guid[]? accountIds) =>
+        FromExpression(() => HoldingsAsOfNow(ledgerId, scheduledFrom, accountIds));
+
+    /// <summary>
+    /// Maps to <c>security_prices_as_of_now(p_ledger_id, p_scheduled_from,
+    /// p_security_ids)</c> (migration 259) — per security, the latest close dated on or
+    /// before the caller's today, else the last trade's price (<c>fn_last_trade_price</c>,
+    /// the one no-price rule), on the day's split basis: the price every current value
+    /// is computed at, and the one <see cref="HoldingsAsOfNow"/> carries.
+    /// <paramref name="securityIds"/> null means every security in the ledger.
+    /// </summary>
+    internal IQueryable<SecurityPriceAsOfNowRow> SecurityPricesAsOfNow(
+        Guid ledgerId, DateTime scheduledFrom, Guid[]? securityIds) =>
+        FromExpression(() => SecurityPricesAsOfNow(ledgerId, scheduledFrom, securityIds));
+
     /// <summary>The pure running-balance walk (mig 206). Writes nothing.</summary>
     internal IQueryable<AccountBalanceWalkRow> AccountBalanceWalk(
         Guid accountId, DateTime fromPostedAt, decimal startingBalance) =>
@@ -2642,6 +3202,23 @@ public sealed class AppDbContext : DbContext
     internal IQueryable<HoldingsFifoOpenLotRow> HoldingsFifoOpenLots(
         Guid holdingsAccountId, Guid securityId, DateTime asOf, Guid? excludeHeaderId) =>
         FromExpression(() => HoldingsFifoOpenLots(holdingsAccountId, securityId, asOf, excludeHeaderId));
+
+    /// <summary>
+    /// Maps to <c>holdings_open_lots_as_of(p_ledger_id, p_as_of, p_account_ids)</c>
+    /// (migration 282): every FIFO lot open at an instant on the given HOLDINGS accounts,
+    /// with its acquisition instant and cost. Instant must be UTC.
+    /// </summary>
+    internal IQueryable<OpenLotAsOfRow> HoldingsOpenLotsAsOf(
+        Guid ledgerId, DateTime asOf, Guid[] holdingsAccountIds) =>
+        FromExpression(() => HoldingsOpenLotsAsOf(ledgerId, asOf, holdingsAccountIds));
+
+    /// <summary>
+    /// Maps to <c>realized_gain_lots(p_ledger_id, p_account_ids)</c> (migration 282): every
+    /// sale's FIFO lots on the given HOLDINGS accounts, from the unbounded walk the
+    /// realized-gains writer persists.
+    /// </summary>
+    internal IQueryable<RealizedGainLotRow> RealizedGainLots(Guid ledgerId, Guid[] holdingsAccountIds) =>
+        FromExpression(() => RealizedGainLots(ledgerId, holdingsAccountIds));
 
     /// <summary>
     /// Maps to <c>holdings_fifo_shortfall(p_account_id, p_security_id)</c>
@@ -2694,7 +3271,7 @@ public sealed class AppDbContext : DbContext
     /// Maps to <c>ledger_snapshot_write(p_snapshot_id, p_ledger_id)</c> (mig 179).
     /// Captures the in-scope graph into <c>ledger_snapshots.content_json</c> entirely
     /// server-side and returns the uncompressed byte size. The payload never enters
-    /// managed memory (the OOM fix). Invoked via
+    /// managed memory. Invoked via
     /// <c>LedgerSnapshotWrite(id, ledgerId).Select(r => r.ContentSizeUncompressed).FirstAsync()</c>.
     /// </summary>
     internal IQueryable<LedgerSnapshotWriteRow> LedgerSnapshotWrite(
@@ -2711,6 +3288,11 @@ public sealed class AppDbContext : DbContext
     /// <summary>Maps to <c>snapshot_ledger_unlock(p_ledger_id)</c> (migration 247).</summary>
     internal IQueryable<SnapshotLedgerUnlockRow> SnapshotLedgerUnlock(Guid ledgerId) =>
         FromExpression(() => SnapshotLedgerUnlock(ledgerId));
+
+    /// <summary>Maps to <c>ledger_snapshot_stored_sizes(p_ledger_id)</c> (migration 271):
+    /// one row per snapshot of the ledger, with the bytes it occupies as stored.</summary>
+    internal IQueryable<SnapshotStoredSizeRow> LedgerSnapshotStoredSizes(Guid ledgerId) =>
+        FromExpression(() => LedgerSnapshotStoredSizes(ledgerId));
 
     /// <summary>
     /// Maps to <c>restore_readiness()</c> (migration 246): the connecting role, the
@@ -2738,4 +3320,37 @@ public sealed class AppDbContext : DbContext
     /// </summary>
     internal IQueryable<LedgerDeleteRow> LedgerDelete(Guid ledgerId) =>
         FromExpression(() => LedgerDelete(ledgerId));
+
+    /// <summary>
+    /// Maps to <c>tag_name_key(p_name)</c> (migration 263): the one definition of "the
+    /// same tag name" — lower() of the name with leading and trailing .NET white space
+    /// removed, under the database collation. Every name-to-id resolution compares
+    /// these keys in SQL; nothing folds a tag name in .NET.
+    /// </summary>
+    internal static string TagNameKey(string name) =>
+        throw new InvalidOperationException("Only callable inside an EF query.");
+
+    /// <summary>
+    /// Maps to <c>tag_name_keys(p_names)</c> (migration 263): one row per requested name
+    /// with its <see cref="TagNameKey"/>. The row source a resolver joins to
+    /// <see cref="Tags"/> on the key, so a request's names — matched or new — are all
+    /// keyed in the round trip that finds the existing tags. EF cannot root a query on
+    /// a parameter array, which is why this is a function rather than a primitive
+    /// collection.
+    /// </summary>
+    internal IQueryable<TagNameKeyRow> TagNameKeys(string[] names) =>
+        FromExpression(() => TagNameKeys(names));
+
+    /// <summary>
+    /// Maps to <c>saved_reports_repoint_tag(p_ledger_id, p_from_tag_id, p_to_tag_id)</c>
+    /// (migration 263): rewrites <c>spec.tagId</c> on every saved report of
+    /// the ledger that filters on <paramref name="fromTagId"/>, other members' private
+    /// reports included. SECURITY DEFINER, so it checks the caller's owner/editor grant
+    /// on the ledger itself (42501 otherwise) and that both tags are the ledger's (22023).
+    /// Called by the tag merge only, inside its transaction, between the junction
+    /// repoints and the source delete.
+    /// </summary>
+    internal IQueryable<SavedReportsRepointTagRow> SavedReportsRepointTag(
+        Guid ledgerId, Guid fromTagId, Guid toTagId) =>
+        FromExpression(() => SavedReportsRepointTag(ledgerId, fromTagId, toTagId));
 }

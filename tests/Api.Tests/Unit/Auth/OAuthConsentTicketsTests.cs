@@ -5,8 +5,7 @@ using Coffer.Api.Tests.Support;
 namespace Coffer.Api.Tests.Unit.Auth;
 
 /// <summary>
-/// The consent ticket store and the redirect rule behind the 2026-10-12 security audit's
-/// H1 and M1 fixes.
+/// The consent ticket store and the redirect rule (ADR-0105 D5).
 /// </summary>
 public sealed class OAuthConsentTicketsTests
 {
@@ -81,7 +80,7 @@ public sealed class OAuthConsentTicketsTests
     [InlineData("http://127.0.0.1:33418/cb", true)]
     [InlineData("http://localhost/cb", true)]
     [InlineData("http://[::1]:8080/cb", true)]
-    [InlineData("javascript://localhost/%0Aalert(1)", false)]   // the audit's H1: IsLoopback is true here
+    [InlineData("javascript://localhost/%0Aalert(1)", false)]   // IsLoopback is true here
     [InlineData("javascript://127.0.0.1/x", false)]
     [InlineData("http://example.com/cb", false)]
     [InlineData("ftp://localhost/cb", false)]

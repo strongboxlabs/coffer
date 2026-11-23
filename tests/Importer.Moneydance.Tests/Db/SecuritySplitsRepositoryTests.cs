@@ -10,20 +10,17 @@ namespace Coffer.Importer.Moneydance.Tests.Db;
 /// <c>(ledger_id, external_id)</c> so re-imports stay idempotent.
 /// </summary>
 [Collection(DbCollection.Name)]
-public sealed class SecuritySplitsRepositoryTests
+public sealed class SecuritySplitsRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SecuritySplitsRepositoryTests(PostgresFixture fixture)
+    public SecuritySplitsRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     [Fact]
     public async Task BulkUpsert_inserts_new_rows()
     {
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var securityA = Guid.NewGuid();
@@ -53,8 +50,7 @@ public sealed class SecuritySplitsRepositoryTests
     {
         // MD re-export of the same csplit with an adjusted ratio (operator
         // corrected the entry) should refresh in place, not duplicate.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId   = TestLedger.Id;
         var securityId = Guid.NewGuid();
@@ -93,8 +89,7 @@ public sealed class SecuritySplitsRepositoryTests
     {
         // User-entered splits (no MD source) all have NULL external_id;
         // the partial unique index doesn't apply, so they don't collide.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId   = TestLedger.Id;
         var securityId = Guid.NewGuid();
@@ -119,7 +114,7 @@ public sealed class SecuritySplitsRepositoryTests
     [Fact]
     public async Task BulkUpsert_returns_zero_for_empty_input()
     {
-        await using var conn = _fixture.OpenConnection();
+        await using var conn = Db.OpenConnection();
         var repo = new SecuritySplitsRepository(conn);
         var written = await repo.BulkUpsertAsync(Array.Empty<SecuritySplitRow>());
         Assert.Equal(0, written);
@@ -130,8 +125,7 @@ public sealed class SecuritySplitsRepositoryTests
     {
         // Migration 060 CHECK (ratio > 0). A zero or negative ratio is
         // never a valid split.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId   = TestLedger.Id;
         var securityId = Guid.NewGuid();
@@ -157,12 +151,5 @@ public sealed class SecuritySplitsRepositoryTests
             VALUES (@Id, @LedgerId, @Ticker, @Name, 'equity', true, 4);",
             new { Id = securityId, LedgerId = ledgerId, Ticker = ticker,
                   Name = ticker + " Test Security" });
-    }
-
-    private static async Task ResetAsync(NpgsqlConnection conn)
-    {
-        await conn.ExecuteAsync(@"
-            TRUNCATE security_splits, lots, holdings, txn_legs, txn_headers,
-                     securities, accounts RESTART IDENTITY CASCADE;");
     }
 }

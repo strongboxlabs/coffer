@@ -23,11 +23,12 @@ namespace Coffer.Api.Tests.Integration.Notifications;
 /// rather than a compile one.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class LedgerAttentionEndpointTests
+public sealed class LedgerAttentionEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public LedgerAttentionEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public LedgerAttentionEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> ClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -49,7 +50,7 @@ public sealed class LedgerAttentionEndpointTests
         Guid ledgerId, string severity, string eventKey, DateTime at)
     {
         var summary = $"{eventKey} @ {at:O}";
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         db.LedgerEvents.Add(new LedgerEventRow
         {
             LedgerId = ledgerId,
@@ -91,7 +92,7 @@ public sealed class LedgerAttentionEndpointTests
             var settled = false;
             for (var attempt = 0; attempt < 100 && !settled; attempt++)
             {
-                await using (var svc = _fixture.NewServiceDbContext())
+                await using (var svc = Db.NewServiceDbContext())
                 {
                     settled = await svc.LedgerConsistencyStates.AsNoTracking()
                         .AnyAsync(r => r.LedgerId == ledger.LedgerId
@@ -104,7 +105,7 @@ public sealed class LedgerAttentionEndpointTests
             Assert.True(settled, "The consistency monitor never completed its boot pass.");
         }
 
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         foreach (var ledger in ledgers)
         {
             await db.LedgerEvents.Where(e => e.LedgerId == ledger.LedgerId)
@@ -116,6 +117,11 @@ public sealed class LedgerAttentionEndpointTests
         => (await client.GetFromJsonAsync<List<LedgerAttentionDto>>(
             "/api/ledgers/attention"))!;
 
+    private static async Task<List<OutstandingProblemDto>> OutstandingAsync(
+        HttpClient client, SyntheticLedger ledger)
+        => (await client.GetFromJsonAsync<List<OutstandingProblemDto>>(
+            $"/api/ledgers/{ledger.LedgerId}/notifications/outstanding"))!;
+
     private static DateTime At(int day, int hour = 0) =>
         new(2026, 6, day, hour, 0, 0, DateTimeKind.Utc);
 
@@ -126,8 +132,8 @@ public sealed class LedgerAttentionEndpointTests
         // ledger as "nothing to say", which is also what it has before the request
         // finishes — so the quiet case and the loading case render identically and
         // nothing flashes on arrival.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger);
         await ResetEventsAsync(ledger);
 
@@ -145,8 +151,8 @@ public sealed class LedgerAttentionEndpointTests
     [Fact]
     public async Task An_unresolved_warning_reports_the_ledger()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger);
         await ResetEventsAsync(ledger);
 
@@ -165,8 +171,8 @@ public sealed class LedgerAttentionEndpointTests
         // SUBJECT it is about, and nothing else. Without this a routine
         // "consistency.ok" would silently switch off a failing backup's indicator,
         // which is the failure mode that makes an indicator worse than none.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger);
         await ResetEventsAsync(ledger);
 
@@ -183,13 +189,126 @@ public sealed class LedgerAttentionEndpointTests
     }
 
     [Fact]
+    public async Task A_switched_off_job_clears_on_its_next_successful_run()
+    {
+        // ADR-0102 D1: a disable is `<job type>.disabled`, so the job's own next success
+        // is its all-clear once someone turns it back on.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await ClientAsync(factory, ledger);
+        await ResetEventsAsync(ledger);
+
+        // The anchor: an unrelated standing warning, so the count below is this ledger's.
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Warning,
+            "consistency.drift", At(1));
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Critical,
+            "feed-sync.disabled", At(2));
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Info,
+            "feed-sync.succeeded", At(3));
+
+        var row = Assert.Single(await GetAsync(client), r => r.LedgerId == ledger.LedgerId);
+        Assert.Equal(NotificationSeverity.Warning, row.Severity);
+        Assert.Equal(1, row.Count);
+
+        // The outstanding list agrees: the anchor alone.
+        var outstanding = Assert.Single(await OutstandingAsync(client, ledger));
+        Assert.Equal("consistency.", outstanding.SubjectKey);
+    }
+
+    [Fact]
+    public async Task The_outstanding_list_is_the_attention_count_and_severity_row_by_row()
+    {
+        // One query behind both, so the rail's number is the rows a ledger lists.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await ClientAsync(factory, ledger);
+        await ResetEventsAsync(ledger);
+
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Warning,
+            "consistency.drift", At(1));
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Critical,
+            "backup.none", At(2));
+        // A subject that went wrong, cleared, and went wrong again: it is outstanding
+        // from the first problem after the all-clear, not from the first ever.
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Warning,
+            "quote-refresh.failed", At(3));
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Info,
+            "quote-refresh.succeeded", At(4));
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Warning,
+            "quote-refresh.failed", At(5));
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Warning,
+            "quote-refresh.failed", At(6));
+        // Cleared, so on neither.
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Critical,
+            "feed-sync.disabled", At(2));
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Info,
+            "feed-sync.succeeded", At(7));
+
+        var attention = Assert.Single(await GetAsync(client), r => r.LedgerId == ledger.LedgerId);
+        var outstanding = await OutstandingAsync(client, ledger);
+
+        Assert.Equal(attention.Count, outstanding.Count);
+        Assert.Equal(attention.Severity, outstanding[0].Severity);
+        Assert.Equal(
+            ["backup.", "quote-refresh.", "consistency."],
+            outstanding.Select(o => o.SubjectKey).ToArray());
+
+        var quotes = outstanding.Single(o => o.SubjectKey == "quote-refresh.");
+        Assert.Equal(At(5), quotes.FirstUnresolvedAt);
+        Assert.Equal(At(6), quotes.LatestAt);
+        Assert.Equal("quote-refresh.failed", quotes.EventKey);
+        Assert.Equal(NotificationTopics.Scheduler, quotes.Topic);
+    }
+
+    [Fact]
+    public async Task A_later_all_clear_takes_its_subject_off_the_outstanding_list()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await ClientAsync(factory, ledger);
+        await ResetEventsAsync(ledger);
+
+        // The anchor: a subject that stays, so the absence below is this subject's.
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Critical,
+            "backup.none", At(1));
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Warning,
+            "consistency.drift", At(2));
+        Assert.Equal(2, (await OutstandingAsync(client, ledger)).Count);
+
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Info,
+            "consistency.ok", At(3));
+
+        var row = Assert.Single(await OutstandingAsync(client, ledger));
+        Assert.Equal("backup.", row.SubjectKey);
+        Assert.Equal(1, Assert.Single(await GetAsync(client), r => r.LedgerId == ledger.LedgerId).Count);
+    }
+
+    [Fact]
+    public async Task Two_switched_off_jobs_are_two_problems()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await ClientAsync(factory, ledger);
+        await ResetEventsAsync(ledger);
+
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Critical,
+            "feed-sync.disabled", At(1));
+        await AddEventAsync(ledger.LedgerId, NotificationSeverity.Critical,
+            "quote-refresh.disabled", At(2));
+
+        var row = Assert.Single(await GetAsync(client), r => r.LedgerId == ledger.LedgerId);
+        Assert.Equal(NotificationSeverity.Critical, row.Severity);
+        Assert.Equal(2, row.Count);
+    }
+
+    [Fact]
     public async Task The_highest_severity_wins_and_is_not_a_string_compare()
     {
         // "warning" sorts AFTER "critical" alphabetically, so a max over the raw column
         // would report a ledger with both as a warning — downgrading the irreversible
         // to the repairable, which is precisely backwards.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger);
         await ResetEventsAsync(ledger);
 
@@ -212,8 +331,8 @@ public sealed class LedgerAttentionEndpointTests
         // hundreds of rows and exactly one problem. "364" would be a worse answer than
         // no number, and it would keep changing while nothing changed — which is how a
         // reader learns to stop reading it.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger);
         await ResetEventsAsync(ledger);
 
@@ -236,8 +355,8 @@ public sealed class LedgerAttentionEndpointTests
         // the max over every unresolved row instead would pin a ledger red forever on
         // the strength of one bad night months ago, and no later event short of a full
         // all-clear could bring it down.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger);
         await ResetEventsAsync(ledger);
 
@@ -258,10 +377,10 @@ public sealed class LedgerAttentionEndpointTests
         // The grant join is the primary check and ledger_events' RLS the backstop; a
         // service-role context copied in from a neighbouring repository would hand
         // every install's problems to every caller with no error to notice.
-        var mine = await SyntheticLedger.CreateAsync(_fixture);
-        var theirs = await SyntheticLedger.CreateAsync(_fixture);
+        var mine = await SyntheticLedger.CreateAsync(Db);
+        var theirs = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, mine);
         await ResetEventsAsync(mine, theirs);
 
@@ -281,7 +400,7 @@ public sealed class LedgerAttentionEndpointTests
     [Fact]
     public async Task Anonymous_callers_are_refused()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = factory.CreateClient(
             new WebApplicationFactoryClientOptions { HandleCookies = false });
 

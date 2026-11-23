@@ -6,13 +6,13 @@ namespace Coffer.Api.Contracts;
 /// <remarks>
 /// Money and quantities are bounded by their database columns, but anything DERIVED
 /// in C# — a percentage, a per-share cost — is a <see cref="decimal"/> division, and
-/// those run to the type's full 28-29 significant digits. That produced payloads
-/// carrying a percentage that ran to 28 digits next to figures rounded to the cent,
+/// those run to the type's full 28-29 significant digits. Unrounded, a payload
+/// carries a percentage that runs to 28 digits next to figures rounded to the cent,
 /// in the same object.
 /// <para>
 /// Unlike the SQL side this is only cosmetic: a C# decimal division rounds rather
-/// than throwing, so it cannot fail the way an unbounded Postgres NUMERIC read did
-/// in 0.63.0. It is fixed because a reader cannot tell a meaningful digit from an
+/// than throwing, so it cannot fail the way an unbounded Postgres NUMERIC read into a
+/// <see cref="decimal"/> can. It is rounded because a reader cannot tell a meaningful digit from an
 /// artefact of binary division, and because the inconsistency invites someone to
 /// assume the extra precision means something.
 /// </para>
@@ -65,23 +65,29 @@ internal static class ReportingScale
     /// <c>holdings_market_value_as_of_set</c> — and they must produce the SAME number
     /// for the same instant.
     /// <para>
-    /// They did not. A C# <c>decimal</c> product keeps the sum of its operands'
+    /// Unrounded, they do not. A C# <c>decimal</c> product keeps the sum of its operands'
     /// scales, so <c>NUMERIC(25,12)</c> quantity times <c>NUMERIC(19,4)</c> price runs
     /// to 16 decimal places, while the feeder bounds its own output to 4 (that ROUND
     /// exists because an unconstrained NUMERIC has to survive the trip into
-    /// <see cref="decimal"/>, which throws rather than truncating — the 0.63.0
-    /// <c>holdings_snapshot</c> failure). The two agreed anyway for as long as every
-    /// fixture held WHOLE shares, because a whole-share product has no fractional part
-    /// to round. The first 12dp fractional position split them by a few millionths
-    /// of a unit of currency, caught by the boundary matrix on
-    /// <c>NetWorthReconciliationTests</c>.
+    /// <see cref="decimal"/>, which throws rather than truncating). WHOLE-share
+    /// positions cannot show the difference, because a whole-share product has no
+    /// fractional part to round; a 12dp fractional position splits them by a few
+    /// millionths of a unit of currency. The boundary matrix on
+    /// <c>NetWorthReconciliationTests</c> pins the agreement.
     /// </para>
     /// <para>
-    /// Rounding to 4 here rather than to the cent is deliberate: rounding each
-    /// position to 2dp BEFORE summing accumulates its own error across a portfolio.
-    /// Bound at 4dp internally, present at 2dp.
+    /// Rounding to 4 here rather than to the currency's minor unit is deliberate:
+    /// rounding each position to its currency's places BEFORE summing accumulates its
+    /// own error across a portfolio. Bound at 4dp internally, on REST and MCP alike;
+    /// the SPA presents the figure at the currency's places (ADR-0114 D15).
+    /// </para>
+    /// <para>
+    /// A half rounds away from zero, as Postgres <c>ROUND</c> rounds a NUMERIC.
+    /// <see cref="decimal.Round(decimal, int)"/> alone takes a half to the even digit,
+    /// so a product landing exactly on a midpoint (2.5 shares at a 4dp price) came out
+    /// a ten-thousandth apart on the two routes.
     /// </para>
     /// </remarks>
     public static decimal MarketValue(decimal quantity, decimal price) =>
-        decimal.Round(quantity * price, MarketValuePlaces);
+        decimal.Round(quantity * price, MarketValuePlaces, MidpointRounding.AwayFromZero);
 }

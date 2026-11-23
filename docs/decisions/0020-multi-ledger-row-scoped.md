@@ -8,7 +8,7 @@
 > will produce a policy that is both wrong in shape and drastically slower.
 >
 > Migration 071 denormalised `ledger_id` onto the five hot-path tables because the
-> anchor-subquery policies were multiplying recompute cost **180×**; migration 072
+> anchor-subquery policies multiplied recompute cost; migration 072
 > flattened the rest. Every ledger-scoped table now carries its own `ledger_id`, kept
 > coherent by a composite FK to its parent rather than by the subquery, and its policy
 > reads `ledger_id` directly. The "two copies of the same fact" this ADR's rationale
@@ -217,6 +217,13 @@ ledger inline (convenience for the first run). Re-runs of `--ledger
 <id>` are still idempotent — every existing upsert key now reads
 `(ledger_id, …)` so the same MD source doesn't collide across ledgers.
 
+> *Amended 2026-10-25:* the command-line import is removed. The in-app wizard is
+> the only import path and always creates a new ledger
+> ([ADR-0071](0071-install-provisioning-ui-import-authed-restore.md), amendment of
+> that date); re-runs into an existing ledger were already refused by
+> [ADR-0052](0052-moneydance-reimport-idempotency.md) D2. Rule 2's per-ledger keys
+> stand.
+
 ## Phased migration plan
 
 This is a big DDL change but the work is mechanical. The phased plan
@@ -351,8 +358,8 @@ has now been applied to every remaining single-column cross-table FK:
   sync_run_promotions.header_id (the only CASCADE; the rest are
   SET NULL).
 
-All seven Phase-2 references were verified leak-free before the FKs were
-added. The six nullable FKs use PostgreSQL 15+
+Migration 121 checks all seven Phase-2 references for cross-ledger rows
+before adding the FKs, and halts if it finds any. The six nullable FKs use PostgreSQL 15+
 `ON DELETE SET NULL (<col>)` so a parent delete nulls only the FK column
 and never the NOT-NULL `ledger_id`. `users.last_opened_ledger_id` stays
 deliberately non-composite — it intentionally points across ledgers

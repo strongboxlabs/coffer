@@ -11,7 +11,7 @@ namespace Coffer.Api.Notifications;
 /// no database row; a dead-man's-switch monitor notices the missing ping.
 /// <para>
 /// Configure only <see cref="Message"/> providers and you have kept the exact
-/// failure mode that once went unnoticed for days — which is why the configuration surface warns
+/// failure mode that goes unnoticed: a job that silently stops — which is why the configuration surface warns
 /// when no heartbeat-capable subscriber is enabled.
 /// </para>
 /// </remarks>

@@ -25,11 +25,12 @@ namespace Coffer.Api.Tests.Integration.Reminders;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ReminderEstimateUpgradeTests
+public sealed class ReminderEstimateUpgradeTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ReminderEstimateUpgradeTests(PostgresFixture fixture) => _fixture = fixture;
+    public ReminderEstimateUpgradeTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private const string Mig220 = "220_reminder_estimated_amounts.sql";
 
@@ -40,7 +41,7 @@ public sealed class ReminderEstimateUpgradeTests
     private (string ConnectionString, string WorkDir) FreshInstallBefore220(string dbName)
     {
         var work = Directory.CreateTempSubdirectory("coffer-mig220-").FullName;
-        var cs = _fixture.EmptyDatabaseConnectionString(dbName);
+        var cs = Db.EmptyDatabaseConnectionString(dbName);
         UpgradeRehearsal.RunStaged(cs, UpgradeRehearsal.StageBefore(Mig220, work));
         return (cs, work);
     }

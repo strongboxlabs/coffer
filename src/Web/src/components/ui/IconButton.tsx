@@ -2,6 +2,8 @@ import { forwardRef, type ButtonHTMLAttributes } from 'react';
 
 import { cn } from '@/lib/cn';
 
+import { usePendingButtonProps } from './pending';
+
 // IconButton — compact square button for icon-only affordances
 // (⌘K trigger, settings cog, sidebar collapse). Always require an
 // accessible label via `aria-label`.
@@ -19,10 +21,14 @@ export interface IconButtonProps extends ButtonHTMLAttributes<HTMLButtonElement>
      * floor of a comfortable pointer target.
      */
     size?: 'sm' | 'md';
+    /** A request this button waits on is in flight: it keeps focus and refuses
+     *  to act (pending.ts). `disabled` is for unavailable, not for busy. */
+    pending?: boolean;
 }
 
 export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(
-    function IconButton({ className, type, size = 'md', ...props }, ref) {
+    function IconButton({ className, type, size = 'md', pending, onClick, ...props }, ref) {
+        const pendingProps = usePendingButtonProps();
         return (
             <button
                 ref={ref}
@@ -33,9 +39,14 @@ export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(
                     'hover:bg-surface-hover hover:text-text',
                     'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1',
                     'disabled:pointer-events-none disabled:opacity-50',
+                    // Pending looks as disabled does and keeps its pointer
+                    // events, so its resting look is restated on hover (pending.ts).
+                    'aria-disabled:cursor-default aria-disabled:opacity-50',
+                    'aria-disabled:hover:bg-transparent aria-disabled:hover:text-text-muted',
                     className,
                 )}
                 {...props}
+                {...pendingProps(pending, onClick)}
             />
         );
     },

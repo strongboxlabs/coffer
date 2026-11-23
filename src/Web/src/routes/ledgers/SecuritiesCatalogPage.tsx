@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 import { Link, useNavigate, useParams } from '@tanstack/react-router';
 
 import {
@@ -8,6 +9,8 @@ import {
     refreshQuotes,
 } from '@/lib/api';
 import { errorMessage } from '@/lib/errorMessage';
+import { invalidateConvertedReads, invalidateHomeReads } from '@/lib/registerInvalidation';
+import { marketSeriesParts } from '@/lib/ledgerOperationDisplay';
 import type {
     QuoteRunOutcome,
     SecuritySummary,
@@ -21,6 +24,8 @@ import {
     MainPane,
     TopBar,
 } from '@/components/ui/SidebarLayout';
+import { useLedgerRole } from '@/lib/useLedgerRole';
+
 import { AddSecurityDialog } from './components/AddSecurityDialog';
 import { formatPrice, formatQuantity, formatCurrency } from '@/lib/money';
 
@@ -37,6 +42,9 @@ export function SecuritiesCatalogPage() {
 
     const [search, setSearch] = useState('');
     const [addOpen, setAddOpen] = useState(false);
+    // A viewer reads the catalog and changes nothing in it: no price refresh, no
+    // new security (the API refuses a viewer both).
+    const { canEdit } = useLedgerRole(ledgerId);
     const [refreshOutcome, setRefreshOutcome] =
         useState<QuoteRunOutcome | null>(null);
 
@@ -60,6 +68,17 @@ export function SecuritiesCatalogPage() {
             void queryClient.invalidateQueries({
                 queryKey: ['securities', ledgerId],
             });
+            // New prices move the market value of every account holding a
+            // refreshed security, which the sidebar's figures include (FU-052),
+            // and the home screen's balances (ADR-0079).
+            void queryClient.invalidateQueries({
+                queryKey: ['accounts', ledgerId],
+            });
+            invalidateHomeReads(queryClient, ledgerId);
+            // The refresh also fetches exchange rates and benchmark history (ADR-0114
+            // D11), which every converted figure, the rates view and the benchmark
+            // list's availability read.
+            invalidateConvertedReads(queryClient, ledgerId);
         },
     });
 
@@ -101,25 +120,26 @@ export function SecuritiesCatalogPage() {
                                 this ledger's transactions.
                             </p>
                         </div>
-                        <div className="flex items-center gap-2">
-                            <Button
-                                variant="secondary"
-                                size="sm"
-                                onClick={() => refreshMutation.mutate()}
-                                disabled={refreshMutation.isPending}
-                            >
-                                {refreshMutation.isPending
-                                    ? 'Refreshing…'
-                                    : 'Refresh prices'}
-                            </Button>
-                            <Button
-                                variant="primary"
-                                size="sm"
-                                onClick={() => setAddOpen(true)}
-                            >
-                                + Add security
-                            </Button>
-                        </div>
+                        {canEdit ? (
+                            <div className="flex items-center gap-2">
+                                <Button
+                                    variant="secondary"
+                                    size="sm"
+                                    onClick={() => refreshMutation.mutate()}
+                                    pending={refreshMutation.isPending}
+                                    pendingLabel="Refreshing…"
+                                >
+                                    Refresh prices
+                                </Button>
+                                <Button
+                                    variant="primary"
+                                    size="sm"
+                                    onClick={() => setAddOpen(true)}
+                                >
+                                    + Add security
+                                </Button>
+                            </div>
+                        ) : null}
                     </header>
 
                     {refreshMutation.isError ? (
@@ -171,7 +191,7 @@ export function SecuritiesCatalogPage() {
                                 hint={
                                     search.length > 0
                                         ? 'Try a different search.'
-                                        : 'Add one manually or import from Moneydance.'
+                                        : canEdit ? 'Add one manually or import from Moneydance.' : undefined
                                 }
                             />
                         ) : (
@@ -221,7 +241,6 @@ function CatalogTable({
     rows: readonly SecuritySummary[];
     onRowClick: (id: string) => void;
 }) {
-    void ledgerId;
     // Match the Ledger Hub's Securities-section order so a user
     // bouncing between the hub and the full catalog sees the same
     // sequence. Sort key: market value desc (qty × latest price),
@@ -262,7 +281,18 @@ function CatalogTable({
                         <td className="px-4 py-2 font-mono text-[0.75rem] tabular-nums text-text-muted">
                             {s.cusip ?? <span className="text-text-subtle">—</span>}
                         </td>
-                        <td className="px-4 py-2">{s.name}</td>
+                        {/* The name is a link, so the keyboard opens a security
+                            as a click anywhere on the row does. */}
+                        <td className="px-4 py-2">
+                            <Link
+                                to="/ledgers/$ledgerId/securities/$securityId"
+                                params={{ ledgerId, securityId: s.id }}
+                                onClick={(e) => e.stopPropagation()}
+                                className="rounded hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                            >
+                                {s.name}
+                            </Link>
+                        </td>
                         <td className="px-4 py-2 text-[0.6875rem] uppercase tracking-wider text-text-muted">
                             {s.assetClass?.replace(/_/g, ' ') ?? '—'}
                         </td>
@@ -271,14 +301,16 @@ function CatalogTable({
                                 ? formatQuantity(s.totalQuantity)
                                 : '—'}
                         </td>
+                        {/* The price, and the amount it makes, in the price's own
+                            currency: a catalog lists securities priced in several. */}
                         <td className="px-4 py-2 text-right font-mono tabular-nums">
                             {s.latestPrice !== null
-                                ? formatPrice(s.latestPrice)
+                                ? formatPrice(s.latestPrice, s.priceCurrencyCode)
                                 : '—'}
                         </td>
                         <td className="px-4 py-2 text-right font-mono tabular-nums">
                             {s.totalQuantity !== 0 && s.latestPrice !== null
-                                ? formatCurrency(s.totalQuantity * s.latestPrice)
+                                ? formatCurrency(s.totalQuantity * s.latestPrice, s.priceCurrencyCode)
                                 : '—'}
                         </td>
                     </tr>
@@ -301,6 +333,13 @@ function sortKey(s: SecuritySummary): number {
 /** One-line summary of a price-refresh outcome for the inline status. */
 function summarizeRefresh(o: QuoteRunOutcome): string {
     const changed = o.pricesInserted + o.pricesUpdated;
+    // Rates, benchmark days and currency checks are stored by the same run (ADR-0114 D11).
+    const series = marketSeriesParts(o);
+    if (changed === 0 && series.length > 0) {
+        const parts = [...series];
+        if (o.securitiesUnresolved.length > 0) parts.push(`${o.securitiesUnresolved.length} unresolved`);
+        return `No prices updated. Stored ${parts.join(' · ')}.`;
+    }
     if (changed === 0) {
         return o.securitiesUnresolved.length > 0
             ? `No prices updated — ${o.securitiesUnresolved.length} ${
@@ -315,6 +354,7 @@ function summarizeRefresh(o: QuoteRunOutcome): string {
     if (o.securitiesUnresolved.length > 0) {
         parts.push(`${o.securitiesUnresolved.length} unresolved`);
     }
+    parts.push(...series);
     return `Refreshed prices: ${parts.join(' · ')}.`;
 }
 

@@ -16,19 +16,22 @@ namespace Coffer.Api.Tests.Integration.Infra;
 /// <remarks>
 /// <para>
 /// <b>Why this exists.</b> New-code correctness and upgrade correctness are
-/// different properties, and the suite only ever tested the first: every fixture
-/// starts from a database at head, where the state a backfill acts on has already
-/// been migrated away. A green suite against a fresh database says nothing about
-/// what happens to rows that were written years ago.
+/// different properties. A fixture that starts from a database at head tests only
+/// the first: the state a backfill acts on has already been migrated away, and a
+/// green suite against a fresh database says nothing about what happens to rows
+/// that were written years ago.
 /// </para>
 /// <para>
-/// The pattern was hand-rolled once, for migration 214's backfill, with a note
-/// saying it was worth the trouble because "a green suite against a fresh database
-/// would say nothing about that". Four scheduled migrations need the same thing —
-/// a realized-gains backfill, a SET NOT NULL whose backfill needs real key
-/// material, a nullable column on two scheduler tables, and two txn_headers
-/// columns backfilled out of a JSON payload — so it is infrastructure now rather
-/// than a copied block.
+/// Backfills, a SET NOT NULL whose backfill needs real key material, and columns
+/// backfilled out of a JSON payload all need the same staging, so it is shared
+/// infrastructure rather than a copied block.
+/// </para>
+/// <para>
+/// <b>C# migration steps run as an install runs them.</b> Every run goes through
+/// <see cref="MigrationRunner.Run"/>, which registers each of
+/// <see cref="MigrationRunner.CSharpSteps"/> directly after its script whenever that
+/// script is staged, so applying the script also runs and journals its step, and a
+/// directory staged before the script never runs it (<c>StoredNotesBackfillTests</c>).
 /// </para>
 /// <para>
 /// <b>What it does NOT do.</b> It rehearses SQL against data, not a deployment.
@@ -83,7 +86,7 @@ public static class UpgradeRehearsal
     /// <paramref name="connectionString"/>.
     /// </summary>
     public static void RunStaged(string connectionString, string workDir)
-        => MigrationRunner.Run(connectionString, workDir, NullLogger.Instance);
+        => MigrationRunner.Run(TestDatabaseCluster.ForMigrationRunner(connectionString), workDir, NullLogger.Instance);
 
     /// <summary>
     /// Add one migration to the staged set and run it.
@@ -96,7 +99,7 @@ public static class UpgradeRehearsal
             throw new ArgumentException($"No migration named '{migrationFileName}'.", nameof(migrationFileName));
 
         File.Copy(script, Path.Combine(workDir, migrationFileName), overwrite: true);
-        MigrationRunner.Run(connectionString, workDir, NullLogger.Instance);
+        MigrationRunner.Run(TestDatabaseCluster.ForMigrationRunner(connectionString), workDir, NullLogger.Instance);
     }
 
     /// <summary>
@@ -136,7 +139,7 @@ public static class UpgradeRehearsal
             }
         }
 
-        MigrationRunner.Run(connectionString, workDir, NullLogger.Instance);
+        MigrationRunner.Run(TestDatabaseCluster.ForMigrationRunner(connectionString), workDir, NullLogger.Instance);
     }
 
     /// <summary>
@@ -161,7 +164,7 @@ public static class UpgradeRehearsal
     {
         Directory.CreateDirectory(workDir);
         File.WriteAllText(Path.Combine(workDir, fileName), sql);
-        MigrationRunner.Run(connectionString, workDir, NullLogger.Instance);
+        MigrationRunner.Run(TestDatabaseCluster.ForMigrationRunner(connectionString), workDir, NullLogger.Instance);
     }
 
     /// <summary>

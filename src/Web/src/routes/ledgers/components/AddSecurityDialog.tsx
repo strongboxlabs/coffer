@@ -1,4 +1,4 @@
-import { useMutation } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import { ApiError, createSecurity } from '@/lib/api';
 import type { CreateSecurityRequest } from '@/lib/types';
@@ -47,11 +47,11 @@ export function AddSecurityDialog({
         onSuccess: ({ securityId }) => onCreated(securityId),
     });
 
-    const saveDisabled = !form.isValid || createMutation.isPending;
+    const saveDisabled = !form.isValid;
 
     function handleSubmit(e: React.FormEvent) {
         e.preventDefault();
-        if (saveDisabled) return;
+        if (saveDisabled || createMutation.isPending) return;
         createMutation.mutate(form.buildCreatePayload());
     }
 
@@ -80,7 +80,7 @@ export function AddSecurityDialog({
                         variant="secondary"
                         size="sm"
                         onClick={onClose}
-                        disabled={createMutation.isPending}
+                        pending={createMutation.isPending}
                     >
                         Cancel
                     </Button>
@@ -89,8 +89,10 @@ export function AddSecurityDialog({
                         variant="primary"
                         size="sm"
                         disabled={saveDisabled}
+                        pending={createMutation.isPending}
+                        pendingLabel="Saving…"
                     >
-                        {createMutation.isPending ? 'Saving…' : 'Save'}
+                        Save
                     </Button>
                 </footer>
             </form>

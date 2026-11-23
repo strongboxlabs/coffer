@@ -19,11 +19,12 @@ namespace Coffer.Api.Tests.Integration.Notifications;
 /// to remove.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class NotificationPublisherTests
+public sealed class NotificationPublisherTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public NotificationPublisherTests(PostgresFixture fixture) => _fixture = fixture;
+    public NotificationPublisherTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     /// <summary>A subscriber that records what it was handed, or throws on command.</summary>
     private sealed class SpySubscriber : INotificationSubscriber
@@ -51,40 +52,20 @@ public sealed class NotificationPublisherTests
     }
 
     private NotificationPublisher PublisherFor(params INotificationSubscriber[] subscribers) =>
-        new(_fixture.NewServiceFactory(),
-            _fixture.NewLedgerKeyService(),
+        new(Db.NewServiceFactory(),
+            Db.NewLedgerKeyService(),
             subscribers,
             NullLogger<NotificationPublisher>.Instance, TimeProvider.System);
-
-    /// <summary>
-    /// Clear the deployment-scope tables before seeding.
-    /// </summary>
-    /// <remarks>
-    /// These tables are NOT ledger-scoped, so the per-test synthetic ledger that
-    /// isolates every other suite does nothing here — a subscriber another test
-    /// added is still enabled and still matches. That is the same exception
-    /// engineering-standards §5.2 already makes for genuinely global tables like
-    /// <c>bootstrap_tokens</c>, and it is a real property of deployment-scope
-    /// features rather than a wart in these tests: a first version of this file
-    /// skipped it and the topic-filter test failed because an earlier test's
-    /// unfiltered subscriber received the event.
-    /// </remarks>
-    private async Task ResetAsync()
-    {
-        await using var db = _fixture.NewDbContext();
-        await db.Database.ExecuteSqlRawAsync(
-            "TRUNCATE notification_subscribers; TRUNCATE system_events;");
-    }
 
     /// <summary>Seed a configured target with its config sealed, as production does.</summary>
     private async Task<Guid> AddSubscriberAsync(
         string key, string minSeverity, string[]? topics = null, string? monitors = null)
     {
-        var keys = _fixture.NewLedgerKeyService();
+        var keys = Db.NewLedgerKeyService();
         var sealedConfig = keys.SealWithMasterKey(Encoding.UTF8.GetBytes(
             JsonSerializer.Serialize(new SubscriberConfig("https://example.invalid/ping"))));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var id = Guid.NewGuid();
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             INSERT INTO notification_subscribers
@@ -95,7 +76,7 @@ public sealed class NotificationPublisherTests
 
     private async Task<(int Failures, string? Error, DateTime? Success)> HealthAsync(Guid id)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.NotificationSubscribers.AsNoTracking().SingleAsync(r => r.Id == id);
         return (row.ConsecutiveFailures, row.LastError, row.LastSuccessAt);
     }
@@ -103,12 +84,11 @@ public sealed class NotificationPublisherTests
     [Fact]
     public async Task An_event_is_recorded_and_delivered_to_a_matching_target()
     {
-        await ResetAsync();
         var id = await AddSubscriberAsync("spy", NotificationSeverity.Warning);
         // MESSAGE capability: this is about generic delivery, which is the message
-        // class's job. It used to say Heartbeat and pass only because any Critical
-        // event reached a heartbeat target — the conflation that let an unrelated
-        // critical mark a backup check down.
+        // class's job. A Heartbeat target here would pass only if any Critical event
+        // reached a heartbeat target — the conflation that lets an unrelated critical
+        // mark a backup check down.
         var spy = new SpySubscriber("spy", SubscriberCapability.Message);
 
         await PublisherFor(spy).PublishAsync(new NotificationEvent(
@@ -116,7 +96,7 @@ public sealed class NotificationPublisherTests
             "backup.stale", "No backup in 60 hours."));
 
         // Recorded ...
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Contains(await db.SystemEvents.AsNoTracking().ToListAsync(),
             e => e.EventKey == "backup.stale" && e.Severity == NotificationSeverity.Critical);
 
@@ -131,7 +111,6 @@ public sealed class NotificationPublisherTests
     [Fact]
     public async Task An_event_below_a_targets_floor_is_recorded_but_not_delivered()
     {
-        await ResetAsync();
         await AddSubscriberAsync("spy", NotificationSeverity.Critical);
         var spy = new SpySubscriber("spy", SubscriberCapability.Message);
 
@@ -143,7 +122,7 @@ public sealed class NotificationPublisherTests
         // keeps the routine traffic, the bus carries only what warrants attention.
         // A channel that reports every quote refresh gets muted, and then it is
         // protecting nothing.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Contains(await db.SystemEvents.AsNoTracking().ToListAsync(),
             e => e.EventKey == "quotes.refreshed");
         Assert.Empty(spy.Delivered);
@@ -152,7 +131,6 @@ public sealed class NotificationPublisherTests
     [Fact]
     public async Task A_topic_filter_excludes_other_topics()
     {
-        await ResetAsync();
         await AddSubscriberAsync("spy", NotificationSeverity.Info, ["backup"]);
         // Topic filtering is a message-target concern. A heartbeat target is bound to
         // one monitor instead, which is a stronger statement than a topic filter.
@@ -174,7 +152,6 @@ public sealed class NotificationPublisherTests
     [Fact]
     public async Task A_failing_target_is_recorded_and_does_not_break_the_publish()
     {
-        await ResetAsync();
         var id = await AddSubscriberAsync("angry", NotificationSeverity.Info);
         var angry = new SpySubscriber("angry", SubscriberCapability.Message, throws: true);
 
@@ -198,7 +175,6 @@ public sealed class NotificationPublisherTests
         // A renamed key, or a provider dropped from the build. Without this, an
         // unroutable target looks identical to a working one on the settings page —
         // which is the silent failure, wearing a different hat.
-        await ResetAsync();
         var id = await AddSubscriberAsync("ghost", NotificationSeverity.Info);
 
         await PublisherFor(new SpySubscriber("spy", SubscriberCapability.Message))
@@ -215,7 +191,6 @@ public sealed class NotificationPublisherTests
     public async Task The_heartbeat_question_answers_honestly()
     {
         // What the settings surface asks before telling someone they are covered.
-        await ResetAsync();
         var publisher = PublisherFor(
             new SpySubscriber("webhook", SubscriberCapability.Message),
             new SpySubscriber("healthchecks", SubscriberCapability.Heartbeat));
@@ -225,9 +200,9 @@ public sealed class NotificationPublisherTests
         Assert.False(beforeBinding[NotificationMonitors.Backup],
             "a message-only target must not count as absence detection");
 
-        // Bound to the monitor it actually watches. Coverage is per monitor now,
-        // because one healthchecks URL is one check: a target watching backups says
-        // nothing about any other job, and the old boolean could not express that.
+        // Bound to the monitor it actually watches. Coverage is per monitor, because
+        // one healthchecks URL is one check: a target watching backups says nothing
+        // about any other job, which a single boolean cannot express.
         await AddSubscriberAsync("healthchecks", NotificationSeverity.Info,
             monitors: NotificationMonitors.Backup);
         Assert.True((await publisher.MonitorCoverageAsync())[NotificationMonitors.Backup]);

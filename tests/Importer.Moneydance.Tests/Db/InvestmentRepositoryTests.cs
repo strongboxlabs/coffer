@@ -13,13 +13,11 @@ namespace Coffer.Importer.Moneydance.Tests.Db;
 /// scrub in migration 053.
 /// </summary>
 [Collection(DbCollection.Name)]
-public sealed class InvestmentRepositoryTests
+public sealed class InvestmentRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public InvestmentRepositoryTests(PostgresFixture fixture)
+    public InvestmentRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     [Fact]
@@ -38,8 +36,7 @@ public sealed class InvestmentRepositoryTests
         // lot A's cheaper shares into what remains; this asserts FIFO.) The
         // unit_price on the Sell legs is the market price at sale time — it
         // doesn't affect basis, only the consumed FIFO-lot cost does.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -95,8 +92,7 @@ public sealed class InvestmentRepositoryTests
         // corresponding Buys (data drift, partial scrub), the function
         // must NOT produce a negative cost_basis. It floors at zero and
         // moves on.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -128,8 +124,7 @@ public sealed class InvestmentRepositoryTests
         // Sell-everything path: after a Buy and a matched Sell, both
         // running qty and running basis must converge to zero (otherwise
         // a re-bought lot would inherit basis from sold shares).
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -172,8 +167,7 @@ public sealed class InvestmentRepositoryTests
         // correctly (the posting_role marker), but the brokerage's policy
         // decides whether to honor it. Matches the 401k-style account
         // where in-transaction fees are administrative, not commissions.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -206,8 +200,7 @@ public sealed class InvestmentRepositoryTests
         // Brokerage's is_trade_commission = TRUE means posting_role='fee'
         // amounts in the same header flow into basis. A buy plus its fee →
         // basis = quantity × price + fee, and unit_cost = basis / quantity.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -248,8 +241,7 @@ public sealed class InvestmentRepositoryTests
         // Misc Expense" (not "Brokerage Commission") but the posting was
         // explicitly marked as a fee. With the brokerage flag TRUE, it
         // still flows into basis.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -284,8 +276,7 @@ public sealed class InvestmentRepositoryTests
         // Flip back FALSE → run → both revert. The function refreshes
         // both holdings.cost_basis AND lots.unit_cost on every call so
         // toggling the flag propagates fully.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -342,11 +333,10 @@ public sealed class InvestmentRepositoryTests
         Assert.Equal(10m, unitCostBack);
     }
 
-    // The two Trigger_rejects_* tests that lived here previously
-    // exercised trg_validate_posting_role (migration 057). Migration
-    // 084 dropped that trigger — the invariant
+    // The invariant
     //   posting_role IS NOT NULL ⇔ txn_headers.action IS NOT NULL
-    // is now upheld by repository code (InvestmentTransactionsRepository
+    // has no trigger (migration 084 dropped trg_validate_posting_role); it
+    // is upheld by repository code (InvestmentTransactionsRepository
     // .CreateAsync / .PatchAsync, IngestOrchestrator, this repository)
     // and verified at the API integration layer
     // (InvestmentTransactionsEndpointsTests, e.g. lines 118 / 347 / 529
@@ -360,8 +350,7 @@ public sealed class InvestmentRepositoryTests
         // The misc-with-fee shape is a legitimate user-creatable MD
         // event — `inc` txn with both `inc` and `fee` splits → 2
         // postings under one header. The DB must accept it.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -376,10 +365,10 @@ public sealed class InvestmentRepositoryTests
         var headerId = Guid.NewGuid();
         await conn.ExecuteAsync(@"
             INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
-                is_pending, is_hidden, action, created_at)
+                is_pending, is_hidden, action, created_at, originating_account_id)
             VALUES (@Id, @LedgerId, 'manual', NOW(),NOW(),
-                false, false, 'misc', NOW());",
-            new { Id = headerId, LedgerId = ledgerId });
+                false, false, 'misc', NOW(), @Brokerage);",
+            new { Id = headerId, LedgerId = ledgerId, Brokerage = brokerage });
 
         // Posting 0 (income side).
         await conn.ExecuteAsync(@"
@@ -405,6 +394,7 @@ public sealed class InvestmentRepositoryTests
             "SELECT COUNT(DISTINCT posting_index) FROM txn_legs WHERE header_id = @Id;",
             new { Id = headerId });
         Assert.Equal(2, distinctPostings);
+        await StoredNotesSeed.BackfillNotesAsync(conn, ledgerId);
     }
 
     [Fact]
@@ -413,19 +403,20 @@ public sealed class InvestmentRepositoryTests
         // Migration 062 dropped `interest`, `misc_income`, `misc_expense`
         // from the txn_headers.action CHECK. All three should fail
         // check_violation on insert.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         foreach (var oldAction in new[] { "interest", "misc_income", "misc_expense" })
         {
+            // Legless, so no originating account (mig 263).
             var ex = await Assert.ThrowsAsync<Npgsql.PostgresException>(() => conn.ExecuteAsync(@"
                 INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
-                    is_pending, is_hidden, action, created_at)
+                    is_pending, is_hidden, action, created_at, originating_account_id)
                 VALUES (@Id, @LedgerId, 'manual', NOW(),NOW(),
-                    false, false, @Action, NOW());",
+                    false, false, @Action, NOW(), NULL);",
                 new { Id = Guid.NewGuid(), LedgerId = TestLedger.Id, Action = oldAction }));
             Assert.Equal("23514", ex.SqlState);
         }
+        await StoredNotesSeed.BackfillNotesAsync(conn, TestLedger.Id);
     }
 
     [Fact]
@@ -433,18 +424,19 @@ public sealed class InvestmentRepositoryTests
     {
         // Migration 062 added `buyx`, `sellx`, `divx`, `misc` to the
         // CHECK. Each should insert cleanly.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         foreach (var newAction in new[] { "buyx", "sellx", "divx", "misc" })
         {
+            // Legless, so no originating account (mig 263).
             await conn.ExecuteAsync(@"
                 INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
-                    is_pending, is_hidden, action, created_at)
+                    is_pending, is_hidden, action, created_at, originating_account_id)
                 VALUES (@Id, @LedgerId, 'manual', NOW(),NOW(),
-                    false, false, @Action, NOW());",
+                    false, false, @Action, NOW(), NULL);",
                 new { Id = Guid.NewGuid(), LedgerId = TestLedger.Id, Action = newAction });
         }
+        await StoredNotesSeed.BackfillNotesAsync(conn, TestLedger.Id);
     }
 
     [Fact]
@@ -454,8 +446,7 @@ public sealed class InvestmentRepositoryTests
         // Flipping the flag on a category, bank, or credit_card account
         // must fail at the DB level — the flag semantically lives on
         // brokerages.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId = TestLedger.Id;
         var catId    = Guid.NewGuid();
@@ -476,8 +467,7 @@ public sealed class InvestmentRepositoryTests
         // Two equal buys, then a sell of one and a half lots → first lot
         // fully closed, second lot has half its quantity remaining, both
         // basis and lots agree.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -528,8 +518,7 @@ public sealed class InvestmentRepositoryTests
         // Critical for the "flip flag, re-run" workflow: state at the
         // start of each holding's loop is reset from txn_legs, so
         // running the function N times produces the same result.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -567,8 +556,7 @@ public sealed class InvestmentRepositoryTests
     public async Task RecomputeCostBasis_FIFO_closes_lot_fully_when_sell_drains_it_exactly()
     {
         // A buy, then a sell of the same quantity → lot closed with qty=0.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -611,8 +599,7 @@ public sealed class InvestmentRepositoryTests
         // aggregation summed leg deltas (the bought quantity alone) with no
         // split awareness. Post-060 the recompute walks the unified event
         // stream and produces the doubled quantity.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -646,8 +633,7 @@ public sealed class InvestmentRepositoryTests
     {
         // Lot-level: a 2-for-1 forward split must double an open lot's
         // remaining quantity. Closed lots stay closed at quantity=0.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -686,8 +672,7 @@ public sealed class InvestmentRepositoryTests
         // function resets every lot for the holding at the start of each
         // pass; the running-qty walk produces the same doubled quantity
         // every time.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -731,8 +716,7 @@ public sealed class InvestmentRepositoryTests
         // Validates that the basis is correctly carried through the split
         // and that the avg-cost reduction on the post-split sell uses the
         // post-split share count.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -774,8 +758,7 @@ public sealed class InvestmentRepositoryTests
     {
         // A buy → reverse 1-for-2 (ratio 0.5) → quantity halves, basis
         // preserved at the purchase cost (per-share basis doubles).
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId  = TestLedger.Id;
         var brokerage = Guid.NewGuid();
@@ -810,16 +793,17 @@ public sealed class InvestmentRepositoryTests
         // Migration 060 removed 'split' from the action CHECK. Splits are
         // security metadata now, not transactions — inserting a split-
         // action header must fail with a check_violation.
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
+        // Legless, so no originating account (mig 263).
         var ex = await Assert.ThrowsAsync<PostgresException>(() => conn.ExecuteAsync(@"
             INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
-                is_pending, is_hidden, action, created_at)
+                is_pending, is_hidden, action, created_at, originating_account_id)
             VALUES (@Id, @LedgerId, 'manual', NOW(),NOW(),
-                false, false, 'split', NOW());",
+                false, false, 'split', NOW(), NULL);",
             new { Id = Guid.NewGuid(), LedgerId = TestLedger.Id }));
         Assert.Equal("23514", ex.SqlState);    // check_violation
+        await StoredNotesSeed.BackfillNotesAsync(conn, TestLedger.Id);
     }
 
     private static async Task InsertSplitAsync(
@@ -918,10 +902,10 @@ public sealed class InvestmentRepositoryTests
 
         await conn.ExecuteAsync(@"
             INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
-                is_pending, is_hidden, action, created_at)
+                is_pending, is_hidden, action, created_at, originating_account_id)
             VALUES (@Id, @LedgerId, 'manual', @PostedAt,@PostedAt,
-                false, false, @Action, @PostedAt);",
-            new { Id = headerId, LedgerId = ledgerId, PostedAt = posted, Action = action });
+                false, false, @Action, @PostedAt, @BrokerageId);",
+            new { Id = headerId, LedgerId = ledgerId, PostedAt = posted, Action = action, BrokerageId = brokerageId });
 
         await conn.ExecuteAsync(@"
             INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index,
@@ -946,6 +930,7 @@ public sealed class InvestmentRepositoryTests
                 PostedAt       = posted,
             });
 
+        await StoredNotesSeed.BackfillNotesAsync(conn, ledgerId);
         return headerId;
     }
 
@@ -1006,10 +991,10 @@ public sealed class InvestmentRepositoryTests
 
         await conn.ExecuteAsync(@"
             INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
-                is_pending, is_hidden, action, created_at)
+                is_pending, is_hidden, action, created_at, originating_account_id)
             VALUES (@Id, @LedgerId, 'manual', @PostedAt,@PostedAt,
-                false, false, 'buy', @PostedAt);",
-            new { Id = headerId, LedgerId = ledgerId, PostedAt = posted });
+                false, false, 'buy', @PostedAt, @BrokerageId);",
+            new { Id = headerId, LedgerId = ledgerId, PostedAt = posted, BrokerageId = brokerageId });
 
         // Posting 0: shares (security role). Posting 1: fee (fee role).
         await conn.ExecuteAsync(@"
@@ -1045,6 +1030,7 @@ public sealed class InvestmentRepositoryTests
                 PostedAt        = posted,
             });
 
+        await StoredNotesSeed.BackfillNotesAsync(conn, ledgerId);
         return headerId;
     }
 
@@ -1078,14 +1064,5 @@ public sealed class InvestmentRepositoryTests
                 UnitCost   = unitCost,
                 AcquiredAt = acquiredAt,
             });
-    }
-
-    private static async Task ResetAsync(NpgsqlConnection conn)
-    {
-        // Order matters: lots → holdings → txn_legs → txn_headers →
-        // security_splits → securities → accounts. Each step's FK target follows.
-        await conn.ExecuteAsync(@"
-            TRUNCATE security_splits, lots, holdings, txn_legs, txn_headers,
-                     securities, accounts RESTART IDENTITY CASCADE;");
     }
 }

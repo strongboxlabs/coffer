@@ -5,7 +5,7 @@
 -- The lot-reset block (introduced in 056, carried forward in 060)
 -- pulls a lot's source leg from txn_legs and divides tl.amount by
 -- tl.quantity to produce the lot's unit_cost. Acquisition legs
--- normally carry quantity > 0, but MD's real data has edge-case
+-- normally carry quantity > 0, but MD admits edge-case
 -- divr / buy events with `sec.samt = 0` — a degenerate "dividend
 -- of zero shares" or "buy of zero shares" that MD permits as a
 -- bookkeeping side-effect of OFX import paths.

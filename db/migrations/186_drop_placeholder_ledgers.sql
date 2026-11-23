@@ -7,10 +7,10 @@
 -- provision --mode <clean|demo>` would resolve them before the first user
 -- existed: `clean` deleted both, `demo` seeded Demo from the bundled dataset.
 --
--- That assumption did not hold. scripts/dev-up-docker.sh — the documented dev
--- path — never calls provision, so every fresh install kept BOTH placeholders.
--- The setup page lists ledgers straight from this table, so it offered "Default"
--- and "Demo" as if they held data. Picking either granted ownership of an empty
+-- That assumption does not hold. scripts/dev-up-docker.sh — the documented dev
+-- path — never calls provision, so a fresh install keeps BOTH placeholders.
+-- The setup page lists ledgers straight from this table, so it offers "Default"
+-- and "Demo" as if they held data. Picking either grants ownership of an empty
 -- shell: no accounts, and no categories either, because the starter-category
 -- seed deliberately skips the join-existing path ("joining an existing ledger
 -- inherits its categories" — true of a real ledger, false of a placeholder).

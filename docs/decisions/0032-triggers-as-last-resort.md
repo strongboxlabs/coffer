@@ -23,18 +23,18 @@ fall into two families:
 
 The validation triggers were added defensively: each enforced an
 invariant the API code *also* enforced, on the theory that
-"trigger + code" is safer than "code alone." Real-world usage
-showed otherwise:
+"trigger + code" is safer than "code alone." The theory did not
+hold:
 
-### The chain-of-triggers regression (2026-05-28)
+### The chain-of-triggers failure
 
-A user PATCH on a feed-imported brokerage row (upgrade from
-bank-shape to BuyXfr) failed with:
+A PATCH that upgrades a feed-imported brokerage row from bank-shape
+to BuyXfr fails with:
 
 > P0001: posting_role required on legs of investment headers
 > (header_id=…, action=buyx, account_id=…, posting_index=0)
 
-The "violation" was transient. The chain that produced it:
+The "violation" is transient. The chain that produces it:
 
 1. EF flushes `UPDATE txn_headers SET action='buyx'` (the header
    transitions from null → buyx).
@@ -48,12 +48,11 @@ The "violation" was transient. The chain that produced it:
    pending DELETE later in the same EF batch).
 4. Trigger raises. Rollback. User sees a generic error.
 
-The validation was correct *in isolation* — a buyx leg without a
-posting_role IS a violation. But the validation fired during a
-multi-statement update where the API was mid-conversion. The
-brief inconsistency would have been resolved by the next
-statement in the same batch (the DELETE + new INSERT with proper
-roles). Chained triggers don't have visibility into "the parent
+The validation is correct *in isolation* — a buyx leg without a
+posting_role IS a violation. But the validation fires during a
+multi-statement update where the API is mid-conversion. The
+next statement in the same batch (the DELETE + new INSERT with
+proper roles) resolves the brief inconsistency. Chained triggers don't have visibility into "the parent
 operation is mid-flush"; they evaluate each statement in
 isolation.
 
@@ -136,10 +135,10 @@ every writer calls a recompute helper. Trade-off:
 | `trg_txn_legs_recompute_*` (4, holdings/lots) | Very high (holdings + lots, multiple tables) | Low (idempotent recompute) | **Removed mig 104** — moved to `HoldingsRecomputeInterceptor` (sibling of `LegDerivedRecomputeInterceptor`); call-site recompute for the `insert_investment_legs` TVF path (`InvestmentTransactionsRepository.Create/PatchAsync`) and importer Dapper path |
 | `trg_accounts_recompute_on_commission_flip` | Small (a thin `RETURNS TABLE(recomputed_count INTEGER)` SQL wrapper bound via `HasDbFunction` lets the API invoke the recompute via LINQ — same pattern as `insert_investment_legs`) | Low | **Removed mig 088** — `AccountsRepository.SetIsTradeCommissionAsync` calls the recompute explicitly after flipping the flag |
 
-**Balance triggers retired in mig 102.** The family broke four
-times under EF's batched `SaveChanges` (cascade-from-header DELETE
-order, override-on-posted_at bypass, override-on-amount bypass, and
-the merge-with-reshape batch-fire-order bug). The structural fix:
+**Balance triggers retired in mig 102.** The family has four
+distinct failure modes under EF's batched `SaveChanges`
+(cascade-from-header DELETE order, override-on-posted_at bypass,
+override-on-amount bypass, and merge-with-reshape batch fire order). The structural fix:
 move the recompute to API call sites via a `SaveChangesInterceptor`
 in C# (`LegDerivedRecomputeInterceptor`) that scans `ChangeTracker` and
 invokes the recompute SQL function (`fn_recompute_balances_for_account`)
@@ -149,11 +148,9 @@ once per save. Bulk paths that bypass the ChangeTracker
 [ADR-0034](0034-header-walk-running-balance.md) for the full
 rationale and the interceptor design.
 
-**Holdings/lots recompute triggers retired in mig 104.** They were
-kept after mig 102 ("different surface, narrower trigger set, no
-observed bugs"). We retired them anyway: the same arguments that
-made balance triggers a continuous source of bugs apply here in
-latent form — AFTER STATEMENT triggers see per-statement transition
+**Holdings/lots recompute triggers retired in mig 104.** Their surface
+is different and their trigger set narrower, but the balance triggers'
+failure modes apply to them in latent form — AFTER STATEMENT triggers see per-statement transition
 tables (not post-SaveChanges end state), the recompute is invisible
 to the writer, the dispatch logic duplicates what the interceptor
 pattern gets for free. The structural fix: a `HoldingsRecomputeInterceptor`
@@ -213,10 +210,8 @@ entry that tracked it was resolved and deleted:
 3. ~~`trg_validate_posting_completeness`~~ — done in migration 086.
 4. ~~`trg_user_ledger_grants_owner_present`~~ — done in migration 087.
 5. ~~`trg_accounts_recompute_on_commission_flip`~~ — done in
-   migration 088. A first audit (2026-05-29) flagged this as
-   "Keep" on the assumption that moving it would require raw
-   SQL in the repository. A second audit hours later corrected
-   the reasoning: `HasDbFunction` is precisely the documented
+   migration 088. Moving it needs no raw SQL in the repository:
+   `HasDbFunction` is precisely the documented
    escape hatch (engineering-standards §4.2.1) — a thin scalar
    wrapper (`recompute_holdings_for_brokerage`) bound to a
    `RETURNS TABLE(recomputed_count INTEGER)` SQL function lets
@@ -225,12 +220,12 @@ entry that tracked it was resolved and deleted:
    now visible at the call site:
    `SetIsTradeCommissionAsync` flips the flag, then explicitly
    refreshes derived state.
-6. **Stop** — keep all remaining recompute triggers
-   (`trg_*_balance_after_*`, `trg_txn_legs_recompute_*`).
-   Those mutate state on every leg write from multiple call
-   sites; moving them to API code would mean every leg-writer
-   calls a recompute helper — high discipline cost with
-   no chain risk to mitigate.
+6. ~~**Stop** — keep all remaining recompute triggers
+   (`trg_*_balance_after_*`, `trg_txn_legs_recompute_*`).~~
+   Superseded by §3: both families are gone (migrations 102 and
+   104), replaced by the two `SaveChangesInterceptor`s, which run
+   the recompute for every tracked leg writer without a helper call
+   at each site.
 
 ## Consequences
 
@@ -269,3 +264,58 @@ entry that tracked it was resolved and deleted:
   trigger-free recompute jobs.
 * Per-row policy enforcement (RLS) — orthogonal to this ADR;
   enforced separately by Postgres role-based security.
+
+## Amendment, 2026-11-03 — a header change counts for every line it has
+
+§3 describes `HoldingsRecomputeInterceptor` as scanning the ChangeTracker for
+investment-shape `TxnLegRow` entries. The walk it maintains reads the header too: it
+leaves out a hidden or merged header, orders by the header's date, and reads its
+action. So a save that changed only those, with no line written, recomputed no
+position: deleting an imported row (which hides it), restoring one row, and the date a
+merge moves. `LegDerivedRecomputeInterceptor` already counted such a header for the
+balances.
+
+The rule, for every interceptor that maintains a projection from the lines: a modified
+`TxnHeaderRow` whose change touches a header column the projection's recompute reads
+counts as a change to every line of that header, so the projection is recomputed for
+each of them in the same save:
+
+| Projection | Interceptor | Header columns that count |
+|---|---|---|
+| Balances, posting counts | `LegDerivedRecomputeInterceptor` | `posted_at`, `is_merged_into`, `is_hidden` |
+| Holdings, lots, realized gains | `HoldingsRecomputeInterceptor` | `posted_at`, `is_hidden`, `is_merged_into`, `action` |
+| Trade prices | `TradePriceFromLegInterceptor` | `posted_at`, `action`, `provider_raw_payload`, `is_hidden`, `is_merged_into` |
+| Stored memo-and-tags presentation | `LegNotesRecomputeInterceptor` | `memo`, `action`, `originating_account_id` |
+
+The first three name their columns in `RecomputeHeaderProperties`, and
+`HeaderRecomputePropertyCatalogTests` holds each set to the SQL its recompute calls:
+every header column that SQL names and that can change after insert is in the set, and
+nothing else is. The presentation is computed in C# (`LegNotes`) and its interceptor
+has always counted those three header columns. The holdings and trade-price
+interceptors leave a recurring template's header out, as they leave out its lines
+(ADR-0047).
+
+Writers that bypass the ChangeTracker still recompute explicitly; the bulk delete and
+bulk restore already did, as one batch over the selection. The trade-price interceptor
+re-derives the day a moved trade now sits on and the day it left, which takes the price
+of the executions that remain or, with none, keeps its row; the bulk delete and
+`merge_securities` re-derive the days of the executions they remove or move (ADR-0084
+D4, 2026-11-03 amendment). Since migration 273 a hidden or merged-away row is no trade
+(ADR-0084 D4, 2026-11-04 amendment), so the trade-price set gained `is_hidden` and
+`is_merged_into`, and the bulk delete also re-derives the days of the rows it hides, the
+bulk restore those of the rows it unhides.
+
+**A deleted merge winner un-merges its losers.** `is_merged_into` is `ON DELETE SET
+NULL` (migration 121), so deleting a winner, a manual row being a valid one, puts each
+loser back in the register and in both walks, on every account it has a line on, the
+category line of a feed row included. The database does that past the ChangeTracker.
+Every tracked removal of a header (the bank and investment single deletes, and the
+in-kind conversion that deletes its sale and purchase) first loads the losers tracked
+(`MergeLosers.TrackAsync`), so EF's own fixup of the relationship
+(`DeleteBehavior.SetNull`) marks each one's `is_merged_into` modified, and the rule
+above recomputes its balances and positions in the same save, and, since migration 273,
+re-derives the days of its trades; a guard test holds every
+`TxnHeaders.Remove` to it. The bulk delete reads the losers' lines before its
+`ExecuteDeleteAsync` and adds them to its own balance and holdings recomputes, and,
+since migration 273, the days of their trades to its trade-price re-derivation: an
+un-merged row is a trade again.

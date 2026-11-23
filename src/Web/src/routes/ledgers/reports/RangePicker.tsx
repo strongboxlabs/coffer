@@ -2,7 +2,13 @@ import { useEffect, useRef, useState } from 'react';
 
 import { cn } from '@/lib/cn';
 import { FieldLabel } from '@/components/ui/FieldLabel';
-import type { ReportSpec } from '@/types/report';
+import {
+    dismissOnEscape,
+    happenedInside,
+    useDismissOnPageEscape,
+    useReturnFocusOnClose,
+} from '@/components/ui/popoverDismissal';
+import type { ReportSpec, ReportWindowUnit } from '@/types/report';
 
 /**
  * The date range, as a mode rather than a pair of dates (ADR-0104 D5).
@@ -55,6 +61,26 @@ function calendarYear(year: number): Partial<ReportSpec> {
 }
 
 /** What the control says when it is closed. */
+/**
+ * A sliding window by what it is, for any count and unit, so a window that is
+ * not a preset still reads as itself, in the presets' own words.
+ *
+ * ALIGNED is N whole periods, the current one to date among them: "Last 6
+ * months", and for one period "Month to date". ROLLING is N periods back from
+ * this instant to the day: "Last 6 months (to the day)". The two must never
+ * read alike: they start in different places, and a control that renders both
+ * the same way is a coin flip the reader cannot see. In days they are the same
+ * window (a day is the unit the boundary already falls on), so both read "Last
+ * N days", and one day is "Today".
+ */
+function describeSliding(count: number | undefined, unit: ReportWindowUnit, aligned: boolean): string {
+    const n = count ?? 1;
+    const word = unit.toLowerCase();
+    if (unit === 'Day') return n === 1 ? 'Today' : `Last ${n} days`;
+    if (aligned) return n === 1 ? `${unit} to date` : `Last ${n} ${word}s`;
+    return `Last ${n} ${word}${n === 1 ? '' : 's'} (to the day)`;
+}
+
 export function describeRange(spec: ReportSpec): string {
     if (spec.dateMode === 'Sliding') {
         const hit = SLIDING.find((p) => {
@@ -64,15 +90,10 @@ export function describeRange(spec: ReportSpec): string {
                 && (a.windowAlign ?? false) === (spec.windowAlign ?? false);
         });
         if (hit) return hit.label;
-        // Not a preset. Say so rather than printing a label a preset also
-        // uses: an UNALIGNED 3 months and the aligned "Last 3 months" differ
-        // by where the window starts, and a control that renders both the
-        // same way is a coin flip the reader cannot see.
-        const unit = (spec.windowUnit ?? 'Month').toLowerCase();
-        const plural = spec.windowCount === 1 ? '' : 's';
-        return `Last ${spec.windowCount ?? '?'} ${unit}${plural} (to the day)`;
+        return describeSliding(spec.windowCount, spec.windowUnit ?? 'Month', spec.windowAlign ?? false);
     }
-    if (!spec.from && !spec.to) return 'All time';
+    // Returns has no "all time": its open window starts at the first invested point.
+    if (!spec.from && !spec.to) return spec.kind === 'returns' ? 'Since inception' : 'All time';
     const from = spec.from?.slice(0, 10) ?? '…';
     const to = spec.to?.slice(0, 10) ?? '…';
     return `${from} → ${to}`;
@@ -82,23 +103,40 @@ export function RangePicker({
     spec,
     onChange,
     disabled,
+    inception = false,
 }: {
     spec: ReportSpec;
     onChange: (patch: Partial<ReportSpec>) => void;
     disabled?: boolean;
+    /** Offer "Since inception", an open fixed window (the Returns report's default). */
+    inception?: boolean;
 }) {
     const [open, setOpen] = useState(false);
     const [custom, setCustom] = useState(false);
     const rootRef = useRef<HTMLDivElement>(null);
+    const toggleRef = useRef<HTMLButtonElement>(null);
+    const fromRef = useRef<HTMLInputElement>(null);
+
+    // "Custom dates…" gives way to the two date fields, so focus goes on to the
+    // first of them (ADR-0023 §L). The button that held it goes away, and focus
+    // would otherwise fall to the page, outside the popover.
+    useEffect(() => {
+        if (custom) fromRef.current?.focus();
+    }, [custom]);
 
     useEffect(() => {
         if (!open) return;
         const onDown = (e: MouseEvent) => {
-            if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+            if (rootRef.current && !happenedInside(e, rootRef.current)) setOpen(false);
         };
         document.addEventListener('mousedown', onDown);
         return () => document.removeEventListener('mousedown', onDown);
     }, [open]);
+
+    // Esc closes it too, from the list or from the page, and focus goes back
+    // to the button however it closes (ADR-0023 §L).
+    useDismissOnPageEscape(open, () => setOpen(false));
+    useReturnFocusOnClose(open, toggleRef);
 
     const choose = (patch: Partial<ReportSpec>) => {
         onChange(patch);
@@ -109,9 +147,14 @@ export function RangePicker({
     const thisYear = new Date().getUTCFullYear();
 
     return (
-        <div ref={rootRef} className="relative flex min-w-0 flex-col gap-1">
+        <div
+            ref={rootRef}
+            className="relative flex min-w-0 flex-col gap-1"
+            onKeyDown={(e) => { if (open) dismissOnEscape(e, () => setOpen(false)); }}
+        >
             <FieldLabel htmlFor="report-range">Range</FieldLabel>
             <button
+                ref={toggleRef}
                 id="report-range"
                 type="button"
                 disabled={disabled}
@@ -133,6 +176,27 @@ export function RangePicker({
                         Sliding — moves with today
                     </p>
                     <ul className="pb-1">
+                        {inception ? (
+                            <li>
+                                <button
+                                    type="button"
+                                    onClick={() => choose({
+                                        dateMode: 'Static',
+                                        from: undefined,
+                                        to: undefined,
+                                        windowCount: undefined,
+                                        windowUnit: undefined,
+                                        windowAlign: undefined,
+                                    })}
+                                    className={cn(
+                                        'flex w-full items-center px-2.5 py-1 text-left text-xs hover:bg-surface-hover',
+                                        describeRange(spec) === 'Since inception' ? 'bg-accent-soft text-accent-soft-text' : 'text-text',
+                                    )}
+                                >
+                                    Since inception
+                                </button>
+                            </li>
+                        ) : null}
                         {SLIDING.map((preset) => {
                             const active = describeRange(spec) === preset.label;
                             return (
@@ -178,6 +242,7 @@ export function RangePicker({
                                 <label className="flex min-w-0 flex-col gap-1">
                                     <span className="text-[0.625rem] font-semibold uppercase leading-[1.5] tracking-wider text-text-muted">From</span>
                                     <input
+                                        ref={fromRef}
                                         type="date"
                                         aria-label="Range from"
                                         defaultValue={spec.from?.slice(0, 10) ?? ''}

@@ -35,13 +35,16 @@ public sealed class AccountsReportingRepository
     /// <summary>
     /// The account catalog. Excludes holdings-sibling shadow accounts (their value
     /// folds into the owning brokerage). Categories are included only when asked
-    /// (their <see cref="AccountInfo.Balance"/> is null). Balances are MV-aware.
+    /// (their <see cref="AccountInfo.Balance"/> is null). Balances are MV-aware, and
+    /// current on <paramref name="today"/>, the caller's local date as the register
+    /// takes it (null for the register's fallback, which is what MCP gets).
     /// </summary>
     public async Task<IReadOnlyList<AccountInfo>> ListAccountsAsync(
         Guid ledgerId,
         bool includeCategories,
         bool includeInactive,
         string? type,
+        DateOnly? today,
         CancellationToken cancellationToken = default)
     {
         var q = _db.Accounts.AsNoTracking().Where(a => a.LedgerId == ledgerId);
@@ -71,43 +74,62 @@ public sealed class AccountsReportingRepository
             .ConfigureAwait(false);
 
         var cashBalances = await _balances
-            .GetCurrentBalancesAsync(ledgerId, activeOnly: !includeInactive, cancellationToken)
+            .GetCurrentBalancesAsync(ledgerId, activeOnly: !includeInactive, today, cancellationToken)
             .ConfigureAwait(false);
         var mvByAccount = await _investmentReporting
-            .MarketValueByAccountAsync(ledgerId, cancellationToken)
+            .MarketValueByAccountAsync(ledgerId, today, cancellationToken)
+            .ConfigureAwait(false);
+        var folderByAccount = await _db.AccountFolderMembers.AsNoTracking()
+            .Where(m => m.LedgerId == ledgerId)
+            .Join(_db.AccountFolders, m => m.FolderId, f => f.Id,
+                (m, f) => new { m.AccountId, FolderId = f.Id, f.Name })
+            .ToDictionaryAsync(x => x.AccountId, cancellationToken)
             .ConfigureAwait(false);
 
         return accounts
             .Select(a =>
             {
                 decimal? balance = null;
+                IReadOnlyList<RateUnavailable> missing = RateReasons.None;
                 if (a.AccountType != "category")
                 {
-                    var bal = cashBalances.GetValueOrDefault(a.Id);
-                    if (a.AccountType == "investment" && a.HoldingsAccountId is { } sibling)
-                        bal += mvByAccount.GetValueOrDefault(sibling);
-                    balance = bal;
+                    balance = cashBalances.GetValueOrDefault(a.Id);
+                    // The holdings value is already in the brokerage's currency: a
+                    // position priced in another converted at the latest rate, and null
+                    // when that rate is missing (ADR-0114 D7, D9).
+                    if (a.AccountType == "investment" && a.HoldingsAccountId is { } sibling
+                        && mvByAccount.TryGetValue(sibling, out var held))
+                    {
+                        balance = held.Amount is { } mv ? balance + mv : null;
+                        missing = held.Unavailable;
+                    }
                 }
+                var folder = folderByAccount.GetValueOrDefault(a.Id);
                 return new AccountInfo(
                     a.Id, a.Name, a.AccountType, a.CategoryKind, a.ParentId,
                     a.CurrencyCode, a.IsActive, balance,
-                    AccountClassifier.Classify(a.AccountType), a.TaxStatus, a.OpenedOn);
+                    AccountClassifier.Classify(a.AccountType), a.TaxStatus, a.OpenedOn,
+                    folder?.FolderId, folder?.Name, missing);
             })
             .OrderBy(a => a.Name, StringComparer.Ordinal)
+            .ThenBy(a => a.Id)
             .ToList();
     }
 
     /// <summary>Net worth + per-account breakdown, delegating to the Overview
-    /// computation (one definition; matches the Overview screen).</summary>
+    /// computation (one definition; matches the Overview screen). MCP passes no date,
+    /// so it gets the register's fallback.</summary>
     public async Task<McpNetWorth> NetWorthAsync(
-        Guid ledgerId, CancellationToken cancellationToken = default)
+        Guid ledgerId, DateOnly? today, CancellationToken cancellationToken = default)
     {
-        var overview = await _overview.GetAsync(ledgerId, cancellationToken).ConfigureAwait(false);
+        var overview = await _overview.GetAsync(ledgerId, today, cancellationToken).ConfigureAwait(false);
         var breakdown = overview.AccountGroups
             .SelectMany(g => g.Accounts)
             .Select(a => new NetWorthLine(
-                a.Id, a.Name, a.AccountType, AccountClassifier.Classify(a.AccountType), a.Balance))
+                a.Id, a.Name, a.AccountType, AccountClassifier.Classify(a.AccountType), a.Balance,
+                a.CurrencyCode, a.RateUnavailable))
             .OrderBy(a => a.Name, StringComparer.Ordinal)
+            .ThenBy(a => a.AccountId)
             .ToList();
         return new McpNetWorth(
             overview.NetWorth,
@@ -115,7 +137,8 @@ public sealed class AccountsReportingRepository
             overview.TotalLiabilities,
             overview.InvestmentsValue,
             overview.CurrencyCode,
-            breakdown);
+            breakdown,
+            overview.RateUnavailable);
     }
 
     // Guards an LLM asking for e.g. a daily series over decades — 2 as-of feeder
@@ -131,16 +154,36 @@ public sealed class AccountsReportingRepository
     /// (Overview-consistent; holdings-siblings folded into their brokerage, never
     /// double-counted). Computed live (ADR-0008 mview stays deferred).
     /// </summary>
+    public Task<NetWorthHistory> NetWorthHistoryAsync(
+        Guid ledgerId,
+        DateTime fromUtc,
+        DateTime toUtc,
+        ReportTimeBucket interval,
+        CancellationToken cancellationToken = default) =>
+        NetWorthHistoryAsync(ledgerId, fromUtc, toUtc, interval, today: null, cancellationToken);
+
+    /// <inheritdoc cref="NetWorthHistoryAsync(Guid, DateTime, DateTime, ReportTimeBucket, CancellationToken)"/>
+    /// <param name="today">The caller's local date. When sent, the series ends no
+    /// later than the last instant the register does not call Scheduled
+    /// (<see cref="ScheduledBoundary.LastCountedInstant"/>), so its last point is
+    /// the overview's net worth for the same date. Null leaves the window as asked,
+    /// which is what MCP gets.</param>
     public async Task<NetWorthHistory> NetWorthHistoryAsync(
         Guid ledgerId,
         DateTime fromUtc,
         DateTime toUtc,
         ReportTimeBucket interval,
+        DateOnly? today,
         CancellationToken cancellationToken = default)
     {
         var from = Utc(fromUtc);
         var to = Utc(toUtc);
         if (to < from) (from, to) = (to, from);
+        if (today is { } local)
+        {
+            var now = ScheduledBoundary.LastCountedInstant(local);
+            if (now < to) to = now < from ? from : now;
+        }
         // None means "unspecified", and month is the documented default.
         var bucket = interval == ReportTimeBucket.None ? ReportTimeBucket.Month : interval;
 
@@ -176,8 +219,15 @@ public sealed class AccountsReportingRepository
                         && a.AccountType != "category"
                         && !_db.Accounts.Any(o =>
                             o.LedgerId == ledgerId && o.HoldingsAccountId == a.Id))
-            .Select(a => new { a.Id, a.AccountType, a.HoldingsAccountId })
+            .Select(a => new { a.Id, a.AccountType, a.HoldingsAccountId, a.CurrencyCode })
             .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var currencies = await LedgerCurrencies.LoadAsync(_db, ledgerId, cancellationToken).ConfigureAwait(false);
+        var currencyCode = currencies.Reporting;
+
+        // A point before the ledger's first dated fact values nothing: flagged, so a
+        // reader never counts the ledger's arrival as growth.
+        var earliestFact = await LedgerHistoryStart.EarliestFactAsync(_db, ledgerId, cancellationToken)
             .ConfigureAwait(false);
 
         var netWorthSiblings = accounts
@@ -191,17 +241,17 @@ public sealed class AccountsReportingRepository
                 $"That range and interval would produce more than {MaxHistoryPoints} points; " +
                 "widen the interval (quarter/year) or narrow the range.");
 
-        // Both feeders answer for EVERY period end in one call. This used to ask each
-        // of them once per point inside the loop below — the same O(instants) round
-        // trips that made a whole-ledger TWR cost ~60 s before migrations 200/201,
-        // and the reason MaxHistoryPoints exists at all.
+        // Both feeders answer for EVERY period end in one call, not once per point
+        // inside the loop below — per-point calls are O(instants) round trips, the
+        // cost migrations 200/201 remove from a whole-ledger TWR, and the reason
+        // MaxHistoryPoints exists at all.
         // TRUNCATED TO MICROSECONDS, and the same truncated values are used as the
         // dictionary keys below. PeriodEnds yields nextStart.AddTicks(-1), i.e. one
         // tick (a ten-millionth of a second) before midnight — but timestamptz is
         // microsecond-precision, so that value
         // is rounded on the way into Postgres and the as_of coming back is NOT the
-        // DateTime that was sent. Keying on a round-tripped timestamp silently missed
-        // every lookup and reported a net worth of zero for every point.
+        // DateTime that was sent. Keying on a round-tripped timestamp silently misses
+        // every lookup and reports a net worth of zero for every point.
         var instants = dates
             .Select(d =>
             {
@@ -211,15 +261,42 @@ public sealed class AccountsReportingRepository
             .ToArray();
 
         var holdingsRows = await _db.HoldingsMarketValueAsOfSet(ledgerId, instants, null)
-            .Select(r => new { r.AsOf, r.AccountId, r.MarketValue, r.PricedFrom })
+            .Select(r => new { r.AsOf, r.AccountId, r.MarketValue, r.PricedFrom, r.PriceCurrency })
             .ToListAsync(cancellationToken).ConfigureAwait(false);
 
+        // Every rate the series reads, in one load (ADR-0114 D7): each position from its
+        // price's currency into its brokerage's, and each account into the reporting
+        // currency, both at the point's own day. A point's day is its instant's UTC date,
+        // the day every price and balance it values is dated by; a point dated today or
+        // later (the series' last) converts at the latest rate, by the one rule
+        // (RateDay.Of).
+        static DateOnly DayOf(DateTime instant) => DateOnly.FromDateTime(instant);
+        var lookup = _investmentReporting.Rates;
+        var needs = lookup.NewNeeds();
+        foreach (var r in holdingsRows)
+        {
+            var into = currencies.OfPositionsOn(r.AccountId);
+            needs.Add(r.PriceCurrency ?? into, into, DayOf(r.AsOf));
+        }
+        foreach (var instant in instants)
+            foreach (var a in accounts)
+                needs.Add(a.CurrencyCode, currencyCode, DayOf(instant));
+        var rates = await lookup.LoadAsync(ledgerId, needs, cancellationToken).ConfigureAwait(false);
+
+        // Per instant and holdings account, the positions' value in the brokerage's
+        // currency, converted at full precision and rounded once.
         var holdingsByInstant = holdingsRows
             .GroupBy(r => r.AsOf)
             .ToDictionary(
                 g => g.Key,
                 g => g.GroupBy(x => x.AccountId)
-                      .ToDictionary(a => a.Key, a => a.Sum(x => x.MarketValue)));
+                      .ToDictionary(a => a.Key, a =>
+                      {
+                          var into = currencies.OfPositionsOn(a.Key);
+                          var total = rates.NewTotal(into);
+                          foreach (var x in a) total.Add(x.MarketValue, x.PriceCurrency ?? into, DayOf(x.AsOf));
+                          return total.Result;
+                      }));
 
         // Unpriced positions per instant — the same count the per-instant loop
         // produced, now derived from the one batched read.
@@ -242,31 +319,49 @@ public sealed class AccountsReportingRepository
             var balanceByAccount = balancesByInstant.GetValueOrDefault(key)
                                    ?? new Dictionary<Guid, decimal>();
             var holdingsValueBySibling = holdingsByInstant.GetValueOrDefault(key)
-                                         ?? new Dictionary<Guid, decimal>();
+                                         ?? new Dictionary<Guid, Converted>();
+            var day = DayOf(key);
 
-            var netWorth = 0m;
+            // Each account in its own currency (cash, plus its positions converted into
+            // it), then converted into the reporting currency at the point's day and
+            // summed, rounded once. Liabilities are stored negative, so a straight sum.
+            var netWorth = rates.NewTotal(currencyCode);
             foreach (var a in accounts)
             {
-                var bal = balanceByAccount.GetValueOrDefault(a.Id);
-                if (a.AccountType == "investment" && a.HoldingsAccountId is Guid sibling)
-                    bal += holdingsValueBySibling.GetValueOrDefault(sibling);
-                netWorth += bal;   // liabilities are stored negative → straight sum
+                var cash = balanceByAccount.GetValueOrDefault(a.Id);
+                if (a.AccountType == "investment" && a.HoldingsAccountId is Guid sibling
+                    && holdingsValueBySibling.TryGetValue(sibling, out var held))
+                {
+                    var own = rates.NewTotal(a.CurrencyCode)
+                        .Add(cash, a.CurrencyCode, day)
+                        .Add(held, currencies.OfPositionsOn(sibling), day)
+                        .Result;
+                    netWorth.Add(own, a.CurrencyCode, day);
+                }
+                else
+                {
+                    netWorth.Add(cash, a.CurrencyCode, day);
+                }
             }
 
             var unpriced = unpricedByInstant.GetValueOrDefault(key);
-            points.Add(new NetWorthHistoryPoint(t, netWorth, unpriced));
+            var value = netWorth.Result;
+            points.Add(new NetWorthHistoryPoint(
+                t, value.Amount, unpriced, LedgerHistoryStart.Precedes(DateOnly.FromDateTime(t), earliestFact),
+                value.Unavailable));
         }
 
         return new NetWorthHistory(
-            from, to, bucket.ToString().ToLowerInvariant(), "USD", points);
+            from, to, bucket.ToString().ToLowerInvariant(), currencyCode, points);
     }
 
     private static DateTime Utc(DateTime d) =>
         d.Kind == DateTimeKind.Utc ? d : DateTime.SpecifyKind(d, DateTimeKind.Utc);
 
     // End-of-period instants for each period from `from`'s period through `to`'s
-    // period; the last (partial) period is clamped to `to`.
-    private static IEnumerable<DateTime> PeriodEnds(
+    // period; the last (partial) period is clamped to `to`. Shared with the returns
+    // series, so the two reports end a month, a quarter and a year at the same instant.
+    internal static IEnumerable<DateTime> PeriodEnds(
         DateTime from, DateTime to, ReportTimeBucket bucket)
     {
         var cursor = from;

@@ -12,11 +12,13 @@ import type {
     SecurityComponent,
 } from '../types/security';
 import { request } from './_request';
+import { todayQuery, withToday } from './_today';
 
 /**
  * GET /api/ledgers/{ledgerId}/securities — full catalog row list,
  * optionally filtered by case-insensitive substring search on
- * ticker / cusip / name.
+ * ticker / cusip / name. Quantities and prices are current on the
+ * user's local date, sent as the register sends it.
  *
  * 422 codes: `ledger-not-visible`.
  */
@@ -24,17 +26,17 @@ export function fetchSecurities(
     ledgerId: string,
     search?: string,
 ): Promise<SecuritySummary[]> {
-    const qs = search && search.trim().length > 0
-        ? `?q=${encodeURIComponent(search.trim())}`
-        : '';
+    const params = new URLSearchParams();
+    if (search && search.trim().length > 0) params.set('q', search.trim());
     return request<SecuritySummary[]>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/securities${qs}`,
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/securities?${withToday(params).toString()}`,
     );
 }
 
 /**
  * GET /api/ledgers/{ledgerId}/securities/{securityId} — hero data +
- * most-recent 10 price points.
+ * most-recent 10 price points. The hero's figures are current on the
+ * user's local date, sent as the register sends it.
  *
  * 422 codes: `ledger-not-visible`, `security-not-in-ledger`.
  */
@@ -43,7 +45,7 @@ export function fetchSecurity(
     securityId: string,
 ): Promise<SecurityDetail> {
     return request<SecurityDetail>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/securities/${encodeURIComponent(securityId)}`,
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/securities/${encodeURIComponent(securityId)}${todayQuery()}`,
     );
 }
 
@@ -123,7 +125,9 @@ export function fetchSecurityPrices(
 /** POST .../securities/{sid}/prices — append a new price.
  *  422 codes: `security-price-required`, `security-price-date-required`,
  *  `security-price-date-conflict` (PATCH the existing row instead),
- *  `security-price-high-low-invalid`. */
+ *  `security-price-high-low-invalid`, `security-price-currency-required` (no
+ *  currency given and the security has no default to take), and
+ *  `security-price-currency-invalid` (not three characters once trimmed). */
 export function addSecurityPrice(
     ledgerId: string,
     securityId: string,
@@ -135,7 +139,8 @@ export function addSecurityPrice(
     );
 }
 
-/** PATCH .../securities/{sid}/prices/{priceId}. */
+/** PATCH .../securities/{sid}/prices/{priceId}. 422
+ *  `security-price-currency-invalid` for a currency that is not three characters once trimmed. */
 export function patchSecurityPrice(
     ledgerId: string,
     securityId: string,

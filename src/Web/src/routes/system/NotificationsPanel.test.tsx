@@ -8,8 +8,8 @@ import * as apiModule from '@/lib/api';
 
 // NotificationsPanel — the absence-detection warning is the point of this screen.
 // Someone who wires a chat webhook, sees a test message arrive and concludes they
-// are covered has kept the exact failure mode that ran for days unnoticed, so
-// these tests pin that the panel says so — twice, at the point of choosing and as a
+// are covered is still blind to the job that silently stops running (a webhook
+// only speaks when something sends), so these tests pin that the panel says so — twice, at the point of choosing and as a
 // standing banner.
 
 function renderPanel() {
@@ -54,7 +54,7 @@ describe('NotificationsPanel', () => {
         // A configured target exists and the install still cannot notice its own
         // silence — saying nothing here would leave someone falsely reassured. And it
         // NAMES the unwatched job: one healthchecks URL is one check, so "absence
-        // detection is covered" was never a statement the old boolean could honestly
+        // detection is covered" is not a statement a single boolean can honestly
         // make about any particular thing.
         expect(await screen.findByText(/nothing is watching for: backup/i)).toBeTruthy();
     });
@@ -139,10 +139,10 @@ describe('NotificationsPanel', () => {
 
     it('offers no severity floor for a provider whose routing never reads one', async () => {
         // Wants() matches a heartbeat target on monitor name + signal and returns before
-        // the severity floor is consulted, so "Send at" changed nothing on healthchecks.
-        // A control that does nothing is the looks-configured-does-nothing shape this
-        // whole screen exists to warn about, so it is not shown. Topics already followed
-        // this rule; severity did not.
+        // the severity floor is consulted, so "Send at" would change nothing on
+        // healthchecks. A control that does nothing is the looks-configured-does-nothing
+        // shape this whole screen exists to warn about, so it is not shown. Topics follow
+        // the same rule.
         vi.spyOn(apiModule, 'fetchNotificationSubscribers').mockResolvedValue({
             subscribers: [],
             monitorCoverage: { backup: false },
@@ -198,6 +198,142 @@ describe('NotificationsPanel', () => {
             monitors: 'backup',
             minSeverity: 'warning',
         });
+    });
+
+    // ---- upgrade notices are opt-in (ADR-0110) -----------------------------------------------
+    // A target with no topic filter hears every topic EXCEPT upgrade, so ticking the box is the only
+    // way a target is told that a release is available. These pin what the form offers and sends.
+
+    const emptySubscribers = {
+        subscribers: [],
+        monitorCoverage: { backup: false },
+    };
+
+    it('offers upgrade notices for a message provider only, and off by default', async () => {
+        vi.spyOn(apiModule, 'fetchNotificationSubscribers').mockResolvedValue(emptySubscribers);
+
+        renderPanel();
+        const user = userEvent.setup();
+        await screen.findByRole('option', { name: /Webhook/ });
+
+        await user.selectOptions(screen.getByLabelText(/provider/i), 'webhook');
+        const box = screen.getByLabelText(/also send upgrade notices/i) as HTMLInputElement;
+        expect(box.checked).toBe(false);
+
+        // A dead-man's switch is bound to one job and has no topics to choose.
+        await user.selectOptions(screen.getByLabelText(/provider/i), 'healthchecks');
+        expect(screen.queryByLabelText(/also send upgrade notices/i)).toBeNull();
+    });
+
+    it('sends the full topic list, upgrade included, when ticked', async () => {
+        vi.spyOn(apiModule, 'fetchNotificationSubscribers').mockResolvedValue(emptySubscribers);
+        const create = vi.spyOn(apiModule, 'createNotificationSubscriber')
+            .mockResolvedValue(undefined as never);
+
+        renderPanel();
+        const user = userEvent.setup();
+        await screen.findByRole('option', { name: /Webhook/ });
+        await user.selectOptions(screen.getByLabelText(/provider/i), 'webhook');
+        await user.click(screen.getByLabelText(/also send upgrade notices/i));
+        await user.type(screen.getByLabelText(/URL/i), 'https://hook.invalid/abc');
+        await user.click(screen.getByRole('button', { name: /add target/i }));
+
+        await waitFor(() => expect(create).toHaveBeenCalled());
+        const topics = create.mock.calls[0][0].topics;
+        // The whole list, so the target keeps hearing what it would have and also hears this.
+        expect(topics).toEqual(expect.arrayContaining(
+            ['backup', 'snapshot', 'sync', 'quotes', 'consistency', 'scheduler', 'upgrade']));
+        expect(topics).toHaveLength(7);
+        // And the box is off again for the next target: it is never carried over.
+        await waitFor(() =>
+            expect((screen.getByLabelText(/also send upgrade notices/i) as HTMLInputElement).checked)
+                .toBe(false));
+    });
+
+    it('gives focus to the URL field when an added target clears it and leaves Add target disabled', async () => {
+        vi.spyOn(apiModule, 'fetchNotificationSubscribers').mockResolvedValue(emptySubscribers);
+        const create = vi.spyOn(apiModule, 'createNotificationSubscriber')
+            .mockResolvedValue(undefined as never);
+
+        renderPanel();
+        const user = userEvent.setup();
+        await screen.findByRole('option', { name: /Webhook/ });
+        await user.selectOptions(screen.getByLabelText(/provider/i), 'webhook');
+        const url = screen.getByLabelText(/URL/i);
+        await user.type(url, 'https://hook.invalid/abc');
+        const add = screen.getByRole('button', { name: /add target/i });
+        await user.click(add);
+
+        await waitFor(() => expect(create).toHaveBeenCalled());
+        await waitFor(() => expect(add).toBeDisabled());
+        expect(url).toHaveValue('');
+        expect(url).toHaveFocus();
+    });
+
+    // ADR-0023 §L: while the add is in flight its fields are pending. Its success
+    // clears the URL and the upgrade-notices box, so a change made meanwhile would
+    // be dropped, and a severity picked meanwhile would never be sent.
+    it('refuses typing, ticks and picks in the add form while the add is in flight', async () => {
+        vi.spyOn(apiModule, 'fetchNotificationSubscribers').mockResolvedValue(emptySubscribers);
+        vi.spyOn(apiModule, 'createNotificationSubscriber').mockImplementation(() => new Promise(() => {}));
+
+        renderPanel();
+        const user = userEvent.setup();
+        await screen.findByRole('option', { name: /Webhook/ });
+        await user.selectOptions(screen.getByLabelText(/provider/i), 'webhook');
+        const url = screen.getByLabelText(/URL/i);
+        const box = screen.getByLabelText(/also send upgrade notices/i) as HTMLInputElement;
+        const severity = screen.getByLabelText(/send at/i);
+        await user.type(url, 'https://hook.invalid/abc');
+        await user.click(screen.getByRole('button', { name: /add target/i }));
+        await screen.findByRole('button', { name: /adding/i });
+
+        await user.type(url, 'more');
+        await user.click(box);
+        await user.selectOptions(severity, 'critical');
+
+        expect(url).toHaveValue('https://hook.invalid/abc');
+        expect(box.checked).toBe(false);
+        expect(severity).not.toHaveValue('critical');
+        for (const field of [url, box, severity]) expect(field).toHaveAttribute('aria-disabled', 'true');
+    });
+
+    it('sends no topic filter when not ticked, so the target hears everything but upgrades', async () => {
+        vi.spyOn(apiModule, 'fetchNotificationSubscribers').mockResolvedValue(emptySubscribers);
+        const create = vi.spyOn(apiModule, 'createNotificationSubscriber')
+            .mockResolvedValue(undefined as never);
+
+        renderPanel();
+        const user = userEvent.setup();
+        await screen.findByRole('option', { name: /Webhook/ });
+        await user.selectOptions(screen.getByLabelText(/provider/i), 'webhook');
+        await user.type(screen.getByLabelText(/URL/i), 'https://hook.invalid/abc');
+        await user.click(screen.getByRole('button', { name: /add target/i }));
+
+        await waitFor(() => expect(create).toHaveBeenCalled());
+        expect(create.mock.calls[0][0].topics).toBeUndefined();
+    });
+
+    it('describes what a target hears: all topics, all of them with upgrades, or a named few', async () => {
+        const row = (id: string, name: string, topics: string[] | null) => ({
+            id, subscriberKey: 'webhook', displayName: name,
+            isEnabled: true, minSeverity: 'warning', topics, monitors: null,
+            lastSuccessAt: null, lastFailureAt: null, lastError: null, consecutiveFailures: 0,
+        });
+        vi.spyOn(apiModule, 'fetchNotificationSubscribers').mockResolvedValue({
+            subscribers: [
+                row('a', 'Plain', null),
+                row('b', 'Opted in', ['backup', 'snapshot', 'sync', 'quotes', 'consistency', 'scheduler', 'upgrade']),
+                row('c', 'Few', ['backup', 'upgrade']),
+            ],
+            monitorCoverage: { backup: true },
+        });
+
+        renderPanel();
+
+        expect(await screen.findByText('at warning and above · all topics')).toBeTruthy();
+        expect(screen.getByText('at warning and above · all topics, upgrade notices included')).toBeTruthy();
+        expect(screen.getByText('at warning and above · backup, upgrade')).toBeTruthy();
     });
 
     it('describes a heartbeat target by what it watches, not by severity', async () => {
@@ -271,10 +407,10 @@ describe('NotificationsPanel', () => {
     });
 
     it('says the events list failed rather than showing it as quiet', async () => {
-        // The bug this replaces: on error `events.data` is undefined, so a
-        // `data?.length === 0` test was false and the panel rendered an EMPTY LIST.
-        // A failed query looked exactly like a quiet install — the one confusion this
-        // whole subsystem exists to remove, reproduced in the surface that reports it.
+        // On error `events.data` is undefined, so a `data?.length === 0` test is
+        // false and the panel would render an EMPTY LIST. A failed query would look
+        // exactly like a quiet install — the one confusion this whole subsystem
+        // exists to remove, reproduced in the surface that reports it.
         vi.spyOn(apiModule, 'fetchNotificationSubscribers').mockResolvedValue({
             subscribers: [],
             monitorCoverage: { backup: true },

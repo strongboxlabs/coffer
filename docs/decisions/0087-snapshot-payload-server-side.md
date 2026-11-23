@@ -16,14 +16,14 @@ round-tripped the entire payload *through the API process*:
   into an in-memory object graph, then handed the JSON back to
   `fn_ledger_snapshot_restore`.
 
-For a small ledger this is invisible. For a real one it is not: a payload of
-well over a hundred megabytes inflates to multiple GB of managed heap during (de)serialisation, and
+For a small ledger this is invisible. For a large one it is not: the payload
+inflates to a multiple of its own size in managed heap during (de)serialisation, and
 under the API container's `mem_limit` (Workstation GC, capped — see the memory
-cap commit) create threw `OutOfMemoryException`. The failure mode was silent —
-the weekly auto-snapshot scheduler swallowed it and simply produced no new
-snapshot, while the independent daily whole-DB backup (pg_dump, streamed) kept
-working. The user lost fresh per-ledger restore points for weeks without a
-surfaced error. Streaming the blob would help create but cannot cleanly fix
+cap commit) create throws `OutOfMemoryException`. The failure mode is silent —
+the auto-snapshot scheduler swallows it and simply produces no new
+snapshot, while the independent daily whole-DB backup (pg_dump, streamed) keeps
+working. Per-ledger restore points stop being refreshed, with no surfaced error,
+for as long as the ledger stays that large. Streaming the blob would help create but cannot cleanly fix
 restore, which needs the whole document to hand to the restore function.
 
 ## Decision
@@ -38,7 +38,11 @@ does not carry the bytes.
   TVF wrapper `ledger_snapshot_write(snapshot_id, ledger_id)`, which runs
   `content_json := fn_ledger_snapshot_payload(ledger)` and returns only the
   uncompressed byte size for the SPA's "N MB before compression" display. No
-  payload crosses the API boundary.
+  payload crosses the API boundary. *(2026-10-27: no longer one value. Since
+  migration 193 capture writes each table in chunks into `ledger_snapshot_parts`
+  (`fn_snapshot_write_part`), and since 264 every captured table is
+  keyset-chunked on its primary key; see
+  [ADR-0037](0037-snapshots-and-backups.md)'s amendment of 2026-10-25.)*
 - **Restore** projects `content_json IS NOT NULL` (never the value) to detect
   format, then calls `ledger_snapshot_restore_stored(snapshot_id, ledger_id)`,
   which reads the stored jsonb and reuses the existing
@@ -54,7 +58,7 @@ does not carry the bytes.
 gunzip-then-`fn_ledger_snapshot_restore` path. New snapshots (v2) set
 `content_json` and leave `content` empty. Existing v1 snapshots are **not**
 migrated — snapshots are convenience restore points, not the DR mechanism (that
-is the whole-DB backup), and the four in-flight v1 rows age out under the 5-cap.
+is the whole-DB backup), and any v1 rows an install holds age out under the 5-cap.
 
 ## Consequences
 
@@ -64,5 +68,5 @@ is the whole-DB backup), and the four in-flight v1 rows age out under the 5-cap.
   `GzipDecompress` survives only for v1 read-back until those rows age out.
 - The size shown to users is now the true uncompressed jsonb size
   (`octet_length`), computed server-side.
-- The silent-failure lesson is separate and already addressed by observability
-  work; this ADR is only the storage/capture change.
+- Surfacing a failed auto-snapshot is a separate concern, handled by the
+  observability work; this ADR is only the storage/capture change.

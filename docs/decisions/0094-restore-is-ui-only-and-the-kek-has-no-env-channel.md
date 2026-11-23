@@ -1,6 +1,8 @@
 # 0094 — Restore is a UI operation; the master key has no environment channel
 
 * Status: Accepted
+* Amended: 2026-10-27 (D5: the flag's delivery, and a start with the flag and a key refuses;
+  see the amendment at the end)
 * Date: 2026-08-12
 * Amends: [ADR-0060](0060-whole-db-backup-and-admin-role.md) (the operator CLI),
   [ADR-0061](0061-bootstrap-restore.md) (which kept the CLI "for headless DR and very
@@ -15,16 +17,16 @@ UI (ADR-0071 D3), and a `coffer-api restore` CLI (ADR-0060) — plus a fourth mo
 part: `install.sh` asked "are you restoring a backup?" and, if so, took the source
 install's master key and wrote it into `.env` as `COFFER_MASTER_KEK_BASE64`.
 
-Each of the CLI's stated justifications was checked and none held:
+None of the CLI's stated justifications holds:
 
-| Claim | What it turned out to be |
+| Claim | What it is |
 |---|---|
 | "Works on a schema too broken to serve" | Circular. A restore never reads the old schema — it wiped it then, and since 2026-10-09 builds a new database instead (ADR-0061's amendment) — so a broken schema is answered by reinstalling, a documented, cheap operation. |
 | "It skips migrations" | A local detail of that code path, not a capability the UI lacked: migrations were skipped only for `args is ["restore", ..]` to avoid pg_restore colliding with objects migrations had just created. The UI paths run migrations and restore correctly. |
 | "The UI caps at ~128 MB" | ASP.NET's default `FormOptions.MultipartBodyLengthLimit`. Ours to raise, and never raised. |
 | "Headless DR" | Cannot exist. Setup enrols a WebAuthn passkey in a browser, so no install has ever come into being without browser access to it. |
 
-One argument was left standing and then also rejected: a reverse proxy can cap request
+One argument has some force and is rejected too: a reverse proxy can cap request
 bodies (nginx defaults `client_max_body_size` to 1 MB) and time out long uploads, which
 a file-based path sidesteps. That is the operator's environment to configure — exactly
 the position the Moneydance import upload already takes, with no CLI alternative
@@ -33,16 +35,15 @@ nothing in front of it is the fallback.
 
 The installer's key prompt was worse than redundant. It collected the source key at the
 one moment when **no archive exists to validate it against**, so a typo or a wrong-era
-key was accepted silently and surfaced only after the restore had already replaced
-everything. ADR-0092 D4 had already given the restore form a source-KEK field that
-validates against the archive's KEK fingerprint before anything destructive runs, and
-said in as many words that it replaced the `install.sh` prompt. That removal never
-happened.
+key is accepted silently and surfaces only after the restore has already replaced
+everything. ADR-0092 D4 gives the restore form a source-KEK field that validates
+against the archive's KEK fingerprint before anything destructive runs, and says in as
+many words that it replaces the `install.sh` prompt; this ADR carries that out.
 
 Meanwhile `COFFER_MASTER_KEK_BASE64` was to be "honoured for one release" (D6) and then
 removed. ADR-0092 shipped in 0.43.0; 0.44.0 through 0.44.6 shipped after it. Keeping it
-alive meant a value in `.env` that looked authoritative, was silently ignored once the
-key file existed, and went stale the moment anyone rotated from the UI — the exact
+alive means a value in `.env` that looks authoritative, is silently ignored once the
+key file exists, and goes stale the moment anyone rotates from the UI — the exact
 hazard D1 moved the key into a file to eliminate.
 
 ## Decision
@@ -98,15 +99,23 @@ both remedies. Neither loses ledger data or passkeys, which do not depend on the
    already records: a read-only mount makes rotation refuse, since adoption needs to
    write.
 
-2. **`--adopt-new-kek`** — mints fresh and abandons the three sealed secrets (SimpleFIN
-   feed tokens, the stored backup passphrase, the Drive connection), all
-   re-establishable in the UI. Per D5 it exits, so the flag must then be removed.
+2. **`--adopt-new-kek`** — mints fresh and abandons the sealed secrets (the bank-feed
+   tokens, the stored backup passphrase, the Google Drive connection, the notification
+   targets' URLs and tokens, and the OAuth server keys MCP sign-in uses), clearing them all, each
+   re-establishable in the UI. It is irreversible. Per D5 it exits, and it is run as a
+   one-shot container, so there is no flag left to remove:
+
+   ```bash
+   sudo docker compose stop api
+   sudo docker compose run --rm api --adopt-new-kek
+   sudo docker compose up -d api
+   ```
 
 All four states above are pinned by a boot drill in the maintainer tooling, which runs
 the real boot path against a real Postgres: virgin mint, the refusal (including that it
 writes no key while refusing and names both remedies), recovery via the key file, and
 adopt-mint-exit. Upgrade behaviour is not covered by the test suite — every test starts
-from a fresh install — which is the same gap `upgrade-drill.sh` was written for.
+from a fresh install — which is the gap `upgrade-drill.sh` covers.
 
 **A restore over ~4 GiB, or through a proxy that caps bodies, needs operator action** —
 raise `client_max_body_size` or equivalent, or install on localhost with no proxy in
@@ -128,3 +137,23 @@ correct — the removed one had already drifted into claiming capabilities it di
 D6 promised, every install that has booted since 0.43.0 has a key file, and the boot
 refusal plus two documented remedies is a better outcome than a second source of truth
 that silently goes stale.
+
+## Amendment — 2026-10-27: the flag runs in a one-shot container, and refuses with a key
+
+D5 delivered the flag as a temporary compose `command:` override. The service's
+`restart: unless-stopped` reruns that command after the adopt run exits; the rerun found
+the key the run had just written and served with the flag still set, so a later key loss
+would have been minted over and wiped with no one deciding to.
+
+- **A start with `--adopt-new-kek` and a key in place refuses** (non-zero exit, "remove
+  the flag"), so the flag can no longer sit armed under a serving install.
+- **The documented delivery is `docker compose run --rm api --adopt-new-kek`**, after
+  `docker compose stop api`, then `docker compose up -d api`. `run` creates the container
+  with restart policy `no` whatever the service sets, `--rm` removes it when it exits, and
+  the run exits with the command's code; `up` gives the same service `unless-stopped`. So
+  the adoption runs exactly once and its output stays on the operator's terminal.
+- **A start given the flag never serves**: over nothing sealed it saves its key, says there
+  was nothing to wipe, and exits.
+- **A wrong key file in place** (a mis-mounted volume, another install's key) with the right
+  one lost: the refusal says to move it aside, keeping it, then adopt.
+- What the adopt run now clears, and why, is ADR-0092's 2026-10-27 amendment.

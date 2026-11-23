@@ -31,8 +31,8 @@ Provider operations are audited inconsistently:
 - **Quotes are not audited at all.** The quote family (ADR-0033/0054) returns a
   `QuoteRunOutcome` to the caller and persists nothing. A refresh that changed
   nothing — or failed, or was rate-limited — is indistinguishable from one that
-  never ran. No timestamp, no last-run summary. (This is the gap that surfaced
-  in testing: 0 rows written, nothing to show, no record of when or why.)
+  never ran. No timestamp, no last-run summary: a run that wrote 0 rows leaves
+  no record of when or why.
 - **No cross-provider view.** `sync_runs` is shaped for ingest, so there's no
   single place that answers "what ran across all providers, when, and how did
   it go."
@@ -117,6 +117,48 @@ A ledger-wide **Provider activity** timeline (API + SPA) listing all
 `provider_runs` newest-first with family/provider badges, status, counts, and
 who/when — generalizing the per-connection `SyncActivityPanel`. The existing
 per-connection panel narrows to that connection's ingest runs.
+
+> **Amended 2026-11-19 — the per-connection panel is gone.** Two places listed
+> the same runs, and only the Bank feeds strip could open one to read its errors.
+> Settings → Activity is now the one place runs are read, through
+> `GET /sync-runs/{runId}`, which serves a run of any family. A row opens when it has
+> something behind its line:
+> - a failed run shows its failure message;
+> - a needs-reauth run, which records no message, says the bank refused the stored
+>   access and to re-connect in Settings → Bank feeds;
+> - errors show their code and message;
+> - promotions list the charges that cleared at a different amount and count the ones
+>   that cleared at their held figure.
+>
+> A feed sync's row names its connection, so several connections' runs can be told
+> apart. The Bank feeds strip and its per-connection list
+> (`GET /sync-runs?connectionId=`) were removed.
+>
+> A Demo's examples row closed partial opens too, to its message: the steps not added
+> and why, which it records in place of error rows ([ADR-0115](0115-the-demo-is-generated-imported-and-seeded-from-the-hub.md)
+> D3, settled by Claude, 2026-11-19).
+
+> **Amended 2026-11-20 — an error says where it came from and what it is about.** A quote
+> refresh is still one row (D4), but its errors come from several sources. Before this,
+> the errors were one list with no source, so an error from the SimpleFIN holdings read
+> showed on a manual refresh as if Yahoo had raised it.
+> - **Source.** Each `ledger_operation_errors` row of a quote run records the source that
+>   raised it in `provider_key` (migration 303): `simplefin-holdings`, `yahoo` (which also
+>   covers the currency lookup ADR-0114 D5 runs), or `market-series` for the benchmark and
+>   exchange-rate fetch. The orchestrator stamps it on everything a source returns, so a
+>   provider never names itself. An opened run lists its errors under a heading per
+>   source, in the order each source first appears. A sync's errors, and any row written
+>   before 303, have no source and list with no heading, as before.
+> - **Account.** An error about one feed account keeps the feed's id for it in
+>   `simplefin_account_id`, the column a sync's errors already use. The detail read
+>   resolves a label from it: the name of the Coffer account it is mapped to, else
+>   "name · institution" from the bank-feed directory, as the Bank feeds tab shows it. The
+>   label is read when the run is opened, so a rename shows. When neither is known, the
+>   SPA shows the id. It does not repeat an id the message already carries, which a sync's
+>   errors and older rows do. The SimpleFIN holdings messages no longer start with
+>   "Account <id>:".
+> - **Trigger.** A `post-sync` run reads "after SimpleFIN sync". Only a SimpleFIN sync
+>   triggers one, and it runs the SimpleFIN holdings read alone (ADR-0054).
 
 ## Consequences
 

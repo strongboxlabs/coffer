@@ -9,7 +9,7 @@ namespace Coffer.Api.Auth;
 /// <remarks>
 /// Only a cookie session carries them. Step-up reads <see cref="CreatedAt"/> to refuse a
 /// passkey enrolled after the session began, and <see cref="AuthMethod"/> to let a
-/// recovery-code session add one passkey (2026-10-12 audit, M2). A principal without them
+/// recovery-code session add one passkey (ADR-0105 D1, D2). A principal without them
 /// — an MCP bearer token, dev auth — is not a session and gets neither rule's benefit.
 /// </remarks>
 public static class SessionClaims

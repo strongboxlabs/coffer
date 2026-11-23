@@ -13,7 +13,7 @@ import { toWindowIndex } from './registerWindowIndex';
  *   * the EDGE AUTO-LOAD POLICY — start/endReached page the window in both
  *     directions. Filtering is server-side (mig 164), so the payload IS the
  *     filtered set: edge-load walks only matching entries and is never
- *     suppressed (the old client-filter suppression for #322 is obsolete),
+ *     suppressed,
  *   * the pre-fetch viewport margin,
  *   * the timeline sentinels (newest / oldest edge markers),
  *   * the viewport-month tracking that drives the scroll-track "you are here".
@@ -122,14 +122,12 @@ export function RegisterVirtualList<Row>({
     // or left the FRONT", and compensates scrollTop so the viewport does not
     // jump. It is a property of the RENDERED array.
     //
-    // It used to be a prop. Bank passed `register.firstItemIndex`, which the
-    // windowing hook computes in ENTRY space — but every page renders ROWS,
-    // after regrouping target splits, filtering by status and expanding groups,
-    // so the two counts differ. Bank therefore fed a delta that was wrong
-    // whenever any of those changed the count, and negative on the first
-    // prepend, which virtuoso rejects. Investment omitted the prop and got no
-    // compensation at all, so its viewport jumped on both edges. One problem,
-    // two wrong answers. Deriving it from `rows` makes the entry-vs-row mistake
+    // Not a prop. A caller-supplied value would come from the windowing hook,
+    // which counts in ENTRY space — but every page renders ROWS, after
+    // filtering by status and expanding groups, so the two counts differ. That delta is wrong whenever any of those changes
+    // the count, and negative on the first prepend, which virtuoso rejects;
+    // omitting it gives no compensation at all, and the viewport jumps on both
+    // edges. Deriving it from `rows` makes the entry-vs-row mistake
     // unconstructible instead of documented.
     //
     // Derived from the previous props during render, holding the previous value

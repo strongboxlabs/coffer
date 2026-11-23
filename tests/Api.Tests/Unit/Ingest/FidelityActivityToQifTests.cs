@@ -12,13 +12,12 @@ namespace Coffer.Api.Tests.Unit.Ingest;
 /// tests. Asserting on the downstream hints would test both at once and report failures
 /// in the wrong file.</para>
 ///
-/// <para>Fixtures mirror the STRUCTURE of the format's real exports — the same two blank
-/// preamble lines, the same 13 columns in the same order, the same ragged legal
-/// boilerplate — with every value invented. No real export enters the repo.</para>
+/// <para>Fixtures follow the format's STRUCTURE — two blank preamble lines, 13 columns
+/// in a fixed order, ragged legal boilerplate — with every value invented.</para>
 /// </remarks>
 public sealed class FidelityActivityToQifTests
 {
-    /// <summary>The header in the order a REAL export uses.</summary>
+    /// <summary>The header in the order the export format itself uses.</summary>
     /// <remarks>
     /// <c>Price ($)</c> BEFORE <c>Quantity</c>. The widely-cited reference implementation
     /// expects the opposite, so reading by position turns a share count into a unit price.
@@ -141,7 +140,7 @@ public sealed class FidelityActivityToQifTests
     }
 
     [Theory]
-    // Shapes found in real exports.
+    // Action sentences the format writes.
     [InlineData("DIVIDEND RECEIVED SAMPLE FUND (SMPL) (Cash)", 0, 12.34, "Div")]
     [InlineData("REINVESTMENT SAMPLE FUND (SMPL) (Cash)", 1.234, -12.34, "ReinvDiv")]
     // Cash in and out with no shares: XIn/XOut, which the QIF provider deliberately
@@ -193,7 +192,7 @@ public sealed class FidelityActivityToQifTests
     }
 
     [Theory]
-    // Both orders appear in the wild, and the date sits MID-sentence, so it is neither a
+    // The format writes both orders, and the date sits MID-sentence, so it is neither a
     // prefix nor a column.
     [InlineData("PURCHASE INTO CORE ACCOUNT as of 2025-06-30 SAMPLE GOVT MONEY MARKET (SMPLG)", "06/30/2025")]
     [InlineData("PURCHASE INTO CORE ACCOUNT as of 06/30/2025 SAMPLE GOVT MONEY MARKET (SMPLG)", "06/30/2025")]
@@ -204,8 +203,8 @@ public sealed class FidelityActivityToQifTests
     [Fact]
     public void The_effective_date_beats_the_run_date()
     {
-        // Run Date is when Fidelity PROCESSED the row. Rows in real exports commonly carry
-        // "as of" a day earlier, and using Run Date put each such row a day after the
+        // Run Date is when Fidelity PROCESSED the row. A row can carry "as of" a day
+        // earlier, and using Run Date put each such row a day after the
         // identical transaction already imported from the same account's QIF — close
         // enough to look unrelated, which is worse than plainly duplicated.
         var result = FidelityActivityToQif.Convert(File(
@@ -271,10 +270,9 @@ public sealed class FidelityActivityToQifTests
     [Fact]
     public void The_stated_amount_is_taken_as_written_even_when_the_balance_sits_still()
     {
-        // The shape that disproved the reference's balance rule, found in a real export:
-        // the export settles a dividend and its sweep into the core fund together, and
-        // stamps BOTH rows with the balance after the pair. Trusting the delta rewrote
-        // every amount in the file to zero.
+        // The shape that disproved the reference's balance rule: the export settles a
+        // dividend and its sweep into the core fund together, and stamps BOTH rows with
+        // the balance after the pair. Trusting the delta rewrote both amounts to zero.
         var result = FidelityActivityToQif.Convert(File(
             Row("09/02/2026", "PURCHASE INTO CORE ACCOUNT SAMPLE FUND (SMPL) (Cash)", "SMPL",
                 "SAMPLE FUND", "1.00", "43.21", "-43.21", "43.21"),
@@ -290,7 +288,7 @@ public sealed class FidelityActivityToQifTests
     [Fact]
     public void Rows_that_mean_nothing_are_skipped_rather_than_converted()
     {
-        // Three quirks, each learned from a real file: a pending trade carries the word
+        // Three quirks of the format: a pending trade carries the word
         // "Processing" where a balance belongs; a cash-reserves fund's bare CUSIP (the
         // importer's CashReservesCusip) rides along on cash rows carrying no money; and
         // the export emits filler rows with no date.
@@ -331,6 +329,27 @@ public sealed class FidelityActivityToQifTests
                 "10.00", "10", "-104.95", "895.05", commission: "4.95", fees: "0.02")));
 
         Assert.Equal("4.97", Field(result.Qif, 0, 'O'));
+    }
+
+    [Fact]
+    public void A_cash_or_fee_cell_finer_than_four_places_is_handed_on_with_every_digit()
+    {
+        // The one rounding of an ingested amount is at the ingest write, which keeps the
+        // cell's figure in the row's originals (ADR-0114 D15). Rounding here first would
+        // record the shim's figure as the bank's.
+        var result = FidelityActivityToQif.Convert(File(
+            Row("09/02/2026", "YOU BOUGHT SAMPLE FUND (SMPL)", "SMPL", "SAMPLE FUND",
+                "10.00", "10", "-100.123456", "899.876544", commission: "0.000049"),
+            Row("09/03/2026", "YOU BOUGHT SAMPLE FUND (SMPL)", "SMPL", "SAMPLE FUND",
+                "10.00", "50", "-500.00", "399.876544", fees: "1.50")));
+
+        Assert.Equal("100.123456", Field(result.Qif, 0, 'T'));
+        Assert.Equal("0.000049", Field(result.Qif, 0, 'O'));
+
+        // A cell of four places or fewer is written as before: bare when whole, without
+        // trailing zeros, so the external id QIF hashes from it is unchanged.
+        Assert.Equal("500", Field(result.Qif, 1, 'T'));
+        Assert.Equal("1.5", Field(result.Qif, 1, 'O'));
     }
 
     [Fact]

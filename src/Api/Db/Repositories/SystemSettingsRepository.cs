@@ -29,9 +29,40 @@ public sealed class SystemSettingsRepository
     /// <summary>
     /// Present once first-run setup has created a user (written by setup itself; mig
     /// 248 backfills it on installs that predate it). First-run setup — including its
-    /// pre-auth restore — is offered only while it is absent (2026-10-12 audit, S3).
+    /// pre-auth restore — is offered only while it is absent (ADR-0105 D7).
     /// </summary>
     public const string SetupCompletedKey = "setup.completed";
+
+    /// <summary>
+    /// Whether an admin can start an upgrade from the app (ADR-0110). On when absent: the host
+    /// updater is installed and running by default, and this is the in-app switch over it.
+    /// </summary>
+    public const string UpgradeInAppEnabledKey = "upgrade.in_app_enabled";
+
+    /// <summary>
+    /// Whether the app checks for a new release on its own, every few hours (ADR-0110). Off when
+    /// absent: an opt-in. "Check now" is always available either way.
+    /// </summary>
+    public const string UpgradeAutoCheckKey = "upgrade.auto_check";
+
+    /// <summary>
+    /// Whether releases are read from a private fork, with the sealed token
+    /// (<c>upgrade_repo_token</c>). Off when absent: the public repository, no token (ADR-0110).
+    /// </summary>
+    public const string UpgradePrivateRepoKey = "upgrade.private_repo";
+
+    /// <summary>
+    /// The release the app last announced as available (a JSON string, ADR-0110), so a newer one is
+    /// announced once and an all-clear follows only for something announced. Absent when nothing is
+    /// outstanding.
+    /// </summary>
+    public const string UpgradeAnnouncedKey = "upgrade.announced_version";
+
+    /// <summary>
+    /// The last successful release check, as the Upgrade tab shows it (a JSON object, ADR-0110).
+    /// Kept so a restart shows what was shown before: the check result lives in memory otherwise.
+    /// </summary>
+    public const string UpgradeLastCheckKey = "upgrade.last_check";
 
     private readonly ServiceDbContextFactory _serviceFactory;
 
@@ -84,6 +115,50 @@ public sealed class SystemSettingsRepository
             row.UpdatedBy = updatedBy;
         }
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>The raw JSON of <paramref name="key"/>, or null when it is absent.</summary>
+    public async Task<string?> GetValueJsonAsync(string key, CancellationToken cancellationToken = default)
+    {
+        await using var db = _serviceFactory.Create();
+        return await db.SystemSettings.AsNoTracking()
+            .Where(s => s.Key == key)
+            .Select(s => s.ValueJson)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>Upsert <paramref name="json"/> (valid JSON) for <paramref name="key"/>.</summary>
+    public async Task SetValueJsonAsync(
+        string key, string json, Guid? updatedBy, DateTime nowUtc, CancellationToken cancellationToken = default)
+    {
+        await using var db = _serviceFactory.Create();
+        var row = await db.SystemSettings
+            .FirstOrDefaultAsync(s => s.Key == key, cancellationToken)
+            .ConfigureAwait(false);
+        if (row is null)
+        {
+            db.SystemSettings.Add(new SystemSettingRow
+            {
+                Key = key, ValueJson = json, UpdatedAt = nowUtc, UpdatedBy = updatedBy,
+            });
+        }
+        else
+        {
+            row.ValueJson = json;
+            row.UpdatedAt = nowUtc;
+            row.UpdatedBy = updatedBy;
+        }
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Remove <paramref name="key"/>; absent already is not an error.</summary>
+    public async Task RemoveAsync(string key, CancellationToken cancellationToken = default)
+    {
+        await using var db = _serviceFactory.Create();
+        await db.SystemSettings.Where(s => s.Key == key)
+            .ExecuteDeleteAsync(cancellationToken)
+            .ConfigureAwait(false);
     }
 
     // Raw JSONB text for a boolean setting is "true"/"false"; tolerate stray

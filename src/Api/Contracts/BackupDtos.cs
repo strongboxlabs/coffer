@@ -10,8 +10,10 @@ public static class BackupContracts
     /// <summary>One stored backup artifact. <see cref="Id"/> is the opaque
     /// filename stem used in the download / delete / pin routes.
     /// <see cref="Pinned"/> = a "never delete" pin (ADR-0062): excluded from local
-    /// and Drive retention.</summary>
-    public sealed record BackupSummary(string Id, long SizeBytes, DateTime CreatedAtUtc, bool Pinned);
+    /// and Drive retention. <see cref="UpgradeLabel"/> is set for a backup held for an upgrade
+    /// started from the app (ADR-0110), e.g. "before upgrade 0.128.1 to 0.129.0"; such a backup is
+    /// not <see cref="Pinned"/>, which stays the admin pin.</summary>
+    public sealed record BackupSummary(string Id, long SizeBytes, DateTime CreatedAtUtc, bool Pinned, string? UpgradeLabel = null);
 
     /// <summary>
     /// A manual backup that was accepted (FU-065). It runs off the request, so the answer to

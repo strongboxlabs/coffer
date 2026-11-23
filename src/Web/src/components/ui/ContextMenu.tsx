@@ -1,6 +1,7 @@
 import {
     useCallback,
     useEffect,
+    useId,
     useLayoutEffect,
     useMemo,
     useRef,
@@ -11,6 +12,9 @@ import {
 } from 'react';
 
 import { cn } from '@/lib/cn';
+
+import { happenedInside } from './popoverDismissal';
+import { successorOf } from './rowRemovalFocus';
 
 // ContextMenu — anchored popover triggered by right-click (or
 // programmatically), used today for per-row register actions
@@ -26,14 +30,21 @@ import { cn } from '@/lib/cn';
 //   * Keyboard:
 //       ArrowDown / ArrowUp — move highlight (wraps).
 //       Enter / Space      — activate highlighted item.
-//       Esc                — close (does not bubble — parent form's
-//                            cancel handler must not also fire).
+//       Esc                — close and give focus back to where it was
+//                            when the menu opened (does not bubble —
+//                            parent form's cancel handler must not also
+//                            fire).
 //       Tab                — close + move focus naturally to the next
 //                            element (modern web convention: Tab
 //                            commits the menu's selection out is fine).
 //   * Outside click / blur / window blur — close.
 //   * Items with `disabled: true` are skipped by ArrowUp/ArrowDown
 //     and are non-clickable.
+//   * Focus: the menu takes it on open and gives it back on close, to
+//     whatever had it (the row's kebab), so a keyboard user is where they
+//     were after Esc, after a choice, and after the dialog a choice opened
+//     is closed. The highlighted item is exposed through
+//     `aria-activedescendant`, since the menu, not the item, holds focus.
 //
 // Why not a third-party library: we already hand-rolled Typeahead in
 // the same idiom and we want zero new runtime deps in PR-4.7. Radix-
@@ -78,10 +89,19 @@ export interface ContextMenuProps {
      * The component itself closes (re-renders nothing) only via
      * unmount, so the caller's state drives visibility. */
     onClose: () => void;
+    /** The menu's accessible name, e.g. `Actions for Groceries`. A menu with none is announced as
+     *  an unnamed menu. */
+    label?: string;
 }
 
-export function ContextMenu({ anchor, items, onClose }: ContextMenuProps) {
+export function ContextMenu({ anchor, items, onClose, label }: ContextMenuProps) {
     const rootRef = useRef<HTMLDivElement | null>(null);
+    // Where focus was before the menu took it: the kebab that opened it, or
+    // whatever held focus when a right-click did. An Escape hands it back, and
+    // so does the menu going, when nothing else has claimed focus.
+    const returnFocusRef = useRef<HTMLElement | null>(null);
+    const baseId = useId();
+    const itemId = (item: ContextMenuItem) => `${baseId}-${item.id}`;
 
     const activeIndices = useMemo(
         () => items.map((item, idx) => (item.disabled ? -1 : idx)).filter(i => i >= 0),
@@ -92,10 +112,15 @@ export function ContextMenu({ anchor, items, onClose }: ContextMenuProps) {
     const [highlightedIndex, setHighlightedIndex] = useState<number>(initialIndex);
 
     // After mount, position + focus.
+    //
+    // NOT `visibility: hidden` while it measures: a browser will not focus an element that is not
+    // visible, so the focus() below was a silent no-op, the opener kept focus, and no key reached
+    // the menu. jsdom does not model that, so the tests passed over it. The measure-and-move
+    // below is a layout effect, flushed before the browser paints, so the menu is never seen
+    // at the unmeasured spot.
     const [position, setPosition] = useState<CSSProperties>({
         left: anchor.x,
         top: anchor.y,
-        visibility: 'hidden',
     });
     useLayoutEffect(() => {
         const node = rootRef.current;
@@ -113,13 +138,40 @@ export function ContextMenu({ anchor, items, onClose }: ContextMenuProps) {
             ? Math.max(margin, anchor.y - rect.height)
             : anchor.y;
         setPosition({ left, top });
-        node.focus();
+        // Whatever had focus when the menu opened (the kebab, or nothing). Taken before the
+        // menu takes it, and given back when the menu goes, wherever the menu was closed from.
+        // Never read from inside the menu: a re-run on a moved anchor can find the menu itself
+        // focused, and that is not where focus goes back to.
+        const before = document.activeElement;
+        if (before instanceof HTMLElement && !node.contains(before)) returnFocusRef.current = before;
+        const opener = returnFocusRef.current;
+        // preventScroll: the menu is fixed at the pointer, and focusing it must not move the page.
+        node.focus({ preventScroll: true });
+        return () => {
+            // Only when the menu still holds it, or nothing does. If a choice's own handler moved
+            // focus somewhere on purpose before the menu went, that is where it stays. (A click on
+            // another field does not reach this: the menu closes on the pointer going down, before
+            // the browser moves focus, so the click lands after the restore and wins.)
+            const holder = document.activeElement;
+            const unclaimed = holder === null || holder === document.body || node.contains(holder);
+            if (opener === null || !unclaimed) return;
+            // A choice that took the opener's row away: the same control on the next
+            // row, the previous one, or the list's add control takes focus
+            // (rowRemovalFocus.ts). Asked first, because a menu drawn inside the row
+            // it removes goes before the row leaves the page: the list has already
+            // taken the opener away, though it is still on the page.
+            const successor = successorOf(opener);
+            // preventScroll: a scroll closes the menu, and bringing the opener back into view
+            // would undo the scroll that closed it.
+            if (successor !== null) successor.focus({ preventScroll: true });
+            else if (opener.isConnected) opener.focus({ preventScroll: true });
+        };
     }, [anchor.x, anchor.y]);
 
     // Outside-click + window-blur dismissal.
     useEffect(() => {
         function handlePointerDown(e: MouseEvent) {
-            if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
+            if (rootRef.current && !happenedInside(e, rootRef.current)) {
                 onClose();
             }
         }
@@ -184,11 +236,23 @@ export function ContextMenu({ anchor, items, onClose }: ContextMenuProps) {
                 e.preventDefault();
                 if (highlightedIndex >= 0) activate(highlightedIndex);
             } else if (e.key === 'Escape') {
-                // Stop bubble — parent form / register row mustn't also
-                // cancel anything else as a side effect of closing me.
+                // An Escape something nearer already used (marked handled)
+                // is not the menu's to act on.
+                if (e.defaultPrevented) return;
+                // Marked handled and stopped, as a list's is (ADR-0023 §F):
+                // the editor or register row around the opener must not also
+                // cancel anything as a side effect of closing me.
                 e.preventDefault();
                 e.stopPropagation();
                 onClose();
+                // Focus goes back to where the menu was opened from, in this
+                // keystroke, not only once the caller's state has removed the
+                // menu: in an editor the next Escape, the one that should
+                // cancel the edit, must start from the opener, and a caller
+                // that keeps the menu mounted must not leave focus on it.
+                // (The unmount then finds focus claimed and leaves it.)
+                const back = returnFocusRef.current;
+                if (back !== null && back.isConnected) back.focus({ preventScroll: true });
             } else if (e.key === 'Tab') {
                 // Tab closes the menu and lets focus advance naturally.
                 onClose();
@@ -201,6 +265,12 @@ export function ContextMenu({ anchor, items, onClose }: ContextMenuProps) {
         <div
             ref={rootRef}
             role="menu"
+            aria-label={label}
+            aria-activedescendant={
+                highlightedIndex >= 0 && items[highlightedIndex] !== undefined
+                    ? itemId(items[highlightedIndex])
+                    : undefined
+            }
             tabIndex={-1}
             onKeyDown={handleKeyDown}
             className={cn(
@@ -212,6 +282,7 @@ export function ContextMenu({ anchor, items, onClose }: ContextMenuProps) {
             {items.map((item, idx) => (
                 <ContextMenuRow
                     key={item.id}
+                    id={itemId(item)}
                     item={item}
                     highlighted={idx === highlightedIndex}
                     onHover={() => !item.disabled && setHighlightedIndex(idx)}
@@ -223,15 +294,17 @@ export function ContextMenu({ anchor, items, onClose }: ContextMenuProps) {
 }
 
 interface ContextMenuRowProps {
+    id: string;
     item: ContextMenuItem;
     highlighted: boolean;
     onHover: () => void;
     onClick: () => void;
 }
 
-function ContextMenuRow({ item, highlighted, onHover, onClick }: ContextMenuRowProps): ReactNode {
+function ContextMenuRow({ id, item, highlighted, onHover, onClick }: ContextMenuRowProps): ReactNode {
     return (
         <button
+            id={id}
             type="button"
             role="menuitem"
             disabled={item.disabled}

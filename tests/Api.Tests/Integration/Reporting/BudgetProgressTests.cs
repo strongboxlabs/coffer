@@ -18,11 +18,12 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// anyway; half an hour past midnight has none.</para>
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class BudgetProgressTests
+public sealed class BudgetProgressTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public BudgetProgressTests(PostgresFixture fixture) => _fixture = fixture;
+    public BudgetProgressTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime MonthStart(int year, int month) =>
         new(year, month, 1, 0, 0, 0, DateTimeKind.Utc);
@@ -33,7 +34,7 @@ public sealed class BudgetProgressTests
         new(year, month, 1, 0, 30, 0, DateTimeKind.Utc);
 
     private BudgetProgressRepository Repo() =>
-        new(new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System), _fixture.NewDbContext(), TimeProvider.System);
+        new(new ReportingRepository(Db.NewDbContext(), TimeProvider.System), Db.NewDbContext(), TimeProvider.System);
 
     [Fact]
     public async Task Typical_divides_by_the_window_not_by_months_that_had_spend()
@@ -42,7 +43,7 @@ public sealed class BudgetProgressTests
         // mattress a month. Dividing by "months that returned a cell" would
         // make a single purchase a permanent monthly expectation, and the
         // category would then look under-budget for the rest of time.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var furniture = await ledger.AddCategoryAsync("Furniture", "expense");
 
@@ -61,7 +62,7 @@ public sealed class BudgetProgressTests
         // Comparing a month against an average containing it drags the average
         // toward whatever happened and shrinks every deviation — the more
         // unusual the month, the more it hides itself.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense");
 
@@ -83,7 +84,7 @@ public sealed class BudgetProgressTests
     {
         // Zero would render as infinitely over budget on its first month, which
         // is the most likely month for a brand-new category to be looked at.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var newCat = await ledger.AddCategoryAsync("Wedding", "expense");
 
@@ -102,10 +103,13 @@ public sealed class BudgetProgressTests
         // The union of both sides. A category you used to spend on and did not
         // this month is exactly the row a guidepost user wants to notice; only
         // the empty intersection is uninteresting.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var gym = await ledger.AddCategoryAsync("Gym", "expense");
+        var other = await ledger.AddCategoryAsync("Other", "expense");
 
+        // The ledger predates the window, so the whole window is averaged.
+        await ledger.AddTransactionPairAsync(other.Id, bank.Id, 10m, JustInside(2026, 5));
         await ledger.AddTransactionPairAsync(gym.Id, bank.Id, 60m, JustInside(2026, 7));
         await ledger.AddTransactionPairAsync(gym.Id, bank.Id, 60m, JustInside(2026, 8));
 
@@ -126,7 +130,7 @@ public sealed class BudgetProgressTests
         // Three spends, one in each of the three months either side of the
         // window edges. Only the middle one is inside a 1-month window for
         // September, and the September one is the actual.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var cat = await ledger.AddCategoryAsync("Utilities", "expense");
 
@@ -147,7 +151,7 @@ public sealed class BudgetProgressTests
         // With Rollup the parent row is a subtotal that already contains its
         // children, so summing the rows double-counts every descendant. A
         // parent/child pair is the smallest shape that catches it.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var food = await ledger.AddCategoryAsync("Food", "expense");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense", parentId: food.Id);
@@ -169,7 +173,7 @@ public sealed class BudgetProgressTests
     {
         // A derived number has to show its provenance, or a reader cannot judge
         // it. The screen renders both of these verbatim.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
         var dto = await Repo().GetAsync(ledger.LedgerId, MonthStart(2026, 9), windowMonths: 6);
 
@@ -186,7 +190,7 @@ public sealed class BudgetProgressTests
         // the all-categories line it counts the child twice. Leaf cells sum
         // cleanly — and the row summaries above still use rollup, because a
         // TABLE wants subtotals and a LINE wants addends.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var food = await ledger.AddCategoryAsync("Food", "expense");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense", parentId: food.Id);
@@ -205,7 +209,7 @@ public sealed class BudgetProgressTests
     [Fact]
     public async Task The_daily_series_carries_the_day_each_amount_fell_on()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var cat = await ledger.AddCategoryAsync("Groceries", "expense");
 
@@ -228,11 +232,14 @@ public sealed class BudgetProgressTests
         // Same rule as `typical`, and it matters more here: the shaded band is
         // a SHAPE. Dividing by "months that had spend on that day" would make a
         // single big Tuesday a permanent feature of the profile.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var cat = await ledger.AddCategoryAsync("Rent", "expense");
+        var other = await ledger.AddCategoryAsync("Other", "expense");
 
-        // Rent on the 1st of one month only, inside a 3-month window.
+        // The ledger predates the window, so the whole window is averaged; then rent
+        // on the 1st of one month only, inside a 3-month window.
+        await ledger.AddTransactionPairAsync(other.Id, bank.Id, 10m, JustInside(2026, 5));
         await ledger.AddTransactionPairAsync(cat.Id, bank.Id, 900m, JustInside(2026, 7));
 
         var dto = await Repo().GetAsync(ledger.LedgerId, MonthStart(2026, 9), windowMonths: 3);
@@ -247,7 +254,7 @@ public sealed class BudgetProgressTests
     {
         // A cumulative line drawn to the 30th when only 16 days have happened
         // reads as spending collapsing to zero mid-month.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
         var past = await Repo().GetAsync(ledger.LedgerId, MonthStart(2020, 2), windowMonths: 3);
         Assert.Equal(29, past.DaysInMonth);      // 2020 was a leap year
@@ -261,14 +268,14 @@ public sealed class BudgetProgressTests
     [Fact]
     public async Task A_negative_trailing_total_is_no_normal_at_all()
     {
-        // Found on real data: a category whose only recent activity was a
-        // REFUND sums below zero over the window, and the first cut divided
-        // that by three and called it a budget. The row then reported itself
-        // over by the refund amount, in a month with no spending whatsoever —
-        // the single "past normal" row on an otherwise empty screen.
+        // A category whose only recent activity was a REFUND sums below
+        // zero over the window. Dividing that by three and calling it a budget
+        // would report the row over by the refund amount, in a month with no
+        // spending whatsoever — the single "past normal" row on an otherwise
+        // empty screen.
         //
         // You cannot overspend a negative budget. Null is the honest answer.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var clothing = await ledger.AddCategoryAsync("Clothing", "expense");
 

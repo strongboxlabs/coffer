@@ -22,17 +22,16 @@ namespace Coffer.Api.Tests.Integration.Backup;
 /// where it lands has not been shown to exist.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class BackupReportingTests : IDisposable
+public sealed class BackupReportingTests : DatabaseTest, IDisposable
 {
     private const string TimestampFormat = "yyyyMMdd'T'HHmmssfff'Z'";
 
-    private readonly PostgresFixture _fixture;
     private readonly string _dir;
     private readonly LedgerKeyService _keys = new(new MasterKey(new byte[32], "v1"));
 
-    public BackupReportingTests(PostgresFixture fixture)
+    public BackupReportingTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
         _dir = Path.Combine(Path.GetTempPath(), "coffer-report-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(_dir);
     }
@@ -45,7 +44,7 @@ public sealed class BackupReportingTests : IDisposable
     // --- plumbing -------------------------------------------------------------
 
     private NotificationPublisher Publisher() => new(
-        _fixture.NewServiceFactory(), _fixture.NewLedgerKeyService(), [],
+        Db.NewServiceFactory(), Db.NewLedgerKeyService(), [],
         NullLogger<NotificationPublisher>.Instance, TimeProvider.System);
 
     /// <summary>A publisher whose database is unreachable: every write throws.</summary>
@@ -55,19 +54,20 @@ public sealed class BackupReportingTests : IDisposable
             ConnectionString = "Host=127.0.0.1;Port=1;Database=x;Username=u;Password=p;Timeout=1;Command Timeout=1",
             ServiceConnectionString = "Host=127.0.0.1;Port=1;Database=x;Username=u;Password=p;Timeout=1;Command Timeout=1",
         })),
-        _fixture.NewLedgerKeyService(), [],
+        Db.NewLedgerKeyService(), [],
         NullLogger<NotificationPublisher>.Instance, TimeProvider.System);
 
+    /// <summary>The template carries the backup-age monitor's first alert (a host's
+    /// first boot writes it); these tests assert on exactly the events they cause.</summary>
     private async Task ResetAsync()
     {
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         await db.SystemEvents.ExecuteDeleteAsync();
-        await db.Database.ExecuteSqlRawAsync("DELETE FROM drive_sync; DELETE FROM drive_mirrored_backups;");
     }
 
     private async Task<List<(string Key, string Severity)>> EventsAsync()
     {
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         return (await db.SystemEvents.AsNoTracking().OrderBy(e => e.OccurredAt)
                 .Select(e => new { e.EventKey, e.Severity }).ToListAsync())
             .Select(e => (e.EventKey, e.Severity)).ToList();
@@ -118,7 +118,7 @@ public sealed class BackupReportingTests : IDisposable
 
         await Pusher(dest).PushAsync(new HashSet<string>(), default);
 
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         var e = await db.SystemEvents.AsNoTracking().SingleAsync(x => x.EventKey == "drive.push-failed");
         // This goes to whatever webhook an operator configured; a Drive failure can name hosts.
         Assert.DoesNotContain("accounts.google.com", e.Summary);
@@ -196,7 +196,7 @@ public sealed class BackupReportingTests : IDisposable
 
         await Assert.ThrowsAsync<BackupException>(() => handler.RunAsync(null!, default));
 
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         var e = await db.SystemEvents.AsNoTracking().SingleAsync();
         Assert.Equal("backup.failed", e.EventKey);
         Assert.Equal(NotificationSeverity.Critical, e.Severity);
@@ -231,7 +231,7 @@ public sealed class BackupReportingTests : IDisposable
         // Published on a token of its own: the one that fired is why this is running at all.
         var e = Assert.Single(await EventsAsync());
         Assert.Equal("backup.failed", e.Key);
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         Assert.Contains("interrupted", (await db.SystemEvents.AsNoTracking().SingleAsync()).Summary);
     }
 
@@ -239,7 +239,7 @@ public sealed class BackupReportingTests : IDisposable
 
     private DriveSyncMonitor Monitor(NotificationPublisher? publisher = null) => new(
         new BackupStore(_dir, NullLogger<BackupStore>.Instance, 1024 * 1024, TimeProvider.System),
-        new DriveSyncRepository(_fixture.NewServiceFactory()),
+        new DriveSyncRepository(Db.NewServiceFactory()),
         publisher ?? Publisher(), TimeProvider.System);
 
     private void PlaceBackup(double ageHours, string suffix = "abcd1234")
@@ -250,18 +250,18 @@ public sealed class BackupReportingTests : IDisposable
 
     private async Task ConnectDriveAsync(bool enabled = true)
     {
-        var actor = (await SyntheticLedger.CreateAsync(_fixture)).UserId;
+        var actor = (await SyntheticLedger.CreateAsync(Db)).UserId;
         var sealed_ = _keys.SealWithMasterKey(
             DriveCredentialCodec.Serialize(new DriveCredentials("cid", "secret", "refresh")));
-        var repo = new DriveSyncRepository(_fixture.NewServiceFactory());
+        var repo = new DriveSyncRepository(Db.NewServiceFactory());
         await repo.ConnectAsync(sealed_, "folderX", "Coffer Backups [t]", "e@x", actor, DateTime.UtcNow);
         if (!enabled) await repo.SetEnabledAsync(false, actor, DateTime.UtcNow);
     }
 
     private async Task SetMirroredHoursAgoAsync(string id, double hours)
     {
-        await new DriveSyncRepository(_fixture.NewServiceFactory()).RecordMirroredAsync([id]);
-        await using var db = _fixture.NewServiceDbContext();
+        await new DriveSyncRepository(Db.NewServiceFactory()).RecordMirroredAsync([id]);
+        await using var db = Db.NewServiceDbContext();
         await db.Database.ExecuteSqlRawAsync(
             "UPDATE drive_mirrored_backups SET mirrored_at = now() - make_interval(secs => {0}) WHERE backup_id = {1}",
             hours * 3600, id);
@@ -338,7 +338,7 @@ public sealed class BackupReportingTests : IDisposable
         PlaceBackup(ageHours: 1);   // backups keep arriving locally...
         await SetMirroredHoursAgoAsync("coffer-20261012T120000000Z-abcd1234", hours: 100);   // ...Drive stopped
         // ...and every attempt since has failed, which stamps last_sync_at fresh:
-        await new DriveSyncRepository(_fixture.NewServiceFactory())
+        await new DriveSyncRepository(Db.NewServiceFactory())
             .RecordSyncOutcomeAsync("error", "token revoked", DateTime.UtcNow);
 
         var age = await Monitor().CheckAsync();
@@ -353,12 +353,12 @@ public sealed class BackupReportingTests : IDisposable
         await ResetAsync();
         await ConnectDriveAsync();
         PlaceBackup(ageHours: DriveSyncMonitor.CriticalAfterHours + 5);
-        await new DriveSyncRepository(_fixture.NewServiceFactory())
+        await new DriveSyncRepository(Db.NewServiceFactory())
             .RecordSyncOutcomeAsync("error", "quota exceeded for project 424242 at oauth2.googleapis.com", DateTime.UtcNow);
 
         await Monitor().CheckAsync();
 
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         var e = await db.SystemEvents.AsNoTracking().SingleAsync(x => x.EventKey == "drive.stale");
         Assert.DoesNotContain("424242", e.Summary + e.DetailJson);
         Assert.DoesNotContain("googleapis", e.Summary + e.DetailJson);

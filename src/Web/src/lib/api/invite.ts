@@ -30,7 +30,7 @@ export function fetchAdminInvites(): Promise<PendingInvite[]> {
     return request<PendingInvite[]>('/api/admin/invites');
 }
 
-/** An invite that makes its holder an admin needs a passkey tap (security audit, M2). */
+/** An invite that makes its holder an admin needs a passkey tap (ADR-0105 D1). */
 export function createAdminInvite(
     body: { ledgerId?: string; role?: string; grantsAdmin: boolean },
 ): Promise<InviteCreated> {

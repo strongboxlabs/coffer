@@ -1,4 +1,4 @@
-// Account + account-group endpoints, plus the per-account PATCH
+// Account + account-folder endpoints, plus the per-account PATCH
 // surfaces that target an account resource (feed-mapping,
 // sync-from-date, trade-commission). Feed-connection management
 // lives in [./feed.ts].
@@ -6,19 +6,24 @@
 import type {
     AccountSummary,
     AccountDetail,
-    AccountGroupSummary,
-    CreateAccountGroupRequest,
-    PatchAccountGroupRequest,
+    AccountBalance,
+    AccountFolder,
+    AccountSubtotals,
+    BalanceForecast,
+    CreateAccountFolderRequest,
+    RenameAccountFolderRequest,
     PatchAccountFeedMappingRequest,
     PatchAccountSyncFromDateRequest,
     FrequentCounterpartiesResponse,
     CreateAccountRequest,
     UpdateAccountRequest,
+    UpdateAccountResponse,
     LoanPaymentPreviewRequest,
     LoanPaymentPreviewResponse,
     SetupPaymentReminderRequest,
 } from '../types/account';
 import { request } from './_request';
+import { todayQuery, withToday } from './_today';
 
 /**
  * GET /api/ledgers/{id}/accounts — every active account in one
@@ -48,7 +53,12 @@ export function fetchAccounts(
  * `investment` account also materializes its system Holdings sibling
  * server-side. 422 codes: `account-name-required`, `account-type-invalid`,
  * `account-category-kind-invalid`, `account-currency-invalid`,
- * `account-parent-invalid`.
+ * `account-parent-invalid`, `category-currency-not-reporting`.
+ *
+ * `category-currency-not-reporting`: a category create named a currency other than
+ * the ledger's reporting currency. A category has no currency of its own (ADR-0109
+ * D9); with no `currencyCode` sent, the server stamps the reporting one. The SPA's
+ * category create sends none, so it never meets this refusal.
  */
 export function createAccount(
     ledgerId: string,
@@ -78,16 +88,27 @@ export function fetchAccount(
 /**
  * PATCH /api/ledgers/{ledgerId}/accounts/{accountId} — edit an account's
  * general attributes (ADR-0050). Partial; `accountType` is immutable.
- * 204 on success. 422 codes: `account-not-in-ledger`, `account-is-system`,
- * `account-patch-empty`, `account-name-required`,
- * `account-category-kind-invalid`, `account-currency-invalid`.
+ * Answers how many mirrored pairs a currency change left across currencies
+ * ({@link UpdateAccountResponse}, ADR-0114 D13). 422 codes: `account-not-in-ledger`,
+ * `account-is-system`, `account-patch-empty`, `account-name-required`,
+ * `account-category-kind-invalid`, `account-currency-invalid`,
+ * `category-currency-not-reporting`, `amount-places-exceed-currency`,
+ * `relabel-pair-not-representable`, `relabel-places-exceed-currency`.
+ *
+ * `relabel-pair-not-representable`: `count` pairs; when any is on a transaction merged
+ * into another, which no register shows, `mergedInto` names each transaction it was merged
+ * into (`ApiError.mergedInto`, ADR-0114 D13, decided by the owner, 2026-11-18).
+ *
+ * `category-currency-not-reporting`: a category edit named a currency other than the
+ * ledger's reporting currency (ADR-0109 D9). The SPA's category rename sends only the
+ * name, and the account editor edits real accounts only, so it never meets this refusal.
  */
 export function updateAccount(
     ledgerId: string,
     accountId: string,
     body: UpdateAccountRequest,
-): Promise<void> {
-    return request<void>(
+): Promise<UpdateAccountResponse> {
+    return request<UpdateAccountResponse>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/accounts/${encodeURIComponent(accountId)}`,
         { method: 'PATCH', body },
     );
@@ -127,101 +148,131 @@ export function setupPaymentReminder(
     );
 }
 
-// ----------------------------------------------------------------------
-// Account groups (sidebar tabs, migration 033)
-// ----------------------------------------------------------------------
-
 /**
- * GET /api/ledgers/{ledgerId}/account-groups — list the calling
- * user's sidebar tabs in this ledger, with each group's member
- * account ids inline. The implicit "All" tab is rendered client-
- * side and never appears in this list.
+ * GET /api/ledgers/{ledgerId}/accounts/balances — every real account's
+ * current balance (FU-052), inactive ones included, for the sidebar. The
+ * dashboard's figure: cash, plus holdings market value for an investment
+ * account; liabilities negative. Keyed under `['accounts', ledgerId]` so
+ * every existing accounts invalidation refreshes it. Sends the user's local
+ * date, as the register does, so a balance stops exactly where the register's
+ * Scheduled rows begin.
  */
-export function fetchAccountGroups(
-    ledgerId: string,
-): Promise<AccountGroupSummary[]> {
-    return request<AccountGroupSummary[]>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/account-groups`,
+export function fetchAccountBalances(ledgerId: string): Promise<AccountBalance[]> {
+    return request<AccountBalance[]>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/accounts/balances${todayQuery()}`,
     );
 }
 
 /**
- * POST /api/ledgers/{ledgerId}/account-groups — create a new tab.
- *
- * 422 codes:
- *   * `account-group-name-required` — name blank.
- *   * `account-group-name-conflict` — duplicate name (case-insensitive).
+ * GET /api/ledgers/{ledgerId}/accounts/subtotals — the sidebar's section and folder
+ * totals, each converted into the reporting currency on the server (ADR-0114 D7), so
+ * the rail never adds balances. Sends the user's local date, as the balances do.
  */
-export function createAccountGroup(
+export function fetchAccountSubtotals(ledgerId: string): Promise<AccountSubtotals> {
+    return request<AccountSubtotals>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/accounts/subtotals${todayQuery()}`,
+    );
+}
+
+/**
+ * GET /api/ledgers/{ledgerId}/accounts/balance-forecast — the balance of every
+ * account a reminder is paid from, from the user's local today through `days` ahead
+ * (the server clamps it), from the register's committed rows and the reminders not
+ * yet posted.
+ */
+export function fetchBalanceForecast(ledgerId: string, { days }: { days: number }): Promise<BalanceForecast> {
+    const params = withToday(new URLSearchParams({ days: String(days) }));
+    return request<BalanceForecast>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/accounts/balance-forecast?${params.toString()}`,
+    );
+}
+
+// ----------------------------------------------------------------------
+// Account folders (sidebar, migration 258, FU-006)
+// ----------------------------------------------------------------------
+
+/**
+ * GET /api/ledgers/{ledgerId}/account-folders — every folder in the ledger,
+ * flat and ordered by name, each with the accounts directly in it. Any grant
+ * reads; every write below is owner or editor only.
+ */
+export function fetchAccountFolders(ledgerId: string): Promise<AccountFolder[]> {
+    return request<AccountFolder[]>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/account-folders`,
+    );
+}
+
+/**
+ * POST /api/ledgers/{ledgerId}/account-folders — create a folder, at the top
+ * level of its type's section or inside `parentId`. Returns the folder (201).
+ * Codes: `account-folder-name-required`, `account-folder-name-too-long`,
+ * `account-folder-name-taken`, `account-folder-type-invalid`,
+ * `account-folder-type-mismatch`, `account-folder-not-found`.
+ */
+export function createAccountFolder(
     ledgerId: string,
-    body: CreateAccountGroupRequest,
-): Promise<{ id: string }> {
-    return request<{ id: string }>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/account-groups`,
+    body: CreateAccountFolderRequest,
+): Promise<AccountFolder> {
+    return request<AccountFolder>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/account-folders`,
         { method: 'POST', body },
     );
 }
 
-/**
- * PATCH /api/ledgers/{ledgerId}/account-groups/{groupId} — rename
- * a tab.
- *
- * 422 codes: `account-group-name-required`, `account-group-name-conflict`,
- * `account-group-not-found`.
- */
-export function patchAccountGroup(
+/** PATCH /api/ledgers/{ledgerId}/account-folders/{folderId} — rename. */
+export function renameAccountFolder(
     ledgerId: string,
-    groupId: string,
-    body: PatchAccountGroupRequest,
-): Promise<void> {
-    return request<void>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/account-groups/${encodeURIComponent(groupId)}`,
+    folderId: string,
+    body: RenameAccountFolderRequest,
+): Promise<AccountFolder> {
+    return request<AccountFolder>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/account-folders/${encodeURIComponent(folderId)}`,
         { method: 'PATCH', body },
     );
 }
 
 /**
- * DELETE /api/ledgers/{ledgerId}/account-groups/{groupId} — drop
- * a tab. Membership rows cascade.
+ * PUT /api/ledgers/{ledgerId}/account-folders/{folderId}/parent — move a
+ * folder into another of its type, or to the top level with null. 204.
+ * Codes: `account-folder-type-mismatch`, `account-folder-cycle`,
+ * `account-folder-name-taken`, `account-folder-not-found`.
  */
-export function deleteAccountGroup(
+export function moveAccountFolder(
     ledgerId: string,
-    groupId: string,
+    folderId: string,
+    parentId: string | null,
 ): Promise<void> {
     return request<void>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/account-groups/${encodeURIComponent(groupId)}`,
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/account-folders/${encodeURIComponent(folderId)}/parent`,
+        { method: 'PUT', body: { parentId } },
+    );
+}
+
+/**
+ * DELETE /api/ledgers/{ledgerId}/account-folders/{folderId} — 204. Deletes
+ * nothing else: the folder's sub-folders and accounts move up one level.
+ */
+export function deleteAccountFolder(ledgerId: string, folderId: string): Promise<void> {
+    return request<void>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/account-folders/${encodeURIComponent(folderId)}`,
         { method: 'DELETE' },
     );
 }
 
 /**
- * POST /api/ledgers/{ledgerId}/account-groups/{groupId}/members/{accountId}
- * — add an account to a tab. Idempotent (re-adding an existing
- * membership succeeds with 204).
+ * PUT /api/ledgers/{ledgerId}/accounts/{accountId}/folder — put an account in
+ * a folder of its type, or take it out of any with null. 204. Codes:
+ * `account-folder-type-mismatch`, `account-folder-not-found`,
+ * `account-not-in-ledger`, `account-is-system`, `account-is-category`.
  */
-export function addAccountGroupMember(
+export function setAccountFolder(
     ledgerId: string,
-    groupId: string,
     accountId: string,
+    folderId: string | null,
 ): Promise<void> {
     return request<void>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/account-groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(accountId)}`,
-        { method: 'POST' },
-    );
-}
-
-/**
- * DELETE /api/ledgers/{ledgerId}/account-groups/{groupId}/members/{accountId}
- * — remove an account from a tab. Idempotent.
- */
-export function removeAccountGroupMember(
-    ledgerId: string,
-    groupId: string,
-    accountId: string,
-): Promise<void> {
-    return request<void>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/account-groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(accountId)}`,
-        { method: 'DELETE' },
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/accounts/${encodeURIComponent(accountId)}/folder`,
+        { method: 'PUT', body: { folderId } },
     );
 }
 

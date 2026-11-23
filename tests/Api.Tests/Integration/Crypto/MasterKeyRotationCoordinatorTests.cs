@@ -16,9 +16,11 @@ namespace Coffer.Api.Tests.Integration.Crypto;
 /// </summary>
 /// <remarks>
 /// <para>Rotation targets a key with the SAME bytes as the fixture's under a
-/// DIFFERENT id. The database therefore ends up re-wrapped under identical bytes,
-/// so every other test in the shared collection still opens its ledgers, while the
-/// file swap, archive, and rollback all run for real. Same trick and same reason as
+/// DIFFERENT id. Every clone carries material sealed under the fixture key (the
+/// template's OAuth key pair), which the re-wrap has to open, and the database ends up
+/// re-wrapped under identical bytes, so anything that opens it with the fixture key
+/// afterwards, as every test host does, still can; the file swap, archive, and
+/// rollback all run for real. Same trick and same reason as
 /// <see cref="KekRotationServiceTests"/>; different-bytes correctness (a blob sealed
 /// under A won't open under B) is covered by
 /// <c>Unit.Crypto.LedgerKeyServiceTests</c>.</para>
@@ -28,36 +30,22 @@ namespace Coffer.Api.Tests.Integration.Crypto;
 /// later host build resolves.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class MasterKeyRotationCoordinatorTests : IDisposable, IAsyncLifetime
+public sealed class MasterKeyRotationCoordinatorTests : DatabaseTest, IDisposable
 {
-    private readonly PostgresFixture _fixture;
     private readonly string _dir = Directory.CreateTempSubdirectory("coffer-rotate").FullName;
 
-    public MasterKeyRotationCoordinatorTests(PostgresFixture fixture) => _fixture = fixture;
-
-    /// <summary>
-    /// Step 1 of a coordinated rotation is a DRY-RUN rotation, so this class reads every
-    /// table the rotation service reads and has to arrange them the same way
-    /// <see cref="KekRotationServiceTests"/> does. Full rationale on
-    /// <see cref="NotificationTargetReset"/>.
-    /// </summary>
-    /// <remarks>
-    /// The symptom was indirect enough to be worth recording: leftover subscriber rows
-    /// made the dry run throw, the coordinator turned that into
-    /// <c>Refusal.Blocked</c>, and four tests failed asserting on a refusal reason rather
-    /// than on anything to do with notifications.
-    /// </remarks>
-    public Task InitializeAsync() => NotificationTargetReset.ClearAsync(_fixture);
-
-    public Task DisposeAsync() => Task.CompletedTask;
+    public MasterKeyRotationCoordinatorTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     public void Dispose()
     {
         try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
     }
 
-    /// <summary>32 zero bytes — what ApiFactory pins, and what every other test's
-    /// wrapped material is sealed under.</summary>
+    /// <summary>32 zero bytes — what ApiFactory pins, and what the template's wrapped
+    /// material is sealed under.</summary>
     private static byte[] FixtureBytes => new byte[32];
     private static string FixtureBase64 => Convert.ToBase64String(FixtureBytes);
 
@@ -70,14 +58,14 @@ public sealed class MasterKeyRotationCoordinatorTests : IDisposable, IAsyncLifet
 
     private MasterKeyRotationCoordinator NewCoordinator(MasterKeyWriteGate? gate = null) => new(
         new KekRotationService(
-            _fixture.NewServiceFactory(), NullLogger<KekRotationService>.Instance),
+            Db.NewServiceFactory(), NullLogger<KekRotationService>.Instance),
         gate ?? new MasterKeyWriteGate(),
         NullLogger<MasterKeyRotationCoordinator>.Instance, TimeProvider.System);
 
     private async Task<Guid> InsertLedgerAsync(MasterKey wrapUnder, string kekId)
     {
         var id = Guid.NewGuid();
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         db.Ledgers.Add(new LedgerRow
         {
             Id = id,
@@ -115,7 +103,7 @@ public sealed class MasterKeyRotationCoordinatorTests : IDisposable, IAsyncLifet
         Assert.Equal(newId, fileId);
 
         // The database agrees with the file.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.Ledgers.AsNoTracking().SingleAsync(l => l.Id == ledgerId);
         Assert.Equal(newId, row.LekKekId);
         Assert.Equal(32, new LedgerKeyService(new MasterKey(FixtureBytes, newId))
@@ -168,7 +156,7 @@ public sealed class MasterKeyRotationCoordinatorTests : IDisposable, IAsyncLifet
         using var inFlight = gate.Enter();   // a seal-and-save still under way
 
         var coordinator = new MasterKeyRotationCoordinator(
-            new KekRotationService(_fixture.NewServiceFactory(), NullLogger<KekRotationService>.Instance),
+            new KekRotationService(Db.NewServiceFactory(), NullLogger<KekRotationService>.Instance),
             gate, NullLogger<MasterKeyRotationCoordinator>.Instance, TimeProvider.System)
         { DrainTimeout = TimeSpan.FromMilliseconds(150) };
         var outcome = await coordinator.RotateAsync(
@@ -185,7 +173,7 @@ public sealed class MasterKeyRotationCoordinatorTests : IDisposable, IAsyncLifet
         var gate = new MasterKeyWriteGate();
         var inFlight = gate.Enter();
         var coordinator = new MasterKeyRotationCoordinator(
-            new KekRotationService(_fixture.NewServiceFactory(), NullLogger<KekRotationService>.Instance),
+            new KekRotationService(Db.NewServiceFactory(), NullLogger<KekRotationService>.Instance),
             gate, NullLogger<MasterKeyRotationCoordinator>.Instance, TimeProvider.System)
         { DrainTimeout = TimeSpan.FromSeconds(10) };
 
@@ -227,35 +215,23 @@ public sealed class MasterKeyRotationCoordinatorTests : IDisposable, IAsyncLifet
         // discovers the problem only after the key has changed.
         var foreign = new byte[32];
         for (var i = 0; i < foreign.Length; i++) foreign[i] = (byte)(i + 31);
-        var strandedId = await InsertLedgerAsync(new MasterKey(foreign, "other"), "other");
+        await InsertLedgerAsync(new MasterKey(foreign, "other"), "other");
         var store = NewStore();
 
-        try
-        {
-            var outcome = await NewCoordinator().RotateAsync(
-                new MasterKey(FixtureBytes, "v1"),
-                new MasterKey(FixtureBytes, "v2-blocked"),
-                FixtureBase64,
-                store);
+        var outcome = await NewCoordinator().RotateAsync(
+            new MasterKey(FixtureBytes, "v1"),
+            new MasterKey(FixtureBytes, "v2-blocked"),
+            FixtureBase64,
+            store);
 
-            Assert.Equal(MasterKeyRotationCoordinator.Refusal.Blocked, outcome.Refusal);
-            Assert.Null(outcome.Result);
-            Assert.Null(outcome.PreviousKeyArchivedAt);
+        Assert.Equal(MasterKeyRotationCoordinator.Refusal.Blocked, outcome.Refusal);
+        Assert.Null(outcome.Result);
+        Assert.Null(outcome.PreviousKeyArchivedAt);
 
-            // Untouched: still the original key AND the original id.
-            var (key, id) = store.Read();
-            Assert.Equal(FixtureBase64, key);
-            Assert.Equal("v1", id);
-        }
-        finally
-        {
-            // MUST clean up: a ledger that doesn't open under the fixture key aborts
-            // any later rotation or preview in this shared database. Learned the hard
-            // way — an unopenable drive_sync row from a neighbouring test did exactly
-            // that to the preview endpoint test.
-            await using var db = _fixture.NewDbContext();
-            await db.Ledgers.Where(l => l.Id == strandedId).ExecuteDeleteAsync();
-        }
+        // Untouched: still the original key AND the original id.
+        var (key, id) = store.Read();
+        Assert.Equal(FixtureBase64, key);
+        Assert.Equal("v1", id);
     }
 
     [Fact]
@@ -285,7 +261,7 @@ public sealed class MasterKeyRotationCoordinatorTests : IDisposable, IAsyncLifet
         // Archive can succeed and Write still fail — a read-only directory permits the
         // move out on some platforms, and a disk-full hits the write, not the rename.
         // Without putting the archive back, "nothing was changed" is a lie and the
-        // install is left with NO key file, which D3 then refuses to boot over its own
+        // install is left with NO key file, which ADR-0092 D3 then refuses to boot over its own
         // wrapped material.
         var store = NewStore();
         var original = store.ReadRaw();

@@ -3,6 +3,8 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import { WHOLE_TREE_SCAN_TIMEOUT_MS } from '@/lib/wholeTreeScan';
+
 /**
  * Every design-token colour class in the SPA must name a token that exists.
  *
@@ -13,14 +15,10 @@ import { describe, expect, it } from 'vitest';
  * colour it asked for. That is invisible in review — the markup reads correctly —
  * and invisible in tests, which assert text and roles rather than paint.
  *
- * It has bitten three times:
- *   * `border-border-subtle` in BOTH notifications panels (no such token; the
- *     divider between target rows never got its colour).
- *   * `state-warn` / `state-warn-soft` in the import dialog, twice — the preview
- *     and result warning boxes. The token is `state-warning`. Those two panels
- *     exist ONLY to be noticed, and they were rendering with no border colour and
- *     no background. Reported by a human looking at the screen, which is the only
- *     thing that was ever going to catch it.
+ * Typical misses: `border-border-subtle` (no such token, so a divider gets no
+ * colour) and `state-warn` / `state-warn-soft` for `state-warning` (so a
+ * warning box that exists ONLY to be noticed renders with no border colour and
+ * no background). Only a person looking at the screen sees either.
  *
  * So this reads the token definitions out of the stylesheet and checks every
  * reference against them. A typo becomes a failing test instead of an invisible
@@ -70,10 +68,9 @@ function tokensIn(body: string): Set<string> {
 /**
  * The tokens the app DEFINES — scoped to the `@theme` block on purpose.
  *
- * It used to scan the whole file. That was fine until the theme overrides
- * landed: a typo inside a `[data-theme]` block (`--color-serface`) would have
- * been read as a definition, so the override would silently do nothing AND
- * the typo would start vouching for itself everywhere else. The override
+ * Scanning the whole file would read a typo inside a `[data-theme]` block
+ * (`--color-serface`) as a definition, so the override would silently do
+ * nothing AND the typo would vouch for itself everywhere else. The override
  * blocks are checked against this set instead, below.
  */
 function definedTokens(): Set<string> {
@@ -105,18 +102,11 @@ describe('design tokens', () => {
 
         // KNOWN DEBT — empty, and it stays that way.
         //
-        // All four entries (text-default, on-accent, accent-foreground,
-        // state-danger-bg) were cleared alongside the themes. What had frozen
-        // them was the note that "a wrong guess is a silent appearance change";
-        // the four-theme contrast audit is what unblocked them, because every
-        // substitution could be checked against its real background in each
-        // theme before being made rather than guessed.
-        //
-        // on-accent and accent-foreground both resolved to text-text-inverse,
-        // as the old note predicted — but only after that token was made
-        // theme-aware, which is the thing the guess could not have known: a
-        // white label is correct on the light themes' teal-700 and unreadable
-        // (1.78:1) on the dark themes' teal-400.
+        // A substitute for an undefined token is checked against its real
+        // background in each theme by the four-theme contrast audit, not guessed:
+        // a white label is correct on the light themes' teal-700 and unreadable
+        // (1.78:1) on the dark themes' teal-400, which is why text-text-inverse
+        // is theme-aware.
         //
         // Do not add to this set. A name here is a class that paints nothing;
         // fix the reference instead.
@@ -137,7 +127,7 @@ describe('design tokens', () => {
         // Listed rather than counted, because the failure has to name the typo to be
         // actionable — "3 bad tokens" sends the reader hunting.
         expect(offenders).toEqual([]);
-    });
+    }, WHOLE_TREE_SCAN_TIMEOUT_MS);
 
     it('themes override only tokens that exist', () => {
         // A `[data-theme]` block can only RE-point a token the @theme block
@@ -171,10 +161,9 @@ describe('design tokens', () => {
         //
         // Second, and the reason this test exists: the light block is the
         // checklist. A token absent from it is a token no theme was ever asked
-        // about, so its light value leaks into all four. That is how
-        // `surface-sidebar` came within a commit of painting a white rail down
-        // the side of both dark themes — it was never wrong anywhere, just
-        // never considered.
+        // about, so its light value leaks into all four — a sidebar token missing
+        // here would paint a white rail down the side of both dark themes
+        // without being wrong anywhere, just never considered.
         const css = readFileSync(CSS, 'utf8');
         const light = tokensIn(blockBody(css, '[data-theme="light"] {'));
         const missing = [...definedTokens()].filter((t) => !light.has(t)).sort();
@@ -184,8 +173,7 @@ describe('design tokens', () => {
     it('the style guide renders every @theme token', () => {
         // StyleGuidePage says at the top that every token in index.css renders
         // there, and ADR-0021 D.1 is what makes that page the first place a
-        // token change is verified. Nothing enforced it, and it had already
-        // drifted: surface-header was missing before the themes landed.
+        // token change is verified. Unenforced, that claim drifts.
         //
         // Tokens appear there two ways — as a `--color-x` literal in the label,
         // or only as the utility class that paints the swatch — so both count.
@@ -203,9 +191,8 @@ describe('design tokens', () => {
 
     it('would catch a token that does not exist', () => {
         // The guard's own guard. A regex that quietly stopped matching would make the
-        // test above pass forever, which is the failure mode this repo keeps finding:
-        // a check that cannot fail. This proves the matcher still fires on the exact
-        // shape of the bug that prompted it.
+        // test above pass forever: a check that cannot fail. This proves the matcher
+        // still fires on an undefined-token reference.
         const defined = definedTokens();
         const sample = 'className="rounded border border-state-warn/40 bg-state-warn-soft"';
 

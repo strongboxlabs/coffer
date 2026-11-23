@@ -51,8 +51,9 @@ function renderPanel() {
  * first, so the fifteen existing cases keep exercising the panel with no router —
  * which is what most of them are actually about.
  */
-function renderPanelRouted() {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderPanelRouted(
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+) {
     const root = createRootRoute();
     const here = createRoute({
         getParentRoute: () => root,
@@ -84,13 +85,13 @@ describe('Ledger NotificationsPanel', () => {
         vi.spyOn(apiModule, 'fetchLedgerEvents').mockResolvedValue([]);
         // The owner's view by default: where a ledger reports is theirs (FU-095).
         vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([
-            { id: LEDGER_ID, name: 'Personal', role: 'owner' },
+            { id: LEDGER_ID, name: 'Personal', role: 'owner', currencyCode: 'USD' },
         ]);
     });
 
     it("shows an editor where the ledger reports, and not the owner's add or remove", async () => {
         vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue([
-            { id: LEDGER_ID, name: 'Personal', role: 'editor' },
+            { id: LEDGER_ID, name: 'Personal', role: 'editor', currencyCode: 'USD' },
         ]);
         vi.spyOn(apiModule, 'fetchLedgerNotifications').mockResolvedValue({
             subscribers: [
@@ -147,11 +148,9 @@ describe('Ledger NotificationsPanel', () => {
     });
 
     it('offers a switch bound to one of this ledger\'s own jobs', async () => {
-        // Reverses the refusal shipped earlier in this branch. That refusal was right
-        // about the code — every monitor was a deployment job, so a ledger switch could
-        // never fire — and wrong about the design: quote-refresh and snapshot ARE
-        // per-ledger scheduled jobs, and they are exactly the things that go quiet
-        // without anyone noticing. The scheduler now emits a signal per run for each.
+        // Quote-refresh and snapshot are per-ledger scheduled jobs, and they are
+        // exactly the things that go quiet without anyone noticing. The scheduler
+        // emits a signal per run for each, so a ledger switch bound to one can fire.
         vi.spyOn(apiModule, 'fetchLedgerNotifications').mockResolvedValue({
             subscribers: [],
             monitorCoverage: { 'quote-refresh': false },
@@ -180,6 +179,96 @@ describe('Ledger NotificationsPanel', () => {
             subscriberKey: 'healthchecks',
             monitors: 'quote-refresh',
         });
+    });
+
+    it('says the quote refresh switch also watches exchange rates and benchmarks, which ride that job', async () => {
+        // ADR-0114 D11: rates and benchmarks are fetched by the quote refresh, so there is
+        // no job of their own to pick. Without the reading, "quote-refresh" reads as
+        // prices only and an owner looking for a currency watch finds none.
+        vi.spyOn(apiModule, 'fetchLedgerNotifications').mockResolvedValue({
+            subscribers: [{
+                id: 's1', subscriberKey: 'healthchecks', displayName: 'HC quotes',
+                isEnabled: true, minSeverity: 'warning', topics: null, monitors: 'quote-refresh',
+                lastSuccessAt: null, lastFailureAt: null, lastError: null,
+                consecutiveFailures: 0,
+            }],
+            monitorCoverage: { 'quote-refresh': true, snapshot: false },
+            monitorsWatchingNothing: [],
+        });
+
+        renderPanel();
+        const user = userEvent.setup();
+        await screen.findByRole('option', { name: /Healthchecks/i });
+        await user.selectOptions(screen.getByLabelText(/provider/i), 'healthchecks');
+
+        const watches = screen.getByLabelText(/watches/i);
+        expect(within(watches).getByRole('option', { name: 'quote-refresh — prices, exchange rates, benchmarks' }))
+            .toHaveValue('quote-refresh');
+        // A job whose name says what it covers is shown as it is.
+        expect(within(watches).getByRole('option', { name: 'snapshot' })).toHaveValue('snapshot');
+        // The bound target's line reads the same way.
+        expect(screen.getByText(/watches quote-refresh — prices, exchange rates, benchmarks/)).toBeInTheDocument();
+    });
+
+    it('gives focus to the URL field when an added target clears it and leaves Add target disabled', async () => {
+        vi.spyOn(apiModule, 'fetchLedgerNotifications').mockResolvedValue({
+            subscribers: [],
+            monitorCoverage: {},
+            monitorsWatchingNothing: [],
+        });
+        const create = vi
+            .spyOn(apiModule, 'createLedgerNotificationSubscriber')
+            .mockResolvedValue(undefined as never);
+
+        renderPanel();
+        const user = userEvent.setup();
+        await screen.findByRole('option', { name: /Webhook/i });
+        await user.selectOptions(screen.getByLabelText(/provider/i), 'webhook');
+        const url = screen.getByLabelText(/^URL/i);
+        await user.type(url, 'https://hook.invalid/abc');
+        const add = screen.getByRole('button', { name: /add target/i });
+        await user.click(add);
+
+        await waitFor(() => expect(create).toHaveBeenCalled());
+        await waitFor(() => expect(add).toBeDisabled());
+        expect(url).toHaveValue('');
+        expect(url).toHaveFocus();
+    });
+
+    // ADR-0023 §L: while the add is in flight its fields are pending. Its success
+    // clears the name and URL, so anything typed meanwhile would be dropped, and a
+    // severity picked meanwhile would never be sent.
+    it('refuses typing and picks in the add form while the add is in flight', async () => {
+        vi.spyOn(apiModule, 'fetchLedgerNotifications').mockResolvedValue({
+            subscribers: [],
+            monitorCoverage: {},
+            monitorsWatchingNothing: [],
+        });
+        vi.spyOn(apiModule, 'createLedgerNotificationSubscriber')
+            .mockImplementation(() => new Promise(() => {}));
+
+        renderPanel();
+        const user = userEvent.setup();
+        await screen.findByRole('option', { name: /Webhook/i });
+        await user.selectOptions(screen.getByLabelText(/provider/i), 'webhook');
+        const name = screen.getByLabelText(/^Name/i);
+        const url = screen.getByLabelText(/^URL/i);
+        const severity = screen.getByLabelText(/send at/i);
+        await user.type(name, 'Target A');
+        await user.type(url, 'https://hook.invalid/abc');
+        await user.click(screen.getByRole('button', { name: /add target/i }));
+        await screen.findByRole('button', { name: /adding/i });
+
+        await user.type(name, ' more');
+        await user.type(url, 'more');
+        await user.selectOptions(severity, 'critical');
+        await user.selectOptions(screen.getByLabelText(/provider/i), '');
+
+        expect(name).toHaveValue('Target A');
+        expect(url).toHaveValue('https://hook.invalid/abc');
+        expect(severity).not.toHaveValue('critical');
+        expect(screen.getByLabelText(/provider/i)).toHaveValue('webhook');
+        for (const field of [name, url, severity]) expect(field).toHaveAttribute('aria-disabled', 'true');
     });
 
     it('names the jobs nothing is watching', async () => {
@@ -221,13 +310,12 @@ describe('Ledger NotificationsPanel', () => {
 
     it('does not invent that complaint when every bound switch has its job on', async () => {
         // Keeps the test above from passing on a panel that renders the warning
-        // unconditionally, which is the failure mode this repo keeps finding: a check
-        // that cannot fail.
+        // unconditionally: a check that cannot fail.
         //
-        // The anchor is load-bearing and was WRONG the first time. Waiting on the
-        // 'Notifications' heading proved nothing: it renders on the pending frame, so the
-        // absence assertion passed before the query resolved and a panel that always
-        // showed the warning still went green. Anchoring on the OTHER warning fixes that
+        // The anchor is load-bearing. Waiting on the 'Notifications' heading would prove
+        // nothing: it renders on the pending frame, so the absence assertion would pass
+        // before the query resolved and a panel that always showed the warning would
+        // still go green. Anchoring on the OTHER warning fixes that
         // — it can only appear once settings.data exists — and it doubles as proof the
         // two messages stay distinct rather than one matching the other's text.
         vi.spyOn(apiModule, 'fetchLedgerNotifications').mockResolvedValue({
@@ -281,13 +369,13 @@ describe('Ledger NotificationsPanel', () => {
     });
 
     it('describes a switch by what it watches, not by a floor it never reads', async () => {
-        // The reported bug. The saved row said "at warning and above" under a switch whose
-        // create form had just said there is no severity to choose — and the form was the
+        // A saved row saying "at warning and above" under a switch whose create form
+        // says there is no severity to choose contradicts itself — and the form is the
         // half telling the truth. Wants() branches on capability BEFORE any floor check
         // and the heartbeat arm returns on monitor name and signal alone, so MinSeverity
         // is never read for this row.
         //
-        // It was not a harmless label. A successful run publishes at info, strictly BELOW
+        // It is not a harmless label. A successful run publishes at info, strictly BELOW
         // a warning floor: if the line described real routing, every success ping would be
         // dropped and the check would go red from inactivity. The stored "warning" is just
         // the create form's hidden default.
@@ -399,8 +487,7 @@ describe('Ledger NotificationsPanel', () => {
         expect(await screen.findByText(/yahoo timed out/i)).toBeTruthy();
 
         // WHEN, not just what. Without a time, a days-old warning that has since been
-        // resolved is indistinguishable from one raised a minute ago — which is exactly
-        // what the first real row this panel ever showed turned out to be.
+        // resolved is indistinguishable from one raised a minute ago.
         const when = document.querySelector('time[datetime="2026-08-26T03:00:00Z"]');
         expect(when).not.toBeNull();
         expect(when!.textContent?.trim()).not.toBe('');
@@ -460,6 +547,75 @@ describe('Ledger NotificationsPanel', () => {
         // It must land on General with the arrival flag, or it is a link to a panel
         // that shows nothing.
         expect(action.getAttribute('href')).toContain('check=true');
+    });
+
+    // An editor writes, so an editor repairs, as an owner does: the fix follows who can
+    // edit, not who owns the ledger.
+    it('hands an editor the drift finding\'s fix', async () => {
+        const editorLedgers = [{ id: LEDGER_ID, name: 'Personal', role: 'editor', currencyCode: 'USD' }];
+        vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue(editorLedgers);
+        vi.spyOn(apiModule, 'fetchLedgerNotifications').mockResolvedValue({
+            subscribers: [],
+            monitorCoverage: {},
+            monitorsWatchingNothing: [],
+        });
+        vi.spyOn(apiModule, 'fetchLedgerEvents').mockResolvedValue([
+            {
+                id: 'e3',
+                occurredAt: '2026-08-26T09:00:00Z',
+                severity: 'warning',
+                topic: 'consistency',
+                eventKey: 'consistency.drift',
+                summary: 'realized_gains: 3 of 175 disagree with the transactions.',
+                resolvedAt: null,
+            },
+        ]);
+
+        // The role is known on the first frame, as in the viewer's case below.
+        const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+        queryClient.setQueryData(['ledgers'], editorLedgers);
+
+        renderPanelRouted(queryClient);
+
+        expect(await screen.findByText(/3 of 175 disagree/i)).toBeTruthy();
+        const action = screen.getByRole('link', { name: /check and repair/i });
+        expect(action.getAttribute('href')).toContain('check=true');
+    });
+
+    // General offers a viewer no Repair, since the server refuses one, so the finding
+    // does not offer one either: a viewer's link reads "Details" and leads to General
+    // without the check, as the Overview's Problems does.
+    it('offers a viewer no repair for an unresolved drift finding', async () => {
+        const viewerLedgers = [{ id: LEDGER_ID, name: 'Personal', role: 'viewer', currencyCode: 'USD' }];
+        vi.spyOn(apiModule, 'fetchVisibleLedgers').mockResolvedValue(viewerLedgers);
+        vi.spyOn(apiModule, 'fetchLedgerNotifications').mockResolvedValue({
+            subscribers: [],
+            monitorCoverage: {},
+            monitorsWatchingNothing: [],
+        });
+        vi.spyOn(apiModule, 'fetchLedgerEvents').mockResolvedValue([
+            {
+                id: 'e3',
+                occurredAt: '2026-08-26T09:00:00Z',
+                severity: 'warning',
+                topic: 'consistency',
+                eventKey: 'consistency.drift',
+                summary: 'realized_gains: 3 of 175 disagree with the transactions.',
+                resolvedAt: null,
+            },
+        ]);
+        // The ledger list is in the cache before the first frame, so the reader's role
+        // is known on every frame and the absence below is not that of a frame before it.
+        const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+        queryClient.setQueryData(['ledgers'], viewerLedgers);
+
+        renderPanelRouted(queryClient);
+
+        // The finding's row draws its link in the same frame as its summary.
+        expect(await screen.findByText(/3 of 175 disagree/i)).toBeTruthy();
+        expect(screen.queryByRole('link', { name: /check and repair/i })).toBeNull();
+        const details = screen.getByRole('link', { name: /^details$/i });
+        expect(details.getAttribute('href')).toBe(`/ledgers/${LEDGER_ID}/settings`);
     });
 
     it('does not offer to re-check drift that is already resolved', async () => {
@@ -524,10 +680,8 @@ describe('Ledger NotificationsPanel', () => {
     });
 
     it('warns that a message target cannot detect silence', async () => {
-        // The surviving half of 'switches mode and warns about a message-only target'.
-        // The mode-switching half tested a control that no longer exists; the warning is
-        // still the point — a ledger owner picking their own target can make exactly the
-        // same mistake an admin can.
+        // The warning is the point: a ledger owner picking their own target can make
+        // exactly the same mistake an admin can.
         vi.spyOn(apiModule, 'fetchLedgerNotifications').mockResolvedValue({
             subscribers: [
                 {
@@ -584,10 +738,10 @@ describe('Ledger NotificationsPanel', () => {
     });
 
     it('does not strike out the row that says the problem was fixed', async () => {
-        // The specific absurdity this replaces: line-through on the <li> propagates to
-        // descendants that cannot cancel it, so the green "resolved" badge announcing
-        // the fix was itself crossed out and the summary — the only thing worth
-        // reading — was the hardest text on the page to read.
+        // Line-through on the <li> propagates to descendants that cannot cancel it,
+        // so it would cross out the green "resolved" badge announcing the fix and
+        // make the summary — the only thing worth reading — the hardest text on the
+        // page to read.
         //
         // A class-name assertion, deliberately: jsdom loads no CSS, so
         // getComputedStyle().textDecorationLine cannot see a Tailwind utility. The
@@ -633,7 +787,7 @@ describe('Ledger NotificationsPanel', () => {
                 occurredAt: '2026-08-26T09:00:00Z',
                 severity: 'critical',
                 topic: 'scheduler',
-                eventKey: 'scheduler.job-disabled',
+                eventKey: 'quote-refresh.disabled',
                 summary:
                     'Scheduled quote-refresh has been switched OFF after 5 consecutive failures.',
                 resolvedAt: null,

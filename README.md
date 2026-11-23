@@ -73,14 +73,21 @@ Feature-complete across the original 10-phase build — PostgreSQL schema,
 Moneydance importer, .NET API + RLS, React SPA, bank-feed + file ingest,
 override/categorization, merge review, dashboard, investments, and single-container
 ops/packaging — plus **multi-user access**: per-ledger owner/editor/viewer roles,
-member + admin management, and invite links (ADR-0083).
+member + admin management, and invite links (ADR-0083). Since then: **budgets** as a
+mark per category, your target or your usual spending (ADR-0099); **Reports**, saved
+and pinned, as a chart or a table (ADR-0104); a generic **CSV import** with saved
+column layouts; and an **attention-first Overview** that lists what needs you, with
+rows to review accepted in place, report tiles and a projection of each account's cash
+over the weeks ahead (ADR-0109); and **benchmarks and currency conversion**: a ledger's
+Returns report can be drawn beside a fund's total return, and a ledger whose accounts
+span currencies shows its totals converted into its reporting currency at exchange
+rates fetched from Frankfurter, opt-in, or typed by hand, and every amount is shown,
+typed and stored at its own currency's places, 0, 2 or 3 (ADR-0114).
 
 The phase sequence is in [docs/architecture.md](docs/architecture.md) §8; open work
 (the ordered *Next* slices + the backlog) is in
-the open-work backlog. Larger items still open: **budgets and
-budget-vs-actual** (the biggest unbuilt feature), the generic **CSV ingest
-provider**, and broader **in-app reports** — today's reporting strength is via MCP
-rather than the UI.
+the open-work backlog. The larger item still open is
+**rules** that categorize feed rows as they sync.
 
 ## Install
 
@@ -121,8 +128,9 @@ you'll enrol changes the install, and finding that out afterwards is the wrong o
 4. **Open the `http://localhost:8080/setup/<token>` link it prints** at the end.
 5. **Enrol a passkey.** On a Linux box that means a security key in this machine, or
    tunnelling in from a laptop — see [Signing in](#signing-in).
-6. **Tick "Include a Demo ledger"** if you want something populated to look at, then
-   **save the recovery codes** (shown once) and the master key from the welcome screen.
+6. **Save the recovery codes** (shown once) and the master key from the welcome screen.
+   You land on the ledger hub: press **Demo ledger** if you want something populated to
+   look at first.
 
 ### Windows (Docker Desktop + WSL2)
 
@@ -186,8 +194,18 @@ including the first upgrade of an install from before 0.123.0, which has no
 `upgrade.sh` yet. Re-running the installer by hand also offers a wipe-and-reinstall. See
 [ADR-0075](docs/decisions/0075-linux-install-script.md).
 
+**Upgrading from the app:** an admin can also start the upgrade from **System → Upgrade**,
+on a Linux host with a cron daemon where your user can run docker without `sudo`. The
+tab checks for a newer release (when you switch the automatic check on, or press Check
+now; that is the only thing it sends to GitHub), takes a verified backup, and asks for a
+typed word and a passkey tap. A small updater on the host, run from your crontab, then runs
+`upgrade.sh`. See [operations](docs/operations.md#upgrading-from-the-app) and
+[ADR-0110](docs/decisions/0110-upgrade-from-the-app.md).
+
 **Undoing it entirely:** `cd ~/coffer && docker compose down -v` removes the
-containers and all three volumes — the database, the backups and the master key with them.
+containers and all four volumes — the database, the backups, the master key and the upgrade
+mailbox with them. It leaves the updater's cron line, which `app-upgrades.sh disable` or
+`crontab -e` removes.
 
 **Restoring an existing Coffer?** Install normally; the installer asks nothing extra
 and takes no key. Then pick **Restore from a backup** on the setup screen and paste
@@ -240,9 +258,9 @@ through:
 1. **Create or restore** (`/setup/<token>`) — confirms the token is valid
    and unconsumed, then offers "Set up a new install" or "Restore from a
    backup" (ADR-0061).
-2. **Account form** — username, display name, passkey label, and one
-   optional box: **Include a Demo ledger** (ADR-0088). No ledger is
-   created unless it's ticked; there is no ledger picker.
+2. **Account form** — username, display name and passkey label. Setup
+   asks nothing about ledgers and creates none (ADR-0088, as amended by
+   [ADR-0115](docs/decisions/0115-the-demo-is-generated-imported-and-seeded-from-the-hub.md)).
 3. **Passkey registration** — WebAuthn ceremony against the operator's
    authenticator, with origin pinned to `Api.Fido2.Origins` (see
    `appsettings.Development.json` for the dev allow-list).
@@ -250,9 +268,9 @@ through:
    ceremony gates "Continue" on an explicit acknowledgement
    checkbox.
 5. **Continue** — drops the user at the ledger hub (`/`), which lists the
-   ledgers they can access and offers **New ledger** / **Import from
-   Moneydance**. With no Demo ledger that list is empty, which is the
-   expected first-run state.
+   ledgers they can access and offers **Import from Moneydance**, **Demo
+   ledger** and **New ledger**. On first run that list is empty, which is
+   the expected state.
 
 The token is single-use and time-boxed (30-minute default, configurable
 via `Api.Bootstrap.TokenLifetime`). A consumed or expired token returns
@@ -266,10 +284,14 @@ Subsequent API starts no-op the bootstrap step — if any
 DB-superuser path: truncate `webauthn_credentials`, restart the API,
 register a new passkey via a fresh ceremony.
 
-**About that Demo box:** it seeds a worked example through the normal Moneydance
-import pipeline, and it brings its own categories. A ledger you create empty later
-(the hub's **New ledger** dialog) seeds a starter category tree instead
-([ADR-0071](docs/decisions/0071-install-provisioning-ui-import-authed-restore.md) D5).
+**About the Demo:** the hub's **Demo ledger** button adds a worked example: five years
+of made-up household history, ending on the day you add it, generated by Coffer and
+brought in through the normal Moneydance import pipeline. It builds in the background,
+and its row in the hub shows how far it has got. Each press adds another ledger ("Demo",
+"Demo 2", …), so delete one when you are done with it. It brings its own categories. A
+ledger you create empty (the hub's **New ledger** dialog) seeds a starter category tree
+instead ([ADR-0071](docs/decisions/0071-install-provisioning-ui-import-authed-restore.md)
+D5). See [ADR-0115](docs/decisions/0115-the-demo-is-generated-imported-and-seeded-from-the-hub.md).
 
 ## Signing in
 
@@ -505,32 +527,30 @@ Resetting the database during early development is in
 
 ## Moneydance import
 
-**Use the in-app import wizard** (ADR-0071) — Ledgers → Import. Every UI import
-creates a new ledger, and it's the only path that exists in the published container.
+**Use the in-app import wizard** (ADR-0071) — Ledgers → Import. It is the only import
+path: every import creates a new ledger, owned by the person who ran it. The name you
+give it is only a label; an existing ledger with the same name is never written to.
 
 An export is held in memory while it is read, at about six and a half times its file
 size, so the server reads one at a time across all users, refuses an export it does not
 have the memory for (raise `COFFER_API_MEM_LIMIT`), and accepts up to 512 MB
 (`COFFER_IMPORT_MAX_UPLOAD_MB` in `.env` to change it).
 
-The CLI below is **not in the image**: the Dockerfile publishes `Api.csproj` only, so
-`coffer-import-moneydance` requires a source checkout and the .NET SDK. It exists for
-bulk work and the two read-only fidelity diagnostics, not as the normal route. It
-connects as `coffer_service` (BYPASSRLS, for cross-ledger access):
+An import seeds its new ledger once, in the transaction that creates it (ADR-0052).
+A transaction the importer cannot map is dropped and fails the import's
+`no-dropped-transactions` check. The ledger is created either way, and the wizard's
+last step lists each failed check in plain words; the dropped transactions are listed first, by date,
+security, shares and reason, to be fixed in Moneydance and imported again into a new
+ledger. The list stops at a fixed number of rows and says how many more were not
+listed. It is shown on that screen only; the server log also records a warning naming
+each failed check.
 
-```powershell
-$env:COFFER_DB_CONNECTION = "Host=localhost;Port=5432;Database=coffer;Username=coffer_service;Password=$(Get-Content -Raw secrets/coffer_service_password)"
-
-# A target ledger is required (ADR-0088 — there is no implicit default).
-# --ledger-name targets an existing ledger or creates it; --ledger-id <UUID>
-# imports into an existing one. --dry-run parses + validates without writing.
-dotnet run --project src/Importer.Moneydance.Cli -- import path/to/export.json --ledger-name "Personal"
-```
-
-Import is idempotent and fails loudly on any dropped transaction. Two read-only
-diagnostics — `audit` (which MD fields are dropped or lossy) and `reconcile` (what a
-re-import would drop, run against an ephemeral rolled-back ledger) — are documented
-in [docs/moneydance-import-fidelity.md](docs/moneydance-import-fidelity.md).
+Two read-only diagnostics remain as a command-line tool, `coffer-import-moneydance`:
+`audit` (which MD fields are dropped or lossy) and `reconcile` (what an import of an
+export would drop, run against an ephemeral rolled-back ledger). Neither writes to a
+ledger. The tool is **not in the image** (the Dockerfile publishes `Api.csproj` only),
+so it needs a source checkout and the .NET SDK. Both are documented in
+[docs/moneydance-import-fidelity.md](docs/moneydance-import-fidelity.md).
 
 ## MCP — AI access to your ledger (ADR-0063)
 
@@ -559,33 +579,44 @@ explains.
    Coffer (RLS-scoped to you), never the model. Read tools can't change anything;
    the write tools (below) stay off unless you deliberately enable them.
 
-**Read tools (19).** Discovery: `list_ledgers`, `list_accounts`, `list_securities`,
+**Read tools (24).** Discovery: `list_ledgers`, `list_accounts`, `list_securities`,
 `list_tags`. Transactions: `transaction_summary` (income/expense/net by
 category·account·payee, over time, with category-tree rollup), `list_transactions`
-(line drill — filter by account/category/payee/amount/text, sort, page), `net_worth`,
-`net_worth_history`. Investments: `holdings_snapshot`, `account_portfolio`,
+(line drill — filter by account/category/payee/amount/text, sort, page; each line's
+memo and tags as that register shows them, its own leg id, and the currency its
+amount is in),
+`net_worth`, `net_worth_history`.
+Budgets: `budget_progress`. Investments: `holdings_snapshot`, `account_portfolio`,
 `allocation` (by asset class / region / vehicle, with multi-asset look-through),
-`investment_income`, `realized_gains` (FIFO), `returns` (money-weighted IRR),
-`activity`, `price_history`, `find_in_kind_transfer_candidates`. Reminders:
-`list_upcoming_reminders`. All read-only, USD.
+`investment_income`, `realized_gains` (FIFO), `returns` (money-weighted IRR and
+time-weighted, with the window's gain), `returns_cost_estimate`, `returns_series` (the index, gain and money-weighted
+return at each month, quarter or year end, with a reason beside every null, and with
+`benchmark` one of the ledger's benchmark funds' total return beside it), `activity`,
+`price_history`, `find_in_kind_transfer_candidates`. Reminders:
+`list_upcoming_reminders`. CSV import layouts: `list_csv_mappings`,
+`get_csv_mapping`, `validate_csv_mapping`. All read-only. A figure for one account is in
+that account's currency; a figure that combines accounts is converted into the ledger's
+reporting currency and named by `currencyCode`, or is null with `rate_unavailable` naming
+the missing rate (ADR-0114).
 
 There is deliberately no general write API here: nothing over MCP can create or delete
 a transaction, or change an amount or a date. The write surface is taxonomy and
 metadata cleanup only.
 
-**AI-assisted writes (21 tools, ADR-0081, off by default).** Categories:
+**AI-assisted writes (23 tools, ADR-0081, off by default).** Categories:
 `create_category`, `rename_category`, `reparent_category`, `merge_category`,
 `delete_category`, `set_transaction_category`, `set_split_posting_category`. Tags:
-`set_transaction_tags` (bulk), `rename_tag`, `merge_tags`, `delete_tag`,
-`cleanup_unused_tags`. Securities: `update_security`, `merge_securities`,
+`set_transaction_tags` (bulk; needs the register `accountId`, because each side of a
+transaction carries its own tags), `rename_tag`, `merge_tags`, `delete_tag`,
+`cleanup_unused_tags`. CSV import layouts: `save_csv_mapping`, `delete_csv_mapping`. Securities: `update_security`, `merge_securities`,
 `set_security_classification`, `set_security_components`. Prices: `add_price`,
 `update_price`, `delete_price`. Accounts: `set_account_taxstatus`. Investments:
 `convert_in_kind_transfer`. They stay off behind two keys: a deployment-wide **AI-writes**
 switch (a hot kill-switch — turn it off and it takes effect immediately, no restart)
 AND a `coffer.write` grant an admin opts a token/client into. A `coffer.read` token
 can never write. Every write is audited under **System → MCP → AI write activity**
-(kept 180 days); the OAuth clients that can connect are listed, write-grantable, and
-revocable there too.
+(kept 180 days by default, `Api:AuditRetentionDays`); the OAuth clients that can
+connect are listed, write-grantable, and revocable there too.
 
 Manage your own granted access under **Account → Security → Connected apps**: the MCP
 tokens you made and the apps you signed in to, each revocable any time. An app's
@@ -599,10 +630,15 @@ Coffer/
 ├── data/                            Local Moneydance export (gitignored)
 ├── db/
 │   ├── migrations/                  numbered SQL (001…), applied at API startup via DbUp
-│   └── test/                        Manual verification scripts (NOT auto-run)
+│   └── test/                        SQL verification scripts, run by CI
 ├── src/
 │   ├── Api/                         .NET 10 web API — layered: Db/ (data), Auth/ (security), Endpoints/+Contracts/+Errors/ (API surface)
-│   ├── Importer.Moneydance/         .NET 10 console app — Moneydance JSON → Coffer Postgres
+│   ├── Coffer.Domain.Annotations/   The memo-and-tags rule and its planner, shared by the API and the importer
+│   ├── Coffer.Domain.Investment/    Investment postings, actions and returns, shared by the API and the importer
+│   ├── Coffer.Domain.Money/         Each currency's ISO 4217 minor units, read from the table the SPA imports, shared by the API and the importer
+│   ├── Coffer.Domain.Reminders/     Recurrence expansion and next-due, shared by the API and the importer
+│   ├── Importer.Moneydance/         The Moneydance mapping and import pipeline, run by the API's import wizard
+│   ├── Importer.Moneydance.Cli/     Read-only `audit` and `reconcile` diagnostics for a Moneydance export
 │   └── Web/                         Vite + React SPA — login, registers, settings, etc.
 ├── tests/
 │   ├── Api.Tests/                   xUnit (unit + integration via Testcontainers)

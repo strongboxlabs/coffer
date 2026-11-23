@@ -50,6 +50,13 @@ export function monthLabel(year: number, month: number): string {
     return MONTH_LABEL_FORMAT.format(new Date(Date.UTC(year, month - 1, 1)));
 }
 
+const MONTH_SHORT_FORMAT = new Intl.DateTimeFormat(undefined, { month: 'short', timeZone: 'UTC' });
+
+/** "Jun" for a 1-based month: the month alone, where the year is plain from context. */
+export function monthShortLabel(year: number, month: number): string {
+    return MONTH_SHORT_FORMAT.format(new Date(Date.UTC(year, month - 1, 1)));
+}
+
 /** Step a {year, month} (1-based) by `delta` months, wrapping the year. */
 export function addMonths(
     year: number, month: number, delta: number,

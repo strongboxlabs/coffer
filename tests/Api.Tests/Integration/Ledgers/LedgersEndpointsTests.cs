@@ -19,13 +19,11 @@ namespace Coffer.Api.Tests.Integration.Ledgers;
 /// another's ledgers.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class LedgersEndpointsTests
+public sealed class LedgersEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public LedgersEndpointsTests(PostgresFixture fixture)
+    public LedgersEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     /// <summary>
@@ -58,10 +56,10 @@ public sealed class LedgersEndpointsTests
     [Fact]
     public async Task Get_returns_only_ledgers_the_authenticated_user_can_see()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var aliceClient = await AuthedClientAsync(factory, alice);
 
         var response = await aliceClient.GetAsync("/api/ledgers");
@@ -80,8 +78,8 @@ public sealed class LedgersEndpointsTests
         // request lands on the system user and the new ledger appears
         // in the response. Pins the dev-auth fallback path so a future
         // refactor can't silently break the local-dev experience.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();   // dev-auth → system user
 
         var response = await client.GetAsync("/api/ledgers");
@@ -99,8 +97,8 @@ public sealed class LedgersEndpointsTests
         // endpoint returns 401 — proving the gate is what keeps dev-auth
         // out of production. Adding the synthetic ledger first so the
         // env-var setup path is the same as the comparison test above.
-        await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
         {
             HandleCookies = false,
@@ -113,8 +111,8 @@ public sealed class LedgersEndpointsTests
     [Fact]
     public async Task Post_creates_a_ledger_with_the_caller_as_owner_and_returns_201()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, alice);
 
         var name = $"family-{Guid.NewGuid():N}";
@@ -128,7 +126,7 @@ public sealed class LedgersEndpointsTests
         Assert.Equal("owner", created.Role);
 
         // Owner grant landed for the authenticated user.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var role = await db.UserLedgerGrants.AsNoTracking()
             .Where(g => g.LedgerId == created.Id && g.UserId == alice.UserId)
             .Select(g => g.Role)
@@ -141,8 +139,8 @@ public sealed class LedgersEndpointsTests
     [InlineData("   ")]
     public async Task Post_rejects_empty_name_with_422_and_code(string name)
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, alice);
 
         var response = await client.PostAsJsonAsync(
@@ -157,8 +155,8 @@ public sealed class LedgersEndpointsTests
     [Fact]
     public async Task GetLastOpened_returns_204_when_unset()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, alice);
 
         var response = await client.GetAsync("/api/ledgers/me/last-opened");
@@ -168,8 +166,8 @@ public sealed class LedgersEndpointsTests
     [Fact]
     public async Task PutLastOpened_then_GetLastOpened_round_trips_the_value()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, alice);
 
         var put = await client.PutAsync(
@@ -186,9 +184,9 @@ public sealed class LedgersEndpointsTests
     [Fact]
     public async Task PutLastOpened_returns_422_with_code_when_user_has_no_grant_on_the_ledger()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, alice);
 
         // Try to mark Bob's ledger as Alice's last-opened.
@@ -204,14 +202,14 @@ public sealed class LedgersEndpointsTests
     [Fact]
     public async Task GetLastOpened_clears_stale_value_when_grant_revoked_since_last_login()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, alice);
 
         // Set last-opened, then revoke Alice's grant directly so the
         // stored id becomes stale.
         await client.PutAsync($"/api/ledgers/me/last-opened/{alice.LedgerId}", content: null);
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             // The synthetic ledger granted owner to both alice and the
             // system user; revoking alice still leaves system as owner
@@ -226,7 +224,7 @@ public sealed class LedgersEndpointsTests
 
         // The stored value got cleared so a subsequent read doesn't pay
         // the same lookup.
-        await using var db2 = _fixture.NewDbContext();
+        await using var db2 = Db.NewDbContext();
         var stored = await db2.Users.AsNoTracking()
             .Where(u => u.Id == alice.UserId)
             .Select(u => u.LastOpenedLedgerId)

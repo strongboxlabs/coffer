@@ -18,11 +18,11 @@ export const RESTORE_CONFIRM_PHRASE = 'yes i agree';
  * React Query key for the stored-backup list.
  *
  * Exported so every screen that shows the list, and every mutation that
- * changes it, name the SAME cache entry. They did not: the backups panel
- * invalidated `admin-backups` while the restore card read `backups`, so
- * creating or deleting a backup left the restore picker showing a list that
- * was no longer true — offering an artifact that had just been deleted, or
- * hiding the picker entirely after the first backup was made.
+ * changes it, name the SAME cache entry. A panel invalidating one key while
+ * the restore card reads another would leave the restore picker showing a list
+ * that is no longer true after a backup is created or deleted — offering an
+ * artifact that has just been deleted, or hiding the picker entirely after the
+ * first backup is made.
  */
 export const BACKUPS_QUERY_KEY = ['admin-backups'] as const;
 
@@ -46,7 +46,7 @@ export function fetchBackupRun(runId: string): Promise<BackupRun> {
 }
 
 /** How often a running backup is polled, and how long to wait before giving up. A
- *  backup of a large ledger takes minutes; the cap is a backstop for a server that
+ *  backup's duration grows with the ledger; the cap is a backstop for a server that
  *  stops answering, not a deadline for the backup. */
 const BACKUP_POLL_MS = 2000;
 const BACKUP_POLL_GIVE_UP_MS = 60 * 60 * 1000;
@@ -89,7 +89,7 @@ export async function createBackup(
 }
 
 /** `DELETE /api/admin/backups/{id}` — idempotent. Needs a passkey tap: deleting
- *  backups is how a stolen session would destroy the recovery points (audit, M2). */
+ *  backups is how a stolen session would destroy the recovery points (ADR-0105 D1). */
 export async function deleteBackup(id: string): Promise<void> {
     const headers = await stepUpHeaders('backup-delete');
     return request<void>(`/api/admin/backups/${encodeURIComponent(id)}`, { method: 'DELETE', headers });
@@ -137,7 +137,7 @@ export function unpinBackup(id: string): Promise<void> {
 
 /** `PUT /api/admin/backups/passphrase` — set / rotate the backup passphrase
  *  (sealed under the master KEK server-side). 422 `backup-passphrase-invalid`
- *  when shorter than the server minimum. Needs a passkey tap (audit, M2):
+ *  when shorter than the server minimum. Needs a passkey tap (ADR-0105 D1):
  *  otherwise setting a known passphrase and downloading a backup got round the
  *  tap that guards revealing it. */
 export async function setBackupPassphrase(passphrase: string): Promise<void> {
@@ -220,7 +220,7 @@ export async function restoreBackup(
     const sourceKey = sourceMasterKeyBase64?.trim();
     if (sourceKey) form.append('sourceMasterKeyBase64', sourceKey);
     // A restore replaces everything and can install a master key: a passkey tap
-    // first (security audit, M2), before the upload rather than after a refusal.
+    // first (ADR-0105 D1), before the upload rather than after a refusal.
     const headers = await stepUpHeaders('restore');
     return requestMultipart<RestoreAccepted>('/api/admin/backups/restore', form, undefined, headers);
 }

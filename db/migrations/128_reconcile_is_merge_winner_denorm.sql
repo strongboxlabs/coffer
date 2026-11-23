@@ -12,14 +12,14 @@
 -- (TransactionsRepository.PatchAsync) sets loser is_merged_into and winner
 -- is_merge_winner atomically, so the flag stays correct going forward.
 --
--- The ADR-0052 D4 audit found rows on the Default ledger that ARE merge
--- targets (a loser points at them) yet carry is_merge_winner=false. They
--- were merged under the PRE-"merge-direction-invert" code (editor was the
+-- The class (ADR-0052 D4): a row can be a merge target (a
+-- loser points at it) yet carry is_merge_winner=false if it was merged
+-- under the PRE-"merge-direction-invert" code (editor was the
 -- winner, candidate the loser -- the reverse of today), which left the flag
--- on the wrong side; mig 107's backfill could not catch them because the
--- surviving rows were created after mig 107 ran. This is one-time historical
--- residue, not a recurring bug. is_merged_into (the truth) is correct, so
--- balances and the register were never affected -- only the overlay icon.
+-- on the wrong side; mig 107's backfill does not reach rows merged after it
+-- ran. The active merge path cannot produce the state, so it is residue, not a
+-- recurring bug. is_merged_into (the truth) is correct, so balances and the
+-- register are unaffected -- only the overlay icon.
 --
 -- This reconcile sets the missing TRUEs (false-negatives) only. It does NOT
 -- clear TRUEs that lack a pointer: mig 107 defines the flag as monotonic

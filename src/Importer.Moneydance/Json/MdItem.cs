@@ -20,21 +20,19 @@ namespace Coffer.Importer.Moneydance.Json;
 /// </para>
 /// <para>
 /// <see cref="Fields"/> holds JsonElements that are VIEWS into the export's single
-/// parsed <see cref="JsonDocument"/> — never <c>Clone()</c>s of it. Clone is what
-/// caused the OOM this design replaced: it allocates an independent
-/// <c>JsonDocument</c> (object + byte buffer + metadata db) per field, and a real
-/// full-sized export has a seven-figure field count. Not cloning is the whole fix;
-/// the dictionary itself was never the problem.
+/// parsed <see cref="JsonDocument"/> — never <c>Clone()</c>s of it. Clone allocates
+/// an independent <c>JsonDocument</c> (object + byte buffer + metadata db) per
+/// field, and a full-sized export's field count is every field of every item, so
+/// cloning runs the import out of memory. Not cloning is the whole fix; the
+/// dictionary itself is not the problem.
 /// </para>
 /// <para>
-/// The dictionary IS load-bearing for speed, and this was measured the hard way.
-/// An earlier attempt dropped it and read fields straight off the item's element
-/// via <c>TryGetProperty</c>. That is a LINEAR SCAN of the item's properties, and
-/// a transaction with many splits carries a hundred-plus fields which
-/// <c>MdTxn.ExtractSplits</c> then probes one at a time — quadratic per item. It
-/// cut memory, but made the same real import roughly fifteen times slower.
-/// O(1) lookup is worth the dictionary's memory, which adds under a third to the
-/// scan-only peak.
+/// The dictionary IS load-bearing for speed. Reading fields straight off the
+/// item's element via <c>TryGetProperty</c> is a LINEAR SCAN of the item's
+/// properties, and a transaction carries a set of fields per split, which
+/// <c>MdTxn.ExtractSplits</c> then probes one at a time — quadratic per item. That
+/// cuts memory, but makes the import's cost grow with the square of a
+/// transaction's split count. O(1) lookup is worth the dictionary's memory.
 /// </para>
 /// <para>
 /// CONSEQUENCE: an item is only readable while the owning <see cref="MdExport"/>
@@ -77,7 +75,8 @@ public sealed record MdItem(
     /// <summary>
     /// Parse a long from a string-encoded number. Returns <c>null</c> if the
     /// key is missing, empty, or non-numeric. Moneydance amounts are always
-    /// in minor units (cents), so this returns the raw integer.
+    /// in minor units, at their currency's own <c>dec</c> places, so this
+    /// returns the raw integer; <c>MdAmounts.ToMoney</c> scales it.
     /// </summary>
     public long? GetLong(string key)
     {
@@ -130,13 +129,15 @@ public sealed record MdItem(
     /// Taking the UTC date is safe rather than a guess: MD stamps these at local
     /// NOON (a file written at a negative UTC offset lands in the UTC afternoon),
     /// which is exactly the convention that keeps the calendar day stable under
-    /// conversion. On a real export, every account carrying BOTH fields agrees
-    /// between this UTC date and <c>date_created</c> — and they still agree at
-    /// every offset in the verified band, which is lopsided: it reaches far west
-    /// of UTC but only slightly east of it (the same band
-    /// <c>MdAcctTests</c> and migration 196 record). Within that band no local
-    /// timezone is needed to land on the right day; a file written well east of
-    /// UTC is outside what was verified.
+    /// conversion. Local noon at offset <c>h</c> is <c>12:00 - h</c> UTC, which
+    /// stays on the same calendar day for every offset after UTC-12 up to and
+    /// including UTC+12 — the band migration 196 states. Within it no local
+    /// timezone is needed to land on the right day, so where an account carries
+    /// BOTH fields for the same local day, this UTC date and <c>date_created</c>
+    /// agree. Outside it the UTC date is off by one: a day late at UTC-12, a day
+    /// early at UTC+13 / UTC+14.
+    /// <c>MdAcctTests</c> pins two points inside the band (UTC-5 and its
+    /// daylight-time UTC-4), not its edges.
     /// </remarks>
     public DateOnly? GetMdEpochDate(string key)
     {

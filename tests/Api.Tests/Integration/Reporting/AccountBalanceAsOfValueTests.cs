@@ -22,18 +22,19 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// <c>&lt;=</c> boundary shows.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class AccountBalanceAsOfValueTests
+public sealed class AccountBalanceAsOfValueTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AccountBalanceAsOfValueTests(PostgresFixture fixture) => _fixture = fixture;
+    public AccountBalanceAsOfValueTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Utc(int y, int m, int d, int h = 0) =>
         new(y, m, d, h, 0, 0, DateTimeKind.Utc);
 
     private async Task<decimal> BalanceAsync(Guid ledgerId, Guid accountId, DateTime asOf)
     {
-        await using var conn = _fixture.OpenServiceConnection();
+        await using var conn = Db.OpenServiceConnection();
         return await conn.ExecuteScalarAsync<decimal>(
             """
             SELECT balance
@@ -46,7 +47,7 @@ public sealed class AccountBalanceAsOfValueTests
     [Fact]
     public async Task Reflects_only_headers_up_to_the_instant()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var other = await ledger.AddBankAccountAsync("Savings");
 
@@ -73,7 +74,7 @@ public sealed class AccountBalanceAsOfValueTests
     [Fact]
     public async Task Takes_the_last_header_when_two_share_an_instant()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var other = await ledger.AddBankAccountAsync("Savings");
 
@@ -88,13 +89,13 @@ public sealed class AccountBalanceAsOfValueTests
     /// <summary>
     /// A posted-at override that moves a header BACKWARDS. The ordering must run on
     /// the effective date, not the raw <c>posted_at</c> — and this is the case that
-    /// disproved an attempt to denormalise that ordering, because the override moves
-    /// the date without moving the row's <c>seq</c>.
+    /// rules out denormalising that ordering, because the override moves the date
+    /// without moving the row's <c>seq</c>.
     /// </summary>
     [Fact]
     public async Task Honors_a_posted_at_override_that_moves_a_header_earlier()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var other = await ledger.AddBankAccountAsync("Savings");
 
@@ -115,7 +116,7 @@ public sealed class AccountBalanceAsOfValueTests
     [Fact]
     public async Task Falls_back_to_the_opening_balance_for_an_untouched_account()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var untouched = await ledger.AddBankAccountAsync("Nothing Here", openingBalance: 250m);
 
         // No headers at all: every instant reports the opening balance, and the

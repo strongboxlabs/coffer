@@ -71,11 +71,10 @@ public sealed class SyncConnectionLockTests
         // must return null. This is the actual race the SPA's
         // rapid-Map-click scenario triggers.
         //
-        // History: this test was originally flaky on CI — a
-        // TaskCompletionSource start signal plus a short hold
-        // (10 ms) wasn't enough to guarantee contention on a
-        // constrained 2-core runner. The winner could finish +
-        // release its slot before some of the other 19 tasks had
+        // A TaskCompletionSource start signal plus a short hold
+        // (10 ms) is not enough to guarantee contention on a
+        // constrained 2-core runner: the winner can finish +
+        // release its slot before some of the other 19 tasks have
         // even been scheduled, producing 2+ winners. A
         // CountdownEvent barrier solves it: every task signals it
         // has reached the contention point THEN waits for the

@@ -16,16 +16,17 @@ namespace Coffer.Api.Tests.Integration.Crypto;
 /// (FU-078): a 503 that says to retry, not a 500 — and nothing saved under the retired key.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class MasterKeyRotatingResponseTests
+public sealed class MasterKeyRotatingResponseTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public MasterKeyRotatingResponseTests(PostgresFixture fixture) => _fixture = fixture;
+    public MasterKeyRotatingResponseTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     [Fact]
     public async Task Saving_a_secret_after_a_rotation_committed_is_a_503_to_retry()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
         factory.Services.GetRequiredService<MasterKeyWriteGate>().Retire();   // as a committed rotation leaves it
 

@@ -8,10 +8,10 @@ namespace Coffer.Api.Configuration;
 /// CIDR ranges; empty means <see cref="Defaults"/>.
 /// </summary>
 /// <remarks>
-/// <para>Forwarded headers used to be believed from any peer, and <c>X-Forwarded-For</c> not
-/// at all. So behind a proxy every client had the proxy's address, every rate limit was one
-/// bucket shared by everyone — one client could hold the recovery-code login at 429 for all
-/// of them, or use up the client-registration cap — and on a published port anyone could
+/// <para>Forwarded headers believed from any peer, with <c>X-Forwarded-For</c> ignored,
+/// give every client behind a proxy the proxy's address, so every rate limit is one
+/// bucket shared by everyone — one client can hold the recovery-code login at 429 for all
+/// of them, or use up the client-registration cap — and on a published port anyone can
 /// set the scheme and host the app builds its own URLs from.</para>
 /// <para>The default trusts loopback and the private ranges, which is where a reverse proxy
 /// on the host (through Docker's bridge), a cloudflared container or a proxy on the LAN

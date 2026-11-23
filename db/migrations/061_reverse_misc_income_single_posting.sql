@@ -5,24 +5,21 @@
 --
 -- Background
 -- ----------
--- Migrations 058 + 059 and the importer's Path B fan-out were predicated
--- on the belief that the "Change in Market Value …" multi-posting
--- MiscInc events found on a real ledger were a Moneydance automated-import
--- artifact (a brokerage-statement import path), and that user-creatable
--- MiscInc was always single-posting.
+-- Migrations 058 + 059 and the importer's Path B fan-out treat
+-- multi-posting MiscInc as an import artifact and force every MiscInc
+-- to a single posting.
 --
--- Closer inspection of MD's raw JSON data (see docs/moneydance-investment-actions.md)
--- showed the opposite: those events are the standard MD `inc` txn shape
--- with the OPTIONAL `fee` split present — i.e. `[sec, fee, inc]`,
--- exactly what a user would emit from MD's UI by entering a MiscInc
--- transaction with a fee field filled in. The events being
--- net-zero on both legs was the user's bookkeeping pattern (same
--- Adjustment category on both sides), NOT a structural anomaly.
+-- In MD's raw JSON format (see docs/moneydance-investment-actions.md)
+-- a multi-posting MiscInc is the standard MD `inc` txn shape with the
+-- OPTIONAL `fee` split present — i.e. `[sec, fee, inc]`, exactly what
+-- a user emits from MD's UI by entering a MiscInc transaction with a
+-- fee field filled in. One that nets to zero on both legs is a
+-- bookkeeping choice (the same category on both sides), NOT a
+-- structural anomaly.
 --
--- Conclusion: multi-posting MiscInc is a legitimate user-creatable
--- MD shape. The "single-posting invariant" we built around 058/059
--- forced unnecessary fan-out and made the Ledger model less
--- expressive than MD's.
+-- So multi-posting MiscInc is a legitimate user-creatable MD shape,
+-- and the single-posting invariant of 058/059 forces an unnecessary
+-- fan-out that makes the Ledger model less expressive than MD's.
 --
 -- This migration:
 --   1. Drops the trigger and function from 059 (the invariant goes away).

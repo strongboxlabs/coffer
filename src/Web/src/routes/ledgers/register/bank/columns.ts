@@ -37,7 +37,7 @@ export const BANK_REGISTER_COLS = BANK_COLS;
 
 /**
  * True when this bank-register row's canonical owner is an investment
- * header (a Buy / Sell / Div / Misc cash leg landing in a bank
+ * header (a Buy / Sell / Dividend / Misc cash leg landing in a bank
  * account — read-only here; edit + delete belong on the brokerage
  * register).
  *

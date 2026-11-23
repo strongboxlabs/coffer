@@ -22,7 +22,7 @@ date until the user manually adds prices.
 The fix is a **quote-provider family** — a parallel to ADR-0031's
 ingest providers but for price data instead of transactions.
 
-### Design tension surfaced during the design discussion
+### Design tension: a shared provider base
 
 A shared "Layer 1" provider base (common `IProvider` interface,
 unified `provider_connections` + `provider_runs` tables, capability

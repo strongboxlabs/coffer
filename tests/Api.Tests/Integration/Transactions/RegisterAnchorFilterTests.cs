@@ -11,17 +11,18 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// ADR-0076: the focus/anchor (starting_at) path must respect the active
 /// filter. A focused row the filter excludes must NOT be pinned to the top of
 /// the register — the backend resolves the anchor through the same
-/// register_filtered_entries primitive, so the register never shows a row that
-/// doesn't match the filter (the confusing case found in dev: a scheduled
+/// filter (RegisterQuery.Filtered), so the register never shows a row that
+/// doesn't match the filter (the confusing case: a scheduled
 /// credit-card payment row pinned under a groceries filter). A non-matching
 /// anchor falls through to the most-recent FILTERED page (not an empty one).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class RegisterAnchorFilterTests
+public sealed class RegisterAnchorFilterTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public RegisterAnchorFilterTests(PostgresFixture fixture) => _fixture = fixture;
+    public RegisterAnchorFilterTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Day(int d) => new(2026, 1, d, 12, 0, 0, DateTimeKind.Utc);
 
@@ -39,7 +40,7 @@ public sealed class RegisterAnchorFilterTests
     [Fact]
     public async Task Anchor_the_filter_excludes_is_not_pinned()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var acct = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddBankAccountAsync("groceries");
         var rent = await ledger.AddBankAccountAsync("rent");
@@ -51,7 +52,7 @@ public sealed class RegisterAnchorFilterTests
         var (rentLeg, _) = await ledger.AddTransactionPairAsync(acct.Id, rent.Id, 30m, Day(20), "landlord");
         var rentHeader = await ledger.ResolveHeaderIdAsync(rentLeg);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Anchor on the RENT header, but filter to the GROCERIES counterparty.
@@ -70,7 +71,7 @@ public sealed class RegisterAnchorFilterTests
     [Fact]
     public async Task Anchor_the_filter_includes_is_still_pinned()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var acct = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddBankAccountAsync("groceries");
 
@@ -79,7 +80,7 @@ public sealed class RegisterAnchorFilterTests
         await ledger.AddTransactionPairAsync(acct.Id, groceries.Id, 30m, Day(12), "market-new");
         var midHeader = await ledger.ResolveHeaderIdAsync(midLeg);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Anchor on the MIDDLE grocery header under a groceries filter it

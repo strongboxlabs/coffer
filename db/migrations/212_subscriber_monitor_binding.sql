@@ -3,7 +3,7 @@
 -- A healthchecks.io check is a single ping URL. Its request body is stored for
 -- diagnostics but does NOT affect alerting, and it has no concept of severity: the
 -- only things it can express are "this one thing is alive" and "this one thing is
--- down". Verified against the current pinging API docs, not assumed.
+-- down" (per the healthchecks.io pinging API).
 --
 -- WHAT WAS WRONG. notification_subscribers had `topics` (a filter) and `min_severity`,
 -- and nothing saying WHICH recurring job a URL watches. Routing then delivered any

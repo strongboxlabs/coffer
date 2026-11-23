@@ -7,12 +7,11 @@ namespace Coffer.Api.Tests.Unit;
 /// the wall clock, elapsed time and timers alike.
 /// </summary>
 /// <remarks>
-/// <para>Until 2026-10-13 the API read the wall clock directly in 147 places, and a
-/// few of those reads were not even the process clock: <c>DateTime.UtcNow</c> inside
-/// an EF lambda is translated to the database's <c>now()</c>, so the session idle
-/// timeout compared a Postgres timestamp with a process one. No test could move
-/// "now", so a due date, an expiry or a month boundary was tested against whatever
-/// day the suite happened to run on, or not at all.</para>
+/// <para>A direct wall-clock read cannot be moved by a test, so a due date, an expiry
+/// or a month boundary behind one is tested against whatever day the suite runs on, or
+/// not at all. Some reads are not even the process clock: <c>DateTime.UtcNow</c> inside
+/// an EF lambda is translated to the database's <c>now()</c>, so a comparison against
+/// a value the process computed mixes a Postgres timestamp with a process one.</para>
 ///
 /// <para>Asserted against the SOURCE, like <see cref="Db.WriteTransactionBoundaryTests"/>:
 /// a stray clock read has no symptom until the day it matters, and the edit that adds

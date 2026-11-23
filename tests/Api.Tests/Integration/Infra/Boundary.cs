@@ -4,10 +4,10 @@ namespace Coffer.Api.Tests.Integration.Infra;
 /// One source of truth for the magnitudes a financial path has to survive.
 /// </summary>
 /// <remarks>
-/// Two production failures came from tests seeded with kiddie-pool data — three-figure
-/// money, two-digit share counts — which never approach the magnitudes where money math breaks. The code was wrong at
-/// scale and every test passed, because no test ever asked a question big enough to
-/// get the wrong answer.
+/// Tests seeded with kiddie-pool data — three-figure money, two-digit share counts —
+/// never approach the magnitudes where money math breaks. Code that is wrong at scale
+/// passes every such test, because no test asks a question big enough to get the
+/// wrong answer.
 /// <para>
 /// So a financial suite takes a <c>[Theory]</c> over <see cref="Positions"/> rather
 /// than a single <c>[Fact]</c> at a comfortable size. Every value here is tied to a
@@ -17,8 +17,9 @@ namespace Coffer.Api.Tests.Integration.Infra;
 /// <list type="bullet">
 ///   <item><c>txn_legs.quantity</c>, <c>txn_legs.unit_price</c> and
 ///     <c>lots.unit_cost</c> are <c>NUMERIC(25,12)</c> (migration 180, finishing 043).</item>
-///   <item>The <c>realized_gains</c> money columns are <c>NUMERIC(19,2)</c>
-///     (migration 182).</item>
+///   <item>The <c>realized_gains</c> money columns are <c>NUMERIC(20,3)</c>: 17 integer
+///     digits, as migration 182 set them, and the 3-place ceiling of migration 301
+///     (ADR-0114 D15). Each figure in them is held at its account currency's places.</item>
 ///   <item><c>security_prices.price</c> is <c>NUMERIC(19,4)</c> (migration 155).</item>
 /// </list>
 /// <para>
@@ -36,7 +37,13 @@ public static class Boundary
     /// <summary>Scale of <c>quantity</c> / <c>unit_price</c> / <c>unit_cost</c> (mig 180).</summary>
     public const int QuantityScale = 12;
 
-    /// <summary>Scale of the money columns (mig 182).</summary>
+    /// <summary>
+    /// The places of the fixtures' money: every <see cref="Position"/> is seeded on an
+    /// account in a 2-place currency (USD), so its money lands at 2 places. Not a column
+    /// scale: since migration 301 each figure is held at its own currency's minor units,
+    /// under a 3-place ceiling (ADR-0114 D15), and a test on a 0- or 3-place account
+    /// rounds at that currency's places instead (<c>RealizedGainsMinorUnitsTests</c>).
+    /// </summary>
     public const int MoneyScale = 2;
 
     /// <summary>Scale of <c>security_prices.price</c> (mig 155).</summary>
@@ -76,10 +83,9 @@ public static class Boundary
         /// <see cref="Boundary.LargeFractional"/>'s fractional count. A test can then assert two
         /// magnitudes agree without modelling the code under test at all.
         /// <para>
-        /// It is deliberately not a coincidence to be rediscovered: an earlier fixture
-        /// moved the price up a quarter in one case and a ninth in the other, which made
-        /// that invariance false and produced
-        /// a failing test that looked like an engine bug and was not.
+        /// It is deliberately not a coincidence: cases that moved the price by different
+        /// ratios (a quarter in one, a ninth in another) would make that invariance false
+        /// and produce a failing test that looks like an engine bug and is not.
         /// </para>
         /// </remarks>
         public decimal Ratio => SellPrice / BuyPrice;
@@ -113,11 +119,13 @@ public static class Boundary
         Proceeds: 2_000m);
 
     /// <summary>
-    /// A six-figure fractional share count — a full 12dp fractional quantity at a
-    /// seven-figure position. The basis does not divide evenly, so <c>unit_cost</c> carries all 12
-    /// decimals and <c>quantity × unit_cost</c> reaches 24dp / ~30 significant digits.
-    /// This is the shape that took down <c>realized_gains</c> in production before
-    /// migration 182 constrained the money columns.
+    /// A synthetic boundary position: a fractional share count with a full 12dp
+    /// quantity, sized so the basis does not divide evenly. <c>unit_cost</c> then carries
+    /// all 12 decimals and <c>quantity × unit_cost</c> reaches 24dp / ~30 significant
+    /// digits, past the .NET <c>decimal</c> ceiling. With unconstrained money columns
+    /// that product overflows when <c>realized_gains</c> is read; migration 182
+    /// constrained those columns to a scale so the read cannot overflow (2 places then,
+    /// the 3-place ceiling since migration 301).
     /// </summary>
     public static readonly Position LargeFractional = new(
         Name: "large-fractional",
@@ -163,8 +171,9 @@ public static class Boundary
     public const decimal MaxScaleQuantity = 9_999_999_999_999.999999999999m;
 
     /// <summary>
-    /// The largest value <c>NUMERIC(19,2)</c> holds: 17 integer digits and 2 decimals.
-    /// A money column maximum (mig 182).
+    /// The largest 2-place figure the money columns hold: 17 integer digits and 2
+    /// decimals, the 17 integer digits mig 182 set and mig 301 kept when it widened the
+    /// scale to 3 (ADR-0114 D15).
     /// </summary>
     public const decimal MaxMoney = 99_999_999_999_999_999.99m;
 
@@ -185,7 +194,7 @@ public static class Boundary
 
     /// <summary>
     /// A money figure large enough to exercise seven-figure-plus aggregation without
-    /// approaching <see cref="MaxMoney"/> — the magnitude a real portfolio reaches.
+    /// approaching <see cref="MaxMoney"/> — a magnitude a large portfolio can reach.
     /// </summary>
     public const decimal LargeMoney = 9_999_999_999.99m;
 }

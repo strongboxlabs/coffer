@@ -2,6 +2,7 @@ import type {
     InvestmentRow,
     LedgerInvestmentAction,
 } from '@/lib/types';
+import { roundToMinorUnits } from '@/lib/money';
 import { isLinkedAction } from './actionLayout';
 import { seedTransactedAt, type InvestmentTxnDraft } from './validation';
 
@@ -25,6 +26,10 @@ import { seedTransactedAt, type InvestmentTxnDraft } from './validation';
 export function hintToDraft(
     action: LedgerInvestmentAction | null,
     brokerageAccountId: string,
+    /** The brokerage's currency. Every amount the draft derives is rounded once at its
+     *  places, half away from zero, and a total within half a minor unit of zero counts
+     *  as none (ADR-0114 D15). Null rounds nothing. */
+    currency: string | null,
     header: {
         postedAt: string;
         /** Tax date from the row; blanked below when it is the posted day. */
@@ -70,16 +75,29 @@ export function hintToDraft(
     // funded by a transfer — where seeding from the cash leg would leave Amount
     // at 0 and block Accept. (The editor's price↔amount link still recomputes
     // if the user actually edits shares or price.)
+    //
+    // Each amount derived here is the app's own figure, so it is rounded once at the
+    // brokerage currency's places (ADR-0114 D15); the ingest carriers it reads stay as
+    // the file sent them. A total counts as present only when it is at least half a
+    // minor unit: when it rounds to a figure that is not zero.
+    const present = (total: number) => roundToMinorUnits(total, currency) !== 0;
     const sharesPrice =
         ingestShares != null && ingestUnitPrice != null
-            ? Number.parseFloat((ingestShares * ingestUnitPrice).toFixed(2))
+            ? roundToMinorUnits(ingestShares * ingestUnitPrice, currency)
             : null;
+    // The Fee field's prefill. The carrier is the file's figure as sent, finer than
+    // the currency when the file was, so it is rounded once here, at the brokerage's
+    // places, like every other money input (ADR-0114 D14, D15); a fee under half a
+    // minor unit is none there.
+    const feeAmount =
+        ingestFee != null && present(ingestFee) ? roundToMinorUnits(ingestFee, currency) : null;
     // The trade value implied by the REAL cash total (authoritative — it's the
     // actual settled amount, which can differ from shares × price by a cent or
     // two because the per-share price is rounded). The Amount field is the
     // principal/proceeds excluding the fee: a buy pays principal + fee, a sell
     // nets proceeds − fee, so reconstruct the fee-excluded value accordingly.
-    const feeAbs = ingestFee != null ? Math.abs(ingestFee) : 0;
+    // It takes the fee the draft carries, so Amount and Fee add back to the total.
+    const feeAbs = feeAmount != null ? Math.abs(feeAmount) : 0;
     const cashBasedAmount =
         action === 'buy' || action === 'buyx'
             ? Math.abs(cashAmount) - feeAbs
@@ -88,19 +106,19 @@ export function hintToDraft(
                 : null; // reinvest is cash-neutral — no meaningful cash total
     // The file's own total, where it stated one (mig 228). This is the answer
     // for a cash-neutral row: a REINVEST's cash leg is zero BY DESIGN — the
-    // dividend funds the purchase — so `cashBasedAmount` is null and the code
-    // below used to fall through to shares × price. That is precisely the
-    // recomputation this function's own comment warns about: it "would silently
-    // change the amount just by opening the row, and Accept would persist the
-    // wrong value". It did. A file stating a three-decimal unit count, a
-    // rounded two-decimal price and its own total opened one cent below that
-    // total, adrift of the settled row beside it.
+    // dividend funds the purchase — so `cashBasedAmount` is null, and falling
+    // through to shares × price is precisely the recomputation this function's
+    // own comment warns about: it "would silently change the amount just by
+    // opening the row, and Accept would persist the wrong value". A file
+    // stating a three-decimal unit count, a rounded two-decimal price and its
+    // own total would open one cent below that total, adrift of the settled
+    // row beside it.
     //
     // A fee, if any, is excluded the same way a buy's is: the Amount field is
     // the principal, and the fee rides in its own field.
     const ingestBasedAmount =
-        ingestAmount != null && Math.abs(ingestAmount) > 0.005
-            ? Number.parseFloat((Math.abs(ingestAmount) - feeAbs).toFixed(2))
+        ingestAmount != null && present(ingestAmount)
+            ? roundToMinorUnits(Math.abs(ingestAmount) - feeAbs, currency)
             : null;
 
     const amount =
@@ -109,8 +127,8 @@ export function hintToDraft(
             // the file's stated total, and only then shares × price — the last
             // is a RECONSTRUCTION and is kept purely so a row with neither still
             // opens with something rather than 0 (which would block Accept).
-            ? (cashBasedAmount != null && cashBasedAmount > 0.005
-                ? Number.parseFloat(cashBasedAmount.toFixed(2))
+            ? (cashBasedAmount != null && cashBasedAmount > 0 && present(cashBasedAmount)
+                ? roundToMinorUnits(cashBasedAmount, currency)
                 : ingestBasedAmount
                     ?? sharesPrice
                     ?? amountForAction(cashAmount, action))
@@ -152,7 +170,7 @@ export function hintToDraft(
         // the magnitude, not which expense category the user wants
         // it categorised under.
         feeAccountId: null,
-        feeAmount: ingestFee,
+        feeAmount,
         // A feed row can already carry tags — a rule, an earlier merge, or the
         // MCP bulk tool. Upgrading it to investment shape must not drop them.
         tags: header.tags ?? [],

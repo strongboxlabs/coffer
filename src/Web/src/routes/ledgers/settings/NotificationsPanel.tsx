@@ -1,20 +1,27 @@
-import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 import { Link } from '@tanstack/react-router';
 
 import {
     fetchLedgerNotificationProviders,
     fetchLedgerEvents,
     fetchLedgerNotifications,
-    fetchVisibleLedgers,
     createLedgerNotificationSubscriber,
     deleteLedgerNotificationSubscriber,
 } from '@/lib/api';
 import { formatLedgerDateTime } from '@/lib/dates';
 import type { NotificationProvider, NotificationSubscriber } from '@/lib/types';
 import { errorMessage } from '@/lib/errorMessage';
+import { useLedgerRole } from '@/lib/useLedgerRole';
 import { Button } from '@/components/ui/Button';
 import { Panel, PanelBody, PanelHead } from '@/components/ui/Panel';
+import { pendingChoiceProps, pendingTextProps } from '@/components/ui/pending';
+import { useRowRemovalFocus } from '@/components/ui/rowRemovalFocus';
+
+/** A field of the add form, which looks as a disabled one does while it is pending. */
+const ADD_FIELD = 'mt-1 w-full rounded border border-border bg-surface p-2 '
+    + 'disabled:cursor-not-allowed disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:opacity-50';
 
 /**
  * `NotificationTopics` (src/Api/Notifications/NotificationEvent.cs:40-51) in English.
@@ -33,6 +40,21 @@ const SUBJECT_WORDS: Record<string, string> = {
     consistency: 'Data consistency',
     scheduler: 'Scheduled jobs',
 };
+
+/**
+ * What a job monitor's run covers, where its name alone does not say. The name stays the
+ * API's key (a switch is stored and matched on it); this only adds the reading. The quote
+ * refresh is the one that needs it: exchange rates and benchmarks ride that job (ADR-0114
+ * D11), so its switch is the one that watches them, and nothing in "quote-refresh" says so.
+ */
+const MONITOR_COVERS: Record<string, string> = {
+    'quote-refresh': 'prices, exchange rates, benchmarks',
+};
+
+function monitorLabel(monitor: string): string {
+    const covers = MONITOR_COVERS[monitor];
+    return covers ? `${monitor} — ${covers}` : monitor;
+}
 
 /**
  * Per-ledger notifications (ADR-0096): adopt the deployment's targets, or name this
@@ -63,13 +85,23 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
     const invalidate = () => queryClient.invalidateQueries({ queryKey: key });
     // Where a ledger's events go is its owners' to change (FU-095); the API refuses an
     // editor, so the controls are not offered to one. Everyone with access still reads.
-    const ledgers = useQuery({ queryKey: ['ledgers'], queryFn: fetchVisibleLedgers });
-    const isOwner = ledgers.data?.find((l) => l.id === ledgerId)?.role === 'owner';
+    // A repair is a write, so the drift finding's fix is offered to whoever can edit.
+    const { isOwner, canEdit } = useLedgerRole(ledgerId);
 
     const [subscriberKey, setSubscriberKey] = useState('');
     const [displayName, setDisplayName] = useState('');
     const [url, setUrl] = useState('');
+    // An added target clears the URL, which leaves Add target disabled with
+    // focus on it; focus goes to the URL field it waits on (ADR-0023 §L).
+    const urlRef = useRef<HTMLInputElement>(null);
     const [minSeverity, setMinSeverity] = useState('warning');
+    // A removed target takes its row's Remove with it: focus goes to the next
+    // row's Remove, the previous row's, or the URL field Add target waits on
+    // (ADR-0023 §L).
+    const removeControl = useRowRemovalFocus(
+        (settings.data?.subscribers ?? []).map((s) => s.id),
+        urlRef,
+    );
     // Which job a dead-man's switch on THIS ledger watches. Same rule as the
     // deployment surface: its URL is one check, so it must name one.
     const [monitors, setMonitors] = useState('');
@@ -78,17 +110,17 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
         mutationFn: () =>
             createLedgerNotificationSubscriber(ledgerId, {
                 subscriberKey,
-                // Sent at last. Without it the API fell back to the subscriber key, so
-                // every target a ledger owner created was called "webhook" — and with
-                // one selectable provider that made the list useless for the one
-                // operation it offers, deleting the right row.
+                // Without it the API falls back to the subscriber key, so every target
+                // a ledger owner creates is called "webhook" — and with one selectable
+                // provider that makes the list useless for the one operation it
+                // offers, deleting the right row.
                 displayName: displayName.trim() || undefined,
                 url,
                 // The default, not whatever was last picked while a message provider was
                 // selected. The field is hidden for a heartbeat, and storing a value the
                 // owner cannot see and the router never reads is how a row starts
                 // disagreeing with the screen that created it. Mirrors the deployment
-                // panel, which already did this.
+                // panel.
                 minSeverity: chosen?.detectsAbsence ? 'warning' : minSeverity,
                 monitors: chosen?.detectsAbsence ? monitors : undefined,
             }),
@@ -131,8 +163,8 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
 
     // The inverse of `uncovered`, and not derivable from it. Coverage is keyed on the
     // jobs this ledger RUNS, so a switch bound to a job that is switched off matches no
-    // key and appears nowhere above. That is the state a real bank-feed check was found
-    // in: bound, never pinged, with nothing on this page saying why.
+    // key and appears nowhere above: bound, never pinged, with nothing on this page
+    // saying why. This list names that state.
     const watchingNothing = settings.data?.monitorsWatchingNothing ?? [];
 
     const chosen = providers.data?.find((p) => p.subscriberKey === subscriberKey);
@@ -157,15 +189,13 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                     <span className="font-medium">Where events go</span>
                 </PanelHead>
                 <PanelBody className="space-y-3">
-                    {/* Not a choice any more. This used to offer "use the installation's
-                        targets" vs "use only my own", and the first of those was the
-                        DEFAULT — so on a shared install every ledger's activity went to
-                        whoever watched the deployment channel until someone opted out.
-                        Migration 214 moved each ledger's inherited targets into the
-                        ledger and retired the mode.
+                    {/* Not a choice. "Use the installation's targets" would send, on a
+                        shared install, every ledger's activity to whoever watches the
+                        deployment channel. Migration 214 moves each ledger's inherited
+                        targets into the ledger and retires the mode.
 
-                        One destination for several ledgers is still available, and is
-                        now explicit rather than implicit: paste the same URL into each
+                        One destination for several ledgers is available, and is
+                        explicit rather than implicit: paste the same URL into each
                         ledger. The delivered payload names the ledger it is about, so
                         the messages stay tellable apart. */}
                     <p className="text-sm text-text-muted">
@@ -258,21 +288,22 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                                         severity or topic: Wants() branches on capability
                                         FIRST and the heartbeat arm returns on monitor
                                         name and signal without ever reading MinSeverity,
-                                        so "at warning and above" stated a filter that
-                                        does not exist on this row.
-                                        
-                                        It was not merely decorative, it was backwards. A
-                                        successful run publishes at info, which is BELOW
-                                        a warning floor — if that line were true every
-                                        success ping would be dropped and the check would
-                                        go red from inactivity. It reads "warning" only
-                                        because the create form posts its hidden default.
-                                        
-                                        The deployment panel fixed this already; this was
-                                        the un-updated copy of the same markup. */}
+                                        so "at warning and above" would state a filter
+                                        that does not exist on this row.
+
+                                        That line would be backwards, not merely
+                                        decorative. A successful run publishes at info,
+                                        which is BELOW a warning floor — if it were true
+                                        every success ping would be dropped and the check
+                                        would go red from inactivity. The stored value
+                                        reads "warning" only because the create form
+                                        posts its hidden default.
+
+                                        The deployment panel describes its targets the
+                                        same way. */}
                                     <p className="text-xs text-text-muted">
                                         {s.monitors
-                                            ? `watches ${s.monitors} · pings on success, /fail on failure`
+                                            ? `watches ${monitorLabel(s.monitors)} · pings on success, /fail on failure`
                                             : `at ${s.minSeverity} and above` +
                                               (s.topics && s.topics.length > 0
                                                   ? ` · ${s.topics.join(', ')}`
@@ -288,11 +319,12 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                                 </div>
                                 {isOwner ? (
                                     <Button
+                                        ref={removeControl(s.id)}
                                         type="button"
                                         variant="secondary"
                                         className="shrink-0"
                                         onClick={() => remove.mutate(s.id)}
-                                        disabled={remove.isPending}
+                                        pending={remove.isPending}
                                     >
                                         Remove
                                     </Button>
@@ -310,10 +342,15 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                         <PanelBody className="space-y-3">
                             <label className="block text-sm">
                                 <span className="text-text-muted">Provider</span>
+                                {/* Every field of the add form is pending while the add is in
+                                    flight: its success clears the name and URL, and a change
+                                    made meanwhile would be dropped or never sent (ADR-0023 §L). */}
                                 <select
-                                    className="mt-1 w-full rounded border border-border bg-surface p-2"
+                                    className={ADD_FIELD}
                                     value={subscriberKey}
-                                    onChange={(e) => setSubscriberKey(e.target.value)}
+                                    {...pendingChoiceProps<HTMLSelectElement>(add.isPending, {
+                                        onChange: (e) => setSubscriberKey(e.target.value),
+                                    })}
                                 >
                                     <option value="">Choose…</option>
                                     {providers.data?.map((p: NotificationProvider) => (
@@ -337,14 +374,16 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                                 <label className="block text-sm">
                                     <span className="text-text-muted">Watches</span>
                                     <select
-                                        className="mt-1 w-full rounded border border-border bg-surface p-2"
+                                        className={ADD_FIELD}
                                         value={monitors}
-                                        onChange={(e) => setMonitors(e.target.value)}
+                                        {...pendingChoiceProps<HTMLSelectElement>(add.isPending, {
+                                            onChange: (e) => setMonitors(e.target.value),
+                                        })}
                                     >
                                         <option value="">Choose the job…</option>
                                         {(chosen?.monitors ?? []).map((m) => (
                                             <option key={m} value={m}>
-                                                {m}
+                                                {monitorLabel(m)}
                                             </option>
                                         ))}
                                     </select>
@@ -358,28 +397,31 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
 
                             {/* Named by the operator, because the API's fallback is the
                                 subscriber key and there is only one selectable provider
-                                at ledger scope — so every target came out called
-                                "webhook" and the list could not be used to pick which
-                                one to delete. */}
+                                at ledger scope — so unnamed, every target would be
+                                called "webhook" and the list could not be used to pick
+                                which one to delete. */}
                             <label className="block text-sm">
                                 <span className="text-text-muted">Name</span>
                                 <input
                                     type="text"
-                                    className="mt-1 w-full rounded border border-border bg-surface p-2"
+                                    className={ADD_FIELD}
                                     value={displayName}
                                     onChange={(e) => setDisplayName(e.target.value)}
                                     placeholder="e.g. Discord — household"
+                                    {...pendingTextProps<HTMLInputElement>(add.isPending)}
                                 />
                             </label>
 
                             <label className="block text-sm">
                                 <span className="text-text-muted">URL</span>
                                 <input
+                                    ref={urlRef}
                                     type="url"
-                                    className="mt-1 w-full rounded border border-border bg-surface p-2"
+                                    className={ADD_FIELD}
                                     value={url}
                                     onChange={(e) => setUrl(e.target.value)}
                                     placeholder="https://…"
+                                    {...pendingTextProps<HTMLInputElement>(add.isPending)}
                                 />
                             </label>
                             <p className="text-xs text-text-muted">
@@ -398,9 +440,11 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                                 <label className="block text-sm">
                                     <span className="text-text-muted">Send at</span>
                                     <select
-                                        className="mt-1 w-full rounded border border-border bg-surface p-2"
+                                        className={ADD_FIELD}
                                         value={minSeverity}
-                                        onChange={(e) => setMinSeverity(e.target.value)}
+                                        {...pendingChoiceProps<HTMLSelectElement>(add.isPending, {
+                                            onChange: (e) => setMinSeverity(e.target.value),
+                                        })}
                                     >
                                         <option value="info">Everything, including routine</option>
                                         <option value="warning">Warnings and problems</option>
@@ -420,11 +464,12 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                             <Button
                                 type="button"
                                 onClick={() => add.mutate()}
-                                disabled={
-                                    add.isPending || subscriberKey === '' || url.trim() === ''
-                                }
+                                disabled={subscriberKey === '' || url.trim() === ''}
+                                pending={add.isPending}
+                                pendingLabel="Adding…"
+                                fallbackFocusRef={urlRef}
                             >
-                                {add.isPending ? 'Adding…' : 'Add target'}
+                                Add target
                             </Button>
                         </PanelBody>
                     </Panel>
@@ -469,7 +514,7 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                         has gone wrong", and those are very different claims.
 
                         This is the surface ADR-0096 D5 promised for ledger scope. It is
-                        deliberately NOT presented as coverage: D5's own alternatives
+                        deliberately NOT presented as coverage: ADR-0096 D5's own alternatives
                         section rejected "in-app notifications only" because that is the
                         design which produced days of silence. A page you have to
                         remember to open cannot tell you the app stopped running; that is
@@ -574,11 +619,10 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                                             {/* WHEN, kept. A list headed "recent
                                                 problems" with no times reads as a list of
                                                 CURRENT problems, and the two are not the
-                                                same thing: the first real row this panel
-                                                ever showed was a days-old drift
-                                                warning that had already been resolved,
-                                                indistinguishable from one raised a minute
-                                                ago. */}
+                                                same thing: without a time, a days-old
+                                                drift warning that has since been
+                                                resolved is indistinguishable from one
+                                                raised a minute ago. */}
                                             <time
                                                 dateTime={e.occurredAt}
                                                 className="tabular-nums"
@@ -623,16 +667,22 @@ export function NotificationsPanel({ ledgerId }: { ledgerId: string }) {
                                                 Only while unresolved: offering to
                                                 re-check something the report has since
                                                 called healthy invites a walk over every
-                                                position for nothing. */}
+                                                position for nothing.
+
+                                                Only to a reader who can edit: General
+                                                offers a viewer no Repair, since the server
+                                                refuses one. A viewer's link reads
+                                                "Details" and leads to General without the
+                                                check, as the Overview's Problems does. */}
                                             {e.eventKey === 'consistency.drift' &&
                                             !e.resolvedAt ? (
                                                 <Link
                                                     to="/ledgers/$ledgerId/settings"
                                                     params={{ ledgerId }}
-                                                    search={{ check: true } as never}
+                                                    search={(canEdit ? { check: true } : {}) as never}
                                                     className="font-medium text-accent underline underline-offset-2 hover:text-accent-hover"
                                                 >
-                                                    Check and repair
+                                                    {canEdit ? 'Check and repair' : 'Details'}
                                                 </Link>
                                             ) : null}
                                         </div>

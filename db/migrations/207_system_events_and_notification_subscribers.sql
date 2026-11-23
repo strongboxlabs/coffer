@@ -2,10 +2,10 @@
 -- 207 — system_events + notification_subscribers (ADR-0096)
 -- =============================================================================
 --
--- WHY. Two incidents six days apart were the same defect: snapshots and backups
--- died for days with nothing said, and a data scrub left projections
--- wrong for months, surfacing only because somebody ran a maintenance action by
--- hand. Neither was a missing check. Coffer had no way to tell anyone anything.
+-- WHY. Two different failures share one defect: scheduled snapshots and backups
+-- can stop with nothing said, and a projection left wrong by a data change
+-- stays wrong until somebody happens to run a maintenance action by hand.
+-- Neither is a missing check. Coffer had no way to tell anyone anything.
 --
 -- TWO SCOPES, DELIBERATELY APART (ADR-0096 D1). `ledger_operations` already
 -- records per-ledger runs and stays as it is. Deployment-scope events get their
@@ -19,12 +19,12 @@
 --   * snapshot capture differs — ADR-0037 captures per-ledger tables, and system
 --     history must never ride inside a ledger snapshot.
 --
--- SEVERITY AND TOPIC ARE SEPARATE COLUMNS (D3), not one enum. "Backup succeeded"
+-- SEVERITY AND TOPIC ARE SEPARATE COLUMNS (ADR-0096 D3), not one enum. "Backup succeeded"
 -- and "quotes updated" share a severity and want different routing; "backup
 -- failed" and "provider unreachable" likewise. Collapsing them forces every
 -- subscriber to re-derive the distinction.
 --
--- SUBSCRIBER CONFIG IS SEALED HERE, NOT IN secrets/ (D8). Docker secrets are for
+-- SUBSCRIBER CONFIG IS SEALED HERE, NOT IN secrets/ (ADR-0096 D8). Docker secrets are for
 -- credentials the app needs BEFORE it can read a database; a webhook URL is a
 -- user-configurable integration. Sealed with the master key, the way Drive sync
 -- already stores its outbound OAuth blob.
@@ -33,13 +33,13 @@
 BEGIN;
 
 -- ---------------------------------------------------------------------------
--- Deployment-scope events. No ledger_id, by design (D1) — this table is about
+-- Deployment-scope events. No ledger_id, by design (ADR-0096 D1) — this table is about
 -- the INSTALLATION, and a row here must survive deleting every ledger.
 -- ---------------------------------------------------------------------------
 CREATE TABLE system_events (
     id           UUID        NOT NULL DEFAULT gen_random_uuid(),
     occurred_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- Orthogonal by design (D3). Constrained rather than free text so a typo is a
+    -- Orthogonal by design (ADR-0096 D3). Constrained rather than free text so a typo is a
     -- write error instead of an event no subscriber ever matches.
     severity     TEXT        NOT NULL,
     topic        TEXT        NOT NULL,
@@ -82,7 +82,7 @@ CREATE TABLE notification_subscribers (
     -- floor is inclusive, so 'warning' means warning + critical.
     min_severity   TEXT        NOT NULL DEFAULT 'warning',
     topics         TEXT[]      NULL,
-    -- The provider's URL / token, sealed with the master key (D8). Never a plain
+    -- The provider's URL / token, sealed with the master key (ADR-0096 D8). Never a plain
     -- column: a webhook URL with an embedded token is a credential.
     config_ciphertext BYTEA    NOT NULL,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),

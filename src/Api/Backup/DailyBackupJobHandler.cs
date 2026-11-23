@@ -74,8 +74,8 @@ public sealed class DailyBackupJobHandler : IGlobalScheduledJobHandler
 
         // The HEARTBEAT, and the load-bearing half of ADR-0096 D5. An external
         // monitor counts these and alerts when they stop — the only way to catch
-        // a deployment that is not running at all. Backups once stopped for days
-        // and the only record was LogError lines inside a container.
+        // a deployment that is not running at all. Without it, a stopped backup
+        // leaves no record but LogError lines inside a container.
         //
         // OUTSIDE the try above, on purpose (FU-067). It sat inside it, so a failed event
         // write announced a backup that was written, verified and listed as FAILED, and

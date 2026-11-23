@@ -13,8 +13,8 @@ namespace Coffer.Importer.Moneydance.Json;
 /// OWNS the parsed <see cref="JsonDocument"/> that every <see cref="MdItem"/> is a
 /// view into, which is why this is <see cref="IDisposable"/>. Items are readable
 /// only until this is disposed; the alternative — copying each item's fields out
-/// so they could outlive the document — cost three times the memory and OOM'd a
-/// 1 GiB container on a real export (see <see cref="MdItem"/>).
+/// so they could outlive the document — allocates a document per field, which can
+/// run a memory-capped container out of memory (see <see cref="MdItem"/>).
 /// </para>
 /// <para>
 /// Dispose ONCE, at the point the whole import is finished. The in-app import is

@@ -6,8 +6,9 @@
 
 ## Context
 
-Setup refused `ada.reyes@example.com` as a username, disabled its submit button, and
-said nothing about why. Investigating that turned up four separate problems.
+Setup refuses an email address such as `ada.reyes@example.com` as a username,
+disables its submit button, and says nothing about why. Behind that are four separate
+problems.
 
 **1. The rule existed in exactly one place and nothing enforced it.**
 `SetupPage.tsx` tested `^[a-z0-9_-]{3,32}$` client-side. Meanwhile:
@@ -105,8 +106,8 @@ for reasons that serve nothing. The permissive rule accommodates both.
 ## Consequences
 
 **A `LIKE`/pattern operator on `users.username` will now fail.** Non-deterministic
-collations do not support them. Audited before the change: every use is equality
-— nothing sorts, searches, or pattern-matches on username. A future username
+collations do not support them. Every use is equality — nothing sorts, searches,
+or pattern-matches on username. A future username
 *search* must compare against an explicitly-collated expression rather than
 adding `LIKE` to this column.
 
@@ -118,10 +119,9 @@ picking a survivor would hand one person's ledgers to the other.
 
 **Globalization analyzers are now build-breaking.** `.editorconfig` escalates
 CA1304/CA1305/CA1310/CA1311 to warnings, and `Api.csproj` already sets
-`TreatWarningsAsErrors`. Enabling them found four real culture-dependent call
-sites (number and date formatting in tests), all fixed. CA1304/1310/1311 found
-none — there was no culture-dependent case folding anywhere, so the invariant
-starts clean and can no longer regress silently.
+`TreatWarningsAsErrors`. The codebase builds clean under all four, with no
+culture-dependent case folding anywhere, so the invariant cannot regress
+silently.
 
 **Display case is preserved.** Usernames store as typed and compare folded, the
 standard convention — so `AdaReyes` still renders the way the user wrote it.

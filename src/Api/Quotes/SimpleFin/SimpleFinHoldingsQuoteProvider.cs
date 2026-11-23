@@ -39,6 +39,19 @@ public sealed class SimpleFinHoldingsQuoteProvider : IQuotePullProvider
 {
     public const string Key = "simplefin-holdings";
 
+    /// <summary>Per-account error code: the feed account gave no currency.</summary>
+    public const string CurrencyMissingCode = CurrencyCodes.MissingErrorCode;
+
+    /// <summary>Per-account error code: the feed account's currency is not a currency code.</summary>
+    public const string CurrencyUnknownCode = CurrencyCodes.UnknownErrorCode;
+
+    /// <summary>The <see cref="CurrencyMissingCode"/> message. A feed account that names
+    /// no currency errors only when it is mapped to no Coffer account, since a mapped one
+    /// is priced in its Coffer account's currency, so the fix is to map it.</summary>
+    public const string MissingUnmappedMessage =
+        "SimpleFIN sent no currency for this account and it is not mapped to a Coffer account, "
+        + "so its holdings were not priced. Map it in Settings → Bank feeds.";
+
     private readonly AppDbContext _db;
     private readonly ILogger<SimpleFinHoldingsQuoteProvider> _logger;
     private readonly TimeProvider _clock;
@@ -72,7 +85,7 @@ public sealed class SimpleFinHoldingsQuoteProvider : IQuotePullProvider
         var raws = await _db.FeedConnectionAccounts.AsNoTracking()
             .Where(a => a.LedgerId == context.LedgerId
                         && a.LastProviderRawPayload != null)
-            .Select(a => new { a.ExternalId, a.LastProviderRawPayload })
+            .Select(a => new { a.FeedConnectionId, a.ExternalId, a.LastProviderRawPayload })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
         if (raws.Count == 0)
@@ -81,6 +94,19 @@ public sealed class SimpleFinHoldingsQuoteProvider : IQuotePullProvider
                 Array.Empty<QuoteEntry>(),
                 Array.Empty<QuoteError>());
         }
+
+        // The currency of the Coffer account each feed account is mapped to, by the
+        // binding the sync uses (accounts.feed_connection_id + external_id). A feed
+        // account that reports no currency is priced in it (ADR-0114 D5, amendment).
+        var mappedCurrency = (await _db.Accounts.AsNoTracking()
+                .Where(a => a.LedgerId == context.LedgerId
+                            && a.FeedConnectionId != null
+                            && a.ExternalId != null)
+                .Select(a => new { FeedConnectionId = a.FeedConnectionId!.Value, ExternalId = a.ExternalId!, a.CurrencyCode })
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false))
+            .GroupBy(a => (a.FeedConnectionId, a.ExternalId))
+            .ToDictionary(g => g.Key, g => g.First().CurrencyCode);
 
         // Build a case-insensitive ticker → security map from the
         // orchestrator's pre-loaded security set. The orchestrator
@@ -101,6 +127,7 @@ public sealed class SimpleFinHoldingsQuoteProvider : IQuotePullProvider
             ParseAccount(
                 raw.LastProviderRawPayload!,
                 raw.ExternalId,
+                mappedCurrency.GetValueOrDefault((raw.FeedConnectionId, raw.ExternalId)),
                 tickerToSecurity,
                 quotes,
                 errors,
@@ -116,9 +143,12 @@ public sealed class SimpleFinHoldingsQuoteProvider : IQuotePullProvider
     /// lists. Tolerates malformed JSON (skips the account with a
     /// typed error rather than throwing).
     /// </summary>
+    /// <param name="mappedCurrency">The currency of the Coffer account this feed account
+    /// is mapped to; null when it is mapped to none.</param>
     private void ParseAccount(
         string rawJson,
         string externalId,
+        string? mappedCurrency,
         IReadOnlyDictionary<string, QuoteSecurityRef> tickerToSecurity,
         List<QuoteEntry> quotes,
         List<QuoteError> errors,
@@ -138,7 +168,8 @@ public sealed class SimpleFinHoldingsQuoteProvider : IQuotePullProvider
                 SecurityId: null,
                 Ticker: string.Empty,
                 Code: "raw-payload-parse",
-                Message: $"Account {externalId}: {ex.Message}"));
+                Message: ex.Message,
+                FeedAccountId: externalId));
             return;
         }
         using (doc)
@@ -155,6 +186,21 @@ public sealed class SimpleFinHoldingsQuoteProvider : IQuotePullProvider
             var asOf = ReadUnixSeconds(doc.RootElement, "balance-date")
                 ?? ReadUnixSeconds(doc.RootElement, "balance_date")
                 ?? _clock.GetUtcNow().UtcDateTime;
+
+            // A holding's market_value is in its account's currency (ADR-0114 D5): the
+            // `currency` the feed reports on the account the holdings sit in. Read once
+            // per account. When the feed names none, the Coffer account the feed account
+            // is mapped to says what currency it holds, as it already does for the
+            // account's transactions, which a sync does not judge when the feed names no
+            // currency (ADR-0114 D13). A feed account with no currency that is mapped to no
+            // Coffer account, or one whose currency is not a currency code (SimpleFIN
+            // names a custom currency by URL), fails its holdings closed: none of them is
+            // stored, and the account gets one error. Checked only when a holding matched,
+            // so a cash account with no positions stays silent.
+            var rawCurrency = ReadString(doc.RootElement, "currency");
+            var missing = string.IsNullOrWhiteSpace(rawCurrency);
+            var currencyOk = CurrencyCodes.TryNormalize(missing ? mappedCurrency : rawCurrency, out var currency);
+            var currencyErrorReported = false;
 
             foreach (var h in holdings.EnumerateArray())
             {
@@ -179,6 +225,26 @@ public sealed class SimpleFinHoldingsQuoteProvider : IQuotePullProvider
                 var price = marketValue.Value / shares.Value;
                 if (price < 0m) continue;
 
+                if (!currencyOk)
+                {
+                    if (!currencyErrorReported)
+                    {
+                        currencyErrorReported = true;
+                        // The account is named by FeedAccountId: the Activity log shows
+                        // its name when the run is opened, so the message does not
+                        // repeat it.
+                        errors.Add(new QuoteError(
+                            SecurityId: null,
+                            Ticker: string.Empty,
+                            Code: missing ? CurrencyMissingCode : CurrencyUnknownCode,
+                            Message: missing
+                                ? MissingUnmappedMessage
+                                : $"SimpleFIN named currency '{rawCurrency!.Trim()}', which is not a currency code, so its holdings were not priced.",
+                            FeedAccountId: externalId));
+                    }
+                    continue;
+                }
+
                 if (!seen.Add((security.SecurityId, asOf))) continue;
 
                 quotes.Add(new QuoteEntry(
@@ -190,7 +256,7 @@ public sealed class SimpleFinHoldingsQuoteProvider : IQuotePullProvider
                     // can carry sub-cent precision a valuation doesn't need.)
                     Price: decimal.Round(price, 4),
                     PriceAsOfUtc: asOf,
-                    CurrencyCode: security.CurrencyCode,
+                    CurrencyCode: currency,
                     Source: PriceSource.Simplefin));
             }
         }

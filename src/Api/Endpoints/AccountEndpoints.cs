@@ -47,7 +47,7 @@ public static class AccountEndpoints
         recovery.MapGet("/", RecoveryCodesStatusAsync);
         recovery.MapPost("/regenerate", RegenerateRecoveryCodesAsync);
 
-        // Sign out everywhere else (ADR-0013's promise; 2026-10-12 audit). Protective, so
+        // Sign out everywhere else (ADR-0013's promise; ADR-0105 D3). Protective, so
         // no step-up: the worst a stolen cookie can do with it is sign the owner out.
         // The list and the one-session sign-out (FU-087) are protective the same way.
         var sessions = routes.MapGroup("/api/auth/sessions").RequireAuthorization();
@@ -73,9 +73,9 @@ public static class AccountEndpoints
         IOptions<ApiOptions> apiOptions,
         CancellationToken cancellationToken)
     {
-        // A cookie alone used to be enough to enrol a passkey, which then passed every
-        // step-up (2026-10-12 audit, M2). Now it takes a tap from an existing passkey,
-        // or the recovery-code allowance: see StepUpGuard.
+        // A passkey enrolled on a cookie alone would then pass every step-up
+        // (ADR-0105 D1). So enrolling takes a tap from an existing passkey, or the
+        // recovery-code allowance: see StepUpGuard.
         var approval = await stepUp.RequireAsync(StepUpActions.PasskeyAdd, cancellationToken)
                                    .ConfigureAwait(false);
         if (approval.Failure is not null)

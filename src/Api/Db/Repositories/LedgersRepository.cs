@@ -49,10 +49,12 @@ public sealed class LedgersRepository
     /// </summary>
     public async Task<IReadOnlyList<LedgerSummary>> GetVisibleAsync(
         Guid userId, CancellationToken cancellationToken = default) =>
-        await _db.UserVisibleLedgers
-            .Where(v => v.UserId == userId)
-            .OrderBy(v => v.LedgerName)
-            .Select(v => new LedgerSummary(v.LedgerId, v.LedgerName, v.Role))
+        await (
+            from v in _db.UserVisibleLedgers
+            join l in _db.Ledgers on v.LedgerId equals l.Id
+            where v.UserId == userId
+            orderby v.LedgerName, v.LedgerId
+            select new LedgerSummary(v.LedgerId, v.LedgerName, v.Role, l.CurrencyCode))
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
@@ -63,9 +65,11 @@ public sealed class LedgersRepository
     /// </summary>
     public async Task<LedgerSummary?> GetVisibleByIdAsync(
         Guid userId, Guid ledgerId, CancellationToken cancellationToken = default) =>
-        await _db.UserVisibleLedgers
-            .Where(v => v.UserId == userId && v.LedgerId == ledgerId)
-            .Select(v => new LedgerSummary(v.LedgerId, v.LedgerName, v.Role))
+        await (
+            from v in _db.UserVisibleLedgers
+            join l in _db.Ledgers on v.LedgerId equals l.Id
+            where v.UserId == userId && v.LedgerId == ledgerId
+            select new LedgerSummary(v.LedgerId, v.LedgerName, v.Role, l.CurrencyCode))
             .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
 
@@ -78,10 +82,14 @@ public sealed class LedgersRepository
     /// insert would otherwise satisfy a WITH CHECK predicate while
     /// the other hasn't landed yet.
     /// </summary>
+    /// <param name="currencyCode">The reporting currency (ADR-0114 D7), already in
+    /// <see cref="Quotes.CurrencyCodes"/>' stored form; USD when omitted.</param>
     public async Task<LedgerSummary> CreateWithOwnerAsync(
-        Guid userId, string name, CancellationToken cancellationToken = default)
+        Guid userId, string name, string currencyCode = DisplayCurrency.Fallback,
+        CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        RequireStoredCurrency(currencyCode);
 
         // Held until the ledger and its wrapped LEK are committed (FU-078).
         using var sealing = _ledgerKeys.EnterSealing();
@@ -100,6 +108,7 @@ public sealed class LedgersRepository
             WrappedLek = _ledgerKeys.CreateWrappedLek(),
             LekKekId = _ledgerKeys.CurrentKekId,
             LekCreatedAt = _clock.GetUtcNow().UtcDateTime,
+            CurrencyCode = currencyCode,
         };
         db.Ledgers.Add(ledger);
 
@@ -114,7 +123,44 @@ public sealed class LedgersRepository
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
-        return new LedgerSummary(ledger.Id, ledger.Name, "owner");
+        return new LedgerSummary(ledger.Id, ledger.Name, "owner", ledger.CurrencyCode);
+    }
+
+    /// <summary>
+    /// Set a ledger's reporting currency (ADR-0114 D7). Service role, as a rename is; the
+    /// endpoint has already verified the caller is an <c>owner</c>. Returns whether the
+    /// code changed.
+    /// </summary>
+    /// <remarks>
+    /// The ledger write lock (migration 275) is taken first. A budget target stamps the
+    /// reporting currency it reads (ADR-0114 D12) under the same lock
+    /// (<see cref="BudgetTargetsRepository"/>), so a target written beside this change
+    /// either commits before it, in the old code, or waits for it and reads the new one:
+    /// none is stamped with a code that was already replaced when it committed. A wait past
+    /// the lock's bound throws <see cref="LedgerWriteBusyException"/>, answered as the busy
+    /// refusal, with nothing changed.
+    /// </remarks>
+    /// <param name="currencyCode">Already in <see cref="Quotes.CurrencyCodes"/>' stored form.</param>
+    public async Task<bool> SetReportingCurrencyAsync(
+        Guid ledgerId, string currencyCode, CancellationToken cancellationToken = default)
+    {
+        RequireStoredCurrency(currencyCode);
+        await using var db = _serviceFactory.Create();
+        await using var write = await db.BeginLedgerWriteAsync(ledgerId, cancellationToken)
+                                        .ConfigureAwait(false);
+        var changed = await db.Ledgers
+            .Where(l => l.Id == ledgerId && l.CurrencyCode != currencyCode)
+            .ExecuteUpdateAsync(s => s.SetProperty(l => l.CurrencyCode, currencyCode), cancellationToken)
+            .ConfigureAwait(false);
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return changed > 0;
+    }
+
+    private static void RequireStoredCurrency(string currencyCode)
+    {
+        if (!Quotes.CurrencyCodes.TryNormalize(currencyCode, out var normal)
+            || !string.Equals(normal, currencyCode, StringComparison.Ordinal))
+            throw new ArgumentException($"'{currencyCode}' is not a currency code in stored form.", nameof(currencyCode));
     }
 
     /// <summary>
@@ -142,25 +188,27 @@ public sealed class LedgersRepository
     /// caller (endpoint) must have already verified the user is an
     /// <c>owner</c>. Destructive + irreversible.
     /// </summary>
+    /// <remarks>
+    /// The wipe takes the ledger write lock (migration 275) as its transaction's first
+    /// statement. It deletes every row of the ledger, so a write in flight that holds the
+    /// lock and rows the wipe reaches, and then needs a row the wipe has already deleted or
+    /// locked, would otherwise wait for it while it waited for that write. With the lock
+    /// first, the wipe waits for the write in flight to commit, and a write that starts
+    /// after it waits for the wipe and then finds the ledger gone. A wait past the lock's
+    /// bound throws <see cref="LedgerWriteBusyException"/>, answered as the busy refusal,
+    /// with nothing deleted.
+    /// </remarks>
     public async Task DeleteAsync(
         Guid ledgerId, CancellationToken cancellationToken = default)
     {
         await using var db = _serviceFactory.Create();
-        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken)
-                                                        .ConfigureAwait(false);
-        try
-        {
-            await db.LedgerDelete(ledgerId)
-                .Select(r => r.LedgerId)
-                .SingleAsync(cancellationToken)
-                .ConfigureAwait(false);
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch
-        {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-            throw;
-        }
+        await using var write = await db.BeginLedgerWriteAsync(ledgerId, cancellationToken)
+                                        .ConfigureAwait(false);
+        await db.LedgerDelete(ledgerId)
+            .Select(r => r.LedgerId)
+            .SingleAsync(cancellationToken)
+            .ConfigureAwait(false);
+        await write.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -168,20 +216,20 @@ public sealed class LedgersRepository
     /// were given one.
     /// </summary>
     /// <remarks>
-    /// <para>Migration 035 shipped <c>wrapped_lek</c> nullable and said "a
-    /// subsequent migration sets NOT NULL once backfill is verified complete".
-    /// That migration could never have been written, because wrapping a LEK
-    /// needs the master KEK and SQL does not have it. So the backfill has to
+    /// <para><c>wrapped_lek</c> is nullable (migration 035), and no migration can
+    /// backfill it and set NOT NULL, because wrapping a LEK needs the master KEK
+    /// and SQL does not have it. So the backfill has to
     /// live here, in the process that holds the key, and the constraint can
     /// only follow in a LATER release — migrations run before this code on the
     /// same boot, so a NOT NULL added today would fail on the very rows it is
     /// waiting for.</para>
     ///
-    /// <para>WHERE THE NULLS COME FROM, which is not where the follow-up said.
+    /// <para>WHERE THE NULLS COME FROM.
     /// <see cref="CreateWithOwnerAsync"/> has wrapped a LEK in the ledger's own
-    /// INSERT since ADR-0026, so nothing the API creates is ever NULL. The gap
-    /// is the Moneydance importer: it is a separate binary with no master KEK
-    /// and inserts <c>ledgers (id, name)</c> directly, so every ledger it
+    /// INSERT since ADR-0026, so nothing the API's own repositories create is
+    /// ever NULL. The gap is the Moneydance import: the importer library writes
+    /// through its own Dapper repository, which inserts <c>ledgers (id, name)</c>
+    /// directly and has no access to the master KEK, so every ledger an import
     /// creates starts without one. Migration-seeded ledgers (014, 055) are the
     /// same shape.</para>
     ///
@@ -191,11 +239,11 @@ public sealed class LedgersRepository
     /// <para>AND THE COLUMN STAYS NULLABLE. Migration 035's promised NOT NULL is
     /// not deferred here, it is declined. ADR-0088 removed the seeded default
     /// ledger, so a Moneydance import into a fresh install has to CREATE its
-    /// ledger (<c>--ledger-name</c>), and the importer cannot supply a wrapped
-    /// LEK — it is a separate binary with no master KEK. A NOT NULL would
-    /// therefore not be waiting on legacy rows; it would reject the import. The
-    /// only way to satisfy it is to hand the master key to a second process,
-    /// which trades a real widening of the key's blast radius for a constraint.
+    /// ledger, and the importer library cannot supply a wrapped LEK — it has no
+    /// access to the master KEK. A NOT NULL would therefore not be waiting on
+    /// legacy rows; it would reject the import. The only way to satisfy it is to
+    /// hand the master key to the importer, which trades a real widening of the
+    /// key's blast radius for a constraint.
     /// This backfill is the resolution instead: the window where a ledger lacks
     /// a LEK is bounded by the next boot, and nothing can seal a secret for it
     /// in the meantime without going through the lazy path below.</para>

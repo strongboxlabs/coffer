@@ -1,7 +1,9 @@
+import type { RefObject } from 'react';
 import { Link2 } from 'lucide-react';
 
 import type { PendingInvite } from '@/lib/api';
 import { Button } from '@/components/ui/Button';
+import { useRowRemovalFocus } from '@/components/ui/rowRemovalFocus';
 
 /**
  * The list of outstanding (unredeemed) invite links, each with a Revoke action
@@ -10,18 +12,25 @@ import { Button } from '@/components/ui/Button';
  * visually distinct from the "create a new invite" control above it. <c>showLedger</c>
  * spells out the target ledger — useful on the admin view (which lists invites across
  * every ledger), redundant on a single ledger's Members panel.
+ *
+ * A revoked link takes its row's Revoke with it: focus goes to the next row's Revoke,
+ * the previous row's, or the host's Create invite link (`addRef`, ADR-0023 §L).
  */
 export function PendingInvitesList({
     invites,
     onRevoke,
     revoking,
     showLedger = false,
+    addRef,
 }: {
     invites: PendingInvite[];
     onRevoke: (id: string) => void;
     revoking: boolean;
     showLedger?: boolean;
+    /** The host's Create invite link, where focus goes when the last link is revoked. */
+    addRef: RefObject<HTMLElement | null>;
 }) {
+    const revokeControl = useRowRemovalFocus(invites.map((inv) => inv.id), addRef);
     if (invites.length === 0) {
         return <p className="text-sm text-text-muted">No outstanding invite links.</p>;
     }
@@ -39,9 +48,10 @@ export function PendingInvitesList({
                         </div>
                     </div>
                     <Button
+                        ref={revokeControl(inv.id)}
                         variant="danger"
                         size="sm"
-                        disabled={revoking}
+                        pending={revoking}
                         onClick={() => onRevoke(inv.id)}
                     >
                         Revoke

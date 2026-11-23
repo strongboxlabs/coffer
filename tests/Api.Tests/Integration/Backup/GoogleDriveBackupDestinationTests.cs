@@ -19,15 +19,14 @@ namespace Coffer.Api.Tests.Integration.Backup;
 /// (service DB) + a recording fake <see cref="IDriveClient"/> — no network.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class GoogleDriveBackupDestinationTests : IDisposable
+public sealed class GoogleDriveBackupDestinationTests : DatabaseTest, IDisposable
 {
-    private readonly PostgresFixture _fixture;
     private readonly string _dir;
     private readonly LedgerKeyService _keys = new(new MasterKey(new byte[32], "v1"));
 
-    public GoogleDriveBackupDestinationTests(PostgresFixture fixture)
+    public GoogleDriveBackupDestinationTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
         _dir = Path.Combine(Path.GetTempPath(), "coffer-dest-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_dir);
     }
@@ -48,24 +47,22 @@ public sealed class GoogleDriveBackupDestinationTests : IDisposable
         new(_dir, NullLogger<BackupStore>.Instance, TestPartSize, TimeProvider.System);
 
     private GoogleDriveBackupDestination NewDestination(RecordingDriveClient drive) =>
-        new(new DriveSyncRepository(_fixture.NewServiceFactory()), _keys, drive, NewStore(),
-            new BackupSettingsRepository(_fixture.NewServiceFactory()),
+        new(new DriveSyncRepository(Db.NewServiceFactory()), _keys, drive, NewStore(),
+            new BackupSettingsRepository(Db.NewServiceFactory()),
             NullLogger<GoogleDriveBackupDestination>.Instance);
 
-    private DriveSyncRepository Repo() => new(_fixture.NewServiceFactory());
+    private DriveSyncRepository Repo() => new(Db.NewServiceFactory());
 
     private async Task ConnectAsync()
     {
-        await using var db = _fixture.NewDbContext();
-        await db.Database.ExecuteSqlRawAsync("DELETE FROM drive_sync; DELETE FROM drive_mirrored_backups;");
-        var actor = (await SyntheticLedger.CreateAsync(_fixture)).UserId;
+        var actor = (await SyntheticLedger.CreateAsync(Db)).UserId;
         // The retention the mirror's delete floor is measured against, set rather than
-        // inherited: another test class changes this row.
-        await new BackupSettingsRepository(_fixture.NewServiceFactory())
+        // inherited from the install default.
+        await new BackupSettingsRepository(Db.NewServiceFactory())
             .SetRetentionAsync(7, 8, 12, actor, DateTime.UtcNow);
         var sealed_ = _keys.SealWithMasterKey(
             DriveCredentialCodec.Serialize(new DriveCredentials("cid", "secret", "refresh")));
-        await new DriveSyncRepository(_fixture.NewServiceFactory())
+        await new DriveSyncRepository(Db.NewServiceFactory())
             .ConnectAsync(sealed_, "folderX", "Coffer Backups [t]", "e@x", actor, DateTime.UtcNow);
     }
 
@@ -110,7 +107,7 @@ public sealed class GoogleDriveBackupDestinationTests : IDisposable
         Assert.Equal(
             new HashSet<string> { older + ".cofferbak", newest + ".cofferbak" },
             drive.Uploads.ToHashSet());
-        var status = await new DriveSyncRepository(_fixture.NewServiceFactory()).GetStatusAsync();
+        var status = await new DriveSyncRepository(Db.NewServiceFactory()).GetStatusAsync();
         Assert.Equal("ok", status.LastSyncStatus);
     }
 
@@ -158,9 +155,9 @@ public sealed class GoogleDriveBackupDestinationTests : IDisposable
     [Fact]
     public async Task One_local_backup_beside_many_remote_ones_deletes_nothing()
     {
-        // FU-064's own scenario: the backup directory is swapped or mounted empty, the next
-        // backup leaves ONE local file, and every older Drive copy used to be deleted. They are
-        // all recent enough for retention to keep them, so none may go.
+        // FU-064: the backup directory is swapped or mounted empty, the next backup leaves
+        // ONE local file, and a mirror that follows the local set would delete every older
+        // Drive copy. They are all recent enough for retention to keep them, so none may go.
         await ConnectAsync();
         var only = WriteLocal(DateTime.UtcNow);
         var older = Enumerable.Range(1, 6).Select(IdDaysAgo).ToList();
@@ -308,10 +305,10 @@ public sealed class GoogleDriveBackupDestinationTests : IDisposable
 
     // --- a backup too big to go up as one file (ADR-0101) -------------------
     //
-    // Everything above uses sub-megabyte artifacts, so before these the
-    // splitting code had never once executed: the suite was green over a
-    // feature that did not run. TestPartSize is 1 MB precisely so a few
-    // megabytes of fixture crosses the threshold.
+    // Everything above uses sub-megabyte artifacts, which never execute the
+    // splitting code: on their own they stay green over a feature that does
+    // not run. TestPartSize is 1 MB precisely so a few megabytes of fixture
+    // crosses the threshold.
 
     [Fact]
     public async Task A_backup_over_the_part_size_goes_up_as_named_parts_that_rejoin()
@@ -341,7 +338,7 @@ public sealed class GoogleDriveBackupDestinationTests : IDisposable
         Assert.Equal(TestPartSize / 2, drive.Content[$"{id}.cofferbak.003-of-003"].Length);
 
         // And the bytes are the artifact, in order. Names alone would pass for a
-        // split that shipped the wrong content — which shows up much later, as a
+        // split that sent the wrong content — which shows up much later, as a
         // backup that will not decrypt.
         Assert.Equal(bytes, drive.Uploads.SelectMany(n => drive.Content[n]).ToArray());
     }
@@ -414,9 +411,9 @@ public sealed class GoogleDriveBackupDestinationTests : IDisposable
         public IReadOnlyList<DriveArtifact> Remote { get; init; } = [];
 
         /// <summary>
-        /// What was actually sent, per file name. The fake used to drop the
-        /// stream on the floor, which meant a test could only ever check that
-        /// the NAMES looked right — and a split that named three files
+        /// What was actually sent, per file name. A fake that drops the
+        /// stream on the floor lets a test check only that the NAMES look
+        /// right — and a split that named three files
         /// correctly while sending the wrong bytes in them is exactly the
         /// failure that surfaces later as a backup which will not decrypt.
         /// </summary>

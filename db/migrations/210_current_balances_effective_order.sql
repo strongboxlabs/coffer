@@ -12,12 +12,11 @@
 -- from the middle of the sequence, which is why it looks plausible rather than
 -- obviously broken.
 --
--- This is not a new discovery. Mig 173 diagnosed exactly this bug in
--- account_balance_as_of and fixed it there, in its own words: "Bound + order by the
--- SAME COALESCE the recompute's running sum uses". The current as-of path still
--- honours that (mig 203). The mig-133 view was simply never given the same
--- treatment, so the dashboard overview, the brokerage-cash read in
--- HoldingsRepository, and the loan-payoff figure kept the raw ordering.
+-- Mig 173 fixed the same bug in account_balance_as_of, in its own words: "Bound +
+-- order by the SAME COALESCE the recompute's running sum uses". The current as-of
+-- path still honours that (mig 203). The mig-133 view lacks the same fix, so the
+-- dashboard overview, the brokerage-cash read in HoldingsRepository, and the
+-- loan-payoff figure use the raw ordering.
 --
 -- Fix is the mig-173 shape, verbatim minus the as-of bound this view does not have:
 -- LEFT JOIN txn_header_overrides and order by COALESCE(o.posted_at, h.posted_at).

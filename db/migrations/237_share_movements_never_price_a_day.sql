@@ -2,37 +2,34 @@
 -- 237 — finish what 235 started: a share movement NEVER prices a day.
 --
 -- ADR-0084 D6 states the principle plainly — a ShrsIn/ShrsOut has no cash
--- consideration, so it has no price. Migration 235 implemented only half of it,
--- excluding such a leg when its amount still equalled the share count, on the
--- reasoning that a leg carrying a "real" figure was a real observation. Running
--- the check against a real ledger showed both halves of that reasoning to be
--- wrong.
+-- consideration, so it has no price. Migration 235 implements only half of it,
+-- excluding such a leg when its amount still equals the share count and
+-- treating a leg carrying any other figure as a real observation. Both halves
+-- of that rule fail:
 --
--- 1. THE NOMINAL TEST WAS OFF BY A CENT. Quicken truncated where 235 assumed
---    rounding: a leg whose share count has a third decimal of five carries an
+-- 1. THE NOMINAL TEST IS OFF BY A CENT. The nominal amount can be truncated
+--    where 235 assumed rounding: a leg whose share count has a third decimal of five carries an
 --    amount truncated to two decimals, while round(quantity, 2) rounds that
---    five up. The two differ by a cent, the equality never matched, and the
---    placeholder priced its day a hair under one anyway. Widening to a
+--    five up. The two differ by a cent, the equality never matches, and the
+--    placeholder prices its day a hair under one anyway. Widening to a
 --    tolerance would patch that one arithmetic, and leave (2) untouched.
 --
 -- 2. A "REAL" FIGURE ON A SHARE MOVEMENT IS COST BASIS, NOT A PRICE. An in-kind
 --    move carries each lot across at the price it was originally bought at, so
 --    one security on one day arrives with as many different unit_prices as there
---    were lots — many of them in one observed case, spanning more than a tenfold
---    range — and they sort AFTER the day's genuine trades by seq, so a lot's
---    historical purchase price displaces the real one. On a real ledger this
---    showed as disagreements where both the stored and the expected figure were
---    lot basis from an in-kind conversion, and neither was a market price.
+--    were lots — and they sort AFTER the day's genuine trades by seq, so a lot's
+--    historical purchase price displaces the real one. The check then reports
+--    disagreements where both the stored and the expected figure are lot basis
+--    from an in-kind conversion, and neither is a market price.
 --
 -- There is no test that separates a basis figure from a price, because nothing
 -- in the row distinguishes them. The action does: a share movement is not a
 -- trade, whatever number rides along with it. So the action is the whole rule
 -- now, and fn_leg_prices_a_day loses its arithmetic.
 --
--- WHAT THIS COSTS. Found on a real ledger: the large majority of days currently
--- priced by a trade are still priced by a genuine one. The small remainder lose
--- their trade price — and on every one of those, no trade occurred; only shares
--- moved. Valuation
+-- WHAT THIS COSTS. A day a genuine trade prices keeps its price. A day whose
+-- only pricing leg was a share movement loses its trade price — and on every one
+-- of those, no trade occurred; only shares moved. Valuation
 -- falls back to the nearest real price or reports the position stale, which is
 -- the honest answer where no trade set a price.
 --

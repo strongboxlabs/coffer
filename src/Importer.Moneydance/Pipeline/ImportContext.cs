@@ -6,7 +6,8 @@ namespace Coffer.Importer.Moneydance.Pipeline;
 /// State carried across the import pipeline's steps. Each step (security
 /// import, account import, transaction import, ...) reads from prior steps'
 /// outputs and writes its own. Kept small on purpose — only the
-/// MD-id → Coffer-id maps the next step actually needs.
+/// MD-id → Coffer-id maps the next step actually needs, and what a
+/// step found that a validation check reports.
 /// </summary>
 public sealed class ImportContext
 {
@@ -18,11 +19,19 @@ public sealed class ImportContext
 
     public MdExport Export { get; }
 
+    private Mappers.MdCurrencies? _currencies;
+
+    /// <summary>
+    /// The export's currencies (ADR-0114): the base currency, and the code each
+    /// account's own <c>currid</c> names. Read once, on first use.
+    /// </summary>
+    public Mappers.MdCurrencies Currencies => _currencies ??= Mappers.MdCurrencies.From(Export);
+
     /// <summary>
     /// The ledger every anchor row written by this import is stamped with
-    /// (ADR-0020 Phase A). Resolved up front by the CLI from the user's
-    /// <c>--ledger-id</c>/<c>--ledger-name</c> flags or the default ledger;
-    /// every step reads it via this property.
+    /// (ADR-0020 Phase A). Resolved up front by
+    /// <see cref="MoneydanceImportService"/> before any step runs; every step
+    /// reads it via this property.
     /// </summary>
     public Guid LedgerId { get; }
 
@@ -48,6 +57,16 @@ public sealed class ImportContext
     public Dictionary<string, AccountRef> AccountByMdId { get; } = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// The Moneydance ids in <see cref="AccountByMdId"/> that resolve to the
+    /// ledger's system Uncategorized category rather than to an account of
+    /// their own — MD's blank-named top-level leaf categories
+    /// (<see cref="Mappers.AccountMapper.IsBlankLeafCategory"/>). Populated by
+    /// <see cref="AccountImportStep"/>. They have no <c>account_external_ids</c>
+    /// junction row, which the account-count parity check has to know.
+    /// </summary>
+    public HashSet<string> MdIdsOnUncategorized { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// Maps a Moneydance security sub-account (<c>acct.type='s'</c>) id to
     /// the corresponding <see cref="SecurityRef"/>. Built once at the
     /// start of the investment-transaction step by walking every <c>s</c>
@@ -58,7 +77,19 @@ public sealed class ImportContext
     /// security's per-security precision.
     /// </summary>
     public Dictionary<string, SecurityRef> SecurityByMdSecAcctId { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The securities whose <c>sec_type</c> code is not in
+    /// <see cref="Mappers.MdSecurityType"/>'s table, so they were imported with
+    /// vehicle <c>other</c>. Populated by <see cref="SecurityImportStep"/>; read by
+    /// the <c>security-types-recognised</c> check.
+    /// </summary>
+    public List<UnrecognisedSecurityType> UnrecognisedSecurityTypes { get; } = [];
 }
+
+/// <summary>A security imported with vehicle <c>other</c> because its account's
+/// <c>sec_type</c> code is not one Coffer recognises.</summary>
+public sealed record UnrecognisedSecurityType(string SecurityMdId, string Code);
 
 /// <summary>
 /// Small descriptor of a persisted Coffer security, kept on the import
@@ -95,12 +126,20 @@ public sealed record AccountRef(
     /// when the account was set up for QFX file imports. Paired
     /// with `OlbFi` to drive the classifier.
     /// </summary>
-    string? OfxImportAcctNum = null)
+    string? OfxImportAcctNum = null,
+    /// <summary>
+    /// The decimal places this account's Moneydance amounts are stored at: its MD
+    /// currency's <c>dec</c> (0 for the yen, 2 for the euro). Null where it was never
+    /// resolved; scaling an amount on such an account throws (<c>MdAmounts.ToMoney</c>)
+    /// rather than assume two places.
+    /// </summary>
+    int? AmountDecimals = null)
 {
     public bool IsCategory => AccountType == "category";
 }
 
-/// <summary>Counts emitted by a single import step for the CLI summary.</summary>
+/// <summary>Counts emitted by a single import step, for the validation report and
+/// the reconcile diagnostic's summary.</summary>
 /// <remarks>
 /// <see cref="Skips"/> itemises every transaction the step declined to import.
 /// A dropped transaction is silent data loss (see the share-undercount

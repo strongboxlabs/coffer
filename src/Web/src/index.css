@@ -116,6 +116,24 @@
     --color-cat-rec-soft: #fdf2f8;
     --color-cat-rec-text: #9d174d;
 
+    /* Chart shades — ADR-0021 Rule 5. A report chart fills each series
+       with its hue family's -chart shade, not its -text one: the -text
+       shades are tuned for words on a chip, and several pairs of them are
+       too close to tell apart as fills side by side. Nine families and no
+       slate one: slate is Other's, drawn in --color-cat-xfer-text, so no
+       group can look like the fold. Chips and dots keep the -text shades.
+       chartShades.test.ts holds every pair in a theme, Other included, at
+       ΔE2000 13 or more, and each shade at 3:1 or more on the card. */
+    --color-cat-groc-chart: #ea580c;
+    --color-cat-din-chart: #a855f7;
+    --color-cat-house-chart: #3b82f6;
+    --color-cat-util-chart: #92400e;
+    --color-cat-sub-chart: #4f46e5;
+    --color-cat-tran-chart: #0891b2;
+    --color-cat-sal-chart: #059669;
+    --color-cat-phone-chart: #0369a1;
+    --color-cat-rec-chart: #ec4899;
+
     /*
      * PINNED LENGTHS — ADR-0021 Rule 11.
      *
@@ -164,9 +182,10 @@
      * text, and at 1.2x a primary button would be 48px.
      *
      * Seven values, which is more than a scale wants, but each is load-bearing
-     * somewhere: 28px is the dense register control, 36/40/44 are Button's
-     * three sizes, 24 and 32 are the sidebar disc and the day-of-week toggle,
-     * and 20px is the compact kebab that fits a ~23px sidebar nav row.
+     * somewhere: 28px is the dense register control and Button's in-row `xs`,
+     * 36/40/44 are Button's other sizes, 24 and 32 are the sidebar disc and the
+     * day-of-week toggle, and 20px is the compact kebab that fits a ~23px
+     * sidebar nav row.
      */
     --spacing-control-20px: 1.25rem;
     --spacing-control-24px: 1.5rem;
@@ -187,6 +206,7 @@
     --spacing-fixed-12px: 0.75rem;
     --spacing-fixed-40px: 2.5rem;
     --spacing-fixed-48px: 3rem;
+    --spacing-fixed-56px: 3.5rem; /* the collapsed sidebar rail (FU-051) */
     --spacing-fixed-64px: 4rem;
     --spacing-fixed-80px: 5rem;
     --spacing-fixed-96px: 6rem;
@@ -199,6 +219,9 @@
     --spacing-fixed-288px: 18rem;
     --spacing-fixed-320px: 20rem;
     --spacing-fixed-344px: 21.5rem;
+    /* The Overview's content cap: the one page with columns side by side
+       (ADR-0021 C). Every other destination page caps at max-w-5xl. */
+    --spacing-fixed-1600px: 100rem;
 }
 
 /*
@@ -227,7 +250,7 @@
  * while it is transparent, so EVERY number input reserves ~13px on its right
  * edge that its text can never use. On a right-aligned currency field that is
  * 13px of invisible offset between the figure and the column heading above it,
- * which is exactly the "looks not quite aligned" the splits grid showed — and
+ * which reads as "not quite aligned" on the splits grid — and
  * the same offset exists on the single-posting amount field, the investment
  * editor's quantity and price, and everywhere else the app asks for a number.
  *
@@ -365,6 +388,17 @@ input[type="number"] {
     --color-cat-rec-soft: #fdf2f8;
     --color-cat-rec-text: #9d174d;
 
+    /* Chart shades — see the @theme note */
+    --color-cat-groc-chart: #ea580c;
+    --color-cat-din-chart: #a855f7;
+    --color-cat-house-chart: #3b82f6;
+    --color-cat-util-chart: #92400e;
+    --color-cat-sub-chart: #4f46e5;
+    --color-cat-tran-chart: #0891b2;
+    --color-cat-sal-chart: #059669;
+    --color-cat-phone-chart: #0369a1;
+    --color-cat-rec-chart: #ec4899;
+
     /* Neutral chip — see the @theme note */
     --color-chip-neutral: #e2e8f0;
     --color-chip-neutral-text: #475569;
@@ -440,6 +474,17 @@ input[type="number"] {
     --color-cat-phone-text: #0c4a6e;
     --color-cat-rec-soft: #fbcfe8;
     --color-cat-rec-text: #831843;
+
+    /* Chart shades — see the @theme note */
+    --color-cat-groc-chart: #ea580c;
+    --color-cat-din-chart: #a855f7;
+    --color-cat-house-chart: #3b82f6;
+    --color-cat-util-chart: #92400e;
+    --color-cat-sub-chart: #4f46e5;
+    --color-cat-tran-chart: #0891b2;
+    --color-cat-sal-chart: #059669;
+    --color-cat-phone-chart: #0369a1;
+    --color-cat-rec-chart: #ec4899;
 
     /* Neutral chip — see the @theme note */
     --color-chip-neutral: #cbd5e1;
@@ -517,6 +562,17 @@ input[type="number"] {
     --color-cat-rec-soft: #511837;
     --color-cat-rec-text: #f9a8d4;
 
+    /* Chart shades — see the @theme note */
+    --color-cat-groc-chart: #fed7aa;
+    --color-cat-din-chart: #e9d5ff;
+    --color-cat-house-chart: #3b82f6;
+    --color-cat-util-chart: #fbbf24;
+    --color-cat-sub-chart: #a5b4fc;
+    --color-cat-tran-chart: #a5f3fc;
+    --color-cat-sal-chart: #a7f3d0;
+    --color-cat-phone-chart: #38bdf8;
+    --color-cat-rec-chart: #f472b6;
+
     /* Neutral chip — see the @theme note */
     --color-chip-neutral: #0f172a;
     --color-chip-neutral-text: #cbd5e1;
@@ -592,6 +648,17 @@ input[type="number"] {
     --color-cat-phone-text: #7dd3fc;
     --color-cat-rec-soft: #371025;
     --color-cat-rec-text: #f9a8d4;
+
+    /* Chart shades — see the @theme note */
+    --color-cat-groc-chart: #fed7aa;
+    --color-cat-din-chart: #a855f7;
+    --color-cat-house-chart: #2563eb;
+    --color-cat-util-chart: #fbbf24;
+    --color-cat-sub-chart: #818cf8;
+    --color-cat-tran-chart: #a5f3fc;
+    --color-cat-sal-chart: #6ee7b7;
+    --color-cat-phone-chart: #38bdf8;
+    --color-cat-rec-chart: #fbcfe8;
 
     /* Neutral chip — see the @theme note */
     --color-chip-neutral: #020617;

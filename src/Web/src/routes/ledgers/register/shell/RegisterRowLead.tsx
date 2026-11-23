@@ -5,11 +5,10 @@ import type { ReactNode, Ref } from 'react';
 // Both the bank and investment registers open each row with the same
 // two cells — a selection checkbox, then the status badge — and the
 // header band opens with the matching select-all checkbox + an empty
-// status header. Previously each page hand-rolled these, and they had
-// drifted: bank rendered `[checkbox][status]`, investment rendered
-// `[status][checkbox]`, so the investment header's select-all sat over
-// the wrong column. Standardizing on checkbox-first here means the two
-// registers can't diverge again — the order lives in one place.
+// status header. Hand-rolled per page they drift — `[checkbox][status]`
+// on one, `[status][checkbox]` on the other puts a header's select-all
+// over the wrong column. Checkbox-first, here, means the two registers
+// can't diverge — the order lives in one place.
 //
 // The leading two grid TRACKS (checkbox width, then status width) are
 // kept identical in `BANK_COLS` and `INVESTMENT_REGISTER_COLS` so these

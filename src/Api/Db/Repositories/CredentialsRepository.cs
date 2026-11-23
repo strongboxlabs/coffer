@@ -91,6 +91,7 @@ public sealed class CredentialsRepository
         return await db.WebAuthnCredentials.AsNoTracking()
             .Where(c => c.UserId == userId)
             .OrderBy(c => c.CreatedAt)
+            .ThenBy(c => c.Id)
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
     }
@@ -153,10 +154,10 @@ public sealed class CredentialsRepository
     /// Single-statement <c>UPDATE</c> via EF's <c>ExecuteUpdate</c>.
     /// </summary>
     /// <remarks>
-    /// A compare-and-set on the counter the assertion was verified against (FU-095). The
-    /// update used to be unconditional, so two assertions racing on one credential, each
-    /// verified against the same stored counter, both passed, and the later write could
-    /// move the counter back. Now only the first commits; the other finds the counter
+    /// A compare-and-set on the counter the assertion was verified against (FU-095). With
+    /// an unconditional update, two assertions racing on one credential, each verified
+    /// against the same stored counter, both pass, and the later write can move the
+    /// counter back. So only the first commits; the other finds the counter
     /// moved and is refused, as the replay it may be. An authenticator that keeps no
     /// counter reports 0 against a stored 0, and that still succeeds.
     /// </remarks>

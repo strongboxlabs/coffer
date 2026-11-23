@@ -30,7 +30,7 @@
 
 import { useCallback, useState } from 'react';
 
-import { emptyDraft, nextKey, type PostingDraft } from '../postingDraft';
+import { emptyDraft, nextKey, withCounterparty, type PostingDraft } from '../postingDraft';
 import {
     seedCheckNumber,
     seedMemo,
@@ -45,7 +45,7 @@ import type { TxnRowMode } from '../../TxnRowEdit';
 /** The seven editable fields, as one value. */
 export interface TxnRowDraft {
     payee: string;
-    headerMemo: string;
+    txnMemo: string;
     checkNumber: string;
     /** `yyyy-mm-dd`, the date input's own format — not an ISO stamp. */
     postedAt: string;
@@ -59,13 +59,14 @@ export interface TxnRowDraftApi {
     draft: TxnRowDraft;
 
     setPayee: (v: string) => void;
-    setHeaderMemo: (v: string) => void;
+    setTxnMemo: (v: string) => void;
     setCheckNumber: (v: string) => void;
     setPostedAt: (v: string) => void;
     setTransactedAt: (v: string) => void;
     setTags: (v: readonly string[]) => void;
 
-    /** Merge `fields` into the posting with this key. */
+    /** Merge `fields` into the posting with this key. A new counterparty drops the
+     *  posting's second amount (ADR-0114 D14), before the other fields are merged. */
     patchPosting: (key: string, fields: Partial<PostingDraft>) => void;
     /** Append a posting, mark it for auto-focus, and return its key. */
     addPosting: (prefill?: Partial<PostingDraft>) => string;
@@ -81,29 +82,39 @@ export interface TxnRowDraftApi {
     setFocusKey: (key: string | null) => void;
 }
 
-export function useTxnRowDraft(mode: TxnRowMode): TxnRowDraftApi {
+/** `currency` is the source posting's; the amounts are seeded at its places (ADR-0114 D15).
+ *  `currencyOf` gives a counterparty's, for a stored second amount (ADR-0114 D14). */
+export function useTxnRowDraft(
+    mode: TxnRowMode,
+    currency: string | null,
+    currencyOf?: (accountId: string | null) => string | null,
+): TxnRowDraftApi {
     // See note 1 — every one of these initialisers runs exactly once.
     const [payee, setPayee] = useState(() => seedPayee(mode));
-    const [headerMemo, setHeaderMemo] = useState(() => seedMemo(mode));
+    const [txnMemo, setTxnMemo] = useState(() => seedMemo(mode));
     const [checkNumber, setCheckNumber] = useState(() => seedCheckNumber(mode));
     const [postedAt, setPostedAt] = useState(() => seedPostedAt(mode));
     const [transactedAt, setTransactedAt] = useState(() => seedTransactedAt(mode));
     const [tags, setTags] = useState<readonly string[]>(() => seedTags(mode));
     const [postings, setPostings] = useState<readonly PostingDraft[]>(
-        () => seedPostings(mode),
+        () => seedPostings(mode, currency, currencyOf),
     );
 
     const [focusKey, setFocusKey] = useState<string | null>(null);
 
     const patchPosting = useCallback((key: string, fields: Partial<PostingDraft>) => {
-        setPostings((prev) => prev.map((p) => (p.key === key ? { ...p, ...fields } : p)));
+        setPostings((prev) => prev.map((p) => {
+            if (p.key !== key) return p;
+            const base = fields.counterpartyId !== undefined ? withCounterparty(p, fields.counterpartyId) : p;
+            return { ...base, ...fields };
+        }));
     }, []);
 
     // See note 2 — the key is minted HERE, outside the updater, so the caller
     // gets it back synchronously and both setState calls batch together.
     const addPosting = useCallback((prefill?: Partial<PostingDraft>) => {
         const key = nextKey();
-        setPostings((prev) => [...prev, { ...emptyDraft(), ...prefill, key, legId: null }]);
+        setPostings((prev) => [...prev, { ...emptyDraft(), ...prefill, key, legId: null, stored: null }]);
         setFocusKey(key);
         return key;
     }, []);
@@ -153,9 +164,9 @@ export function useTxnRowDraft(mode: TxnRowMode): TxnRowDraftApi {
     }, []);
 
     return {
-        draft: { payee, headerMemo, checkNumber, postedAt, transactedAt, tags, postings },
+        draft: { payee, txnMemo, checkNumber, postedAt, transactedAt, tags, postings },
         setPayee,
-        setHeaderMemo,
+        setTxnMemo,
         setCheckNumber,
         setPostedAt,
         setTransactedAt,

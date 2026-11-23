@@ -15,7 +15,7 @@
 > survive the flip; the reads lose a join.
 >
 > The leg-level half (`txn_leg_overrides`) was dropped rather than
-> flipped — zero rows in every database, no writer anywhere.
+> flipped — no writer anywhere, so no code path could have filled it.
 
 ## Context
 

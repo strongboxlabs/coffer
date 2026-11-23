@@ -19,8 +19,7 @@
 --      h.posted_at) so the recompute window catches both the OLD
 --      effective position and the NEW.
 --
--- Posted_at overrides are still rare in practice; this trigger fires
--- only when the user explicitly edits a header's date through the
+-- The trigger fires only when a header's date is edited through the
 -- override surface.
 -- =============================================================================
 

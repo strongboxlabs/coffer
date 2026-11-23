@@ -19,21 +19,22 @@ namespace Coffer.Api.Tests.Integration.Mcp;
 /// the default factory client is an admin client; a non-admin cookie is forbidden.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class AdminMcpAuditEndpointTests
+public sealed class AdminMcpAuditEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AdminMcpAuditEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public AdminMcpAuditEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private McpAuditRecorder Recorder() =>
         new(PostgresFixture.ServiceFactoryFor(Options.Create(
-            new ApiOptions { ServiceConnectionString = _fixture.ServiceConnectionString })), TimeProvider.System);
+            new ApiOptions { ServiceConnectionString = Db.ServiceConnectionString })), TimeProvider.System);
 
     [Fact]
     public async Task Non_admin_cookie_is_forbidden()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);   // not an admin
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled().WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);   // not an admin
+        await using var factory = new ApiFactory(Db).WithMcpEnabled().WithoutDevAuth();
         var cookie = await alice.IssueSessionCookieAsync();
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
         client.DefaultRequestHeaders.Add("Cookie", $"__Host-coffer.session={cookie}");
@@ -46,13 +47,13 @@ public sealed class AdminMcpAuditEndpointTests
     [Fact]
     public async Task Admin_lists_then_clears_the_write_audit()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var recorder = Recorder();
         var auditId = await recorder.RecordAttemptAsync(
             ledger.UserId, "set_transaction_tags", arguments: null, traceId: null);
         await recorder.FinalizeAsync(auditId, InvocationStatus.Ok, "tagged 1");
 
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled();   // dev-auth = admin
+        await using var factory = new ApiFactory(Db).WithMcpEnabled();   // dev-auth = admin
         using var client = factory.CreateClient();
 
         var listed = await client.GetFromJsonAsync<List<McpAuditEntryDto>>("/api/admin/mcp/audit");

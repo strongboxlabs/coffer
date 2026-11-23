@@ -1,6 +1,6 @@
 # 0050 — Account editor + loan amortization modeling
 
-* Status: Accepted
+* Status: Accepted (amended 2026-11-03 by [ADR-0111](0111-structure-is-one-page.md): D8's accounts management page is the Accounts tab of Structure, at the same URL; D3 amended 2026-11-14 by [ADR-0114](0114-benchmarks-and-currency-conversion.md): a managed loan reminder whose paying account or real escrow account is in another currency than the loan's is refused, and (2026-11-16) the payment rounds up to one minor unit of the loan's currency and the split rounds at its places; D8 amended 2026-11-14 by [ADR-0114](0114-benchmarks-and-currency-conversion.md): an account currency edit relabels, is refused when a two-amount pair would end up in one currency with magnitudes that differ, and reports how many mirrored pairs became two-amount pairs, and (2026-11-16) is refused when stored figures carry more places than the new currency allows; D1 amended 2026-11-16 by [ADR-0114](0114-benchmarks-and-currency-conversion.md): the loan's money terms and the opening balance are validated at the account currency's places, and the payment preview request carries the currency)
 * Date: 2026-06-15
 * Related: ADR-0002 (unified accounts table), ADR-0017 (account discriminator /
   `account_type`), ADR-0043 (account/category picker), ADR-0047/0048/0049
@@ -10,17 +10,16 @@
 
 ## Context
 
-A loan (mortgage) reminder surfaced wrong values: the calendar showed only the
-fixed escrow portion of the payment, not the full principal + interest + escrow.
-Investigation against a real Moneydance file confirmed the cause is **not** an
-import bug:
+An imported loan reminder carries the wrong amount: only its fixed legs (an
+escrow portion, where the loan has one), not the full principal + interest +
+escrow. The cause is the Moneydance export format, **not** an import bug:
 
 - A Moneydance **loan account** (`obj_type:"o"`) carries the amortization
   parameters — original principal, annual rate, payment count, payments/year,
   `calc_pmt` (MD computes the P&I payment), a current escrow amount, and the
   interest + escrow account references.
 - The loan **reminder** template stores **0** for the principal and interest
-  splits (only the fixed escrow leg has an amount). MD recomputes the P&I split
+  splits (only a fixed leg, such as escrow, has an amount). MD recomputes the P&I split
   for each occurrence from the loan account's amortization (current balance ×
   rate), so it never stores them in the reminder. The importer faithfully
   carried MD's zeros.
@@ -29,7 +28,7 @@ import bug:
   account exists only because import created it; `AccountsEndpoints` exposes only
   narrow patches (feed-mapping, sync, trade-commission, active).
 
-The user chose to model loans properly rather than work around it. Because the
+Coffer models loans rather than working around the zeros. Because the
 loan parameters need an entry/maintenance point and Coffer has no account editor,
 the work has two parts: a **general account editor** and a **loan amortization
 model** layered on it.
@@ -44,7 +43,7 @@ way MD does from those parameters. The computation is transparent and remains
 **user-overridable at post** (adjust-at-post, ADR-0049 D9/D10). We are modeling
 per the feed's loan definition, not imposing a treatment inferred from a memo.
 
-## Decisions (agreed with the user)
+## Decisions
 
 ### D1 — `loan_terms` table, 1:1 with the loan account
 
@@ -58,6 +57,16 @@ constraints: rate ≥ 0, `payment_count` > 0, `payments_per_year` > 0,
 `original_principal` > 0. The EF entity configures every FK
 (`HasOne/WithMany/HasForeignKey/OnDelete`). Loan terms hold only the **fixed
 contract**.
+
+*(Amended 2026-11-16, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D15: the money terms, `original_principal`,
+`escrow_amount` and a stored fixed payment, are validated at the loan account's
+currency's places, and so is the opening balance (D8); a figure finer than that is
+refused as any typed amount is. The Moneydance import's loan mapper (D7) checks escrow
+and the fixed payment the way the import checks every amount (ADR-0114 D15): accepted
+when the file's own `dec` for the currency is at most Coffer's places for that code,
+refused at preview when greater, naming the account and both place counts. The stateless `loan-payment-preview` request
+carries the currency, so the preview rounds as the posted payment does (D3) (settled by
+Claude, 2026-11-16).)*
 
 ### D2 — Current balance is derived, never stored
 
@@ -80,6 +89,14 @@ has `loan_terms`. For such a reminder the occurrence's postings are computed:
 
 The reminder template's P&I legs remain 0 — the import stays faithful; the split
 is a computed view, not stored data.
+
+*(Amended 2026-11-14, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D13: interest and escrow are computed in the
+loan's currency, so a managed reminder whose paying account, or whose real escrow
+account, is in another currency than the loan's is refused at setup and at fire time
+([ADR-0078](0078-managed-loan-payment-reminder.md) D2). An escrow that is a category mirrors as usual. Extended 2026-11-16,
+ADR-0114 D15: the computed payment rounds up to one minor unit of the loan's currency,
+and the interest and principal are rounded once at its places, half away from zero
+([ADR-0078](0078-managed-loan-payment-reminder.md) D3) (settled by Claude, 2026-11-16).)*
 
 ### D4 — Amortization lives in a C# service (business layer)
 
@@ -114,7 +131,7 @@ The Moneydance import maps `obj_type:"o"` loan accounts: it already creates the
 fields (rate, payment count, payments/year, principal, escrow amount,
 `interest_account_id` / `escrow_account_id` resolved through the import account
 map to the **exact** Coffer accounts MD points at, `calc_pmt`). Idempotent, keyed
-by account. Real data has duplicate/aliased interest & escrow accounts, so the
+by account. Interest and escrow accounts can share or alias a name, so the
 mapping resolves the specific referenced ids rather than matching by name.
 
 ### D8 — General account editor (new foundational capability)
@@ -140,6 +157,18 @@ blocks (lift the concept, not the layout).
 - **Deferred to the next slice (needs the migration):** Start date (`opened_on`)
   and opening-balance editing.
 
+*(Amended 2026-11-14, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D13: a currency edit through `PATCH
+/accounts/{id}` relabels, and every stored figure is kept. It is refused when a
+two-amount pair would end up in one currency with magnitudes that differ, which cannot be
+represented. A mirrored pair that lands across currencies becomes a two-amount pair with
+equal magnitudes and opposite signs, and the edit's result reports how many did. When
+it is above 0 the editor shows it and stays open on that line until it is closed by Done,
+Escape or the dialog's close (ADR-0114 D13, decided by the owner, 2026-11-18). A
+brokerage's edit carries to its Holdings sibling under
+[ADR-0019](0019-symmetric-postings.md) Rule 4. Extended 2026-11-16, ADR-0114 D15: the edit is also
+refused when stored figures carry more places than the new currency allows, and the
+refusal names how many do not fit (settled by Claude, 2026-11-16).)*
+
 ### D9 — Loan terms stay loan-specific; credit-card terms are a separate feature
 
 We do NOT generalize `loan_terms` into a shared "account terms". Amortizing
@@ -152,13 +181,13 @@ numbers, hide-on-summary, net-worth flag, balance adjustment) are out (Deferred)
 
 ### D10 — Import seeds once; Coffer owns accounts + categories thereafter
 
-The endgame is to retire Moneydance and run Coffer exclusively at parity, so MD
-import is a one-time **seed**: the importer INSERTs new accounts/categories with
+Coffer replaces Moneydance rather than running beside it, so MD import is a
+one-time **seed**: the importer INSERTs new accounts/categories with
 their MD metadata but **never updates an existing row** on re-import. From the
 first import on, Coffer owns every account/category field — name, institution,
 account/routing number, URL, notes, currency, `is_active`, parent/kind, and
-`loan_terms`. This fixes the reported bug (re-import flipping a Coffer-deactivated
-account back to active) and generalizes it: any in-Coffer edit survives re-import.
+`loan_terms`. A re-import therefore cannot flip a Coffer-deactivated account back
+to active, and more generally any in-Coffer edit survives re-import.
 
 - `UpsertWithAdoptionAsync` updates metadata ONLY on a fresh insert; existing
   rows (junction hit or same-name adoption) are returned untouched (it returns
@@ -174,12 +203,15 @@ account back to active) and generalizes it: any in-Coffer edit survives re-impor
   Coffer-owned. `accounts.opened_on` (Start Date) is seeded from the MD `acct`
   item's creation stamp, which MD writes **two ways, inconsistently**:
   `date_created` (a `yyyyMMdd` int) and `creation_date` (epoch millis). Take the
-  int when present, else the epoch field — on a real export the int covers far
-  fewer accounts than the epoch field does, and the epoch field covers every
-  investment account, so reading only the tidier one leaves most accounts NULL.
+  int when present, else the epoch field — MD does not write the int on every
+  account, so reading only the tidier one leaves every account that carries only
+  the epoch field NULL.
   Reading the epoch field as a UTC date is safe rather than a guess: MD stamps
-  it at local noon, and every account carrying both fields agrees, at every
-  offset from UTC-12 to UTC+2.
+  it at local noon, and local noon at offset `h` is `12:00 - h` UTC, so its UTC
+  date is the local date for every offset after UTC-12 up to and including
+  UTC+12. Outside that band it is a day off (late at UTC-12, early at UTC+13 /
+  UTC+14). `MdAcctTests` pins two offsets inside the band (UTC-5 and UTC-4),
+  not its edges.
   `loan_terms.first_payment_date` derives from the same stamp and takes the same
   two-source read. Seed-once on the same terms as `loan_terms`: the upsert applies
   `COALESCE(accounts.opened_on, EXCLUDED.opened_on)`, never clobbering a value the
@@ -197,8 +229,7 @@ Categories are treated exactly like accounts (Coffer will manage them too, later
 
 ## Consequences
 
-- Loan reminders show the correct full payment and a correct, editable P&I +
-  escrow split — the motivating defect is fixed.
+- Loan reminders show the full payment and an editable P&I + escrow split.
 - Coffer gains a first-class account editor, unblocking manual account
   maintenance generally (not just loans).
 - The amortization is a computed view over imported parameters + the live
@@ -240,7 +271,7 @@ Categories are treated exactly like accounts (Coffer will manage them too, later
    Tests.
 4. **Amortization service + loan-aware reminders** — the C# service +
    `GetUpcomingAsync`/`GetDetailAsync`/`reminderBankPrefill`/fire computing the
-   split for loan-driven reminders. End-to-end verification against a real loan.
+   split for loan-driven reminders.
 
 (Credit-card terms + investment default-fee-category: separate later features,
 per D9.)

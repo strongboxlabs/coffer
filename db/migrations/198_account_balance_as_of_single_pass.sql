@@ -8,26 +8,23 @@
 -- planner served that join by sequentially scanning the WHOLE headers table,
 -- once per account:
 --
---   Nested Loop Left Join   (actual time=8.768..244.672 rows=27 loops=1)
---     ->  Seq Scan on accounts a                     rows=27
---     ->  Limit                                      loops=27
---           ->  Sort  (top-N heapsort)               loops=27
---                 ->  Hash Join                      loops=27
---                       ->  Seq Scan on txn_headers  rows=50000 loops=27
---                             Buffers: shared hit=27189
---   Execution Time: 244.707 ms
+--   Nested Loop Left Join
+--     ->  Seq Scan on accounts a
+--     ->  Limit                                      (once per account)
+--           ->  Sort  (top-N heapsort)
+--                 ->  Hash Join
+--                       ->  Seq Scan on txn_headers  (every header, every loop)
 --
--- 50000 rows × 27 accounts = 1350000 row visits and 27189 buffer hits to
--- return 27 numbers. The cost is driven by the number of ACCOUNTS in the ledger
--- multiplied by the size of the whole transaction table, neither of which has
--- anything to do with how much work the answer needs.
+-- Every header is visited once per account to return one number per account.
+-- The cost is driven by the number of ACCOUNTS in the ledger multiplied by the
+-- size of the whole transaction table, neither of which has anything to do with
+-- how much work the answer needs.
 --
--- WHY THIS SURFACED NOW: time-weighted return values the portfolio once per
+-- WHY IT MATTERS: time-weighted return values the portfolio once per
 -- external-flow instant, so a report over a ledger with N flow dates calls this
--- N times. A guard (MaxReturnsBoundaries) capped N at 400 to bound the damage,
--- and the cap was read as "TWR is expensive" rather than "one of its inputs is
--- doing quadratic work". Raising the cap was the wrong fix — it would have let a
--- read request run for minutes. This is the right one.
+-- N times, and the per-call cost above makes the report quadratic. A cap on N
+-- (MaxReturnsBoundaries, 400) bounds the cost without removing it, and raising
+-- the cap lets a read request run for minutes; the fix is the per-call cost.
 --
 -- The rewrite scopes accounts first, joins the balance rows for those accounts
 -- once, and picks each account's latest row with DISTINCT ON. Headers are

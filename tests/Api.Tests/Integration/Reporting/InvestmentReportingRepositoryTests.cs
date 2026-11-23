@@ -10,13 +10,14 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// holdings + prices.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class InvestmentReportingRepositoryTests
+public sealed class InvestmentReportingRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
+    public InvestmentReportingRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
-    public InvestmentReportingRepositoryTests(PostgresFixture fixture) => _fixture = fixture;
-
-    private InvestmentReportingRepository NewRepo() => new(_fixture.NewDbContext(), TimeProvider.System);
+    private InvestmentReportingRepository NewRepo() => new(Db.NewDbContext(), TimeProvider.System);
 
     /// <summary>Trade date for the allocation fixtures — before the 2026-06-01
     /// feed closes they price against, so the close is what the feeder uses.</summary>
@@ -32,7 +33,7 @@ public sealed class InvestmentReportingRepositoryTests
     [Fact]
     public async Task Holdings_snapshot_values_at_the_latest_price()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
@@ -87,7 +88,7 @@ public sealed class InvestmentReportingRepositoryTests
     [Fact]
     public async Task Allocation_buckets_by_asset_class_with_percent()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
 
@@ -116,7 +117,7 @@ public sealed class InvestmentReportingRepositoryTests
     [Fact]
     public async Task Allocation_decomposes_look_through_security_by_component_weights()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
 
@@ -145,7 +146,7 @@ public sealed class InvestmentReportingRepositoryTests
     [Fact]
     public async Task Allocation_buckets_by_security()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
 
@@ -166,7 +167,7 @@ public sealed class InvestmentReportingRepositoryTests
     [Fact]
     public async Task Allocation_buckets_by_account_apportioned_by_quantity()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var one = await ledger.AddInvestmentAccountAsync("Brokerage One");
         var two = await ledger.AddInvestmentAccountAsync("Brokerage Two");
 
@@ -190,13 +191,13 @@ public sealed class InvestmentReportingRepositoryTests
     /// The failure this closes is SILENT: a multi_asset security with no sleeves
     /// cannot be looked through, so its whole value lands in one opaque bucket and
     /// every other bucket is understated — with nothing in the response saying so.
-    /// One such fund holding most of a real portfolio made equity read as a small
-    /// fraction of its true share, and the chart looked entirely plausible.
+    /// A portfolio held mostly in one such fund reads equity as a small fraction
+    /// of its true share, and the chart looks entirely plausible.
     /// </summary>
     [Fact]
     public async Task Allocation_names_a_multi_asset_security_it_could_not_decompose()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
 
@@ -225,7 +226,7 @@ public sealed class InvestmentReportingRepositoryTests
     [Fact]
     public async Task Allocation_flags_an_undecomposable_security_on_every_dimension()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
 
@@ -253,7 +254,7 @@ public sealed class InvestmentReportingRepositoryTests
     [Fact]
     public async Task Allocation_reports_nothing_undecomposed_once_sleeves_exist()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
 
@@ -278,7 +279,7 @@ public sealed class InvestmentReportingRepositoryTests
     [Fact]
     public async Task Allocation_total_plus_excluded_cash_equals_the_returns_portfolio_value()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
@@ -304,7 +305,7 @@ public sealed class InvestmentReportingRepositoryTests
     [Fact]
     public async Task Allocation_values_a_past_instant()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
@@ -333,7 +334,7 @@ public sealed class InvestmentReportingRepositoryTests
     [Fact]
     public async Task Reporting_responses_stamp_when_and_by_which_build()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, 1_000m, Utc(2024, 1, 10));
@@ -364,23 +365,22 @@ public sealed class InvestmentReportingRepositoryTests
 
     /// <summary>
     /// A position whose cost basis carries a long fractional scale must still be
-    /// READABLE. This shipped broken in 0.63.0: holdings_cost_basis_as_of returned
-    /// the walk's raw NUMERIC, and Npgsql threw
-    /// <c>OverflowException: Numeric value does not fit in a System.Decimal</c> for
-    /// every account big enough that the scale pushed it past 28-29 digits.
+    /// READABLE. If holdings_cost_basis_as_of returns the walk's raw NUMERIC, Npgsql
+    /// throws <c>OverflowException: Numeric value does not fit in a System.Decimal</c>
+    /// for every account big enough that the scale pushes it past 28-29 digits.
     /// </summary>
     /// <remarks>
     /// Scale enters through a SELL: a buy adds its leg amount, which is exact, but a
     /// sale subtracts <c>take x (amount / quantity)</c>, and that division rarely
-    /// terminates. Magnitude then decides whether it throws, which is why production
-    /// looked data-random — a basis that divided evenly was fine, one at 28 digits
-    /// squeaked under, a seven-figure one threw. The fixture below is deliberately large AND
+    /// terminates. Magnitude then decides whether it throws, which makes the failure
+    /// look data-random — a basis that divides evenly is fine, one at 28 digits
+    /// squeaks under, a seven-figure one throws. The fixture below is deliberately large AND
     /// fractional so it lands past the limit rather than near it.
     /// </remarks>
     [Fact]
     public async Task Holdings_snapshot_bounds_scale_so_a_large_fractional_basis_is_readable()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
@@ -401,7 +401,7 @@ public sealed class InvestmentReportingRepositoryTests
         // Money bounded to 4dp, shares to 12dp — the same convention the sibling
         // feeders (mig 172 / 200) round to, and what the holdings columns store.
         Assert.True(
-            decimal.Round(row.CostBasis, 4) == row.CostBasis,
+            decimal.Round(row.CostBasis!.Value, 4) == row.CostBasis,
             $"cost basis must be bounded to 4dp, got {row.CostBasis}");
         Assert.True(
             decimal.Round(row.Quantity, 12) == row.Quantity,
@@ -421,7 +421,7 @@ public sealed class InvestmentReportingRepositoryTests
     [Fact]
     public async Task Holdings_snapshot_values_a_past_instant()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
@@ -454,7 +454,7 @@ public sealed class InvestmentReportingRepositoryTests
     [Fact]
     public async Task Holdings_snapshot_reports_cost_basis_as_of_a_past_instant()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
@@ -489,7 +489,7 @@ public sealed class InvestmentReportingRepositoryTests
     [Fact]
     public async Task Holdings_snapshot_drops_a_position_closed_before_the_instant()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
@@ -523,7 +523,7 @@ public sealed class InvestmentReportingRepositoryTests
     [Fact]
     public async Task Holdings_snapshot_allocation_and_returns_agree_at_the_same_instant()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;

@@ -2,11 +2,13 @@
 
 import type {
     LedgerConsistencyReport,
-    ProjectionConsistency,
-    BalanceHealthReport,
+    LedgerConsistencyState,
+    ProjectionRepairResult,
     LedgerSummary,
+    UpdateLedgerRequest,
 } from '../types/ledger';
 import { request } from './_request';
+import { todayQuery } from './_today';
 
 /**
  * GET /api/ledgers — every ledger the authenticated user has any
@@ -22,22 +24,41 @@ export function fetchVisibleLedgers(): Promise<LedgerSummary[]> {
  * POST /api/ledgers — create a ledger; the caller becomes its owner.
  * `seedDefaultCategories` (ADR-0071 D5, default true) seeds a starter category
  * tree so the ledger is usable immediately; pass false to start blank.
+ * `currencyCode` is the reporting currency (ADR-0114 D7); omitted or blank, the
+ * server takes USD. Anything not a 3-letter code is 422 `ledger-currency-invalid`.
  */
 export function createLedger(
     name: string,
     seedDefaultCategories = true,
+    currencyCode?: string,
 ): Promise<LedgerSummary> {
     return request<LedgerSummary>('/api/ledgers', {
         method: 'POST',
-        body: { name, seedDefaultCategories },
+        body: currencyCode === undefined
+            ? { name, seedDefaultCategories }
+            : { name, seedDefaultCategories, currencyCode },
     });
 }
 
 /** PATCH /api/ledgers/{id} — rename (owner-only server-side). */
 export function renameLedger(id: string, name: string): Promise<void> {
+    return updateLedger(id, { name });
+}
+
+/**
+ * PATCH /api/ledgers/{id} — rename, change the reporting currency, or both. Owner
+ * only. 204. A currency change starts a background backfill of the rates it needs
+ * (ADR-0114 D11).
+ *
+ * 422 codes: `ledger-name-required` (neither field, or a blank name),
+ * `ledger-currency-invalid`, `ledger-not-visible`, `ledger-not-owner`,
+ * `ledger-write-busy` (the currency is applied first, so a busy refusal changes
+ * nothing, the name included).
+ */
+export function updateLedger(id: string, body: UpdateLedgerRequest): Promise<void> {
     return request<void>(`/api/ledgers/${encodeURIComponent(id)}`, {
         method: 'PATCH',
-        body: { name },
+        body,
     });
 }
 
@@ -50,48 +71,29 @@ export function deleteLedger(id: string): Promise<void> {
 }
 
 /**
- * GET /api/ledgers/{id}/balances/health — READ-ONLY check of every
- * txn_header_account_balances row against the pure walk (mig 206).
- * Reports which rows disagree and changes nothing.
- *
- * This was a POST that healed as a side effect of checking, because the
- * only implementation of the rules lived inside the recompute's
- * DELETE + INSERT. Asking rewrote the answer — on one real ledger, thousands
- * of rows, silently. Checking and repairing are now two deliberate actions.
- */
-export function checkBalanceHealth(
-    ledgerId: string,
-): Promise<BalanceHealthReport> {
-    return request<BalanceHealthReport>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/balances/health`,
-    );
-}
-
-/**
- * POST /api/ledgers/{id}/balances/repair — rebuild every stored running
- * balance from the legs. The user chooses this explicitly, after a check
- * has reported drift; it is the remedy for a writer that mutated legs
- * without invoking the recompute, not something to run speculatively.
- */
-export function repairBalances(
-    ledgerId: string,
-): Promise<BalanceHealthReport> {
-    return request<BalanceHealthReport>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/balances/repair`,
-        { method: 'POST' },
-    );
-}
-
-/**
- * GET /api/ledgers/{id}/balances/consistency — READ-ONLY check of every derived
- * projection (balances, holdings, realized gains, posting counts, prices from
- * trades). Writes nothing.
+ * POST /api/ledgers/{id}/balances/consistency — check every derived projection
+ * (balances, holdings, realized gains, posting counts, prices from trades, stored
+ * memo-and-tags notes, holdings currency, the currency of fetched quotes). It changes no figure and heals nothing; it
+ * records its verdict as the scheduled check does, which is what the Overview's
+ * Problems widget and its "checked" text read. The unbacked-price advisory's holding
+ * value is a current value, so the user's local date is sent as the register sends it.
  */
 export function checkLedgerConsistency(
     ledgerId: string,
 ): Promise<LedgerConsistencyReport> {
     return request<LedgerConsistencyReport>(
-        `/api/ledgers/${encodeURIComponent(ledgerId)}/balances/consistency`,
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/balances/consistency${todayQuery()}`,
+        { method: 'POST' },
+    );
+}
+
+/**
+ * GET /api/ledgers/{id}/balances/consistency/state — the last check's stored verdict,
+ * without running a check. A ledger never checked reads as no verdict.
+ */
+export function fetchConsistencyState(ledgerId: string): Promise<LedgerConsistencyState> {
+    return request<LedgerConsistencyState>(
+        `/api/ledgers/${encodeURIComponent(ledgerId)}/balances/consistency/state`,
     );
 }
 
@@ -99,14 +101,20 @@ export function checkLedgerConsistency(
  * POST /api/ledgers/{id}/balances/consistency/{projection}/repair — rebuild one
  * projection, touching only what the check reported. Every projection the report
  * names has a repair, so the UI never surfaces a problem with no way to fix it.
+ * Answers what it rewrote and every projection checked again after it, so the
+ * user's local date goes with it, as with the check.
+ *
+ * The `quote_currency` repair asks Yahoo, so it is refused with 422
+ * `consistency-repair-needs-yahoo` while the repairing user's Yahoo opt-in is off,
+ * and nothing changes. What it could not repair comes back in `notRepaired`.
  */
 export function repairProjection(
     ledgerId: string,
     projection: string,
-): Promise<ProjectionConsistency> {
-    return request<ProjectionConsistency>(
+): Promise<ProjectionRepairResult> {
+    return request<ProjectionRepairResult>(
         `/api/ledgers/${encodeURIComponent(ledgerId)}/balances/consistency/`
-        + `${encodeURIComponent(projection)}/repair`,
+        + `${encodeURIComponent(projection)}/repair${todayQuery()}`,
         { method: 'POST' },
     );
 }

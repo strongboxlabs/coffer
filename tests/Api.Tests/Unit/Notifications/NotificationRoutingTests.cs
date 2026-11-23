@@ -81,11 +81,13 @@ public sealed class NotificationRoutingTests
     [Fact]
     public void Every_topic_is_accepted_by_the_database_check_constraint()
     {
-        // Migration 207 constrains system_events.topic. The constraint and this list
-        // have to agree or a publish throws at the INSERT — which, for a
-        // notification, means the event is lost at exactly the moment it mattered.
+        // Migration 207 constrains system_events.topic, and migration 272 widened it for
+        // `upgrade`. The constraint and this list have to agree or a publish throws at the
+        // INSERT — which, for a notification, means the event is lost at exactly the moment
+        // it mattered. This pins the vocabulary; NotificationTopicsTests inserts every one
+        // against the real constraint.
         Assert.Equal(
-            new[] { "backup", "snapshot", "sync", "quotes", "consistency", "scheduler" },
+            new[] { "backup", "snapshot", "sync", "quotes", "consistency", "scheduler", "upgrade" },
             NotificationTopics.All);
     }
 }

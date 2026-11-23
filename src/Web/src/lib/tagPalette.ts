@@ -6,12 +6,12 @@
 // A COLOURED tag renders as a SOLID fill of its hex with a black or white
 // label, whichever contrasts more.
 //
-// It used to be the hex as text over a ~13% tint of the same hex. That reads
-// nicely and is unfixable: both sides of the pair move together, so there is
-// no contrast term in it. Measured against the shipping themes, 33 of 40
-// swatch/theme combinations were below WCAG AA — on light, ALL TEN failed, with
-// amber at 1.94:1. It went unnoticed because tag colours are user DATA, so they
-// sit outside the token audit by construction.
+// The hex as text over a ~13% tint of the same hex reads nicely and is
+// unfixable: both sides of the pair move together, so there is no contrast term
+// in it. Against the shipping themes, 33 of 40 swatch/theme combinations of that
+// form are below WCAG AA — on light, all ten, with amber at 1.94:1. Tag colours
+// are user DATA, so they sit outside the token audit by construction, and the
+// rendering has to guarantee contrast for any hex on its own.
 //
 // Solid fill fixes it by construction rather than by tuning. Contrast then
 // depends only on the hex, not on the surface, so it is immune to the theme and

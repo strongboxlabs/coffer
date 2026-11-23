@@ -156,7 +156,7 @@ export function SecurityFormFields({
                     type="text"
                     value={form.cusip}
                     onChange={(e) => form.setCusip(e.target.value)}
-                    placeholder="e.g. 037833100"
+                    placeholder="e.g. 000000AA7"
                     className={inputCls}
                 />
             </Field>

@@ -17,16 +17,17 @@ namespace Coffer.Api.Tests.Integration.Scheduling;
 /// Plus a concrete check that the snapshot handler creates an auto snapshot.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class SchedulerRunnerTests
+public sealed class SchedulerRunnerTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SchedulerRunnerTests(PostgresFixture fixture) => _fixture = fixture;
+    public SchedulerRunnerTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     [Fact]
     public async Task Dispatches_due_jobs_by_type_and_advances()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5));
         await SeedJobAsync(ledger, JobTypes.Snapshot, DateTime.UtcNow.AddMinutes(-5));
 
@@ -39,7 +40,7 @@ public sealed class SchedulerRunnerTests
         };
 
         var now = DateTime.UtcNow;
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var count = await new SchedulerRunner()
             .RunDueAsync(db, handlers, now, NullLogger.Instance, default);
 
@@ -47,7 +48,7 @@ public sealed class SchedulerRunnerTests
         Assert.Equal((ledger.LedgerId, ledger.UserId), Assert.Single(quote.Calls));
         Assert.Equal((ledger.LedgerId, ledger.UserId), Assert.Single(snapshot.Calls));
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var jobs = await read.ScheduledJobs.AsNoTracking()
             .Where(j => j.LedgerId == ledger.LedgerId).ToListAsync();
         Assert.Equal(2, jobs.Count);
@@ -58,17 +59,17 @@ public sealed class SchedulerRunnerTests
     [Fact]
     public async Task Job_with_no_handler_is_skipped_but_advanced()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5));
 
         var now = DateTime.UtcNow;
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         // No handlers registered → the due row is skipped, not run, but advanced.
         var count = await new SchedulerRunner().RunDueAsync(
             db, new Dictionary<string, IScheduledJobHandler>(), now, NullLogger.Instance, default);
 
         Assert.Equal(1, count);
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var job = await read.ScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.LedgerId == ledger.LedgerId);
         Assert.True(job.NextRunAt > now);
@@ -77,13 +78,13 @@ public sealed class SchedulerRunnerTests
     [Fact]
     public async Task Snapshot_handler_creates_an_auto_snapshot()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
 
         await new SnapshotJobHandler(NullLoggerFactory.Instance, TimeProvider.System)
             .RunAsync(db, ledger.LedgerId, ledger.UserId, new JobRunClock(DateTime.UtcNow, "UTC"), default);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var autos = await read.LedgerSnapshots.AsNoTracking()
             .Where(s => s.LedgerId == ledger.LedgerId && s.Kind == "auto")
             .ToListAsync();
@@ -93,7 +94,6 @@ public sealed class SchedulerRunnerTests
     [Fact]
     public async Task Dispatches_due_global_jobs_and_advances()
     {
-        await ResetGlobalRowAsync();
         await SeedGlobalJobAsync(GlobalJobTypes.Backup, DateTime.UtcNow.AddMinutes(-5));
 
         var backup = new SpyGlobalHandler(GlobalJobTypes.Backup);
@@ -103,14 +103,14 @@ public sealed class SchedulerRunnerTests
         };
 
         var now = DateTime.UtcNow;
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var count = await new SchedulerRunner()
             .RunDueGlobalAsync(db, handlers, now, NullLogger.Instance, default);
 
         Assert.Equal(1, count);
         Assert.Equal(1, backup.Calls);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var job = await read.GlobalScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.JobType == GlobalJobTypes.Backup);
         Assert.True(job.NextRunAt > now);
@@ -120,16 +120,15 @@ public sealed class SchedulerRunnerTests
     [Fact]
     public async Task Global_job_with_no_handler_is_skipped_but_advanced()
     {
-        await ResetGlobalRowAsync();
         await SeedGlobalJobAsync(GlobalJobTypes.Backup, DateTime.UtcNow.AddMinutes(-5));
 
         var now = DateTime.UtcNow;
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var count = await new SchedulerRunner().RunDueGlobalAsync(
             db, new Dictionary<string, IGlobalScheduledJobHandler>(), now, NullLogger.Instance, default);
 
         Assert.Equal(1, count);
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var job = await read.GlobalScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.JobType == GlobalJobTypes.Backup);
         Assert.True(job.NextRunAt > now);
@@ -138,7 +137,7 @@ public sealed class SchedulerRunnerTests
     [Fact]
     public async Task Failing_job_advances_and_records_the_failure()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5));
         var handlers = new Dictionary<string, IScheduledJobHandler>
         {
@@ -146,10 +145,10 @@ public sealed class SchedulerRunnerTests
         };
 
         var now = DateTime.UtcNow;
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await new SchedulerRunner().RunDueAsync(db, handlers, now, NullLogger.Instance, default);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var job = await read.ScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.LedgerId == ledger.LedgerId);
         Assert.True(job.NextRunAt > now);              // failure does not mean "retry next tick"
@@ -160,17 +159,17 @@ public sealed class SchedulerRunnerTests
     }
 
     /// <summary>
-    /// The mig-194 regression test. A handler that leaves the connection unusable
-    /// used to cost us the advance — the runner applied next_run_at in memory and
-    /// persisted it after the loop, over the context the handler had just wrecked,
-    /// so the row stayed due and re-fired every tick. The advance is now committed
+    /// Mig 194. If the runner applied next_run_at in memory and persisted it after
+    /// the loop, a handler that leaves the connection unusable would lose the
+    /// advance — the write would go over the context the handler had just wrecked,
+    /// so the row would stay due and re-fire every tick. The advance is committed
     /// before dispatch, so it survives even though the post-run bookkeeping cannot
     /// be written.
     /// </summary>
     [Fact]
     public async Task Job_that_poisons_the_connection_still_advances()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5));
         var handlers = new Dictionary<string, IScheduledJobHandler>
         {
@@ -178,12 +177,12 @@ public sealed class SchedulerRunnerTests
         };
 
         var now = DateTime.UtcNow;
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         // Must not throw: the runner absorbs the unwritable outcome and gives up
         // on the tick rather than propagating.
         await new SchedulerRunner().RunDueAsync(db, handlers, now, NullLogger.Instance, default);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var job = await read.ScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.LedgerId == ledger.LedgerId);
         Assert.True(job.NextRunAt > now);
@@ -197,7 +196,7 @@ public sealed class SchedulerRunnerTests
         // FU-070. The outcome was saved on the context the handler had just wrecked, so
         // last_error and consecutive_failures stayed unwritten and the schedule showed a
         // neutral "last attempted" for exactly the job whose failure mattered.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5));
         var handlers = new Dictionary<string, IScheduledJobHandler>
         {
@@ -205,12 +204,12 @@ public sealed class SchedulerRunnerTests
         };
 
         var now = DateTime.UtcNow;
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await new SchedulerRunner().RunDueAsync(
             db, handlers, now, NullLogger.Instance, default, publisher: null,
-            freshContext: _fixture.NewDbContext);
+            freshContext: Db.NewDbContext);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var job = await read.ScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.LedgerId == ledger.LedgerId);
         Assert.True(job.NextRunAt > now);
@@ -232,16 +231,16 @@ public sealed class SchedulerRunnerTests
 
     private async Task<ScheduledJobRow> RunOnceAsync(JobRunOutcome? outcome, string? throwing = null)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedJobAsync(ledger, JobTypes.Snapshot, DateTime.UtcNow.AddMinutes(-5));
         IScheduledJobHandler handler = throwing is not null
             ? new ThrowingHandler(JobTypes.Snapshot, throwing)
             : new OutcomeHandler(JobTypes.Snapshot, outcome!.Value);
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await new SchedulerRunner().RunDueAsync(
             db, new Dictionary<string, IScheduledJobHandler> { [JobTypes.Snapshot] = handler },
             DateTime.UtcNow, NullLogger.Instance, default);
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         return await read.ScheduledJobs.AsNoTracking().SingleAsync(j => j.LedgerId == ledger.LedgerId);
     }
 
@@ -294,7 +293,7 @@ public sealed class SchedulerRunnerTests
     [Fact]
     public async Task Failure_at_the_threshold_disables_the_job()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5),
             consecutiveFailures: SchedulerRunner.DisableAfterConsecutiveFailures - 1);
         var handlers = new Dictionary<string, IScheduledJobHandler>
@@ -302,11 +301,11 @@ public sealed class SchedulerRunnerTests
             [JobTypes.QuoteRefresh] = new ThrowingHandler(JobTypes.QuoteRefresh, "again"),
         };
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await new SchedulerRunner().RunDueAsync(
             db, handlers, DateTime.UtcNow, NullLogger.Instance, default);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var job = await read.ScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.LedgerId == ledger.LedgerId);
         Assert.Equal(SchedulerRunner.DisableAfterConsecutiveFailures, job.ConsecutiveFailures);
@@ -327,7 +326,7 @@ public sealed class SchedulerRunnerTests
     [Fact]
     public async Task A_failure_below_the_threshold_leaves_the_job_enabled_and_unlabelled()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5),
             consecutiveFailures: SchedulerRunner.DisableAfterConsecutiveFailures - 2);
         var handlers = new Dictionary<string, IScheduledJobHandler>
@@ -335,11 +334,11 @@ public sealed class SchedulerRunnerTests
             [JobTypes.QuoteRefresh] = new ThrowingHandler(JobTypes.QuoteRefresh, "not yet"),
         };
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await new SchedulerRunner().RunDueAsync(
             db, handlers, DateTime.UtcNow, NullLogger.Instance, default);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var job = await read.ScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.LedgerId == ledger.LedgerId);
         Assert.True(job.Enabled);
@@ -349,7 +348,7 @@ public sealed class SchedulerRunnerTests
     [Fact]
     public async Task Success_clears_earlier_failures()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5),
             consecutiveFailures: 3);
         var handlers = new Dictionary<string, IScheduledJobHandler>
@@ -357,11 +356,11 @@ public sealed class SchedulerRunnerTests
             [JobTypes.QuoteRefresh] = new SpyHandler(JobTypes.QuoteRefresh),
         };
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await new SchedulerRunner().RunDueAsync(
             db, handlers, DateTime.UtcNow, NullLogger.Instance, default);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var job = await read.ScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.LedgerId == ledger.LedgerId);
         Assert.Equal(0, job.ConsecutiveFailures);
@@ -376,9 +375,9 @@ public sealed class SchedulerRunnerTests
         // The middle state, and the reason it exists. A job that RAN but did not do its
         // work is neither a failure nor a success: counting it as a failure would
         // auto-disable a daily refresh after five flaky days (losing more than it
-        // protects), and counting it as a success is what let a total provider outage
-        // look healthy in the first place.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // protects), and counting it as a success would let a total provider outage
+        // look healthy.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5),
             consecutiveFailures: 3);
         var handlers = new Dictionary<string, IScheduledJobHandler>
@@ -390,11 +389,11 @@ public sealed class SchedulerRunnerTests
         };
 
         var now = DateTime.UtcNow;
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await new SchedulerRunner().RunDueAsync(
             db, handlers, now, NullLogger.Instance, default);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var job = await read.ScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.LedgerId == ledger.LedgerId);
 
@@ -415,7 +414,7 @@ public sealed class SchedulerRunnerTests
         // Directly pins the rule the auto-disable would otherwise break: a ledger holding
         // one delisted ticker degrades every single day, and must never lose the job for
         // it. Seeded one short of the threshold so a single miscount would trip it.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedJobAsync(ledger, JobTypes.QuoteRefresh, DateTime.UtcNow.AddMinutes(-5),
             consecutiveFailures: SchedulerRunner.DisableAfterConsecutiveFailures - 1);
         var handlers = new Dictionary<string, IScheduledJobHandler>
@@ -426,11 +425,11 @@ public sealed class SchedulerRunnerTests
             },
         };
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await new SchedulerRunner().RunDueAsync(
             db, handlers, DateTime.UtcNow, NullLogger.Instance, default);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var job = await read.ScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.LedgerId == ledger.LedgerId);
         Assert.True(job.Enabled);
@@ -440,7 +439,6 @@ public sealed class SchedulerRunnerTests
     [Fact]
     public async Task Failing_global_job_advances_and_records_the_failure()
     {
-        await ResetGlobalRowAsync();
         await SeedGlobalJobAsync(GlobalJobTypes.Backup, DateTime.UtcNow.AddMinutes(-5));
         var handlers = new Dictionary<string, IGlobalScheduledJobHandler>
         {
@@ -448,10 +446,10 @@ public sealed class SchedulerRunnerTests
         };
 
         var now = DateTime.UtcNow;
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await new SchedulerRunner().RunDueGlobalAsync(db, handlers, now, NullLogger.Instance, default);
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var job = await read.GlobalScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.JobType == GlobalJobTypes.Backup);
         Assert.True(job.NextRunAt > now);
@@ -462,10 +460,9 @@ public sealed class SchedulerRunnerTests
     [Fact]
     public async Task A_global_job_cut_short_by_a_stop_is_recorded_as_interrupted()
     {
-        // FU-065: the run was claimed (last_run_at advanced) and then the process stopped
-        // under it. The cancellation was rethrown with nothing recorded, so the row showed a
-        // run that started and never an outcome; only the 48-hour age alert ever noticed.
-        await ResetGlobalRowAsync();
+        // FU-065: the run is claimed (last_run_at advanced) and then the process stops
+        // under it. A cancellation rethrown with nothing recorded leaves a row showing a
+        // run that started and never an outcome, visible only to the 48-hour age alert.
         await SeedGlobalJobAsync(GlobalJobTypes.Backup, DateTime.UtcNow.AddMinutes(-5));
         using var stopping = new CancellationTokenSource();
         var handlers = new Dictionary<string, IGlobalScheduledJobHandler>
@@ -474,11 +471,11 @@ public sealed class SchedulerRunnerTests
         };
 
         var now = DateTime.UtcNow;
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             new SchedulerRunner().RunDueGlobalAsync(db, handlers, now, NullLogger.Instance, stopping.Token));
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var job = await read.GlobalScheduledJobs.AsNoTracking()
             .SingleAsync(j => j.JobType == GlobalJobTypes.Backup);
         Assert.Equal(1, job.ConsecutiveFailures);
@@ -499,15 +496,9 @@ public sealed class SchedulerRunnerTests
         }
     }
 
-    private async Task ResetGlobalRowAsync()
-    {
-        await using var db = _fixture.NewDbContext();   // service role
-        await db.Database.ExecuteSqlRawAsync("DELETE FROM global_scheduled_jobs;");
-    }
-
     private async Task SeedGlobalJobAsync(string jobType, DateTime nextRunAt)
     {
-        await using var db = _fixture.NewDbContext();   // service-role only table
+        await using var db = Db.NewDbContext();   // service-role only table
         db.GlobalScheduledJobs.Add(new GlobalScheduledJobRow
         {
             JobType = jobType,

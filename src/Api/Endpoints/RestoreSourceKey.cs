@@ -15,9 +15,9 @@ namespace Coffer.Api.Endpoints;
 /// <remarks>
 /// Without it a restore onto another install still succeeds, but every secret sealed under
 /// the source's key (bank feed tokens, the stored backup passphrase, the Drive token,
-/// notification targets) is cleared by reconciliation (D5) because it will not open. That is
+/// notification targets) is cleared by reconciliation (ADR-0092 D5) because it will not open. That is
 /// the right outcome when the key is lost, and the wrong one for a disaster-recovery restore
-/// by an operator who has it, which the setup screen used to force on everyone.
+/// by an operator who has it.
 /// </remarks>
 internal static class RestoreSourceKey
 {
@@ -60,7 +60,7 @@ internal static class RestoreSourceKey
         // be THE key this backup was sealed under. Catches a paste-the-wrong-key mistake now
         // rather than after the restore has replaced everything and the install can't open
         // its own secrets. A v1 archive has no fingerprint to check against, so it proceeds
-        // — and if the key turns out wrong, D5's reconciliation on the post-adopt boot clears
+        // — and if the key turns out wrong, ADR-0092 D5's reconciliation on the post-adopt boot clears
         // what won't open, which is the same outcome as not supplying one.
         try
         {

@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
     seedCheckNumber,
+    seedIsCreate,
     seedMemo,
+    seedNotesBaseline,
     seedPayee,
     seedPostedAt,
     seedPostings,
@@ -12,12 +14,12 @@ import {
 import type { TxnRowMode } from '../TxnRowEdit';
 
 /**
- * Unit tests for the seeding logic, which previously lived in seven `useState`
- * initialisers and could only be reached by rendering the whole editor.
+ * Unit tests for the seeding logic, reachable here without rendering the whole
+ * editor.
  *
- * `seedTransactedAt` is the one that earns this file. It carries a documented
- * data-loss history — an edit-mode caller that failed to seed the field would
- * silently WIPE a tax date the transaction already had — and its noise filter
+ * `seedTransactedAt` is the one that earns this file. An edit-mode caller that
+ * fails to seed the field would silently WIPE a tax date the transaction already
+ * had — and its noise filter
  * has a subtlety the component-level gate cannot see: the existing same-day
  * test feeds BYTE-IDENTICAL ISO strings, so a naive `mode.transactedAt ===
  * mode.postedAt` passes it while being wrong for every realistic pair. The
@@ -52,10 +54,15 @@ const editMode = (over: Partial<Extract<TxnRowMode, { kind: 'edit' }>> = {}): Tx
     postedAt: '2026-01-02T00:00:00.000Z',
     transactedAt: null,
     balanceAfter: 100,
+    balanceCurrencyCode: 'USD',
     tags: [],
+    inherited: null,
     needsReview: false,
     ...over,
 });
+
+/** The postings seeded for a source posting in `currency` (ADR-0114 D15). */
+const seedPostingsIn = (currency: string | null, mode: TxnRowMode) => seedPostings(mode, currency);
 
 describe('header seeds', () => {
     it('are blank in new mode with no prefill', () => {
@@ -68,11 +75,13 @@ describe('header seeds', () => {
 
     it('come from the prefill in new mode when Duplicate supplied one', () => {
         const m = newMode({
-            prefill: { payee: 'Payee A', memo: 'September', checkNumber: '4471' },
+            prefill: { payee: 'Payee A', memo: 'September', checkNumber: '4471', tags: ['Work'] },
         });
         expect(seedPayee(m)).toBe('Payee A');
         expect(seedMemo(m)).toBe('September');
         expect(seedCheckNumber(m)).toBe('4471');
+        // A duplicate copies the tags the source showed, as the copy's own.
+        expect(seedTags(m)).toEqual(['Work']);
     });
 
     it('turn edit-mode nulls into empty strings, not the string "null"', () => {
@@ -87,7 +96,7 @@ describe('header seeds', () => {
         expect(seedPayee(m)).toBe('Corner Shop');
         expect(seedMemo(m)).toBe('weekly');
         expect(seedCheckNumber(m)).toBe('99');
-        expect(seedTags(editMode({ tags: ['rental', 'q3'] }))).toEqual(['rental', 'q3']);
+        expect(seedTags(editMode({ tags: ['work', 'q3'] }))).toEqual(['work', 'q3']);
     });
 });
 
@@ -148,13 +157,13 @@ describe('seedPostings', () => {
     it('opens new mode with exactly one blank posting', () => {
         // A single row is just the N=1 case — there is no separate
         // "convert to split" path.
-        const p = seedPostings(newMode());
+        const p = seedPostingsIn('USD', newMode());
         expect(p).toHaveLength(1);
         expect(p[0]).toMatchObject({ legId: null, counterpartyId: null, amount: '', legMemo: '' });
     });
 
     it('clones every prefilled posting, with no legIds', () => {
-        const p = seedPostings(newMode({
+        const p = seedPostingsIn('USD', newMode({
             prefill: {
                 postings: [
                     { counterpartyAccountId: CAT, amount: -4, legMemo: 'a' },
@@ -165,12 +174,13 @@ describe('seedPostings', () => {
         expect(p).toHaveLength(2);
         // Duplicate must INSERT, never PATCH the original's legs.
         expect(p.every((x) => x.legId === null)).toBe(true);
+        // At the source posting's places, as an edit seeds (ADR-0114 D15).
         expect(p[0]?.amount).toBe('-4.00');
         expect(p[1]?.legMemo).toBe('');
     });
 
     it('preserves legIds and order in edit mode', () => {
-        const p = seedPostings(editMode({
+        const p = seedPostingsIn('USD', editMode({
             postings: [
                 { legId: 'l1', counterpartyAccountId: CAT, counterpartyAccountName: 'a', legTags: [], amount: -4, legMemo: null },
                 { legId: 'l2', counterpartyAccountId: CAT, counterpartyAccountName: 'b', legTags: [], amount: -3, legMemo: 'x' },
@@ -180,18 +190,98 @@ describe('seedPostings', () => {
         expect(p.map((x) => x.amount)).toEqual(['-4.00', '-3.00']);
     });
 
-    it('formats amounts to two decimals, because the field is free text', () => {
-        const p = seedPostings(editMode({
-            postings: [{ legId: 'l1', counterpartyAccountId: CAT, counterpartyAccountName: 'a', legTags: [], amount: -4, legMemo: null }],
+    // ADR-0114 D15: the field is free text, seeded at the posting currency's places.
+    const whole = (currency: string | null, amount: number) => seedPostingsIn(currency, editMode({
+        postings: [{ legId: 'l1', counterpartyAccountId: CAT, counterpartyAccountName: 'a', legTags: [], amount, legMemo: null }],
+    }))[0]?.amount;
+
+    it('seeds each amount at its currency\'s places, because the field is free text', () => {
+        expect(whole('USD', -4)).toBe('-4.00');
+        expect(whole('JPY', -4)).toBe('-4');
+        expect(whole('KWD', -4)).toBe('-4.000');
+        // No currency yet pads nothing.
+        expect(whole(null, -4)).toBe('-4');
+    });
+
+    it('keeps every digit a stored figure carries beyond its currency\'s places', () => {
+        // A stored figure finer than its currency is kept (ADR-0114 D15): the seed
+        // shows it whole, and never rounds it to fit.
+        expect(whole('USD', -4.125)).toBe('-4.125');
+        expect(whole('JPY', -4.5)).toBe('-4.5');
+    });
+
+    it('remembers the text each amount was seeded with, so a save can tell a change', () => {
+        const [p] = seedPostingsIn('JPY', editMode({
+            postings: [{ legId: 'l1', counterpartyAccountId: CAT, counterpartyAccountName: 'a', legTags: [], amount: -4.5, legMemo: null }],
         }));
-        expect(p[0]?.amount).toBe('-4.00');
+        expect(p?.seededAmount).toBe('-4.5');
+        // A blank line was seeded with nothing.
+        expect(seedPostingsIn('JPY', newMode())[0]?.seededAmount).toBeUndefined();
     });
 
     it('mints a fresh key per call, so it must run once per mount', () => {
         // Not idempotent by design — see postingDraft.ts. This is the property
         // that forces the call site to be useState, never useMemo.
-        const a = seedPostings(editMode());
-        const b = seedPostings(editMode());
+        const a = seedPostingsIn('USD', editMode());
+        const b = seedPostingsIn('USD', editMode());
         expect(a[0]?.key).not.toBe(b[0]?.key);
+    });
+
+    it('records each line\'s stored tag count, the size the limit measures growth from', () => {
+        const p = seedPostingsIn('USD', editMode({
+            postings: [{
+                legId: 'l1', counterpartyAccountId: CAT, counterpartyAccountName: 'a',
+                legTags: ['a', 'b', 'c'], amount: -4, legMemo: null,
+            }],
+        }));
+        expect(p[0]?.tagBaseline).toBe(3);
+    });
+});
+
+describe('seedNotesBaseline and the stored line values', () => {
+    it('is what an edit opened with; each line carries its own stored values', () => {
+        const mode = editMode({
+            memo: 'Weekly shop',
+            tags: ['Household'],
+            postings: [
+                { legId: 'l1', counterpartyAccountId: CAT, counterpartyAccountName: 'a', legTags: ['Organic'], amount: -4, legMemo: 'Produce' },
+                { legId: 'l2', counterpartyAccountId: CAT, counterpartyAccountName: 'b', legTags: [], amount: -3, legMemo: null },
+            ],
+        });
+        const b = seedNotesBaseline(mode);
+        expect(b).toEqual({ memo: 'Weekly shop', tags: ['Household'] });
+        expect(seedPostingsIn('USD', mode).map((p) => p.stored)).toEqual([
+            { memo: 'Produce', tags: ['Organic'] },
+            { memo: '', tags: [] },
+        ]);
+    });
+
+    it('stores nothing for a copy, so every line counts as new', () => {
+        const p = seedPostingsIn('USD', newMode({
+            prefill: { postings: [{ counterpartyAccountId: CAT, amount: -4, legMemo: 'Produce', legTags: ['a'] }] },
+        }));
+        expect(p[0]?.stored).toBeNull();
+        expect(p[0]?.tagBaseline).toBe(0);
+        expect(seedIsCreate(newMode())).toBe(true);
+    });
+
+    it('treats a stored template\'s lines as stored, with no leg id when the prefill names none', () => {
+        const mode = newMode({
+            prefillIsStored: true,
+            prefill: { postings: [{ counterpartyAccountId: CAT, amount: -4, legMemo: 'Produce', legTags: ['a'] }] },
+        });
+        const p = seedPostingsIn('USD', mode);
+        expect(p[0]?.legId).toBeNull();
+        expect(p[0]?.stored).toEqual({ memo: 'Produce', tags: ['a'] });
+        expect(p[0]?.tagBaseline).toBe(1);
+        expect(seedIsCreate(mode)).toBe(false);
+    });
+
+    it('marks a stored template line\'s tags as not known when the prefill does not carry them', () => {
+        const p = seedPostingsIn('USD', newMode({
+            prefillIsStored: true,
+            prefill: { postings: [{ counterpartyAccountId: CAT, amount: -4, legMemo: 'Produce' }] },
+        }));
+        expect(p[0]?.stored).toEqual({ memo: 'Produce', tags: null });
     });
 });

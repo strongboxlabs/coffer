@@ -13,17 +13,18 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// is not acting as anyone and would prove nothing.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ReportPinsTests
+public sealed class ReportPinsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ReportPinsTests(PostgresFixture fixture) => _fixture = fixture;
+    public ReportPinsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private const string SpecJson = """{"measure":"Spending","groupBy":"Category"}""";
 
     private async Task<Guid> SaveAsync(SyntheticLedger ledger, string name, string visibility)
     {
-        await using var db = _fixture.NewAppDbContextAsUser(ledger.UserId);
+        await using var db = Db.NewAppDbContextAsUser(ledger.UserId);
         var created = await new SavedReportsRepository(db, TimeProvider.System)
             .CreateAsync(ledger.LedgerId, ledger.UserId, name, SpecJson, visibility);
         return created.Id;
@@ -32,10 +33,10 @@ public sealed class ReportPinsTests
     [Fact]
     public async Task A_pinned_report_appears_in_the_rail_with_its_name()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var reportId = await SaveAsync(ledger, "Groceries, 12 months", "private");
 
-        await using var db = _fixture.NewAppDbContextAsUser(ledger.UserId);
+        await using var db = Db.NewAppDbContextAsUser(ledger.UserId);
         var pins = new ReportPinsRepository(db, TimeProvider.System);
         Assert.True(await pins.PinSavedAsync(ledger.LedgerId, reportId, ledger.UserId));
 
@@ -48,10 +49,10 @@ public sealed class ReportPinsTests
     [Fact]
     public async Task Pinning_twice_does_not_duplicate_the_rail_entry()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var reportId = await SaveAsync(ledger, "Twice", "private");
 
-        await using var db = _fixture.NewAppDbContextAsUser(ledger.UserId);
+        await using var db = Db.NewAppDbContextAsUser(ledger.UserId);
         var pins = new ReportPinsRepository(db, TimeProvider.System);
         await pins.PinSavedAsync(ledger.LedgerId, reportId, ledger.UserId);
         await pins.PinSavedAsync(ledger.LedgerId, reportId, ledger.UserId);
@@ -64,9 +65,9 @@ public sealed class ReportPinsTests
     [Fact]
     public async Task A_canned_report_can_be_pinned_without_being_saved_first()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
-        await using var db = _fixture.NewAppDbContextAsUser(ledger.UserId);
+        await using var db = Db.NewAppDbContextAsUser(ledger.UserId);
         var pins = new ReportPinsRepository(db, TimeProvider.System);
         await pins.PinCatalogAsync(ledger.LedgerId, "income-and-expenses", ledger.UserId);
 
@@ -85,9 +86,9 @@ public sealed class ReportPinsTests
     [Fact]
     public async Task Pinning_the_same_canned_report_twice_is_a_no_op()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
-        await using var db = _fixture.NewAppDbContextAsUser(ledger.UserId);
+        await using var db = Db.NewAppDbContextAsUser(ledger.UserId);
         var pins = new ReportPinsRepository(db, TimeProvider.System);
         await pins.PinCatalogAsync(ledger.LedgerId, "income-and-expenses", ledger.UserId);
         await pins.PinCatalogAsync(ledger.LedgerId, "income-and-expenses", ledger.UserId);
@@ -98,10 +99,10 @@ public sealed class ReportPinsTests
     [Fact]
     public async Task The_two_kinds_of_pin_sit_in_one_ordered_rail()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var reportId = await SaveAsync(ledger, "Groceries", "private");
 
-        await using var db = _fixture.NewAppDbContextAsUser(ledger.UserId);
+        await using var db = Db.NewAppDbContextAsUser(ledger.UserId);
         var pins = new ReportPinsRepository(db, TimeProvider.System);
         await pins.PinCatalogAsync(ledger.LedgerId, "income-and-expenses", ledger.UserId);
         await pins.PinSavedAsync(ledger.LedgerId, reportId, ledger.UserId);
@@ -117,19 +118,19 @@ public sealed class ReportPinsTests
     [Fact]
     public async Task Two_people_on_one_ledger_do_not_share_a_rail()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var otherUserId = await ledger.AddMemberAsync("editor");
         // Shared, so the OTHER user can genuinely see it — this test is about
         // the pin being private, not about the report being invisible.
         var reportId = await SaveAsync(ledger, "Household spending", "ledger");
 
-        await using (var ownerDb = _fixture.NewAppDbContextAsUser(ledger.UserId))
+        await using (var ownerDb = Db.NewAppDbContextAsUser(ledger.UserId))
         {
             await new ReportPinsRepository(ownerDb, TimeProvider.System)
                 .PinSavedAsync(ledger.LedgerId, reportId, ledger.UserId);
         }
 
-        await using var otherDb = _fixture.NewAppDbContextAsUser(otherUserId);
+        await using var otherDb = Db.NewAppDbContextAsUser(otherUserId);
         var theirRail = await new ReportPinsRepository(otherDb, TimeProvider.System).ListAsync(ledger.LedgerId);
 
         // A pin says "I come back to this". It is not a property of the report
@@ -140,11 +141,11 @@ public sealed class ReportPinsTests
     [Fact]
     public async Task Someone_can_pin_a_shared_report_they_did_not_write()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var otherUserId = await ledger.AddMemberAsync("editor");
         var reportId = await SaveAsync(ledger, "Household spending", "ledger");
 
-        await using var otherDb = _fixture.NewAppDbContextAsUser(otherUserId);
+        await using var otherDb = Db.NewAppDbContextAsUser(otherUserId);
         var pins = new ReportPinsRepository(otherDb, TimeProvider.System);
         Assert.True(await pins.PinSavedAsync(ledger.LedgerId, reportId, otherUserId));
 
@@ -156,11 +157,11 @@ public sealed class ReportPinsTests
     [Fact]
     public async Task A_report_that_is_not_visible_cannot_be_pinned()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var otherUserId = await ledger.AddMemberAsync("editor");
         var privateId = await SaveAsync(ledger, "Mine alone", "private");
 
-        await using var otherDb = _fixture.NewAppDbContextAsUser(otherUserId);
+        await using var otherDb = Db.NewAppDbContextAsUser(otherUserId);
         var pinned = await new ReportPinsRepository(otherDb, TimeProvider.System)
             .PinSavedAsync(ledger.LedgerId, privateId, otherUserId);
 
@@ -172,24 +173,24 @@ public sealed class ReportPinsTests
     [Fact]
     public async Task Un_sharing_a_report_drops_it_from_other_peoples_rails()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var otherUserId = await ledger.AddMemberAsync("editor");
         var reportId = await SaveAsync(ledger, "Was shared", "ledger");
 
-        await using (var otherDb = _fixture.NewAppDbContextAsUser(otherUserId))
+        await using (var otherDb = Db.NewAppDbContextAsUser(otherUserId))
         {
             await new ReportPinsRepository(otherDb, TimeProvider.System)
                 .PinSavedAsync(ledger.LedgerId, reportId, otherUserId);
             Assert.Single(await new ReportPinsRepository(otherDb, TimeProvider.System).ListAsync(ledger.LedgerId));
         }
 
-        await using (var ownerDb = _fixture.NewAppDbContextAsUser(ledger.UserId))
+        await using (var ownerDb = Db.NewAppDbContextAsUser(ledger.UserId))
         {
             await new SavedReportsRepository(ownerDb, TimeProvider.System)
                 .UpdateAsync(ledger.LedgerId, reportId, ledger.UserId, null, null, "private");
         }
 
-        await using var again = _fixture.NewAppDbContextAsUser(otherUserId);
+        await using var again = Db.NewAppDbContextAsUser(otherUserId);
         // Their pin ROW survives — nothing deleted it — but the join to a
         // report they can no longer see drops it, so the rail does not show an
         // entry that would 404 on click.

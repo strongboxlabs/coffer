@@ -16,13 +16,11 @@ namespace Coffer.Api.Tests.Integration.Auth;
 /// here so a future refactor can't drift it.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class AuthMeEndpointTests
+public sealed class AuthMeEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AuthMeEndpointTests(PostgresFixture fixture)
+    public AuthMeEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -39,8 +37,8 @@ public sealed class AuthMeEndpointTests
     [Fact]
     public async Task Get_returns_current_users_identity()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, alice);
 
         var response = await client.GetAsync("/api/auth/me");
@@ -61,15 +59,15 @@ public sealed class AuthMeEndpointTests
     [Fact]
     public async Task Get_reflects_the_admin_flag()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
         // Only the service role may set is_admin (migration 138 column grant).
-        await using (var serviceDb = _fixture.NewDbContext())
+        await using (var serviceDb = Db.NewDbContext())
         {
             await serviceDb.Database.ExecuteSqlRawAsync(
                 "UPDATE users SET is_admin = true WHERE id = {0}", alice.UserId);
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, alice);
 
         var body = (await (await client.GetAsync("/api/auth/me"))
@@ -85,8 +83,8 @@ public sealed class AuthMeEndpointTests
         // coffer_app role any UPDATE of is_admin — so a user can't self-promote
         // even on their own row. Only the service role (setup-complete,
         // migrations) sets it.
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        await using var appDb = _fixture.NewAppDbContextAsUser(alice.UserId);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        await using var appDb = Db.NewAppDbContextAsUser(alice.UserId);
 
         var ex = await Assert.ThrowsAsync<Npgsql.PostgresException>(() =>
             appDb.Database.ExecuteSqlRawAsync(
@@ -101,8 +99,8 @@ public sealed class AuthMeEndpointTests
         // No auth header, no dev-auth → the default policy rejects.
         // The SPA's auth-check loader treats this 401 as "redirect
         // to /login," which is the whole reason this endpoint exists.
-        await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
         {
             HandleCookies = false,
@@ -119,9 +117,9 @@ public sealed class AuthMeEndpointTests
         // /api/auth/me ever looked up users by something other than
         // the authenticated user (regression risk in a future
         // refactor), this would surface it.
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var aliceClient = await AuthedClientAsync(factory, alice);
 
         var response = await aliceClient.GetAsync("/api/auth/me");

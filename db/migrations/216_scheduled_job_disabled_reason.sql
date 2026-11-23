@@ -11,7 +11,7 @@
 -- the second is a LogError line inside a container — precisely the situation mig 194
 -- set out to escape.
 --
--- The consequence is not academic. A job the scheduler gave up on looks exactly like one
+-- The consequence: a job the scheduler gave up on looks exactly like one
 -- the operator meant to leave off, so the state that needs attention is
 -- indistinguishable from the state that does not.
 --

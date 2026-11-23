@@ -20,4 +20,7 @@ export interface LedgerOperationSummary {
      *  { txns_inserted, txns_already_known } or { prices_inserted, … }. */
     details: Record<string, number>;
     errorCount: number;
+    /** The bank feed connection a feed sync pulled; null for every other operation and
+     *  for a sync whose connection has since been removed. */
+    feedConnectionId: string | null;
 }

@@ -17,11 +17,12 @@ namespace Coffer.Api.Tests.Integration.Auth;
 /// forgotten call site from breaking).
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class UsernameCaseInsensitivityTests
+public sealed class UsernameCaseInsensitivityTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public UsernameCaseInsensitivityTests(PostgresFixture fixture) => _fixture = fixture;
+    public UsernameCaseInsensitivityTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     [Fact]
     public async Task Lookup_by_a_different_case_finds_the_row()
@@ -29,7 +30,7 @@ public sealed class UsernameCaseInsensitivityTests
         var suffix = Guid.NewGuid().ToString("N");
         var stored = $"Ada_{suffix}";
 
-        await using (var seed = _fixture.NewDbContext())
+        await using (var seed = Db.NewDbContext())
         {
             seed.Users.Add(new UserRow
             {
@@ -41,10 +42,10 @@ public sealed class UsernameCaseInsensitivityTests
             await seed.SaveChangesAsync();
         }
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
 
-        // The bug this fixes: registering as `Ada` then typing `ada` at sign-in
-        // returned nothing — "user not found" for an account that exists. With a
+        // Registering as `Ada` then typing `ada` at sign-in must find the account,
+        // not answer "user not found" for an account that exists. With a
         // passkey the username is often the only thing the user types.
         foreach (var typed in new[] { stored.ToUpperInvariant(), stored.ToLowerInvariant() })
         {
@@ -62,7 +63,7 @@ public sealed class UsernameCaseInsensitivityTests
     {
         var suffix = Guid.NewGuid().ToString("N");
 
-        await using (var seed = _fixture.NewDbContext())
+        await using (var seed = Db.NewDbContext())
         {
             seed.Users.Add(new UserRow
             {
@@ -74,7 +75,7 @@ public sealed class UsernameCaseInsensitivityTests
             await seed.SaveChangesAsync();
         }
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         db.Users.Add(new UserRow
         {
             Id = Guid.NewGuid(),
@@ -102,7 +103,7 @@ public sealed class UsernameCaseInsensitivityTests
         var suffix = Guid.NewGuid().ToString("N");
         var stored = $"JOSÉ_{suffix}";
 
-        await using (var seed = _fixture.NewDbContext())
+        await using (var seed = Db.NewDbContext())
         {
             seed.Users.Add(new UserRow
             {
@@ -114,7 +115,7 @@ public sealed class UsernameCaseInsensitivityTests
             await seed.SaveChangesAsync();
         }
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var typed = $"josé_{suffix}";
         var found = await db.Users.AsNoTracking()
             .FirstOrDefaultAsync(u => u.Username == typed);

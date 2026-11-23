@@ -13,26 +13,26 @@ namespace Coffer.Api.Tests.Integration.Scheduling;
 /// <para>
 /// <c>UpsertAsync</c> computes <c>next_run_at</c> through the same
 /// <see cref="DailyScheduleTiming"/> helper the scheduler tick uses, and a local time
-/// inside the gap made <c>ConvertTimeToUtc</c> throw — a 500 on the PUT, and on the
-/// tick an exception that escaped <c>RunDueAsync</c> and stalled every job on the
-/// ledger for a day.
+/// inside the gap makes an unguarded <c>ConvertTimeToUtc</c> throw — a 500 on the PUT,
+/// and on the tick an exception that escapes <c>RunDueAsync</c> and stalls every job on
+/// the ledger for a day.
 /// </para>
 /// <para>
-/// <b>This is a repository test rather than an endpoint test on purpose.</b> The
-/// endpoint version was written first and was VACUOUS: the endpoint passes
-/// <c>DateTime.UtcNow</c>, so the next 02:30 is almost never the spring-forward date,
-/// and it passed with the guard deleted. Verified by mutation, not assumed.
-/// <c>UpsertAsync</c> takes <c>nowUtc</c> as a parameter, so this level can pin the one
+/// <b>This is a repository test rather than an endpoint test on purpose.</b> An
+/// endpoint test is VACUOUS: the endpoint passes <c>DateTime.UtcNow</c>, so the next
+/// 02:30 is almost never the spring-forward date, and it passes with the guard
+/// deleted. <c>UpsertAsync</c> takes <c>nowUtc</c> as a parameter, so this level can pin the one
 /// instant that actually exercises the gap — and the endpoint is covered by sharing the
 /// helper, which the assertion on the stored <c>next_run_at</c> pins.
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class SchedulesRepositoryDstTests
+public sealed class SchedulesRepositoryDstTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SchedulesRepositoryDstTests(PostgresFixture fixture) => _fixture = fixture;
+    public SchedulesRepositoryDstTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     /// <summary>
     /// 2026-03-08 06:00Z is 01:00 EST — before the jump, so the next 02:30 slot is
@@ -41,8 +41,8 @@ public sealed class SchedulesRepositoryDstTests
     [Fact]
     public async Task Storing_a_schedule_whose_next_run_falls_in_the_dst_gap_succeeds()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewServiceDbContext();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewServiceDbContext();
         var repo = new SchedulesRepository(db);
 
         var nowUtc = new DateTime(2026, 3, 8, 6, 0, 0, DateTimeKind.Utc);

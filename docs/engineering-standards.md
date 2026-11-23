@@ -62,8 +62,8 @@ The body should answer "why this change is needed" and "what alternatives were c
 
 - Once a migration file is committed to `main`, it is never edited.
 - Need to fix a mistake? Add a new migration that corrects it.
-- **One exception: comments** (decided 2026-10-20). A shipped migration's comments
-  may be rewritten, as they were to take account names and amounts out of the repo's
+- **One exception: comments.** A shipped migration's comments
+  may be rewritten, for example to keep account names and amounts out of the repo's
   prose (§8). DbUp journals by script name, so nothing re-runs. But Postgres keeps
   two kinds of text: `COMMENT ON` text, and a function's body, comments included. An
   edit to either, on an object that is still current, ships with a new migration that
@@ -71,6 +71,13 @@ The body should answer "why this change is needed" and "what alternatives were c
   (migration 257 is the first). Code is never edited in place, comment or not.
 - Migration filenames are zero-padded sequential: `001_extensions.sql`, `002_tables.sql`, …
 - Each migration is idempotent where reasonable, but the primary contract is "run once on a fresh DB". **DbUp** is the migration runner: the API applies every file in `db/migrations/` at startup via `MigrationRunner` (`src/Api/Migrations/`), journaled in a DbUp tracking table, using the service-role connection.
+- **A data step that must run C# is a journaled C# step**, not SQL: listed in
+  `MigrationRunner.CSharpSteps`, journaled under its own name directly after the script
+  it belongs to, and deterministic like any migration (`264_stored_leg_notes_backfill` is
+  the first). The memo-and-tags rule has no SQL definition, so a change to what it
+  stores ships as a new numbered recompute step, which also retires older snapshots
+  through the schema version. `StoredNotesRuleVersionTests` fails when the rule's output
+  over its perspective matrix changes without one.
 
 ### 3.2 Schema changes
 
@@ -123,9 +130,15 @@ Triggers in scope today:
   canonical `(posted_at, seq)` ordering by rejecting any UPDATE
   that would mutate `seq` or `created_at`. Both columns are set
   once on INSERT and never change.
-- **Validation (being phased out, ADR-0032 §4)** — all migrated
-  to API-side enforcement; remaining cleanup tracked in
-  follow-ups.
+- **Validation (none left, ADR-0032 §4)** — all migrated to
+  API-side enforcement. The last one,
+  `trg_account_folders_refuse_cycle` (mig 258, added as a backstop
+  under the API's own cycle check), was dropped in migration 261;
+  `AccountFoldersRepository.MoveAsync` refuses the cycle under a
+  per-section lock.
+- **Not yet re-justified** — the two invariant-lockdown guards
+  above predate this rule's gates and have never been checked
+  against them; the open-work backlog tracks it.
 
 **Every trigger** (existing or new) must have:
 
@@ -168,21 +181,37 @@ API, future sync worker, tests — not just bulk imports.
 
 **Rules:**
 
-1. **Repositories are stateless.** They accept an `NpgsqlConnection`
-   (or, in the future, a connection + transaction abstraction) and
-   execute against the caller's transaction context. Repositories
-   never call `BeginTransactionAsync` themselves; that's the caller's
-   job at the orchestration layer.
+1. **An API repository method is one unit of work.** Repositories hold
+   no state between calls. When a method runs more than one statement
+   that must stand or fall together, it opens the transaction itself,
+   unless its caller already holds one, in which case it works in the
+   caller's. An endpoint that writes through a repository opens no
+   transaction. The endpoints that complete an invite, accept one and
+   complete setup write a user's rows (the user, its passkey and
+   recovery codes, a ledger grant, the admin flag) on a service
+   context directly, with no repository between, and open their own.
+   A write that can recompute
+   a ledger's balances or holdings opens its transaction through
+   `BeginLedgerWriteAsync` (`LedgerWriteLock`,
+   [ADR-0112](decisions/0112-one-write-lock-per-ledger.md)), never
+   through `BeginTransactionAsync` directly: the helper takes the
+   ledger write lock as the transaction's first statement, or takes it
+   in the caller's transaction. A save that opens no transaction gets
+   the fallback transaction rule 4 describes.
 
-2. **Transaction boundaries live at the orchestration layer.**
-   - The Moneydance importer wraps every step inside a single
-     transaction in `ImportCommand`. If any step fails, the entire
-     import rolls back.
-   - The .NET API (Phase 3+) wraps each write endpoint in a
-     transaction. Read endpoints can use auto-commit / single-statement
-     queries.
-   - The SimpleFIN sync worker (Phase 5+) wraps each pulled batch (per
-     institution per run) in a transaction.
+2. **Where the boundaries are.**
+   - **The API:** the repository method (rule 1).
+   - **The Moneydance importer:** `MoneydanceImportService.ImportAsync`
+     wraps every step in a single transaction on its connection, and
+     the importer's repositories work in it. If any step fails, the
+     entire import rolls back.
+   - **Bank feeds and file imports** (`IngestOrchestrator`): each save
+     of a run is its own transaction. A save that can recompute takes
+     the ledger write lock; the lock is never held across the provider
+     fetch or the file parse.
+   - **Reads:** a single-statement read uses auto-commit. A read that
+     needs one consistent view across several statements (a report,
+     the consistency check) opens a `REPEATABLE READ` transaction.
 
 3. **Schema invariants are enforced in the database, not in
    application code.** FK constraints, CHECK constraints, UNIQUE
@@ -198,14 +227,21 @@ API, future sync worker, tests — not just bulk imports.
    `unnest()` is a single statement inside the surrounding
    transaction, so a later failure rolls the whole thing back.
 
-   This rule used to cite "statement-level triggers (e.g. `balance_after`)"
-   as the mechanism. There are no such triggers: migration 102 dropped the
-   balance family, and the only triggers left in the schema are the two
-   `txn_headers` immutability guards — as §3.3 of this document already
-   says, so the two contradicted each other. Derived state is recomputed
-   by an EF `SaveChangesInterceptor` after the write, inside the same
-   transaction, which preserves the same rollback property by a different
-   route.
+   The mechanism is not a trigger: migration 102 dropped the balance family,
+   and the only triggers in the schema are the two `txn_headers`
+   immutability guards (§3.3). Derived state is recomputed by an EF
+   `SaveChangesInterceptor` after the write, inside the same transaction,
+   which preserves the same rollback property. That transaction is the
+   caller's when it holds one; otherwise `LegNotesRecomputeInterceptor`,
+   registered last, opens one for every save and commits it after every
+   other interceptor's post-save work, and `AppDbContext` ends it when the
+   save throws (a concurrency failure included, which EF reports without
+   `SaveChangesFailed`). A save that recomputes balances or holdings runs
+   in its writer's own transaction, opened with the ledger write lock
+   (`BeginLedgerWriteAsync`, rule 1): the recompute functions refuse a
+   transaction that has written without that lock, and the fallback
+   transaction does not take it. The fallback serves saves that recompute
+   neither.
 
 5. **No DDL inside data-write transactions.** `ALTER TABLE`,
    `DISABLE TRIGGER`, `CREATE INDEX`, etc. inside a write transaction
@@ -214,26 +250,32 @@ API, future sync worker, tests — not just bulk imports.
    the right fix is almost always at the application level (batching,
    bulk SQL, query restructure), not at the schema level.
 
-6. **Tests inherit the same discipline.** Integration tests reset
-   state via transactions or `TRUNCATE`; either way the DB's
-   invariants apply during test runs. Adding a test that explicitly
+6. **Tests inherit the same discipline.** Every integration test runs on
+   a database of its own, cloned from a migrated template and dropped
+   after it (§5.2), so the DB's invariants apply during test runs exactly
+   as they do on an install. Adding a test that explicitly
    exercises rollback (start a transaction, write rows, throw,
    ROLLBACK, assert zero rows) for any new repository is good
    practice.
 
 7. **Concurrency.** Multi-user shipped in 0.34.0 (ADR-0083): per-ledger
    owner / editor / viewer grants, member management and invite links.
-   This rule used to say "Coffer is a single-user app … if we ever go
-   multi-user, this section gets superseded by a new ADR" — the ADR
-   exists and the rule did not follow it.
 
-   What has NOT changed is that there are still no optimistic
+   There are still no optimistic
    concurrency tokens and no conflict-resolution rules; a second editor
    on the same row is last-write-wins. That is now a gap rather than a
    property of the product. Where concurrency IS handled it is handled
    explicitly and per-path: the transaction boundary on a write covers
    its own read-then-write (see the PATCH paths), and long operations
-   take a named lock rather than relying on there being one user.
+   take a named lock rather than relying on there being one user. Every
+   write that can recompute a ledger's balances or holdings, and every
+   consistency repair, takes the ledger write lock (`fn_ledger_write_lock`,
+   [ADR-0112](decisions/0112-one-write-lock-per-ledger.md)) before it
+   writes or locks anything, so writes to one ledger take turns. A write
+   that waits past the bound (half its command timeout) is refused as
+   `ledger-write-busy` (a 422, an MCP error result, a deferral for a
+   scheduled writer) and changes nothing; a repair, which takes the lock
+   one piece at a time, keeps the pieces it rewrote before the refusal.
 
 ---
 
@@ -251,17 +293,18 @@ API, future sync worker, tests — not just bulk imports.
 - Nullable reference types **on**.
 - `record` for DTOs; `class` for behaviour.
 - Async all the way; no `.Result` / `.Wait()`.
-- Migrations and seed data live in SQL, not in C# fluent migrations. EF Core is for queries, not for schema authority.
+- Schema and seed data live in SQL, not in C# fluent migrations. EF Core is for queries, not for schema authority. A data step that must run the C# memo-and-tags rule is a journaled C# step (§3.1), never a SQL copy of the rule.
+- **Memo and tags have one writer and one reading.** Every write of a memo, a tag pairing or the originating account goes through the write primitive (`AnnotationPlanner` in `Coffer.Domain.Annotations`, applied in the API by `AnnotationWriter`); `AnnotationWriteCatalogTests` fails on a writer outside it. Every reader of what a register shows reads the stored memo-and-tags presentation (`notes_*`, `txn_leg_note_tags`), never the raw inputs; `AnnotationReaderCatalogTests` fails on a read of an input outside its allow-list.
 
 ### 4.2.1 Data-access split: EF Core vs. Dapper
 
-Per [decisions/0005-dapper-and-efcore.md](decisions/0005-dapper-and-efcore.md), with the realignment as of PR 3.6.5:
+Per [decisions/0005-dapper-and-efcore.md](decisions/0005-dapper-and-efcore.md), as realigned:
 
 | Layer | Default | Notes |
 |---|---|---|
 | **API** (`src/Api/`) | **EF Core via `AppDbContext`** | Routine CRUD, transactional inserts, view-backed reads, `ExecuteUpdate`/`ExecuteDelete` for set-based mutations. The Dapper package is not referenced by the API at all. |
-| **Register query** (PR 3.7+) | **EF Core over the Postgres function `register_entry_keys`**, bound with `HasDbFunction` | Keyset paging is the one place ADR-0005 originally carved out for Dapper. It is a Postgres function rather than raw SQL in C#, so the API stays on one ORM. The cursor is `(posted_at, header_seq, entry_key)` — `seq` replaced `created_at` in migration 097, and the entry key is asymmetric per ADR-0036. **`MR.EntityFrameworkCore.KeysetPagination` is still a package reference but is never called** — this row used to name it as the mechanism; it is dead weight and should come out of `Api.csproj`. |
-| **Importer** (`src/Importer.Moneydance/`) | **Dapper** | Bulk-insert patterns (a six-figure row count in a single transaction), `unnest(@arr1, @arr2)` array-parameter inserts, deferred constraint timing — these are the genuine Dapper sweet spots. The importer never adopted EF and won't until there's a concrete reason to. |
+| **Register query** (PR 3.7+) | **EF Core LINQ over `resolved_transactions`** (`RegisterQuery`; the Postgres function it replaced, `register_entry_keys`, was dropped by migration 266) | Keyset paging is the one place ADR-0005 originally carved out for Dapper. It is LINQ rather than raw SQL in C#, so the API stays on one ORM; the keyset is a row-value comparison EF translates. The cursor is `(posted_at, header_seq, entry_key)` — `seq` replaced `created_at` in migration 097, and the entry key is the stored grouping (the header on the side it belongs to, else the leg). |
+| **Importer** (`src/Importer.Moneydance/`) | **Dapper** | Bulk-insert patterns (a whole export's rows in a single transaction), `unnest(@arr1, @arr2)` array-parameter inserts, deferred constraint timing — these are the genuine Dapper sweet spots. The importer never adopted EF and won't until there's a concrete reason to. It plans memo and tags through the same write primitive as the API (`AnnotationPlanner`, via `MoneydanceNotes`), and the API fills the stored memo-and-tags presentation inside the import's own transaction (`ImportJobRunner`'s before-commit step runs `LegNotes.RecomputeLedgerOnAsync`, first of the writes it makes inside the import's transaction). |
 | **Tests** | Same as the layer they test | Test helpers (arrange / assert) use the same data-access layer as the production code under test, so a test isn't more permissive than the path it covers. |
 
 ### 4.2.2 EF Core entity mapping rules
@@ -303,6 +346,8 @@ Boundary rules:
 - **Pre-auth or cross-user code paths** explicitly inject `ServiceDbContextFactory` and `await using var db = factory.Create()` for that operation. The factory boundary is visible in the type signature — there's no implicit switch.
 - **Identity tables (`users`, `user_ledger_grants`, `auth_sessions`, `webauthn_credentials`, `recovery_codes`, `webauthn_pending_challenges`, `ledgers`)** are `FOR SELECT TO coffer_app` only in migration 017; writes require service-role escalation. The exception is `users` (and `users.last_opened_ledger_id` self-update) — `FOR ALL` with `id = current_app_user_id()` so the self-update path stays on `coffer_app`.
 - **Ledger-content tables (`accounts`, `transactions`, `tags`, `merge_rules`, `transaction_rules`, …)** are `FOR ALL TO coffer_app` with `WITH CHECK == USING` so the user can read AND write under the same predicate — they're the legitimate writer.
+- **A `SECURITY DEFINER` function is a declared exception**, never a convenience, and each one checks access itself. `saved_reports_repoint_tag` (migration 263) is one: a tag merge has to repoint every member's saved reports, which RLS keeps owner-only, so the function rewrites only the tag reference inside `saved_reports.spec`, after checking that the caller holds an owner or editor grant on the ledger. That makes it a second place that checks ledger access, an accepted risk, so it is tested with a second ledger and a non-member caller (`SavedReportsRepointTagTests`).
+- **A `BYPASSRLS` path never resolves a ledger by name.** The Moneydance import runs on the service role, where a lookup by name would find other users' ledgers; it only ever creates a new ledger, owned by the importing user.
 
 When in doubt: if the operation is "the authenticated user doing a thing in their own data," use `AppDbContext` and trust RLS. If the operation crosses the authentication boundary (resolves who the user is, mints/burns auth state, creates a ledger as a unit, applies a DDL migration), use `ServiceDbContextFactory`.
 
@@ -318,7 +363,7 @@ When in doubt: if the operation is "the authenticated user doing a thing in thei
 
 ### 4.3.1 Frontend engineering posture
 
-The user is the long-term maintainer and is not a React expert. The posture: **conservative, grounded, security-first, no shortcuts** (saved as memory `feedback_frontend_engineering_posture` for AI agents and as standards here for humans).
+The frontend has to stay maintainable by someone who is not a React specialist. The posture: **conservative, grounded, security-first, no shortcuts**.
 
 Concretely:
 
@@ -337,7 +382,7 @@ src/Web/
 ├── vite.config.ts          /api proxy + Vitest test config (uses defineConfig from vitest/config so the `test` block types)
 ├── eslint.config.js        Flat config, typescript-eslint + react-hooks + react-refresh
 ├── index.html              Vite entry
-├── vitest.setup.ts         Extends expect with @testing-library/jest-dom
+├── vitest.setup.ts         Extends expect with @testing-library/jest-dom; fails a test that sends a request whose path has an empty segment (an empty id), when the request goes through the API client's request functions (whatever fetch the test installed) or reaches the environment's fetch or the shared fetch stub
 └── src/
     ├── main.tsx            QueryClientProvider + RouterProvider mount
     ├── App.tsx             Pure components only (RootLayout, AuthedOutlet)
@@ -354,7 +399,7 @@ src/Web/
     │   └── useWindowedRegister.ts   The register's bidirectional page window
     ├── components/ui/      ~25 hand-built primitives — Button, Input, Label,
     │                       Typeahead, ContextMenu, ConfirmDialog, Modal,
-    │                       StatusBadge, KpiTile, Chip, Panel, Toolbar, …
+    │                       StatusBadge, Skeleton, Chip, Panel, Toolbar, …
     └── routes/             One folder per route, route component lives here
 ```
 
@@ -385,19 +430,19 @@ assertion nobody has seen fail is a claim, not a check — and the failure mode 
 by construction: the suite goes green either way, which is the one defect a test suite
 cannot find.
 
-This is not theoretical here. A component test asserting that two strings were absent
-ran on a frame where the component had short-circuited and the DOM was empty; it
-passed whether or not the feature worked, and it SHIPPED. Two more asserting that
-admin-only tabs are hidden from non-admins queried before any tab had rendered — they
-passed whether or not those tabs were gated at all. A repository test called `Revoke`
-twice and asserted nothing. Each read as a normal, well-named test.
+The shapes it catches: a component test asserting that two strings are absent, run on
+a frame where the component short-circuited and the DOM is empty, passes whether or
+not the feature works; a test asserting that admin-only tabs are hidden from
+non-admins, querying before any tab renders, passes whether or not the tabs are gated;
+a repository test that calls `Revoke` twice and asserts nothing passes whatever
+`Revoke` does. Each reads as a normal, well-named test.
 
 Scoped deliberately, or it becomes ceremony nobody does:
 
 - **Assertions on NEW behaviour**, not every test a change happens to touch.
 - **Negative assertions always** — `Assert.Null`, `Assert.Empty`, `DoesNotContain`,
   "expect 204", `queryBy*`. A negative assertion is true of an empty world, so it
-  passes whenever the code under test never ran. This is the whole population above.
+  passes whenever the code under test never ran. Every shape above is one.
 - **Not required where the test already failed first** and was made to pass. That is
   the same evidence arrived at from the other side.
 - Name the mutation in the PR body — "dropping the account filter deletes every member
@@ -408,9 +453,8 @@ Scoped deliberately, or it becomes ceremony nobody does:
 satisfied by an empty render. The predicate is exact, so there is nothing to suppress.
 
 **The .NET half stays a rule rather than a gate**, because "would this pass against
-unmodified code" is undecidable in general and every mechanical approximation tried
-here produced far more noise than signal — a gate that cries wolf is one someone turns
-off.
+unmodified code" is undecidable in general and a mechanical approximation produces far
+more noise than signal — a gate that cries wolf is one someone turns off.
 
 ### 5.1 Unit vs. integration test layout
 
@@ -426,10 +470,11 @@ tests/Api.Tests/
 │       └── BootstrapTokenHelpersTests.cs    ← static encoders; no DB
 └── Integration/
     ├── Infra/
-    │   ├── PostgresFixture.cs               ← Testcontainers + DbUp
+    │   ├── PostgresFixture.cs               ← Testcontainers + migrated template
+    │   ├── DatabaseTest.cs                  ← base class: a database per test (§5.2)
+    │   ├── TestDatabase.cs                  ← one test's database and its handles
     │   ├── ApiFactory.cs                    ← WebApplicationFactory<Program>
-    │   ├── SyntheticLedger.cs               ← per-test atomic builder
-    │   └── TestConnectionFactory.cs
+    │   └── SyntheticLedger.cs               ← per-test atomic builder
     ├── Auth/
     │   ├── BootstrapTokenServiceTests.cs    ← DB-touching service
     │   ├── UsersRepositoryTests.cs          ← Dapper CRUD round-trips
@@ -437,23 +482,38 @@ tests/Api.Tests/
     └── HealthEndpointsTests.cs              ← WebApplicationFactory
 ```
 
-### 5.2 Integration tests bootstrap a synthetic ledger atomically
+### 5.2 Every integration test gets a database of its own
 
-Every integration test arranges its own state from scratch. Helpers like `SyntheticLedger.CreateAsync` mint a fresh ledger row, a fresh user with a random username, and a default owner grant in **one transaction** at the start of each test. Tests reach further state (accounts, transactions, credentials) via repository methods seeded by these per-test ids.
+Tests that share a database see whatever earlier tests left in it, so a result depends on what ran before, and a per-test timing measures the whole run's rows. Unique ids per test separate rows logically; they do not isolate global tables, planner statistics, or anything a test counts. So **every test that touches the database runs on its own database**: a clone of a template, created before the test and dropped after it. The one exception is a class fixture that holds one database for every test of its class (`PostgresFixture.CreateDatabaseAsync(owner, log)`), used where building the state is a cost the whole class shares: `FullDemoTests` adds the whole Demo once and every fact reads it (ADR-0115 D8). Its database gets the same end checks when the class ends, and no test of that class may also be a `DatabaseTest`, whose end would find the fixture's sessions in a database not its own.
 
-This pattern is the source of test isolation:
+**How.** A test class derives from `DatabaseTest` (`tests/Api.Tests/Integration/Infra/DatabaseTest.cs`; the importer test project has its own, over the same linked machinery) and reaches its database through `Db`: connection strings for the three roles, contexts and factories, all pointing at that one database (the importer's `Db` is `coffer_service` only, the role production's import writes as). Setup that needs it goes in `OnInitializedAsync`, since a constructor runs before it exists. The fixture exposes no connection string; a test that points one of its own at another database is caught by the end-of-test check.
 
-- **No shared fixture state.** Tests don't rely on rows another test left behind, and don't have to TRUNCATE between runs (except for genuinely global tables like `bootstrap_tokens` whose semantics are inherently global).
-- **No real export.** Importing a large real-world Moneydance file in tests is forbidden — it's slow, non-deterministic, and forces every test to coexist with thousands of unrelated rows. Atomic synthetic data is fast and lets the test name what it actually exercises.
-- **Per-anchor uniqueness keeps tests parallel-safe.** Migration 014 made the `external_id` indexes per-`ledger_id`, so two tests inserting the same MD external_id under different ledgers don't collide.
+**The template**, built once per test process, the same way in both test projects: roles provisioned cluster-wide as `db/init` does, the template owned by the fixture's own superuser role so no role a test runs as can unlock it, migrated as `coffer_service` by the production runner, first-boot writes settled through the app's own code (API project: the OAuth key pair, the backup-age monitor's first alert) so a host booted on a clone writes nothing at boot, ANALYZEd, then locked (`IS_TEMPLATE`, no connections). A clone starts with exactly its rows and statistics. The backup alert throttles the monitor for `BackupAgeMonitor.RepeatAfter` from when it was written, so a clone is refused, with a message saying so, once the process is within an hour of that bound.
 
-A test that needs the same ledger across phases of arrange/act builds it once and reuses the returned `SyntheticLedger` instance; a test that needs two ledgers (e.g. cross-ledger isolation) calls the builder twice.
+**What a test's end checks**, failing the test (`TestDatabaseCluster.EndTestAsync`): a session left in a database that is not the test's own; a session in its own still running a statement or holding a transaction; once every pool in the process is cleared, any session left in the maintenance database (a connection never returned, which could hold an advisory lock or a LISTEN into the next test); a connection into an earlier test's database after that test released it; a large object in the maintenance database; a database outside the allowlist (the server's own, the template, running and pending per-test databases), whatever its name; a change to the two roles (attributes, memberships, settings) or to the databases no test owns (owner, flags, ACL); a failed drop of an earlier test's database. The fixture's own sessions run as a role whose password only the cluster holds, and are the only ones the checks leave out. The drop runs in the background; at the end of the run the fixture waits for every drop, repeats the checks, compares the template's content through a fresh clone, and fails the run (a collection cleanup failure, which makes `dotnet test` exit non-zero) on any of them. A test whose `OnInitializedAsync` throws has its database ended and released before the exception propagates, since xunit 2 skips `DisposeAsync` after a failed `InitializeAsync`. Each test's output says `db <name> clone <ms>`.
+
+**The stored notes, before that.** `DatabaseTest`'s teardown, in both test projects, first runs the stored-equals-computed check over the test's database (`StoredNotesDatabaseCheck`): every leg's stored memo-and-tags presentation must be what the rule computes from its current rows. A test that seeds or changes an input of the rule past every writer ends with the backfill (`SyntheticLedger.RecomputeAllNotesAsync`, `LegNotesBackfill.RunAsync`) or fails here, by name; one that makes the stored values wrong on purpose puts them right before it ends.
+
+**A second database.** `Db.CreateSiblingAsync()` is another clone of the template; `Db.EmptyDatabaseConnectionString(suffix)` is one with no schema, the state a fresh install boots into (upgrade and migration tests). Both are named under the test's database and dropped with it.
+
+**What is still shared** between the tests of one process, which run one at a time in one collection:
+
+- the container, and the roles with their cluster-wide settings (`RoleSettingsMirrorInitScriptTests` holds them to `db/init/00-init-roles.sh`);
+- process environment variables (`ApiFactory` rewrites the ones `Program.cs` reads at host build);
+- temp and bin-directory files (backup and restore-staging directories: give a test its own);
+- anything a test changes cluster-wide, which it must put back in a `finally` — `AdminRestoreEndpointTests` toggles `coffer_service`'s `CREATEDB`.
+
+Nothing a test could share may live in the maintenance database or in `template1`: `coffer_app` can connect to neither; `coffer_service`, which the migration runner connects to `postgres` with, can create nothing there (no `CREATE` on `public` by the server's default, no `TEMPORARY`, no large objects), and cannot connect to `template1`. Empty databases are created from `template0`, owned by `coffer_service` as a fresh install's is. Tests that run the migration runner hand it an unpooled connection string (`TestDatabaseCluster.ForMigrationRunner`): its database-exists check pools in a place `ClearAllPools` does not reach, and that idle connection would read as a leak.
+
+So a test never truncates or deletes rows to protect itself from other tests. It deletes rows only when its own scenario needs them gone — for example the OAuth key pair or the first backup alert the template carries.
+
+**Synthetic data still.** `SyntheticLedger.CreateAsync` mints a ledger, a user with a random username and the owner grants in one transaction, and tests reach further state through repository methods seeded by those ids, so a test names the state it exercises rather than leaning on whatever the template holds. Importing a large real-world Moneydance file in tests is forbidden: it is slow, non-deterministic, and buries what the test exercises. A test that needs the same ledger across phases reuses the returned `SyntheticLedger`; a test that needs two ledgers (cross-ledger isolation) calls the builder twice.
 
 ---
 
 ### 5.2.1 Financial paths test a `{ typical, boundary }` matrix
 
-Two shipped bugs came from tests seeded with kiddie-pool data — a round three-digit amount, a handful of whole shares — that never approached the magnitudes where money math breaks. The code was wrong at scale and every test passed, because no test asked a question big enough to get the wrong answer.
+Tests seeded with small round data — a three-digit amount, a handful of whole shares — never approach the magnitudes where money math breaks. Code that is wrong at scale passes every such test, because none asks a question big enough to get the wrong answer.
 
 So **a test touching money, a quantity, or a `decimal` materialisation path is a `[Theory]` over `Boundary.Positions`, not a `[Fact]` at a comfortable size**:
 
@@ -465,9 +525,33 @@ public async Task Something_holds(Boundary.Position p) { ... }
 
 `tests/Api.Tests/Integration/Infra/Boundary.cs` is the single source of truth for the magnitudes, and every value in it is tied to a **column precision verified against the migration that set it** — never a round number chosen for looking large. `SyntheticLedger.AddBoundaryPositionAsync` seeds a position at a given magnitude in one call (holdings row, buy, and recompute together — doing only some of the three silently leaves the projection empty).
 
-Why fractional quantities specifically: a `decimal` product keeps the **sum of its operands' scales**, so a `NUMERIC(25,12)` quantity times a `NUMERIC(19,4)` price runs to 16 decimal places. Whole shares divide evenly and never grow the scale, so a whole-share fixture cannot reach the failure. This is not a hypothetical — it is how the net-worth cross-check between the overview and the history series passed while the two routes disagreed.
+Why fractional quantities specifically: a `decimal` product keeps the **sum of its operands' scales**, so a `NUMERIC(25,12)` quantity times a `NUMERIC(19,4)` price runs to 16 decimal places. Whole shares divide evenly and never grow the scale, so a whole-share fixture cannot reach the failure: on one, the net-worth cross-check between the overview and the history series passes even where the two routes would disagree at a fractional position.
+
+A value that lands exactly on a midpoint is the other case round data never reaches. `decimal.Round` rounds a half to even by default and Postgres `ROUND` rounds it away from zero, so a figure computed in C# and the same figure computed in SQL differ by one unit in the last place there. C# rounding that must agree with SQL passes `MidpointRounding.AwayFromZero` (`ReportingScale.MarketValue`), and `NetWorthReconciliationTests` seeds a position whose market value is a midpoint.
+
+Money also has a currency dimension. Every money figure is held at its own currency's ISO 4217 minor units ([ADR-0114](decisions/0114-benchmarks-and-currency-conversion.md) D15), so a test of a path that validates, rounds, stores or formats a money figure covers each case a 2-place fixture cannot reach:
+
+- **0, 2 and 3 places**: a currency of each, with an amount at exactly its places, one with a digit more (refused when typed; rounded half away from zero when computed or ingested, except the loan payment, which rounds up to one minor unit), and, for the 3-place currency, an amount with three decimals that a 2-place assumption would round away;
+- **the refused codes**: a 4-place fund unit (`CLF`, `UYW`) and a code that is not an ISO 4217 currency with an exponent, each refused as an account's and as a ledger's currency;
+- **a grandfathered value**: a stored amount that does not fit its currency, which is kept, passes an edit that leaves it unchanged, and is listed by the consistency check, as an advisory without counting in its verdict (settled by Claude, 2026-11-16); and a stored account or ledger code that would now be refused for any reason (a 4-place fund unit, an "N.A." entry or a code that is not an ISO 4217 currency with an exponent), which keeps working at 2 places, also in the SQL minor-units function, and is listed too (settled by Claude, 2026-11-16).
+
+The places come from the checked-in ISO 4217 data file the API and the SPA share (ADR-0114 D15). Prices, share quantities and exchange rates are not money and keep the magnitudes above.
 
 The complement is the schema-drift guards (`SchemaDriftGuardTests`): those catch the *column* side, boundary data catches the *code-path* side.
+
+---
+
+### 5.2.2 A disposed test host is garbage
+
+Every endpoint test boots its own host through `ApiFactory`, so nothing process-wide may hold a host once the test has disposed it. A host that is held is kept for the rest of the run: memory grows by a host per test, and every full collection walks the pile, so later tests run slower than they do alone. A production process builds one host and keeps it for its life, so the same holder costs production nothing, and only the suite shows it.
+
+The holders are things a host fills or starts and the framework or a library never empties or stops: ASP.NET Core's rate-limiting middleware never disposes its endpoint limiter, whose replenishment timer then holds the pipeline; the HTTP client factory's handler-expiry and cleanup timers call back into the factory, which holds the host's services until its handlers expire and are cleaned up, minutes after the host is disposed; and Microsoft.Extensions.AI caches each MCP tool's descriptor under the MCP SDK's process-wide serializer options, with an entry key that captures the host's services. A holder that lets go after minutes still counts: the suite then keeps the hosts of the last few minutes, and every test runs slower for them. So:
+
+- **The fix for a holder only the suite shows lives in the test host, not in production code.** Production rate limiting, authentication, authorization and session code is never changed or replaced to fix a test problem. `ApiFactory` releases the holders when it disposes a host: it disposes the framework rate limiters it finds in the host's pipeline (`PipelineRateLimiters`), stops the timers of the host's HTTP client factory (`HttpClientFactoryTimers`), and drops the tool descriptors cached under the SDK's default options (`McpToolDescriptorCache`). Each reads framework or library internals and fails, rather than do nothing, when those move. The test host keeps production's configuration, such as the handler lifetime; the release happens after the host is disposed.
+- A timer, limiter or background loop the app itself starts is owned by the container (a singleton disposed with it) or stopped by the host's shutdown.
+- A test disposes every `ApiFactory` it builds, including one a setup helper returns: a host that is never disposed keeps its process-wide registrations (its tracing listener among them) for the rest of the run.
+
+`DisposedHostTests` boots and disposes hosts, with and without MCP, and fails if one is still reachable after a full collection. At the end of the run `PostgresFixture` fails the run if any `ApiFactory` was never disposed, naming the tests that built them.
 
 ---
 
@@ -564,31 +648,50 @@ Documentation updates ship in the same commit/PR as the code change. Stale docs 
 - Pin major versions; let minors float within a single major.
 - Prefer the standard library over a third-party package for trivial helpers.
 - Adding a new top-level dependency requires a one-line justification in the commit message: "why this, why now, why not stdlib".
-- **Vulnerability scanning is Dependabot, not a CI job.** This bullet used to read
-  "run a vulnerability scan in CI on every push"; no such job exists in any
-  workflow. `.github/dependabot.yml` opens PRs on its own schedule, and
+- **Vulnerability scanning is Dependabot, not a CI job.** No workflow runs a
+  vulnerability scan on push. `.github/dependabot.yml` opens PRs on its own schedule, and
   `dotnet restore --force` re-runs the NuGet audit (which is why `Api.Tests.csproj`
   carries pinned transitive versions with a comment each). If you want a push gate,
   that is work to do rather than a rule to cite.
 - **A package that is referenced but never called is a dependency too.** Check
-  before adding, and check when removing a subsystem: the register's keyset paging
-  moved to a Postgres function and left `MR.EntityFrameworkCore.KeysetPagination`
-  behind as a reference with no call sites.
+  before adding, and check when removing or replacing a subsystem: the package it
+  used can stay referenced with no call sites.
 
 ---
 
 ## 8. Secrets and sensitive data
 
 - No secrets in the repo. `.env` is gitignored; `.env.example` is committed with placeholder values only.
-- The Moneydance export (`data/moneydance-export.json`) is **personal financial data** and is gitignored. Test data is synthetic.
+- A Moneydance export is **personal financial data**: anything placed under `data/` as `*.json`, `*.moneydance`, `*.csv`, `*.ofx`, `*.qif` or `*.qfx` is gitignored, and only the synthetic samples in `data/samples/` are tracked. Test data is synthetic.
 - **No account names and no amounts in prose, real or invented.** Docs and code comments
   name no account, security, payee, institution, plan or place, and state no figure; a
-  case is described by its shape ("a basis that ran to 28 digits", "the brokerage"), and
+  case is described by its shape ("a basis with more digits than the column holds", "the brokerage"), and
   a test's arithmetic lives in its code, not restated in a comment. Fixtures use generic
   names (Brokerage, Fund A, Payee A) and invented amounts, never values copied from a
   ledger, a feed, an export or a screenshot. "Real or not" is the point: nobody can keep
   a list of what is real, so the rule forbids the shape, and a preflight gate checks it.
   The one institution the product names is an import format: the Fidelity CSV.
+- **Nothing derived from a real dataset in prose, approximate included.** No count,
+  magnitude, proportion or observation attributed to an export or ledger someone
+  actually keeps: state the rule ("MD keeps the bank's original string beside the
+  cleaned one") and justify a priority by what breaks and for whom. The same gate
+  checks this by shape: real-data provenance in a sentence with a magnitude or
+  proportion, or as the thing an observation was made on or the subject of an
+  observation verb.
+- **State the issue and how it is handled; never how, when, where or by whom it was
+  found.** Prose describes the mechanism in the present tense (what breaks, for whom,
+  under what condition) and then the fix, rule or test that deals with it. It tells no
+  story: not how a defect was noticed, when or where it happened, who reported it, how
+  long it went on, or what it cost before it was fixed. A story adds history, not
+  reasoning, and history about an install or the data in it must not publish. So an
+  incident is written as its condition ("a cache can serve a stale row when ..."), a
+  discovery as the test that pins it, and an ADR's Context as a
+  problem statement rather than a timeline. A size or shape that an incident would
+  imply is stated generically ("any ledger past one chunk"). Two things are not
+  stories: a decision date in an ADR's status line or amendment heading, which is
+  metadata, and the release in which a behaviour changed, stated as a fact ("since
+  0.36.8 the timeout is 600s"). The same gate checks the strongest markers of a story
+  by shape.
 - Database passwords, OAuth tokens, and API keys live in environment variables loaded at runtime.
 - Logs must not contain raw account numbers, OAuth tokens, or full transaction memos that may include personal info. Redact at the boundary.
 
@@ -624,8 +727,8 @@ Plus two workflows of their own:
 6. **`secret-gate.yml`** — the key-material and identity deny-list, so a key or a
    personal identifier cannot reach a public mirror.
 
-There is **no vulnerability-scan job**, despite what §10 used to imply: dependency
-alerts come from Dependabot on its own schedule, not from a gate on push.
+There is **no vulnerability-scan job**: dependency alerts come from Dependabot on its
+own schedule, not from a gate on push.
 
 A red CI never merges. If CI is flaky, fix the flake — don't retry.
 
@@ -643,15 +746,13 @@ in parallel across its cores (`ci-dotnet-shards.sh` with no arguments); several
 smaller machines want one shard each (`--shard <name>`). Neither is universally
 right, so pick from the runner topology rather than by habit.
 
-**Measured dead end — do not revive without new measurement.** A pre-migrated
-Postgres image (baking the ~183 migrations into the fixture image) was built and
-benchmarked on the theory that per-shard migration bootstrap was costing ~85-90s.
-It was not: DbUp against a fresh empty container is **~5s** (DDL on empty tables
-is fast). Isolated single-class run came out 12s vs 11s stock — *worse* — and a
-a full contended test run measured 328s against a ~325-362s baseline, dead in the
-noise. Shards are bound by **test execution** (233-317s each), not bootstrap. The
-image was abandoned as zero-gain added maintenance. The original ~85-90s figure
-was an assumption that was never measured; measure first.
+**Rejected: a pre-migrated Postgres image** (the migrations baked into the fixture
+image). It saves only DbUp's run against a fresh empty container, which is short
+because DDL on empty tables is fast, while shards are bound by **test execution**, not
+bootstrap; the saving falls inside run-to-run noise, and the image would add
+maintenance for no gain. Revisit only with a measurement showing bootstrap dominates a
+shard. Measure a bootstrap cost before optimizing it.
+
 ---
 
 ## 10. When in doubt

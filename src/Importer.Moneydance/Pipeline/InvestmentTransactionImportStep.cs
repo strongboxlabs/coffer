@@ -21,9 +21,9 @@ namespace Coffer.Importer.Moneydance.Pipeline;
 /// <para>Holdings deltas (per-(account, security) aggregate position)
 /// upsert through <see cref="InvestmentRepository.BulkUpsertHoldingsAsync"/>.
 /// Tax-lot rows (one per buy / dividend-reinvest) write through
-/// <see cref="InvestmentRepository.BulkReplaceLotsAsync"/>, which
-/// deletes the existing lots for the affected legs and bulk-inserts
-/// the new set — keeps re-imports idempotent. ADR-0022 Phase 2
+/// <see cref="InvestmentRepository.InsertLotsAsync"/>, one plain
+/// INSERT: the import seeds a new ledger, so the legs the lots
+/// point at were inserted moments earlier and own none yet. ADR-0022 Phase 2
 /// retargeted the lots FK from <c>transactions(id)</c> to
 /// <c>txn_legs(id)</c>; the lot's <see cref="LotRow.LegId"/> points
 /// at the holdings-side leg of the buy/divr posting.</para>
@@ -32,15 +32,18 @@ public sealed class InvestmentTransactionImportStep
 {
     private readonly TransactionsRepository _transactionsRepo;
     private readonly InvestmentRepository _investmentRepo;
+    private readonly TagsRepository _tagsRepo;
     private readonly string _importSource;
 
     public InvestmentTransactionImportStep(
         TransactionsRepository transactionsRepo,
         InvestmentRepository investmentRepo,
+        TagsRepository tagsRepo,
         string importSource)
     {
         _transactionsRepo = transactionsRepo;
         _investmentRepo = investmentRepo;
+        _tagsRepo = tagsRepo;
         _importSource = importSource;
     }
 
@@ -56,8 +59,11 @@ public sealed class InvestmentTransactionImportStep
         var allHeaders   = new List<TxnHeaderRow>();
         var allLegs      = new List<TxnLegRow>();
         var allLegRecons = new List<LegReconSeed>();
+        var allOriginals = new List<HeaderOriginalsSeed>();
         var deltas       = new List<InvestmentTransactionMapper.HoldingDelta>();
         var lots         = new List<LotRow>();
+        // The event's tags, in encounter order (the first spelling of a new name is created).
+        var tagSets      = new List<ImportTagSet>();
         // Raw skip records (txn + reason + the sec split), resolved to
         // security/ticker/shares after the loop so the common clean-import
         // path pays nothing. Silent drops are forbidden — a skip here is
@@ -88,8 +94,13 @@ public sealed class InvestmentTransactionImportStep
             allHeaders.Add(result.Header);
             allLegs.AddRange(result.Legs);
             allLegRecons.AddRange(result.LegRecons);
+            if (result.Originals is not null)    allOriginals.Add(result.Originals);
             if (result.HoldingDelta is not null) deltas.Add(result.HoldingDelta);
             if (result.NewLot is not null)       lots.Add(result.NewLot);
+            if (result.HeaderTags is { Count: > 0 } headerTags)
+                tagSets.Add(new ImportTagSet(result.Header.Id, IsHeader: true, headerTags));
+            foreach (var seed in result.LegTags ?? [])
+                tagSets.Add(new ImportTagSet(seed.LegId, IsHeader: false, seed.Tags));
         }
 
         var skips = ResolveSkips(rawSkips, context);
@@ -97,13 +108,18 @@ public sealed class InvestmentTransactionImportStep
         if (allHeaders.Count == 0)
             return new ImportStepResult("investment_transactions", read, 0, skipped, skips);
 
-        // Pass 2: bulk-upsert headers + legs through the same path as
-        // the non-investment importer. ON CONFLICT keys on
-        // (ledger_id, external_id) for the header and
-        // (header_id, posting_index, account_id) for the leg.
+        // Pass 2: insert headers + legs through the same path as the
+        // non-investment importer (plain inserts into a new ledger). Each
+        // row maps back by its natural key: (ledger_id, external_id) for
+        // the header and (header_id, posting_index, account_id) for the leg.
         var upsertResult = await _transactionsRepo
-            .BulkUpsertAsync(allHeaders, allLegs, legRecons: allLegRecons, cancellationToken: cancellationToken)
+            .BulkUpsertAsync(allHeaders, allLegs, legRecons: allLegRecons,
+                headerOriginals: allOriginals, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
+
+        // Pass 2b: the events' tags. Seed-once makes every proposed id the
+        // persisted one (BulkUpsertAsync).
+        await _tagsRepo.LinkImportedAsync(context.LedgerId, tagSets, cancellationToken).ConfigureAwait(false);
 
         // Pass 3: aggregate holdings deltas per (account, security) and
         // upsert. The holdings table doesn't reference txn ids.
@@ -131,18 +147,17 @@ public sealed class InvestmentTransactionImportStep
         //       doesn't know the holding's persisted id at map time.
         //       Resolve here via (account, security) → holding.
         //
-        //   (b) LegId. The mapper sets it to the proposed leg id, but
-        //       the legs upsert may have hit ON CONFLICT and kept the
-        //       EXISTING leg id. BulkUpsertAsync returns a proposed →
-        //       persisted leg id map for exactly this case.
+        //   (b) LegId. The mapper sets it to the proposed leg id.
+        //       BulkUpsertAsync returns a proposed → persisted leg id
+        //       map, and the lots are rebound through it.
         //
-        // On a fresh import (no prior data) (b) is a no-op — proposed
-        // ids ARE persisted ids. On re-import (b) is mandatory.
+        // Every import seeds a new ledger, so (b) is a no-op in practice —
+        // proposed ids ARE persisted ids; the map keeps it robust to the
+        // database assigning ids.
         if (lots.Count > 0)
         {
             var legsById = allLegs.ToDictionary(l => l.Id);
             var resolved = new List<LotRow>(lots.Count);
-            var lotLegIds = new HashSet<Guid>();
             foreach (var lot in lots)
             {
                 if (!legsById.TryGetValue(lot.LegId, out var holdingsLeg)) continue;
@@ -152,7 +167,6 @@ public sealed class InvestmentTransactionImportStep
                 if (!upsertResult.Legs.TryGetValue(lot.LegId, out var persistedLegId))
                     continue;
 
-                lotLegIds.Add(persistedLegId);
                 resolved.Add(lot with
                 {
                     HoldingId = holdingId,
@@ -161,14 +175,14 @@ public sealed class InvestmentTransactionImportStep
             }
 
             await _investmentRepo
-                .BulkReplaceLotsAsync(lotLegIds, resolved, cancellationToken)
+                .InsertLotsAsync(resolved, cancellationToken)
                 .ConfigureAwait(false);
         }
 
         // Pass 5: avg-cost recompute of holdings.cost_basis.
         //
         // The HoldingDelta aggregation in Pass 3 only adds basis on
-        // Buy / DivReinvest and leaves Sells at zero (ADR-0018 rule 4),
+        // Buy / Reinvest and leaves Sells at zero (ADR-0018 rule 4),
         // so the upserted basis = lifetime gross acquisition cost, not
         // the basis of currently-held shares. Migration 052's
         // `recompute_holdings_cost_basis(ledger_id)` walks every
@@ -287,6 +301,7 @@ public sealed class InvestmentTransactionImportStep
         var step = new InvestmentTransactionImportStep(
             new TransactionsRepository(connection),
             new InvestmentRepository(connection),
+            new TagsRepository(connection),
             importSource);
         return await step.ExecuteAsync(context, cancellationToken).ConfigureAwait(false);
     }

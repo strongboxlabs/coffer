@@ -4,24 +4,23 @@
 -- Bug context. The sidebar's "Show inactive" toggle surfaces
 -- accounts where is_active=FALSE, expecting that to cover every
 -- "user deactivated this" row. It didn't: a deactivated account
--- typically carried is_hidden=TRUE AND is_active=FALSE and got filtered
+-- could carry is_hidden=TRUE AND is_active=FALSE, and was then filtered
 -- out unconditionally by the sidebar grouping function (which also
--- drops is_hidden rows) — an account reported missing from the sidebar
--- was one of these. An outlier can also carry is_active=TRUE AND
--- is_hidden=TRUE — the two flags disagreeing on direction.
+-- drops is_hidden rows), so no toggle could bring it back. A row can
+-- also carry is_active=TRUE AND is_hidden=TRUE — the two flags
+-- disagreeing on direction.
 --
 -- Root cause is column conflation. Mig 012 introduced
 -- accounts.is_hidden as the Moneydance `hide` flag with an
 -- explicit "orthogonal to is_active" doc comment. ADR-0032 later
--- introduced is_active for the inactive-account lifecycle. In
--- practice the two flags collapsed: an is_hidden row is also
--- is_active=false, outliers aside. The "orthogonal" model never
--- materialized; meanwhile the dual-flag state
+-- introduced is_active for the inactive-account lifecycle. Both
+-- flags came to mean "this account is gone", so the "orthogonal"
+-- model never materialized; meanwhile the dual-flag state
 -- gives users two ways to mark an account "gone" and one of them
 -- is invisible to the "Show inactive" toggle.
 --
 -- This migration:
---   1. Backfills is_active=FALSE on any outlier row
+--   1. Backfills is_active=FALSE on any disagreeing row
 --      (is_hidden=TRUE, is_active=TRUE). The user marked it
 --      hidden, so the collapsed semantics treat it as inactive.
 --   2. Drops accounts.is_hidden.

@@ -89,25 +89,19 @@ public sealed class InvestmentRepository
     }
 
     /// <summary>
-    /// Replace every <c>lots</c> row owned by the supplied legs, then
-    /// bulk-insert the new set. Lots are owned by their opening leg
-    /// (the holdings-side leg of a buy or dividend-reinvest); the
-    /// replacement pattern keeps re-runs idempotent. ADR-0022 Phase 2
-    /// retargeted the FK from <c>transaction_id</c> to <c>leg_id</c>.
+    /// Bulk-insert <c>lots</c> rows in one statement. Lots are owned by their
+    /// opening leg (the holdings-side leg of a buy or dividend-reinvest); ADR-0022
+    /// Phase 2 retargeted the FK from <c>transaction_id</c> to <c>leg_id</c>.
     /// </summary>
-    public async Task BulkReplaceLotsAsync(
-        IReadOnlyCollection<Guid> legIdsToReset,
+    /// <remarks>
+    /// Insert only: every import creates a new ledger (seed-once, ADR-0052 D2), and
+    /// the legs these lots point at were inserted in the same import, so no lot can
+    /// exist for them yet.
+    /// </remarks>
+    public async Task InsertLotsAsync(
         IReadOnlyList<LotRow> rows,
         CancellationToken cancellationToken = default)
     {
-        if (legIdsToReset.Count > 0)
-        {
-            await _connection.ExecuteAsync(new CommandDefinition(
-                "DELETE FROM lots WHERE leg_id = ANY(@ids);",
-                new { ids = legIdsToReset.ToArray() },
-                cancellationToken: cancellationToken)).ConfigureAwait(false);
-        }
-
         if (rows.Count == 0) return;
 
         const string sql = """
@@ -168,7 +162,7 @@ public sealed class InvestmentRepository
     /// Recompute every <c>holdings.cost_basis</c> in the ledger using the
     /// average-cost method (migration 052). The HoldingDelta aggregation
     /// in <see cref="InvestmentTransactionImportStep"/> only ADDS basis
-    /// on Buy / DivReinvest; it leaves Sells alone per ADR-0018 rule 4,
+    /// on Buy / Reinvest; it leaves Sells alone per ADR-0018 rule 4,
     /// which means a user who has sold anything ends up with a cost basis
     /// equal to lifetime gross acquisition cost, not the basis of
     /// currently-held shares. This finaliser corrects that by walking

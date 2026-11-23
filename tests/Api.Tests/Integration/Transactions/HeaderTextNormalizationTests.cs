@@ -27,11 +27,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// next client able to store <c>"Acme  "</c>.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class HeaderTextNormalizationTests
+public sealed class HeaderTextNormalizationTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public HeaderTextNormalizationTests(PostgresFixture fixture) => _fixture = fixture;
+    public HeaderTextNormalizationTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Utc(int y, int m, int d) =>
         new(y, m, d, 12, 0, 0, DateTimeKind.Utc);
@@ -50,7 +51,7 @@ public sealed class HeaderTextNormalizationTests
 
     private async Task<TxnHeaderRowView> StoredAsync(Guid headerId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var h = await db.TxnHeaders.AsNoTracking().SingleAsync(x => x.Id == headerId);
         return new TxnHeaderRowView(h.Payee, h.Memo, h.CheckNumber);
     }
@@ -58,16 +59,28 @@ public sealed class HeaderTextNormalizationTests
     private sealed record TxnHeaderRowView(string? Payee, string? Memo, string? CheckNumber);
 
     /// <summary>
+    /// The memo stored on <paramref name="accountId"/>'s leg: where a one-posting
+    /// transaction keeps it (an event's on its brokerage leg).
+    /// </summary>
+    private async Task<string?> LegMemoAsync(Guid headerId, Guid accountId)
+    {
+        await using var db = Db.NewDbContext();
+        return await db.TxnLegs.AsNoTracking()
+            .Where(l => l.HeaderId == headerId && l.AccountId == accountId)
+            .Select(l => l.LegMemo).SingleAsync();
+    }
+
+    /// <summary>
     /// The INVESTMENT create path trims, and stores whitespace-only as null.
     /// </summary>
     [Fact]
     public async Task Investment_create_stores_header_text_trimmed()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("TRIM", ticker: "TRIM");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -93,7 +106,9 @@ public sealed class HeaderTextNormalizationTests
 
         var stored = await StoredAsync(headerId);
         Assert.Equal("Acme Brokerage", stored.Payee);
-        Assert.Equal("padded memo", stored.Memo);
+        // A one-posting buy keeps the event's memo on its brokerage leg.
+        Assert.Null(stored.Memo);
+        Assert.Equal("padded memo", await LegMemoAsync(headerId, brokerage.Id));
         Assert.Null(stored.CheckNumber);
     }
 
@@ -104,11 +119,11 @@ public sealed class HeaderTextNormalizationTests
     [Fact]
     public async Task Investment_patch_stores_header_text_trimmed()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("TRIM", ticker: "TRIM");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var postedAt = Utc(2026, 5, 4);
@@ -147,33 +162,32 @@ public sealed class HeaderTextNormalizationTests
 
         var stored = await StoredAsync(headerId);
         Assert.Equal("Acme Brokerage", stored.Payee);
-        Assert.Equal("tabbed", stored.Memo);
+        Assert.Equal("tabbed", await LegMemoAsync(headerId, brokerage.Id));
     }
 
     /// <summary>
     /// The BANK patch path trims at the same place, not only in its editor.
     /// </summary>
     /// <remarks>
-    /// Bank's client already trimmed, so this is not a behaviour change for the
-    /// SPA — it closes the same hole for every other caller. Asserted so that
-    /// "bank was already fine" cannot be used to move the rule back into the
-    /// editor, where it only ever covered one of the clients.
+    /// The bank editor trims too, but a rule in the editor covers only one of the
+    /// clients; trimming at the patch path covers every caller. Asserted so the
+    /// rule cannot move back into the editor.
     /// </remarks>
     [Fact]
     public async Task Bank_patch_stores_header_text_trimmed()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("checking");
         var other = await ledger.AddBankAccountAsync("savings");
         var (legId, _) = await ledger.AddTransactionPairAsync(
             checking.Id, other.Id, 25m, Utc(2026, 5, 1), "seed");
 
-        await using var db0 = _fixture.NewDbContext();
+        await using var db0 = Db.NewDbContext();
         var headerId = (await db0.TxnLegs.AsNoTracking()
             .SingleAsync(l => l.Id == legId)).HeaderId;
         await db0.DisposeAsync();
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var patch = await client.PatchAsJsonAsync(
@@ -181,14 +195,14 @@ public sealed class HeaderTextNormalizationTests
             new PatchTransactionRequest
             {
                 Payee = "  Padded Payee  ",
-                Memo = "  padded memo  ",
+                Notes = new TransactionNotesRequest { Side = checking.Id, Memo = "  padded memo  " },
                 CheckNumber = "  ",
             });
         Assert.True(patch.IsSuccessStatusCode, await patch.Content.ReadAsStringAsync());
 
         var stored = await StoredAsync(headerId);
         Assert.Equal("Padded Payee", stored.Payee);
-        Assert.Equal("padded memo", stored.Memo);
+        Assert.Equal("padded memo", await LegMemoAsync(headerId, checking.Id));
         Assert.Null(stored.CheckNumber);
     }
 
@@ -198,11 +212,11 @@ public sealed class HeaderTextNormalizationTests
     [Fact]
     public async Task A_null_header_field_stays_null()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("TRIM", ticker: "TRIM");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(

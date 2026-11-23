@@ -10,23 +10,23 @@ namespace Coffer.Importer.Moneydance.Tests.Db;
 /// An imported tag name obeys the same 64-character cap the API enforces.
 /// </summary>
 /// <remarks>
-/// <para>It did not. <c>tags.name</c> is bare <c>TEXT</c> with no CHECK and the
-/// importer only trimmed, so a Moneydance export could mint names the
-/// application's own tag management would refuse to create — and any later
-/// rename of one would be judged against a limit the stored value already
-/// broke. Two endpoints each held their own <c>const int 64</c>; the importer
-/// held neither.</para>
+/// <para><c>tags.name</c> is bare <c>TEXT</c> with no CHECK, so an importer
+/// that only trimmed could mint names the application's own tag management
+/// would refuse to create, and any later rename of one would be judged against
+/// a limit the stored value already broke. The importer and the tag endpoints
+/// share one cap, <see cref="TagName.MaxLength"/>.</para>
 ///
-/// <para>Truncate rather than reject, decided by the maintainer: refusing a
+/// <para>Truncate rather than reject: refusing a
 /// whole import over a label is worse than shortening the label, and a tag
 /// name carries no identity — nothing downstream keys on it.</para>
 /// </remarks>
 [Collection(DbCollection.Name)]
-public sealed class TagNameTruncationTests
+public sealed class TagNameTruncationTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public TagNameTruncationTests(PostgresFixture fixture) => _fixture = fixture;
+    public TagNameTruncationTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private const string Prefix =
         "A tag name long enough to be cut by the sixty-four character cap";   // exactly 64
@@ -60,11 +60,40 @@ public sealed class TagNameTruncationTests
         Assert.Equal(normalized.TrimEnd(), normalized);
     }
 
+    /// <summary>The cap counts UTF-16 units, as every caller's length check does,
+    /// and a character outside the Basic Multilingual Plane is two of them.</summary>
+    private static readonly string Straddling = Prefix[..63] + "\U0001F600" + " tail";
+
+    [Fact]
+    public void A_cut_inside_a_surrogate_pair_drops_the_whole_character()
+    {
+        // A cut between the two halves leaves half a character, which is not text:
+        // a strict UTF-8 encoder refuses it and a lenient one stores a replacement
+        // character no one typed. The name stays within the cap by losing the pair.
+        var normalized = TagName.Normalize(Straddling)!;
+
+        Assert.Equal(Prefix[..63], normalized);
+        Assert.False(char.IsSurrogate(normalized[^1]));
+    }
+
+    [Fact]
+    public async Task A_name_cut_inside_a_surrogate_pair_imports_as_whole_characters()
+    {
+        await using var conn = Db.OpenConnection();
+        var ledgerId = TestLedger.Id;
+
+        await ImportOneTaggedTxnAsync(conn, ledgerId, Straddling);
+
+        var stored = await conn.QuerySingleAsync<string>(
+            "SELECT name FROM tags WHERE ledger_id = @L;", new { L = ledgerId });
+        Assert.Equal(Prefix[..63], stored);
+    }
+
     [Fact]
     public async Task An_over_length_imported_tag_is_stored_at_the_cap()
     {
-        await using var conn = _fixture.OpenConnection();
-        var ledgerId = await FreshLedgerAsync(conn);
+        await using var conn = Db.OpenConnection();
+        var ledgerId = TestLedger.Id;
 
         var longName = Prefix + " and then a great deal more that cannot fit";
         await ImportOneTaggedTxnAsync(conn, ledgerId, longName);
@@ -80,18 +109,21 @@ public sealed class TagNameTruncationTests
     public async Task The_link_survives_truncation_rather_than_being_dropped()
     {
         // The failure mode that made WHERE the truncation happens matter. The
-        // import step resolves links with `tagIdByName.TryGetValue(name, ...)`
-        // and ignores a miss. Truncating at the repository instead of the
-        // mapper would key that dictionary by the short name while the caller
-        // asked with the long one — no exception, no log, just a tag that
-        // quietly failed to attach.
-        await using var conn = _fixture.OpenConnection();
-        var ledgerId = await FreshLedgerAsync(conn);
+        // import step resolves links by name; truncating at the repository
+        // instead of the mapper would key that lookup by the short name while
+        // the caller asked with the long one, and the tag would fail to attach.
+        // A one-split's transaction tags belong to its other side.
+        await using var conn = Db.OpenConnection();
+        var ledgerId = TestLedger.Id;
 
         await ImportOneTaggedTxnAsync(conn, ledgerId, Prefix + " overflowing well past the cap");
 
-        var links = await conn.ExecuteScalarAsync<int>(
-            "SELECT COUNT(*) FROM txn_header_tags WHERE ledger_id = @L;", new { L = ledgerId });
+        var links = await conn.ExecuteScalarAsync<int>("""
+            SELECT COUNT(*) FROM txn_leg_tags x
+              JOIN txn_legs l ON l.id = x.leg_id
+              JOIN accounts a ON a.id = l.account_id
+             WHERE x.ledger_id = @L AND a.external_id = 'a-cat';
+            """, new { L = ledgerId });
         Assert.Equal(1, links);
     }
 
@@ -99,11 +131,11 @@ public sealed class TagNameTruncationTests
     public async Task Two_names_sharing_the_first_64_characters_become_ONE_tag()
     {
         // THE COST OF TRUNCATING, pinned rather than discovered. Rejecting
-        // would have avoided this at the price of refusing the import; the
-        // maintainer chose truncation knowing it. If this test ever starts
+        // would avoid this at the price of refusing the import; truncation
+        // accepts it. If this test ever starts
         // failing, the policy changed — it is not a bug on its own.
-        await using var conn = _fixture.OpenConnection();
-        var ledgerId = await FreshLedgerAsync(conn);
+        await using var conn = Db.OpenConnection();
+        var ledgerId = TestLedger.Id;
 
         await ImportOneTaggedTxnAsync(
             conn, ledgerId, Prefix + " ending one way", Prefix + " ending quite another");
@@ -115,8 +147,8 @@ public sealed class TagNameTruncationTests
         Assert.Equal(Prefix, names[0]);
     }
 
-    /// <summary>Import one bank txn carrying <paramref name="tagNames"/> as its
-    /// header tags, through the real pipeline rather than a direct insert.</summary>
+    /// <summary>Import one bank one-split carrying <paramref name="tagNames"/> as its
+    /// transaction tags, through the real pipeline rather than a direct insert.</summary>
     private static async Task ImportOneTaggedTxnAsync(
         Npgsql.NpgsqlConnection conn, Guid ledgerId, params string[] tagNames)
     {
@@ -125,7 +157,7 @@ public sealed class TagNameTruncationTests
             {
               "metadata": {"exporter":"x","moneydance_build":1,"export_date":1,"file_name":"y"},
               "all_items": [
-                {"obj_type":"acct","id":"a-root","type":"r","name":"Root","currid":"c-usd"},
+                {"obj_type":"curr","id":"c-usd","currid":"USD","name":"US Dollar","dec":"2","isbase":"1"},{"obj_type":"acct","id":"a-root","type":"r","name":"Root","currid":"c-usd"},
                 {"obj_type":"acct","id":"a-bank","type":"b","name":"Checking","parentid":"a-root","currid":"c-usd","sbal":"0"},
                 {"obj_type":"acct","id":"a-cat","type":"e","name":"Groceries","parentid":"a-root","currid":"c-usd"},
                 {"obj_type":"txn","id":"t-1","acctid":"a-bank","desc":"Shop","dt":"20260101",
@@ -138,18 +170,6 @@ public sealed class TagNameTruncationTests
         var context = new ImportContext(MdItemReader.ReadString(json), ledgerId);
         await AccountImportStep.RunAsync(conn, context);
         await TransactionImportStep.RunAsync(conn, context, "test:tag-truncation");
-    }
-
-    private static async Task<Guid> FreshLedgerAsync(Npgsql.NpgsqlConnection conn)
-    {
-        await conn.ExecuteAsync("""
-            TRUNCATE txn_header_tags, txn_leg_tags, tags, txn_legs, txn_headers, accounts
-            RESTART IDENTITY CASCADE;
-            """);
-        var id = TestLedger.Id;
-        await conn.ExecuteAsync(
-            "INSERT INTO ledgers (id, name) VALUES (@Id, 'Default') ON CONFLICT (id) DO NOTHING;",
-            new { Id = id });
-        return id;
+        await StoredNotesSeed.ComputeImportedNotesAsync(conn, ledgerId);
     }
 }

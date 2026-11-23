@@ -4,14 +4,14 @@ import { render, screen, fireEvent } from '@testing-library/react';
 import { DateField } from './DateField';
 
 /**
- * Unit tests for the date input extracted out of TxnRowEdit, where the same
- * markup and keyboard handler existed twice. Testing the keyboard shortcuts here
- * rather than by driving the 1600-line editor is the point of the extraction:
- * `t` / `y` / `+` / `-` are the behaviour, and this is where they live now.
+ * Unit tests for the date input shared by the transaction editors. Testing the
+ * keyboard shortcuts here rather than by driving the whole editor is the point
+ * of the component: `t` / `y` / `+` / `-` are the behaviour, and this is where
+ * they live.
  *
  * `fireEvent.change` rather than `userEvent.type`: native `type="date"` inputs do
- * not accept synthetic per-character typing reliably, which is exactly what made
- * the first version of the editor tests fail against an empty value.
+ * not accept synthetic per-character typing reliably, so a typed value can arrive
+ * empty.
  */
 
 function setup(initial = '') {
@@ -24,6 +24,19 @@ function setup(initial = '') {
 }
 
 describe('DateField', () => {
+    it('renders the input alone when bare, still named and still keyed', () => {
+        const onChange = vi.fn();
+        const { container } = render(
+            <DateField bare label="Tax date" id="tax" value="2026-03-04" onChange={onChange} />,
+        );
+        const input = screen.getByLabelText('Tax date');
+        expect(container.firstChild).toBe(input);
+        expect(container.querySelector('label')).toBeNull();
+        expect(input).toHaveAttribute('id', 'tax');
+        fireEvent.keyDown(input, { key: '+' });
+        expect(onChange).toHaveBeenLastCalledWith('2026-03-05');
+    });
+
     it('reports typed dates through onChange', () => {
         const { input, onChange } = setup();
         fireEvent.change(input, { target: { value: '2026-03-04' } });

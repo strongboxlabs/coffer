@@ -48,6 +48,9 @@ public static class SecuritiesEndpoints
     private static async Task<IResult> ListAsync(
         Guid ledgerId,
         string? q,
+        // The caller's local date (?today=), as the register takes it, for the
+        // quantity held and the price.
+        DateOnly? today,
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         SecuritiesRepository securities,
@@ -59,7 +62,7 @@ public static class SecuritiesEndpoints
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
 
-        var rows = await securities.ListByLedgerAsync(ledgerId, q, cancellationToken)
+        var rows = await securities.ListByLedgerAsync(ledgerId, q, today, cancellationToken)
                                    .ConfigureAwait(false);
         return Results.Ok(rows);
     }
@@ -67,6 +70,9 @@ public static class SecuritiesEndpoints
     private static async Task<IResult> GetAsync(
         Guid ledgerId,
         Guid securityId,
+        // The caller's local date (?today=), as the register takes it, for the
+        // hero's quantity, cost basis and price.
+        DateOnly? today,
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         SecuritiesRepository securities,
@@ -78,7 +84,7 @@ public static class SecuritiesEndpoints
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
 
-        var detail = await securities.GetByIdAsync(ledgerId, securityId, cancellationToken)
+        var detail = await securities.GetByIdAsync(ledgerId, securityId, today, cancellationToken)
                                      .ConfigureAwait(false);
         if (detail is null)
             return BusinessError.Problem(BusinessError.Codes.SecurityNotInLedger,
@@ -231,8 +237,9 @@ public static class SecuritiesEndpoints
         // Confirm the security exists in this ledger BEFORE listing —
         // otherwise a cross-ledger securityId would silently return an
         // empty page (subtly leaks "this id doesn't apply here" via the
-        // 200/empty distinction). The 422 is explicit and matches GET.
-        var detail = await securities.GetByIdAsync(ledgerId, securityId, cancellationToken)
+        // 200/empty distinction). The 422 is explicit and matches GET. Only
+        // existence is read, so the date is the register's fallback.
+        var detail = await securities.GetByIdAsync(ledgerId, securityId, today: null, cancellationToken)
                                      .ConfigureAwait(false);
         if (detail is null)
             return BusinessError.Problem(BusinessError.Codes.SecurityNotInLedger,
@@ -262,7 +269,8 @@ public static class SecuritiesEndpoints
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
 
-        var detail = await securities.GetByIdAsync(ledgerId, securityId, cancellationToken)
+        // Existence only, so the register's fallback date serves.
+        var detail = await securities.GetByIdAsync(ledgerId, securityId, today: null, cancellationToken)
                                      .ConfigureAwait(false);
         if (detail is null)
             return BusinessError.Problem(BusinessError.Codes.SecurityNotInLedger,
@@ -281,6 +289,8 @@ public static class SecuritiesEndpoints
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         SecuritiesRepository securities,
+        Quotes.MarketSeries.MarketSeriesBackfill backfill,
+        Db.AppDbContext db,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -291,8 +301,15 @@ public static class SecuritiesEndpoints
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
 
+        // ADR-0114 D11: a price in a currency new to a held security adds a position pair,
+        // and one dated before its first price in that currency moves the pair's start
+        // earlier; read before the write that can do either.
+        var before = await NeededFxPairs.StartsAsync(db, ledgerId, cancellationToken).ConfigureAwait(false);
         var outcome = await securities.AddPriceAsync(
             ledgerId, securityId, request, cancellationToken).ConfigureAwait(false);
+        if (outcome.Kind == SecuritiesRepository.AddPriceResult.Ok)
+            await backfill.StartIfEarlierAsync(db, ledgerId, currentUser.UserId, before, cancellationToken)
+                .ConfigureAwait(false);
         return outcome.Kind switch
         {
             SecuritiesRepository.AddPriceResult.Ok =>
@@ -311,6 +328,12 @@ public static class SecuritiesEndpoints
             SecuritiesRepository.AddPriceResult.HighLowInvalid =>
                 BusinessError.Problem(BusinessError.Codes.SecurityPriceHighLowInvalid,
                     "High must be greater than or equal to Low."),
+            SecuritiesRepository.AddPriceResult.CurrencyInvalid =>
+                BusinessError.Problem(BusinessError.Codes.SecurityPriceCurrencyInvalid,
+                    "Currency must be a 3-letter ISO code."),
+            SecuritiesRepository.AddPriceResult.CurrencyRequired =>
+                BusinessError.Problem(BusinessError.Codes.SecurityPriceCurrencyRequired,
+                    "Give the price's currency: this security has no price yet, and the accounts holding it do not settle one."),
             _ => Results.Problem("Unknown add-price result.", statusCode: 500),
         };
     }
@@ -323,6 +346,8 @@ public static class SecuritiesEndpoints
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
         SecuritiesRepository securities,
+        Quotes.MarketSeries.MarketSeriesBackfill backfill,
+        Db.AppDbContext db,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -333,8 +358,14 @@ public static class SecuritiesEndpoints
             return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
                 "Ledger not found or not visible to this user.");
 
+        // ADR-0114 D11: moving a price's date or currency can add a position pair or move
+        // its start earlier. A delete only narrows what is needed, so it is no trigger.
+        var before = await NeededFxPairs.StartsAsync(db, ledgerId, cancellationToken).ConfigureAwait(false);
         var outcome = await securities.PatchPriceAsync(
             ledgerId, securityId, priceId, request, cancellationToken).ConfigureAwait(false);
+        if (outcome == SecuritiesRepository.PatchPriceResult.Ok)
+            await backfill.StartIfEarlierAsync(db, ledgerId, currentUser.UserId, before, cancellationToken)
+                .ConfigureAwait(false);
         return outcome switch
         {
             SecuritiesRepository.PatchPriceResult.Ok => Results.NoContent(),
@@ -350,6 +381,9 @@ public static class SecuritiesEndpoints
             SecuritiesRepository.PatchPriceResult.HighLowInvalid =>
                 BusinessError.Problem(BusinessError.Codes.SecurityPriceHighLowInvalid,
                     "High must be greater than or equal to Low."),
+            SecuritiesRepository.PatchPriceResult.CurrencyInvalid =>
+                BusinessError.Problem(BusinessError.Codes.SecurityPriceCurrencyInvalid,
+                    "Currency must be a 3-letter ISO code."),
             _ => Results.Problem("Unknown patch-price result.", statusCode: 500),
         };
     }

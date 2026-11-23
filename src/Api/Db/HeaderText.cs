@@ -1,3 +1,5 @@
+using Coffer.Domain.Annotations;
+
 namespace Coffer.Api.Db;
 
 /// <summary>
@@ -32,10 +34,11 @@ internal static class HeaderText
     /// it is empty or whitespace-only. Null in, null out — an absent field
     /// stays absent rather than becoming an empty string.
     /// </summary>
-    public static string? Normalize(string? value)
-    {
-        if (value is null) return null;
-        var trimmed = value.Trim();
-        return trimmed.Length == 0 ? null : trimmed;
-    }
+    /// <remarks>
+    /// The rule itself lives in <see cref="AnnotationText.NormalizeText"/>, which
+    /// the memo-and-tags write primitive applies to every memo it stores, header or
+    /// leg. One definition, so a memo that moves between the header and a leg on a
+    /// change of shape keeps its bytes.
+    /// </remarks>
+    public static string? Normalize(string? value) => AnnotationText.NormalizeText(value);
 }

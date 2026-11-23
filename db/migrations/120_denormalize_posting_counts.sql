@@ -7,9 +7,9 @@
 -- `resolved_transactions` computed `account_postings_on_header` and
 -- `header_total_postings` (ADR-0036's originating-vs-target discriminator)
 -- via TWO correlated `COUNT(DISTINCT posting_index)` subqueries that ran
--- once PER ROW. On the windowed register that's ~10ms/page, but on a
--- full-account or account-group aggregation (reports) it is the dominant
--- per-row cost (~110ms over a long-history account, measured) and inflates
+-- once PER ROW. On the windowed register the page size bounds that, but on
+-- a full-account or account-group aggregation (reports) it is the dominant
+-- per-row cost, growing with the account's whole history, and inflates
 -- the view's planner cost enough to trigger pathological JIT compilation.
 --
 -- Per "optimize each layer independently" (the data layer must be fast by

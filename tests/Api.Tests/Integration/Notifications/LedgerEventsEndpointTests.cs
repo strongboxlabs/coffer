@@ -15,17 +15,17 @@ namespace Coffer.Api.Tests.Integration.Notifications;
 /// The in-app read over <c>ledger_events</c> — ADR-0096 D5's promised surface.
 /// </summary>
 /// <remarks>
-/// D5 justified ledger scope having no external absence detection on the grounds that it
-/// is "DB-backed and pull-based, surfaced in-app". Nothing read the table: migration 208
-/// installed <c>ledger_events_read</c> and it had never had a single caller. These are the
-/// first tests to exercise it.
+/// ADR-0096 D5 justifies ledger scope having no external absence detection on the grounds that it
+/// is "DB-backed and pull-based, surfaced in-app". That holds only while something reads
+/// the table, so these tests pin the endpoint over <c>ledger_events_read</c> (migration 208).
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class LedgerEventsEndpointTests
+public sealed class LedgerEventsEndpointTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public LedgerEventsEndpointTests(PostgresFixture fixture) => _fixture = fixture;
+    public LedgerEventsEndpointTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> ClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -40,7 +40,7 @@ public sealed class LedgerEventsEndpointTests
         Guid ledgerId, string severity, string summary, DateTime? at = null,
         string eventKey = "test.event")
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         db.LedgerEvents.Add(new LedgerEventRow
         {
             LedgerId = ledgerId,
@@ -70,13 +70,13 @@ public sealed class LedgerEventsEndpointTests
         // publishes an info success, so returning all severities would mean a newest-20
         // of "completed" lines with the one failure pushed off the end — a surface that
         // looks answered while hiding the answer.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tag = Guid.NewGuid().ToString("N")[..6];
         await AddEventAsync(ledger.LedgerId, NotificationSeverity.Info, $"routine-{tag}");
         await AddEventAsync(ledger.LedgerId, NotificationSeverity.Warning, $"trouble-{tag}");
         await AddEventAsync(ledger.LedgerId, NotificationSeverity.Critical, $"disaster-{tag}");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger);
 
         var events = await GetAsync(client, ledger.LedgerId);
@@ -95,7 +95,7 @@ public sealed class LedgerEventsEndpointTests
         // month of daily successes would return an empty list while a real warning sat
         // just below the cut. Bury the warning under more than one page of noise and
         // assert it still comes back.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tag = Guid.NewGuid().ToString("N")[..6];
 
         await AddEventAsync(ledger.LedgerId, NotificationSeverity.Warning, $"buried-{tag}",
@@ -106,7 +106,7 @@ public sealed class LedgerEventsEndpointTests
                 at: DateTime.UtcNow.AddDays(-i));
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger);
 
         var events = await GetAsync(client, ledger.LedgerId);
@@ -116,14 +116,13 @@ public sealed class LedgerEventsEndpointTests
     [Fact]
     public async Task A_warning_a_later_success_supersedes_is_marked_resolved()
     {
-        // The failure this exists for: the first real row this list ever showed was a
-        // days-old drift warning that had already been resolved, indistinguishable
-        // from one raised a minute ago.
+        // Without a resolution marker, a drift warning that has since cleared is
+        // indistinguishable from one raised a minute ago.
         //
         // Event keys are "<subject>.<outcome>", so a later INFO event with the same
         // SUBJECT is the all-clear. Every scheduled job already publishes one on its next
         // good run, which makes job warnings self-resolving without a new event type.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tag = Guid.NewGuid().ToString("N")[..6];
 
         await AddEventAsync(ledger.LedgerId, NotificationSeverity.Warning,
@@ -131,7 +130,7 @@ public sealed class LedgerEventsEndpointTests
         await AddEventAsync(ledger.LedgerId, NotificationSeverity.Info,
             $"fixed-{tag}", at: DateTime.UtcNow.AddHours(-1), eventKey: "quote-refresh.succeeded");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger);
 
         var broke = (await GetAsync(client, ledger.LedgerId))
@@ -144,13 +143,13 @@ public sealed class LedgerEventsEndpointTests
     [Fact]
     public async Task A_warning_with_no_later_success_stays_unresolved()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tag = Guid.NewGuid().ToString("N")[..6];
 
         await AddEventAsync(ledger.LedgerId, NotificationSeverity.Warning,
             $"still-{tag}", at: DateTime.UtcNow.AddHours(-2), eventKey: "snapshot.failed");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger);
 
         var still = (await GetAsync(client, ledger.LedgerId))
@@ -164,7 +163,7 @@ public sealed class LedgerEventsEndpointTests
         // The rule is per subject, not per ledger. A snapshot succeeding says nothing
         // about the quote refresh, and treating it as an all-clear would silently mark
         // real problems fixed — worse than never marking them at all.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tag = Guid.NewGuid().ToString("N")[..6];
 
         await AddEventAsync(ledger.LedgerId, NotificationSeverity.Warning,
@@ -172,7 +171,7 @@ public sealed class LedgerEventsEndpointTests
         await AddEventAsync(ledger.LedgerId, NotificationSeverity.Info,
             $"snap-ok-{tag}", at: DateTime.UtcNow.AddHours(-1), eventKey: "snapshot.succeeded");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger);
 
         var broke = (await GetAsync(client, ledger.LedgerId))
@@ -186,7 +185,7 @@ public sealed class LedgerEventsEndpointTests
         // Ordering matters or the mark is meaningless: yesterday's success cannot fix
         // today's failure. A naive "does a success exist for this subject" would call
         // every recurring problem resolved forever after its first good run.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tag = Guid.NewGuid().ToString("N")[..6];
 
         await AddEventAsync(ledger.LedgerId, NotificationSeverity.Info,
@@ -194,7 +193,7 @@ public sealed class LedgerEventsEndpointTests
         await AddEventAsync(ledger.LedgerId, NotificationSeverity.Warning,
             $"later-broke-{tag}", at: DateTime.UtcNow.AddHours(-2), eventKey: "snapshot.failed");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger);
 
         var broke = (await GetAsync(client, ledger.LedgerId))
@@ -205,14 +204,14 @@ public sealed class LedgerEventsEndpointTests
     [Fact]
     public async Task Newest_first()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var tag = Guid.NewGuid().ToString("N")[..6];
         await AddEventAsync(ledger.LedgerId, NotificationSeverity.Warning, $"older-{tag}",
             at: DateTime.UtcNow.AddDays(-5));
         await AddEventAsync(ledger.LedgerId, NotificationSeverity.Warning, $"newer-{tag}",
             at: DateTime.UtcNow.AddMinutes(-1));
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger);
 
         var mine = (await GetAsync(client, ledger.LedgerId))
@@ -230,12 +229,12 @@ public sealed class LedgerEventsEndpointTests
         // endpoint's explicit ledger_id predicate is the primary check, and
         // ledger_events_read (mig 208) is the backstop for the day someone forgets it.
         // What matters is that a caller with no grant gets nothing.
-        var mine = await SyntheticLedger.CreateAsync(_fixture);
-        var theirs = await SyntheticLedger.CreateAsync(_fixture);
+        var mine = await SyntheticLedger.CreateAsync(Db);
+        var theirs = await SyntheticLedger.CreateAsync(Db);
         var tag = Guid.NewGuid().ToString("N")[..6];
         await AddEventAsync(theirs.LedgerId, NotificationSeverity.Critical, $"secret-{tag}");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, mine);
 
         // Asking for my own ledger must not leak theirs...
@@ -251,8 +250,8 @@ public sealed class LedgerEventsEndpointTests
     [Fact]
     public async Task The_limit_is_clamped_rather_than_trusted()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await ClientAsync(factory, ledger);
 
         // A caller-supplied limit reaches a Take(). Unclamped, limit=0 or a negative

@@ -3,11 +3,12 @@
 -- =============================================================================
 --
 -- Three related changes that ride together because they all stem from
--- the same observation: the dev "Default" ledger has been mixing
--- imported data with three independent seed scripts' demo/test/synthetic
--- rows, and that mixing produces user-visible noise (e.g. the IDXA
--- stock-split row from seed-demo-investments.sql leaks a share-count
--- discrepancy into the imported holdings view).
+-- the same design problem: three independent seed scripts wrote their
+-- demo/test/synthetic rows into the "Default" ledger, the same ledger
+-- that holds imported data, so seed rows could surface in views of the
+-- imported data (e.g. a seeded stock-split row from
+-- seed-demo-investments.sql would alter share counts in the holdings
+-- view).
 --
 -- 1. Function update — `recompute_holdings_cost_basis` now also
 --    refreshes `lots.unit_cost` on the idempotency-reset step. Before:
@@ -30,12 +31,11 @@
 --    are rewired in lockstep to target this Demo ledger; re-running
 --    them after this migration populates Demo without touching Default.
 --
--- 3. Fees commission flag — in Default ledger, the "Fees" expense
---    category gets `is_trade_commission = TRUE`, because it is the
---    category that carries trade commissions. The recompute pass at the
---    end of this migration folds those commissions into basis.
---    "Investment Fees" stays FALSE because its Buy-side rows are not
---    trade commissions.
+-- 3. Fees commission flag — in Default ledger, the top-level "Fees"
+--    expense category gets `is_trade_commission = TRUE`; it is the
+--    category this migration treats as the trade-commission bucket.
+--    No other category is flagged. The recompute pass at the end of
+--    this migration folds qualifying commissions into basis.
 -- =============================================================================
 
 
@@ -182,7 +182,7 @@ $$;
 -- -----------------------------------------------------------------------------
 -- Part 2: Delete demo / test / synthetic rows from Default ledger.
 --
--- 12 accounts identified by name pattern. Deletion order matters:
+-- Accounts identified by name pattern. Deletion order matters:
 -- lots → holdings → txn_legs → txn_headers → accounts. The seeds were
 -- self-contained (every header has only demo-account legs or — for
 -- synthetic — a Default-category counterpart that we remove the header
@@ -265,14 +265,14 @@ ON CONFLICT DO NOTHING;
 
 -- -----------------------------------------------------------------------------
 -- Part 4: Flag the Default ledger's "Fees" category as a trade
--- commission. This is the bucket that carries trade commissions; the
+-- commission. This migration treats it as the commission bucket; the
 -- Option B gate ensures only events where the fee's cash counterpart is
 -- on an investment account contribute to basis.
 -- -----------------------------------------------------------------------------
 
--- Top-level "Fees" only — `parent_id IS NULL` filters out
--- sub-categories elsewhere in the tree that happen to share the
--- name but are not investment commissions. (Even without this filter
+-- Top-level "Fees" only — `parent_id IS NULL` excludes any
+-- sub-category elsewhere in the tree that could share the name
+-- without being an investment commission. (Even without this filter
 -- Option B's structural gate would block pollution from non-investment
 -- paths, but the narrower UPDATE keeps the audit trail honest.)
 UPDATE accounts

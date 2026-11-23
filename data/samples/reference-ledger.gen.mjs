@@ -1,16 +1,16 @@
 // =============================================================================
 // reference-ledger.gen.mjs — generator for data/samples/reference-ledger.json
 //
-// A synthetic, PII-free "truly representative" Moneydance export whose shapes
-// are derived from diffing the real import against the demo (roadmap #3). Unlike
-// the demo (MD-native: `invest.txntype` set), this mirrors real MD-from-QIF
-// data: investment txns have a BLANK `invest.txntype` and are classified via
-// `xfer_type` + `qif_invst_action` — the code path every investment
-// transaction in a real QIF-origin export takes. It also carries the shapes the demo lacks:
+// A synthetic, PII-free Moneydance export in the QIF-origin shape (roadmap #3).
+// Unlike the demo (MD-native: `invest.txntype` set), its investment txns have a
+// BLANK `invest.txntype` and are classified via `xfer_type` + `qif_invst_action`
+// — the importer's QIF-origin classification path (ADR-0027's second and third
+// sources), which the demo never exercises. It also carries the shapes the demo lacks:
 //   - placeholder-price transfers (orphan + paired) and a self-ref buysellxfr
 //   - security diversity: mutual fund (dec 9), money-market (dec 4), bond,
 //     equity, international, ETF — spanning share precisions the demo never hits
-//   - an inactive/closed position, and asset + liability accounts (net-worth breadth)
+//   - an inactive closed position (the IRA's MFB: every share transferred out),
+//     and asset + liability accounts (net-worth breadth)
 //
 // Encoding (verified against the importer): pamt = cash * 100 (cents);
 // samt = shares * 10^dec; price is derived cash/qty (the `rate` field is
@@ -32,13 +32,16 @@ push({ obj_type: "curr", id: "curr-usd", currid: "USD", name: "US Dollar",
        type: undefined, isbase: "1", dec: "2", pref: "$", suff: "", rate: "1.0", rrate: "1.0" });
 
 // [id, ticker, name, dec, sec_type, sec_subtype]
+// sec_type is Moneydance's numeric code, written on the type-s security account
+// (the importer's MdSecurityType table): 0 CD, 1 Bond, 2 Mutual Fund, 3 Stock,
+// 4 Option. A Mutual Fund is an ETF or a money-market fund by its subtype.
 const SECS = [
   ["MFA", "Reference Mutual Fund A", 9, "2", "Balanced"],       // high-precision mutual fund
   ["MFB", "Reference Mutual Fund B", 4, "2", "Equity Index"],
-  ["MMF", "Reference Money Market",  4, "5", "Money Market"],   // stable-NAV fund
+  ["MMF", "Reference Money Market",  4, "2", "Money Market"],   // stable-NAV fund
   ["EQA", "Reference Equity A",      2, "2", "Equity"],
   ["INT", "Reference International", 4, "2", "International"],
-  ["BND", "Reference Bond A",        3, "3", "Income"],
+  ["BND", "Reference Bond A",        3, "1", "Income"],
   ["ETF", "Reference ETF A",         5, "2", "Exchange Traded Fund"],
 ];
 const secCurr = {}, sAcct = {}, secDec = {};
@@ -62,6 +65,8 @@ const catXfer = push({ obj_type: "acct", id: "cat-xfer", type: "i", parentid: ro
 const catMisc = push({ obj_type: "acct", id: "cat-misc", type: "e", parentid: root, currid: "curr-usd", name: "Misc Investment Expense", sbal: "0" });
 
 // one 's' security sub-account per (investment account, security) actually used.
+// `inactive` marks the sub-account inactive whether this call creates it or it
+// already exists (push stores a copy, so the emitted item is the one updated).
 function sacct(acctV, tk, inactive = false) {
   const key = `${acctV}:${tk}`;
   if (!sAcct[key]) {
@@ -70,6 +75,8 @@ function sacct(acctV, tk, inactive = false) {
       currid: secCurr[tk], name, sec_type, sec_subtype, is_inactive: inactive ? "1" : "0",
       applies_to_net_worth: "1", cost_basis: "1", strike: "0", face_value: "0",
       option: "0", option_price: "0.0", sec_dividend: "0", bond_type: "0" });
+  } else if (inactive) {
+    items.find((i) => i.id === sAcct[key]).is_inactive = "1";
   }
   return sAcct[key];
 }
@@ -158,6 +165,7 @@ sharesIn(ira, "MFB", 287.654, 32.4750, 20060315);
 sharesIn(ira, "MFB", 100.000, 34.0500, 20060315);   // 3-lot rollover, one security+date
 divReinvest(ira, "MFB", 21.111, 845.50, 20121217);
 dollarOut(ira, "MFB", 821.110, 20130122);         // orphan placeholder-price transfer-out of all shares
+sacct(ira, "MFB", true);                          // the closed position: zero shares left, marked inactive
 
 // --- PAIRED placeholder-price transfer: brokerage INT out -> IRA in, same day
 dollarOut(brk, "INT", 800.000, 20210615);
@@ -166,7 +174,7 @@ sharesIn(ira, "INT", 800.000, 43.2500, 20210615);   // dest carries real carried
 // --- self-referential buysellxfr (ADR-0053): transfer clearing back to brk ---
 // A real-priced sellx whose xfr leg targets the SAME investment account.
 txn(brk, 20190701, "Sold", "xfrtp_buysellxfr",
-  [{ acct: sacct(brk, "BND", true), stype: "sec", samt: shares(-50, 3), pamt: cents(50 * 99.10) },
+  [{ acct: sacct(brk, "BND"), stype: "sec", samt: shares(-50, 3), pamt: cents(50 * 99.10) },
    { acct: brk, stype: "xfr", samt: cents(-50 * 99.10), pamt: cents(-50 * 99.10) }]);
 
 // ---- emit -------------------------------------------------------------------

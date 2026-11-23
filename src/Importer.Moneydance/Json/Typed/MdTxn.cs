@@ -139,16 +139,24 @@ public sealed record MdTxn(
     /// True if this transaction belongs to the investment-mapper pipeline,
     /// either because its <see cref="InvestTxnType"/> tag is set or because
     /// its <see cref="XferType"/> names an investment-only transfer shape.
-    /// Real exports include a population of buy/sell/dividend-shaped txns
-    /// (likely manually-entered or migrated from another tool) that lack
-    /// the txntype tag but still belong to the investment pipeline; the
+    /// An export can carry buy/sell/dividend-shaped txns (manually
+    /// entered, or migrated from another tool) that lack the txntype
+    /// tag but still belong to the investment pipeline; the
     /// xfer_type fallback keeps them from being routed to the
     /// non-investment mapper, which can't translate sec splits.
     /// </summary>
-    public bool IsInvestmentShape => IsInvestmentTxn || XferType is
-        "xfrtp_buysell" or "xfrtp_buysellxfr" or
-        "xfrtp_dividend" or "xfrtp_dividendxfr" or
-        "xfrtp_miscincexp";
+    public bool IsInvestmentShape => IsInvestmentShapeOf(InvestTxnType, XferType);
+
+    /// <summary>
+    /// The <see cref="IsInvestmentShape"/> test over its two raw fields, so a
+    /// reminder's embedded txn (<see cref="MdReminderTxn"/>) applies the same
+    /// one.
+    /// </summary>
+    internal static bool IsInvestmentShapeOf(string? investTxnType, string? xferType) =>
+        !string.IsNullOrEmpty(investTxnType) || xferType is
+            "xfrtp_buysell" or "xfrtp_buysellxfr" or
+            "xfrtp_dividend" or "xfrtp_dividendxfr" or
+            "xfrtp_miscincexp";
 
     private static string? NullIfEmpty(string? value) =>
         string.IsNullOrEmpty(value) ? null : value;

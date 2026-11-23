@@ -1,11 +1,11 @@
 # 0058 — UI/UX consolidation pass: shared overlay/state primitives, sidebar destinations, settings consolidation, register polish
 
-Status: Accepted
+Status: Accepted; amended 2026-10-20 by [ADR-0106](0106-folders-replace-tabs.md) (the account filter tabs are gone)
 
 ## Context
 
-After the feature build-out the SPA had accumulated drift that a feature-by-feature
-view never surfaces:
+A feature-by-feature build-out accumulates drift that no single feature's view
+shows. In the SPA:
 
 - **Dialogs** were each hand-rolled — every one its own backdrop, Esc handler,
   and (inconsistent) focus handling; several had no focus trap or return-focus.
@@ -33,7 +33,8 @@ This pass consolidates the surface; it refines (does not supersede) ADR-0021,
 2. **Navigation into the sidebar.** Per-ledger destinations (Overview / Accounts /
    Securities / Reminders / Activity / Settings) render in the persistent sidebar;
    the Overview emoji header-nav and the `⋯`-to-hub control are retired. The
-   account filter tabs sit directly below the destinations. The sidebar account
+   account filter tabs sit directly below the destinations (removed 2026-10-20;
+   folders inside each type section replace them, ADR-0106). The sidebar account
    list renders **one section per account type** (Banking / Cash / Credit cards /
    Investments / Assets / Liabilities / Loans), labelled + ordered by a shared
    `lib/accountTypes` metadata module the Ledger Hub also consumes — so the two

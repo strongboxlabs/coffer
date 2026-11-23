@@ -42,9 +42,10 @@ public sealed record DiscoveredFileAccount(
     /// <c>"investment"</c>. Drives the SPA's mapping wizard's
     /// suggested-account filter.</summary>
     string AccountType,
-    /// <summary>ISO-4217 currency on the statement (e.g. <c>"USD"</c>).
-    /// Lets the SPA refuse mappings whose Coffer account has a
-    /// different currency.</summary>
+    /// <summary>ISO-4217 currency on the statement (e.g. <c>"USD"</c>),
+    /// null for a format that states none (QIF, CSV). An import into an
+    /// account in another currency is refused before its run opens
+    /// (<see cref="StatementCurrencyMismatchException"/>, ADR-0114 D13).</summary>
     string? Currency,
     /// <summary>Count of transactions parsed for this account block.
     /// Surface only — the actual transactions live on

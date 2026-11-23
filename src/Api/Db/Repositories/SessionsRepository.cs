@@ -74,7 +74,7 @@ public sealed class SessionsRepository
     /// </summary>
     /// <remarks>
     /// The disabled check is not redundant with disabling revoking every session
-    /// (2026-10-12 audit, H2). Revocation handles the sessions that exist when the
+    /// (ADR-0105 D3). Revocation handles the sessions that exist when the
     /// admin clicks; this handles a session minted in the same instant, and any
     /// future path that flips <c>is_disabled</c> without going through the revoke.
     /// </remarks>
@@ -108,10 +108,10 @@ public sealed class SessionsRepository
     /// </summary>
     /// <remarks>
     /// The app clock, read once and sent as a parameter, like the insert's
-    /// stamp and the idle-timeout check that reads it. It used to be the
-    /// database's <c>now()</c> (a bare clock read inside the lambda is
-    /// translated to SQL), which the idle check then compared against the
-    /// process clock: two clocks in one comparison.
+    /// stamp and the idle-timeout check that reads it. A bare clock read inside
+    /// the lambda would be translated to the database's <c>now()</c>, which the
+    /// idle check would then compare against the process clock: two clocks in
+    /// one comparison.
     /// </remarks>
     public async Task BumpLastSeenAsync(Guid id, CancellationToken cancellationToken = default)
     {
@@ -160,7 +160,7 @@ public sealed class SessionsRepository
     /// <summary>
     /// A user's live sessions, most recently used first (FU-087): not revoked, not past
     /// their lifetime, and seen since <paramref name="seenSince"/>, the idle cutoff the
-    /// caller owns. ADR-0013 promised this list; until now there was only a button.
+    /// caller owns. ADR-0013's session list.
     /// </summary>
     public async Task<IReadOnlyList<SessionSummary>> ListActiveForUserAsync(
         Guid userId, DateTime seenSince, CancellationToken cancellationToken = default)
@@ -170,6 +170,7 @@ public sealed class SessionsRepository
         return await db.AuthSessions.AsNoTracking()
             .Where(s => s.UserId == userId && s.RevokedAt == null && s.ExpiresAt > now && s.LastSeenAt >= seenSince)
             .OrderByDescending(s => s.LastSeenAt)
+            .ThenByDescending(s => s.Id)
             .Select(s => new SessionSummary(s.Id, s.CreatedAt, s.LastSeenAt, s.UserAgent, s.AuthMethod))
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);

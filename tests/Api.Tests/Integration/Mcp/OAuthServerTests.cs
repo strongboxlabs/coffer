@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Json;
 
 using Coffer.Api.Tests.Integration.Infra;
 
@@ -11,16 +12,17 @@ namespace Coffer.Api.Tests.Integration.Mcp;
 /// to drive the connector OAuth flow.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class OAuthServerTests
+public sealed class OAuthServerTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public OAuthServerTests(PostgresFixture fixture) => _fixture = fixture;
+    public OAuthServerTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     [Fact]
     public async Task Discovery_document_advertises_endpoints_when_mcp_enabled()
     {
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled();
         using var client = factory.CreateClient();
 
         var response = await client.GetAsync("/.well-known/oauth-authorization-server");
@@ -42,7 +44,7 @@ public sealed class OAuthServerTests
     {
         // Behind Traefik the app speaks HTTP on an internal host; the generated
         // OAuth URLs must be the external https://<domain> the client used.
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled();
         using var client = factory.CreateClient();
 
         var request = new HttpRequestMessage(HttpMethod.Get, "/.well-known/oauth-authorization-server");
@@ -59,9 +61,30 @@ public sealed class OAuthServerTests
     }
 
     [Fact]
+    public async Task Issuer_has_no_trailing_slash_and_matches_the_protected_resource_metadata()
+    {
+        // RFC 8414 §3.3: the issuer in the document must equal, exactly, the issuer the
+        // client built the metadata URL from — the authorization_servers entry. The MCP
+        // SDK enforces this; a trailing "/" made mcp-remote abort during auth.
+        await using var factory = new ApiFactory(Db).WithMcpEnabled();
+        using var client = factory.CreateClient();
+
+        var discovery = await client.GetFromJsonAsync<System.Text.Json.JsonElement>(
+            "/.well-known/oauth-authorization-server");
+        var resource = await client.GetFromJsonAsync<System.Text.Json.JsonElement>(
+            "/.well-known/oauth-protected-resource");
+
+        var issuer = discovery.GetProperty("issuer").GetString();
+        var named = resource.GetProperty("authorization_servers")[0].GetString();
+        Assert.False(string.IsNullOrEmpty(issuer));
+        Assert.False(issuer!.EndsWith('/'));
+        Assert.Equal(named, issuer);
+    }
+
+    [Fact]
     public async Task Protected_resource_metadata_points_at_the_authorization_server()
     {
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled();
         using var client = factory.CreateClient();
 
         var response = await client.GetAsync("/.well-known/oauth-protected-resource");
@@ -78,7 +101,7 @@ public sealed class OAuthServerTests
     {
         // No dev-auth: the only way to authenticate /mcp is a token, so an
         // anonymous call 401s and must carry the discovery pointer.
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled().WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled().WithoutDevAuth();
         using var client = factory.CreateClient();
 
         var response = await client.PostAsync("/mcp", new StringContent(

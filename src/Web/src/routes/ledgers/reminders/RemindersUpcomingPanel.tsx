@@ -1,14 +1,18 @@
-import { useMemo, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMemo, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import { unskipReminder, ApiError, fetchUpcomingReminders } from '@/lib/api';
 import type { UpcomingOccurrence } from '@/lib/types';
 import { formatSignedAmount } from '@/lib/money';
+import { estimateTitle, isEstimating } from '@/lib/reminderEstimate';
 import {
     addMonths, monthGridRange, monthLabel, monthMatrix, todayParts,
 } from '@/lib/calendar';
 import { Button } from '@/components/ui/Button';
 import { Panel, PanelBody } from '@/components/ui/Panel';
+import { usePendingButtonProps } from '@/components/ui/pending';
+import { useRowRemovalFocus } from '@/components/ui/rowRemovalFocus';
 
 import { ReminderOccurrenceModal } from './ReminderOccurrenceModal';
 
@@ -16,13 +20,25 @@ const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MAX_CHIPS = 3;
 
 /**
+ * A chip's key: its occurrence, never its state or its place in the cell. A
+ * due chip skipped or restored is the same chip; a posted one is its own.
+ */
+const chipKey = (o: UpcomingOccurrence) =>
+    `${o.reminderId}:${o.date}:${o.kind === 'scheduled' ? 'posted' : 'due'}`;
+
+/**
  * Upcoming view (ADR-0049) — a full-width month calendar whose chips are the
  * occurrences. Clicking an un-fired chip opens the occurrence dialog
  * (`ReminderOccurrenceModal`): one form to edit + Post or Skip. The dialog owns
  * the Post/Skip mutations + the catch-up cascade; it reports a post-action
- * notice back here. `scheduled` (posted) occurrences are read-only chips.
+ * notice back here. `scheduled` (posted) occurrences are read-only chips, and for
+ * a viewer every chip is: a viewer neither posts nor skips nor restores.
  */
-export function RemindersUpcomingPanel({ ledgerId }: { ledgerId: string }) {
+export function RemindersUpcomingPanel({ ledgerId, canEdit }: {
+    ledgerId: string;
+    /** Owner or editor: a due chip opens Post or skip, a skipped one restores. */
+    canEdit: boolean;
+}) {
     const today = useMemo(() => todayParts(), []);
     const [view, setView] = useState<{ year: number; month: number }>(
         { year: today.year, month: today.month });
@@ -53,6 +69,22 @@ export function RemindersUpcomingPanel({ ledgerId }: { ledgerId: string }) {
         return map;
     }, [occurrences]);
     const grid = useMemo(() => monthMatrix(view.year, view.month), [view]);
+
+    // A chip's own action can change it (ADR-0023 §L). Skip and restore turn a
+    // due chip into a skipped one and back: the chip is keyed by its occurrence,
+    // not its state, so it stays the same button and keeps focus. A post turns
+    // it into a read-only chip, and the button that held focus hands it to the
+    // next chip button drawn (across the month, the chips folded behind
+    // "+N more" left out), else the previous one, else the calendar itself,
+    // which has no add control.
+    const shownIn = (date: string) => {
+        const items = byDate.get(date) ?? [];
+        return expanded.has(date) ? items : items.slice(0, MAX_CHIPS);
+    };
+    const drawnChips = grid.flat().flatMap((cell) =>
+        shownIn(cell.date).filter((o) => o.kind !== 'scheduled').map(chipKey));
+    const calendarRef = useRef<HTMLDivElement | null>(null);
+    const chipControl = useRowRemovalFocus(drawnChips, calendarRef);
 
     const openOccurrence = (o: UpcomingOccurrence) => { setNotice(null); setActive(o); };
 
@@ -102,7 +134,13 @@ export function RemindersUpcomingPanel({ ledgerId }: { ledgerId: string }) {
                     </PanelBody>
                 </Panel>
             ) : (
-                <Panel>
+                <Panel
+                    ref={calendarRef}
+                    role="group"
+                    aria-label={`Reminders in ${monthLabel(view.year, view.month)}`}
+                    tabIndex={-1}
+                    className="focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                >
                     <PanelBody className="p-2">
                         <div className="grid grid-cols-7 text-center text-[0.625rem] uppercase tracking-wider text-text-subtle">
                             {WEEKDAYS.map((d) => <div key={d} className="py-1">{d}</div>)}
@@ -111,8 +149,7 @@ export function RemindersUpcomingPanel({ ledgerId }: { ledgerId: string }) {
                             {grid.flat().map((cell) => {
                                 const items = byDate.get(cell.date) ?? [];
                                 const isToday = cell.date === today.date;
-                                const isExpanded = expanded.has(cell.date);
-                                const shown = isExpanded ? items : items.slice(0, MAX_CHIPS);
+                                const shown = shownIn(cell.date);
                                 const hidden = items.length - shown.length;
                                 return (
                                     <div
@@ -124,10 +161,12 @@ export function RemindersUpcomingPanel({ ledgerId }: { ledgerId: string }) {
                                             {Number(cell.date.slice(8, 10))}
                                         </div>
                                         <div className="mt-0.5 space-y-0.5">
-                                            {shown.map((o, i) => (
+                                            {shown.map((o) => (
                                                 <OccurrenceChip
-                                                    key={`${o.reminderId}-${o.kind}-${i}`}
+                                                    key={chipKey(o)}
+                                                    chipRef={chipControl(chipKey(o))}
                                                     occ={o}
+                                                    canEdit={canEdit}
                                                     onOpen={openOccurrence}
                                                     onUnskip={(x) => unskip.mutate(x)}
                                                     unskipping={unskip.isPending}
@@ -148,7 +187,7 @@ export function RemindersUpcomingPanel({ ledgerId }: { ledgerId: string }) {
                             })}
                         </div>
                         <p className="mt-2 px-1 text-[0.625rem] text-text-subtle">
-                            <span className="text-accent">● Reminder</span> (click to edit + post) ·{' '}
+                            <span className="text-accent">● Reminder</span>{canEdit ? ' (click to edit + post)' : null} ·{' '}
                             <span className="text-text-muted">✓ Scheduled</span> (posted) ·{' '}
                             <span className="text-text-subtle line-through">⊘ Skipped</span>
                         </p>
@@ -174,38 +213,59 @@ export function RemindersUpcomingPanel({ ledgerId }: { ledgerId: string }) {
  * read-only chip — `skipped` rendered struck-through so a catch-up cascade
  * leaves a visible trail rather than a gap.
  */
-function OccurrenceChip({ occ, onOpen, onUnskip, unskipping }: {
+function OccurrenceChip({ occ, canEdit, chipRef, onOpen, onUnskip, unskipping }: {
     occ: UpcomingOccurrence;
+    /** A viewer's chip reads, whatever its state: it opens and restores nothing. */
+    canEdit: boolean;
+    /** The ref for the chip's button (due or skipped), for when a post makes
+     *  it read-only (useRowRemovalFocus); the read-only chip takes none. */
+    chipRef: (el: HTMLElement | null) => void;
     onOpen: (o: UpcomingOccurrence) => void;
     onUnskip: (o: UpcomingOccurrence) => void;
     unskipping: boolean;
 }) {
+    const pendingProps = usePendingButtonProps();
     const label = occ.payee ?? 'Reminder';
-    const amount = formatSignedAmount(occ.amount);
+    // In the series' source account's currency. A series with no single source has
+    // none, so its chip carries no figure rather than one in a currency it is not in.
+    const amount = occ.currencyCode ? formatSignedAmount(occ.amount, occ.currencyCode) : null;
 
-    // Mig 220. An estimated amount is prefixed "≈" and says so in the tooltip, because
-    // the number alone cannot tell a reader it is a guess. Only when an estimate was
-    // actually PRODUCED: a series that asked for one and could not have it is showing its
-    // template figure, which is not an estimate and must not be marked as one.
-    const estimated = occ.estimate?.amount != null;
-    const shownAmount = estimated ? `≈${amount}` : amount;
-    const title = estimated
-        ? `${label} · ${shownAmount} · estimated from the last `
-          + `${occ.estimate!.availableSampleCount} occurrence(s)`
-        : `${label} · ${amount}`;
+    // Mig 220. An estimating series' amount is prefixed "≈" and the tooltip says what
+    // it rests on, because the number alone cannot tell a reader it is not the bill:
+    // the estimate, or the amount entered standing in until there is one.
+    const estimate = amount !== null && isEstimating(occ) ? estimateTitle(occ.estimate) : null;
+    const shownAmount = amount === null ? '' : estimate !== null ? `≈${amount}` : amount;
+    const title = amount === null
+        ? label
+        : estimate !== null
+            ? `${label} · ${shownAmount} · ${estimate}`
+            : `${label} · ${amount}`;
 
-    // A SKIPPED chip is now actionable: un-skip exists, and three fire errors have
-    // instructed people to use it since before it did. A posted (`scheduled`) chip stays
+    // A SKIPPED chip is actionable: three fire errors instruct people to un-skip.
+    // A posted (`scheduled`) chip stays
     // read-only — undoing that is deleting a real transaction, which belongs in the
     // register, not behind a calendar chip.
+    if (occ.kind === 'skipped' && !canEdit) {
+        return (
+            <div
+                title={`${title} · skipped`}
+                className="rounded bg-surface-muted px-1 text-[0.625rem] leading-tight text-text-subtle"
+            >
+                <span className="flex items-baseline justify-between gap-1">
+                    <span className="truncate line-through">⊘ {label}</span>
+                    <span className="shrink-0 tabular-nums">{shownAmount}</span>
+                </span>
+            </div>
+        );
+    }
     if (occ.kind === 'skipped') {
         return (
             <button
+                ref={chipRef}
                 type="button"
                 title={`${title} · skipped — restore it`}
-                onClick={() => onUnskip(occ)}
-                disabled={unskipping}
-                className="block w-full rounded bg-surface-muted px-1 text-left text-[0.625rem] leading-tight text-text-subtle hover:bg-surface-muted/60 hover:text-text-muted disabled:opacity-50"
+                {...pendingProps(unskipping, () => onUnskip(occ))}
+                className="block w-full rounded bg-surface-muted px-1 text-left text-[0.625rem] leading-tight text-text-subtle hover:bg-surface-muted/60 hover:text-text-muted disabled:opacity-50 aria-disabled:opacity-50"
             >
                 <span className="flex items-baseline justify-between gap-1">
                     <span className="truncate line-through">⊘ {label}</span>
@@ -230,9 +290,22 @@ function OccurrenceChip({ occ, onOpen, onUnskip, unskipping }: {
         );
     }
 
+    // Un-fired reminder, for a viewer: read, in the due chip's colours.
+    if (!canEdit) {
+        return (
+            <div title={title} className="rounded bg-accent-soft px-1 text-[0.625rem] leading-tight text-accent">
+                <span className="flex items-baseline justify-between gap-1">
+                    <span className="truncate">● {label}</span>
+                    <span className="shrink-0 tabular-nums">{shownAmount}</span>
+                </span>
+            </div>
+        );
+    }
+
     // Un-fired reminder: actionable (opens the occurrence dialog).
     return (
         <button
+            ref={chipRef}
             type="button"
             title={title}
             onClick={() => onOpen(occ)}

@@ -1,30 +1,27 @@
 -- ---------------------------------------------------------------------------
 -- 236 — delete the trade prices that were never prices.
 --
--- Migration 235 stopped a share movement from PRICING a day. It could not undo
+-- Migration 235 stopped a placeholder share movement from PRICING a day. It could not undo
 -- what had already been written: the rows were already in security_prices, and
 -- once 235 excludes the legs behind them nothing re-derives them, so they stop
 -- being reported by the consistency check as well. Left alone they would be
 -- invisible AND wrong — valuing holdings at a nominal price of one per share,
 -- forever, with nothing in the product able to see it.
 --
--- WHAT THESE ARE. Quicken wrote share movements into Moneydance with the
--- transaction amount set to the SHARE COUNT rather than a value (an MD record
+-- WHAT THESE ARE. A Moneydance share movement can carry the transaction amount
+-- set to the SHARE COUNT rather than a value (an MD record
 -- carries a `1.pamt` that, read as money, is its `1.samt` share count rounded
 -- to cents). The importer derives unit_price = amount / quantity and so
--- produced a price of about one, which then seeded a `trade` price. Found on a
--- real ledger: a fund with a three-figure price five weeks earlier has a stored
--- price of exactly one.
+-- produced a price of about one, which then seeded a `trade` price — on a fund
+-- that may trade far above one, a stored price of par.
 --
--- THE SET IS CLOSED. Checked across a whole real ledger: every nominal-priced
--- leg on a security that trades well above the band is a ShrsIn or ShrsOut,
--- every one of them carries a `qif_sn` marker, and all of them fall inside one
--- span of years that ended long ago. Every other leg with the same arithmetic —
--- including every recent one — is a money-market or stable-value fund
--- genuinely priced at par. This is a finished historical artifact of one
--- Quicken migration; it cannot grow, which is why a one-time delete is the
--- proportionate fix rather than a new reason code and repair verb for a small,
--- closed set.
+-- THE SET IS CLOSED. After 235 no placeholder share movement prices a day, so
+-- nothing can write a new row of this kind; what is left is what was written
+-- before it. A set that cannot grow is why a one-time delete is the
+-- proportionate fix rather than a new reason code and repair verb. (235's test
+-- does not match placeholders whose amount is truncated rather than rounded to
+-- cents; migration 237 closes that by excluding every share movement, and
+-- deletes the nominal prices they wrote on the same terms as this one.)
 --
 -- THE PREDICATE, and why each clause is load-bearing:
 --
@@ -45,9 +42,9 @@
 --                           evidence rather than cleaning up.
 --   the security trades well above the band somewhere in its own history
 --   (the EXISTS clause below)
---                         — the guard that keeps money-market funds out. It is
---                           not theoretical: found on a real ledger, it protects
---                           a row that every other clause matches.
+--                         — the guard that keeps money-market funds out. A
+--                           fund genuinely priced at par, on a day no surviving
+--                           leg prices, matches every other clause.
 --
 -- Safe to delete rather than correct: security_prices `trade` rows are DERIVED.
 -- Removing one makes valuation fall back to the nearest real price or report

@@ -1,26 +1,13 @@
 # `bank-edit/` — the bank transaction editor
 
-`TxnRowEdit.tsx` was 1643 lines and its split branch grew without bound. This
-folder is where its pieces went, mirroring `investment-edit/` next door: **pure
+The pieces of `TxnRowEdit.tsx`, mirroring `investment-edit/` next door: **pure
 `.ts` at the root, `fields/` for widgets, `hooks/` for the draft hook.** The
 extension is the boundary marker — a reviewer can tell what may import React by
 looking at the filename, and the pure tier is what stays unit-testable.
 
-The shell is now ~980 lines, down from 1643 — in the same range as the
-investment shell next door.
-
-*Approximate on purpose.* An exact count here has already been wrong twice: it
-was written as 989 (true mid-decomposition, before the redesign cut it), then
-corrected to 983, then stale again the same day because a comment was deleted.
-A figure that moves with every edit invites a reader to spot-check it and find
-the document lying about something trivial. `wc -l` is the source of truth; this
-line is for the order of magnitude.
-
-Two pieces of work landed here: the decomposition (Follow-ups Slice 3), which
-was behaviour-zero by rule, and the splits redesign, which was not. The
-decomposition's gate was that `TxnRowEdit.test.tsx` **and**
-`TxnRowEdit.characterisation.test.tsx` pass with **no assertion edits**, and it
-held. The redesign then changed three of those assertions on purpose; the diff
+`TxnRowEdit.test.tsx` **and** `TxnRowEdit.characterisation.test.tsx` pin the
+editor's behaviour. A refactor here passes them with **no assertion edits**; a
+change to one of their assertions is a deliberate behaviour change, and the diff
 is the record of exactly what changed, which is what a characterisation suite
 is for.
 
@@ -59,7 +46,7 @@ what two parallel validators produce.
 it means touching every reference to seven state variables in the SAME diff
 that moves the seeding logic — two risks at once, with the gate only able to
 say that something broke, not which. Per-field seeds need no call-site changes,
-so the logic became testable first and the consolidation stayed a separate step.
+so the logic is testable on its own and the consolidation is a separate step.
 
 **4 · `nextKey` is a module counter and deliberately not pure.**
 *2026-09-15.*
@@ -74,16 +61,15 @@ in-flight edit.
 **5 · The legs have their OWN grid; only the root row rides the register's.**
 *2026-09-15.* `fields/SplitsGrid.tsx` lays legs out on
 `# · Category+Tags · Memo · Amount · actions`.
-**Why:** leg rows used to ride the register's eight tracks so each field sat
-under its root counterpart. That bought vertical alignment and paid for it three
-times: columns 1–3 were empty on every leg of every split, the category picker
-had to share one track with the per-posting tags slot, and a leg row was
-therefore ~62px tall.
+**Why:** leg rows on the register's eight tracks, each field under its root
+counterpart, buy vertical alignment and pay for it three times: columns 1–3 are
+empty on every leg of every split, the category picker has to share one track
+with the per-posting tags slot, and a leg row is therefore ~62px tall.
 Twenty-five of those is ~1550px of form — the Save button is further away the
 further down the split you work, and the running total scrolls off the top of
 the screen while you type the amounts it sums. Legs have no register counterpart
 to align with, so stepping out of the template costs nothing and buys back three
-tracks of width. A leg row is now 30px, which is what makes a fixed-height
+tracks of width. On its own grid a leg row is 30px, which is what makes a fixed-height
 scroll viewport practical: **the list scrolls, the editor does not grow.**
 
 **6 · Reorder works from a keyboard and on touch, not by drag alone.**
@@ -98,8 +84,7 @@ dragging down and "before you" when dragging up — correct for a drag, and not
 
 The drag's insertion line is drawn from the same asymmetry rather than always
 before the hovered row. Anything else would show the row landing somewhere it
-will not, which is the defect the line was added to fix: the old drag
-highlighted the target ROW, and a row highlight cannot express "between 2 and 3".
+will not — and a highlight on the target ROW cannot express "between 2 and 3".
 
 **7 · The per-leg memo stays a `<textarea>` even though the row is one line.**
 *2026-09-15.*
@@ -114,19 +99,43 @@ on the main row, the split parent and the leg row alike.
 
 The two registers deliberately differ: the bank register flags money going out
 in red, the investment register flags money coming in green, and each is
-internally consistent. This editor first followed the INVESTMENT pairing on the
-reasoning that red is also the error colour in this grid, so a split of ordinary
-expenses would read as twenty-five errors.
+internally consistent.
 
-**Why that was wrong:** it is the BANK editor. It opens inside the bank register
-and visually replaces bank rows, so every leg of a paycheck was red in the
-register and plain the instant you opened it — the same number contradicting
-itself across two views, which is the exact failure two representations are
-feared for. The collision being avoided is also not real: a defect here is
+**Why not the INVESTMENT pairing,** though red is also the error colour in this
+grid: this is the BANK editor. It opens inside the bank register and visually
+replaces bank rows, so under the other pairing every leg of a paycheck would be
+red in the register and plain the instant you opened it — the same number
+contradicting itself across two views, which is the exact failure two
+representations are feared for. Nor is the collision real: a defect here is
 signalled by a tinted row, an inset bar, a red field BORDER, a red row number
 and a marker icon, none of which is a figure's text colour. The single-posting
-branch carried no colour at all, so a plain transaction changed colour merely by
-being opened; it now uses the same pairing.
+branch uses the same pairing, so a plain transaction does not change colour
+merely by being opened.
+
+**9 · The second amount is a rule about one posting, decided by one predicate.**
+*2026-11-16.* A posting between real accounts in different currencies carries the
+other account's own figure (ADR-0114 D13, D14): `otherAmount` on the draft, shown as
+Received or Sent right of Amount (`fields/SecondAmountField.tsx`), or under the split
+column caption Other amount while a split's lines go both ways, required and nonzero
+(`validation.ts`, kind `second`), sent as `counterpartyAmount` signed opposite to Amount
+(`secondAmount.ts`). Its refusal is the field's own sentence, numbered by posting on a
+split line, and the splits strip groups those lines by that sentence (ADR-0114 D14).
+**Why it is not a balance rule:** it compares nothing across postings. It says one
+posting's two legs are both there, as a blank amount does, so "no balance rule, ever"
+below still holds, and zero stays legal for Amount.
+**Why category legs are excluded:** a category holds no money of its own, so its leg
+mirrors the paying side. The predicate (`secondAmountSide`) is: the source is not a
+category, the counterparty is not a category, and their currencies differ. It is decided
+once in the shell beside `counterpartyKind` and handed down. A bare currency comparison
+would ask for a second amount on a category's own register, where the source is the
+category and the editor's currency is the paying account's, and from a foreign-currency
+source to a category.
+**Why the field holds a magnitude:** its sign is always opposite Amount's, so a typed
+minus is ignored and flipping Amount flips the saved figure. A stored or copied figure is
+seeded `otherFixed` and never refilled from a rate; any other field follows Amount and
+the date through the derived rate (`lib/useSecondAmount.ts`) until it is typed in.
+Changing the counterparty drops the figure (`withCounterparty`), so one that comes back
+is prefilled afresh.
 
 ## Out of scope
 
@@ -139,26 +148,32 @@ being opened; it now uses the same pairing.
   has no non-zero constraint.
 - **Per-leg tags are real.** ADR-0103 gave a posting its own tags, distinct from
   the header's — a header tag is a claim about the transaction, a leg tag about
-  one posting, and neither is derived from the other. The slot in col2 was held
-  at a fixed width by a placeholder for exactly this, so landing them did not
-  reshuffle the form; `TagSelect` fills it in its `compact` form — one control on
+  one posting, and neither is derived from the other. On a one-split each side
+  holds its own, and a side with none shows the other side's, inherited
+  (ADR-0108). The slot in col2 is a
+  fixed width; `TagSelect` fills it in its `compact` form — one control on
   every tag surface, because chips wrap and a 30px leg row cannot grow (ADR-0103 D7).
-  The draft always SENDS `tags`, never omits them: the server reads an omitted
-  list as "leave this posting's tags alone", which is the right default for a
-  client that predates the field and the wrong one here, where clearing the last
-  chip has to mean clearing it.
-- **The shell stays large.** The investment shell is still 890 lines after full
+  The draft sends memo and tags by PRESENCE (`notesBody.ts`): an edit sends a
+  key only when the user changed that value from what the editor opened with,
+  because the server reads an omitted key as "leave it" and `null` / `[]` as
+  "clear it", which on a one-split means "inherit the other side's". What the
+  editor shows as inherited is what the save will leave (`inheritedAfterSave.ts`):
+  from the counterparty in the draft, since a kept posting's other leg moves
+  there with its values, and nothing once the stored posting is replaced. A create
+  sends every value that is not blank, a save after collapsing a split to one
+  line always sends memo and tags, and a reminder template edit sends every
+  line's values in full.
+- **The shell stays large.** So does the investment shell after full
   decomposition, and that is correct: the target is a shell holding only what no
   field can own. Driving it toward zero pushes queries into field components or
   inverts the dependency graph.
 
 ## Two things that must NOT move
 
-Both verified against the code rather than assumed:
-
 1. **The container ref and the outside-pointerdown effect stay in the same
-   component.** Separated, `containerRef.current?.contains(...)` yields
-   `undefined` and the editor calls `onCancel()` on its own Save click — and the
+   component.** Separated, the ref is empty when the effect asks
+   `happenedInside(event, containerRef.current)`, every press reads as outside,
+   and the editor calls `onCancel()` on its own Save click — and the
    existing gate passes `cancelOnOutsideClick={false}`, so nothing in the repo
    would catch it. The row menu is `position: fixed` but NOT portalled, so it
    stays inside that ref and a click on a menu item does not cancel the edit.

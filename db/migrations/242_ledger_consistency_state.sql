@@ -9,10 +9,10 @@
 -- So "done" was invisible. An operator with several ledgers could not tell one
 -- that had been repaired from one nobody had opened, and a report expected to be
 -- unhealthy on some unremembered subset trains people to ignore the one signal
--- that matters (FU-012). Migration 209 created that situation deliberately: it
--- fixed the realized-gains writer and did NOT backfill existing rows, on the
--- sound grounds that a blanket recompute at migration time would rewrite
--- holdings and lots for every pair. The consequence was left unowned.
+-- that matters (FU-012). Migration 209 produces exactly that: it fixes the
+-- realized-gains writer and deliberately does NOT backfill existing rows (a
+-- blanket recompute at migration time would rewrite holdings and lots for every
+-- pair), so an affected ledger reads unhealthy until someone repairs it.
 --
 -- WHAT THIS ANSWERS. Three states that were previously one:
 --
@@ -25,16 +25,16 @@
 --
 -- plus last_repaired_at, so "I repaired this in March" survives the next check.
 --
--- "Unknown" is a real state and gets a real NULL rather than a sentinel. The
--- first draft used healthy = false with an empty failing list and an epoch
--- timestamp to mean it, which is wrong in the direction that matters: anything
+-- "Unknown" is a real state and gets a real NULL rather than a sentinel.
+-- Encoding it as healthy = false with an empty failing list and an epoch
+-- timestamp would be wrong in the direction that matters: anything
 -- rendering the verdict reads false as UNHEALTHY and would show a red mark for a
 -- ledger nobody has examined. A CHECK keeps the pair honest, so "checked but no
 -- verdict" and "a verdict from no particular time" cannot be written at all.
 --
 -- IT ALSO GATES THE CADENCE. ConsistencyMonitor ran on every scheduler tick —
 -- 15 minutes, 96 full checks a day, to announce at most once (the publish is
--- throttled to 24h, the check behind it was not). On a real ledger that is
+-- throttled to 24h, the check behind it was not). On any ledger that is
 -- every balance row and every position re-verified every quarter hour — work
 -- that grows with the ledger, for an answer that rarely changes. With
 -- last_checked_at recorded, the monitor can simply skip a ledger checked

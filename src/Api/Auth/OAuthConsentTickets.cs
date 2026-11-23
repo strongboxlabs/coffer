@@ -5,16 +5,16 @@ namespace Coffer.Api.Auth;
 
 /// <summary>
 /// Single-use proof that the consent screen was shown to this user, for this request
-/// (2026-10-12 audit, H1 and M1).
+/// (ADR-0105 D5).
 /// </summary>
 /// <remarks>
-/// <para>Before, <c>POST /oauth/authorize</c> issued a code for any request whose
-/// <c>decision</c> wasn't "deny". The session cookie is SameSite=Strict, so another
-/// site couldn't post it — but a page on a sibling subdomain could, and so got an MCP
-/// token for whoever was signed in. And the consent screen read the client's name and
-/// redirect from the link, so an attacker chose what it said.</para>
+/// <para>The issue: a <c>POST /oauth/authorize</c> that issues a code for any request
+/// whose <c>decision</c> isn't "deny" hands an MCP token to a page on a sibling
+/// subdomain, which SameSite=Strict does not stop — it is the same site. And a consent
+/// screen that reads the client's name and redirect from the link says whatever an
+/// attacker wrote there.</para>
 ///
-/// <para>Now the GET that decides consent is needed mints a ticket and hands it to the
+/// <para>So the GET that decides consent is needed mints a ticket and hands it to the
 /// consent page. The page shows what the SERVER registered for the client, fetched by
 /// the ticket. Allow is honoured only with the ticket, which must match the user, the
 /// client, the redirect, the scopes and the PKCE challenge of the request it approves —

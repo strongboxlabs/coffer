@@ -14,24 +14,23 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// them can be made against a database at head, where the override table no
 /// longer exists.</para>
 ///
-/// <para><b>The one line that matters is the fold.</b> Most override rows in the
-/// field carry only SOME fields — a payee rename sets payee and leaves posted_at
-/// NULL — so <c>SET posted_at = o.posted_at</c> would blank the date on every one
-/// of them. The fold must be <c>COALESCE(o.x, h.x)</c>, and the only way to catch
+/// <para><b>The one line that matters is the fold.</b> An override row can
+/// carry only SOME fields — a payee rename sets payee and leaves posted_at
+/// NULL — so <c>SET posted_at = o.posted_at</c> would blank the date on every
+/// such row. The fold must be <c>COALESCE(o.x, h.x)</c>, and the only way to catch
 /// the difference is to seed a PARTIAL override row and check the columns it did
 /// NOT touch. A rehearsal seeded with fully-populated overrides would pass either
 /// way, which is the can-never-fail shape this harness exists to stamp out.</para>
 ///
-/// <para>Verified by hand against a cloned database as well, with
-/// 801 manufactured partial overrides; this pins the same property where it runs
-/// on every push.</para>
+/// <para>This pins that property where it runs on every push.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class HeaderOriginalsUpgradeTests
+public sealed class HeaderOriginalsUpgradeTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public HeaderOriginalsUpgradeTests(PostgresFixture fixture) => _fixture = fixture;
+    public HeaderOriginalsUpgradeTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private const string Mig230 = "230_flip_header_overrides_to_originals.sql";
 
@@ -57,7 +56,7 @@ public sealed class HeaderOriginalsUpgradeTests
     private (string ConnectionString, string WorkDir) FreshInstallBefore230(string dbName)
     {
         var work = Directory.CreateTempSubdirectory("coffer-mig230-").FullName;
-        var cs = _fixture.EmptyDatabaseConnectionString(dbName);
+        var cs = Db.EmptyDatabaseConnectionString(dbName);
         UpgradeRehearsal.RunStaged(cs, UpgradeRehearsal.StageBefore(Mig230, work));
         return (cs, work);
     }
@@ -177,8 +176,8 @@ public sealed class HeaderOriginalsUpgradeTests
     /// An unedited row comes through the upgrade byte-identical.
     /// </summary>
     /// <remarks>
-    /// The overwhelming majority of rows on any install have no override at all
-    /// (headers carrying one are a small fraction). A fold that reached them — a join written
+    /// A row nobody edited has no override at all, and the fold must leave every
+    /// such row untouched. A fold that reached them — a join written
     /// as a cross product, say — would rewrite the whole table, and the two tests
     /// above would not notice.
     /// </remarks>
@@ -244,8 +243,9 @@ public sealed class HeaderOriginalsUpgradeTests
     /// <c>CREATE OR REPLACE VIEW</c> DROPS this option silently and
     /// <c>pg_get_viewdef</c> does not emit it, so a migration that rewrites the
     /// view and forgets the <c>ALTER VIEW</c> turns the hottest read path in the
-    /// app into a cross-ledger leak with nothing on screen to say so. Migration
-    /// 228 exists because that happened. Asserted on the catalog rather than by
+    /// app into a cross-ledger leak with nothing on screen to say so. Migrations
+    /// 228 and 230 each re-apply the option with <c>ALTER VIEW</c> after
+    /// recreating a view; this test pins it after 230. Asserted on the catalog rather than by
     /// querying as another user, because the option is the mechanism and a
     /// behavioural test would pass on a single-ledger fixture.
     /// </remarks>
@@ -280,8 +280,7 @@ public sealed class HeaderOriginalsUpgradeTests
 
     /// <summary>Applied twice against the database it just changed.</summary>
     /// <remarks>
-    /// The re-run is not hypothetical for this one: the operator's next restart
-    /// re-runs nothing, but a restore onto a database that already carries the
+    /// The operator's next restart re-runs nothing, but a restore onto a database that already carries the
     /// journal row does, and so does anyone applying the script by hand. The
     /// second pass runs against a database with no override tables at all, so
     /// every statement that references them has to tolerate their absence.

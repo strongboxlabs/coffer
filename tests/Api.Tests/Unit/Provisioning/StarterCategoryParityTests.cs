@@ -1,5 +1,7 @@
+using System.Text;
 using System.Text.Json;
 using Coffer.Api.Provisioning;
+using Coffer.Api.Tests.Support;
 
 namespace Coffer.Api.Tests.Unit.Provisioning;
 
@@ -9,17 +11,24 @@ namespace Coffer.Api.Tests.Unit.Provisioning;
 /// <remarks>
 /// <para>They did not, for a long time. A new ledger was seeded from a
 /// hand-written <c>starter-categories.json</c> (61 entries) while Demo inherited
-/// whatever <c>moneydance-export-demo.json</c> carried (108) — and only about 6
+/// whatever the committed demo export carried (108) — and only about 6
 /// of ~22 top-level names overlapped, so the categories a user saw while
 /// exploring Demo had almost nothing to do with the ones their own ledger got.
 /// </para>
-/// <para>The export is now the single source of truth and the starter catalogue
-/// is generated from it by <c>data/samples/starter-categories.gen.mjs</c>. A
-/// generator alone is not enough, though: nothing stops someone editing the
-/// export and forgetting to regenerate, or hand-editing the JSON. This test is
-/// the thing that notices. It compares the two FILES, because that is where the
-/// drift would appear; the final assertion then confirms the build embedded the
-/// file we just checked.</para>
+/// <para>The Demo's curated base is now the single source of truth: the C# Demo
+/// generator writes it into every Demo export, and the starter catalogue is
+/// generated from it by <c>data/samples/starter-categories.gen.mjs</c>. A
+/// generator alone is not enough, though: nothing stops someone editing the base
+/// and forgetting to regenerate, or hand-editing the JSON. This test is the thing
+/// that notices. It compares the generator's OUTPUT (the tests' fixed-date short
+/// span) with the starter FILE, because that is where the drift would appear; the
+/// final assertion then confirms the build embedded the file we just checked.</para>
+/// <para>An entry is its full segment path plus its kind, at every depth, and
+/// the export side applies the <c>coffer_category_kind</c> override the importer
+/// applies (ADR-0091, amendment of 2026-11-18). The existence assertions are
+/// what make the override and the third level count: without them, losing the
+/// override on both sides, or flattening both trees, would still compare
+/// equal.</para>
 /// </remarks>
 public sealed class StarterCategoryParityTests
 {
@@ -27,13 +36,29 @@ public sealed class StarterCategoryParityTests
     private static readonly Dictionary<string, string> Kinds =
         new() { ["i"] = "income", ["e"] = "expense" };
 
-    private sealed record Entry(string Kind, string? Parent, string Name);
+    private const string OverrideKey = "coffer_category_kind";
+    private const string Separator = " > ";
+
+    private sealed record Entry(string Kind, string Path)
+    {
+        /// <summary>The parent's full path, or null at the top level.</summary>
+        public string? Parent
+        {
+            get
+            {
+                var i = Path.LastIndexOf(Separator, StringComparison.Ordinal);
+                return i < 0 ? null : Path[..i];
+            }
+        }
+
+        public string Name => Parent is null ? Path : Path[(Parent.Length + Separator.Length)..];
+    }
 
     [Fact]
     public void Starter_catalogue_matches_the_demo_export_category_tree()
     {
-        var exportEntries = ReadExport(Locate("data/samples/moneydance-export-demo.json"));
-        var starterEntries = ReadStarter(Locate("src/Api/Provisioning/starter-categories.json"));
+        var exportEntries = ReadExport(DemoTestExports.ShortBytes);
+        var starterEntries = ReadStarter(Locate("src/Api/Provisioning/starter-categories.json")).ToHashSet();
 
         // Report the actual difference — "counts differ" sends the reader hunting.
         var onlyInExport = exportEntries.Except(starterEntries).OrderBy(e => e.ToString()).ToList();
@@ -58,6 +83,10 @@ public sealed class StarterCategoryParityTests
         Assert.Contains(starterEntries, e => e.Kind == "income");
         Assert.Contains(starterEntries, e => e.Kind == "expense");
 
+        // The third kind and the third level are present on both sides.
+        Assert.Contains(starterEntries, e => e.Kind == "adjustment");
+        Assert.Contains(new Entry("expense", "Vacation > Travel > Airfare"), starterEntries);
+
         // The EMBEDDED resource is what actually seeds a ledger; confirm the build
         // embedded the same file this test just compared.
         Assert.Equal(starterEntries.Count, new StarterCategoriesSeeder(TimeProvider.System).CategoryCount);
@@ -75,17 +104,17 @@ public sealed class StarterCategoryParityTests
         var entries = ReadStarter(Locate("src/Api/Provisioning/starter-categories.json"));
 
         var dupes = entries
-            .GroupBy(e => (e.Kind, e.Parent, e.Name))
+            .GroupBy(e => e)
             .Where(g => g.Count() > 1)
-            .Select(g => $"{g.Key.Kind} {g.Key.Parent ?? "(root)"} > {g.Key.Name}")
+            .Select(g => $"{g.Key.Kind} {g.Key.Path}")
             .ToList();
 
         Assert.True(dupes.Count == 0, "duplicate categories: " + string.Join(", ", dupes));
 
         // And the cross-kind case is genuinely present, so this test would notice
         // if a future "dedupe" collapsed it by name alone.
-        Assert.Contains(entries, e => e.Kind == "income" && e.Name == "Investment");
-        Assert.Contains(entries, e => e.Kind == "expense" && e.Name == "Investment");
+        Assert.Contains(new Entry("income", "Investment"), entries);
+        Assert.Contains(new Entry("expense", "Investment"), entries);
     }
 
     /// <summary>
@@ -110,54 +139,75 @@ public sealed class StarterCategoryParityTests
         Assert.Contains(entries, e => e.Parent == "Bills" && e.Name == "Natural Gas");
     }
 
-    private static HashSet<Entry> ReadExport(string path)
+    /// <summary>
+    /// The seeder refuses a catalogue whose branch mixes kinds, so a hand-edit
+    /// cannot seed an income child under an expense parent.
+    /// </summary>
+    [Fact]
+    public void A_catalogue_that_mixes_kinds_within_a_branch_is_refused()
     {
-        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        const string json = """
+            { "categories": [
+              { "name": "Vacation", "kind": "expense", "children": [
+                  { "name": "Travel", "kind": "expense", "children": [
+                      { "name": "Refund", "kind": "income" } ] } ] } ] }
+            """;
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(json));
+
+        var ex = Assert.Throws<InvalidOperationException>(() => StarterCategoriesSeeder.Parse(stream));
+        Assert.Contains("Vacation > Travel > Refund", ex.Message);
+    }
+
+    private static HashSet<Entry> ReadExport(byte[] json)
+    {
+        using var doc = JsonDocument.Parse(json);
         var accounts = doc.RootElement.GetProperty("all_items").EnumerateArray()
             .Where(x => x.TryGetProperty("obj_type", out var t) && t.GetString() == "acct")
-            .ToList();
+            .ToDictionary(a => a.GetProperty("id").GetString()!);
 
-        var nameById = accounts.ToDictionary(
-            a => a.GetProperty("id").GetString()!,
-            a => a.GetProperty("name").GetString()!);
-        var kindById = accounts.ToDictionary(
-            a => a.GetProperty("id").GetString()!,
-            a => a.GetProperty("type").GetString()!);
+        bool IsCategory(string? id) =>
+            id is not null
+            && accounts.TryGetValue(id, out var a)
+            && Kinds.ContainsKey(a.GetProperty("type").GetString()!);
+
+        // Up the parent chain while the parent is a category: a parent that is
+        // not a category (MD's root) means this is the top level.
+        string PathOf(JsonElement a)
+        {
+            var name = a.GetProperty("name").GetString()!;
+            var parentId = a.TryGetProperty("parentid", out var p) ? p.GetString() : null;
+            return IsCategory(parentId) ? PathOf(accounts[parentId!]) + Separator + name : name;
+        }
 
         var result = new HashSet<Entry>();
-        foreach (var a in accounts)
+        foreach (var a in accounts.Values)
         {
-            var type = a.GetProperty("type").GetString()!;
-            if (!Kinds.TryGetValue(type, out var kind)) continue;   // real account, not a category
-
-            var parentId = a.TryGetProperty("parentid", out var p) ? p.GetString() : null;
-            // A parent that is not itself a category means this is a top level.
-            var parentIsCategory = parentId is not null
-                && kindById.TryGetValue(parentId, out var pt)
-                && Kinds.ContainsKey(pt);
-
-            result.Add(new Entry(
-                kind,
-                parentIsCategory ? nameById[parentId!] : null,
-                a.GetProperty("name").GetString()!));
+            if (!Kinds.TryGetValue(a.GetProperty("type").GetString()!, out var kind)) continue;   // real account
+            if (a.TryGetProperty(OverrideKey, out var over)) kind = over.GetString()!;
+            result.Add(new Entry(kind, PathOf(a)));
         }
         return result;
     }
 
-    private static HashSet<Entry> ReadStarter(string path)
+    /// <summary>Every node at every depth, as a list so a repeat stays visible.</summary>
+    private static List<Entry> ReadStarter(string path)
     {
         using var doc = JsonDocument.Parse(File.ReadAllText(path));
-        var result = new HashSet<Entry>();
-        foreach (var top in doc.RootElement.GetProperty("categories").EnumerateArray())
-        {
-            var name = top.GetProperty("name").GetString()!;
-            var kind = top.GetProperty("kind").GetString()!;
-            result.Add(new Entry(kind, null, name));
+        var result = new List<Entry>();
 
-            if (!top.TryGetProperty("children", out var children)) continue;
-            foreach (var child in children.EnumerateArray())
-                result.Add(new Entry(kind, name, child.GetString()!));
+        void Walk(JsonElement nodes, string? parentPath)
+        {
+            foreach (var node in nodes.EnumerateArray())
+            {
+                var nodePath = parentPath is null
+                    ? node.GetProperty("name").GetString()!
+                    : parentPath + Separator + node.GetProperty("name").GetString();
+                result.Add(new Entry(node.GetProperty("kind").GetString()!, nodePath));
+                if (node.TryGetProperty("children", out var children)) Walk(children, nodePath);
+            }
         }
+
+        Walk(doc.RootElement.GetProperty("categories"), null);
         return result;
     }
 

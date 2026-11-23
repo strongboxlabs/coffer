@@ -18,22 +18,61 @@ public sealed record QuotesPrefs
 /// One opt-in quote provider available to a ledger — the catalog the settings
 /// UI renders toggles from (<c>GET /api/ledgers/{id}/quote-providers</c>).
 /// </summary>
-public sealed record QuoteProviderDto(string Key, string DisplayName);
+/// <param name="Host">The host its requests go to, so the switch can name where data is
+/// sent (ADR-0114 D4, D8): Yahoo's chart host, and Frankfurter's from the install's
+/// configured base URL (<c>Quotes:Frankfurter:BaseUrl</c>, set by
+/// <c>COFFER_FX_RATES_URL</c>). The host alone, never a path, port or query; null when the
+/// configured URL is not usable.</param>
+public sealed record QuoteProviderDto(string Key, string DisplayName, string? Host);
 
 /// <summary>
-/// The <c>dashboard</c> preference namespace (ADR-0056 slice 3 / ADR-0057):
-/// the per-ledger Overview layout. <see cref="Widgets"/> order = display order;
-/// each carries a show/hide flag. The widget catalog (keys + labels) lives in
-/// the SPA; the API stores the layout opaquely (distinct, non-empty keys), so a
-/// new widget needs no API change. An unset pref means the canonical default
-/// (all widgets, canonical order), resolved client-side.
+/// A <c>dashboard</c> layout as a PUT sends it (version 2): the per-ledger home
+/// screen's columns and widgets. Used to check the document's structure and nothing
+/// else.
 /// </summary>
-public sealed record DashboardPrefs
+/// <remarks>
+/// <para>The dashboard is an exception to ADR-0057's typed namespaces: the SPA owns
+/// the widget catalog (keys, titles, default column and visibility, setting defaults
+/// and allowed values) and resolves every default, so a new widget or setting needs
+/// no API change. The API checks types and bounds, never vocabulary: it does not know
+/// which keys, column names or settings exist.</para>
+/// <para><see cref="UpdatedAt"/> is the stored row's <c>updated_at</c> as the last
+/// read returned it, null when no row exists; it is never stored inside the
+/// document.</para>
+/// </remarks>
+public sealed record DashboardDocument
 {
+    [JsonPropertyName("version")]
+    public int? Version { get; init; }
+
+    [JsonPropertyName("columns")]
+    public string? Columns { get; init; }
+
     [JsonPropertyName("widgets")]
-    public IReadOnlyList<DashboardWidgetPref> Widgets { get; init; } = Array.Empty<DashboardWidgetPref>();
+    public IReadOnlyList<DashboardWidgetDocument>? Widgets { get; init; }
+
+    [JsonPropertyName("updatedAt")]
+    public DateTime? UpdatedAt { get; init; }
 }
 
-public sealed record DashboardWidgetPref(
-    [property: JsonPropertyName("key")] string Key,
-    [property: JsonPropertyName("visible")] bool Visible);
+/// <summary>One widget in a <see cref="DashboardDocument"/>. <see cref="Id"/> equals
+/// <see cref="Key"/> for a widget that appears once; a report tile's id names its
+/// report. Every <see cref="Settings"/> value is a boolean, number, string, null or
+/// array of strings.</summary>
+public sealed record DashboardWidgetDocument
+{
+    [JsonPropertyName("id")]
+    public string? Id { get; init; }
+
+    [JsonPropertyName("key")]
+    public string? Key { get; init; }
+
+    [JsonPropertyName("visible")]
+    public bool? Visible { get; init; }
+
+    [JsonPropertyName("column")]
+    public string? Column { get; init; }
+
+    [JsonPropertyName("settings")]
+    public IReadOnlyDictionary<string, System.Text.Json.JsonElement>? Settings { get; init; }
+}

@@ -17,7 +17,7 @@ stolen) loses them. ADR-0060 named off-host sync (slice ④) as the missing
 piece and sketched it as "a refresh token sealed under the master KEK + a
 scheduled push of retained artifacts."
 
-The reference point the user raised is
+The reference point is
 [hassio-google-drive-backup](https://github.com/sabeechen/hassio-google-drive-backup):
 folder-isolated Drive sync, separate local-vs-Drive retention, delete-remote-
 only-once-replaced, "never delete" pins. We adopt those **behaviors**. We do
@@ -34,7 +34,11 @@ The artifact pushed to Drive is the **already-encrypted `.cofferbak`**. Google
 holds ciphertext only; the passphrase and master KEK never leave the host. Drive
 sync is **disabled by default** — it does nothing until an admin connects an
 account. This is the only outbound-egress feature besides market-data quotes
-(ADR-0054) and is documented as such.
+(ADR-0054) and is documented as such. *(Amended 2026-10-31: the opt-in release
+check of the Upgrade tab, which asks the GitHub API for the latest release, is a third;
+[ADR-0110](0110-upgrade-from-the-app.md). Amended 2026-11-13: exchange rates from
+Frankfurter, opt-in per user and off by default, are a fourth, at
+`COFFER_FX_RATES_URL` or the public service; [ADR-0114](0114-benchmarks-and-currency-conversion.md) D4, D8.)*
 
 ### D2 — Auth: the user's own Google Cloud OAuth client, authorization-code redirect flow
 
@@ -54,11 +58,9 @@ folder isolation).
 **Why this over the device-code flow (the original sketch):** the redirect flow
 lets an operator **reuse a Web OAuth client they already have** — adding one
 authorized redirect URI is additive and doesn't disturb that client's other
-apps, so no new secret is propagated. (The user raised exactly this — "I use this
-client in other apps and don't want to propagate more secrets.") The device-code
-flow additionally requires a dedicated **"TVs and Limited Input devices"** client
-(its own client type), which can't be reused and which Google had rejected when a
-non-TV client was tried. Since Coffer has a public HTTPS origin, the redirect
+apps, so no new secret is propagated. The device-code flow additionally requires
+a dedicated **"TVs and Limited Input devices"** client (its own client type),
+which can't be reused; Google rejects the flow for any other client type. Since Coffer has a public HTTPS origin, the redirect
 flow's "needs a callback URL" requirement is free.
 
 The callback is the one **anonymous** route on the admin surface: Google
@@ -117,8 +119,8 @@ applied to the Drive listing. Borrowed from hassio:
   would then prune across both (data loss). So each install generates a stable
   opaque **install id** on first connect (kept across disconnect) and names its
   folder `Coffer Backups [<install_id>]`. The id is shown in the admin UI so an
-  operator can map folder ↔ install. (Added after ④a — the original D5 said
-  "folder isolation" but only isolated Coffer-vs-other-files, not install-vs-install.)
+  operator can map folder ↔ install. Folder isolation alone separates Coffer's
+  files from other files, not one install from another.
 - **Delete-remote-only-once-replaced** — never prune a remote artifact unless a
   newer one is confirmed uploaded (no over-deletion during a recovery).
 - **Never-Delete pin** — an admin can pin a backup; pinned artifacts are
@@ -187,16 +189,16 @@ Unpin** ("never delete") control in the backups list. (The feature is one-way
   (delete-only-once-replaced, never the newest); **Never-Delete pins** (mig 144
   `backup_pins`, excluded from local + remote sweeps); **Upload existing** backfill;
   the enable toggle + retention editor + staleness badge; and `pg_dump --compress=zstd`
-  by default (`Api:Backup:Compress`, ~10% smaller than zlib). **The dump excludes
+  by default (`Api:Backup:Compress`, smaller output than zlib). **The dump excludes
   `ledger_snapshots` data** (`--exclude-table-data`, added 0.8.x): the ADR-0037 in-place
   snapshots are *local* restore points, not DR payload, and as already-compressed blobs
-  they pass through the dump ~1:1 — up to 5 full copies of the ledger were ballooning
-  every backup (excluding them cut a real ledger's dump to a fraction of its size). The table *schema* stays
+  they pass through the dump ~1:1 — including them adds up to 5 full copies of the
+  ledger to every backup. The table *schema* stays
   in the dump, so a restored DB has an empty `ledger_snapshots` and new snapshots
-  regenerate. *(2026-10-09: since mig 193 the payload lives in `ledger_snapshot_parts`,
-  which was NOT excluded — so the bulk returned, and every backup held chunks without
-  their parent rows, which failed the FK on restore. Both tables' data is now excluded,
-  and a restore skips both — see ADR-0061's amendment.)* Follow-up (0.4.1):
+  regenerate. *(2026-10-09: since mig 193 the payload lives in `ledger_snapshot_parts`.
+  Excluding only `ledger_snapshots` keeps the bulk in the dump and leaves chunks without
+  their parent rows, which fails the FK on restore. Both tables' data is excluded, and
+  a restore skips both — see ADR-0061's amendment.)* Follow-up (0.4.1):
   Drive files carry the `.cofferbak` extension, the manual control is one
   "Upload all backups now", and the UI says "upload" not "sync".
 

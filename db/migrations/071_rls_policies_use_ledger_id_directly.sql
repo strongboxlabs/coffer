@@ -4,10 +4,10 @@
 --
 -- THE PERF PROBLEM
 --
--- The recompute trigger chain (068 + 069/070) was measured at ~3.5 s
--- per investment save. Diagnosis: not the function bodies — it's RLS
--- cascade. Functions called under `coffer_app` did page reads in the
--- millions vs thousands under superuser (180×). Source: child-table RLS policies use
+-- The recompute trigger chain (068 + 069/070) runs under `coffer_app`,
+-- where each row it reads pays the RLS cascade: a function called under
+-- `coffer_app` reads far more pages than the same call under superuser,
+-- because child-table RLS policies use
 -- the parent-recursion pattern (`x IN (SELECT id FROM parent)`) and
 -- parent's policy itself recurses to grandparent. For txn_legs the
 -- chain was:

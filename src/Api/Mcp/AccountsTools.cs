@@ -18,16 +18,25 @@ public static class AccountsTools
 {
     [McpServerTool(Name = "list_accounts"), Description(
         "List a ledger's accounts (and optionally categories): id, name, type, " +
-        "categoryKind, parentId (the category tree — real accounts are flat), " +
+        "categoryKind, parentId (the category tree), " +
+        "folderId and folderName (the sidebar folder a real account sits in directly, " +
+        "the folder's own name; folders nest, hold one account type, and are a grouping " +
+        "only, with no balance or transactions of their own; null when in none), " +
         "currency, active flag, class ('asset' | 'liability' | 'none'), taxStatus " +
         "('taxable' | 'tax_deferred' | 'tax_free' | 'other'; null = unknown), openedOn " +
         "(the account's Start Date — the as-of date of its opening balance; null when " +
         "unknown, and null for categories), and balance. " +
         "Balances are Overview-consistent — investment accounts include holdings " +
-        "market value (cash + positions), not just cash. Categories have a null " +
+        "market value (cash + positions), not just cash. Balances are as of today (UTC): " +
+        "a transaction, trade or price dated later is not counted until its date, " +
+        "exactly as the register shows such a row as Scheduled. " +
+        "Categories have a null " +
         "balance (they carry flows; use transaction_summary). Excludes internal " +
         "holdings-sibling accounts. Use this to resolve account ids for the other " +
-        "tools and to total assets/liabilities. USD.")]
+        "tools. Each balance is in its own account's currency; a position priced in " +
+        "another currency converts into the account's at the latest exchange rate, and " +
+        "when that rate is missing the balance is null and rateUnavailable names the " +
+        "currency pair and day. For totals use net_worth, which converts.")]
     public static async Task<IReadOnlyList<AccountInfo>> ListAccounts(
         AccountsReportingRepository repository,
         [Description("Ledger id (GUID) from list_ledgers.")] Guid ledgerId,
@@ -38,7 +47,9 @@ public static class AccountsTools
         [Description("Restrict to one account type (e.g. 'bank', 'investment', 'credit_card'). Omit for all.")]
         string? type = null,
         CancellationToken cancellationToken = default) =>
-        await repository.ListAccountsAsync(ledgerId, includeCategories, includeInactive, type, cancellationToken)
+        // No date: an MCP caller gets the register's own fallback (ScheduledBoundary).
+        await repository.ListAccountsAsync(
+                ledgerId, includeCategories, includeInactive, type, today: null, cancellationToken)
             .ConfigureAwait(false);
 
     [McpServerTool(Name = "net_worth"), Description(
@@ -46,12 +57,18 @@ public static class AccountsTools
         "negative, so net worth = assets + liabilities), investments value, and a " +
         "per-account breakdown. Investment accounts include holdings market value. " +
         "This is the authoritative figure — it matches the app's Overview screen — so " +
-        "prefer it over summing list_accounts yourself. As of now. USD.")]
+        "prefer it over summing list_accounts yourself. As of today (UTC): anything " +
+        "dated later is not counted until its date. The totals are in the ledger's " +
+        "reporting currency, named by currencyCode: each account converts at the latest " +
+        "exchange rate (the newest stored rate on or before today), then they are summed " +
+        "and rounded once. Each breakdown line stays in its own account's currency, named " +
+        "by its currencyCode. A figure that needs a missing rate is null and " +
+        "rateUnavailable names the currency pair and day; it is never a partial sum.")]
     public static async Task<McpNetWorth> NetWorth(
         AccountsReportingRepository repository,
         [Description("Ledger id (GUID) from list_ledgers.")] Guid ledgerId,
         CancellationToken cancellationToken = default) =>
-        await repository.NetWorthAsync(ledgerId, cancellationToken).ConfigureAwait(false);
+        await repository.NetWorthAsync(ledgerId, today: null, cancellationToken).ConfigureAwait(false);
 
     [McpServerTool(Name = "net_worth_history"), Description(
         "Net worth OVER TIME: a series of points, each the ledger's net worth as of the " +
@@ -59,9 +76,14 @@ public static class AccountsTools
         "the final point clamped to toUtc. Each point = cash balances as of that date + " +
         "split-adjusted holdings market value, Overview-consistent (investment accounts " +
         "include positions; a security is priced at the last market close on/before the " +
-        "date, else its last trade price). unpricedSecurityCount flags points where a held " +
-        "security had NO price at all at that date (valued at 0, so net worth is " +
-        "understated by those). Prefer a wider interval over long ranges. USD.")]
+        "date, else its last trade price in the ledger). unpricedSecurityCount flags points " +
+        "where a held security had neither at that date (carried at its cost basis, so " +
+        "net worth shows those at cost). noHistory flags points before the ledger's first " +
+        "dated fact, whose zero is not a net worth. Prefer a wider interval over long " +
+        "ranges. In the ledger's reporting currency, named by currencyCode: at each point " +
+        "every account (and a position priced in another currency) converts at the " +
+        "exchange rate for that point's day. A point that needs a missing rate has a null " +
+        "netWorth and rateUnavailable naming the currency pair and day.")]
     public static async Task<NetWorthHistory> NetWorthHistory(
         AccountsReportingRepository repository,
         [Description("Ledger id (GUID) from list_ledgers.")] Guid ledgerId,
@@ -80,7 +102,15 @@ public static class AccountsTools
         "position (security, quantity, cost basis, latest price, market value, " +
         "unrealized gain), and a summary (portfolio value, cost, unrealized gain %, " +
         "cash, total = cash + positions). This is the 'investment balance by account' " +
-        "view. Resolve accountId via list_accounts (type 'investment'). USD.")]
+        "view. As of today (UTC): positions as held today, at the latest price dated on " +
+        "or before today, else the security's last trade price (a position with neither " +
+        "has a null price and counts at cost basis). Resolve accountId via list_accounts " +
+        "(type 'investment'). In the account's own currency, named by currencyCode. A " +
+        "position priced in another currency names it in priceCurrencyCode (its currentPrice " +
+        "and currentValue stay in it) and adds accountValue, converted into the account's currency " +
+        "at the latest rate, which its gain and the summary use. A missing rate makes that " +
+        "position's accountValue and gain, and the summary's value, gain and total, null, " +
+        "named in rateUnavailable.")]
     public static async Task<HoldingsViewDto> AccountPortfolio(
         HoldingsRepository repository,
         [Description("Ledger id (GUID) from list_ledgers.")] Guid ledgerId,
@@ -88,7 +118,7 @@ public static class AccountsTools
         CancellationToken cancellationToken = default)
     {
         var result = await repository
-            .GetByBrokerageAsync(ledgerId, accountId, cancellationToken)
+            .GetByBrokerageAsync(ledgerId, accountId, today: null, cancellationToken)
             .ConfigureAwait(false);
         return result.Kind switch
         {

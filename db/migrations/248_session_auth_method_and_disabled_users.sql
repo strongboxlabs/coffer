@@ -2,7 +2,7 @@
 -- 248 — sessions remember how they began; a disabled user is not an admin;
 --       one step-up flow per action; setup completes once.
 --
--- Four changes for the 2026-10-12 security audit (ADR-0105).
+-- Four changes (ADR-0105).
 --
 -- 1. auth_sessions.auth_method. Sensitive actions now need a fresh passkey tap,
 --    and that tap must come from a passkey OLDER than the session making the

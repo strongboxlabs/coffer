@@ -8,12 +8,11 @@ namespace Coffer.Api.Auth;
 /// The one place that decides what a username may be (ADR-0089).
 /// </summary>
 /// <remarks>
-/// <para>Before this existed the rule lived only in the SPA's setup form
-/// (<c>^[a-z0-9_-]{3,32}$</c>) and nothing enforced it: <c>/setup/begin</c>
-/// checked only non-empty + uniqueness, the invite form had no pattern at all,
-/// and the DB had no CHECK. So an API caller or any invited user could already
-/// create <c>someone@example.com</c> while the first user was refused it — with
-/// a disabled button and no stated reason.</para>
+/// <para>One rule, enforced server-side. A rule held only in the SPA's setup
+/// form, with <c>/setup/begin</c> checking only non-empty + uniqueness and the
+/// invite form and the DB checking nothing, would let an API caller or any
+/// invited user create <c>someone@example.com</c> while the first user is
+/// refused it — with a disabled button and no stated reason.</para>
 ///
 /// <para><b>Permissive by intent.</b> A username may be an email address, a
 /// handle, or a name in any script. We reject only what actually causes harm:

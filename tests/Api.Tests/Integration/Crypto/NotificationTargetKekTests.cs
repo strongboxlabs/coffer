@@ -35,25 +35,12 @@ namespace Coffer.Api.Tests.Integration.Crypto;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class NotificationTargetKekTests : IAsyncLifetime
+public sealed class NotificationTargetKekTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public NotificationTargetKekTests(PostgresFixture fixture) => _fixture = fixture;
-
-    /// <summary>
-    /// Rotation reads both delivery-target tables; this class has to control both.
-    /// Full rationale on <see cref="NotificationTargetReset"/>.
-    /// </summary>
-    /// <remarks>
-    /// Clearing only notification_subscribers (which SeedTargetAsync used to do) left
-    /// ledger_notification_subscribers holding whatever the endpoint tests deposited —
-    /// including a deliberately unopenable 3-byte row — which aborts a rotation before
-    /// its first assert.
-    /// </remarks>
-    public Task InitializeAsync() => NotificationTargetReset.ClearAsync(_fixture);
-
-    public Task DisposeAsync() => Task.CompletedTask;
+    public NotificationTargetKekTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     /// <summary>The key the app runs under — ApiFactory pins 32 zero bytes.</summary>
     private static MasterKey LocalKey => new(new byte[32], "v1");
@@ -73,7 +60,7 @@ public sealed class NotificationTargetKekTests : IAsyncLifetime
 
     private async Task<Guid> SeedTargetAsync(MasterKey sealUnder, string key = "healthchecks")
     {
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
 
         var row = new NotificationSubscriberRow
         {
@@ -90,7 +77,7 @@ public sealed class NotificationTargetKekTests : IAsyncLifetime
 
     private async Task<NotificationSubscriberRow> ReadAsync(Guid id)
     {
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         return await db.NotificationSubscribers.AsNoTracking().SingleAsync(t => t.Id == id);
     }
 
@@ -98,21 +85,15 @@ public sealed class NotificationTargetKekTests : IAsyncLifetime
     /// Rotation carries a target's sealed URL across, re-wrapping it in place.
     /// </summary>
     /// <remarks>
-    /// Rotates to the same key BYTES under a different id, which is the convention the
-    /// two sibling rotation classes document and for the same reason: RotateAsync is a
-    /// global, committing re-wrap of every ledger LEK, the backup passphrase and the
-    /// Drive token, and PostgresFixture is one database shared by the whole collection
-    /// with no per-class reset. An earlier version of this test rotated to 32 bytes of
-    /// 0x09 and committed, which would have sealed every other test's material under a
-    /// key none of them holds. It passed only because an unrelated poison row made the
-    /// rotation throw before the commit — so fixing that row would have turned a green
-    /// suite red in four other classes, for reasons pointing nowhere near here.
+    /// Rotates to the same key BYTES under a different id, the convention of the two
+    /// sibling rotation classes: everything stays openable under the fixture key every
+    /// test host runs with.
     ///
     /// What that costs: "the blob no longer opens under the old key" cannot be asserted
     /// under identical bytes. It is not lost — Unit.Crypto.LedgerKeyServiceTests covers
-    /// different-bytes correctness directly, with no shared database to corrupt. What
+    /// different-bytes correctness directly. What
     /// this test uniquely proves is that rotation REACHES this row at all, which is what
-    /// the branch changed and what the ciphertext-changed assertion below pins.
+    /// the ciphertext-changed assertion below pins.
     /// </remarks>
     [Fact]
     public async Task Rotating_the_master_key_keeps_a_targets_url_openable()
@@ -122,7 +103,7 @@ public sealed class NotificationTargetKekTests : IAsyncLifetime
         var newKey = new MasterKey(new byte[32], "v2");
 
         var service = new KekRotationService(
-            _fixture.NewServiceFactory(), NullLogger<KekRotationService>.Instance);
+            Db.NewServiceFactory(), NullLogger<KekRotationService>.Instance);
         var result = await service.RotateAsync(LocalKey, newKey, dryRun: false);
 
         Assert.Equal(1, result.NotificationTargetsRotated);
@@ -148,7 +129,7 @@ public sealed class NotificationTargetKekTests : IAsyncLifetime
         var id = await SeedTargetAsync(ForeignKey);
 
         var service = new KekReconciliationService(
-            _fixture.NewServiceFactory(),
+            Db.NewServiceFactory(),
             new LedgerKeyService(LocalKey),
             NullLogger<KekReconciliationService>.Instance, TimeProvider.System);
         var result = await service.ReconcileAsync();
@@ -176,17 +157,17 @@ public sealed class NotificationTargetKekTests : IAsyncLifetime
     [Fact]
     public async Task A_reconciled_target_no_longer_blocks_a_later_rotation()
     {
-        // The regression this pairs with: reconciliation used to leave the unopenable
-        // blob in place, which permanently wedged rotation. Reconcile, then rotate.
+        // The pair to the test above: an unopenable blob left in place would
+        // permanently wedge rotation. Reconcile, then rotate.
         await SeedTargetAsync(ForeignKey);
 
         await new KekReconciliationService(
-            _fixture.NewServiceFactory(),
+            Db.NewServiceFactory(),
             new LedgerKeyService(LocalKey),
             NullLogger<KekReconciliationService>.Instance, TimeProvider.System).ReconcileAsync();
 
         var rotation = new KekRotationService(
-            _fixture.NewServiceFactory(), NullLogger<KekRotationService>.Instance);
+            Db.NewServiceFactory(), NullLogger<KekRotationService>.Instance);
 
         // Same bytes, different id — see the rotation test above for why that matters.
         var result = await rotation.RotateAsync(
@@ -206,7 +187,7 @@ public sealed class NotificationTargetKekTests : IAsyncLifetime
         var id = await SeedTargetAsync(LocalKey);
 
         var service = new KekReconciliationService(
-            _fixture.NewServiceFactory(),
+            Db.NewServiceFactory(),
             new LedgerKeyService(LocalKey),
             NullLogger<KekReconciliationService>.Instance, TimeProvider.System);
         var result = await service.ReconcileAsync();

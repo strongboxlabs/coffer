@@ -5,11 +5,11 @@ import {
     canonicalLeg,
     groupAmount,
     groupBalanceAfter,
-    regroupTargetSplits,
+    groupBalanceRateUnavailable,
+    groupCurrency,
 } from './splitCollapse';
+import { NO_NOTES } from './annotations/rowNotesFixture';
 import type { BankRow, RegisterEntry } from './types';
-
-type GroupEntry = Extract<RegisterEntry, { kind: 'group' }>;
 
 const ACCOUNT_A = '00000000-0000-0000-0000-0000000000aa';
 
@@ -18,18 +18,18 @@ const ACCOUNT_A = '00000000-0000-0000-0000-0000000000aa';
 // (ADR-0030 §2 — bank rows carry no investment fields).
 function txn(overrides: Partial<BankRow> & { id: string }): BankRow {
     return {
+        ...NO_NOTES,
         kind: 'bank',
-        legTags: [],
         accountId: ACCOUNT_A,
         payee: 'Payroll',
-        memo: null,
         amount: 0,
         postedAt: '2026-05-04T12:00:00Z',
         transactedAt: null,
         status: 'cleared',
         isHidden: false,
-        hasOverrides: false,
         balanceAfter: 1000,
+        currencyCode: 'USD',
+        balanceCurrencyCode: 'USD',
         origin: 'moneydance_import',
         isPending: false,
         externalId: null,
@@ -40,13 +40,10 @@ function txn(overrides: Partial<BankRow> & { id: string }): BankRow {
         counterpartyAccountId: null,
         counterpartyAccountName: null,
         counterpartyAccountType: null,
-        tags: [],
         headerId: '00000000-0000-0000-0000-000000000000',
         clearedAt: '2026-05-04T12:00:00Z',
         clearedByUserId: null,
         createdAt: '2026-05-04T12:00:00Z',
-        legMemo: null,
-        headerMemo: null,
         onlineMatchFitid: null,
         onlineMatchFiId: null,
         needsReview: false,
@@ -152,6 +149,30 @@ describe('groupAmount', () => {
         ];
         expect(groupAmount(legs)).toBe(-1000);
     });
+
+    // A category's split can be paid from accounts in different currencies, each
+    // line in its paying account's (ADR-0114 D7). No figure adds currencies, so the
+    // group has no net: not the stored one, which adds them, nor a sum of the lines.
+    it('has no net when the lines are in different currencies', () => {
+        const stored = [
+            txn({ id: '1', amount: 10, currencyCode: 'USD', headerAccountNetAmount: 30 }),
+            txn({ id: '2', amount: 20, currencyCode: 'CAD', headerAccountNetAmount: 30 }),
+        ];
+        expect(groupAmount(stored)).toBeNull();
+        expect(groupCurrency(stored)).toBeNull();
+
+        const summed = stored.map((leg) => ({ ...leg, headerAccountNetAmount: null }));
+        expect(groupAmount(summed)).toBeNull();
+    });
+
+    it('names the one currency the lines share', () => {
+        const legs = [
+            txn({ id: '1', amount: 10, currencyCode: 'CAD', headerAccountNetAmount: 30 }),
+            txn({ id: '2', amount: 20, currencyCode: 'CAD', headerAccountNetAmount: 30 }),
+        ];
+        expect(groupCurrency(legs)).toBe('CAD');
+        expect(groupAmount(legs)).toBe(30);
+    });
 });
 
 describe('groupBalanceAfter', () => {
@@ -173,6 +194,27 @@ describe('groupBalanceAfter', () => {
     });
 });
 
+describe('groupBalanceRateUnavailable', () => {
+    const missing = { fromCurrency: 'CAD', toCurrency: 'USD', date: '2026-10-08', reason: 'rate_unavailable' as const };
+
+    it('returns the missing rates of the leg whose balance the group shows, the last', () => {
+        const legs = [
+            txn({ id: '1', legIndex: 0, balanceAfter: 900 }),
+            txn({ id: '2', legIndex: 1, balanceAfter: null, balanceRateUnavailable: [missing] }),
+        ];
+        expect(groupBalanceAfter(legs)).toBeNull();
+        expect(groupBalanceRateUnavailable(legs)).toEqual([missing]);
+    });
+
+    it('returns none when the last leg has its rate, whatever an earlier one carries', () => {
+        const legs = [
+            txn({ id: '1', legIndex: 1, balanceAfter: 750 }),
+            txn({ id: '2', legIndex: 0, balanceAfter: null, balanceRateUnavailable: [missing] }),
+        ];
+        expect(groupBalanceRateUnavailable(legs)).toBeUndefined();
+    });
+});
+
 describe('canonicalLeg', () => {
     it('returns the first leg (server sorts by leg_index ASC)', () => {
         const legs = [
@@ -184,79 +226,25 @@ describe('canonicalLeg', () => {
     });
 });
 
-describe('regroupTargetSplits', () => {
-    // A header whose postings partly land on this account: 2 of 9 postings
-    // here → two leg-keyed target entries that must fold into one cluster.
-    const TARGET = { accountPostingsOnHeader: 2, headerTotalPostings: 9 };
+describe('a split seen from a line\'s other side', () => {
+    // Two lines of one header that both land on this account: from here each
+    // line is its own read-only row, and nothing clusters them back.
+    const OPPOSITE = {
+        accountPostingsOnHeader: 2,
+        headerTotalPostings: 9,
+        notesKind: 'splitOpposite' as const,
+        isReadOnly: true,
+    };
 
-    it('folds a contiguous target-split run into one group entry', () => {
-        const deferral = txn({ id: 'deferral', headerId: 'h1', legIndex: 0, amount: 1100.25, ...TARGET });
-        const match = txn({ id: 'match', headerId: 'h1', legIndex: 1, amount: 300.50, ...TARGET });
-
-        const out = regroupTargetSplits([entryTxn(deferral), entryTxn(match)]);
-
-        expect(out).toHaveLength(1);
-        expect(out[0]!.kind).toBe('group');
-        const g = out[0] as GroupEntry;
-        expect(g.groupId).toBe('h1');
-        expect(g.legs.map((l) => l.id)).toEqual(['deferral', 'match']);
-    });
-
-    it('sorts folded legs by leg_index even when they arrive out of order', () => {
-        const b = txn({ id: 'b', headerId: 'h1', legIndex: 1, ...TARGET });
-        const a = txn({ id: 'a', headerId: 'h1', legIndex: 0, ...TARGET });
-
-        const out = regroupTargetSplits([entryTxn(b), entryTxn(a)]);
-
-        const g = out[0] as GroupEntry;
-        expect(g.legs.map((l) => l.id)).toEqual(['a', 'b']);
-    });
-
-    it('passes a single-posting target through as a flat txn (no one-leg parent)', () => {
-        const solo = txn({ id: 'solo', headerId: 'h1', accountPostingsOnHeader: 1, headerTotalPostings: 9 });
-
-        const out = regroupTargetSplits([entryTxn(solo)]);
-
-        expect(out).toHaveLength(1);
-        expect(out[0]!.kind).toBe('txn');
-    });
-
-    it('leaves ordinary single-posting txns untouched', () => {
-        const a = entryTxn(txn({ id: 'a' })); // accountPostingsOnHeader=1, total=1
-        expect(regroupTargetSplits([a])).toEqual([a]);
-    });
-
-    it('passes originating group entries straight through', () => {
-        const legs = [
-            txn({ id: 't1', headerId: 'g1', legIndex: 0, accountPostingsOnHeader: 2, headerTotalPostings: 2 }),
-            txn({ id: 't2', headerId: 'g1', legIndex: 1, accountPostingsOnHeader: 2, headerTotalPostings: 2 }),
-        ];
-        const g = entryGroup('g1', legs);
-        expect(regroupTargetSplits([g])).toEqual([g]);
-    });
-
-    it('does not merge legs from different headers', () => {
-        const out = regroupTargetSplits([
-            entryTxn(txn({ id: 'h1a', headerId: 'h1', legIndex: 0, ...TARGET })),
-            entryTxn(txn({ id: 'h1b', headerId: 'h1', legIndex: 1, ...TARGET })),
-            entryTxn(txn({ id: 'h2a', headerId: 'h2', legIndex: 0, ...TARGET })),
-            entryTxn(txn({ id: 'h2b', headerId: 'h2', legIndex: 1, ...TARGET })),
-        ]);
-
-        expect(out).toHaveLength(2);
-        expect(out.every((e) => e.kind === 'group')).toBe(true);
-        expect((out[0] as GroupEntry).groupId).toBe('h1');
-        expect((out[1] as GroupEntry).groupId).toBe('h2');
-    });
-
-    it('preserves order with interleaved singles and clusters', () => {
-        const out = regroupTargetSplits([
-            entryTxn(txn({ id: 's1' })),
-            entryTxn(txn({ id: 'c1', headerId: 'h1', legIndex: 0, ...TARGET })),
-            entryTxn(txn({ id: 'c2', headerId: 'h1', legIndex: 1, ...TARGET })),
-            entryTxn(txn({ id: 's2' })),
-        ]);
-
-        expect(out.map((e) => e.kind)).toEqual(['txn', 'group', 'txn']);
+    it('renders one row per line, in the order the server sent them', () => {
+        const rows = buildDisplayRows(
+            [
+                entryTxn(txn({ id: 'deferral', headerId: 'h1', legIndex: 0, ...OPPOSITE })),
+                entryTxn(txn({ id: 'match', headerId: 'h1', legIndex: 1, ...OPPOSITE })),
+            ],
+            new Set(['h1']),
+        );
+        expect(rows.map((r) => r.kind)).toEqual(['txn', 'txn']);
+        expect(rows.map((r) => (r.kind === 'txn' ? r.txn.id : null))).toEqual(['deferral', 'match']);
     });
 });

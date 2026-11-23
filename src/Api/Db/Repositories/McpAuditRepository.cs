@@ -29,6 +29,7 @@ public sealed class McpAuditRepository
             query = query.Where(r => r.CreatedAt < cursor);
         return await query
             .OrderByDescending(r => r.CreatedAt)
+            .ThenByDescending(r => r.Id)
             .Take(take)
             .Join(db.Users.AsNoTracking(), r => r.UserId, u => u.Id,
                 (r, u) => new McpAuditEntryDto(

@@ -7,8 +7,8 @@ namespace Coffer.Api.Db.Entities;
 /// </summary>
 /// <remarks>
 /// Dates rather than a per-row boolean so a caller joins once. The per-row
-/// predicate rescans the security's legs for every price: measured at 728ms
-/// against 14ms over one security's long daily price history.
+/// predicate rescans the security's legs for every price, so its cost is
+/// prices × legs; this form reads them once.
 /// </remarks>
 internal sealed class UnbackedPriceDateRow
 {

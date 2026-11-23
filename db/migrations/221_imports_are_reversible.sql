@@ -10,11 +10,11 @@
 -- everything the moment a download window shifts. Neither is worth having in a ledger
 -- that gets reconciled against real balances.
 --
--- So the answer to "I uploaded that twice" is not prevention-by-guessing, it is UNDO.
+-- So the answer to a file uploaded twice is not prevention-by-guessing, it is UNDO.
 -- That requires knowing which rows a given import created, and nothing recorded it:
 -- txn_headers carries `provider_key` (WHICH provider) but not WHICH RUN, so a second
--- upload produced rows indistinguishable from the first — same provider, same dates,
--- same amounts. Cleanup meant hunting duplicates by eye.
+-- upload produces rows indistinguishable from the first — same provider, same dates,
+-- same amounts — and cleanup means hunting duplicates by eye.
 --
 -- `ledger_operation_id` closes that. The orchestrator already opens a
 -- `ledger_operations` row per import (family 'ingest') and already returns its id to

@@ -12,10 +12,10 @@ namespace Coffer.Api.Backup;
 /// every way in that was granted before, and the Google Drive identity.
 /// </summary>
 /// <remarks>
-/// <para><b>Access (FU-076).</b> A restore used to bring back every session, MCP token and
+/// <para><b>Access (FU-076).</b> A restore that brought back every session, MCP token and
 /// OAuth grant exactly as it was at backup time, revoked ones included, and every pending
-/// invite. Incident response backfired: revoke the attacker, restore a backup from before
-/// the incident, and their access came back. So a restore now signs everyone out: every
+/// invite, would defeat incident response: revoke the attacker, restore a backup from before
+/// the incident, and their access comes back. So a restore signs everyone out: every
 /// cookie session, manual MCP token, OAuth authorization and OAuth token is revoked, and
 /// every pending invite is removed. Revoked, not deleted, for the first four, with the
 /// same <c>revoked_at</c> / status the per-user revocation sets, so the rows read as

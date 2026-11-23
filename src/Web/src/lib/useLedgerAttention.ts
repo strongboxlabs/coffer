@@ -34,6 +34,9 @@ export interface LedgerAttentionView {
     /** The aggregate behind the Coffer wordmark: critical anywhere outranks warning. */
     worst: AttentionSeverity | null;
     isPending: boolean;
+    /** The read failed: no surface may say "no problems" from it. */
+    isError: boolean;
+    refetch: () => void;
     /** The severity to draw for one ledger, already narrowed. */
     severityFor: (ledgerId: string | undefined) => AttentionSeverity | null;
     /** How many distinct subjects are outstanding on one ledger. */
@@ -73,6 +76,8 @@ export function useLedgerAttention(): LedgerAttentionView {
         byLedger,
         worst,
         isPending: query.isPending,
+        isError: query.isError,
+        refetch: () => { void query.refetch(); },
         severityFor: (ledgerId) =>
             toSeverity(ledgerId ? byLedger.get(ledgerId)?.severity : undefined),
         // Paired with severityFor: a count is only ever drawn beside a dot, so a count

@@ -10,7 +10,7 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// Returns is an aggregation over valuations — each sub-period boundary values the
 /// whole account — so a position whose <c>quantity × price</c> runs to 16 decimal
 /// places is multiplied and summed repeatedly. That is the shape that broke
-/// <c>realized_gains</c> and <c>holdings_snapshot</c> on a real ledger, reached here
+/// <c>realized_gains</c> and <c>holdings_snapshot</c>, reached here
 /// through a third path.
 /// <para>
 /// One thing to know before reading the expectation: TWR is NOT the raw price move.
@@ -22,11 +22,12 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ReturnsBoundaryTests
+public sealed class ReturnsBoundaryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ReturnsBoundaryTests(PostgresFixture fixture) => _fixture = fixture;
+    public ReturnsBoundaryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Utc(int y, int m, int d) => new(y, m, d, 0, 0, 0, DateTimeKind.Utc);
 
@@ -34,7 +35,7 @@ public sealed class ReturnsBoundaryTests
     [MemberData(nameof(Boundary.Positions), MemberType = typeof(Boundary))]
     public async Task Returns_value_a_position_at_any_magnitude(Boundary.Position p)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
@@ -46,7 +47,7 @@ public sealed class ReturnsBoundaryTests
         await ledger.AddBoundaryPositionAsync(brokerage.Id, holdings, sec, p, Utc(2024, 1, 10));
         await ledger.AddSecurityPriceAsync(sec, p.SellPrice, Utc(2024, 6, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var r = await new InvestmentReportingRepository(db, TimeProvider.System).ReturnsAsync(
             ledger.LedgerId, accountId: null, fromUtc: null, toUtc: null,
             nowUtc: Utc(2024, 6, 2));
@@ -54,7 +55,7 @@ public sealed class ReturnsBoundaryTests
         // The position is valued at the quoted price, at the feeder's 4dp scale. A
         // 12dp quantity that overflowed or was dropped fails here first.
         var expectedEnd = decimal.Round(p.Quantity * p.SellPrice, 4);
-        Assert.True(Math.Abs(r.EndValue - expectedEnd) <= p.Tolerance,
+        Assert.True(Math.Abs(r.EndValue!.Value - expectedEnd) <= p.Tolerance,
             $"{p.Name}: end value {r.EndValue}, expected {expectedEnd}");
 
         // The return the prices imply, annualized over the engine's own covered days
@@ -92,7 +93,7 @@ public sealed class ReturnsBoundaryTests
 
         foreach (var p in Boundary.All)
         {
-            var ledger = await SyntheticLedger.CreateAsync(_fixture);
+            var ledger = await SyntheticLedger.CreateAsync(Db);
             var bank = await ledger.AddBankAccountAsync("Checking");
             var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
             var holdings = brokerage.HoldingsAccountId!.Value;
@@ -102,7 +103,7 @@ public sealed class ReturnsBoundaryTests
             await ledger.AddBoundaryPositionAsync(brokerage.Id, holdings, sec, p, Utc(2024, 1, 10));
             await ledger.AddSecurityPriceAsync(sec, p.SellPrice, Utc(2024, 6, 1));
 
-            await using var db = _fixture.NewDbContext();
+            await using var db = Db.NewDbContext();
             var r = await new InvestmentReportingRepository(db, TimeProvider.System).ReturnsAsync(
                 ledger.LedgerId, accountId: null, fromUtc: null, toUtc: null,
                 nowUtc: Utc(2024, 6, 2));

@@ -2,8 +2,8 @@
 -- 150 — rich security classification (ADR-0067)
 -- =============================================================================
 --
--- securities.asset_class was overloaded: it held the VEHICLE ('mutual_fund',
--- 'etf', 'cash_equivalent') on many rows, mixed with real classes ('equity',
+-- securities.asset_class was overloaded: it could hold the VEHICLE ('mutual_fund',
+-- 'etf', 'cash_equivalent'), mixed with real classes ('equity',
 -- 'bond'). This splits the concerns into orthogonal, single-vocabulary columns
 -- and adds a look-through table for multi-asset wrappers.
 --

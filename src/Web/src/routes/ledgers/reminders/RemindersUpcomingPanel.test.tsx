@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 import { RemindersUpcomingPanel } from './RemindersUpcomingPanel';
 import * as apiModule from '@/lib/api';
+import { formatSignedAmount } from '@/lib/money';
 import type { UpcomingOccurrence } from '@/lib/types';
 
 vi.mock('@/lib/api', () => ({
@@ -21,18 +22,23 @@ vi.mock('@/lib/api', () => ({
 // The occurrence dialog is heavy (it hosts the live editors); it's tested on its
 // own. Here we stub it to verify the panel opens it with the right occurrence
 // and surfaces its onActed notice.
-vi.mock('./ReminderOccurrenceModal', () => ({
-    ReminderOccurrenceModal: ({ occ, onClose, onActed }: {
-        occ: UpcomingOccurrence; onClose: () => void; onActed: (n: string | null) => void;
-    }) => (
-        <div role="dialog" aria-label="occurrence dialog">
-            <span>{`stub:${occ.payee}:${occ.date}`}</span>
-            <button type="button" onClick={() => { onActed('Posted. Also marked 2 earlier occurrences as skipped.'); onClose(); }}>
-                act
-            </button>
-        </div>
-    ),
-}));
+// The stub is drawn in the real dialog shell, which gives focus back to the
+// chip that opened it as the real dialog does.
+vi.mock('./ReminderOccurrenceModal', async () => {
+    const { Modal } = await import('@/components/ui/Modal');
+    return {
+        ReminderOccurrenceModal: ({ occ, onClose, onActed }: {
+            occ: UpcomingOccurrence; onClose: () => void; onActed: (n: string | null) => void;
+        }) => (
+            <Modal open onClose={onClose} ariaLabel="occurrence dialog">
+                <span>{`stub:${occ.payee}:${occ.date}`}</span>
+                <button type="button" onClick={() => { onActed('Posted. Also marked 2 earlier occurrences as skipped.'); onClose(); }}>
+                    act
+                </button>
+            </Modal>
+        ),
+    };
+});
 
 const fetchUpcomingReminders = vi.mocked(apiModule.fetchUpcomingReminders);
 const unskipReminder = vi.mocked(apiModule.unskipReminder);
@@ -46,7 +52,7 @@ const TODAY = `${now.getFullYear().toString().padStart(4, '0')}-${
 function occ(over: Partial<UpcomingOccurrence>): UpcomingOccurrence {
     return {
         date: TODAY, kind: 'reminder', reminderId: 'r1', headerId: null,
-        payee: 'Electric Bill', memo: null, amount: -120, seriesNextDue: null, ...over,
+        payee: 'Electric Bill', memo: null, amount: -120, seriesNextDue: null, currencyCode: 'USD', ...over,
     };
 }
 
@@ -54,7 +60,7 @@ function renderPanel() {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
         <QueryClientProvider client={queryClient}>
-            <RemindersUpcomingPanel ledgerId={LEDGER} />
+            <RemindersUpcomingPanel ledgerId={LEDGER} canEdit />
         </QueryClientProvider>,
     );
 }
@@ -73,6 +79,49 @@ describe('RemindersUpcomingPanel', () => {
         renderPanel();
         const chip = await screen.findByRole('button', { name: /Electric Bill/ });
         expect(chip).toHaveTextContent('-$120.00');
+    });
+
+    it('prints a chip\'s amount in its source account\'s currency, and none for a series with no source', async () => {
+        fetchUpcomingReminders.mockResolvedValue([
+            occ({ currencyCode: 'EUR' }),
+            occ({ reminderId: 'r2', payee: 'Custom Series', amount: 0, currencyCode: null }),
+        ]);
+        renderPanel();
+        const euro = await screen.findByRole('button', { name: /Electric Bill/ });
+        expect(euro).toHaveTextContent(formatSignedAmount(-120, 'EUR'));
+        expect(euro).toHaveAttribute('title', `Electric Bill · ${formatSignedAmount(-120, 'EUR')}`);
+        // No source, so no currency: the chip names the series and carries no figure.
+        const custom = screen.getByRole('button', { name: /Custom Series/ });
+        expect(custom).toHaveTextContent(/^● Custom Series$/);
+        expect(custom).toHaveAttribute('title', 'Custom Series');
+        expect(euro.textContent).not.toContain('$');
+    });
+
+    it('marks an estimating series\' amount "≈", with an estimate or before it has one, and a fixed amount not', async () => {
+        fetchUpcomingReminders.mockResolvedValue([
+            occ({ reminderId: 'made', payee: 'Payee Made', amount: -50,
+                estimate: { requestedSampleCount: 3, availableSampleCount: 2, amount: -50, unavailableReason: null } }),
+            occ({ reminderId: 'not-yet', payee: 'Payee New', amount: -35,
+                estimate: { requestedSampleCount: 3, availableSampleCount: 0, amount: null, unavailableReason: 'no-history' } }),
+            occ({ reminderId: 'fixed', payee: 'Payee Fixed', amount: -20 }),
+        ]);
+        renderPanel();
+
+        const made = await screen.findByRole('button', { name: /Payee Made/ });
+        const madeAmount = `≈${formatSignedAmount(-50, 'USD')}`;
+        expect(made).toHaveTextContent(madeAmount);
+        expect(made).toHaveAttribute('title', `Payee Made · ${madeAmount} · Estimated from the last 2 occurrences`);
+
+        const notYet = screen.getByRole('button', { name: /Payee New/ });
+        const notYetAmount = `≈${formatSignedAmount(-35, 'USD')}`;
+        expect(notYet).toHaveTextContent(notYetAmount);
+        expect(notYet).toHaveAttribute('title',
+            `Payee New · ${notYetAmount} · Estimated: the amount entered is used until an estimate can be made`);
+
+        const fixed = screen.getByRole('button', { name: /Payee Fixed/ });
+        expect(fixed).toHaveTextContent(formatSignedAmount(-20, 'USD'));
+        expect(fixed).toHaveAttribute('title', `Payee Fixed · ${formatSignedAmount(-20, 'USD')}`);
+        expect(fixed.textContent).not.toContain('≈');
     });
 
     it('clicking a chip opens the occurrence dialog for that occurrence', async () => {
@@ -101,14 +150,10 @@ describe('RemindersUpcomingPanel', () => {
     });
 
     /*
-     * This case used to assert the opposite — "a read-only struck-through chip, not a
-     * button" — and it was right when written, because un-skip did not exist. Three fire
-     * paths rejected a suppressed slot with "un-skip it before firing" and there was no
-     * route and no control, so a mis-clicked Skip was permanent and a read-only chip was
-     * the honest rendering of that.
-     *
-     * The route exists now, so the chip is the affordance. The struck-through styling
-     * stays: it is still a suppressed occurrence, not a pending one.
+     * The fire paths reject a suppressed slot with "un-skip it before firing", so the
+     * un-skip route is what keeps a mis-clicked Skip from being permanent, and the chip
+     * is its affordance. The struck-through styling stays: it is still a suppressed
+     * occurrence, not a pending one.
      */
     it('a skipped occurrence can be restored from its chip', async () => {
         fetchUpcomingReminders.mockResolvedValue([
@@ -150,5 +195,95 @@ describe('RemindersUpcomingPanel', () => {
         expect(screen.queryByRole('button', { name: /Bill D/ })).not.toBeInTheDocument();
         await userEvent.click(screen.getByRole('button', { name: /\+1 more/ }));
         expect(await screen.findByRole('button', { name: /Bill D/ })).toBeInTheDocument();
+    });
+});
+
+describe('RemindersUpcomingPanel: focus when a chip\'s own action changes it', () => {
+    // ADR-0023 §L: a control that replaces or removes itself hands focus to the
+    // control that takes its place, never to the page. Skip and restore keep
+    // the chip (keyed by its occurrence); a post makes it read-only, and focus
+    // goes to the next chip button drawn.
+    function renderWithClient() {
+        const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+        render(
+            <QueryClientProvider client={queryClient}>
+                <RemindersUpcomingPanel ledgerId={LEDGER} canEdit />
+            </QueryClientProvider>,
+        );
+        return queryClient;
+    }
+
+    it('keeps focus on a skipped chip once its restore lands', async () => {
+        let restored = false;
+        fetchUpcomingReminders.mockImplementation(async () => [occ({ kind: restored ? 'reminder' : 'skipped', payee: 'Bill S' })]);
+        unskipReminder.mockImplementation(async () => { restored = true; return undefined as never; });
+        renderWithClient();
+        const user = userEvent.setup();
+
+        const chip = await screen.findByRole('button', { name: /Bill S/ });
+        expect(chip).toHaveAttribute('title', expect.stringContaining('skipped'));
+        chip.focus();
+        await user.keyboard('{Enter}');
+
+        await waitFor(() => expect(chip).not.toHaveAttribute('title', expect.stringContaining('skipped')));
+        expect(screen.getByRole('button', { name: /Bill S/ })).toBe(chip);
+        expect(chip).toHaveFocus();
+    });
+
+    it('keeps focus on a chip skipped from its dialog', async () => {
+        let skipped = false;
+        fetchUpcomingReminders.mockImplementation(async () => [occ({ kind: skipped ? 'skipped' : 'reminder', payee: 'Bill S' })]);
+        const queryClient = renderWithClient();
+        const user = userEvent.setup();
+
+        const chip = await screen.findByRole('button', { name: /Bill S/ });
+        await user.click(chip);
+        await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'act' }));
+        expect(chip).toHaveFocus();
+        skipped = true;
+        await act(() => queryClient.invalidateQueries({ queryKey: ['reminders'] }));
+
+        await waitFor(() => expect(chip).toHaveAttribute('title', expect.stringContaining('skipped')));
+        expect(chip).toHaveFocus();
+    });
+
+    it('gives focus to the next chip button when a post makes a chip read-only', async () => {
+        let posted = false;
+        fetchUpcomingReminders.mockImplementation(async () => [
+            occ({ reminderId: 'r1', kind: posted ? 'scheduled' : 'reminder', payee: 'Bill A' }),
+            occ({ reminderId: 'r2', payee: 'Bill B' }),
+        ]);
+        const queryClient = renderWithClient();
+        const user = userEvent.setup();
+
+        await user.click(await screen.findByRole('button', { name: /Bill A/ }));
+        await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'act' }));
+        posted = true;
+        await act(() => queryClient.invalidateQueries({ queryKey: ['reminders'] }));
+
+        await waitFor(() => expect(screen.queryByRole('button', { name: /Bill A/ })).toBeNull());
+        expect(screen.getByRole('button', { name: /Bill B/ })).toHaveFocus();
+    });
+
+    // The calendar has no add control, so when the post leaves no chip button
+    // focus goes to the calendar itself: named, and no Tab stop of its own.
+    it('gives focus to the calendar when a post leaves no chip button', async () => {
+        let posted = false;
+        fetchUpcomingReminders.mockImplementation(async () => [
+            occ({ reminderId: 'r1', kind: posted ? 'scheduled' : 'reminder', payee: 'Bill A' }),
+        ]);
+        const queryClient = renderWithClient();
+        const user = userEvent.setup();
+
+        await user.click(await screen.findByRole('button', { name: /Bill A/ }));
+        await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'act' }));
+        posted = true;
+        await act(() => queryClient.invalidateQueries({ queryKey: ['reminders'] }));
+
+        await waitFor(() => expect(screen.queryByRole('button', { name: /Bill A/ })).toBeNull());
+        expect(screen.getByTitle(/Bill A/)).toHaveTextContent('✓ Bill A');
+        const calendar = screen.getByRole('group', { name: /^Reminders in / });
+        expect(calendar).toHaveAttribute('tabindex', '-1');
+        expect(calendar).toHaveFocus();
     });
 });

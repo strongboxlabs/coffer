@@ -8,7 +8,7 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// A refund: a NEGATIVE amount posted to an expense category.
 /// </summary>
 /// <remarks>
-/// <para>Dimension 7 of the fixture audit, and the one it ranks first. Income
+/// <para>Dimension 7. Income
 /// and expense are properties of the CATEGORY, not of the posting, and either
 /// kind can carry either sign — a refund to an expense category is negative, a
 /// reversal of income is positive. Nothing in the reporting layer branches on
@@ -16,22 +16,22 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// up, costs down" reading is how those postings usually sum, not a rule the
 /// report applies.</para>
 ///
-/// <para>That paragraph was stated WRONGLY in review — as though the sign
-/// followed from the kind — and no test contradicted it, because none existed.
-/// These pin the behaviour so the next person reasoning about signs has
-/// something that fails when they are wrong.</para>
+/// <para>It is easy to reason as though the sign followed from the kind. These
+/// pin the behaviour so anyone reasoning about signs has something that fails
+/// when they are wrong.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class RefundSignTests
+public sealed class RefundSignTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public RefundSignTests(PostgresFixture fixture) => _fixture = fixture;
+    public RefundSignTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static readonly DateTime May = new(2026, 5, 15, 12, 0, 0, DateTimeKind.Utc);
 
     private Task<ReportResult> SummarizeAsync(Guid ledgerId, ReportMeasure measure, bool rollup = false) =>
-        new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System).SummarizeAsync(new ReportSpec
+        new ReportingRepository(Db.NewDbContext(), TimeProvider.System).SummarizeAsync(new ReportSpec
         {
             LedgerId = ledgerId,
             Measure = measure,
@@ -43,7 +43,7 @@ public sealed class RefundSignTests
     [Fact]
     public async Task A_refund_reduces_that_category_rather_than_adding_to_it()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var clothing = await ledger.AddCategoryAsync("Clothing", "expense");
 
@@ -64,7 +64,7 @@ public sealed class RefundSignTests
     [Fact]
     public async Task A_category_refunded_past_its_spending_goes_negative()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var clothing = await ledger.AddCategoryAsync("Clothing", "expense");
 
@@ -88,7 +88,7 @@ public sealed class RefundSignTests
         // purchase and its refund in the SAME month collapse to one positive
         // figure and a bug that took magnitudes would be invisible. Split
         // across months there are two cells, and the second is negative.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var clothing = await ledger.AddCategoryAsync("Clothing", "expense");
 
@@ -96,7 +96,7 @@ public sealed class RefundSignTests
         await ledger.AddTransactionPairAsync(
             clothing.Id, bank.Id, -40m, May.AddMonths(1));
 
-        var result = await new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System).SummarizeAsync(new ReportSpec
+        var result = await new ReportingRepository(Db.NewDbContext(), TimeProvider.System).SummarizeAsync(new ReportSpec
         {
             LedgerId = ledger.LedgerId,
             Measure = ReportMeasure.Spending,
@@ -117,7 +117,7 @@ public sealed class RefundSignTests
     [Fact]
     public async Task Under_Both_a_refund_raises_net_instead_of_deepening_a_cost()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var salary = await ledger.AddCategoryAsync("Salary", "income");
         var clothing = await ledger.AddCategoryAsync("Clothing", "expense");
@@ -141,7 +141,7 @@ public sealed class RefundSignTests
     [Fact]
     public async Task A_refund_rolls_up_into_its_parent_as_a_reduction()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var personal = await ledger.AddCategoryAsync("Personal", "expense");
         var clothing = await ledger.AddCategoryAsync("Clothing", "expense", personal.Id);

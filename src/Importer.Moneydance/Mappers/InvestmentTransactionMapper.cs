@@ -25,9 +25,11 @@ namespace Coffer.Importer.Moneydance.Mappers;
 ///   per IRS convention. The legacy <c>txn_legs.commission</c> redundancy
 ///   was dropped in migration 046 — fees live exclusively on their own
 ///   paired row under one <c>txn_group_id</c>.</description></item>
-///   <item><description><b>buyx / sellx</b> — Holdings sibling pairs directly with the
-///   external (xfr) account; no brokerage-cash leg, since no cash flows
-///   through the brokerage.</description></item>
+///   <item><description><b>buyx / sellx</b> — the sec pair (brokerage-cash with the
+///   Holdings sibling), as for buy / sell, plus an xfr pair (brokerage-cash with the
+///   external account) that funds or receives it, so the brokerage carries a leg in
+///   every posting. A self-referential one (the xfr names this brokerage) keeps the
+///   sec pair and drops the xfr pair.</description></item>
 ///   <item><description><b>div</b> (cash dividend) — single pair: brokerage-cash ↔
 ///   income category. <c>security_id</c> on the cash side (qty/price = 0)
 ///   to keep the dividend in the per-security register query.</description></item>
@@ -43,9 +45,10 @@ namespace Coffer.Importer.Moneydance.Mappers;
 /// </list>
 ///
 /// <para>Money sums work on Moneydance's minor units (long) and convert to
-/// <c>decimal</c> only at the boundary
-/// (<see cref="AccountMapper.MinorUnitsToDecimal"/>). Share quantities use
-/// <see cref="MdSplit.SplitAmount"/> with 4 implicit decimals.</para>
+/// <c>decimal</c> only at the boundary, at each account's own currency's decimal
+/// places (<see cref="MdAmounts"/>); a category side carries the real side's amount.
+/// Share quantities use <see cref="MdSplit.SplitAmount"/> at the security's own
+/// <c>dec</c> places.</para>
 /// </remarks>
 public static class InvestmentTransactionMapper
 {
@@ -105,7 +108,14 @@ public static class InvestmentTransactionMapper
         IReadOnlyList<LegReconSeed> LegRecons,
         HoldingDelta? HoldingDelta,
         LotRow? NewLot,
-        SkipReason? Skip);
+        SkipReason? Skip,
+        // FU-024: the feed's payee/memo when they differ from the curated
+        // ones written where the transaction's memo sits; null otherwise (FeedOriginals).
+        HeaderOriginalsSeed? Originals = null,
+        // The event's tag names, on the header (several postings) or the
+        // brokerage leg (one), as its notes were planned.
+        IReadOnlyList<string>? HeaderTags = null,
+        IReadOnlyList<LegTagSeed>? LegTags = null);
 
     /// <summary>
     /// Map one MD investment txn into one ADR-0022 header + N postings.
@@ -116,13 +126,12 @@ public static class InvestmentTransactionMapper
     /// that header in input order.
     /// </summary>
     /// <remarks>
-    /// MiscInc-with-fee (`[sec, fee, inc]`) used to be fanned out into
-    /// N single-posting headers under a "single-posting MiscInc
-    /// invariant" (migrations 058/059). That invariant was based on a
-    /// misread of MD's data — the multi-posting shape is the standard
+    /// MiscInc-with-fee (`[sec, fee, inc]`) is ONE multi-posting header,
+    /// not N single-posting ones: the multi-posting shape is the standard
     /// user-creatable MiscInc-with-fee, not an automated-import artifact.
-    /// Migration 061 reversed the data + dropped the trigger; this
-    /// mapper now treats MiscInc identically to every other action.
+    /// Migration 061 drops the "single-posting MiscInc" trigger of
+    /// migrations 058/059, and this mapper treats MiscInc identically to
+    /// every other action.
     /// </remarks>
     public static HeaderLegsResult MapToHeaderAndLegs(
         MdTxn txn,
@@ -143,7 +152,26 @@ public static class InvestmentTransactionMapper
         // Pair rows by counterparty_id, walking in input order so the
         // posting_index sequence is stable.
         var pairs = PairByCounterparty(paired.Rows);
-        return BuildSingleHeader(paired, pairs, ledgerId);
+        var built = BuildSingleHeader(paired, pairs, ledgerId);
+
+        // The event's one memo and tag set (MoneydanceNotes), planned from the home
+        // (acctid): the brokerage Map resolved it to, on every pair's cash leg and so
+        // the originating account. One posting keeps it on the brokerage leg, several
+        // on the header; the read-only side gets nothing.
+        var home = accountByMdId[txn.AcctId];
+        var plan = MoneydanceNotes.PlanEvent(
+            ImportAnnotations.ShapeOf(home, built.Header!.Action, built.Legs),
+            home.Id,
+            MoneydanceNotes.InvestmentEvent(txn, MoneydanceNotes.WrittenMemo(txn.Memo, txn.OlOrigMemo)));
+        var stamped = ImportAnnotations.Stamp(plan, built.Header, built.Legs);
+        return built with
+        {
+            Header = stamped.Header,
+            Legs = stamped.Legs,
+            HeaderTags = stamped.HeaderTags,
+            LegTags = stamped.LegTags,
+            Originals = FeedOriginals.SeedFor(txn, stamped.Header, stamped.TransactionMemo, stamped.Legs),
+        };
     }
 
     /// <summary>
@@ -259,7 +287,8 @@ public static class InvestmentTransactionMapper
             Origin:              source.Origin,
             ExternalId:          externalId,
             Payee:               payee,
-            Memo:                source.FeedMemo,
+            // The event's memo is planned with its legs (MapToHeaderAndLegs).
+            Memo:                null,
             PostedAt:            source.FeedPostedAt,
             TransactedAt:        source.FeedTransactedAt,
             Status:              status,
@@ -273,6 +302,9 @@ public static class InvestmentTransactionMapper
             OnlineMatchFitid:    null,
             OnlineMatchFiId:     null,
             Action:              action,
+            // Mig 263: the home brokerage, stamped by MapToHeaderAndLegs with the
+            // event's notes once the legs exist.
+            OriginatingAccountId: null,
             // Mig 107: provider_key was computed by the MapCtx
             // decompose at row-emit time and stamped on every
             // TransactionRow in the pair; pass it through here.
@@ -292,7 +324,7 @@ public static class InvestmentTransactionMapper
             LedgerId:          ledgerId,
             AccountId:         row.AccountId,
             PostingIndex:      postingIndex,
-            LegMemo:           null,                      // investment txns don't carry per-leg memos
+            LegMemo:           null,                      // planned with the event's notes (MapToHeaderAndLegs)
             Amount:            row.FeedAmount,
             SecurityId:        row.SecurityId,
             Quantity:          row.Quantity,
@@ -322,12 +354,11 @@ public static class InvestmentTransactionMapper
         ArgumentNullException.ThrowIfNull(txn);
 
         // Investment-flavoured txns are recognised by either an explicit
-        // `invest.txntype` tag *or* by an investment `xfer_type`. Real
-        // exports include a population of buy/sell/dividend-shaped txns
-        // (likely manually-entered or migrated from another tool) where
-        // the txntype tag is missing but the xfer_type still names the
-        // event class — these used to fall through to the non-investment
-        // mapper and get silently dropped (their sec split's target is a
+        // `invest.txntype` tag *or* by an investment `xfer_type`. An export
+        // can carry buy/sell/dividend-shaped txns where the txntype tag is
+        // missing but the xfer_type still names the event class — left to
+        // fall through to the non-investment
+        // mapper they would be silently dropped (their sec split's target is a
         // type='s' sub-account that's not a Coffer account). We infer the
         // shape from xfer_type + the sec split's share-direction.
         if (!txn.IsInvestmentShape)
@@ -417,8 +448,8 @@ public static class InvestmentTransactionMapper
                     if (split.SplitAmount == 0 && split.ParentAmount == 0) continue;
 
                     var quantity      = ToShareQuantity(split.SplitAmount, secRef.ShareDecimals);
-                    var unitPrice     = ComputeUnitPrice(split, secRef.ShareDecimals);
-                    var secCash       = AccountMapper.MinorUnitsToDecimal(split.ParentAmount);
+                    var unitPrice     = ComputeUnitPrice(split, secRef.ShareDecimals, ctx.Brokerage);
+                    var secCash       = MdAmounts.ToMoney(split.ParentAmount, ctx.Brokerage);
                     var holdingsValue = -secCash;
 
                     // Self-referential buysellxfr (xfr target == this
@@ -430,12 +461,12 @@ public static class InvestmentTransactionMapper
                     // cash that funds the new class; a fee-funding sell
                     // leaves cash to pay the fee.
                     //
-                    // An earlier version zeroed secCash here on a "MD nets
-                    // the brokerage cash to zero" premise. But that netting
-                    // happens across the PAIRED buy / fee leg, not within
-                    // this single header -- so zeroing dropped the sale
-                    // proceeds and left every self-ref buyx/sellx unbalanced
-                    // by the trade amount (ADR-0052 D4). The default
+                    // secCash is NOT zeroed on a "MD nets the brokerage cash
+                    // to zero" premise: that netting happens across the
+                    // PAIRED buy / fee leg, not within this single header,
+                    // so zeroing would drop the sale proceeds and leave every
+                    // self-ref buyx/sellx unbalanced by the trade amount
+                    // (ADR-0052 D4). The default
                     // secCash/holdingsValue above is correct for both
                     // directions: a sell carries pamt>0 (cash in, holdings
                     // out); a buy carries pamt<0 (cash out, holdings in).
@@ -454,11 +485,11 @@ public static class InvestmentTransactionMapper
                     if (!ctx.AccountByMdId.TryGetValue(split.AcctId, out var feeRef))
                         return Skip(SkipReason.UnknownIncomeOrFeeCategory);
                     var (cashFee, feeCat) = MakeCategoryPair(
-                        ctx, split, feeRef.Id, action, groupId,
+                        ctx, split, feeRef, action, groupId,
                         securityId, postingRole: "fee");
                     rows.Add(cashFee);
                     rows.Add(feeCat);
-                    totalCommission += Math.Abs(AccountMapper.MinorUnitsToDecimal(split.ParentAmount));
+                    totalCommission += Math.Abs(MdAmounts.ToMoney(split.ParentAmount, ctx.Brokerage));
                     break;
                 }
 
@@ -472,7 +503,7 @@ public static class InvestmentTransactionMapper
                     if (!ctx.AccountByMdId.TryGetValue(split.AcctId, out var catRef))
                         return Skip(SkipReason.UnknownIncomeOrFeeCategory);
                     var (cashCat, catRow) = MakeCategoryPair(
-                        ctx, split, catRef.Id, action, groupId,
+                        ctx, split, catRef, action, groupId,
                         securityId, postingRole: "income");
                     rows.Add(cashCat);
                     rows.Add(catRow);
@@ -486,7 +517,7 @@ public static class InvestmentTransactionMapper
                     if (isSelfRefXfr) continue;
                     if (!ctx.AccountByMdId.TryGetValue(split.AcctId, out var xferRef))
                         return Skip(SkipReason.UnknownXferAccount);
-                    var (cashXfr, xferRow) = MakeXferPair(ctx, split, xferRef.Id, groupId);
+                    var (cashXfr, xferRow) = MakeXferPair(ctx, split, xferRef, groupId);
                     rows.Add(cashXfr);
                     rows.Add(xferRow);
                     break;
@@ -502,7 +533,7 @@ public static class InvestmentTransactionMapper
 
         // `txn_group_id` is the "multi-posting event" marker — strip it
         // back to null when only one pair landed (a solo Buy / Sell /
-        // Div / etc. without a fee). Keeps the discriminator meaningful
+        // Dividend / etc. without a fee). Keeps the discriminator meaningful
         // for queries that look for grouped events.
         if (rows.Count == 2)
         {
@@ -566,7 +597,7 @@ public static class InvestmentTransactionMapper
             return (null, null);
 
         var quantity = ToShareQuantity(sec.SplitAmount, secRef.ShareDecimals);
-        var secPrice = Math.Abs(AccountMapper.MinorUnitsToDecimal(sec.ParentAmount));
+        var secPrice = Math.Abs(MdAmounts.ToMoney(sec.ParentAmount, ctx.Brokerage));
 
         // Delegate the action × policy logic to the shared layer.
         var impact = InvestmentPostings.BuildHoldingsImpact(
@@ -606,10 +637,9 @@ public static class InvestmentTransactionMapper
     /// `invest.txntype` equivalent. Returns <c>null</c> when the
     /// QIF action is absent or unmapped — the caller falls through
     /// to structural classification. Mapping table is locked in
-    /// <see href="../../../docs/decisions/0027-investment-action-catalog.md">ADR-0027</see>,
-    /// grounded in cross-tab evidence from real-world MD exports
-    /// (every observed QIF action maps deterministically; counts
-    /// not reproduced in code).
+    /// <see href="../../../docs/decisions/0027-investment-action-catalog.md">ADR-0027</see>:
+    /// each QIF action listed maps to exactly one txntype, and an
+    /// ambiguous one returns null rather than a guess.
     /// </summary>
     private static string? MapQifInvstActionToTxnType(string? qifAction)
     {
@@ -652,12 +682,11 @@ public static class InvestmentTransactionMapper
             // split, no inc split) — the QIF "MiscIncX" name is
             // misleading. Map to bank, not inc.
             "MiscIncX"  => "bank",
-            // "Cash" is direction-ambiguous in QIF: most rows are
-            // pure cash adjustments on the brokerage (xfrtp_bank),
-            // but the data shows a small subset emitted with
-            // xfrtp_miscincexp + an inc split. The dispatcher pairs
-            // xfer_type with txntype, so returning "bank" here is
-            // correct for the majority case; the xfrtp_miscincexp
+            // "Cash" is direction-ambiguous in QIF: MD writes it
+            // either as a pure cash adjustment on the brokerage
+            // (xfrtp_bank) or with xfrtp_miscincexp + an inc split.
+            // The dispatcher pairs xfer_type with txntype, so no one
+            // txntype here is right for both; the xfrtp_miscincexp
             // case falls through to the structural classifier below
             // (which routes by splittype to inc/exp).
             "Cash"      => null,
@@ -751,7 +780,7 @@ public static class InvestmentTransactionMapper
 
         return MaterializePair(ctx, posting, action,
             sourceSplit: sec,
-            // Sec pair never has a category-side memo override (the sec
+            // Sec pair never has a counterparty payee override (the sec
             // split's `desc` is just the security name, redundant with
             // the header's primary payee).
             counterpartyPayeeOverride: null,
@@ -762,17 +791,20 @@ public static class InvestmentTransactionMapper
     private static (TransactionRow Cash, TransactionRow Category) MakeCategoryPair(
         MapCtx ctx,
         MdSplit leg,
-        Guid categoryAccountId,
+        AccountRef category,
         string action,
         Guid? groupId,
         Guid? securityId,
         string postingRole)
     {
+        // The category side carries the brokerage cash negated, in the brokerage's
+        // currency, never the split's samt (MdAmounts.Posting).
+        var (cashAmount, categoryAmount) = MdAmounts.Posting(leg, ctx.Brokerage, category);
         var posting = InvestmentPostings.BuildCategoryPair(
             brokerageAccountId: ctx.Brokerage.Id,
-            categoryAccountId:  categoryAccountId,
-            cashAmount:         AccountMapper.MinorUnitsToDecimal(leg.ParentAmount),
-            categoryAmount:     AccountMapper.MinorUnitsToDecimal(leg.SplitAmount),
+            categoryAccountId:  category.Id,
+            cashAmount:         cashAmount,
+            categoryAmount:     categoryAmount,
             postingRole:        postingRole,
             securityId:         securityId);
 
@@ -781,7 +813,7 @@ public static class InvestmentTransactionMapper
             // Category pair: the leg's `desc` (when present) labels the
             // counterparty side specifically (e.g. "Reinvest dividend
             // Q4 2024"), so it wins over the header's primary payee on
-            // the category side only.
+            // the category side's row only; as a memo it joins the event's.
             counterpartyPayeeOverride: NullIfEmpty(leg.Description),
             legIndex: leg.Index,
             groupId:  groupId);
@@ -790,14 +822,16 @@ public static class InvestmentTransactionMapper
     private static (TransactionRow Cash, TransactionRow Other) MakeXferPair(
         MapCtx ctx,
         MdSplit xfr,
-        Guid otherAccountId,
+        AccountRef other,
         Guid? groupId)
     {
+        // Each real side in its own currency; a category side the brokerage's amount.
+        var (brokerageAmount, otherAmount) = MdAmounts.Posting(xfr, ctx.Brokerage, other);
         var posting = InvestmentPostings.BuildXferPair(
             brokerageAccountId: ctx.Brokerage.Id,
-            otherAccountId:     otherAccountId,
-            brokerageAmount:    AccountMapper.MinorUnitsToDecimal(xfr.ParentAmount),
-            otherAmount:        AccountMapper.MinorUnitsToDecimal(xfr.SplitAmount));
+            otherAccountId:     other.Id,
+            brokerageAmount:    brokerageAmount,
+            otherAmount:        otherAmount);
 
         return MaterializePair(ctx, posting, action: LedgerActions.Transfer,
             sourceSplit: xfr,
@@ -847,7 +881,6 @@ public static class InvestmentTransactionMapper
             IsPending:        false,
             InvestmentAction: action,
             FeedPayee:        ctx.PrimaryPayee,
-            FeedMemo:         ctx.PrimaryMemo,
             FeedAmount:       posting.Cash.Amount,
             FeedPostedAt:     ctx.Posted,
             FeedTransactedAt: ctx.Transacted,
@@ -859,7 +892,7 @@ public static class InvestmentTransactionMapper
             SecurityId:       posting.Cash.SecurityId,
             Quantity:         posting.Cash.Quantity,
             UnitPrice:        posting.Cash.UnitPrice,
-            CheckNumber:      null,
+            CheckNumber:      ctx.CheckNumber,
             PostingRole:      posting.Cash.PostingRole,
             ReconStat:        cashReconStat,
             // Mig 109 / ADR-0035 §3: forward verbatim MD JSON so it
@@ -875,7 +908,6 @@ public static class InvestmentTransactionMapper
             IsPending:        false,
             InvestmentAction: action,
             FeedPayee:        counterpartyPayeeOverride ?? ctx.PrimaryPayee,
-            FeedMemo:         counterpartyPayeeOverride ?? ctx.PrimaryMemo,
             FeedAmount:       posting.Counterparty.Amount,
             FeedPostedAt:     ctx.Posted,
             FeedTransactedAt: ctx.Transacted,
@@ -887,7 +919,7 @@ public static class InvestmentTransactionMapper
             SecurityId:       posting.Counterparty.SecurityId,
             Quantity:         posting.Counterparty.Quantity,
             UnitPrice:        posting.Counterparty.UnitPrice,
-            CheckNumber:      null,
+            CheckNumber:      ctx.CheckNumber,
             PostingRole:      posting.Counterparty.PostingRole,
             ReconStat:        otherReconStat,
             // Mig 109 / ADR-0035 §3 (same as cash side above).
@@ -917,17 +949,16 @@ public static class InvestmentTransactionMapper
     /// shares are being acquired or disposed. The trade direction lives
     /// in the qty + amount signs, never in the price.
     ///
-    /// HISTORICAL: this used to be <c>cash / qty</c> with cash forced
-    /// positive but qty left signed, producing negative unit prices on
-    /// every Sell row. The drill-in showed a negative share count times a
-    /// negative price equalling a negative amount, which double-negatived: qty × price came out positive
-    /// while amount was negative. Wired up rows on 2026-05-19 scrub.
+    /// Not <c>cash / qty</c> with cash forced positive and qty left signed:
+    /// that gives a negative unit price on every Sell row, and qty × price
+    /// then comes out positive while the amount is negative. Migration
+    /// 051's CHECK rejects a negative unit_price outright.
     /// </summary>
-    private static decimal ComputeUnitPrice(MdSplit secSplit, int shareDecimals)
+    private static decimal ComputeUnitPrice(MdSplit secSplit, int shareDecimals, AccountRef brokerage)
     {
         var qty = Math.Abs(ToShareQuantity(secSplit.SplitAmount, shareDecimals));
         if (qty == 0m) return 0m;
-        var cash = Math.Abs(AccountMapper.MinorUnitsToDecimal(secSplit.ParentAmount));
+        var cash = Math.Abs(MdAmounts.ToMoney(secSplit.ParentAmount, brokerage));
         return cash / qty;
     }
 
@@ -954,12 +985,16 @@ public static class InvestmentTransactionMapper
         IReadOnlyDictionary<string, SecurityRef> SecurityByMdSecAcctId)
     {
         public DateTimeOffset? Transacted => TransactionMapper.ParseMdDate(Txn.TransactedDate);
-        // Precedence matches PR #38: Description / Memo (what the user
-        // sees in MD) wins; OlOrigPayee / OlOrigMemo (raw OFX original)
-        // is fallback only.
+        // Same precedence as TransactionMapper: Description (what the user
+        // sees in MD) wins; OlOrigPayee (raw OFX original) is fallback only.
+        // The memo takes the same precedence in MoneydanceNotes.WrittenMemo.
         public string? PrimaryPayee  => NullIfEmpty(Txn.Description) ?? NullIfEmpty(Txn.OlOrigPayee);
-        public string? PrimaryMemo   => NullIfEmpty(Txn.Memo)        ?? NullIfEmpty(Txn.OlOrigMemo);
         public string? PrimaryStatus => NullIfEmpty(Txn.Status);
+        // MD's `chk`, normalized exactly as TransactionMapper does it: blank
+        // becomes null, anything else verbatim. On a QIF-origin row this holds
+        // the QIF action word ("Buy", "ReinvLg"), the only place the original
+        // distinction between the reinvest variants survives.
+        public string? CheckNumber   => NullIfEmpty(Txn.CheckNumber);
 
         // Mig 107: decompose MD per-row metadata into the canonical
         // (origin, provider_key) pair. Same value for the cash and

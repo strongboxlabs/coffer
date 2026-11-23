@@ -32,7 +32,7 @@ BEGIN
     END;
 END $$;
 
--- Test 2 (allow): not public WITH a quote symbol — the 529 feed-only case.
+-- Test 2 (allow): not public WITH a quote symbol — the feed-only private symbol case.
 INSERT INTO securities (id, ledger_id, name, quote_symbol, quote_symbol_public)
 VALUES ('cccccccc-2222-2222-2222-cccccccccccc',
         'cccccccc-0000-0000-0000-cccccccccccc',

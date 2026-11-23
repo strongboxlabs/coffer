@@ -28,11 +28,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// full new state. Atomic per-test ledger.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class InvestmentMutationBalanceTests
+public sealed class InvestmentMutationBalanceTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public InvestmentMutationBalanceTests(PostgresFixture fixture) => _fixture = fixture;
+    public InvestmentMutationBalanceTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -50,11 +51,11 @@ public sealed class InvestmentMutationBalanceTests
     [Fact]
     public async Task Create_sell_after_buy_shifts_cash_and_holdings()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("ETFA", ticker: "ETFA");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Buy: brokerage cash falls by shares × price, holdings rise by the same,
@@ -91,7 +92,7 @@ public sealed class InvestmentMutationBalanceTests
 
         var holdingsAccountId = brokerage.HoldingsAccountId!.Value;
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
 
         // Brokerage cash after the sell: the buy's outflow plus the sell's inflow.
         var brokerageAfterSell = await db.TxnHeaderAccountBalances.AsNoTracking()
@@ -114,12 +115,12 @@ public sealed class InvestmentMutationBalanceTests
     [Fact]
     public async Task Create_dividend_reinvest_is_cash_neutral()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("ETFA", ticker: "ETFA");
         var divIncome = await ledger.AddCategoryAsync("dividend-income");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -140,7 +141,7 @@ public sealed class InvestmentMutationBalanceTests
 
         var holdingsAccountId = brokerage.HoldingsAccountId!.Value;
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
 
         // Brokerage cash nets to zero: the income leg's +principal cancels the
         // security leg's -principal.
@@ -158,12 +159,12 @@ public sealed class InvestmentMutationBalanceTests
     [Fact]
     public async Task Create_buy_with_fee_posting_charges_cash_and_fee_leg()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("ETFA", ticker: "ETFA");
         var feeCategory = await ledger.AddCategoryAsync("brokerage-fees");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync(
@@ -183,7 +184,7 @@ public sealed class InvestmentMutationBalanceTests
         var headerId = (await resp.Content.ReadFromJsonAsync<JsonElement>())
             .GetProperty("headerId").GetGuid();
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
 
         // Brokerage cash: the negative principal plus the negative fee leg.
         var brokerageRow = await db.TxnHeaderAccountBalances.AsNoTracking()
@@ -201,11 +202,11 @@ public sealed class InvestmentMutationBalanceTests
     [Fact]
     public async Task Patch_buy_shares_shifts_cash_balance()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("ETFA", ticker: "ETFA");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var postedAt = new DateTime(2026, 5, 26, 12, 0, 0, DateTimeKind.Utc);
@@ -224,7 +225,7 @@ public sealed class InvestmentMutationBalanceTests
         var headerId = (await createResp.Content.ReadFromJsonAsync<JsonElement>())
             .GetProperty("headerId").GetGuid();
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var pre = await db.TxnHeaderAccountBalances.AsNoTracking()
                 .SingleAsync(r => r.HeaderId == headerId && r.AccountId == brokerage.Id);
@@ -248,7 +249,7 @@ public sealed class InvestmentMutationBalanceTests
 
         var holdingsAccountId = brokerage.HoldingsAccountId!.Value;
 
-        await using var dbAfter = _fixture.NewDbContext();
+        await using var dbAfter = Db.NewDbContext();
         var post = await dbAfter.TxnHeaderAccountBalances.AsNoTracking()
             .SingleAsync(r => r.HeaderId == headerId && r.AccountId == brokerage.Id);
         Assert.Equal(-7800m, post.NetAmount);
@@ -265,11 +266,11 @@ public sealed class InvestmentMutationBalanceTests
     [Fact]
     public async Task Patch_posted_at_later_recomputes_vacated_range_on_brokerage_cash()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("ETFA", ticker: "ETFA");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> BuyAsync(int day, decimal shares, decimal price)
@@ -296,7 +297,7 @@ public sealed class InvestmentMutationBalanceTests
         var tX = await BuyAsync(10, 1m, 200m);
         var tB = await BuyAsync(15, 1m, 50m);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var tBpre = await db.TxnHeaderAccountBalances.AsNoTracking()
                 .SingleAsync(r => r.HeaderId == tB && r.AccountId == brokerage.Id);
@@ -321,7 +322,7 @@ public sealed class InvestmentMutationBalanceTests
 
         // New order: tA -> tB -> tX. tB is the vacated row -> tA + tB only; tX now
         // ends the walk at the full sum.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var tAbal = await db.TxnHeaderAccountBalances.AsNoTracking()
                 .SingleAsync(r => r.HeaderId == tA && r.AccountId == brokerage.Id);
@@ -340,11 +341,11 @@ public sealed class InvestmentMutationBalanceTests
     [Fact]
     public async Task Delete_buy_leaves_no_stale_balance_rows()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("ETFA", ticker: "ETFA");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> BuyAsync(int day, decimal shares, decimal price)
@@ -369,7 +370,7 @@ public sealed class InvestmentMutationBalanceTests
         var tEarly = await BuyAsync(8, 3m, 1000m);
         var tLate = await BuyAsync(12, 1m, 1000m);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var latePre = await db.TxnHeaderAccountBalances.AsNoTracking()
                 .SingleAsync(r => r.HeaderId == tLate && r.AccountId == brokerage.Id);
@@ -384,7 +385,7 @@ public sealed class InvestmentMutationBalanceTests
 
         var holdingsAccountId = brokerage.HoldingsAccountId!.Value;
 
-        await using var dbAfter = _fixture.NewDbContext();
+        await using var dbAfter = Db.NewDbContext();
 
         var deletedRows = await dbAfter.TxnHeaderAccountBalances.AsNoTracking()
             .Where(r => r.HeaderId == tEarly).CountAsync();
@@ -405,17 +406,17 @@ public sealed class InvestmentMutationBalanceTests
     /// still RESTRICT-referenced the buy's leg. With <c>lots.leg_id ON DELETE
     /// CASCADE</c> the leg + its closed lot cascade away, and the post-save
     /// recompute rebuilds the holding from the surviving legs (the Sell now
-    /// drains the later Buy instead). This is the headline mig-123 scenario
-    /// the PR #196 audit flagged as sound-by-construction but unverified.
+    /// drains the later Buy instead). This is the headline mig-123 scenario,
+    /// sound by construction and verified here.
     /// </summary>
     [Fact]
     public async Task Delete_buy_whose_lot_was_consumed_cascades_and_rebuilds_holding()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("ETFA", ticker: "ETFA");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> TradeAsync(int day, string action, decimal shares, decimal price)
@@ -445,7 +446,7 @@ public sealed class InvestmentMutationBalanceTests
 
         var holdingsAccountId = brokerage.HoldingsAccountId!.Value;
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var lots = await db.Lots.AsNoTracking()
                 .Where(l => l.LedgerId == ledger.LedgerId)
@@ -471,7 +472,7 @@ public sealed class InvestmentMutationBalanceTests
             deleteResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)deleteResp.StatusCode}: {await deleteResp.Content.ReadAsStringAsync()}");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             // A's closed lot is gone; the Sell now drains its size from B -> B
             // open at the remainder. Exactly one lot remains.

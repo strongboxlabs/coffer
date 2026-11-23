@@ -11,23 +11,20 @@ namespace Coffer.Importer.Moneydance.Tests.Db;
 /// 1-leg leftovers at transaction commit.
 /// </summary>
 [Collection(DbCollection.Name)]
-public sealed class PostingInvariantTests
+public sealed class PostingInvariantTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public PostingInvariantTests(PostgresFixture fixture)
+    public PostingInvariantTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     [Fact]
     public async Task Accepts_exactly_2_legs_per_posting()
     {
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
         var ctx = await BuildLedgerWithAccountsAsync(conn);
 
-        var headerId = await InsertHeaderAsync(conn, ctx.LedgerId);
+        var headerId = await InsertHeaderAsync(conn, ctx.LedgerId, ctx.BankId);
 
         // Two legs on the same posting, on different accounts → valid.
         await conn.ExecuteAsync(@"
@@ -42,6 +39,7 @@ public sealed class PostingInvariantTests
         var count = await conn.ExecuteScalarAsync<int>(
             "SELECT COUNT(*) FROM txn_legs WHERE header_id = @Id;", new { Id = headerId });
         Assert.Equal(2, count);
+        await StoredNotesSeed.BackfillNotesAsync(conn, ctx.LedgerId);
     }
 
     // Rejects_third_leg_at_same_posting (formerly here) exercised the
@@ -80,23 +78,17 @@ public sealed class PostingInvariantTests
         return new TestCtx(ledgerId, bankId, catId);
     }
 
-    private static async Task<Guid> InsertHeaderAsync(NpgsqlConnection conn, Guid ledgerId)
+    private static async Task<Guid> InsertHeaderAsync(NpgsqlConnection conn, Guid ledgerId, Guid ownerAccountId)
     {
         var id = Guid.NewGuid();
         await conn.ExecuteAsync(@"
             INSERT INTO txn_headers (id, ledger_id, origin, posted_at, transacted_at,
-                is_pending, is_hidden, created_at)
+                is_pending, is_hidden, created_at, originating_account_id)
             VALUES (@Id, @LedgerId, 'manual', NOW(),NOW(),
-                false, false, NOW());",
-            new { Id = id, LedgerId = ledgerId });
+                false, false, NOW(), @Owner);",
+            new { Id = id, LedgerId = ledgerId, Owner = ownerAccountId });
+        // Legless until its caller adds the legs, which settles them in its turn.
+        await StoredNotesSeed.BackfillNotesAsync(conn, ledgerId);
         return id;
-    }
-
-    private static async Task ResetAsync(NpgsqlConnection conn)
-    {
-        await conn.ExecuteAsync(@"
-            TRUNCATE security_splits, lots, holdings, txn_legs, txn_headers,
-                     security_prices, securities,
-                     account_external_ids, accounts RESTART IDENTITY CASCADE;");
     }
 }

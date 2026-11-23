@@ -12,19 +12,17 @@ namespace Coffer.Api.Tests.Integration;
 /// the probe is the explicit contract the orchestrator gates on).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class HealthEndpointsTests
+public sealed class HealthEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _postgres;
-
-    public HealthEndpointsTests(PostgresFixture postgres)
+    public HealthEndpointsTests(PostgresFixture postgres, ITestOutputHelper output)
+        : base(postgres, output)
     {
-        _postgres = postgres;
     }
 
     [Fact]
     public async Task Healthz_returns_200_and_alive_status_anonymously()
     {
-        await using var factory = new ApiFactory(_postgres);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var response = await client.GetAsync("/healthz");
@@ -38,7 +36,7 @@ public sealed class HealthEndpointsTests
     [Fact]
     public async Task Readyz_returns_200_when_db_is_reachable()
     {
-        await using var factory = new ApiFactory(_postgres);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var response = await client.GetAsync("/readyz");

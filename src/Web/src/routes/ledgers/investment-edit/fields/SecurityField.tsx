@@ -14,7 +14,8 @@ interface SecurityFieldProps {
     valueId: string | null;
     onChangeId: (next: string | null) => void;
     error?: string | null;
-    disabled?: boolean;
+    /** The save is in flight: the field keeps focus and refuses input (pending.ts). */
+    pending?: boolean;
     /** Security ids currently held in the brokerage account being
      * edited. When provided, those items sort to the top of the
      * dropdown with a divider beneath them — the 95% case is "Buy
@@ -41,7 +42,7 @@ interface SecurityFieldProps {
  *   3. "+ Create new security…" (brand new; never seen in the ledger)
  */
 export function SecurityField({
-    securities, valueId, onChangeId, error, disabled,
+    securities, valueId, onChangeId, error, pending,
     holdingsSecurityIds, onCreate,
 }: SecurityFieldProps) {
     const inputId = useId();
@@ -64,7 +65,7 @@ export function SecurityField({
                 getLabel={getLabel}
                 getSearchableText={getLabel}
                 placeholder="Ticker or name…"
-                disabled={disabled}
+                pending={pending}
                 aria-label="Security"
                 className={cn(error ? 'border-state-danger' : undefined)}
                 // Render the whole catalog; the dropdown's

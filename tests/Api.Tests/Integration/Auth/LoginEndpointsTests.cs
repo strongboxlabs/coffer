@@ -25,13 +25,11 @@ namespace Coffer.Api.Tests.Integration.Auth;
 /// YubiKey smoke test post-deploy.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class LoginEndpointsTests
+public sealed class LoginEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public LoginEndpointsTests(PostgresFixture fixture)
+    public LoginEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static byte[] RandomBytes(int length)
@@ -102,7 +100,7 @@ public sealed class LoginEndpointsTests
     private async Task<(SyntheticLedger Ledger, WebAuthnCredentialRow Credential)>
         SeedUserWithCredentialAsync(string username = "alice")
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await OverrideUsernameAsync(ledger.UserId, username);
         var credential = await ledger.AddCredentialAsync();
         return (ledger, credential);
@@ -115,7 +113,7 @@ public sealed class LoginEndpointsTests
     /// </summary>
     private async Task OverrideUsernameAsync(Guid userId, string username)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await db.Users
             .Where(u => u.Id == userId)
             .ExecuteUpdateAsync(s => s.SetProperty(u => u.Username, _ => username));
@@ -127,7 +125,7 @@ public sealed class LoginEndpointsTests
         var (_, credential) = await SeedUserWithCredentialAsync(username: $"alice-{Guid.NewGuid():N}");
 
         var sub = NewSuccessfulSubstitute(newSignatureCounter: 1);
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var username = await GetUsernameAsync(credential.UserId);
@@ -139,7 +137,7 @@ public sealed class LoginEndpointsTests
         var challengeId = doc.RootElement.GetProperty("challengeId").GetGuid();
         Assert.NotEqual(Guid.Empty, challengeId);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.PendingChallenges.AsNoTracking()
             .Where(c => c.Id == challengeId)
             .Select(c => new { c.Flow, c.UserId })
@@ -152,7 +150,7 @@ public sealed class LoginEndpointsTests
     public async Task Begin_rejects_unknown_username_with_401()
     {
         var sub = NewSuccessfulSubstitute(1);
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var response = await client.PostAsJsonAsync(
@@ -169,12 +167,12 @@ public sealed class LoginEndpointsTests
         // Synthetic ledger creates a user but no credentials — login
         // can't proceed without something for the authenticator picker
         // to choose from.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var username = $"alice-{Guid.NewGuid():N}";
         await OverrideUsernameAsync(ledger.UserId, username);
 
         var sub = NewSuccessfulSubstitute(1);
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var response = await client.PostAsJsonAsync(
@@ -186,7 +184,7 @@ public sealed class LoginEndpointsTests
     public async Task Begin_rejects_disabled_user_with_401()
     {
         var (ledger, _) = await SeedUserWithCredentialAsync(username: $"alice-{Guid.NewGuid():N}");
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Users
                 .Where(u => u.Id == ledger.UserId)
@@ -194,7 +192,7 @@ public sealed class LoginEndpointsTests
         }
 
         var sub = NewSuccessfulSubstitute(1);
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var username = await GetUsernameAsync(ledger.UserId);
@@ -209,7 +207,7 @@ public sealed class LoginEndpointsTests
     public async Task Begin_rejects_empty_username_with_422_and_code(string username)
     {
         var sub = NewSuccessfulSubstitute(1);
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var response = await client.PostAsJsonAsync(
@@ -227,7 +225,7 @@ public sealed class LoginEndpointsTests
         var (_, credential) = await SeedUserWithCredentialAsync(username: $"alice-{Guid.NewGuid():N}");
 
         var sub = NewSuccessfulSubstitute(newSignatureCounter: 7);
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var username = await GetUsernameAsync(credential.UserId);
@@ -264,7 +262,7 @@ public sealed class LoginEndpointsTests
         var (_, credential) = await SeedUserWithCredentialAsync(username: $"alice-{Guid.NewGuid():N}");
 
         var sub = NewSuccessfulSubstitute(1);
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var response = await client.PostAsJsonAsync(
@@ -288,7 +286,7 @@ public sealed class LoginEndpointsTests
         var (_, credentialB) = await SeedUserWithCredentialAsync(username: $"b-{Guid.NewGuid():N}");
 
         var sub = NewSuccessfulSubstitute(1);
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var usernameA = await GetUsernameAsync(credentialA.UserId);
@@ -329,7 +327,7 @@ public sealed class LoginEndpointsTests
            .Returns<Task<WebAuthnAssertionOutcome>>(_ =>
                throw new Fido2VerificationException("forged signature"));
 
-        await using var factory = new ApiFactory(_fixture).WithService(_ => sub);
+        await using var factory = new ApiFactory(Db).WithService(_ => sub);
         using var client = factory.CreateClient();
 
         var username = await GetUsernameAsync(credential.UserId);
@@ -353,7 +351,7 @@ public sealed class LoginEndpointsTests
         // Counter still 0; no auth_sessions row created.
         Assert.Equal(0, await GetCounterAsync(credential.Id));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var sessionCount = await db.AuthSessions
             .CountAsync(s => s.UserId == credential.UserId && s.RevokedAt == null);
         Assert.Equal(0, sessionCount);
@@ -361,7 +359,7 @@ public sealed class LoginEndpointsTests
 
     private async Task<long> GetCounterAsync(Guid credentialId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.WebAuthnCredentials
             .Where(c => c.Id == credentialId)
             .Select(c => c.SignatureCounter)
@@ -370,7 +368,7 @@ public sealed class LoginEndpointsTests
 
     private async Task<string> GetUsernameAsync(Guid userId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.Users
             .Where(u => u.Id == userId)
             .Select(u => u.Username)

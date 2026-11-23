@@ -1,6 +1,6 @@
 # 0015 — Moneydance importer is a .NET 10 console app
 
-* Status: Accepted
+* Status: Accepted (amended 2026-10-25: the import runs only in the API's wizard; the console tool keeps `audit` and `reconcile`)
 * Date: 2026-05-08
 
 ## Context
@@ -48,6 +48,21 @@ Other projects (the API, the SimpleFIN sync worker, etc.) are added to
 `Coffer.sln` **only when their phase begins**. We do not pre-create empty
 project shells — that's the kind of premature abstraction
 [engineering-standards.md §1](../engineering-standards.md) explicitly forbids.
+
+## Amendment, 2026-10-25 — the import runs in the API's wizard
+
+The console application no longer imports. Its `import` command is removed, with
+`prune-batch` ([ADR-0071](0071-install-provisioning-ui-import-authed-restore.md),
+amendment of that date): the in-app wizard is the only import path, and the API runs the
+import as a background job (`ImportJobRunner`) over the `Importer.Moneydance` library.
+That is the in-API hosting rejected below; the reason given there, a one-shot tool
+coupled to the API's lifecycle, gave way to one import path behind the API's
+authorization and its import audit record (ADR-0071, same amendment).
+
+The console application stays, with only the read-only diagnostics `audit` and
+`reconcile` (`Importer.Moneydance.Cli/Program.cs`), which write nothing. The solution,
+project and test layout above, and Spectre.Console.Cli for the remaining commands, are
+unchanged.
 
 ## Consequences
 

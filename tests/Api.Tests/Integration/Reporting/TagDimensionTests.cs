@@ -22,16 +22,17 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// at first execution.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class TagDimensionTests
+public sealed class TagDimensionTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public TagDimensionTests(PostgresFixture fixture) => _fixture = fixture;
+    public TagDimensionTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static readonly DateTime May = new(2026, 5, 15, 12, 0, 0, DateTimeKind.Utc);
 
     private Task<ReportResult> SummarizeByTagAsync(Guid ledgerId) =>
-        new ReportingRepository(_fixture.NewDbContext(), TimeProvider.System).SummarizeAsync(new ReportSpec
+        new ReportingRepository(Db.NewDbContext(), TimeProvider.System).SummarizeAsync(new ReportSpec
         {
             LedgerId = ledgerId,
             Measure = ReportMeasure.Spending,
@@ -40,14 +41,16 @@ public sealed class TagDimensionTests
         });
 
     [Fact]
-    public async Task Header_tags_group_and_untagged_spending_keeps_its_own_row()
+    public async Task A_tagged_one_split_groups_and_untagged_spending_keeps_its_own_row()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense");
 
+        // A one-split's tags live on a leg, never on its header: here the bank's,
+        // the real account a report reads the posting from.
         var tagged = await ledger.AddTransactionPairAsync(groceries.Id, bank.Id, 100m, May);
-        await ledger.AddTagAsync(tagged.FromTxnId, "Holiday");
+        await ledger.AddLegTagAsync(tagged.ToTxnId, "Holiday");
         await ledger.AddTransactionPairAsync(groceries.Id, bank.Id, 40m, May);
 
         var rows = (await SummarizeByTagAsync(ledger.LedgerId)).Rows;
@@ -62,7 +65,7 @@ public sealed class TagDimensionTests
     [Fact]
     public async Task A_leg_tag_charges_its_own_posting_and_not_its_sibling()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense");
         var dining = await ledger.AddCategoryAsync("Dining", "expense");
@@ -82,8 +85,8 @@ public sealed class TagDimensionTests
 
         // The tagged posting alone, not the header's total: the dining posting
         // shares the header but not the tag. A header-level reading of this tag
-        // would report the whole header and be wrong in
-        // precisely the way the rental-property case in ADR-0103 described.
+        // would report the whole header and be wrong in precisely the way
+        // ADR-0103's split-across-two-projects case describes.
         Assert.Equal(60m, Assert.Single(rows, r => r.GroupName == "Reimbursable").Amount);
         Assert.Equal(40m, Assert.Single(rows, r => r.GroupName == "(untagged)").Amount);
     }
@@ -91,7 +94,7 @@ public sealed class TagDimensionTests
     [Fact]
     public async Task The_same_tag_at_both_levels_counts_a_posting_once()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense");
 

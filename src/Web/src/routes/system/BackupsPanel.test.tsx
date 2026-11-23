@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
@@ -48,14 +48,76 @@ describe('BackupsPanel', () => {
 
         renderPanel();
 
+        // Anchored on the status the schedule's answer writes: before it, nothing
+        // is known about the passphrase.
+        expect(await screen.findByText(/^Not set\. Required before/)).toBeInTheDocument();
         // The set-passphrase CTA (not "Change") is shown.
-        expect(await screen.findByRole('button', { name: /set passphrase/i })).toBeInTheDocument();
-        // Create is disabled with no passphrase.
-        expect(screen.getByRole('button', { name: /create backup/i })).toBeDisabled();
+        expect(screen.getByRole('button', { name: /set passphrase/i })).toBeInTheDocument();
+        // Create is disabled with no passphrase, and says why.
+        const create = screen.getByRole('button', { name: /create backup/i });
+        expect(create).toBeDisabled();
+        expect(create).toHaveAttribute('title', 'Set a backup passphrase first.');
         // Empty-state hint points at the passphrase (await the backups query).
         expect(
             await screen.findByText(/set a backup passphrase to get started/i),
         ).toBeInTheDocument();
+    });
+
+    // ADR-0023 §L: the passphrase dialog's fields are pending while its save is in
+    // flight; the save sends what was typed at the press and its success closes it.
+    it('refuses typing in the passphrase dialog while it saves', async () => {
+        vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchRestoreLimits')
+            .mockResolvedValue({ partSizeBytes: 49 * 1024 * 1024 });
+        vi.spyOn(apiModule, 'fetchBackupSchedule').mockResolvedValue(SCHEDULE_OFF);
+        vi.spyOn(apiModule, 'setBackupPassphrase').mockImplementation(() => new Promise(() => {}));
+        const user = userEvent.setup();
+
+        renderPanel();
+        await user.click(await screen.findByRole('button', { name: /set passphrase/i }));
+        const dialog = await screen.findByRole('dialog');
+        const passphrase = within(dialog).getByLabelText('Passphrase');
+        const confirm = within(dialog).getByLabelText('Confirm passphrase');
+        await user.type(passphrase, 'longenough');
+        await user.type(confirm, 'longenough');
+        await user.click(within(dialog).getByRole('button', { name: /set passphrase/i }));
+        await within(dialog).findByRole('button', { name: /saving/i });
+
+        await user.type(passphrase, 'x');
+        await user.type(confirm, 'x');
+        expect(passphrase).toHaveValue('longenough');
+        expect(confirm).toHaveValue('longenough');
+        expect(passphrase).toHaveAttribute('aria-disabled', 'true');
+        expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    });
+
+    it('holds Create backup pending, not disabled, while the schedule says whether a passphrase is set', async () => {
+        vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchRestoreLimits')
+            .mockResolvedValue({ partSizeBytes: 49 * 1024 * 1024 });
+        let answer: (s: BackupSchedule) => void = () => {};
+        vi.spyOn(apiModule, 'fetchBackupSchedule').mockImplementation(
+            () => new Promise((resolve) => { answer = resolve; }));
+        const create = vi.spyOn(apiModule, 'createBackup');
+
+        renderPanel();
+
+        const button = await screen.findByRole('button', { name: /create backup/i });
+        const status = screen.getByText('Backup passphrase').parentElement!;
+        expect(within(status).getByText('Loading…')).toBeInTheDocument();
+        expect(button).toBeEnabled();
+        expect(button).toHaveAttribute('aria-busy', 'true');
+        expect(button).not.toHaveAttribute('title');
+        expect(screen.queryByText('Set a backup passphrase first.')).toBeNull();
+        await userEvent.click(button);
+        expect(create).not.toHaveBeenCalled();
+
+        await act(async () => { answer(SCHEDULE_OFF); });
+        expect(await screen.findByText(/^Not set\. Required before/)).toBeInTheDocument();
+        expect(button).toBeDisabled();
+        expect(button).not.toHaveAttribute('aria-busy');
     });
 
     it('enables create and lists artifacts once a passphrase exists', async () => {
@@ -86,6 +148,30 @@ describe('BackupsPanel', () => {
 
         // Restore-from-backup is now an in-app admin action (ADR-0071 D3).
         expect(screen.getByRole('button', { name: /restore database/i })).toBeInTheDocument();
+    });
+
+    it('names a backup held for an upgrade, and does not call it pinned (ADR-0110)', async () => {
+        const backups: BackupSummary[] = [
+            { id: 'coffer-20260623T031500000Z-0a1b2c3d', sizeBytes: 2048, createdAtUtc: '2026-06-23T03:15:00Z', pinned: false, upgradeLabel: 'before upgrade 0.128.1 to 0.129.0' },
+            { id: 'coffer-20260622T031500000Z-0a1b2c3e', sizeBytes: 2048, createdAtUtc: '2026-06-22T03:15:00Z', pinned: false },
+        ];
+        vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue(backups);
+        vi.spyOn(backupModule, 'fetchBackups').mockResolvedValue(backups);
+        vi.spyOn(backupModule, 'fetchRestoreLimits')
+            .mockResolvedValue({ partSizeBytes: 49 * 1024 * 1024 });
+        vi.spyOn(apiModule, 'fetchBackupSchedule').mockResolvedValue({
+            ...SCHEDULE_OFF, passphraseConfigured: true,
+        });
+
+        renderPanel();
+
+        const label = (await screen.findAllByText('before upgrade 0.128.1 to 0.129.0'))[0];
+        const rows = screen.getAllByRole('listitem').filter((li) => li.textContent?.includes('Download'));
+        const labelled = label.closest('li');
+        expect(labelled).not.toBeNull();
+        expect(within(labelled!).queryByText(/pinned/i)).toBeNull();
+        // Only the labelled row carries it.
+        expect(rows.filter((li) => li.textContent?.includes('before upgrade'))).toHaveLength(1);
     });
 
     it('offers Show only once a passphrase exists (ADR-0092 D7)', async () => {
@@ -131,6 +217,8 @@ describe('BackupsPanel', () => {
 
         await user.click(screen.getByRole('button', { name: /^hide$/i }));
         expect(screen.queryByText('correct-horse-battery')).not.toBeInTheDocument();
+        // ADR-0023 §L: Hide took itself away with focus on it; focus went to Show.
+        expect(screen.getByRole('button', { name: /^show$/i })).toHaveFocus();
     });
 
     it('drops a revealed passphrase once it has been changed', async () => {
@@ -186,11 +274,10 @@ describe('BackupsPanel', () => {
     });
 
     it('confirms a created backup, naming its size', async () => {
-        // Creating one used to announce nothing: a row appeared somewhere in a
-        // list that already had rows, after a pause long enough to wonder
-        // whether the click registered. Failure was announced and success was
-        // not, leaving the outcome you most want to be sure of as the one you
-        // had to infer.
+        // Without an announcement a row just appears somewhere in a list that
+        // already has rows, after a pause long enough to wonder whether the
+        // click registered. Announcing failure but not success would leave the
+        // outcome you most want to be sure of as the one you have to infer.
         vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue([]);
         vi.spyOn(backupModule, 'fetchBackups').mockResolvedValue([]);
         vi.spyOn(backupModule, 'fetchRestoreLimits')
@@ -214,5 +301,62 @@ describe('BackupsPanel', () => {
         const notice = await screen.findByRole('status');
         expect(notice).toHaveTextContent(/backup created/i);
         expect(notice).toHaveTextContent(/22\.2 MB/);
+    });
+
+    // ADR-0023 §L: a retention save that lands leaves nothing changed, so
+    // Save, holding focus, becomes disabled; focus goes to the first field,
+    // never to the page.
+    it('gives focus to Daily when its own save disables Save', async () => {
+        vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchRestoreLimits')
+            .mockResolvedValue({ partSizeBytes: 49 * 1024 * 1024 });
+        vi.spyOn(apiModule, 'fetchBackupSchedule').mockResolvedValue({
+            ...SCHEDULE_OFF, passphraseConfigured: true,
+        });
+        vi.spyOn(apiModule, 'fetchBackupRetention')
+            .mockResolvedValueOnce({ retentionDaily: 7, retentionWeekly: 4, retentionMonthly: 6 })
+            .mockResolvedValue({ retentionDaily: 8, retentionWeekly: 4, retentionMonthly: 6 });
+        const save = vi.spyOn(apiModule, 'setBackupRetention').mockResolvedValue(undefined as never);
+        const user = userEvent.setup();
+        renderPanel();
+
+        const daily = await screen.findByRole('spinbutton', { name: /daily/i });
+        await user.tripleClick(daily);
+        await user.keyboard('8');
+        const saveButton = screen.getByRole('button', { name: 'Save' });
+        await user.click(saveButton);
+
+        expect(save).toHaveBeenCalledTimes(1);
+        await waitFor(() => expect(saveButton).toBeDisabled());
+        await waitFor(() => expect(daily).toHaveFocus());
+        expect(daily).toHaveValue(8);
+    });
+
+    // A pending field looks as the same field disabled does (ADR-0023 §L):
+    // the retention fields dim when disabled, with the arrow cursor a disabled
+    // field shows, so pending they show that cursor too, not the text caret
+    // their readOnly would.
+    it('shows a pending retention field with the cursor and dim of a disabled one', async () => {
+        vi.spyOn(apiModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchBackups').mockResolvedValue([]);
+        vi.spyOn(backupModule, 'fetchRestoreLimits')
+            .mockResolvedValue({ partSizeBytes: 49 * 1024 * 1024 });
+        vi.spyOn(apiModule, 'fetchBackupSchedule').mockResolvedValue({
+            ...SCHEDULE_OFF, passphraseConfigured: true,
+        });
+        vi.spyOn(apiModule, 'fetchBackupRetention')
+            .mockResolvedValue({ retentionDaily: 7, retentionWeekly: 4, retentionMonthly: 6 });
+        vi.spyOn(apiModule, 'setBackupRetention').mockReturnValue(new Promise<never>(() => {}));
+        const user = userEvent.setup();
+        renderPanel();
+
+        const daily = await screen.findByRole('spinbutton', { name: /daily/i });
+        await user.tripleClick(daily);
+        await user.keyboard('8');
+        await user.click(screen.getByRole('button', { name: 'Save' }));
+
+        await waitFor(() => expect(daily).toHaveAttribute('aria-disabled', 'true'));
+        expect(daily).toHaveClass('aria-disabled:cursor-default', 'aria-disabled:opacity-50', 'disabled:opacity-50');
     });
 });

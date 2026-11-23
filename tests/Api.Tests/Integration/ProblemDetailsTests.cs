@@ -12,19 +12,17 @@ namespace Coffer.Api.Tests.Integration;
 /// correlation.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class ProblemDetailsTests
+public sealed class ProblemDetailsTests : DatabaseTest
 {
-    private readonly PostgresFixture _postgres;
-
-    public ProblemDetailsTests(PostgresFixture postgres)
+    public ProblemDetailsTests(PostgresFixture postgres, ITestOutputHelper output)
+        : base(postgres, output)
     {
-        _postgres = postgres;
     }
 
     [Fact]
     public async Task Unmapped_route_returns_problem_details_404()
     {
-        await using var factory = new ApiFactory(_postgres);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var response = await client.GetAsync("/no-such-endpoint");

@@ -1,4 +1,5 @@
 import { cn } from '@/lib/cn';
+import { InheritedMarker } from '@/components/register/InheritedMarker';
 
 import { useTagColor } from './TagColorsContext';
 
@@ -31,9 +32,9 @@ import { useTagColor } from './TagColorsContext';
  *
  * THE 6px INSET IS THE LINE'S, NOT THE STRIPE'S. A category {@link Chip} is
  * `px-1.5`, so its text sits 6px into the cell. The stripe is 2px wide with a
- * 4px margin — also exactly 6px — so a coloured tag used to line up under the
- * chip by COINCIDENCE, with the stripe doing double duty as the inset. An
- * uncoloured tag rendered no stripe and started flush at 0, 6px adrift, which
+ * 4px margin — also exactly 6px — so with the stripe doing double duty as the
+ * inset a coloured tag lines up under the chip by COINCIDENCE, and an
+ * uncoloured tag renders no stripe and starts flush at 0, 6px adrift, which
  * in a register column reads as the whole row being crooked without saying
  * which element moved.
  *
@@ -54,7 +55,7 @@ import { useTagColor } from './TagColorsContext';
  * whatever the line cuts.
  */
 export function TagLine(
-    { tags, inset }: {
+    { tags, inset, inherited, ownTone = 'muted' }: {
         tags: readonly string[];
         /**
          * Pad the names to a category {@link Chip}'s 6px text inset. Set where
@@ -62,16 +63,41 @@ export function TagLine(
          * inside a control that already pads its own content.
          */
         inset?: boolean;
+        /**
+         * The tags are the other side's, shown because this side has none of
+         * its own. The line then leads with the inherited marker and reads in
+         * the subtle colour. `from` names the account they come from.
+         */
+        inherited?: { from: string | null | undefined } | false;
+        /**
+         * The colour of OWN names. `muted` in a register row, where the tags
+         * are a secondary line under the category. `text` inside an editor's
+         * tag control, where they are a field's value and read like the memo
+         * typed beside them. Inherited names keep the subtle colour either
+         * way: the colour is half of how they say they are not this side's.
+         */
+        ownTone?: 'muted' | 'text';
     },
 ) {
     if (tags.length === 0) return null;
 
+    const isInherited = inherited !== undefined && inherited !== false;
     return (
-        <span className="flex min-w-0 items-center gap-1" title={tags.join(', ')}>
+        <span
+            className={cn('flex min-w-0 items-center gap-1', isInherited && inset === true && 'pl-1.5')}
+            title={tags.join(', ')}
+            data-inherited={isInherited ? 'true' : undefined}
+        >
+            {isInherited ? <InheritedMarker from={inherited.from} /> : null}
             <span
                 className={cn(
-                    'min-w-0 truncate text-[0.6875rem] leading-[1.25] text-text-muted',
-                    inset === true && 'pl-1.5',
+                    'min-w-0 truncate text-[0.6875rem] leading-[1.25]',
+                    isInherited
+                        ? 'text-text-subtle'
+                        : ownTone === 'text' ? 'text-text' : 'text-text-muted',
+                    // With the marker leading, the marker takes the inset and
+                    // the names follow it, so the names do not pad again.
+                    inset === true && !isInherited && 'pl-1.5',
                 )}
             >
                 {tags.map((tag, i) => (

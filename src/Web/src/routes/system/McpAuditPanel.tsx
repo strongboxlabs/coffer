@@ -1,5 +1,6 @@
-import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useId, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import { fetchMcpAudit, clearMcpAudit, type McpInvocationStatus } from '@/lib/api';
 import { errorMessage } from '@/lib/errorMessage';
@@ -42,12 +43,16 @@ export function McpAuditPanel() {
     const [clearOpen, setClearOpen] = useState(false);
 
     const entries = query.data;
+    // Clear log empties the list and goes with it: focus goes to the list
+    // itself, which has no add control (ADR-0023 §L).
+    const listRef = useRef<HTMLDivElement | null>(null);
+    const headingId = useId();
 
     return (
         <section className="space-y-3">
             <header className="flex items-start justify-between gap-4">
                 <div className="space-y-1">
-                    <h2 className="text-base font-semibold">AI write activity</h2>
+                    <h2 id={headingId} className="text-base font-semibold">AI write activity</h2>
                     <p className="text-sm text-text-muted">
                         Every change an AI client made through the MCP write tools. Kept for 180
                         days, then removed automatically.
@@ -59,7 +64,13 @@ export function McpAuditPanel() {
                     </Button>
                 ) : null}
             </header>
-            <Panel>
+            <Panel
+                ref={listRef}
+                role="group"
+                aria-labelledby={headingId}
+                tabIndex={-1}
+                className="focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            >
                 <PanelBody>
                     {query.isPending ? (
                         <p className="text-sm text-text-muted">Loading…</p>
@@ -116,6 +127,7 @@ export function McpAuditPanel() {
                 confirmLabel="Clear log"
                 variant="danger"
                 isConfirming={clear.isPending}
+                fallbackFocusRef={listRef}
                 onConfirm={() => clear.mutate(undefined, { onSuccess: () => setClearOpen(false) })}
                 onCancel={() => setClearOpen(false)}
             />

@@ -7,27 +7,26 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Notifications;
 
 /// <summary>
-/// The subject rule is written twice — once in C#, once as a LINQ expression the
-/// database evaluates. This is what keeps them the same rule.
+/// The subject rule has two spellings, one in C# and one the database evaluates. This
+/// keeps them the same rule.
 /// </summary>
 /// <remarks>
-/// <para>Two readers depend on "the same subject": the per-ledger events panel resolves
-/// each problem in memory, and the cross-ledger attention summary groups in SQL because
-/// it cannot afford to pull the log. Neither could use the other's spelling —
-/// <see cref="EventSubjects.Of"/> is a method body EF cannot translate, and the query's
-/// expression is not something C# should be reimplementing at every call site.</para>
+/// <para>The per-ledger events panel resolves each problem in memory with
+/// <see cref="EventSubjects.Of"/>. The attention summary and the outstanding list group
+/// in SQL, because they cannot afford to pull the log, through
+/// <see cref="EventSubjects.WithSubject"/>: <c>Of</c> is a method body EF cannot
+/// translate.</para>
 ///
-/// <para>So there are two, and the risk is that they drift on exactly the keys that
-/// matter. A comment asking the next person to keep them in step is not a mechanism.
-/// This runs both over the same keys, against a real Postgres, and fails if they ever
-/// disagree.</para>
+/// <para>The risk is that the two drift on exactly the keys that matter. This runs both
+/// over the same keys, against a real Postgres, and fails if they ever disagree.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class EventSubjectTests
+public sealed class EventSubjectTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public EventSubjectTests(PostgresFixture fixture) => _fixture = fixture;
+    public EventSubjectTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     /// <summary>
     /// Every key any publisher in this build emits, plus the shapes that break naive
@@ -50,7 +49,7 @@ public sealed class EventSubjectTests
         "consistency.drift",
         "consistency.ok",
         "consistency.repaired",
-        "scheduler.job-disabled",
+        "feed-sync.disabled",
         "quote-refresh.failed",
         "quote-refresh.succeeded",
         "snapshot.failed",
@@ -64,9 +63,9 @@ public sealed class EventSubjectTests
     [Fact]
     public async Task The_database_and_CSharp_agree_on_every_subject()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         foreach (var key in Keys)
         {
             db.LedgerEvents.Add(new LedgerEventRow
@@ -82,15 +81,12 @@ public sealed class EventSubjectTests
 
         await db.SaveChangesAsync();
 
-        // Exactly the expression LedgerNotificationsEndpoints.ListAttentionAsync groups
-        // by. Projected, not grouped, so a disagreement names the key it happened on.
+        // The projection every subject query composes on. Projected, not grouped, so a
+        // disagreement names the key it happened on.
         var fromDatabase = await db.LedgerEvents.AsNoTracking()
             .Where(e => e.LedgerId == ledger.LedgerId)
-            .Select(e => new
-            {
-                e.EventKey,
-                Subject = e.EventKey.Substring(0, e.EventKey.IndexOf(".") + 1),
-            })
+            .WithSubject()
+            .Select(e => new { e.EventKey, e.Subject })
             .ToListAsync();
 
         Assert.Equal(Keys.Length, fromDatabase.Count);

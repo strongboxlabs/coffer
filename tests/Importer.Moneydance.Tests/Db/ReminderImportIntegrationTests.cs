@@ -16,11 +16,12 @@ namespace Coffer.Importer.Moneydance.Tests.Db;
 /// only path exercised.
 /// </summary>
 [Collection(DbCollection.Name)]
-public sealed class ReminderImportIntegrationTests
+public sealed class ReminderImportIntegrationTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ReminderImportIntegrationTests(PostgresFixture fixture) => _fixture = fixture;
+    public ReminderImportIntegrationTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     // Weekly reminder on weeklydays=6 (Friday, Java Calendar DOW) with
     // auto-commit 2 days before; single split source -> category.
@@ -42,8 +43,7 @@ public sealed class ReminderImportIntegrationTests
     [Fact]
     public async Task Reminder_materializes_a_template_that_never_hits_balances()
     {
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
 
         var ledgerId = TestLedger.Id;
         var bankId = Guid.NewGuid();
@@ -59,11 +59,12 @@ public sealed class ReminderImportIntegrationTests
             new { A = bankId, C = catId, L = ledgerId });
 
         var ctx = new ImportContext(MdItemReader.ReadString(ReminderExportJson), ledgerId);
-        ctx.AccountByMdId["a-checking"] = new AccountRef(bankId, "bank");
-        ctx.AccountByMdId["a-cat"] = new AccountRef(catId, "category");
+        ctx.AccountByMdId["a-checking"] = new AccountRef(bankId, "bank", AmountDecimals: 2);
+        ctx.AccountByMdId["a-cat"] = new AccountRef(catId, "category", AmountDecimals: 2);
 
         var result = await ReminderImportStep.RunAsync(conn, ctx, "moneydance_export");
         Assert.Equal(1, result.Written);
+        await StoredNotesSeed.ComputeImportedNotesAsync(conn, ledgerId);
 
         // --- the recurring SERIES row ---
         var row = await conn.QuerySingleAsync<(string? Rrule, int? AutoCommit, Guid? TemplateHeaderId, Guid? SourceAccountId, string? SourcePayload, string Origin, bool IsActive)>(
@@ -96,11 +97,4 @@ public sealed class ReminderImportIntegrationTests
             "SELECT COUNT(*) FROM txn_header_account_balances WHERE header_id = @H;", new { H = templateHeaderId });
         Assert.Equal(0, balanceRows);
     }
-
-    private static async Task ResetAsync(NpgsqlConnection conn) =>
-        await conn.ExecuteAsync(@"
-            TRUNCATE recurring_transactions, txn_header_account_balances,
-                     security_splits, lots, holdings, txn_legs, txn_headers,
-                     security_prices, securities,
-                     account_external_ids, accounts RESTART IDENTITY CASCADE;");
 }

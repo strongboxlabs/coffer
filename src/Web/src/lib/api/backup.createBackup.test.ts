@@ -2,10 +2,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createBackup } from './backup';
 
-// A manual backup runs on the server, not in its request (FU-065). The request used to
-// carry the whole backup and died with it when a proxy cancelled it at its timeout
-// (Cloudflare's is 100 seconds). Now POST answers 202 with a run id at once, and
-// `createBackup` polls the run until it has finished, so the panel keeps one promise that
+// A manual backup runs on the server, not in its request (FU-065). A request that
+// carried the whole backup would die with it whenever a reverse proxy cancels it at its
+// timeout. So POST answers 202 with a run id at once, and `createBackup` polls the run
+// until it has finished, so the panel keeps one promise that
 // resolves with the backup or rejects with why it failed.
 
 function json(body: unknown, status = 200): Response {

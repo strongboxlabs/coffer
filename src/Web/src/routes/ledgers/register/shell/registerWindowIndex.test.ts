@@ -4,13 +4,13 @@ import { toWindowIndex } from './registerWindowIndex';
 
 // `aria-rowindex` is fed from whatever `itemContent` receives, and virtuoso
 // emits an index shifted by `firstItemIndex` — seeded to 1000000 so rows can
-// be prepended without going negative. Unmapped, the register announced its
+// be prepended without going negative. Unmapped, the register would announce its
 // first row as "row 1000001".
 //
 // This is a pure-function test on purpose. Under jsdom virtuoso emits LOCAL
 // indices (firstItemIndex needs layout to take effect), so a rendered-DOM
 // assertion reads 1 and 2 with or without the mapping and cannot tell the two
-// apart — it was green against the bug.
+// apart.
 describe('toWindowIndex', () => {
     const OFFSET_BASE = 1_000_000;
 

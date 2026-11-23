@@ -1,8 +1,8 @@
 -- 019_register_entry_functions.sql
 --
 -- Postgres function that drives the entry-keyed page of the register
--- endpoint (the "100 complete sets" model agreed after the PR 5.2
--- spot-check). The function lives here rather than inline in the
+-- endpoint (the "100 complete sets" model). The function lives here
+-- rather than inline in the
 -- C# repository because:
 --
 --   * SQL belongs with the schema it queries — version-controlled
@@ -19,12 +19,11 @@
 -- parallelize and inline it aggressively.
 --
 -- Q2 ("fetch every row belonging to those entries") is intentionally
--- NOT a function. We tried it, and the SETOF wrapper produced an
--- opaque function scan that the planner couldn't push filters into
--- (cost was the default `rows=1000` opaque-SETOF estimate, plan time
--- 312ms vs 7ms for the equivalent direct view query). The OR-on-null
--- account-scope pattern compounded it — the planner couldn't fold
--- away the unused branch. Q2 now runs as plain LINQ over the view
+-- NOT a function. A SETOF wrapper is an opaque function scan the
+-- planner can't push filters into (it plans with the default
+-- `rows=1000` opaque-SETOF estimate), so it is far slower than the
+-- equivalent direct view query. The OR-on-null account-scope pattern
+-- compounds it — the planner can't fold away the unused branch. Q2 now runs as plain LINQ over the view
 -- (no raw SQL in C#) which lets EF emit literal account predicates.
 --
 -- RLS: the function invokes the security_invoker view

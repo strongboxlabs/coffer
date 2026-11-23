@@ -11,9 +11,9 @@
 -- was singular about it is that it was the one derived figure the report did not
 -- examine — while feeding valuation, allocation and returns. Anything that
 -- rewrites trade legs WITHOUT going through EF leaves it silently stale: a
--- hand-run scrub, or a migration that reshapes legs. That is exactly the shape
--- of the incident the checker exists for — a raw-SQL scrub desynced a projection
--- and the register showed wrong figures for months.
+-- hand-run scrub, or a migration that reshapes legs. That is exactly the failure
+-- the checker exists for — a raw-SQL write desyncs a projection, and the register
+-- shows wrong figures until something recomputes it.
 --
 -- So the check is written the way the DTO comment said it would have to be —
 -- against what the source-priority rule IMPLIES for each day, not against row

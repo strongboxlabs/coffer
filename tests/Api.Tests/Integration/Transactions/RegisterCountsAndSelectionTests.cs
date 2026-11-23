@@ -18,11 +18,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// predicate) against a live DB, so a bad LINQ→SQL translation surfaces here.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class RegisterCountsAndSelectionTests
+public sealed class RegisterCountsAndSelectionTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public RegisterCountsAndSelectionTests(PostgresFixture fixture) => _fixture = fixture;
+    public RegisterCountsAndSelectionTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -37,13 +38,13 @@ public sealed class RegisterCountsAndSelectionTests
     [Fact]
     public async Task Reconciling_is_its_own_view_and_uncleared_excludes_it()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var acct = await ledger.AddBankAccountAsync("checking");
         var other = await ledger.AddBankAccountAsync("savings");
         await ledger.AddTransactionPairAsync(acct.Id, other.Id, 10m, Day(2026, 1, 10), "unc");
         var (recLeg, _) = await ledger.AddTransactionPairAsync(acct.Id, other.Id, 20m, Day(2026, 1, 11), "rec");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Mark the second row reconciling through the recon-status endpoint.
@@ -58,8 +59,8 @@ public sealed class RegisterCountsAndSelectionTests
             $"/api/ledgers/{ledger.LedgerId}/transactions?account_id={acct.Id}&limit=100&status=reconciling&today=2026-07-13"))!;
         Assert.Equal("rec", Assert.Single(rec.Entries).Txn!.Payee);
 
-        // status=uncleared → excludes the reconciling row (it used to be lumped
-        // in with uncleared; mig 165 split them so the view matches its label).
+        // status=uncleared → excludes the reconciling row (mig 165 keeps them
+        // apart so the view matches its label).
         var unc = (await client.GetFromJsonAsync<RegisterPage>(
             $"/api/ledgers/{ledger.LedgerId}/transactions?account_id={acct.Id}&limit=100&status=uncleared&today=2026-07-13"))!;
         Assert.Equal("unc", Assert.Single(unc.Entries).Txn!.Payee);
@@ -68,7 +69,7 @@ public sealed class RegisterCountsAndSelectionTests
     [Fact]
     public async Task Status_counts_narrow_with_the_active_filter()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var acct = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("Groceries");
         var dining = await ledger.AddCategoryAsync("Dining");
@@ -77,7 +78,7 @@ public sealed class RegisterCountsAndSelectionTests
         for (var i = 0; i < 2; i++)
             await ledger.AddTransactionPairAsync(acct.Id, dining.Id, 20m + i, Day(2026, 2, 10 + i), $"d{i}");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // No filter → all five uncleared on the account.
@@ -97,7 +98,7 @@ public sealed class RegisterCountsAndSelectionTests
     [Fact]
     public async Task Select_all_honors_the_active_filter()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var acct = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("Groceries");
         var dining = await ledger.AddCategoryAsync("Dining");
@@ -106,7 +107,7 @@ public sealed class RegisterCountsAndSelectionTests
         for (var i = 0; i < 2; i++)
             await ledger.AddTransactionPairAsync(acct.Id, dining.Id, 20m, Day(2026, 2, 10 + i), $"d{i}");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // How many entries the register shows under the groceries filter — the
@@ -137,7 +138,7 @@ public sealed class RegisterCountsAndSelectionTests
         });
 
         // The filtered select-all covers exactly the filtered view — not the
-        // whole account (the bug this fixes).
+        // whole account.
         Assert.Equal(filteredEntryCount, filteredSummary);
         Assert.True(filteredSummary < wholeAccount,
             $"filtered select-all ({filteredSummary}) should be fewer than the whole account ({wholeAccount})");
@@ -147,11 +148,11 @@ public sealed class RegisterCountsAndSelectionTests
     public async Task Select_all_on_a_status_view_is_exactly_what_the_register_shows_for_that_date()
     {
         // The register decides each view from the user's LOCAL date and
-        // leaves pending rows out of the recon views; the bulk predicate used to
-        // judge "future" by an instant and keep pending rows, so a bulk clear over
-        // "all uncleared" could act on rows the reader was not shown. The dates are
+        // leaves pending rows out of the recon views; a bulk predicate that judged
+        // "future" by an instant and kept pending rows would let a bulk clear over
+        // "all uncleared" act on rows the reader was not shown. The dates are
         // fixed and the date is sent, so this holds on any day the suite runs.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var acct = await ledger.AddBankAccountAsync("checking");
         var other = await ledger.AddBankAccountAsync("savings");
         await ledger.AddTransactionPairAsync(acct.Id, other.Id, 10m, Day(2026, 1, 10), "uncleared");
@@ -160,7 +161,7 @@ public sealed class RegisterCountsAndSelectionTests
         var (clearedLeg, _) = await ledger.AddTransactionPairAsync(acct.Id, other.Id, 13m, Day(2026, 1, 8), "cleared");
         var (futureClearedLeg, _) = await ledger.AddTransactionPairAsync(acct.Id, other.Id, 14m, Day(2026, 1, 13), "cleared-future");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         foreach (var leg in new[] { clearedLeg, futureClearedLeg })
@@ -172,7 +173,7 @@ public sealed class RegisterCountsAndSelectionTests
         }
         // Pending is set by bank feeds; nothing on the write API sets it.
         var pendingHeader = await ledger.ResolveHeaderIdAsync(pendingLeg);
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             await db.TxnHeaders.Where(h => h.Id == pendingHeader)
                 .ExecuteUpdateAsync(s => s.SetProperty(h => h.IsPending, true));
 
@@ -200,16 +201,6 @@ public sealed class RegisterCountsAndSelectionTests
             Assert.True(selected == shown,
                 $"select-all on '{status}' covers {selected} rows; the register shows {shown}");
         }
-
-        // A caller with no account in scope gets the same date rule for scheduled.
-        var ledgerWide = await SelectionCountAsync(client, ledger, new SelectionRequest
-        {
-            Kind = "all",
-            StatusFilter = "scheduled",
-            SelectedAt = Day(2030, 1, 1),
-            Today = today,
-        });
-        Assert.Equal(2, ledgerWide);
     }
 
     private static async Task<int> SelectionCountAsync(

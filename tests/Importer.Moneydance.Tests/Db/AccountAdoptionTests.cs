@@ -16,20 +16,17 @@ namespace Coffer.Importer.Moneydance.Tests.Db;
 /// source already created.
 /// </summary>
 [Collection(DbCollection.Name)]
-public sealed class AccountAdoptionTests
+public sealed class AccountAdoptionTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AccountAdoptionTests(PostgresFixture fixture)
+    public AccountAdoptionTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     [Fact]
     public async Task Inserts_new_account_and_junction_row_on_first_import()
     {
-        await using var conn = _fixture.OpenConnection();
-        await ResetAsync(conn);
+        await using var conn = Db.OpenConnection();
         var repo = new AccountsRepository(conn);
 
         var (id, inserted) = await repo.UpsertWithAdoptionAsync(
@@ -47,6 +44,26 @@ public sealed class AccountAdoptionTests
 
         Assert.Equal(1, totalAccounts);
         Assert.Equal(1, junctionRows);
+    }
+
+    [Fact]
+    public async Task Inserts_the_tax_status_guess_with_the_account()
+    {
+        // ADR-0066: the importer seeds a tax-status guess, then Coffer owns it.
+        await using var conn = Db.OpenConnection();
+        var repo = new AccountsRepository(conn);
+
+        var (id, _) = await repo.UpsertWithAdoptionAsync(
+            MakeAccount(name: "Retirement 401(k)", externalId: "md-401k-1") with
+            {
+                AccountType = "investment",
+                TaxStatus = "tax_deferred",
+            },
+            source: "moneydance");
+
+        var stored = await conn.ExecuteScalarAsync<string?>(
+            "SELECT tax_status::text FROM accounts WHERE id = @Id;", new { Id = id });
+        Assert.Equal("tax_deferred", stored);
     }
 
     private static AccountRow MakeAccount(string name, string externalId) =>
@@ -68,13 +85,4 @@ public sealed class AccountAdoptionTests
             InstitutionName:   null,
             RoutingNumber:     null,
             AccountUrl:        null);
-
-    private static async Task ResetAsync(Npgsql.NpgsqlConnection conn)
-    {
-        await conn.ExecuteAsync(@"
-            TRUNCATE security_splits, lots, holdings, txn_legs, txn_headers,
-                     security_prices, securities,
-                     account_external_ids, accounts
-                     RESTART IDENTITY CASCADE;");
-    }
 }

@@ -4,8 +4,7 @@ import type { SelectionStatusFilter } from '@/lib/types/selection';
 /**
  * Shared register row-status derivation (ADR-0030 reuse).
  *
- * These helpers were previously bank-only (they lived in
- * `bank/columns.ts`), but the status vocabulary + the future-dated
+ * Not bank-only: the status vocabulary + the future-dated
  * "scheduled" rule are register-wide concepts: the investment
  * register surfaces the same recon-status badge and the same
  * status-filter tabs. The helpers operate on `RegisterRowBase`
@@ -40,6 +39,20 @@ export const REGISTER_STATUS_VIEWS: ReadonlyArray<{ value: StatusFilter; label: 
     { value: 'needs_review', label: 'Needs review' },
     { value: 'hidden', label: 'Hidden' },
 ];
+
+/**
+ * The views a register can be opened on by its `?status=` search param, an ARRIVAL
+ * instruction: the view is the register's own state after arrival. Needs review is how
+ * the home screen's review counts land on the rows they count; Hidden is how a link to
+ * a hidden row (the consistency check's advisory, ADR-0114 D15) lands on the one view
+ * that shows it (ADR-0072 D1).
+ */
+export type RegisterArrivalStatus = Extract<StatusFilter, 'needs_review' | 'hidden'>;
+
+/** The arrival view a `?status=` value names, or undefined for any other value. */
+export function arrivalStatusOf(value: unknown): RegisterArrivalStatus | undefined {
+    return value === 'needs_review' || value === 'hidden' ? value : undefined;
+}
 
 export type RowStatus =
     | 'cleared'

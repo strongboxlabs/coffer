@@ -6,8 +6,8 @@ namespace Coffer.Api.Tests.Unit.Scheduling;
 
 /// <summary>
 /// FU-071: a daily job that does nothing — no failure, so no failure count and no
-/// auto-disable — used to report a Warning every day for as long as it lasted. A day in,
-/// it is coverage that has stopped, and its signal says so at Critical.
+/// auto-disable — would otherwise report a Warning every day for as long as it lasts. A
+/// day in, it is coverage that has stopped, and its signal says so at Critical.
 /// </summary>
 public sealed class NothingDoneEscalationTests
 {

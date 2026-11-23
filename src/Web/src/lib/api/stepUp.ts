@@ -2,7 +2,7 @@ import { startAuthentication } from '@simplewebauthn/browser';
 
 import { ApiError, request } from './_request';
 
-// Fresh passkey tap for one sensitive action (2026-10-12 security audit, M2).
+// Fresh passkey tap for one sensitive action (ADR-0105 D1).
 //
 // The session cookie only proves someone signed in at some point in the last 30
 // days. Actions that grant lasting access or replace data — adding or removing a
@@ -27,7 +27,8 @@ export type StepUpAction =
     | 'restore'
     | 'backup-passphrase'
     | 'backup-delete'
-    | 'mcp-writes';
+    | 'mcp-writes'
+    | 'upgrade';
 
 /** The header a tap travels in. */
 export const STEP_UP_HEADER = 'X-Coffer-Step-Up';

@@ -19,11 +19,12 @@ namespace Coffer.Api.Tests.Integration.Notifications;
 /// ADR rests on.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class LedgerNotificationTests
+public sealed class LedgerNotificationTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public LedgerNotificationTests(PostgresFixture fixture) => _fixture = fixture;
+    public LedgerNotificationTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private sealed class SpySubscriber : INotificationSubscriber
     {
@@ -42,25 +43,18 @@ public sealed class LedgerNotificationTests
     }
 
     private NotificationPublisher PublisherFor(params INotificationSubscriber[] subs) =>
-        new(_fixture.NewServiceFactory(),
-            _fixture.NewLedgerKeyService(),
+        new(Db.NewServiceFactory(),
+            Db.NewLedgerKeyService(),
             subs,
             NullLogger<NotificationPublisher>.Instance, TimeProvider.System);
 
-    private async Task ResetAsync()
-    {
-        await using var db = _fixture.NewDbContext();
-        await db.Database.ExecuteSqlRawAsync(
-            "TRUNCATE notification_subscribers; TRUNCATE system_events;");
-    }
-
     private byte[] SealedConfig() =>
-        _fixture.NewLedgerKeyService().SealWithMasterKey(Encoding.UTF8.GetBytes(
+        Db.NewLedgerKeyService().SealWithMasterKey(Encoding.UTF8.GetBytes(
             JsonSerializer.Serialize(new SubscriberConfig("https://example.invalid/x"))));
 
     private async Task AddSystemTargetAsync(string key)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             INSERT INTO notification_subscribers
                 (subscriber_key, display_name, min_severity, config_ciphertext)
@@ -69,7 +63,7 @@ public sealed class LedgerNotificationTests
 
     private async Task AddLedgerTargetAsync(Guid ledgerId, string key)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             INSERT INTO ledger_notification_subscribers
                 (ledger_id, subscriber_key, display_name, min_severity, config_ciphertext)
@@ -83,28 +77,23 @@ public sealed class LedgerNotificationTests
     [Fact]
     public async Task A_ledger_event_never_reaches_a_deployment_target()
     {
-        await ResetAsync();
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await AddSystemTargetAsync("sys");
 
         var sys = new SpySubscriber("sys");
         await PublisherFor(sys).PublishLedgerAsync(ledger.LedgerId, Drift());
 
-        // Inverts Inherit_delivers_a_ledger_event_to_the_deployments_targets, which
-        // pinned the behaviour migration 214 retired. That test was correct about what
-        // the code did and the code was wrong: a ledger's events went to every
-        // deployment target with no ledger filter, by default, so on a shared install
-        // one ledger's activity reached whoever watched the deployment channel. The
-        // publisher's own sibling test called that a leak while this one called it a
-        // feature.
+        // Delivering a ledger's events to every deployment target with no ledger
+        // filter would, on a shared install, send one ledger's activity to whoever
+        // watches the deployment channel. Migration 214 makes ledger events go to that
+        // ledger's own targets only.
         Assert.Empty(sys.Delivered);
     }
 
     [Fact]
     public async Task A_ledger_event_goes_to_that_ledgers_targets()
     {
-        await ResetAsync();
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await AddSystemTargetAsync("sys");
         await AddLedgerTargetAsync(ledger.LedgerId, "mine");
 
@@ -126,8 +115,7 @@ public sealed class LedgerNotificationTests
         // keeps its own targets now, so the intended way to get one channel is to point
         // several ledgers at the same URL — which is useless if the messages that arrive
         // are indistinguishable from each other.
-        await ResetAsync();
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await AddLedgerTargetAsync(ledger.LedgerId, "mine");
 
         // Carries its own Detail, so this also proves the ledger name is ADDED rather
@@ -158,14 +146,13 @@ public sealed class LedgerNotificationTests
         // too would duplicate it into every historical row and freeze a stale copy of a
         // renameable thing in the store as well as in the payload. The payload needs it
         // because a webhook body has no other way to say it; the row does not.
-        await ResetAsync();
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await AddLedgerTargetAsync(ledger.LedgerId, "mine");
 
         await PublisherFor(new SpySubscriber("mine"))
             .PublishLedgerAsync(ledger.LedgerId, Drift());
 
-        await using var read = _fixture.NewDbContext();
+        await using var read = Db.NewDbContext();
         var row = await read.LedgerEvents.AsNoTracking()
             .SingleAsync(e => e.LedgerId == ledger.LedgerId);
         Assert.DoesNotContain("\"ledger\"", row.DetailJson);
@@ -175,8 +162,7 @@ public sealed class LedgerNotificationTests
     [Fact]
     public async Task No_targets_is_silence_rather_than_a_fallback()
     {
-        await ResetAsync();
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await AddSystemTargetAsync("sys");
 
         var sys = new SpySubscriber("sys");
@@ -191,12 +177,11 @@ public sealed class LedgerNotificationTests
     [Fact]
     public async Task A_ledger_event_never_lands_in_system_events()
     {
-        await ResetAsync();
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
         await PublisherFor().PublishLedgerAsync(ledger.LedgerId, Drift());
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Contains(await db.LedgerEvents.AsNoTracking()
                 .Where(e => e.LedgerId == ledger.LedgerId).ToListAsync(),
             e => e.EventKey == "consistency.drift");
@@ -209,9 +194,8 @@ public sealed class LedgerNotificationTests
     [Fact]
     public async Task The_throttle_is_per_ledger()
     {
-        await ResetAsync();
-        var first = await SyntheticLedger.CreateAsync(_fixture);
-        var second = await SyntheticLedger.CreateAsync(_fixture);
+        var first = await SyntheticLedger.CreateAsync(Db);
+        var second = await SyntheticLedger.CreateAsync(Db);
         await AddSystemTargetAsync("sys");
         var publisher = PublisherFor(new SpySubscriber("sys"));
 

@@ -117,10 +117,9 @@ public sealed class KekRotationService : IKekRotationService
         }
 
         // Notification delivery configs (mig 207 / 208, ADR-0096 D8). Sealed under the
-        // master KEK exactly like the two above, and omitted from this loop when they
-        // were added — so rotating the key left every delivery target holding
-        // ciphertext nothing could open. The subsystem then fails in the one way it
-        // exists to prevent: alerts stop, and the only trace is a per-target last_error
+        // master KEK exactly like the two above. A rotation that skips them leaves
+        // every delivery target holding ciphertext nothing can open, and the subsystem
+        // then fails in the one way it exists to prevent: alerts stop, and the only trace is a per-target last_error
         // on a settings page nobody visits until they wonder why it went quiet.
         //
         // Both scopes, in one pass. A rotation that fixed the deployment's targets and
@@ -188,6 +187,26 @@ public sealed class KekRotationService : IKekRotationService
             }
         }
 
+        // The private-fork release token (mig 269, ADR-0110). Missed here, the next release
+        // check against a private fork would fail with a token nothing can open.
+        var upgradeToken = await db.UpgradeRepoToken
+            .FirstOrDefaultAsync(t => t.Id == (short)1, ct)
+            .ConfigureAwait(false);
+        var upgradeTokenRotated = false;
+        if (upgradeToken is { TokenCiphertext.Length: > 0 })
+        {
+            var pt = OpenOrThrow(oldKeys, upgradeToken.TokenCiphertext, oldKey.Id, "upgrade repository token");
+            try
+            {
+                if (!dryRun) upgradeToken.TokenCiphertext = newKeys.SealWithMasterKey(pt);
+                upgradeTokenRotated = true;
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(pt);
+            }
+        }
+
         if (dryRun)
         {
             await tx.RollbackAsync(ct).ConfigureAwait(false);
@@ -213,7 +232,8 @@ public sealed class KekRotationService : IKekRotationService
         }
 
         return new RotationResult(
-            rotated, passphraseRotated, driveTokenRotated, subscribersRotated, oauthKeysRotated, dryRun);
+            rotated, passphraseRotated, driveTokenRotated, subscribersRotated, oauthKeysRotated, dryRun,
+            upgradeTokenRotated);
     }
 
     private static byte[] OpenOrThrow(LedgerKeyService keys, byte[] sealedBytes, string oldId, string what)
@@ -226,7 +246,7 @@ public sealed class KekRotationService : IKekRotationService
         {
             // Surfaced verbatim in the admin UI (ADR-0092 D4), so it must not name a
             // retired env var an operator would then go looking for. The likely cause
-            // is a cross-KEK restore that skipped reconciliation, which D5 handles.
+            // is a cross-KEK restore that skipped reconciliation, which ADR-0092 D5 handles.
             throw new KekRotationException(
                 $"{what} does not open under the current KEK (id '{oldId}'). Aborting — is the "
                 + "master key file the key this data was wrapped with? This usually means a "
@@ -242,7 +262,8 @@ public sealed record RotationResult(
     bool DriveTokenRotated,
     int NotificationTargetsRotated,
     bool OauthKeysRotated,
-    bool DryRun);
+    bool DryRun,
+    bool UpgradeTokenRotated = false);
 
 /// <summary>Thrown when rotation can't proceed (a blob won't open under the
 /// supplied current KEK); the transaction is rolled back.</summary>

@@ -17,9 +17,8 @@
 --
 -- This migration:
 --   1. Re-applies 056's backfill heuristic to any leg that's still
---      NULL inside an investment header (only the 32 demo legs
---      created by post-056 seed runs that hadn't been updated to
---      stamp the role).
+--      NULL inside an investment header (legs written by a writer,
+--      such as a seed script, that does not stamp the role).
 --   2. Verifies zero NULL-investment-leg rows remain — fails loudly
 --      via RAISE EXCEPTION if any survived. The trigger can't be armed
 --      against dirty data.
@@ -33,9 +32,8 @@
 -- Part 1: Re-backfill any leg still NULL inside an investment header.
 --
 -- Same logic as 056, guarded by `posting_role IS NULL` so it's a no-op
--- for every leg already stamped correctly. Catches the demo legs
--- inserted by post-056 seed runs before the seeds learned to stamp
--- the role themselves.
+-- for every leg already stamped correctly. Catches legs from any writer
+-- that inserted investment legs without stamping the role.
 -- -----------------------------------------------------------------------------
 
 DO $$

@@ -9,49 +9,28 @@ using Coffer.Api.Errors;
 namespace Coffer.Api.Endpoints;
 
 /// <summary>
-/// Per-connection sync activity log (slice 2c.1). Two reads —
-/// list-by-connection (the FeedConnectionsPage activity panel) and
-/// detail-by-id (the expandable per-run view with errors +
-/// promotions). Writes happen on the sync path; no mutations here.
+/// One run's detail: its summary, errors and promote-on-clear events. Backs the
+/// expandable row in Settings → Activity, which lists runs of every family from
+/// <c>/ledger-operations</c> and opens one here. The id is a <c>ledger_operations</c>
+/// id, so a quote refresh's errors read the same way a sync's do. Writes happen on
+/// the run's own path; no mutations here.
 /// </summary>
+/// <remarks>
+/// There was a per-connection list here (<c>GET /sync-runs?connectionId=</c>) for the
+/// Bank feeds panel's own activity strip. The strip was removed, Activity being the
+/// one place runs are read, and the list went with it: a path the SPA does not call
+/// is not kept.
+/// </remarks>
 public static class SyncRunsEndpoints
 {
-    /// <summary>Default page size for the list endpoint when the
-    /// client omits <c>limit</c>. Sized to one screen of activity —
-    /// the SPA shows ~5 inline + "view all" for the rest.</summary>
-    public const int DefaultLimit = 50;
-
     public static IEndpointRouteBuilder MapSyncRunsEndpoints(this IEndpointRouteBuilder routes)
     {
-        var group = routes.MapGroup("/api/ledgers/{ledgerId:guid}/sync-runs")
-                          .RequireAuthorization()
-                          .RequireLedgerAccess();
-
-        group.MapGet("/", ListAsync);
-        group.MapGet("/{runId:guid}", GetDetailAsync);
+        routes.MapGroup("/api/ledgers/{ledgerId:guid}/sync-runs")
+              .RequireAuthorization()
+              .RequireLedgerAccess()
+              .MapGet("/{runId:guid}", GetDetailAsync);
 
         return routes;
-    }
-
-    private static async Task<IResult> ListAsync(
-        Guid ledgerId,
-        Guid connectionId,
-        int? limit,
-        ICurrentUserAccessor currentUser,
-        LedgersRepository ledgers,
-        LedgerOperationsRepository syncRuns,
-        CancellationToken cancellationToken)
-    {
-        var visible = await ledgers.GetVisibleByIdAsync(
-            currentUser.UserId, ledgerId, cancellationToken).ConfigureAwait(false);
-        if (visible is null)
-            return BusinessError.Problem(BusinessError.Codes.LedgerNotVisible,
-                "Ledger not found or not visible to this user.");
-
-        var rows = await syncRuns.ListByConnectionAsync(
-            ledgerId, connectionId, limit ?? DefaultLimit, cancellationToken)
-            .ConfigureAwait(false);
-        return Results.Ok(rows);
     }
 
     private static async Task<IResult> GetDetailAsync(

@@ -10,8 +10,8 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 
 /// <summary>
 /// ADR-0076: the register page, the date-rail buckets, and the status-count
-/// badges all read ONE filter definition — the <c>register_filtered_entries</c>
-/// primitive (migration 167). These tests pin that the three surfaces agree:
+/// badges all read ONE filter definition — <c>RegisterQuery.Filtered</c>.
+/// These tests pin that the three surfaces agree:
 /// the same filter selects the same set on each. That's the guarantee the old
 /// hand-synced LINQ twin (ApplyRegisterFilterPredicates) couldn't make — its
 /// drift was the #322 class of bug. Two dimensions (search, amount) are checked
@@ -19,11 +19,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// dropped the other would still be caught.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class RegisterFilterConsistencyTests
+public sealed class RegisterFilterConsistencyTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public RegisterFilterConsistencyTests(PostgresFixture fixture) => _fixture = fixture;
+    public RegisterFilterConsistencyTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Day(int d) => new(2026, 1, d, 12, 0, 0, DateTimeKind.Utc);
 
@@ -41,7 +42,7 @@ public sealed class RegisterFilterConsistencyTests
 
     private async Task<(SyntheticLedger Ledger, Guid AccountId)> SeedAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var acct = await ledger.AddBankAccountAsync("checking");
         var other = await ledger.AddBankAccountAsync("savings");
         var day = 10;
@@ -74,7 +75,7 @@ public sealed class RegisterFilterConsistencyTests
     public async Task Page_rail_and_counts_select_the_same_set_under_a_filter()
     {
         var (ledger, acct) = await SeedAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Unfiltered: all three agree on the full count.

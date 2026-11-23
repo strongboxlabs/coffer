@@ -19,7 +19,7 @@
 --
 -- Perf: the primitive is a single-SELECT LANGUAGE sql STABLE function, so the
 -- planner INLINES it into register_entry_keys' dynamic keyset query. Verified
--- on real data (EXPLAIN identical to the pre-167 inline plan, cost + node tree;
+-- by EXPLAIN (identical to the pre-167 inline plan, cost + node tree;
 -- no Function Scan barrier, LIMIT selectivity + account index scan preserved).
 -- Filtering per-leg then GROUP BY keeps the "entry appears iff ANY leg matches"
 -- semantics (entry_key derives from view-precomputed counts, constant per leg).

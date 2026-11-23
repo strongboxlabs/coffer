@@ -20,19 +20,19 @@ describe('WelcomePanel', () => {
         // hub behind filing away a secret that currently protects nothing.
         const onContinue = vi.fn();
         const user = userEvent.setup();
-        render(<WelcomePanel keyBase64={KEY} hasLedger onContinue={onContinue} />);
+        render(<WelcomePanel keyBase64={KEY} onContinue={onContinue} />);
 
         expect(screen.getByText(KEY)).toBeInTheDocument();
         expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
 
-        const go = screen.getByRole('button', { name: /go to my ledgers/i });
+        const go = screen.getByRole('button', { name: 'Get started' });
         expect(go).toBeEnabled();
         await user.click(go);
         expect(onContinue).toHaveBeenCalledOnce();
     });
 
     it('points at backups as the thing that actually protects the data', () => {
-        render(<WelcomePanel keyBase64={KEY} hasLedger onContinue={vi.fn()} />);
+        render(<WelcomePanel keyBase64={KEY} onContinue={vi.fn()} />);
 
         expect(screen.getByText(/then set up backups/i)).toBeInTheDocument();
         // The claim that makes the key's lower severity legible: a restore needs the
@@ -42,26 +42,34 @@ describe('WelcomePanel', () => {
     });
 
     it('says the key can be seen again — not a false last chance', () => {
-        render(<WelcomePanel keyBase64={KEY} hasLedger onContinue={vi.fn()} />);
+        render(<WelcomePanel keyBase64={KEY} onContinue={vi.fn()} />);
 
         expect(screen.getByText(/not a last chance/i)).toBeInTheDocument();
         expect(screen.getByText(/System → Encryption/i)).toBeInTheDocument();
     });
 
-    it('offers the import route when setup seeded no ledger', () => {
-        render(<WelcomePanel keyBase64={KEY} hasLedger={false} onContinue={vi.fn()} />);
+    // Setup creates no ledger (ADR-0115 D2), so there is one next step, with every
+    // way to a first ledger the hub offers: create, a Demo, or an import.
+    it('names creating, a Demo and an import as the next step, in one copy', () => {
+        render(<WelcomePanel keyBase64={KEY} onContinue={vi.fn()} />);
 
-        expect(screen.getByText(/add your first ledger/i)).toBeInTheDocument();
-        expect(screen.getByText(/import a Moneydance export/i)).toBeInTheDocument();
-        expect(screen.getByRole('button', { name: /get started/i })).toBeInTheDocument();
+        expect(screen.getByRole('heading', { name: 'Add your first ledger' })).toBeInTheDocument();
+        expect(screen.getByText(
+            'Create an empty ledger, add a Demo ledger to look around first, or import a '
+            + 'Moneydance export to bring your history across with accounts, splits, '
+            + 'investment lots and cost basis intact.',
+        )).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'Get started' })).toBeInTheDocument();
+        // The old seeded-Demo branch is gone.
+        expect(screen.queryByText(/have a look around/i)).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /go to my ledgers/i })).not.toBeInTheDocument();
     });
 
     it('downloads via an in-document anchor and outlives the click', async () => {
         // Both details are load-bearing and easy to "simplify" away: Firefox ignores a
         // click on an anchor that isn't in the document, and Safari cancels the download
         // if the object URL is revoked before the handler resolves. Getting either wrong
-        // yields a button that silently does nothing on those browsers — which is
-        // exactly what the first version of this component did.
+        // yields a button that silently does nothing on those browsers.
         const createObjectURL = vi.fn(() => 'blob:mock');
         const revokeObjectURL = vi.fn();
         vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL });
@@ -73,7 +81,7 @@ describe('WelcomePanel', () => {
                 anchorInDocumentAtClick = document.body.contains(this);
             });
 
-        render(<WelcomePanel keyBase64={KEY} hasLedger onContinue={vi.fn()} />);
+        render(<WelcomePanel keyBase64={KEY} onContinue={vi.fn()} />);
 
         // fireEvent, not userEvent, and that is the whole point. handleDownload is
         // synchronous, so a synchronous dispatch runs it to completion with no

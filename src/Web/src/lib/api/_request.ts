@@ -22,6 +22,9 @@
 // same-origin (Sec-Fetch-Site / Origin; SameOriginRequestMiddleware). The browser
 // sets those headers itself, so the SPA needs no CSRF token of its own.
 
+import type { RelabelMergedInto } from '../types/account';
+import type { RateUnavailable } from '../types/conversion';
+
 /** Error thrown when the API returns 4xx/5xx. */
 export class ApiError extends Error {
     /** HTTP status code from the response. */
@@ -37,12 +40,56 @@ export class ApiError extends Error {
     /** Human-readable detail from ProblemDetails. */
     readonly detail: string;
 
-    constructor(status: number, detail: string, code?: string) {
+    /**
+     * The missing rate a `rate-unavailable` refusal names, from the ProblemDetails
+     * extension member of the same name (ADR-0114 D9, D12). Undefined on every other
+     * error. The detail already names the pair and day in words.
+     */
+    readonly rateUnavailable: RateUnavailable | undefined;
+
+    /**
+     * The missing rates a `rate-unavailable` refusal names as a list: a share move between
+     * brokerages in different currencies names each missing stored leg (account currency
+     * into the reporting currency) and its day (ADR-0114 D13). Empty on every other error,
+     * and on one whose `rateUnavailable` is a single rate.
+     */
+    readonly rateUnavailableLegs: readonly RateUnavailable[];
+
+    /**
+     * The transactions a `relabel-pair-not-representable` refusal names, from its
+     * `mergedInto` member: each one that a refused pair's transaction, which no register
+     * shows, was merged into (ADR-0114 D13, decided by the owner, 2026-11-18), followed
+     * to the end of a chain of merges (settled by Claude, 2026-11-18). Empty on
+     * every other error, and on that refusal when every pair is on a row a register shows.
+     */
+    readonly mergedInto: readonly RelabelMergedInto[];
+
+    /**
+     * The Demo a refused or failed `POST /api/ledgers/demo` had already named, from the
+     * ProblemDetails extension member of the same name (ADR-0115 D9): the hub shows that
+     * build as failed under its name. Undefined on every other error, and on a Demo
+     * refusal that came before a name was chosen (another import running).
+     */
+    readonly ledgerName: string | undefined;
+
+    constructor(
+        status: number,
+        detail: string,
+        code?: string,
+        rateUnavailable?: RateUnavailable,
+        rateUnavailableLegs: readonly RateUnavailable[] = [],
+        mergedInto: readonly RelabelMergedInto[] = [],
+        ledgerName?: string,
+    ) {
         super(detail);
         this.name = 'ApiError';
         this.status = status;
         this.code = code;
         this.detail = detail;
+        this.rateUnavailable = rateUnavailable;
+        this.rateUnavailableLegs = rateUnavailableLegs;
+        this.mergedInto = mergedInto;
+        this.ledgerName = ledgerName;
     }
 }
 
@@ -59,6 +106,16 @@ interface RequestOptions {
  * supply T explicitly to keep the boundary tight.
  */
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+    // `request` stringifies the body itself. A caller that already did leaves the server a
+    // JSON *string* where it expects an object, and it answers 400 — this shipped twice
+    // (notifications, then MCP rename) because `body` is `unknown` and the compiler can't
+    // tell. No endpoint takes a bare JSON string, so refuse it where it is cheapest to see.
+    if (typeof options.body === 'string') {
+        throw new TypeError(
+            `request(${path}): body is already a string; pass the object — request() serializes it.`,
+        );
+    }
+
     const init: RequestInit = {
         method: options.method ?? 'GET',
         credentials: 'include',
@@ -136,12 +193,19 @@ async function buildApiError(response: Response): Promise<ApiError> {
     // (network proxy returned text/html etc.), fall back to a
     // status-only error.
     let code: string | undefined;
+    let rateUnavailable: RateUnavailable | undefined;
+    let rateUnavailableLegs: RateUnavailable[] = [];
+    let mergedInto: RelabelMergedInto[] = [];
+    let ledgerName: string | undefined;
     let detail = response.statusText || `HTTP ${response.status}`;
     try {
         const body = (await response.json()) as {
             detail?: string;
             title?: string;
             code?: string;
+            rateUnavailable?: unknown;
+            mergedInto?: unknown;
+            ledgerName?: unknown;
         };
         if (typeof body.detail === 'string' && body.detail.length > 0) {
             detail = body.detail;
@@ -151,8 +215,39 @@ async function buildApiError(response: Response): Promise<ApiError> {
         if (typeof body.code === 'string') {
             code = body.code;
         }
+        if (isRateUnavailable(body.rateUnavailable)) {
+            rateUnavailable = body.rateUnavailable;
+        } else if (Array.isArray(body.rateUnavailable)) {
+            rateUnavailableLegs = body.rateUnavailable.filter(isRateUnavailable);
+        }
+        if (Array.isArray(body.mergedInto)) {
+            mergedInto = body.mergedInto.filter(isRelabelMergedInto);
+        }
+        if (typeof body.ledgerName === 'string' && body.ledgerName.length > 0) {
+            ledgerName = body.ledgerName;
+        }
     } catch {
         // Body wasn't JSON; keep the status-text fallback.
     }
-    return new ApiError(response.status, detail, code);
+    return new ApiError(response.status, detail, code, rateUnavailable, rateUnavailableLegs, mergedInto, ledgerName);
+}
+
+function isRelabelMergedInto(value: unknown): value is RelabelMergedInto {
+    if (typeof value !== 'object' || value === null) return false;
+    const v = value as Record<string, unknown>;
+    return typeof v.headerId === 'string'
+        && typeof v.accountId === 'string'
+        && typeof v.account === 'string'
+        && typeof v.date === 'string'
+        && (v.payee === null || typeof v.payee === 'string')
+        && typeof v.hidden === 'boolean';
+}
+
+function isRateUnavailable(value: unknown): value is RateUnavailable {
+    if (typeof value !== 'object' || value === null) return false;
+    const v = value as Record<string, unknown>;
+    return typeof v.fromCurrency === 'string'
+        && typeof v.toCurrency === 'string'
+        && typeof v.date === 'string'
+        && v.reason === 'rate_unavailable';
 }

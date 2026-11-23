@@ -21,9 +21,9 @@ namespace Coffer.Api.Backup;
 /// refused, because a click that quietly queues behind a long job reads as a hang.
 /// </para>
 /// <para>
-/// <b>Off the request.</b> A manual backup used to run inside its HTTP request, so it died
-/// with it: the request is cancelled at a proxy's timeout (Cloudflare's is 100 seconds), and
-/// a backup of a growing ledger crosses that. It is now accepted (202), runs on the host's
+/// <b>Off the request.</b> A manual backup run inside its HTTP request dies with it: the
+/// request is cancelled at a proxy's timeout (Cloudflare's is 100 seconds), and a backup of
+/// a growing ledger crosses that. So it is accepted (202), runs on the host's
 /// own lifetime, and the browser polls <see cref="Get"/> for the outcome, the way a restore
 /// reports through a recorded outcome rather than through the connection that asked.
 /// </para>

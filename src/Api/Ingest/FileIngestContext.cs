@@ -57,4 +57,17 @@ public sealed record FileIngestContext(
     /// <see cref="IngestedTransaction.ProviderAccountId"/> matches.
     /// NULL for single-account file formats — every parsed
     /// transaction lands in <see cref="AccountId"/>.</summary>
-    string? ProviderAccountId = null);
+    string? ProviderAccountId = null,
+    /// <summary>The currency code of <see cref="AccountId"/>, which the orchestrator
+    /// fills from the account it loads, so a provider stays pure. NULL in a preview that
+    /// names no account. The QIF provider reads it for the three-place half of its comma
+    /// rule (ADR-0114 D15); no provider rounds by it, because the one rounding of an
+    /// ingested amount is the orchestrator's, at the write.</summary>
+    string? CurrencyCode = null,
+    /// <summary>How the import started, which the orchestrator writes to the run's
+    /// <c>ledger_operations.triggered_via</c>. Every upload leaves it at
+    /// <c>file-upload</c>. The Demo's card statement import (ADR-0115 D3) passes
+    /// <c>manual</c>: nothing was uploaded, and the hub action that started it is the
+    /// trigger, as for the Demo's own Moneydance import. A value outside the column's
+    /// CHECK is refused by the database at the write.</summary>
+    string TriggeredVia = "file-upload");

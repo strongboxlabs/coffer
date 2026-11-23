@@ -1,6 +1,8 @@
 # 0095 — The master key leaves the setup ceremony for a welcome screen
 
-* Status: Accepted
+* Status: Accepted (amended 2026-11-18 by
+  [ADR-0115](0115-the-demo-is-generated-imported-and-seeded-from-the-hub.md): the
+  welcome's next step is the hub's create, Demo or import)
 * Date: 2026-08-12
 * Amends: [ADR-0092](0092-kek-lifecycle-in-the-ui.md) D2 (which put the key in the
   setup ceremony behind its own acknowledgement)
@@ -26,8 +28,8 @@ passphrase; the archive is encrypted under the passphrase, not the KEK. Losing t
 costs three reconnections and no data — not the ledgers, not the passkeys, not the
 backups. Gating progress on it put it visually and procedurally on a par with the
 recovery codes, which are genuinely unrecoverable, and that mis-teaches severity at the
-one moment the operator has no way to calibrate. (This ADR's immediate cause: the docs
-had drifted into claiming the key was required for disaster recovery. It never was.)
+one moment the operator has no way to calibrate. (The key is not required for disaster
+recovery, and no doc may claim it is.)
 
 ## Decision
 
@@ -38,6 +40,10 @@ cannot be recovered.
 copy/download and the reason it exists; the advice to set up backups, which is what
 actually protects the data and is where the key's purpose becomes concrete; and the next
 step for the ledger itself — look around the Demo ledger, or create/import a first one.
+
+*Amended 2026-11-18 by [ADR-0115](0115-the-demo-is-generated-imported-and-seeded-from-the-hub.md):*
+setup creates no ledger, so the next step is the same for everyone: from the hub, create
+an empty ledger, add a Demo ledger to look around first, or import a Moneydance export.
 
 **No acknowledgement on the welcome screen.** It is advice at the moment it is true, not
 a ceremony. The key remains viewable under System → Encryption behind a fresh passkey

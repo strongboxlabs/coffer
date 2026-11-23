@@ -75,8 +75,8 @@ public sealed class McpWriteGuardTests
     // ---------- Completeness: no write tool bypasses the guard ----------
 
     // Every tool the server exposes as a write, by its attribute — the set McpAuditFilter and
-    // the ledger filter act on. Selecting by return type, as this once did, skipped the two
-    // bulk recategorize tools, whose results are their own types.
+    // the ledger filter act on. Selecting by return type would skip the two bulk
+    // recategorize tools, whose results are their own types.
     private static List<MethodInfo> WriteTools() =>
         typeof(McpWriteTools)
             .GetMethods(BindingFlags.Public | BindingFlags.Static)

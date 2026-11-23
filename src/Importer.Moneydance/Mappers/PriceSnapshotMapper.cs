@@ -22,13 +22,22 @@ public static class PriceSnapshotMapper
 
     public sealed record MapResult(SecurityPriceRow? Row, SkipReason? Skip);
 
+    /// <param name="currencyCode">The currency the snapshot's rate is relative to, which
+    /// the inverted price is in: the file's base currency. Moneydance quotes a snapshot
+    /// against its security's relative currency when the security has one, and against
+    /// the base currency otherwise; the export field that would name a relative
+    /// currency is not known, so the base currency is the one this importer can
+    /// prove (see <c>PriceSnapshotImportStep</c>).</param>
     public static MapResult Map(
         MdCsnap csnap,
         IReadOnlyDictionary<string, SecurityRef> securityByMdId,
+        string currencyCode,
         Guid ledgerId = default)
     {
         ArgumentNullException.ThrowIfNull(csnap);
         ArgumentNullException.ThrowIfNull(securityByMdId);
+        if (!MdCurrencies.IsCurrencyCode(currencyCode))
+            throw new ArgumentException($"'{currencyCode}' is not a currency code in stored form.", nameof(currencyCode));
 
         if (!securityByMdId.TryGetValue(csnap.CurrId, out var securityRef))
             return new MapResult(null, SkipReason.UnknownSecurity);
@@ -39,16 +48,14 @@ public static class PriceSnapshotMapper
         var date = ResolvePriceDate(csnap);
         if (date is null) return new MapResult(null, SkipReason.UnparseableDate);
 
-        // Moneydance stores currency rates as base_currency_per_unit, so for a
-        // security `rate` is 1/share_price. Invert to get the actual price.
+        // A security's `rate` is 1/share_price: shares per one unit of the currency
+        // the rate is relative to. Invert to get the price, in that currency.
         // High and low swap meaning under the inversion: a higher `rate` means
         // a lower price, so urt.hi → price.low and urt.lo → price.high.
         var price = 1m / csnap.Rate.Value;
 
-        // Sanity gate: real exports occasionally contain corrupted snapshots
-        // (likely a Moneydance internal glitch around delisted or rebased
-        // securities) where the inverted price clears any plausible
-        // tradeable-security range. Skip rather than persist garbage prices
+        // Sanity gate: an MD snapshot can be corrupt, with a rate whose
+        // inverted price clears any plausible tradeable-security range. Skip rather than persist garbage prices
         // that would distort portfolio totals.
         if (price > 1_000_000m)
             return new MapResult(null, SkipReason.MissingPrice);
@@ -60,8 +67,8 @@ public static class PriceSnapshotMapper
         decimal? roundedHigh = priceHigh is { } ph ? decimal.Round(ph, 4) : null;
         decimal? roundedLow  = priceLow  is { } pl ? decimal.Round(pl, 4) : null;
 
-        // Some real-export csnaps have hi/lo inverted or otherwise inconsistent
-        // (Moneydance bug or manual edits gone wrong). The schema CHECK
+        // A csnap's hi/lo can be inverted or otherwise inconsistent — nothing
+        // in the export format guarantees hi >= lo. The schema CHECK
         // requires high >= low; rather than reject the snapshot, drop both
         // and keep only the close. The close is the load-bearing value for
         // every downstream report.
@@ -76,7 +83,7 @@ public static class PriceSnapshotMapper
             LedgerId:     ledgerId,
             SecurityId:   securityRef.Id,
             Price:        decimal.Round(price, 4),
-            CurrencyCode: "USD",                            // multi-currency is a future concern
+            CurrencyCode: currencyCode,
             PriceDate:    date.Value,
             High:         roundedHigh,
             Low:          roundedLow,

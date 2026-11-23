@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Modal';
 import { AccountCategoryPicker } from '@/components/register/AccountCategoryPicker';
+import { TwoAmountDone } from '@/components/TwoAmountDone';
 import type { AccountSummary } from '@/lib/types/account';
 
 // Move dialog (ADR-0072 D3). Picks the destination for a register
@@ -15,13 +16,12 @@ import type { AccountSummary } from '@/lib/types/account';
 // It offers only targets on the register's own side of the CATEGORY
 // boundary — categories on a category's register, money accounts (banking
 // and investment alike) everywhere else. The move re-points the leg sitting
-// on the register's own account, and crossing that boundary turned a
-// category leg into a money-account leg and left the transaction with no
+// on the register's own account, and crossing that boundary would turn a
+// category leg into a money-account leg and leave the transaction with no
 // category at all.
 //
-// It used to split banking from investment too, mirroring the bulk path —
-// which the single-row path never did, so the two disagreed and this picker
-// held a THIRD copy of the rule. Banking ↔ investment is allowed now (a
+// It does NOT split banking from investment: a split here would be a THIRD
+// copy of a rule the single-row path does not have. Banking ↔ investment is allowed (a
 // mis-filed deposit, or a contribution filed against the wrong side), and
 // whether a particular row may cross is a per-row question only the server
 // can answer: a split may not, and an investment event may not unless it is
@@ -53,6 +53,11 @@ export interface MoveToAccountDialogProps {
     pending: boolean;
     /** Server rejection message (guard code) to surface inline, or null. */
     error: string | null;
+    /** How many transfers the landed move left keeping two amounts (ADR-0114 D13). Above
+     *  0, the dialog shows that line and Done in place of the picker. REQUIRED, like
+     *  sourceAccountType: a page that forgot it would show the picker again after the
+     *  move, over a selection already cleared. */
+    becameTwoAmount: number;
     onConfirm: (targetAccountId: string) => void;
     onCancel: () => void;
 }
@@ -74,11 +79,18 @@ export function MoveToAccountDialog({
     count,
     pending,
     error,
+    becameTwoAmount,
     onConfirm,
     onCancel,
 }: MoveToAccountDialogProps) {
     const sourceIsCategory = isCategory(sourceAccountType);
     const [targetId, setTargetId] = useState<string | null>(null);
+    // The count the title read when Move was pressed. A landed move clears the
+    // selection, so `count` falls to 0 while the dialog stays open on the two-amount
+    // line; the title keeps what it said.
+    const [movedCount, setMovedCount] = useState(count);
+    const done = becameTwoAmount > 0;
+    const shownCount = done ? movedCount : count;
 
     // Reset the picked target each time the dialog opens.
     useEffect(() => {
@@ -92,46 +104,55 @@ export function MoveToAccountDialog({
                     id="move-dialog-title"
                     className="text-base font-semibold text-text"
                 >
-                    Move {count} transaction{count === 1 ? '' : 's'} to…
+                    Move {shownCount} transaction{shownCount === 1 ? '' : 's'} to…
                 </h2>
-                {/* Active, non-system, not the source, same side of the
-                    category boundary. The picker's other tab auto-hides,
-                    because nothing in it is eligible. */}
-                <AccountCategoryPicker
-                    accounts={accounts}
-                    isEligible={(a) =>
-                        a.isActive &&
-                        !a.isSystem &&
-                        isCategory(a.accountType) === sourceIsCategory &&
-                        a.id !== sourceAccountId
-                    }
-                    valueId={targetId}
-                    onChangeId={setTargetId}
-                    label={sourceIsCategory ? 'Target category' : 'Target account'}
-                    placeholder={sourceIsCategory ? 'Category…' : 'Account…'}
-                    disabled={pending}
-                    ariaLabel={sourceIsCategory
-                        ? 'Target category for move'
-                        : 'Target account for move'}
-                />
-                {error ? (
-                    <p className="text-sm text-danger" role="alert">
-                        {error}
-                    </p>
-                ) : null}
-                <div className="flex justify-end gap-2">
-                    <Button variant="ghost" onClick={onCancel} disabled={pending}>
-                        Cancel
-                    </Button>
-                    <Button
-                        onClick={() => {
-                            if (targetId !== null) onConfirm(targetId);
-                        }}
-                        disabled={pending || targetId === null}
-                    >
-                        Move
-                    </Button>
-                </div>
+                {done ? (
+                    <TwoAmountDone count={becameTwoAmount} onDone={onCancel} />
+                ) : (
+                    <>
+                        {/* Active, non-system, not the source, same side of the
+                            category boundary. The picker's other tab auto-hides,
+                            because nothing in it is eligible. */}
+                        <AccountCategoryPicker
+                            accounts={accounts}
+                            isEligible={(a) =>
+                                a.isActive &&
+                                !a.isSystem &&
+                                isCategory(a.accountType) === sourceIsCategory &&
+                                a.id !== sourceAccountId
+                            }
+                            valueId={targetId}
+                            onChangeId={setTargetId}
+                            label={sourceIsCategory ? 'Target category' : 'Target account'}
+                            placeholder={sourceIsCategory ? 'Category…' : 'Account…'}
+                            pending={pending}
+                            ariaLabel={sourceIsCategory
+                                ? 'Target category for move'
+                                : 'Target account for move'}
+                        />
+                        {error ? (
+                            <p className="text-sm text-danger" role="alert">
+                                {error}
+                            </p>
+                        ) : null}
+                        <div className="flex justify-end gap-2">
+                            <Button variant="ghost" onClick={onCancel} pending={pending}>
+                                Cancel
+                            </Button>
+                            <Button
+                                onClick={() => {
+                                    if (targetId === null) return;
+                                    setMovedCount(count);
+                                    onConfirm(targetId);
+                                }}
+                                disabled={targetId === null}
+                                pending={pending}
+                            >
+                                Move
+                            </Button>
+                        </div>
+                    </>
+                )}
             </div>
         </Modal>
     );

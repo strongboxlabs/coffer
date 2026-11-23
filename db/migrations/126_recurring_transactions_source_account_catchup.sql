@@ -2,12 +2,10 @@
 -- 126 — recurring_transactions.source_account_id catch-up (ADR-0047 / ADR-0049)
 -- =============================================================================
 --
--- mig 125 (as merged in #202) adds recurring_transactions.source_account_id -
--- the display/query pointer that drives the reminders agenda amount. During
--- #202's draft phase, however, a dev database applied an EARLIER version of
--- 125 that did NOT yet have that column. DbUp journals scripts by FILENAME
--- (__schema_migrations), so it will not re-run 125 on that database, leaving it
--- without the column the API now queries.
+-- mig 125 adds recurring_transactions.source_account_id - the display/query
+-- pointer that drives the reminders agenda amount. A database that applied
+-- an earlier revision of 125 without that column lacks it, and DbUp journals scripts by FILENAME (__schema_migrations), so it
+-- will not re-run 125 there, leaving it without the column the API queries.
 --
 -- This forward migration reconciles such a database through DbUp (the only
 -- sanctioned path - never an out-of-band ALTER). It is fully IDEMPOTENT: on any

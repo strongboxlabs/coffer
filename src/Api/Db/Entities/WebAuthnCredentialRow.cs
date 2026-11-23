@@ -8,10 +8,7 @@ namespace Coffer.Api.Db.Entities;
 /// </summary>
 /// <remarks>
 /// Class with init-only setters rather than a positional record because
-/// the original Dapper-based code path needed property-setter
-/// materialisation (constructor lookup struggled with nullable
-/// annotations). EF Core also prefers properties; the shape stays the
-/// same after the EF migration in PR 3.6.5.
+/// EF Core materialises it through properties.
 /// </remarks>
 public sealed class WebAuthnCredentialRow
 {

@@ -1,12 +1,15 @@
-import { useMemo, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useId, useMemo, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import { deleteCsvMapping, fetchCsvMappings, updateCsvMapping } from '@/lib/api';
 import type { CsvMapping } from '@/lib/types';
 import { errorMessage } from '@/lib/errorMessage';
+import { useLedgerRole } from '@/lib/useLedgerRole';
 import { Button } from '@/components/ui/Button';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { Panel, PanelBody, PanelHead } from '@/components/ui/Panel';
+import { useRowRemovalFocus } from '@/components/ui/rowRemovalFocus';
 import { LayoutNameDialog } from '@/components/imports/LayoutNameDialog';
 
 /**
@@ -30,6 +33,9 @@ import { LayoutNameDialog } from '@/components/imports/LayoutNameDialog';
  */
 export function ImportLayoutsPanel({ ledgerId }: { ledgerId: string }) {
     const queryClient = useQueryClient();
+    // A viewer reads the layouts and their documents, and renames or deletes none
+    // (the API refuses a viewer both).
+    const { canEdit } = useLedgerRole(ledgerId);
     const query = useQuery({
         queryKey: ['csv-mappings', ledgerId],
         queryFn: () => fetchCsvMappings(ledgerId),
@@ -38,6 +44,12 @@ export function ImportLayoutsPanel({ ledgerId }: { ledgerId: string }) {
 
     const [renaming, setRenaming] = useState<CsvMapping | null>(null);
     const [deleting, setDeleting] = useState<CsvMapping | null>(null);
+    // A deleted layout takes its row's Delete with it: focus goes to the next
+    // row's Delete, else the previous row's, else the panel, since the list has
+    // no add control (ADR-0023 §L).
+    const panelRef = useRef<HTMLDivElement | null>(null);
+    const headingId = useId();
+    const deleteControl = useRowRemovalFocus(layouts.map((l) => l.id), panelRef);
 
     const refresh = () =>
         void queryClient.invalidateQueries({ queryKey: ['csv-mappings', ledgerId] });
@@ -57,9 +69,15 @@ export function ImportLayoutsPanel({ ledgerId }: { ledgerId: string }) {
     });
 
     return (
-        <Panel>
+        <Panel
+            ref={panelRef}
+            role="group"
+            aria-labelledby={headingId}
+            tabIndex={-1}
+            className="focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        >
             <PanelHead>
-                <span className="font-medium">Import layouts</span>
+                <span id={headingId} className="font-medium">Import layouts</span>
             </PanelHead>
             <PanelBody>
                 <p className="mb-3 text-xs text-text-muted">
@@ -77,8 +95,9 @@ export function ImportLayoutsPanel({ ledgerId }: { ledgerId: string }) {
                     </p>
                 ) : layouts.length === 0 ? (
                     <p className="text-sm text-text-muted">
-                        None saved yet. Import a CSV and choose “Save as…” to keep the
-                        layout you describe.
+                        {canEdit
+                            ? 'None saved yet. Import a CSV and choose “Save as…” to keep the layout you describe.'
+                            : 'None saved yet.'}
                     </p>
                 ) : (
                     <ul className="divide-y divide-border">
@@ -96,25 +115,28 @@ export function ImportLayoutsPanel({ ledgerId }: { ledgerId: string }) {
                                     {/* Plain buttons, not a right-click menu. This list is
                                         short and the actions are the whole point of the
                                         panel; an affordance nobody knows to look for is one
-                                        this feature has already been bitten by. */}
-                                    <span className="flex shrink-0 gap-1">
-                                        <Button
-                                            type="button"
-                                            variant="ghost"
-                                            size="sm"
-                                            onClick={() => setRenaming(layout)}
-                                        >
-                                            Rename
-                                        </Button>
-                                        <Button
-                                            type="button"
-                                            variant="ghost"
-                                            size="sm"
-                                            onClick={() => setDeleting(layout)}
-                                        >
-                                            Delete
-                                        </Button>
-                                    </span>
+                                        nobody uses. */}
+                                    {canEdit ? (
+                                        <span className="flex shrink-0 gap-1">
+                                            <Button
+                                                type="button"
+                                                variant="ghost"
+                                                size="sm"
+                                                onClick={() => setRenaming(layout)}
+                                            >
+                                                Rename
+                                            </Button>
+                                            <Button
+                                                ref={deleteControl(layout.id)}
+                                                type="button"
+                                                variant="ghost"
+                                                size="sm"
+                                                onClick={() => setDeleting(layout)}
+                                            >
+                                                Delete
+                                            </Button>
+                                        </span>
+                                    ) : null}
                                 </div>
                                 <details className="mt-1">
                                     <summary className="cursor-pointer text-[0.6875rem] text-text-subtle">

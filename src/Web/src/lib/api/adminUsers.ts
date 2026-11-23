@@ -12,7 +12,7 @@ export function fetchAdminUsers(): Promise<AdminUser[]> {
 /**
  * PUT /api/admin/users/{userId}/disabled — disable / re-enable a user. Disabling
  * also signs them out everywhere and revokes their app connections; re-enabling
- * restores none of that (security audit, H2).
+ * restores none of that (ADR-0105 D3).
  */
 export function setUserDisabled(userId: string, disabled: boolean): Promise<void> {
     return request<void>(`/api/admin/users/${encodeURIComponent(userId)}/disabled`, {
@@ -23,7 +23,7 @@ export function setUserDisabled(userId: string, disabled: boolean): Promise<void
 
 /**
  * PUT /api/admin/users/{userId}/admin — grant / revoke the instance admin flag.
- * Granting needs a passkey tap (security audit, M2); revoking doesn't.
+ * Granting needs a passkey tap (ADR-0105 D1); revoking doesn't.
  */
 export function setUserAdmin(userId: string, isAdmin: boolean): Promise<void> {
     return withStepUpIfRequired('grant-admin', (headers) =>

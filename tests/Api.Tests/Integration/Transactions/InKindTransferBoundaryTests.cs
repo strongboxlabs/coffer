@@ -16,10 +16,10 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// A transfer reconstructs the carried basis as <c>round(quantity × unit_cost, 2)</c>,
 /// so it runs migration 180's arithmetic twice — once deriving <c>unit_cost</c> from
 /// the source basis, once rebuilding a total from it. A fractional quantity makes both
-/// steps lossy, which is the drift found on a real ledger's in-kind move.
+/// steps lossy, which is the in-kind drift migration 180's wider scale prevents.
 /// <para>
 /// <c>Transfer_carries_basis_penny_perfect_for_a_large_high_precision_lot</c> pins
-/// that regression with its own hand-picked lot; this runs the property across the
+/// that with its own hand-picked lot; this runs the property across the
 /// shared magnitude matrix, so a case added to <see cref="Boundary"/> extends it too.
 /// </para>
 /// <para>
@@ -32,11 +32,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class InKindTransferBoundaryTests
+public sealed class InKindTransferBoundaryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public InKindTransferBoundaryTests(PostgresFixture fixture) => _fixture = fixture;
+    public InKindTransferBoundaryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -52,14 +53,14 @@ public sealed class InKindTransferBoundaryTests
     [MemberData(nameof(Boundary.Positions), MemberType = typeof(Boundary))]
     public async Task Transfer_carries_quantity_and_basis_at_any_magnitude(Boundary.Position p)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddInvestmentAccountAsync("Source");
         var dest = await ledger.AddInvestmentAccountAsync("Dest");
         var sourceHoldings = source.HoldingsAccountId!.Value;
         var destHoldings = dest.HoldingsAccountId!.Value;
         var security = await ledger.AddSecurityAsync("Bond Fund", "BFND");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<HttpResponseMessage> PostAsync(CreateInvestmentTransactionRequest req) =>
@@ -78,7 +79,7 @@ public sealed class InKindTransferBoundaryTests
         Assert.Equal(HttpStatusCode.Created, buy.StatusCode);
 
         // Ground truth to carry: the source basis as the write path recorded it.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var src = await db.Holdings.AsNoTracking()
                 .SingleAsync(h => h.AccountId == sourceHoldings && h.SecurityId == security);
@@ -100,7 +101,7 @@ public sealed class InKindTransferBoundaryTests
         Assert.True(transfer.StatusCode == HttpStatusCode.Created,
             $"{p.Name}: transfer returned {(int)transfer.StatusCode} — {body}");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var dst = await db.Holdings.AsNoTracking()
                 .SingleAsync(h => h.AccountId == destHoldings && h.SecurityId == security);

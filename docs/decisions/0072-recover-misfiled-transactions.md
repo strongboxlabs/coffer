@@ -1,13 +1,22 @@
 # 0072 — Recover mis-filed transactions: hidden view, bulk unhide, move-to-account
 
-Status: Accepted
+Status: Accepted; D3 amended 2026-11-14 by [ADR-0114](0114-benchmarks-and-currency-conversion.md) (a move relabels and keeps
+every stored figure; a two-amount pair that would end up in one currency with magnitudes
+that differ is refused, and a mirrored pair that lands across currencies becomes a
+two-amount pair with equal magnitudes and opposite signs; extended 2026-11-16, D15: a
+move is refused when moved figures carry more places than the target's currency allows);
+D3 amended 2026-11-18: the single-row move route is removed, and a move of one row is a
+bulk move of an explicit selection of one (settled by Claude, 2026-11-18); D2 amended
+2026-11-18: the single-row unhide route is removed, and a restore of one row is a bulk
+unhide of an explicit selection of one, which restores and counts only hidden rows
+(settled by Claude, 2026-11-18)
 Date: 2026-07-08
 Relates: [ADR-0003](0003-immutable-feed-and-overrides.md), [ADR-0022](0022-txn-headers-and-legs.md), [ADR-0024](0024-register-bulk-selection.md), [ADR-0034](0034-header-walk-running-balance.md), [ADR-0068](0068-mcp-write-surface.md)
 
 ## Context
 
-An OFX/QIF file was imported into the wrong account. The register "delete" of the
-resulting rows is a **soft-hide** (`txn_headers.is_hidden = true`) for feed rows
+An OFX/QIF file imported into the wrong account leaves no supported way back. The
+register "delete" of the resulting rows is a **soft-hide** (`txn_headers.is_hidden = true`) for feed rows
 (ADR-0003), and the OFX dedup is **ledger-wide** by `(ledger, provider_key,
 external_id)` and *counts soft-hidden rows* — so re-importing the same file into
 the correct account is blocked as "already known." The transactions aren't lost
@@ -36,19 +45,32 @@ Rows render with the muted/greyed treatment (mirroring inactive accounts).
 
 ### D2 — Unhide (un-delete)
 
-Single-row `POST /api/ledgers/{ledgerId}/transactions/{headerId}/unhide` + bulk
-`POST /api/ledgers/{ledgerId}/transactions/bulk-unhide` (a `SelectionRequest`).
+`POST /api/ledgers/{ledgerId}/transactions/bulk-unhide` (a `SelectionRequest`)
+restores one row or many; a restore of one row is an explicit selection of one.
 Mirrors the delete path's soft-hide, inverted: set `is_hidden = false` (only on
 rows currently hidden), then the ADR-0034 balance + holdings recompute for the
 affected accounts (same explicit call-site as bulk-delete). Hard-deleted manual
 rows are gone and out of scope — unhide only resurrects soft-hidden rows.
 
+> **Amended 2026-11-18 (settled by Claude, 2026-11-18).** The single-row
+> `POST /api/ledgers/{ledgerId}/transactions/{headerId}/unhide` is removed: no screen
+> called it, and a path the app never calls is dead code. The bulk unhide restores and
+> counts only the selected rows that are hidden, so a visible row in the selection is
+> left as it is and not counted, and it ignores an unknown or merged-away id
+> (ADR-0114 D15).
+
 ### D3 — Move to a different account
 
-Single-row `POST /api/ledgers/{ledgerId}/transactions/{headerId}/move-account`
-+ bulk `POST /api/ledgers/{ledgerId}/transactions/bulk-move-account`, body
-carries the **target account** (and, for bulk, the `SelectionRequest` whose
-`AccountId` is the source scope).
+`POST /api/ledgers/{ledgerId}/transactions/bulk-move-account`, body carries the
+**target account** and the `SelectionRequest` whose `AccountId` is the source scope.
+A move of one row is an explicit selection of one.
+
+> **Amended 2026-11-18 (settled by Claude, 2026-11-18).** The single-row
+> `POST /api/ledgers/{ledgerId}/transactions/{headerId}/move-account` is removed: no
+> screen called it, and a path the app never calls is dead code. Every guard below was
+> already the bulk move's, and its tests now run through the bulk move. The removal
+> also took away a way to write to a row merged into another, which the single route
+> accepted and the bulk move never did (ADR-0114 D15).
 
 Mechanism: repoint the **source-side leg(s)** — the leg(s) on the *current*
 account (`account_type != 'category'`) — to the target, a **direct
@@ -59,25 +81,22 @@ the whole transaction relocates. `external_id`/`provider_key` stay on the header
 (the ledger-wide FITID dedup is unchanged — the move fixes placement without a
 re-import).
 
-> **Amended 2026-10-09 (v0.114.0 and the release after it) — the guards were
-> rewritten.** The list below replaces the original, four of whose bullets had
-> stopped being true. Two causes. First, the original treated "target is a
-> category" and "header is investment-shape" as whole-row refusals, when the
-> hazard each guarded was narrower: crossing between a category and an
-> account, and moving a leg holdings derive from. Both over-refused — a
-> category register could not recategorise, and a dividend's category could
-> not be corrected at all. Second, the rule existed **three times** — the bulk
-> endpoint, the single-row endpoint and the SPA's picker — and the copies
-> drifted: bulk refused banking ↔ investment while the single row allowed it.
-> An attempt to reconcile them by hand copied the bulk rule onto the single
-> row and silently revoked the "a cash row may move to a brokerage" decision
-> below; only the tests encoding it caught that. The rule now has ONE
-> implementation, `BulkTransactionsRepository.CheckHeadersAsync`, which both
-> endpoints call over a header query (one header, or the whole selection); the
-> SPA's picker mirrors only its account-level half.
+> **Amended 2026-10-09 (v0.114.0 and the release after it) — the guards below
+> replace the original list.** Two defects in it. First, "target is a category"
+> and "header is investment-shape" were whole-row refusals, when the hazard each
+> guards is narrower: crossing between a category and an account, and moving a
+> leg holdings derive from. As whole-row refusals they over-refuse — a category
+> register cannot recategorise, and a dividend's category cannot be corrected at
+> all. Second, a rule implemented **three times** — the bulk endpoint, the
+> single-row endpoint and the SPA's picker — drifts: bulk refused banking ↔
+> investment while the single row allowed it. Reconciling copies by hand risks
+> carrying one copy's rule onto another and silently revoking the "a cash row
+> may move to a brokerage" decision below, which tests encode. The rule now has ONE
+> implementation, `BulkTransactionsRepository.CheckHeadersAsync`, which the move
+> calls over the selection's header query; the SPA's picker mirrors only its
+> account-level half. (Since 2026-11-18 the bulk endpoint is the only move route.)
 
-**Guards** — the same for the single-row and the bulk endpoint, enforced in the
-data layer so they hold whatever the caller:
+**Guards** — enforced in the data layer so they hold whatever the caller:
 
 - **A category and an account are not interchangeable**
   (`transaction-move-domain-crossed`). The move is `UPDATE txn_legs SET
@@ -85,11 +104,17 @@ data layer so they hold whatever the caller:
   re-points a category leg onto a money account (or the reverse) and leaves the
   transaction with no category at all. Category → category is allowed — that is
   a recategorise, and it is the operation a category's register should offer.
+  *(Amended 2026-10-27, [ADR-0108](0108-memo-and-tags-per-side.md) D3, D6: the move is not only that `UPDATE`.
+  A transaction the source owned, which after the move has no leg on it, hands
+  its ownership to the target (`AnnotationWriter.FollowRepointAsync`). No memo
+  or tag is rewritten: they sit on legs, and the legs keep their ids, so each
+  stays with its line. The stored memo-and-tags presentation of every moved
+  header is recomputed in the same transaction.)*
 - **Banking and investment accounts ARE interchangeable**, in both directions,
   for a single cash row: a brokerage deposit filed against checking, or a
   contribution filed against the brokerage that belongs in checking. Banking is
   deliberately wide — bank, credit card, asset, liability, loan and cash — since
-  bank → card is a correction people really make.
+  bank → card is an ordinary correction.
 - **A split cannot cross between banking and investment, either way**
   (`transaction-move-split-to-investment`, `transaction-move-split-from-investment`).
   Only a single banking leg moves; a brokerage holds security and lot postings
@@ -115,8 +140,19 @@ data layer so they hold whatever the caller:
   transfer does not qualify: moved to a bank it would still touch one. Nothing
   derived is stranded — holdings, lots and realized gains are all keyed off
   security legs, which a cash-only transfer has none of.
-- **The target must be active** (`account-inactive`). Only the picker used to
-  enforce it, so MCP could move rows onto an account the user had retired. The
+- **A pair that cannot be represented is refused** *(amended 2026-11-14,
+  [ADR-0114](0114-benchmarks-and-currency-conversion.md) D13)*. The move relabels: every stored figure is kept. A
+  two-amount pair whose two sides would end up in one currency with magnitudes that
+  differ cannot be represented, so the move is refused. A mirrored pair that lands across
+  currencies becomes a two-amount pair with equal magnitudes and opposite signs, and the
+  move's result reports how many did. When it is above 0 the Move dialog shows it and
+  stays open on that line until it is closed by Done, Escape or the dialog's close
+  (ADR-0114 D13, decided by the owner, 2026-11-18). *(Extended 2026-11-16, ADR-0114
+  D15.)* A move into an account in another currency is also refused when the moved
+  figures carry more places than that currency allows, and the refusal names how many
+  do not fit (settled by Claude, 2026-11-16).
+- **The target must be active** (`account-inactive`). Enforced only in the
+  picker, it would let MCP move rows onto an account the user retired. The
   source is deliberately not checked: moving rows OFF a deactivated account is
   how one is cleaned up.
 - The `UNIQUE(header_id, posting_index, account_id)` invariant (ADR-0022) means
@@ -138,7 +174,7 @@ account-picker dialog). Re-filing a mis-put transaction is therefore one step
 targets on the register's own side of the category boundary — categories on a
 category's register ("Move to category…"), money accounts everywhere else.
 
-Move does **not** share Delete's read-only gate, and originally did. Delete is
+Move does **not** share Delete's read-only gate. Delete is
 right to refuse a row whose canonical owner is elsewhere — removing a split's
 counter-side here would destroy a transaction another account owns — but a move
 touches only the legs on THIS register's account, so a split's leg can be
@@ -154,8 +190,8 @@ deleted (soft-hidden) — unhide it, or move it to the right account, or both.
 
 The selection machinery already handles a single checked row, so there are no
 separate per-row menu items — selecting one row and using the bar is the
-single-row path. Single-row `unhide` / `move-account` API endpoints still exist
-(for MCP / future callers) and are tested.
+single-row path. The single-row `unhide` and `move-account` API endpoints were
+removed 2026-11-18 (see D2 and D3).
 
 ## Consequences
 

@@ -23,12 +23,14 @@ namespace Coffer.Api.Tests.Integration.Mcp;
 /// the collection stores one this install opens, as a first boot would.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class OAuthServerKeysTests : IAsyncLifetime
+public sealed class OAuthServerKeysTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
     private readonly string _dir = Path.Combine(Path.GetTempPath(), $"coffer-oauth-keys-{Guid.NewGuid():N}");
 
-    public OAuthServerKeysTests(PostgresFixture fixture) => _fixture = fixture;
+    public OAuthServerKeysTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     /// <summary>The key the app runs under — ApiFactory pins 32 zero bytes.</summary>
     private static LedgerKeyService LocalKeys => new(new MasterKey(new byte[32], "v1"));
@@ -43,22 +45,22 @@ public sealed class OAuthServerKeysTests : IAsyncLifetime
         }
     }
 
-    public Task InitializeAsync() => ClearAsync();
-
-    public async Task DisposeAsync()
+    /// <summary>The template carries the pair a host's first boot stores; every test
+    /// here starts from an install that has none.</summary>
+    protected override async Task OnInitializedAsync()
     {
-        await ClearAsync();
-        if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true);
-    }
-
-    private async Task ClearAsync()
-    {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await db.OidcServerKeys.ExecuteDeleteAsync();
     }
 
+    protected override Task OnDisposingAsync()
+    {
+        if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true);
+        return Task.CompletedTask;
+    }
+
     private OpenIddictKeyMaterial NewMaterial(IReadOnlySet<string>? published = null) =>
-        new(_fixture.NewServiceFactory(), TimeProvider.System, NullLogger<OpenIddictKeyMaterial>.Instance,
+        new(Db.NewServiceFactory(), TimeProvider.System, NullLogger<OpenIddictKeyMaterial>.Instance,
             published ?? OpenIddictKeyMaterial.PublishedKeyFingerprints);
 
     private static byte[] Modulus(OpenIddictKeyMaterial m) => m.Current.Signing.Rsa.ExportParameters(false).Modulus!;
@@ -105,7 +107,7 @@ public sealed class OAuthServerKeysTests : IAsyncLifetime
         Assert.False(Directory.Exists(_dir), "the plaintext key files (and their directory) should be gone");
 
         // Stored sealed under the master key, not as the plaintext.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var row = await db.OidcServerKeys.AsNoTracking().SingleAsync();
             Assert.Equal(rsa.ExportRSAPrivateKey(), LocalKeys.OpenWithMasterKey(row.SigningKeyCiphertext));
@@ -120,7 +122,7 @@ public sealed class OAuthServerKeysTests : IAsyncLifetime
     [Fact]
     public async Task A_torn_signing_file_is_replaced_and_the_encryption_key_still_moves_in()
     {
-        // What a crash part-way through the old non-atomic write left, and what bricked boot.
+        // What a crash part-way through a non-atomic write leaves, which must not brick boot.
         using var rsa = RSA.Create(2048);
         var encryption = RandomNumberGenerator.GetBytes(32);
         WriteLegacy(null, encryption);
@@ -188,7 +190,7 @@ public sealed class OAuthServerKeysTests : IAsyncLifetime
         // reconciliation removes such a pair first).
         Assert.True(await NewMaterial().LoadAsync(ForeignKeys, _dir));
         byte[] stored;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             stored = (await db.OidcServerKeys.AsNoTracking().SingleAsync()).SigningKeyCiphertext;
         using var rsa = RSA.Create(2048);
         WriteLegacy(rsa, RandomNumberGenerator.GetBytes(32));
@@ -197,7 +199,7 @@ public sealed class OAuthServerKeysTests : IAsyncLifetime
         Assert.False(await material.LoadAsync(LocalKeys, _dir));
 
         Assert.Throws<InvalidOperationException>(() => material.Current);
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             Assert.Equal(stored, (await db.OidcServerKeys.AsNoTracking().SingleAsync()).SigningKeyCiphertext);
         Assert.True(File.Exists(SigningPath), "nothing should be deleted while the keys do not open");
     }

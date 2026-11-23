@@ -19,13 +19,11 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// seeder.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class MergeCandidatesTests
+public sealed class MergeCandidatesTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public MergeCandidatesTests(PostgresFixture fixture)
+    public MergeCandidatesTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -56,7 +54,7 @@ public sealed class MergeCandidatesTests
         var headerId = Guid.NewGuid();
         var bankLegId = Guid.NewGuid();
         var counterpartyLegId = Guid.NewGuid();
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         // external_id required for SimpleFIN-origin rows (mig 105
         // CHECK). headerId stringified gives a fixture-unique value.
         // Mig 107: origin is icon-level; SimpleFIN tag in
@@ -66,14 +64,17 @@ public sealed class MergeCandidatesTests
         // surface in the candidate set.
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             INSERT INTO txn_headers
-                (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, created_at, needs_review)
+                (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, created_at, needs_review,
+                 originating_account_id)
             VALUES
                 ({headerId}, {ledger.LedgerId}, 'online_import', 'simplefin', {headerId.ToString()}, {bankPayee},
-                 {postedAt},{postedAt}, {postedAt}, {needsReview});
+                 {postedAt},{postedAt}, {postedAt}, {needsReview}, {bankAccountId});
             INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount)
             VALUES
                 ({bankLegId},         {headerId}, {ledger.LedgerId}, {bankAccountId},        0, {amount}),
                 ({counterpartyLegId}, {headerId}, {ledger.LedgerId}, {counterpartyAccountId}, 0, {-amount});");
+        // Raw SQL reaches no writer: store the presentation as the upgrade's backfill does.
+        await ledger.RecomputeNotesAsync(headerId);
         return headerId;
     }
 
@@ -91,13 +92,10 @@ public sealed class MergeCandidatesTests
     /// <paramref name="fromHeaderId"/> (the surviving WINNER).
     /// </summary>
     /// <remarks>
-    /// Merging is a command with its own route; it used to be a PATCH carrying
-    /// <c>MergeFromHeaderId</c>. Several of these calls also sent
-    /// <c>Approve = true</c> alongside it, which was always redundant — the
-    /// repository clears <c>needs_review</c> on a folded-away row itself,
-    /// precisely so the invariant cannot depend on a caller pairing two fields.
-    /// The route has no approve field, so that redundancy is now unexpressible
-    /// rather than merely discouraged.
+    /// Merging is a command with its own route. The repository clears
+    /// <c>needs_review</c> on a folded-away row itself, precisely so the invariant
+    /// cannot depend on a caller pairing two fields, and the route has no approve
+    /// field, so pairing one is unexpressible rather than merely discouraged.
     /// </remarks>
     private static HttpRequestMessage Merge(
         Guid ledgerId, Guid headerId, Guid fromHeaderId) =>
@@ -110,7 +108,7 @@ public sealed class MergeCandidatesTests
     [Fact]
     public async Task Returns_a_single_manual_match_on_amount_account_and_date()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -128,7 +126,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "DOWNTOWN PARKING #4250");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
@@ -136,18 +134,16 @@ public sealed class MergeCandidatesTests
         var single = Assert.Single(candidates);
         Assert.Equal(manualId, single.HeaderId);
         Assert.Equal("Downtown Parking", single.Payee);
-        // Candidate (03-05) is one day older than target (03-06)
-        // → signed delta of -1 per the DTO's contract.
-        Assert.Equal(-1, single.DaysDelta);
+        // The person's own entry: the tooltip says the merge keeps it as entered.
+        Assert.Equal("manual", single.Origin);
         var posting = Assert.Single(single.Postings);
         Assert.Equal(dining.Id, posting.CounterpartyAccountId);
-        Assert.Equal(9m, posting.Amount); // counterparty leg is positive
     }
 
     [Fact]
     public async Task Excludes_rows_with_a_different_amount()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -161,7 +157,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "Acme");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(ledger.LedgerId, targetId)))!;
@@ -171,7 +167,7 @@ public sealed class MergeCandidatesTests
     [Fact]
     public async Task Excludes_rows_outside_the_seven_day_window()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -185,7 +181,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "Acme");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(ledger.LedgerId, targetId)))!;
@@ -195,7 +191,7 @@ public sealed class MergeCandidatesTests
     [Fact]
     public async Task Excludes_rows_on_a_different_source_account()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("checking");
         var savings = await ledger.AddBankAccountAsync("savings");
         var dining = await ledger.AddCategoryAsync("Dining");
@@ -211,7 +207,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "Acme");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(ledger.LedgerId, targetId)))!;
@@ -228,7 +224,7 @@ public sealed class MergeCandidatesTests
         // already categorized that the new sync re-surfaced).
         // Pending bank-feed twins are NOT candidates — see
         // Excludes_pending_candidates.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
 
@@ -242,12 +238,14 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "Acme");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(ledger.LedgerId, targetId)))!;
         var single = Assert.Single(candidates);
         Assert.Equal(priorBankId, single.HeaderId);
+        // An imported row, not the person's own: the tooltip says so.
+        Assert.Equal("online_import", single.Origin);
     }
 
     [Fact]
@@ -258,7 +256,7 @@ public sealed class MergeCandidatesTests
         // merging into a row the user hasn't curated yet absorbs
         // nothing. Hide-then-pick is the right workflow for two
         // pending duplicates.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
 
@@ -272,7 +270,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "Acme");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(ledger.LedgerId, targetId)))!;
@@ -288,7 +286,7 @@ public sealed class MergeCandidatesTests
         // surviving winner keeps its identity and prior history.
         // This unblocks multi-source rows (MD+, SimpleFIN, OFX) from
         // collapsing into one canonical row.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -299,7 +297,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 5, 12, 0, 0, DateTimeKind.Utc),
             payee: "winner");
         var winnerId = await ledger.ResolveHeaderIdAsync(winnerLegId);
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 UPDATE txn_headers SET is_merge_winner = true WHERE id = {winnerId};");
@@ -310,7 +308,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "Acme");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(ledger.LedgerId, targetId)))!;
@@ -321,7 +319,7 @@ public sealed class MergeCandidatesTests
     [Fact]
     public async Task Orders_by_date_proximity()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -348,7 +346,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 10, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "Acme");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(ledger.LedgerId, targetId)))!;
@@ -361,7 +359,7 @@ public sealed class MergeCandidatesTests
     [Fact]
     public async Task Excludes_already_merged_or_hidden_candidates()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -379,7 +377,7 @@ public sealed class MergeCandidatesTests
         var mergedId = await ledger.ResolveHeaderIdAsync(legB);
         var liveId = await ledger.ResolveHeaderIdAsync(legC);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 UPDATE txn_headers SET is_hidden = true WHERE id = {hiddenId};
@@ -391,7 +389,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 7, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "Acme");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(ledger.LedgerId, targetId)))!;
@@ -402,14 +400,14 @@ public sealed class MergeCandidatesTests
     [Fact]
     public async Task Does_not_leak_across_ledgers()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
         var aliceBank = await alice.AddBankAccountAsync("checking");
         var aliceCat = await alice.AddCategoryAsync("Dining");
         await alice.AddTransactionPairAsync(
             aliceBank.Id, aliceCat.Id, -9m,
             new DateTime(2026, 3, 5, 12, 0, 0, DateTimeKind.Utc));
 
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var bobBank = await bob.AddBankAccountAsync("checking");
         var bobUncategorized = await bob.AddCategoryAsync("Uncategorized");
         var targetId = await SeedBankFeedTargetAsync(
@@ -417,7 +415,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "Acme");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
         var candidates = (await bobClient.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(bob.LedgerId, targetId)))!;
@@ -427,7 +425,7 @@ public sealed class MergeCandidatesTests
     [Fact]
     public async Task Surfaces_a_split_candidate_with_aggregated_amount_on_the_source()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var tip = await ledger.AddCategoryAsync("Tip");
@@ -449,7 +447,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "RESTAURANT");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(ledger.LedgerId, targetId)))!;
@@ -465,9 +463,9 @@ public sealed class MergeCandidatesTests
     [Fact]
     public async Task Returns_422_when_ledger_is_not_visible_to_caller()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
         var response = await bobClient.GetAsync(CandidatesUrl(alice.LedgerId, Guid.NewGuid()));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
@@ -480,7 +478,7 @@ public sealed class MergeCandidatesTests
         // be addressable through Accept-flow affordances. Defensive
         // server gate; SPA can't reach a hidden row through the UI
         // but the API enforces independently.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -493,13 +491,13 @@ public sealed class MergeCandidatesTests
             ledger, bank.Id, uncategorized.Id, -9m,
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "Acme");
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 UPDATE txn_headers SET is_hidden = true WHERE id = {targetId};");
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(ledger.LedgerId, targetId)))!;
@@ -513,7 +511,7 @@ public sealed class MergeCandidatesTests
         // user has cleared needs_review on a row, the panel
         // shouldn't surface candidates for it. Otherwise opening
         // any already-processed row would dredge up noise.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -528,21 +526,23 @@ public sealed class MergeCandidatesTests
         var targetId = Guid.NewGuid();
         var bankLegId = Guid.NewGuid();
         var cpLegId = Guid.NewGuid();
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 INSERT INTO txn_headers
-                    (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, created_at, needs_review)
+                    (id, ledger_id, origin, provider_key, external_id, payee, posted_at, transacted_at, created_at, needs_review,
+                     originating_account_id)
                 VALUES
                     ({targetId}, {ledger.LedgerId}, 'online_import', 'simplefin', {targetId.ToString()}, 'Acme',
-                     '2026-03-06','2026-03-06', '2026-03-06', false);
+                     '2026-03-06','2026-03-06', '2026-03-06', false, {bank.Id});
                 INSERT INTO txn_legs (id, header_id, ledger_id, account_id, posting_index, amount)
                 VALUES
                     ({bankLegId}, {targetId}, {ledger.LedgerId}, {bank.Id},          0, -9),
                     ({cpLegId},   {targetId}, {ledger.LedgerId}, {uncategorized.Id}, 0,  9);");
         }
+        await ledger.RecomputeNotesAsync(targetId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(ledger.LedgerId, targetId)))!;
@@ -554,11 +554,11 @@ public sealed class MergeCandidatesTests
     [Fact]
     public async Task Offers_a_candidate_whose_overridden_date_is_inside_the_effective_window()
     {
-        // The bug this fixes: the candidate's RAW posted_at is 9 days off
+        // The candidate's RAW posted_at is 9 days off
         // (outside ±7d), but the user curated its date (override) to the
         // target's day. The register shows it adjacent; the matcher must
         // too — the window reads the EFFECTIVE posted_at, not raw.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -578,15 +578,14 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 20, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "ACME 0320");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(ledger.LedgerId, targetId)))!;
         var single = Assert.Single(candidates);
         Assert.Equal(manualId, single.HeaderId);
-        // Effective dates coincide → 0-day delta, and the display date +
-        // payee are the effective values.
-        Assert.Equal(0, single.DaysDelta);
+        // Effective dates coincide, and the display date is the effective
+        // value.
         Assert.Equal(new DateTime(2026, 3, 20, 12, 0, 0, DateTimeKind.Utc), single.PostedAt);
     }
 
@@ -596,7 +595,7 @@ public sealed class MergeCandidatesTests
         // Mirror image: raw posted_at is in-window, but the curated
         // (effective) date is far off. The effective value wins both
         // directions, so this must NOT be offered.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -613,7 +612,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 20, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "ACME");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(ledger.LedgerId, targetId)))!;
@@ -624,7 +623,7 @@ public sealed class MergeCandidatesTests
     public async Task Excludes_a_hidden_candidate()
     {
         // A hidden row is not on screen, so it is not offerable.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -640,7 +639,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 20, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "ACME");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var candidates = (await client.GetFromJsonAsync<List<MergeCandidateDto>>(
             CandidatesUrl(ledger.LedgerId, targetId)))!;
@@ -657,7 +656,7 @@ public sealed class MergeCandidatesTests
         // the surviving canonical row. The editor's body content
         // (postings reshape, payee edit) is moot — it never applies
         // to the candidate, which stays exactly as it was.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -672,7 +671,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "DOWNTOWN PARKING #4250");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, manualId));
         // Minimal patch body without account_id / postings → server
@@ -681,7 +680,7 @@ public sealed class MergeCandidatesTests
         // the endpoint test for that path.
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var target = await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == targetId);
         var manual = await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == manualId);
         // Editor (target) is now the loser of the candidate.
@@ -701,20 +700,17 @@ public sealed class MergeCandidatesTests
     /// </summary>
     /// <remarks>
     /// "A merged loser is not awaiting review" is an invariant of the data, so it
-    /// is enforced in the repository rather than left to each caller. It used to
-    /// depend on the SPA pairing the merge with approve: true — which it did, so
-    /// the product looked correct — but any other client (MCP, a direct PATCH)
-    /// merged a row and left it flagged, which keeps the sidebar review dot lit on
-    /// an account whose register has nothing left to review.
-    ///
-    /// The investment branch hit exactly that, because its merge PATCH is
-    /// merge-only and never carried the flag. Rather than teach it to send one,
-    /// both paths were reconciled on the server owning the end state.
+    /// is enforced in the repository rather than left to each caller. Depending on
+    /// the SPA pairing the merge with approve: true would leave any other client
+    /// (MCP, a direct PATCH) merging a row and leaving it flagged, which keeps the
+    /// sidebar review dot lit on an account whose register has nothing left to
+    /// review. The investment branch's merge is merge-only and carries no flag, so
+    /// the server owns the end state for both paths.
     /// </remarks>
     [Fact]
     public async Task Patch_mergeFromHeaderId_clears_needs_review_without_an_approve_flag()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -729,7 +725,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "DOWNTOWN PARKING #4250");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Merge stamp ONLY — the body the SPA now sends, and the one an API
@@ -737,7 +733,7 @@ public sealed class MergeCandidatesTests
         var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, manualId));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var target = await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == targetId);
         Assert.Equal(manualId, target.IsMergedInto);
         Assert.False(target.NeedsReview);
@@ -749,7 +745,7 @@ public sealed class MergeCandidatesTests
         // ADR-0072 follow-up: the merged survivor takes the IMPORT
         // (editor / loser) row's posted date — the bank/feed date is
         // authoritative for the merged transaction.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -766,14 +762,14 @@ public sealed class MergeCandidatesTests
             ledger, bank.Id, uncategorized.Id, -9m, importDate,
             bankPayee: "DOWNTOWN PARKING #4250");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, manualId));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
         // The survivor now shows the imported date (03-06), not its own
         // manual date (03-05) — via an effective (override-aware) read.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var winnerEffectivePostedAt = await db.ResolvedTransactions
             .AsNoTracking()
             .Where(rt => rt.HeaderId == manualId)
@@ -788,7 +784,7 @@ public sealed class MergeCandidatesTests
         // ADR-0082: merging a fresh feed row into an (uncleared) transaction
         // marks the survivor 'reconciling' on the merge account — the bank has
         // acknowledged it, but it isn't the user-affirmed 'cleared'.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -802,12 +798,12 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "DOWNTOWN PARKING #4250");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, manualId));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var status = await db.ResolvedTransactions.AsNoTracking()
             .Where(rt => rt.HeaderId == manualId && rt.AccountId == bank.Id)
             .Select(rt => rt.Status)
@@ -824,7 +820,7 @@ public sealed class MergeCandidatesTests
         // else. The matching contract is (account, amount, date);
         // we don't gate on origin. Pending candidates are rejected —
         // see Patch_mergeFromHeaderId_422_when_source_is_pending.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
         var otherBankRowId = await SeedBankFeedTargetAsync(
@@ -837,12 +833,12 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "B");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, otherBankRowId));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var loser = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.Id == targetId);
         var winner = await db.TxnHeaders.AsNoTracking()
@@ -860,7 +856,7 @@ public sealed class MergeCandidatesTests
         // Server mirrors GET /merge-candidates' settled-only filter
         // on the source side. A hand-crafted PATCH that names a
         // pending row as the merge source must be rejected.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
         var pendingSourceId = await SeedBankFeedTargetAsync(
@@ -873,7 +869,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "TARGET");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, pendingSourceId));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
@@ -891,7 +887,7 @@ public sealed class MergeCandidatesTests
         // candidate — folding a third source into it just adds
         // another loser pointer. Graph stays one-hop: every loser
         // points directly to the same surviving winner.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -905,7 +901,7 @@ public sealed class MergeCandidatesTests
             bank.Id, dining.Id, -9m,
             new DateTime(2026, 3, 5, 12, 0, 0, DateTimeKind.Utc));
         var priorLoserId = await ledger.ResolveHeaderIdAsync(priorLoserLegId);
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 UPDATE txn_headers SET is_merge_winner = true WHERE id = {winnerId};
@@ -917,12 +913,12 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "FRESH-FROM-FEED");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.SendAsync(Merge(ledger.LedgerId, freshTargetId, winnerId));
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
 
-        await using var verifyDb = _fixture.NewDbContext();
+        await using var verifyDb = Db.NewDbContext();
         var fresh = await verifyDb.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == freshTargetId);
         var winner = await verifyDb.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == winnerId);
         var priorLoser = await verifyDb.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == priorLoserId);
@@ -938,7 +934,7 @@ public sealed class MergeCandidatesTests
     [Fact]
     public async Task Patch_mergeFromHeaderId_422_when_source_belongs_to_another_ledger()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
         var aliceBank = await alice.AddBankAccountAsync("checking");
         var aliceCat = await alice.AddCategoryAsync("Dining");
         var (aliceLegId, _) = await alice.AddTransactionPairAsync(
@@ -946,7 +942,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 5, 12, 0, 0, DateTimeKind.Utc));
         var aliceManualId = await alice.ResolveHeaderIdAsync(aliceLegId);
 
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var bobBank = await bob.AddBankAccountAsync("checking");
         var bobUncategorized = await bob.AddCategoryAsync("Uncategorized");
         var bobTargetId = await SeedBankFeedTargetAsync(
@@ -954,7 +950,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "Acme");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
         var response = await bobClient.SendAsync(Merge(bob.LedgerId, bobTargetId, aliceManualId));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
@@ -966,7 +962,7 @@ public sealed class MergeCandidatesTests
     [Fact]
     public async Task Patch_mergeFromHeaderId_422_when_source_equals_target()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var (legId, _) = await ledger.AddTransactionPairAsync(
@@ -974,7 +970,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 5, 12, 0, 0, DateTimeKind.Utc));
         var headerId = await ledger.ResolveHeaderIdAsync(legId);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.SendAsync(Merge(ledger.LedgerId, headerId, headerId));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
@@ -986,7 +982,7 @@ public sealed class MergeCandidatesTests
     [Fact]
     public async Task Patch_mergeFromHeaderId_422_when_source_already_merged()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -1001,7 +997,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "A");
         // Merge once: stamps manualId.is_merged_into = firstTarget.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 UPDATE txn_headers SET is_merged_into = {firstTargetId} WHERE id = {manualId};");
@@ -1011,7 +1007,7 @@ public sealed class MergeCandidatesTests
             new DateTime(2026, 3, 7, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "B");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.SendAsync(Merge(ledger.LedgerId, secondTargetId, manualId));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
@@ -1028,7 +1024,7 @@ public sealed class MergeCandidatesTests
         // SPA's UI filtering per the server-side-concurrency
         // principle. A hand-crafted PATCH that tries to merge into
         // an already-accepted row must be rejected.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -1042,13 +1038,13 @@ public sealed class MergeCandidatesTests
             ledger, bank.Id, uncategorized.Id, -9m,
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "Acme");
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 UPDATE txn_headers SET needs_review = false WHERE id = {targetId};");
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, manualId));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
@@ -1060,7 +1056,7 @@ public sealed class MergeCandidatesTests
     [Fact]
     public async Task Patch_mergeFromHeaderId_422_when_target_is_hidden()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var dining = await ledger.AddCategoryAsync("Dining");
         var uncategorized = await ledger.AddCategoryAsync("Uncategorized");
@@ -1074,13 +1070,13 @@ public sealed class MergeCandidatesTests
             ledger, bank.Id, uncategorized.Id, -9m,
             new DateTime(2026, 3, 6, 12, 0, 0, DateTimeKind.Utc),
             bankPayee: "Acme");
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 UPDATE txn_headers SET is_hidden = true WHERE id = {targetId};");
         }
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var response = await client.SendAsync(Merge(ledger.LedgerId, targetId, manualId));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);

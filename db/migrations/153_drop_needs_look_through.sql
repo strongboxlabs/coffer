@@ -10,9 +10,8 @@
 -- asset_class = 'multi_asset' in the security editor.
 --
 -- Carry intent forward before dropping: any row flagged needs_look_through but
--- not yet classed multi_asset becomes multi_asset (no-op on a correctly-classed
--- ledger; the flag is brand-new in this unreleased branch so there's little/no
--- real data to carry).
+-- not yet classed multi_asset becomes multi_asset (a no-op on a correctly-classed
+-- ledger).
 -- =============================================================================
 
 UPDATE securities

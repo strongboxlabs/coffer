@@ -11,8 +11,7 @@
 --
 -- This fires on the snapshot restore (fn_ledger_snapshot_restore deletes
 -- recurring_transactions while its generated headers still exist) AND on any
--- plain "delete a recurring transaction that has generated entries". It was
--- masked until the snapshot OOM (mig 179) was fixed and restore actually ran.
+-- plain "delete a recurring transaction that has generated entries".
 --
 -- Fix (PG15+ column-specific SET NULL): null ONLY recurring_transaction_id, not
 -- ledger_id. Deleting a recurring template detaches its generated entries

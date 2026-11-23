@@ -224,9 +224,10 @@ public sealed class BackupStoreTests : IDisposable
     [Fact]
     public async Task A_pruning_failure_after_a_good_write_does_not_fail_the_backup()
     {
-        // FU-067: a retention pass that threw after the artifact was written, verified and
-        // listed reported the create as FAILED, announced a good backup as failed, and counted
-        // toward the scheduler's five-failure auto-disable. The next create prunes again.
+        // FU-067: a retention pass that throws after the artifact is written, verified and
+        // listed must not report the create as FAILED — that would announce a good backup as
+        // failed and count toward the scheduler's five-failure auto-disable. The next create
+        // prunes again.
         var store = NewStore();
 
         var info = await store.CreateAsync(Writes([1, 2, 3]), Policy, new PinsThatThrowWhenRead());

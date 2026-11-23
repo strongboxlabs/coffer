@@ -1,20 +1,24 @@
-import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMemo, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import {
     fetchLedgerMembers,
     setLedgerMemberRole,
     removeLedgerMember,
-    fetchVisibleLedgers,
     fetchLedgerInvites,
     createLedgerInvite,
     revokeLedgerInvite,
     type LedgerMember,
 } from '@/lib/api';
 import { errorMessage } from '@/lib/errorMessage';
+import { isLedgerOwner } from '@/lib/ledgerRole';
+import { useLedgerRole } from '@/lib/useLedgerRole';
 import { Panel, PanelBody } from '@/components/ui/Panel';
 import { Button } from '@/components/ui/Button';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
+import { usePendingChoiceProps } from '@/components/ui/pending';
+import { useRowRemovalFocus } from '@/components/ui/rowRemovalFocus';
 import { InviteLinkModal } from '@/components/invites/InviteLinkModal';
 import { PendingInvitesList } from '@/components/invites/PendingInvitesList';
 
@@ -33,12 +37,13 @@ const ROLE_OPTIONS = [
  */
 export function MembersPanel({ ledgerId }: { ledgerId: string }) {
     const queryClient = useQueryClient();
+    // A role change writes: it holds its select from the change (pending.ts).
+    const pendingChoiceProps = usePendingChoiceProps();
     const membersKey = ['ledger-members', ledgerId] as const;
     const invitesKey = ['ledger-invites', ledgerId] as const;
 
     const membersQuery = useQuery({ queryKey: membersKey, queryFn: () => fetchLedgerMembers(ledgerId) });
-    const ledgersQuery = useQuery({ queryKey: ['ledgers'], queryFn: fetchVisibleLedgers });
-    const isOwner = ledgersQuery.data?.find((l) => l.id === ledgerId)?.role === 'owner';
+    const { isOwner } = useLedgerRole(ledgerId);
 
     const invalidateMembers = () => queryClient.invalidateQueries({ queryKey: membersKey });
     const setRole = useMutation({
@@ -71,8 +76,16 @@ export function MembersPanel({ ledgerId }: { ledgerId: string }) {
     const [removeTarget, setRemoveTarget] = useState<LedgerMember | null>(null);
 
     const members = membersQuery.data;
-    const ownerCount = members?.filter((m) => m.role === 'owner').length ?? 0;
+    const ownerCount = members?.filter((m) => isLedgerOwner(m.role)).length ?? 0;
     const busy = setRole.isPending || remove.isPending;
+    // A member removed, or an invite revoked, takes its row's button with it:
+    // focus goes to the next row's, the previous row's, or Create invite link
+    // (ADR-0023 §L).
+    const createInviteRef = useRef<HTMLButtonElement | null>(null);
+    const removeControl = useRowRemovalFocus(
+        useMemo(() => (members ?? []).map((m) => m.userId), [members]),
+        createInviteRef,
+    );
 
     return (
         <section className="space-y-4">
@@ -94,7 +107,7 @@ export function MembersPanel({ ledgerId }: { ledgerId: string }) {
                     ) : (
                         <ul className="divide-y divide-border">
                             {members.map((m) => {
-                                const isSoleOwner = m.role === 'owner' && ownerCount <= 1;
+                                const isSoleOwner = isLedgerOwner(m.role) && ownerCount <= 1;
                                 const lockNote = isSoleOwner
                                     ? 'A ledger must keep at least one owner.'
                                     : undefined;
@@ -117,12 +130,13 @@ export function MembersPanel({ ledgerId }: { ledgerId: string }) {
                                                     <select
                                                         aria-label={`Role for ${m.displayName}`}
                                                         value={m.role}
-                                                        disabled={busy || isSoleOwner}
+                                                        disabled={isSoleOwner}
                                                         title={lockNote}
-                                                        onChange={(e) =>
-                                                            setRole.mutate({ userId: m.userId, role: e.target.value })
-                                                        }
-                                                        className="rounded border border-border bg-surface px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-60"
+                                                        className="rounded border border-border bg-surface px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-60 aria-disabled:opacity-60"
+                                                        {...pendingChoiceProps<HTMLSelectElement>(busy, {
+                                                            onChange: (e) =>
+                                                                setRole.mutate({ userId: m.userId, role: e.target.value }),
+                                                        })}
                                                     >
                                                         {ROLE_OPTIONS.map((o) => (
                                                             <option key={o.value} value={o.value}>
@@ -131,9 +145,11 @@ export function MembersPanel({ ledgerId }: { ledgerId: string }) {
                                                         ))}
                                                     </select>
                                                     <Button
+                                                        ref={removeControl(m.userId)}
                                                         variant="danger"
                                                         size="sm"
-                                                        disabled={busy || isSoleOwner}
+                                                        disabled={isSoleOwner}
+                                                        pending={busy}
                                                         title={lockNote}
                                                         onClick={() => setRemoveTarget(m)}
                                                     >
@@ -183,12 +199,14 @@ export function MembersPanel({ ledgerId }: { ledgerId: string }) {
                                         ))}
                                     </select>
                                     <Button
+                                        ref={createInviteRef}
                                         variant="secondary"
                                         size="sm"
-                                        disabled={createInvite.isPending}
+                                        pending={createInvite.isPending}
+                                        pendingLabel="Creating…"
                                         onClick={() => createInvite.mutate()}
                                     >
-                                        {createInvite.isPending ? 'Creating…' : 'Create invite link'}
+                                        Create invite link
                                     </Button>
                                 </div>
                                 {createInvite.isError ? (
@@ -215,6 +233,7 @@ export function MembersPanel({ ledgerId }: { ledgerId: string }) {
                                         invites={invitesQuery.data}
                                         onRevoke={(id) => revokeInvite.mutate(id)}
                                         revoking={revokeInvite.isPending}
+                                        addRef={createInviteRef}
                                     />
                                 ) : (
                                     <p className="text-sm text-text-muted">Loading…</p>

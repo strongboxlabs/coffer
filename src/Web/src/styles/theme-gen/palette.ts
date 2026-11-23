@@ -160,7 +160,7 @@ export const AA = 4.5;
 /**
  * Every text/background pair the register actually renders, INCLUDING the
  * composited row-state fills — the tinted background is what the text sits on,
- * and it is where the first cut of the dark themes failed.
+ * and it is where a dark theme's contrast fails first.
  */
 export function audit(t: Tokens): Array<{ pair: string; value: number }> {
     const s = t['surface']!;

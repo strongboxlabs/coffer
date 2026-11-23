@@ -25,11 +25,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// (atomic isolation per the API engineering standard).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class BankPatchBalanceTests
+public sealed class BankPatchBalanceTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public BankPatchBalanceTests(PostgresFixture fixture) => _fixture = fixture;
+    public BankPatchBalanceTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -50,11 +51,11 @@ public sealed class BankPatchBalanceTests
     [Fact]
     public async Task Patch_amount_change_shifts_downstream_balances_by_delta()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var category = await ledger.AddCategoryAsync("category");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> CreateAsync(int day, decimal amount)
@@ -80,7 +81,7 @@ public sealed class BankPatchBalanceTests
         var h3 = await CreateAsync(15, -20m);  // May 15: a later outflow
 
         // Sanity: the pre-patch chain is the running sum of the three.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var h3Pre = await db.TxnHeaderAccountBalances.AsNoTracking()
                 .SingleAsync(r => r.HeaderId == h3 && r.AccountId == bank.Id);
@@ -106,7 +107,7 @@ public sealed class BankPatchBalanceTests
             patchResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)patchResp.StatusCode}: {await patchResp.Content.ReadAsStringAsync()}");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var h2Post = await db.TxnHeaderAccountBalances.AsNoTracking()
                 .SingleAsync(r => r.HeaderId == h2 && r.AccountId == bank.Id);
@@ -128,12 +129,12 @@ public sealed class BankPatchBalanceTests
     [Fact]
     public async Task Patch_add_split_updates_row_net_and_downstream_balances()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
         var fuel = await ledger.AddCategoryAsync("fuel");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> CreateAsync(int day, decimal amount, Guid counterparty)
@@ -158,7 +159,7 @@ public sealed class BankPatchBalanceTests
         var h2 = await CreateAsync(10, -40m, groceries.Id);   // May 10: one posting (single -> split)
         var h3 = await CreateAsync(15, -10m, groceries.Id);   // May 15: a later outflow
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var h3Pre = await db.TxnHeaderAccountBalances.AsNoTracking()
                 .SingleAsync(r => r.HeaderId == h3 && r.AccountId == bank.Id);
@@ -186,7 +187,7 @@ public sealed class BankPatchBalanceTests
             patchResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)patchResp.StatusCode}: {await patchResp.Content.ReadAsStringAsync()}");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             // Bank row's net is the aggregate of both source-side legs.
             var h2Bank = await db.TxnHeaderAccountBalances.AsNoTracking()
@@ -213,12 +214,12 @@ public sealed class BankPatchBalanceTests
     [Fact]
     public async Task Patch_remove_split_collapses_to_single_posting()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var groceries = await ledger.AddCategoryAsync("groceries");
         var fuel = await ledger.AddCategoryAsync("fuel");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> CreateSingleAsync(int day, decimal amount)
@@ -260,7 +261,7 @@ public sealed class BankPatchBalanceTests
 
         var h3 = await CreateSingleAsync(15, -10m); // May 15: a later outflow
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var h3Pre = await db.TxnHeaderAccountBalances.AsNoTracking()
                 .SingleAsync(r => r.HeaderId == h3 && r.AccountId == bank.Id);
@@ -291,7 +292,7 @@ public sealed class BankPatchBalanceTests
             patchResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)patchResp.StatusCode}: {await patchResp.Content.ReadAsStringAsync()}");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var h2Bank = await db.TxnHeaderAccountBalances.AsNoTracking()
                 .SingleAsync(r => r.HeaderId == h2 && r.AccountId == bank.Id);
@@ -318,12 +319,12 @@ public sealed class BankPatchBalanceTests
     [Fact]
     public async Task Patch_recategorize_moves_counterparty_balance_row()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var oldCategory = await ledger.AddCategoryAsync("old-category");
         var newCategory = await ledger.AddCategoryAsync("new-category");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> CreateAsync(int day, decimal amount, Guid counterparty)
@@ -348,7 +349,7 @@ public sealed class BankPatchBalanceTests
         var h2 = await CreateAsync(10, -60m, oldCategory.Id);  // May 10: an outflow (recategorize)
         var h3 = await CreateAsync(15, -10m, oldCategory.Id);  // May 15: a later outflow
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             // Pre-patch: h2's counterparty row is on oldCategory.
             var oldPre = await db.TxnHeaderAccountBalances.AsNoTracking()
@@ -379,7 +380,7 @@ public sealed class BankPatchBalanceTests
             patchResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)patchResp.StatusCode}: {await patchResp.Content.ReadAsStringAsync()}");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             // Source (bank) value unchanged: h2 nets and sits exactly where it did.
             var h2Bank = await db.TxnHeaderAccountBalances.AsNoTracking()
@@ -408,11 +409,11 @@ public sealed class BankPatchBalanceTests
     [Fact]
     public async Task Recon_status_flip_is_balance_neutral()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var category = await ledger.AddCategoryAsync("category");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> CreateAsync(int day, decimal amount)
@@ -438,7 +439,7 @@ public sealed class BankPatchBalanceTests
         var h3 = await CreateAsync(15, -25m);  // May 15: a later outflow
 
         decimal h2BankBefore, h3BankBefore;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             h2BankBefore = (await db.TxnHeaderAccountBalances.AsNoTracking()
                 .SingleAsync(r => r.HeaderId == h2 && r.AccountId == bank.Id)).BalanceAfter;
@@ -455,7 +456,7 @@ public sealed class BankPatchBalanceTests
             reconResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)reconResp.StatusCode}: {await reconResp.Content.ReadAsStringAsync()}");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var h2BankAfter = await db.TxnHeaderAccountBalances.AsNoTracking()
                 .SingleAsync(r => r.HeaderId == h2 && r.AccountId == bank.Id);

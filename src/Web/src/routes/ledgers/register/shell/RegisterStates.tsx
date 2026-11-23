@@ -9,11 +9,11 @@ import { Panel, PanelBody } from '@/components/ui/Panel';
  * registers unified by default). Renders exactly one of: an error alert, a
  * loading line, the empty-state panel, or — when the window has content — the
  * `children` (the register list). Precedence is error → loading → empty →
- * content, so a load failure always surfaces (bank previously checked loading
- * first, which could mask an error while `initialLoaded` was still false).
+ * content, so a load failure always surfaces (checking loading first could mask
+ * an error while `initialLoaded` is still false).
  *
- * Bank rendered a styled EmptyState + a typed error message; investment
- * rendered plain inline text. This is the single treatment for both.
+ * The single treatment for both registers: a styled EmptyState + a typed error
+ * message.
  */
 export function RegisterStates({
     initialLoaded,
@@ -92,10 +92,10 @@ export function RegisterStates({
                                         ? 'Transactions appear here once something is categorised this way.'
                                         : 'Import a statement or wait for the next sync.'}
                         </p>
-                        {/* The app's own button, not a hand-rolled one. The
-                            first version was accent-coloured text in a thin
-                            box, which read as a warning link rather than an
-                            action and matched nothing else on the page. */}
+                        {/* The app's own button, not a hand-rolled one.
+                            Accent-coloured text in a thin box reads as a
+                            warning link rather than an action and matches
+                            nothing else on the page. */}
                         {parentRollup && onIncludeSubcategories !== undefined ? (
                             <Button
                                 type="button"

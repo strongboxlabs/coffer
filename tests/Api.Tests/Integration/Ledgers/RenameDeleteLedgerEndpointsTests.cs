@@ -18,11 +18,12 @@ namespace Coffer.Api.Tests.Integration.Ledgers;
 /// owner/editor gate is exercised per-user.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class RenameDeleteLedgerEndpointsTests
+public sealed class RenameDeleteLedgerEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public RenameDeleteLedgerEndpointsTests(PostgresFixture fixture) => _fixture = fixture;
+    public RenameDeleteLedgerEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -38,7 +39,7 @@ public sealed class RenameDeleteLedgerEndpointsTests
     /// <summary>Grant a second user a non-owner role on a ledger.</summary>
     private async Task GrantAsync(Guid userId, Guid ledgerId, string role)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         db.UserLedgerGrants.Add(new UserLedgerGrantRow { UserId = userId, LedgerId = ledgerId, Role = role });
         await db.SaveChangesAsync();
     }
@@ -48,8 +49,8 @@ public sealed class RenameDeleteLedgerEndpointsTests
     [Fact]
     public async Task Owner_can_rename_the_ledger()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, alice);
 
         var resp = await client.SendAsync(Patch(alice.LedgerId, new { name = "Renamed Books" }));
@@ -62,8 +63,8 @@ public sealed class RenameDeleteLedgerEndpointsTests
     [Fact]
     public async Task Rename_rejects_an_empty_name()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, alice);
 
         var resp = await client.SendAsync(Patch(alice.LedgerId, new { name = "   " }));
@@ -75,11 +76,11 @@ public sealed class RenameDeleteLedgerEndpointsTests
     [Fact]
     public async Task Rename_by_a_non_owner_is_rejected()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         await GrantAsync(bob.UserId, alice.LedgerId, "editor");   // editor, not owner
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var resp = await bobClient.SendAsync(Patch(alice.LedgerId, new { name = "Hijacked" }));
@@ -91,10 +92,10 @@ public sealed class RenameDeleteLedgerEndpointsTests
     [Fact]
     public async Task Rename_of_an_invisible_ledger_is_rejected()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);   // no grant on alice's ledger
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);   // no grant on alice's ledger
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var resp = await bobClient.SendAsync(Patch(alice.LedgerId, new { name = "x" }));
@@ -109,7 +110,7 @@ public sealed class RenameDeleteLedgerEndpointsTests
     public async Task Owner_delete_wipes_the_entire_footprint_and_leaves_other_ledgers_intact()
     {
         // Seed a broad footprint on alice's ledger.
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
         var bank = await alice.AddBankAccountAsync("checking");
         var dining = await alice.AddCategoryAsync("Dining");
         var (legId, _) = await alice.AddTransactionPairAsync(bank.Id, dining.Id, -42m,
@@ -120,21 +121,23 @@ public sealed class RenameDeleteLedgerEndpointsTests
         var secId = await alice.AddSecurityAsync("ACME");
         await alice.AddHoldingAsync(brokerage.Id, secId, 10m, costBasis: 123.40m);
         await alice.AddSecurityPriceAsync(secId, 12.34m, new DateTime(2026, 3, 5, 0, 0, 0, DateTimeKind.Utc));
+        await AddNestedFoldersAsync(alice, bank.Id);
 
         // A second ledger that must survive untouched.
-        var other = await SyntheticLedger.CreateAsync(_fixture);
+        var other = await SyntheticLedger.CreateAsync(Db);
         var otherBank = await other.AddBankAccountAsync("checking");
         await other.AddTransactionPairAsync(otherBank.Id,
             (await other.AddCategoryAsync("Dining")).Id, -7m,
             new DateTime(2026, 3, 5, 12, 0, 0, DateTimeKind.Utc));
+        await AddNestedFoldersAsync(other, otherBank.Id);
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, alice);
 
         var resp = await client.DeleteAsync($"/api/ledgers/{alice.LedgerId}");
         Assert.Equal(HttpStatusCode.NoContent, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var lid = alice.LedgerId;
         // Financial / RESTRICT tables — explicitly cleared.
         Assert.Equal(0, await db.Accounts.CountAsync(a => a.LedgerId == lid));
@@ -145,6 +148,9 @@ public sealed class RenameDeleteLedgerEndpointsTests
         Assert.Equal(0, await db.Holdings.CountAsync(h => h.LedgerId == lid));
         Assert.Equal(0, await db.SecurityPrices.CountAsync(p => p.LedgerId == lid));
         Assert.Equal(0, await db.Tags.CountAsync(t => t.LedgerId == lid));
+        // Sidebar folders (mig 258) — explicitly cleared, members first.
+        Assert.Equal(0, await db.AccountFolders.CountAsync(f => f.LedgerId == lid));
+        Assert.Equal(0, await db.AccountFolderMembers.CountAsync(m => m.LedgerId == lid));
         // Grants — cleared by the CASCADE off the ledgers row delete.
         Assert.Equal(0, await db.UserLedgerGrants.CountAsync(g => g.LedgerId == lid));
         // The ledger row itself is gone.
@@ -154,16 +160,32 @@ public sealed class RenameDeleteLedgerEndpointsTests
         Assert.True(await db.Ledgers.AnyAsync(l => l.Id == other.LedgerId));
         Assert.True(await db.Accounts.AnyAsync(a => a.LedgerId == other.LedgerId));
         Assert.True(await db.TxnHeaders.AnyAsync(h => h.LedgerId == other.LedgerId));
+        Assert.Equal(2, await db.AccountFolders.CountAsync(f => f.LedgerId == other.LedgerId));
+        Assert.Equal(1, await db.AccountFolderMembers.CountAsync(m => m.LedgerId == other.LedgerId));
+    }
+
+    /// <summary>A folder inside a folder, with the account filed in the inner one.</summary>
+    private async Task AddNestedFoldersAsync(SyntheticLedger ledger, Guid bankAccountId)
+    {
+        await using var db = Db.NewDbContext();
+        var outer = new AccountFolderRow { Id = Guid.NewGuid(), LedgerId = ledger.LedgerId, AccountType = "bank", Name = "Folder A" };
+        var inner = new AccountFolderRow { Id = Guid.NewGuid(), LedgerId = ledger.LedgerId, AccountType = "bank", Name = "Folder B", ParentId = outer.Id };
+        db.AccountFolders.AddRange(outer, inner);
+        db.AccountFolderMembers.Add(new AccountFolderMemberRow
+        {
+            AccountId = bankAccountId, LedgerId = ledger.LedgerId, FolderId = inner.Id, AccountType = "bank",
+        });
+        await db.SaveChangesAsync();
     }
 
     [Fact]
     public async Task Delete_by_a_non_owner_is_rejected()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         await GrantAsync(bob.UserId, alice.LedgerId, "viewer");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var resp = await bobClient.DeleteAsync($"/api/ledgers/{alice.LedgerId}");
@@ -172,15 +194,15 @@ public sealed class RenameDeleteLedgerEndpointsTests
         Assert.Equal("ledger-not-owner", doc.RootElement.GetProperty("code").GetString());
 
         // Nothing deleted.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.True(await db.Ledgers.AnyAsync(l => l.Id == alice.LedgerId));
     }
 
     [Fact]
     public async Task Owner_can_delete_their_only_ledger()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, alice);
 
         var resp = await client.DeleteAsync($"/api/ledgers/{alice.LedgerId}");

@@ -28,11 +28,12 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class HoldingsValueAsOfSetBatchingTests
+public sealed class HoldingsValueAsOfSetBatchingTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public HoldingsValueAsOfSetBatchingTests(PostgresFixture fixture) => _fixture = fixture;
+    public HoldingsValueAsOfSetBatchingTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Utc(int y, int m, int d, int h = 0) =>
         new(y, m, d, h, 0, 0, DateTimeKind.Utc);
@@ -42,9 +43,9 @@ public sealed class HoldingsValueAsOfSetBatchingTests
 
     /// <summary>The same function, asked for ONE instant — the unbatched case.</summary>
     private static async Task<List<ValueRow>> SingleAsync(
-        PostgresFixture fixture, Guid ledgerId, DateTime asOf)
+        TestDatabase database, Guid ledgerId, DateTime asOf)
     {
-        await using var conn = fixture.OpenServiceConnection();
+        await using var conn = database.OpenServiceConnection();
         var rows = await conn.QueryAsync<ValueRow>(
             """
             SELECT account_id AS "AccountId", security_id AS "SecurityId",
@@ -58,9 +59,9 @@ public sealed class HoldingsValueAsOfSetBatchingTests
 
     /// <summary>The batched form, filtered back to one instant for comparison.</summary>
     private static async Task<List<ValueRow>> BatchedAsync(
-        PostgresFixture fixture, Guid ledgerId, DateTime[] asOfs, DateTime pick)
+        TestDatabase database, Guid ledgerId, DateTime[] asOfs, DateTime pick)
     {
-        await using var conn = fixture.OpenServiceConnection();
+        await using var conn = database.OpenServiceConnection();
         var rows = await conn.QueryAsync<ValueRow>(
             """
             SELECT account_id AS "AccountId", security_id AS "SecurityId",
@@ -80,12 +81,12 @@ public sealed class HoldingsValueAsOfSetBatchingTests
     /// exercises that division — a one-instant call has nothing to divide by.
     /// </summary>
     private static async Task AssertAgreeAtAllAsync(
-        PostgresFixture fixture, Guid ledgerId, params DateTime[] instants)
+        TestDatabase database, Guid ledgerId, params DateTime[] instants)
     {
         foreach (var t in instants)
         {
-            var expected = await SingleAsync(fixture, ledgerId, t);
-            var actual = await BatchedAsync(fixture, ledgerId, instants, t);
+            var expected = await SingleAsync(database, ledgerId, t);
+            var actual = await BatchedAsync(database, ledgerId, instants, t);
 
             Assert.Equal(expected.Count, actual.Count);
             for (var i = 0; i < expected.Count; i++)
@@ -102,7 +103,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
     [Fact]
     public async Task Batching_is_invariant_with_no_splits()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var sec = await ledger.AddSecurityAsync("Growth", "GRW");
@@ -112,7 +113,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
         await ledger.AddSecurityPriceAsync(sec, 15m, Utc(2024, 6, 1));
 
         await AssertAgreeAtAllAsync(
-            _fixture, ledger.LedgerId,
+            Db, ledger.LedgerId,
             Utc(2024, 1, 1), Utc(2024, 1, 10), Utc(2024, 2, 1),
             Utc(2024, 4, 10), Utc(2024, 7, 1), Utc(2024, 12, 31));
     }
@@ -125,7 +126,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
     [Fact]
     public async Task Batching_is_invariant_across_splits()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var sec = await ledger.AddSecurityAsync("Splitter", "SPL");
@@ -137,7 +138,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
         await ledger.AddSecurityPriceAsync(sec, 20m, Utc(2024, 7, 1));
 
         await AssertAgreeAtAllAsync(
-            _fixture, ledger.LedgerId,
+            Db, ledger.LedgerId,
             Utc(2024, 1, 1), Utc(2024, 2, 1),
             Utc(2024, 3, 1),                      // exactly ON a split
             Utc(2024, 4, 10),                     // exactly ON a leg
@@ -155,7 +156,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
     [Fact]
     public async Task Batching_is_invariant_when_a_split_shares_an_instant_with_a_trade()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var sec = await ledger.AddSecurityAsync("SameInstant", "SMI");
@@ -170,7 +171,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
         await ledger.AddSecurityPriceAsync(sec, 55m, Utc(2024, 6, 1));
 
         await AssertAgreeAtAllAsync(
-            _fixture, ledger.LedgerId,
+            Db, ledger.LedgerId,
             Utc(2024, 2, 1), shared, Utc(2024, 4, 1), Utc(2024, 12, 1));
     }
 
@@ -182,7 +183,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
     [Fact]
     public async Task Batching_is_invariant_with_fractional_and_reverse_splits()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var sec = await ledger.AddSecurityAsync("Fractional", "FRAC");
@@ -195,7 +196,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
         await ledger.AddSecurityPriceAsync(sec, 140m, Utc(2024, 7, 1));
 
         await AssertAgreeAtAllAsync(
-            _fixture, ledger.LedgerId,
+            Db, ledger.LedgerId,
             Utc(2024, 1, 15), Utc(2024, 2, 1), Utc(2024, 3, 5),
             Utc(2024, 4, 1), Utc(2024, 5, 1), Utc(2024, 6, 5), Utc(2024, 9, 1));
     }
@@ -209,7 +210,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
     [Fact]
     public async Task Batching_is_invariant_for_a_position_closed_mid_window()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var kept = await ledger.AddSecurityAsync("Kept", "KPT");
@@ -223,7 +224,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
         await ledger.AddSecurityPriceAsync(sold, 60m, Utc(2024, 6, 1));
 
         await AssertAgreeAtAllAsync(
-            _fixture, ledger.LedgerId,
+            Db, ledger.LedgerId,
             Utc(2024, 2, 1), Utc(2024, 5, 10), Utc(2024, 5, 11), Utc(2024, 12, 31));
     }
 
@@ -237,7 +238,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
     [Fact]
     public async Task Batching_is_invariant_when_the_price_predates_a_split()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var sec = await ledger.AddSecurityAsync("Stale", "STL");
@@ -247,7 +248,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
         await ledger.AddSecuritySplitAsync(sec, 4m, Utc(2024, 3, 1));     // nothing priced after
 
         await AssertAgreeAtAllAsync(
-            _fixture, ledger.LedgerId,
+            Db, ledger.LedgerId,
             Utc(2024, 1, 15), Utc(2024, 2, 15), Utc(2024, 3, 15), Utc(2024, 12, 1));
     }
 
@@ -260,7 +261,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
     [Fact]
     public async Task Batching_is_invariant_when_only_trade_prices_exist()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var sec = await ledger.AddSecurityAsync("Unpriced", "UNP");
@@ -269,7 +270,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
         await ledger.AddInvestmentBuyAsync(brokerage.Id, holdings, sec, 5m, 130m, Utc(2024, 4, 10));
 
         await AssertAgreeAtAllAsync(
-            _fixture, ledger.LedgerId,
+            Db, ledger.LedgerId,
             Utc(2024, 2, 1), Utc(2024, 4, 10), Utc(2024, 8, 1));
     }
 
@@ -282,7 +283,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
     [Fact]
     public async Task Batching_is_invariant_across_accounts_sharing_a_security()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var one = await ledger.AddInvestmentAccountAsync("Brokerage One");
         var two = await ledger.AddInvestmentAccountAsync("Brokerage Two");
         var sec = await ledger.AddSecurityAsync("Shared", "SHR");
@@ -297,7 +298,7 @@ public sealed class HoldingsValueAsOfSetBatchingTests
         await ledger.AddSecurityPriceAsync(sec, 55m, Utc(2024, 6, 1));
 
         await AssertAgreeAtAllAsync(
-            _fixture, ledger.LedgerId,
+            Db, ledger.LedgerId,
             Utc(2024, 1, 15), Utc(2024, 2, 10), Utc(2024, 3, 1),
             Utc(2024, 4, 10), Utc(2024, 12, 1));
     }

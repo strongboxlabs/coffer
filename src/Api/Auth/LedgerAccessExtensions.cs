@@ -34,7 +34,7 @@ public static class LedgerAccessExtensions
 
     /// <summary>
     /// Gate every endpoint at READ level (any grant), regardless of method — for
-    /// user-OWNED per-ledger surfaces (dashboard preferences, account groups) that a
+    /// user-OWNED per-ledger surfaces (dashboard preferences, saved reports) that a
     /// viewer may still manage for their own view. These tables are deliberately not
     /// role-gated by migration 174.
     /// </summary>

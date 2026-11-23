@@ -2,7 +2,7 @@
 -- 247 — snapshot restore: chunk-safe self-references, security_components,
 --       and references to rows a restore does not bring back
 --
--- Found by a failed production restore (2026-10-09):
+-- A v3 restore of any ledger past one chunk with a forward merge fails with:
 --
 --   ERROR: insert or update on table "txn_headers" violates foreign key
 --          constraint "txn_headers_is_merged_into_ledger_fkey"
@@ -19,10 +19,11 @@
 --      txn_headers.is_merged_into     — a merged header points at its winner
 --      accounts.parent_id             — a category points at its parent
 --      accounts.holdings_account_id   — a brokerage points at its holdings sibling
---    Which rows cross is decided by random uuids, so any ledger past 2000
---    headers with a merge was a coin flip per merge — and once one crossing
---    exists, EVERY snapshot of that ledger is unrestorable. Small ledgers fit in
---    one chunk, which is why every test passed.
+--    Which rows cross is decided by random uuids, so in any ledger past one
+--    chunk each merge is a coin flip — and once one crossing exists, EVERY
+--    snapshot of that ledger is unrestorable. A ledger that fits in one chunk
+--    never crosses, so a test has to force small chunks to reach this (ALSO,
+--    below).
 --
 --    Fix: DEFERRABLE INITIALLY DEFERRED, mig 124's answer for the same problem
 --    (recurring_transactions.template_header_id, the mutual reference with
@@ -67,8 +68,8 @@
 --    DELETE FROM txn_headers took every row with it and nothing put them back:
 --    afterwards each sync run read "0 promoted", and the pending amount each
 --    promotion recorded — the only place it survives — was gone. It is now
---    CAPTURED, so it rolls back with the transactions it describes (decided
---    2026-10-09). Its parent ledger_operations stays outside the snapshot; no
+--    CAPTURED, so it rolls back with the transactions it describes. Its parent
+--    ledger_operations stays outside the snapshot; no
 --    app path deletes a run short of deleting its ledger, which the guard
 --    records as an assumption rather than leaving implicit.
 --
@@ -101,7 +102,7 @@
 --
 -- Every existing snapshot is retired by this migration (ADR-0037: restore
 -- refuses a cross-schema-version snapshot). That is the settled posture, and
--- the snapshots it retires were not restorable for this ledger anyway.
+-- a snapshot holding a chunk-crossing self-reference was not restorable anyway.
 -- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
@@ -252,9 +253,9 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     -- Ceiling for the unchunked path only. Two uuid columns per row, so even at
-    -- this many rows the aggregate is tens of MB — far from the multi-GB peak
-    -- that mig 193 set out to eliminate — but it fails rather than degrading
-    -- quietly.
+    -- this many rows the aggregate is tens of MB — bounded, unlike the
+    -- whole-payload aggregate mig 193 set out to eliminate — but it fails rather
+    -- than degrading quietly.
     c_unchunked_max CONSTANT bigint := 500000;
 
     v_has_id  boolean;
@@ -461,8 +462,8 @@ BEGIN
         'txn_legs',                         (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_legs t WHERE t.ledger_id = p_ledger_id),
         'txn_leg_recon',                    (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_leg_recon t WHERE t.ledger_id = p_ledger_id),
         'lots',                             (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM lots t WHERE t.ledger_id = p_ledger_id),
-        -- mig 188: realized_gains is derived, but re-deriving it on restore cost
-        -- ~27s and overwrote the holdings/lots restored above. Keys on
+        -- mig 188: realized_gains is derived, but re-deriving it on restore walked
+        -- the whole ledger and overwrote the holdings/lots restored above. Keys on
         -- sell_leg_id (a captured txn_legs row) so it round-trips 1:1.
         'realized_gains',                   (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM realized_gains t WHERE t.ledger_id = p_ledger_id),
         'txn_header_originals',             (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_header_originals t WHERE t.ledger_id = p_ledger_id),

@@ -18,29 +18,31 @@ using static OpenIddict.Abstractions.OpenIddictConstants;
 namespace Coffer.Api.Tests.Integration.Mcp;
 
 /// <summary>
-/// The MCP authorization server after the 2026-10-12 security audit (H1, M1, H2).
+/// The MCP authorization server's consent and redirect rules (ADR-0105 D3, D5).
 /// </summary>
 /// <remarks>
-/// H1: anonymous client registration accepted <c>javascript://localhost/…</c> (the check
-/// was "https OR IsLoopback", and IsLoopback reads only the host), and with form_post,
-/// approving consent ran that script on Coffer's origin — confirmed by test before the
-/// fix. M1: a post to /oauth/authorize without decision=deny issued a code, so a page on
-/// a sibling subdomain could get one; and the consent screen showed a client name taken
-/// from the link. H2: a disabled user's app kept refreshing.
+/// Redirect URIs: a check of "https OR IsLoopback" accepts <c>javascript://localhost/…</c>
+/// at anonymous client registration, because IsLoopback reads only the host, and with
+/// form_post, approving consent would run that script on Coffer's origin. Consent: a post
+/// to /oauth/authorize that issues a code unless it says decision=deny lets a page on a
+/// sibling subdomain get one, and a consent screen that shows a client name taken from
+/// the link shows the client's own words. Disable: a disabled user's app must not keep
+/// refreshing.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class OAuthConsentSecurityTests
+public sealed class OAuthConsentSecurityTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public OAuthConsentSecurityTests(PostgresFixture fixture) => _fixture = fixture;
+    public OAuthConsentSecurityTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private const string RedirectUri = "https://example.com/callback";
     private const string CodeChallenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
     private const string CodeVerifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 
     private ApiFactory Factory() =>
-        new ApiFactory(_fixture).WithMcpEnabled().WithConfig("Api:Cookie:RequireHttps", "false");
+        new ApiFactory(Db).WithMcpEnabled().WithConfig("Api:Cookie:RequireHttps", "false");
 
     private static async Task SeedClientAsync(
         WebApplicationFactory<Program> factory, string clientId, string redirectUri = RedirectUri,
@@ -155,7 +157,7 @@ public sealed class OAuthConsentSecurityTests
     [Fact]
     public async Task Authorize_refuses_a_client_registered_with_a_javascript_redirect_before_the_rule()
     {
-        // Seeded through the manager, as a registration made before the fix would be.
+        // Seeded through the manager, as a registration made before the rule existed would be.
         const string evil = "javascript://localhost/%0Aalert(1)";
         await using var factory = Factory();
         await SeedClientAsync(factory, "legacy-js-client", evil);
@@ -215,6 +217,32 @@ public sealed class OAuthConsentSecurityTests
     }
 
     [Fact]
+    public async Task The_authorization_response_iss_is_the_discovery_issuer()
+    {
+        // RFC 9207: a client compares the response's iss to the issuer in the metadata
+        // (RFC 8414 §3.3), exactly. OpenIddict appends "/" to a root issuer; both must
+        // be the slash-free origin the protected-resource metadata names.
+        await using var factory = Factory();
+        await SeedClientAsync(factory, "consent-iss");
+        using var client = await SignedInClientAsync(factory);
+        var parameters = AuthorizeParameters("consent-iss");
+        var (_, ticket) = await ConsentRedirectAsync(client, parameters);
+
+        var discovery = await client.GetFromJsonAsync<JsonElement>("/.well-known/oauth-authorization-server");
+        var issuer = discovery.GetProperty("issuer").GetString();
+
+        var response = await PostDecisionAsync(client, parameters, "allow", ticket);
+        Assert.True(CarriesACode(response));
+        var location = response.Headers.Location!.OriginalString;
+        var iss = QueryHelpers.ParseQuery(location[location.IndexOf('?')..])["iss"].ToString();
+
+        Assert.False(string.IsNullOrEmpty(iss));
+        Assert.DoesNotContain("iss=" + Uri.EscapeDataString(iss + "/"), location);
+        Assert.False(iss.EndsWith('/'));
+        Assert.Equal(issuer, iss);
+    }
+
+    [Fact]
     public async Task A_ticket_cannot_approve_a_different_code_challenge()
     {
         // Swapping in an attacker's PKCE challenge after the user looked would hand the
@@ -260,8 +288,8 @@ public sealed class OAuthConsentSecurityTests
         // the dev system user, who owns the ticket, and the check would prove nothing.
         await using var factory = Factory().WithoutDevAuth();
         await SeedClientAsync(factory, "consent-other-user");
-        using var owner = await PlainCookieClientAsync(factory, await SyntheticLedger.CreateAsync(_fixture));
-        using var stranger = await PlainCookieClientAsync(factory, await SyntheticLedger.CreateAsync(_fixture));
+        using var owner = await PlainCookieClientAsync(factory, await SyntheticLedger.CreateAsync(Db));
+        using var stranger = await PlainCookieClientAsync(factory, await SyntheticLedger.CreateAsync(Db));
         var (_, ticket) = await ConsentRedirectAsync(owner, AuthorizeParameters("consent-other-user"));
 
         Assert.Equal(HttpStatusCode.OK, (await owner.GetAsync($"/api/oauth/consent/{ticket}")).StatusCode);
@@ -286,7 +314,7 @@ public sealed class OAuthConsentSecurityTests
     [Fact]
     public async Task A_disabled_users_app_can_no_longer_refresh()
     {
-        var user = await SyntheticLedger.CreateAsync(_fixture);
+        var user = await SyntheticLedger.CreateAsync(Db);
         await using var factory = Factory();
         await SeedClientAsync(factory, "disabled-refresh");
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
@@ -310,7 +338,7 @@ public sealed class OAuthConsentSecurityTests
 
         // The flag alone, without the revocation that disabling also does: the
         // exchange itself must refuse a disabled subject.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             await db.Users.Where(u => u.Id == user.UserId)
                 .ExecuteUpdateAsync(s => s.SetProperty(u => u.IsDisabled, _ => true));
 

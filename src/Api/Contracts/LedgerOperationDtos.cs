@@ -8,6 +8,9 @@ namespace Coffer.Api.Contracts;
 /// renders the relevant keys per family. <see cref="TriggeredByUserId"/> is the
 /// real user, or the system user for scheduled runs.
 /// </summary>
+/// <param name="FeedConnectionId">The bank feed connection a feed sync pulled, so a
+/// ledger with several connections can tell their runs apart; null for every other
+/// operation, and for a sync whose connection has since been removed.</param>
 public sealed record LedgerOperationSummaryDto(
     Guid Id,
     string Family,
@@ -18,4 +21,5 @@ public sealed record LedgerOperationSummaryDto(
     DateTime? CompletedAt,
     Guid? TriggeredByUserId,
     IReadOnlyDictionary<string, int> Details,
-    int ErrorCount);
+    int ErrorCount,
+    Guid? FeedConnectionId = null);

@@ -22,11 +22,12 @@ namespace Coffer.Api.Tests.Integration.Reminders;
 /// every shared-table read is scoped by the test's ledger/series ids.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class RemindersMutationTests
+public sealed class RemindersMutationTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public RemindersMutationTests(PostgresFixture fixture) => _fixture = fixture;
+    public RemindersMutationTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -42,6 +43,14 @@ public sealed class RemindersMutationTests
         return doc.TryGetProperty("code", out var code) ? code.GetString() : null;
     }
 
+    /// <summary>A by-hand post of the one-line rent series the tests below create,
+    /// at its template amount.</summary>
+    private static FireBankReminderRequest PostAsIs(DateOnly occurrence, Guid bankId, Guid catId) => new()
+    {
+        OccurrenceDate = occurrence, SourceAccountId = bankId,
+        Postings = [new TransactionPosting { CounterpartyAccountId = catId, Amount = -1500m }],
+    };
+
     // -----------------------------------------------------------------------
     // BANK create + keystone
     // -----------------------------------------------------------------------
@@ -49,11 +58,11 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Create_bank_reminder_materializes_template_series_and_never_hits_balances()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var req = new CreateReminderRequest
@@ -62,7 +71,7 @@ public sealed class RemindersMutationTests
             StartDate = new DateOnly(2026, 1, 1),
             AutoCommitDaysBefore = 2,
             Payee = "Rent",
-            Memo = "to landlord",
+            Notes = new TransactionNotesRequest { Side = bank.Id, Memo = "to landlord", Tags = ["housing"] },
             SourceAccountId = bank.Id,
             Postings = new[] { new TransactionPosting { CounterpartyAccountId = cat.Id, Amount = -1500m } },
         };
@@ -84,7 +93,7 @@ public sealed class RemindersMutationTests
             $"/api/ledgers/{ledger.LedgerId}/reminders");
         Assert.Equal(-1500m, Assert.Single(list!).Amount);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var template = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.LedgerId == ledger.LedgerId && h.IsRecurringTemplate);
         Assert.Equal("manual", template.Origin);
@@ -97,6 +106,15 @@ public sealed class RemindersMutationTests
         Assert.Equal("manual", series.Origin);
         Assert.Null(series.ExternalId);
         Assert.Equal(template.Id, series.TemplateHeaderId);
+
+        // The template's one-split notes are its source's own, on the source leg.
+        Assert.Null(template.Memo);
+        Assert.Equal(bank.Id, template.OriginatingAccountId);
+        var notes = await ledger.LoadNotesAsync(template.Id);
+        var bankLeg = notes.Legs.Single(l => l.Key.AccountId == bank.Id).Value;
+        Assert.Equal("to landlord", bankLeg.Memo);
+        Assert.Equal(["housing"], bankLeg.Tags);
+        Assert.True(notes.Header.IsEmpty);
 
         // KEYSTONE: the template produces NO balance row, and the source
         // account balance is untouched (the recompute ran via the interceptor
@@ -114,11 +132,11 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Create_investment_reminder_template_never_touches_holdings_lots_or_balances()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("Index Fund A", "TESTX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var req = new CreateInvestmentReminderRequest
@@ -145,7 +163,7 @@ public sealed class RemindersMutationTests
         // (security/qty/price). The holdings-side leg carries the metadata.
         Assert.Contains(detail.Legs, l => l.SecurityId == securityId && l.Quantity == 10m && l.UnitPrice == 100m);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var template = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.LedgerId == ledger.LedgerId && h.IsRecurringTemplate);
         Assert.Equal("buy", template.Action);
@@ -169,11 +187,11 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Create_investment_reminder_reuses_action_field_validation()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("Index Fund A", "TESTX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // buy without shares → the SHARED investment validator rejects it.
@@ -194,7 +212,7 @@ public sealed class RemindersMutationTests
         Assert.Equal(BusinessError.Codes.InvestmentTxnSharesRequired, await ErrorCodeAsync(resp));
 
         // and nothing was written.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Equal(0, await db.TxnHeaders.AsNoTracking().CountAsync(h => h.LedgerId == ledger.LedgerId));
         Assert.Equal(0, await db.RecurringTransactions.AsNoTracking().CountAsync(r => r.LedgerId == ledger.LedgerId));
     }
@@ -206,12 +224,12 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Create_bank_rejects_invalid_rrule_and_investment_source()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var badRule = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders",
@@ -241,12 +259,12 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Create_bank_rejects_counterparty_in_another_ledger()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var other = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var other = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var foreignCat = await other.AddCategoryAsync("foreign");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders",
@@ -268,12 +286,12 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Edit_bank_updates_schedule_and_postings_keeping_template_off_balances()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
         var cat2 = await ledger.AddCategoryAsync("utilities");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var created = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders",
@@ -309,7 +327,7 @@ public sealed class RemindersMutationTests
         Assert.Equal(4, detail.Legs.Count);                 // two postings × two legs
         Assert.Equal(0m, detail.Legs.Sum(l => l.Amount));   // still balances
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var template = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.LedgerId == ledger.LedgerId && h.IsRecurringTemplate);
         Assert.Equal(4, await db.TxnLegs.AsNoTracking().CountAsync(l => l.HeaderId == template.Id));
@@ -319,11 +337,11 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Edit_rejects_empty_patch_and_shape_mismatch()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var created = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders",
@@ -356,11 +374,11 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Disable_drops_from_upcoming_but_stays_listed_then_enable_restores()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var created = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders",
@@ -401,11 +419,11 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Skip_marks_occurrence_skipped_advances_cursor_and_is_idempotent()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var created = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders",
@@ -440,7 +458,7 @@ public sealed class RemindersMutationTests
             new SkipReminderRequest { OccurrenceDate = skipDate });
         Assert.Equal(HttpStatusCode.OK, skipAgain.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Equal(1, await db.RecurringOccurrenceExceptions.AsNoTracking()
             .CountAsync(e => e.RecurringTransactionId == reminderId && e.OccurrenceDate == skipDate));
     }
@@ -450,14 +468,14 @@ public sealed class RemindersMutationTests
     {
         // Regression (ADR-0049 D11): a series that started years ago, skipped at a
         // recent occurrence, must land the next-due cursor on the next FUTURE slot
-        // — not NULL. ComputeNextDueAsync once anchored its expansion horizon to
-        // start+2y, which a multi-year catch-up backlog exhausted, stranding the
-        // cursor at null. The horizon now anchors to the latest consumed slot.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        // — not NULL. An expansion horizon anchored to start+2y would be
+        // exhausted by a multi-year catch-up backlog, stranding the cursor at
+        // null, so ComputeNextDueAsync anchors it to the latest consumed slot.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var created = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders",
@@ -486,11 +504,11 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Skip_and_fire_are_mutually_exclusive_per_slot()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var created = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders",
@@ -507,19 +525,19 @@ public sealed class RemindersMutationTests
         // Skip Feb, then firing Feb is refused.
         var feb = new DateOnly(2026, 2, 1);
         await client.PostAsJsonAsync($"{baseUrl}/skip", new SkipReminderRequest { OccurrenceDate = feb });
-        var fireSkipped = await client.PostAsJsonAsync($"{baseUrl}/fire", new FireReminderRequest { OccurrenceDate = feb });
+        var fireSkipped = await client.PostAsJsonAsync($"{baseUrl}/fire/bank", PostAsIs(feb, bank.Id, cat.Id));
         Assert.Equal(HttpStatusCode.UnprocessableEntity, fireSkipped.StatusCode);
         Assert.Equal(BusinessError.Codes.ReminderOccurrenceSkipped, await ErrorCodeAsync(fireSkipped));
 
         // Fire Mar, then skipping Mar is refused.
         var mar = new DateOnly(2026, 3, 1);
-        var fireMar = await client.PostAsJsonAsync($"{baseUrl}/fire", new FireReminderRequest { OccurrenceDate = mar });
+        var fireMar = await client.PostAsJsonAsync($"{baseUrl}/fire/bank", PostAsIs(mar, bank.Id, cat.Id));
         Assert.Equal(HttpStatusCode.OK, fireMar.StatusCode);
         var skipFired = await client.PostAsJsonAsync($"{baseUrl}/skip", new SkipReminderRequest { OccurrenceDate = mar });
         Assert.Equal(HttpStatusCode.UnprocessableEntity, skipFired.StatusCode);
         Assert.Equal(BusinessError.Codes.ReminderOccurrenceAlreadyFired, await ErrorCodeAsync(skipFired));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Equal(0, await db.RecurringOccurrenceExceptions.AsNoTracking()
             .CountAsync(e => e.RecurringTransactionId == reminderId && e.OccurrenceDate == mar));
     }
@@ -531,12 +549,12 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Mutations_reject_when_ledger_not_visible_to_caller()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var stranger = await SyntheticLedger.CreateAsync(_fixture);   // different user, no grant on `ledger`
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var stranger = await SyntheticLedger.CreateAsync(Db);   // different user, no grant on `ledger`
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var strangerClient = await AuthedClientAsync(factory, stranger);
 
         var resp = await strangerClient.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders",
@@ -550,7 +568,7 @@ public sealed class RemindersMutationTests
         Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
         Assert.Equal(BusinessError.Codes.LedgerNotVisible, await ErrorCodeAsync(resp));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Equal(0, await db.RecurringTransactions.AsNoTracking().CountAsync(r => r.LedgerId == ledger.LedgerId));
     }
 
@@ -564,11 +582,11 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Acting_catches_up_earlier_unacted_occurrences_but_preserves_a_fired_one()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var created = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders",
@@ -584,8 +602,8 @@ public sealed class RemindersMutationTests
 
         // Fire the EARLIEST occurrence (Jan 1): real committed cash, nothing
         // earlier to catch up.
-        var fireJan = await client.PostAsJsonAsync($"{baseUrl}/fire",
-            new FireReminderRequest { OccurrenceDate = new DateOnly(2026, 1, 1) });
+        var fireJan = await client.PostAsJsonAsync($"{baseUrl}/fire/bank",
+            PostAsIs(new DateOnly(2026, 1, 1), bank.Id, cat.Id));
         Assert.Equal(HttpStatusCode.OK, fireJan.StatusCode);
         Assert.Equal(0, (await fireJan.Content.ReadFromJsonAsync<FireReminderResponse>())!.SkippedEarlierCount);
 
@@ -599,7 +617,7 @@ public sealed class RemindersMutationTests
         Assert.Equal(new DateOnly(2026, 2, 1), skipResp.SkippedEarlierFrom);
         Assert.Equal(new DateOnly(2026, 5, 1), skipResp.NextDueDate);   // cursor past the acted Apr
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         // Jan stays a committed (fired) header — NOT converted to a skip.
         Assert.Equal(1, await db.TxnHeaders.AsNoTracking()
             .CountAsync(h => h.RecurringTransactionId == reminderId && !h.IsRecurringTemplate
@@ -621,12 +639,12 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Edit_investment_replace_all_keeps_template_off_holdings_lots_and_balances()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var sec1 = await ledger.AddSecurityAsync("Fund A", "AAAX");
         var sec2 = await ledger.AddSecurityAsync("Fund B", "BBBX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var created = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders/investment",
@@ -658,7 +676,7 @@ public sealed class RemindersMutationTests
         var detail = await edit.Content.ReadFromJsonAsync<ReminderDetail>();
         Assert.Contains(detail!.Legs, l => l.SecurityId == sec2 && l.Quantity == 5m);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var template = await db.TxnHeaders.AsNoTracking()
             .SingleAsync(h => h.LedgerId == ledger.LedgerId && h.IsRecurringTemplate);
         Assert.Equal(0, await db.Holdings.AsNoTracking().CountAsync(h => h.LedgerId == ledger.LedgerId));
@@ -674,11 +692,11 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Edit_rejects_single_sided_end_date_before_existing_start()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var created = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders",
@@ -699,7 +717,7 @@ public sealed class RemindersMutationTests
         Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
         Assert.Equal(BusinessError.Codes.ReminderEndBeforeStart, await ErrorCodeAsync(resp));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var series = await db.RecurringTransactions.AsNoTracking().SingleAsync(r => r.Id == reminderId);
         Assert.Null(series.EndDate);   // rolled back
     }
@@ -713,11 +731,11 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Snapshot_round_trip_preserves_reminder_series_template_and_skips()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var created = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders",
@@ -744,7 +762,7 @@ public sealed class RemindersMutationTests
         var skipB = new DateOnly(2026, 2, 1);
         await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders/{reminderId}/skip",
             new SkipReminderRequest { OccurrenceDate = skipB });
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             Assert.Equal(2, await db.RecurringOccurrenceExceptions.AsNoTracking()
                 .CountAsync(e => e.RecurringTransactionId == reminderId));
 
@@ -755,7 +773,7 @@ public sealed class RemindersMutationTests
             $"/api/ledgers/{ledger.LedgerId}/snapshots/{snapId}/restore", content: null);
         Assert.Equal(HttpStatusCode.NoContent, restore.StatusCode);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.Equal(1, await db.RecurringTransactions.AsNoTracking().CountAsync(r => r.Id == reminderId));
             Assert.Equal(1, await db.TxnHeaders.AsNoTracking()
@@ -777,11 +795,11 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Fire_with_bank_override_commits_the_edited_amount_and_payee()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("utilities");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var created = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders",
@@ -809,7 +827,7 @@ public sealed class RemindersMutationTests
         Assert.Equal(HttpStatusCode.OK, fire.StatusCode);
         var committedId = (await fire.Content.ReadFromJsonAsync<FireReminderResponse>())!.HeaderId;
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == committedId);
         Assert.False(header.IsRecurringTemplate);
         Assert.Equal(reminderId, header.RecurringTransactionId);
@@ -830,11 +848,11 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Fire_investment_with_override_commits_edited_shares_with_holdings_and_lots()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("Index Fund A", "TESTX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var created = await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders/investment",
@@ -867,7 +885,7 @@ public sealed class RemindersMutationTests
         Assert.Equal(HttpStatusCode.OK, fire.StatusCode);
         var committedId = (await fire.Content.ReadFromJsonAsync<FireReminderResponse>())!.HeaderId;
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking().SingleAsync(h => h.Id == committedId);
         Assert.Equal(reminderId, header.RecurringTransactionId);
         Assert.Equal(occ, header.OccurrenceDate);
@@ -885,13 +903,13 @@ public sealed class RemindersMutationTests
     [Fact]
     public async Task Fire_override_routes_reject_cross_shape()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var cat = await ledger.AddCategoryAsync("rent");
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("Fund", "FND");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var bankRem = (await (await client.PostAsJsonAsync($"/api/ledgers/{ledger.LedgerId}/reminders",

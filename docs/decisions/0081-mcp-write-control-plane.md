@@ -77,6 +77,16 @@ one-entity-per-call. Backed by a new public `TransactionsRepository`
 tag-assignment method extracted from the existing private replace-set logic (with a
 header-in-ledger guard), run under RLS like the other write tools (ADR-0068 D5).
 
+*Amended 2026-10-27 (ADR-0108 D17): tags are written from a side.* Each side of a
+transaction carries its own tags, so the tool gains a REQUIRED `accountId`, the register
+the tags are written from; a breaking change for any caller. The set lands on that
+account's own leg of a one-posting transaction (the brokerage leg of a one-posting
+event), and on the header of a split or a multi-posting event. Writes go through the
+write primitive, so the stored presentation is recomputed in the same transaction. The
+bulk call still fails whole: if any target is outside the ledger, not on that account,
+or read-only in that account's register, nothing is tagged. `dryRun` reports, per
+transaction, where the set would land (`side` or `transaction`) or why it would not.
+
 ## Consequences
 
 - MCP writes become safe to enable: read tokens can't write, off is immediate, every
@@ -88,10 +98,9 @@ header-in-ledger guard), run under RLS like the other write tools (ADR-0068 D5).
 ## Revision — write gating is the kill-switch, not per-client (0.30.1)
 
 D1/D5 originally gated OAuth write **per-client** (DCR clients read-only; an admin
-grants `coffer.write` per client via D5). This did not survive contact with
-`mcp-remote`, which requests **every** advertised scope: the moment 0.30.0 advertised
-`coffer.write`, a read-only DCR client requesting it was rejected by OpenIddict
-(ID2051) — breaking the *entire* connection, not just writes.
+grants `coffer.write` per client via D5). `mcp-remote` requests **every** advertised
+scope, so with `coffer.write` advertised (0.30.0) a read-only DCR client requesting it
+is rejected by OpenIddict (ID2051) — breaking the *entire* connection, not just writes.
 
 Reconciled in **0.30.1**: `IgnoreScopePermissions()` lets any client request
 `coffer.write` without a per-client rejection, so the connection succeeds; the **sole
@@ -100,7 +109,7 @@ write gate is the runtime kill-switch (D2) + `McpWriteGuard`** — the token mus
 AND writes must be enabled deployment-wide. The per-client write-grant endpoint +
 Settings toggle were removed. `coffer.read`-only tokens still can't write, and writes
 stay off by default — the opt-in is now consent/`Writable`, not an admin per-client
-grant. Lesson: an advertised scope is one every client will request — don't advertise
+grant. The rule: an advertised scope is one every client will request — don't advertise
 what only some clients may use.
 
 Follow-up in **0.30.2**: the OAuth consent screen (`ConsentPage`) now derives its copy
@@ -117,7 +126,7 @@ The per-ledger write check (`McpLedgerWriteAuthFilter`) passed any write call wh
 `ledgerId` argument was missing, misnamed or not a GUID, and left it to RLS. It now
 refuses such a call, and refuses when no authorizer is available to answer. Every write
 tool must take a `Guid ledgerId`. `McpWriteGuardTests` picks the write tools by their
-`McpServerTool` attribute: picking them by return type had missed the two bulk recategorize
+`McpServerTool` attribute: picking them by return type misses the two bulk recategorize
 tools. It checks that set against `ToolNames` and holds each tool to the `ledgerId`
 parameter. The settings panel now says, beside the writes switch, that payee and memo text
 from the bank reaches the AI. That switch is what stops a crafted payee from changing data.

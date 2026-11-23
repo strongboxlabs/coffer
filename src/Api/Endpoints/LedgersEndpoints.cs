@@ -9,7 +9,12 @@ using Coffer.Api.Contracts;
 using Coffer.Api.Db;
 using Coffer.Api.Db.Repositories;
 using Coffer.Api.Errors;
+using Coffer.Api.Import;
 using Coffer.Api.Provisioning;
+using Coffer.Api.Provisioning.DemoSeeding;
+using Coffer.Api.Quotes;
+using Coffer.Api.Quotes.MarketSeries;
+using Coffer.Domain.Money;
 
 namespace Coffer.Api.Endpoints;
 
@@ -32,6 +37,9 @@ public static class LedgersEndpoints
         group.MapDelete("/{ledgerId:guid}", DeleteAsync);
         group.MapGet("/me/last-opened", GetLastOpenedAsync);
         group.MapPut("/me/last-opened/{ledgerId:guid}", PutLastOpenedAsync);
+        // The hub's Demo ledger (ADR-0115 D2, D3): add one, and find its build again.
+        group.MapPost("/demo", DemoLedgerEndpoints.StartAsync);
+        group.MapGet("/demo/job", DemoLedgerEndpoints.GetJob);
 
         return routes;
     }
@@ -50,29 +58,70 @@ public static class LedgersEndpoints
                 "Ledger not found or not visible to this user.");
         if (ledger.Role != "owner")
             return BusinessError.Problem(BusinessError.Codes.LedgerNotOwner,
-                "Only an owner can rename or delete a ledger.");
+                "Only an owner can rename a ledger, change its reporting currency, or delete it.");
         return null;
     }
 
+    /// <summary>
+    /// <c>PATCH /api/ledgers/{ledgerId}</c> — rename the ledger, change its reporting
+    /// currency (ADR-0114 D7), or both. Owner only.
+    /// <para>422: <c>ledger-name-required</c> (a blank name, or neither field sent),
+    /// <c>ledger-currency-invalid</c>, <c>ledger-not-visible</c>, <c>ledger-not-owner</c>,
+    /// <c>ledger-write-busy</c>.</para>
+    /// <para>A currency change starts a market-series backfill under the owner's own
+    /// consent (ADR-0114 D11); the response does not wait for it.</para>
+    /// </summary>
     private static async Task<IResult> RenameAsync(
         Guid ledgerId,
-        RenameLedgerRequest request,
+        UpdateLedgerRequest request,
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
+        MarketSeriesBackfill backfill,
         CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(request.Name))
+        if (request.Name is null && request.CurrencyCode is null)
+            return BusinessError.Problem(BusinessError.Codes.LedgerNameRequired,
+                "name or currencyCode is required.");
+        if (request.Name is not null && string.IsNullOrWhiteSpace(request.Name))
             return BusinessError.Problem(BusinessError.Codes.LedgerNameRequired,
                 "name is required.");
+        string? currency = null;
+        if (request.CurrencyCode is not null && !CurrencyCodes.TryNormalize(request.CurrencyCode, out currency))
+            return LedgerCurrencyInvalid();
 
         var gate = await RequireOwnerAsync(currentUser.UserId, ledgerId, ledgers, cancellationToken)
             .ConfigureAwait(false);
         if (gate is not null) return gate;
 
-        await ledgers.RenameAsync(ledgerId, request.Name.Trim(), cancellationToken)
-                     .ConfigureAwait(false);
+        // A new reporting currency must be one a ledger can take (ADR-0114 D15). Resending
+        // the ledger's own stored code is not a change, so a code stored before the rule
+        // keeps working, at 2 places.
+        if (currency is not null && !CurrencyMinorUnits.IsAcceptedAccountCurrency(currency))
+        {
+            var stored = await ledgers.GetVisibleByIdAsync(currentUser.UserId, ledgerId, cancellationToken)
+                .ConfigureAwait(false);
+            if (!string.Equals(stored?.CurrencyCode, currency, StringComparison.Ordinal))
+                return LedgerCurrencyInvalid();
+        }
+
+        // The currency first: it is the half that can be refused as busy, and that refusal
+        // says nothing was changed, so the rename must not have run yet.
+        var currencyChanged = currency is not null
+            && await ledgers.SetReportingCurrencyAsync(ledgerId, currency, cancellationToken).ConfigureAwait(false);
+        if (request.Name is not null)
+            await ledgers.RenameAsync(ledgerId, request.Name.Trim(), cancellationToken)
+                         .ConfigureAwait(false);
+        if (currencyChanged)
+            backfill.Start(ledgerId, currentUser.UserId);
         return Results.NoContent();
     }
+
+    /// <summary>The refusal of a reporting currency a ledger cannot take: not an ISO 4217
+    /// currency with at most 3 places (ADR-0114 D15). Shared with the Moneydance import's
+    /// chosen currency (<see cref="ImportEndpoints"/>).</summary>
+    internal static IResult LedgerCurrencyInvalid() =>
+        BusinessError.Problem(BusinessError.Codes.LedgerCurrencyInvalid,
+            "The reporting currency must be an ISO 4217 currency code with at most 3 decimal places.");
 
     private static async Task<IResult> DeleteAsync(
         Guid ledgerId,
@@ -88,14 +137,32 @@ public static class LedgersEndpoints
         return Results.NoContent();
     }
 
+    /// <summary>
+    /// <c>GET /api/ledgers</c> — the caller's visible ledgers, each with
+    /// <see cref="LedgerListItem.DemoExamplesMissing"/> read from its Demo marker, if it
+    /// has one (ADR-0115 D9).
+    /// </summary>
     private static async Task<IResult> ListVisibleAsync(
         ICurrentUserAccessor currentUser,
         LedgersRepository ledgers,
+        LedgerOperationsRepository operations,
+        ImportJobRegistry jobs,
         CancellationToken cancellationToken)
     {
         var rows = await ledgers.GetVisibleAsync(currentUser.UserId, cancellationToken)
                                 .ConfigureAwait(false);
-        return Results.Ok(rows);
+        var markers = await operations
+            .DemoMarkersAsync(rows.Select(r => r.Id).ToList(), cancellationToken)
+            .ConfigureAwait(false);
+        var building = jobs.RunningDemoLedgerIds();
+
+        return Results.Ok(rows.Select(r =>
+        {
+            var missing = markers.TryGetValue(r.Id, out var marker)
+                ? DemoExamplesMissing.From(marker.Status, marker.DetailsJson, building.Contains(r.Id))
+                : null;
+            return new LedgerListItem(r.Id, r.Name, r.Role, r.CurrencyCode, missing);
+        }).ToList());
     }
 
     private static async Task<IResult> CreateAsync(
@@ -111,8 +178,15 @@ public static class LedgersEndpoints
             return BusinessError.Problem(BusinessError.Codes.LedgerNameRequired,
                 "name is required.");
 
+        // ADR-0114 D7: the reporting currency is chosen here; blank is USD.
+        var currency = DisplayCurrency.Fallback;
+        if (!string.IsNullOrWhiteSpace(request.CurrencyCode)
+            && (!CurrencyCodes.TryNormalize(request.CurrencyCode, out currency)
+                || !CurrencyMinorUnits.IsAcceptedAccountCurrency(currency)))
+            return LedgerCurrencyInvalid();
+
         var created = await ledgers.CreateWithOwnerAsync(
-            currentUser.UserId, request.Name.Trim(), cancellationToken).ConfigureAwait(false);
+            currentUser.UserId, request.Name.Trim(), currency, cancellationToken).ConfigureAwait(false);
 
         // ADR-0071 D5: seed a starter category tree (opt-in, default on) so the
         // new ledger is usable immediately. Best-effort — the ledger already

@@ -10,10 +10,10 @@ namespace Coffer.Api.Tests.Unit.Scheduling;
 /// <remarks>
 /// <para>
 /// <c>QuoteOrchestrator</c> catches every provider exception into its error list and
-/// returns normally. So a scheduled quote refresh in which EVERY provider was down
-/// completed without throwing, the scheduler recorded a clean run, and a dead-man's
-/// switch wired to "the handler did not throw" would have pinged its check green over a
-/// ledger whose prices had not moved in weeks.
+/// returns normally. So a scheduled quote refresh in which EVERY provider is down
+/// completes without throwing, and without an outcome channel the scheduler would record
+/// a clean run and a dead-man's switch wired to "the handler did not throw" would ping
+/// its check green over a ledger whose prices have stopped moving.
 /// </para>
 /// <para>
 /// That is worse than having no monitor: it manufactures exactly the confidence the
@@ -95,5 +95,89 @@ public sealed class QuoteRefreshOutcomeTests
     public void A_clean_run_is_ok()
     {
         Assert.Equal(JobRunResult.Ok, QuoteRefreshJobHandler.Classify(Outcome(["yahoo"])).Result);
+    }
+
+    // ----- exchange rates (ADR-0114 D11: they ride this job, so its switch watches them) -----
+
+    private static QuoteError PairFailed(string pair, string code = Coffer.Api.Quotes.Frankfurter.FrankfurterRatesClient.FetchFailedCode) =>
+        new(SecurityId: null, Ticker: pair, Code: code, Message: $"{pair}: HTTP 503 from the exchange-rate service");
+
+    [Fact]
+    public void Prices_refreshed_but_no_rate_stored_is_not_a_success()
+    {
+        // The trap again, one step over: the rate source down while every quote provider
+        // answers used to read Ok, so the switch stayed green while conversions went stale.
+        var result = QuoteRefreshJobHandler.Classify(Outcome(
+            ["yahoo"],
+            PairFailed("EUR/USD"),
+            PairFailed("GBP/USD")));
+
+        Assert.Equal(JobRunResult.Degraded, result.Result);
+        Assert.False(result.NothingDone);   // prices did land
+        Assert.Contains("Exchange rates were not stored (2 errors)", result.Message);
+        Assert.DoesNotContain("HTTP 503", result.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(Coffer.Api.Quotes.Frankfurter.FrankfurterRatesClient.FetchFailedCode)]
+    [InlineData(Coffer.Api.Quotes.Frankfurter.FrankfurterRatesClient.ParseFailedCode)]
+    [InlineData(Coffer.Api.Quotes.Frankfurter.FrankfurterRatesClient.BaseUrlInvalidCode)]
+    [InlineData(QuoteOrchestrator.MarketSeriesExceptionCode)]
+    [InlineData(Coffer.Api.Quotes.MarketSeries.MarketSeriesFetcher.LedgerWriteBusyCode)]
+    public void Every_code_that_means_rates_were_not_stored_degrades_the_run(string code)
+    {
+        var result = QuoteRefreshJobHandler.Classify(Outcome(["yahoo"], PairFailed("EUR/USD", code)));
+
+        Assert.Equal(JobRunResult.Degraded, result.Result);
+        Assert.Contains("Exchange rates were not stored (1 error)", result.Message);
+    }
+
+    [Fact]
+    public void A_rates_only_ledger_whose_rates_all_failed_did_nothing()
+    {
+        // A ledger of bank accounts in two currencies has no quote work, only rates. If
+        // none landed, the run did none of its work and must escalate like one.
+        var result = QuoteRefreshJobHandler.Classify(Outcome([], PairFailed("EUR/USD")));
+
+        Assert.Equal(JobRunResult.Degraded, result.Result);
+        Assert.True(result.NothingDone);
+    }
+
+    [Fact]
+    public void A_rates_only_ledger_that_stored_some_rates_did_part_of_its_work()
+    {
+        var result = QuoteRefreshJobHandler.Classify(
+            Outcome([], PairFailed("EUR/USD")) with { RatesInserted = 3 });
+
+        Assert.Equal(JobRunResult.Degraded, result.Result);
+        Assert.False(result.NothingDone);
+    }
+
+    [Fact]
+    public void Every_provider_and_the_rates_down_says_both_and_keeps_the_quote_message_first()
+    {
+        var result = QuoteRefreshJobHandler.Classify(Outcome(
+            ["yahoo"], ProviderDown("yahoo"), PairFailed("EUR/USD")));
+
+        Assert.True(result.NothingDone);
+        // Migration 252 matches stored messages on this prefix.
+        Assert.StartsWith("No quote provider succeeded", result.Message, StringComparison.Ordinal);
+        Assert.Contains("Exchange rates were not stored", result.Message);
+    }
+
+    [Theory]
+    [InlineData(Coffer.Api.Quotes.Yahoo.YahooBenchmarkClient.IndexRefusedCode)]
+    [InlineData(Coffer.Api.Quotes.Yahoo.YahooBenchmarkClient.InstrumentUnsupportedCode)]
+    [InlineData(Coffer.Api.Quotes.Yahoo.YahooBenchmarkClient.NoAdjustedCloseCode)]
+    [InlineData(Coffer.Api.Quotes.MarketSeries.MarketSeriesFetcher.BenchmarkCurrencyChangedCode)]
+    public void A_benchmark_refused_for_what_it_is_is_an_ordinary_healthy_run(string code)
+    {
+        // The per-symbol boundary, for benchmarks: an index or an unsupported instrument
+        // is refused every day by design, and must not turn the switch red every day.
+        var result = QuoteRefreshJobHandler.Classify(Outcome(
+            ["yahoo"],
+            new QuoteError(SecurityId: null, Ticker: "^EXAMPLE", Code: code, Message: "refused")));
+
+        Assert.Equal(JobRunResult.Ok, result.Result);
     }
 }

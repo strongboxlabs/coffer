@@ -1,5 +1,6 @@
-import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { forwardRef, useMemo, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import {
     BACKUPS_QUERY_KEY,
@@ -22,6 +23,9 @@ import { Button } from '@/components/ui/Button';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Panel, PanelBody } from '@/components/ui/Panel';
+import { pendingTextProps } from '@/components/ui/pending';
+import { PendingLabel } from '@/components/ui/PendingLabel';
+import { useFocusHandOff, useRowRemovalFocus } from '@/components/ui/rowRemovalFocus';
 import { ScheduleControl } from '@/components/ScheduleControl';
 
 import { GoogleDriveSyncCard } from './components/GoogleDriveSyncCard';
@@ -47,6 +51,9 @@ export function BackupsPanel() {
     // ScheduleControl below shares this exact cache key so there's one fetch.
     const scheduleQuery = useQuery({ queryKey: SCHEDULE_KEY, queryFn: fetchBackupSchedule });
     const passphraseSet = scheduleQuery.data?.passphraseConfigured ?? false;
+    // Known to be missing: the schedule has been read and says so. Until it has
+    // been read nothing is known, and what needs a passphrase waits on the read.
+    const passphraseMissing = scheduleQuery.isSuccess && !passphraseSet;
 
     const [passphraseOpen, setPassphraseOpen] = useState(false);
     const [deleteTarget, setDeleteTarget] = useState<BackupSummary | null>(null);
@@ -54,16 +61,20 @@ export function BackupsPanel() {
     /**
      * What just succeeded, said out loud.
      *
-     * Creating a backup used to confirm nothing: a row appeared somewhere in a
-     * list that already had rows, after a pause long enough to wonder whether
-     * the click registered. Failure was announced and success was not, which
-     * leaves the one outcome you most want to be sure of as the one you have
-     * to infer.
+     * Without it, creating a backup confirms nothing: a row appears somewhere in
+     * a list that already has rows, after a pause long enough to wonder whether
+     * the click registered. Announcing failure and not success leaves the one
+     * outcome you most want to be sure of as the one you have to infer.
      */
     const [actionNotice, setActionNotice] = useState<string | null>(null);
     /** Revealed backup passphrase (ADR-0092 D7). Component state only — never the
      *  query cache, and dropped when the panel unmounts. */
     const [revealedPassphrase, setRevealedPassphrase] = useState<string | null>(null);
+    // Hide takes away the block that holds it, with focus on it: focus goes to
+    // Show, which stays, else to Change (ADR-0023 §L).
+    const showRef = useRef<HTMLButtonElement | null>(null);
+    const changeRef = useRef<HTMLButtonElement | null>(null);
+    const hideHandOff = useFocusHandOff(() => showRef.current ?? changeRef.current);
 
     const revealMutation = useMutation({
         mutationFn: revealBackupPassphrase,
@@ -119,6 +130,13 @@ export function BackupsPanel() {
     });
 
     const backups = backupsQuery.data ?? [];
+    // A deleted backup takes its row's Delete with it: focus goes to the next
+    // row's Delete, the previous row's, or '+ Create backup' (ADR-0023 §L).
+    const createRef = useRef<HTMLButtonElement | null>(null);
+    const deleteControl = useRowRemovalFocus(
+        useMemo(() => (backupsQuery.data ?? []).map((b) => b.id), [backupsQuery.data]),
+        createRef,
+    );
 
     return (
         <section className="space-y-3">
@@ -144,11 +162,19 @@ export function BackupsPanel() {
                     <div className="flex items-center justify-between gap-3">
                         <div className="space-y-0.5">
                             <p className="text-sm font-medium">Backup passphrase</p>
-                            <p className="text-xs text-text-muted">
-                                {passphraseSet
-                                    ? 'Set. Used to encrypt every backup; required to restore.'
-                                    : 'Not set. Required before creating or scheduling a backup.'}
-                            </p>
+                            {scheduleQuery.isError ? (
+                                <p role="alert" className="text-xs text-state-danger">
+                                    {errorMessage(scheduleQuery.error, 'Could not read whether a passphrase is set.')}
+                                </p>
+                            ) : (
+                                <p className="text-xs text-text-muted">
+                                    {scheduleQuery.isPending
+                                        ? 'Loading…'
+                                        : passphraseSet
+                                            ? 'Set. Used to encrypt every backup; required to restore.'
+                                            : 'Not set. Required before creating or scheduling a backup.'}
+                                </p>
+                            )}
                         </div>
                         <div className="flex shrink-0 items-center gap-2">
                             {/* ADR-0092 D7. Without this an operator who forgot the
@@ -157,21 +183,24 @@ export function BackupsPanel() {
                                 though the server unseals it on every scheduled run. */}
                             {passphraseSet ? (
                                 <Button
+                                    ref={showRef}
                                     type="button"
                                     variant="ghost"
                                     size="sm"
                                     onClick={() => revealMutation.mutate()}
-                                    disabled={revealMutation.isPending}
+                                    pending={revealMutation.isPending}
+                                    pendingLabel="Confirming…"
                                 >
-                                    {revealMutation.isPending ? 'Confirming…' : 'Show'}
+                                    Show
                                 </Button>
                             ) : null}
                             <Button
+                                ref={changeRef}
                                 type="button"
                                 variant={passphraseSet ? 'ghost' : 'primary'}
                                 size="sm"
                                 onClick={() => setPassphraseOpen(true)}
-                                disabled={scheduleQuery.isPending}
+                                pending={scheduleQuery.isPending}
                             >
                                 {passphraseSet ? 'Change' : 'Set passphrase'}
                             </Button>
@@ -187,6 +216,7 @@ export function BackupsPanel() {
                                 {revealedPassphrase}
                             </code>
                             <Button
+                                ref={hideHandOff}
                                 type="button"
                                 variant="secondary"
                                 size="sm"
@@ -207,14 +237,19 @@ export function BackupsPanel() {
 
             <div className="flex justify-end">
                 <Button
+                    ref={createRef}
                     type="button"
                     variant="primary"
                     size="sm"
                     onClick={() => createMutation.mutate()}
-                    disabled={!passphraseSet || createMutation.isPending}
-                    title={!passphraseSet ? 'Set a backup passphrase first.' : undefined}
+                    // Unavailable with no passphrase, or when the schedule that says
+                    // whether there is one could not be read; while it is read,
+                    // Create waits on it and is pending.
+                    disabled={passphraseMissing || scheduleQuery.isError}
+                    pending={scheduleQuery.isPending || createMutation.isPending}
+                    title={passphraseMissing ? 'Set a backup passphrase first.' : undefined}
                 >
-                    {createMutation.isPending ? 'Creating…' : '+ Create backup'}
+                    <PendingLabel pending={createMutation.isPending} label="+ Create backup" pendingLabel="Creating…" />
                 </Button>
             </div>
 
@@ -255,7 +290,8 @@ export function BackupsPanel() {
                         <BackupRow
                             key={b.id}
                             backup={b}
-                            disabled={downloadMutation.isPending || deleteMutation.isPending || pinMutation.isPending}
+                            deleteRef={deleteControl(b.id)}
+                            pending={downloadMutation.isPending || deleteMutation.isPending || pinMutation.isPending}
                             onDownload={() => downloadMutation.mutate(b.id)}
                             onDelete={() => setDeleteTarget(b)}
                             onTogglePin={() => pinMutation.mutate({ id: b.id, pin: !b.pinned })}
@@ -272,7 +308,9 @@ export function BackupsPanel() {
                         save={saveBackupSchedule}
                         label="Create a backup automatically each day"
                         note="pruned to your retention policy below"
-                        canEnable={passphraseSet}
+                        // While the schedule is read, its switch waits on the read
+                        // (ScheduleControl holds it off then) and no hint is due.
+                        canEnable={passphraseSet || scheduleQuery.isPending}
                         disabledHint="Set a backup passphrase first."
                     />
                 </PanelBody>
@@ -321,10 +359,14 @@ export function BackupsPanel() {
 }
 
 function BackupRow({
-    backup, disabled, onDownload, onDelete, onTogglePin,
+    backup, deleteRef, pending, onDownload, onDelete, onTogglePin,
 }: {
     backup: BackupSummary;
-    disabled: boolean;
+    /** Given the row's Delete, which takes the row away (useRowRemovalFocus). */
+    deleteRef: (el: HTMLElement | null) => void;
+    /** A download, pin or delete is in flight: the row's buttons keep focus and
+     *  refuse to act (pending.ts). */
+    pending: boolean;
     onDownload: () => void;
     onDelete: () => void;
     onTogglePin: () => void;
@@ -340,6 +382,13 @@ function BackupRow({
                                 📌 Pinned
                             </span>
                         ) : null}
+                        {/* A backup held for an upgrade started from the app (ADR-0110). Named by what
+                            it is for, not as a pin: the admin pin is a separate thing and stays below. */}
+                        {backup.upgradeLabel ? (
+                            <span className="ml-2 text-xs font-normal text-accent" title="Kept until newer upgrade backups replace it">
+                                {backup.upgradeLabel}
+                            </span>
+                        ) : null}
                     </p>
                     <p className="text-xs text-text-subtle">{formatBytes(backup.sizeBytes)}</p>
                 </div>
@@ -349,22 +398,23 @@ function BackupRow({
                         variant="ghost"
                         size="sm"
                         onClick={onTogglePin}
-                        disabled={disabled}
+                        pending={pending}
                         title={backup.pinned
                             ? 'Allow retention to prune this backup'
                             : 'Never delete this backup (exclude from local + Drive retention)'}
                     >
                         {backup.pinned ? 'Unpin' : 'Pin'}
                     </Button>
-                    <Button type="button" variant="ghost" size="sm" onClick={onDownload} disabled={disabled}>
+                    <Button type="button" variant="ghost" size="sm" onClick={onDownload} pending={pending}>
                         Download
                     </Button>
                     <Button
+                        ref={deleteRef}
                         type="button"
                         variant="ghost"
                         size="sm"
                         onClick={onDelete}
-                        disabled={disabled}
+                        pending={pending}
                         className="text-state-danger hover:bg-state-danger-soft"
                     >
                         Delete
@@ -429,16 +479,21 @@ function RetentionEditor({ initial, onSaved }: { initial: BackupRetention; onSav
     const changed = daily !== initial.retentionDaily
         || weekly !== initial.retentionWeekly
         || monthly !== initial.retentionMonthly;
+    // A save that lands leaves nothing changed, so Save, holding focus, is
+    // disabled: focus goes to the first field (ADR-0023 §L).
+    const dailyRef = useRef<HTMLInputElement | null>(null);
 
     return (
         <div className="space-y-1">
             <div className="flex flex-wrap items-end gap-3 text-xs">
-                <RetentionInput label="Daily (days)" min={1} value={daily} onChange={setDaily} disabled={mutation.isPending} />
-                <RetentionInput label="Weekly (weeks)" min={0} value={weekly} onChange={setWeekly} disabled={mutation.isPending} />
-                <RetentionInput label="Monthly (months)" min={0} value={monthly} onChange={setMonthly} disabled={mutation.isPending} />
+                <RetentionInput ref={dailyRef} label="Daily (days)" min={1} value={daily} onChange={setDaily}
+                    pending={mutation.isPending} />
+                <RetentionInput label="Weekly (weeks)" min={0} value={weekly} onChange={setWeekly} pending={mutation.isPending} />
+                <RetentionInput label="Monthly (months)" min={0} value={monthly} onChange={setMonthly} pending={mutation.isPending} />
                 <Button type="button" variant="secondary" size="sm"
-                    onClick={() => mutation.mutate()} disabled={!changed || mutation.isPending}>
-                    {mutation.isPending ? 'Saving…' : 'Save'}
+                    onClick={() => mutation.mutate()} disabled={!changed} pending={mutation.isPending}
+                    pendingLabel="Saving…" fallbackFocusRef={dailyRef}>
+                    Save
                 </Button>
             </div>
             {error !== null ? <p role="alert" className="text-xs text-state-danger">{error}</p> : null}
@@ -446,20 +501,24 @@ function RetentionEditor({ initial, onSaved }: { initial: BackupRetention; onSav
     );
 }
 
-function RetentionInput({ label, min, value, onChange, disabled }: {
-    label: string; min: number; value: number; onChange: (v: number) => void; disabled: boolean;
-}) {
+const RetentionInput = forwardRef<HTMLInputElement, {
+    label: string; min: number; value: number; onChange: (v: number) => void;
+    /** The save is in flight: the field keeps focus and is read-only (pending.ts). */
+    pending: boolean;
+}>(function RetentionInput({ label, min, value, onChange, pending }, ref) {
     return (
         <label className="flex flex-col gap-1">
             <span className="text-text-subtle">{label}</span>
             <input
-                type="number" min={min} max={3650} value={value} disabled={disabled}
+                ref={ref}
+                type="number" min={min} max={3650} value={value}
                 onChange={(e) => onChange(Math.max(min, Math.floor(Number(e.target.value) || 0)))}
-                className="w-fixed-96px rounded border border-border bg-surface px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
+                className="w-fixed-96px rounded border border-border bg-surface px-2 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 aria-disabled:cursor-default aria-disabled:opacity-50"
+                {...pendingTextProps<HTMLInputElement>(pending)}
             />
         </label>
     );
-}
+});
 
 function triggerDownload(blob: Blob, filename: string) {
     const url = URL.createObjectURL(blob);

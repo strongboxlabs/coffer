@@ -33,9 +33,9 @@
 -- This migration:
 --   1. Creates `security_splits` (one row per csplit; per-ledger,
 --      RLS-policed, idempotent re-import keyed on external_id).
---   2. Migrates the demo seed's single IDXA 2-for-1 split (the only
---      action='split' row in the dev DB) to a security_splits row
---      and drops the header + legs.
+--   2. Migrates any action='split' header (the demo seed's IDXA
+--      2-for-1 split writes one) to a security_splits row and drops
+--      the header + legs.
 --   3. Drops 'split' from the txn_headers.action CHECK.
 --   4. Rewrites recompute_holdings_cost_basis to interleave splits
 --      with txn_legs in chronological order, applying
@@ -114,10 +114,10 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON security_splits TO coffer_service;
 -- -----------------------------------------------------------------------------
 -- Part 2: migrate existing action='split' headers → security_splits rows.
 --
--- In production the dev DB has ONE such header (demo seed scenario 11:
--- IDXA 2-for-1 at 2026-05-10 09:00 UTC). Real MD imports never produced
--- an action='split' header because MD's csplit objects live outside the
--- txn stream. After this migration the demo seed (scripts/seed-demo-investments.sql)
+-- The demo seed writes one such header (scenario 11: IDXA 2-for-1 at
+-- 2026-05-10 09:00 UTC). The MD importer never writes
+-- an action='split' header, because MD's csplit objects live outside
+-- the txn stream. After this migration the demo seed (scripts/seed-demo-investments.sql)
 -- is updated separately to write a security_splits row instead.
 --
 -- Migration logic:

@@ -3,6 +3,7 @@ using System.Globalization;
 
 using ModelContextProtocol.Server;
 
+using Coffer.Api.Contracts;
 using Coffer.Api.Db.Repositories;
 
 namespace Coffer.Api.Mcp;
@@ -11,9 +12,8 @@ namespace Coffer.Api.Mcp;
 /// MCP tools over the budget (ADR-0099). Read-only.
 /// </summary>
 /// <remarks>
-/// <para>The budget shipped in 0.88.0 with a REST surface and a SPA screen and
-/// no MCP tool at all, which made it the one subsystem an agent could not see:
-/// it could read every account and every transaction, and still not answer
+/// <para>Without these tools the budget is the one subsystem an agent cannot see:
+/// it can read every account and every transaction, and still not answer
 /// "what is the target for this category" or "how is the month tracking".</para>
 ///
 /// <para>The arithmetic runs HERE, never in the model (ADR-0063 §D4). `mark` in
@@ -33,16 +33,28 @@ public static class BudgetTools
     [McpServerTool(Name = "budget_progress"), Description(
         "How a ledger's spending is tracking against its budget for one month. " +
         "Returns one row per expense category with: actual (spent this month), " +
-        "typical (the mean over the trailing window — history, not a decision), " +
-        "target (what a person typed, or null — most rows have none), and mark " +
+        "typical (the mean over the trailing window — history, not a decision; for a " +
+        "ledger younger than the window, over only the months since its first " +
+        "transaction, which historyFrom then gives), " +
+        "target (what a person typed, or null — most rows have none), " +
+        "targetCurrencyCode (the currency a stored target was typed in, null when " +
+        "none is stored: a null target with a targetCurrencyCode is a stored target " +
+        "that needs a missing exchange rate), and mark " +
         "(THE number to judge against: the target where there is one, else the " +
         "rolled normal). Judge a row by actual-vs-mark; do NOT recompute mark " +
         "from target and typical, because a parent's mark already accounts for " +
         "targets set on its descendants. Rows carry parentId and form a tree; " +
         "parent rows are ROLLUPS, so summing every row double-counts — use " +
-        "actualTotal/markTotal for the ledger-wide figures. Amounts are positive " +
-        "magnitudes in the ledger's currency. Use list_ledgers first to resolve " +
-        "ledgerId.")]
+        "actualTotal for the ledger-wide spend and typicalTotal for the ledger-wide " +
+        "usual (averaged over the same months as typical, the first-transaction rule " +
+        "included; it ignores targets and is not the sum of the marks, so there is no " +
+        "ledger-wide mark). Amounts are positive " +
+        "magnitudes in the ledger's reporting currency (currencyCode): spending in " +
+        "another currency converts at each transaction's date, and a target typed in " +
+        "another currency converts at the month's last day, or at the latest rate for " +
+        "the current month. A figure that needs a missing exchange rate is null and " +
+        "rateUnavailable names the currency pair and day; it is never a partial sum. " +
+        "Use list_ledgers first to resolve ledgerId.")]
     public static async Task<BudgetProgressSummary> BudgetProgress(
         BudgetProgressRepository repository,
         TimeProvider clock,
@@ -52,7 +64,9 @@ public static class BudgetTools
         [Description(
             "How many trailing complete months 'typical' averages over. Default 3 — "
             + "long enough to absorb a fortnightly shop landing twice in one month, "
-            + "short enough that a rent rise stops looking anomalous within a quarter.")]
+            + "short enough that a rent rise stops looking anomalous within a quarter. "
+            + "A ledger whose first transaction is inside the window averages only the "
+            + "months since it.")]
         int? windowMonths = null,
         CancellationToken cancellationToken = default)
     {
@@ -75,15 +89,16 @@ public static class BudgetTools
             dto.Month,
             dto.WindowMonths,
             dto.CurrencyCode,
-            dto.MixedCurrency,
             dto.Rows
                 .Select(r => new BudgetProgressRow(
                     r.CategoryId, r.Name, r.ParentId,
-                    r.Actual, r.Typical, r.Target, r.Mark))
+                    r.Actual, r.Typical, r.Target, r.TargetCurrencyCode, r.Mark, r.RateUnavailable))
                 .ToList(),
             dto.ActualTotal,
             dto.TypicalTotal,
-            dto.LatestMonthWithSpending);
+            dto.LatestMonthWithSpending,
+            dto.HistoryFrom,
+            dto.RateUnavailable);
     }
 
     /// <summary>
@@ -114,40 +129,60 @@ public static class BudgetTools
 /// remarks on <see cref="BudgetTools"/>.
 /// </param>
 /// <param name="Typical">
-/// The trailing mean. Null when the category has no history in the window: null
+/// The trailing mean, over only the months since the ledger's first transaction when
+/// it is younger than the window (see <see cref="BudgetProgressSummary.HistoryFrom"/>).
+/// Null when the category has no history in the window: null
 /// rather than 0 on purpose, because a brand-new category showing "typically 0"
 /// reads as infinitely over.
 /// </param>
-/// <param name="Target">What a person typed for this category and month, or null.</param>
+/// <param name="Target">What a person typed for this category and month, converted into
+/// the reporting currency, or null: none is typed, or one is but needs a missing rate
+/// (then <paramref name="RateUnavailable"/> names it).</param>
+/// <param name="TargetCurrencyCode">The currency a stored target was typed in, null when
+/// none is stored (ADR-0114 D12). It tells a stored target that could not convert from
+/// no target at all.</param>
 public sealed record BudgetProgressRow(
     Guid CategoryId,
     string Name,
     Guid? ParentId,
-    decimal Actual,
+    decimal? Actual,
     decimal? Typical,
     decimal? Target,
-    decimal? Mark);
+    string? TargetCurrencyCode,
+    decimal? Mark,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    IReadOnlyList<RateUnavailable>? RateUnavailable = null);
 
 /// <summary>
 /// One month of budget progress, trimmed for a model: the rows and the totals,
 /// without the per-day chart series the SPA needs.
 /// </summary>
-/// <param name="MixedCurrency">
-/// True when the ledger's accounts do not agree on a currency, in which case the
-/// totals are summed WITHOUT conversion and must be reported as such rather than
-/// stamped with one symbol.
+/// <param name="WindowMonths">
+/// The requested window's length in complete months; it does not shrink for a ledger
+/// younger than the window. When <paramref name="HistoryFrom"/> is set, an answer that
+/// names what was averaged names that day instead of the month count.
+/// </param>
+/// <param name="RateUnavailable">
+/// Every missing exchange rate a total needed, which is then null (ADR-0114 D9).
 /// </param>
 /// <param name="LatestMonthWithSpending">
 /// Populated only when the requested month has no spending at all — the month
 /// where the data actually is, so an answer of "nothing" can say where to look
 /// instead of reading as an empty ledger.
 /// </param>
+/// <param name="HistoryFrom">
+/// The day of the ledger's first transaction when it falls after the window's first
+/// day, or null when the whole window is averaged. The window's months before it are
+/// not averaged, so an answer naming the window names this day instead.
+/// </param>
 public sealed record BudgetProgressSummary(
     string Month,
     int WindowMonths,
     string CurrencyCode,
-    bool MixedCurrency,
     IReadOnlyList<BudgetProgressRow> Rows,
-    decimal ActualTotal,
+    decimal? ActualTotal,
     decimal? TypicalTotal,
-    string? LatestMonthWithSpending);
+    string? LatestMonthWithSpending,
+    DateOnly? HistoryFrom = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    IReadOnlyList<RateUnavailable>? RateUnavailable = null);

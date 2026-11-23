@@ -14,7 +14,7 @@ namespace Coffer.Api.Crypto;
 /// <para>The new key is a PARAMETER rather than generated here. That keeps the
 /// coordinator deterministic, and lets a test rotate to a key with the same bytes
 /// under a different id: the database ends up re-wrapped under identical bytes, so
-/// a shared test database still opens for every other test, while the file swap,
+/// it still opens under the key every test host runs with, while the file swap,
 /// the archive, and the rollback all run for real. Same trick, and same reason, as
 /// <c>KekRotationServiceTests</c>.</para>
 /// </remarks>
@@ -146,7 +146,7 @@ public sealed class MasterKeyRotationCoordinator
             // Archive may have SUCCEEDED before Write failed — a read-only directory
             // still permits the move out on some platforms, and a disk-full hits the
             // write, not the rename. Put it back, or "nothing was changed" is a lie
-            // and the install is left with no key file at all, which D3 then refuses
+            // and the install is left with no key file at all, which ADR-0092 D3 then refuses
             // to boot over its own wrapped material.
             if (archivedAt is not null)
             {

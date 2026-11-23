@@ -8,19 +8,16 @@ The register row carries only one provenance signal today —
 `needs_review` — and it disappears after the user clicks Approve.
 A row that came from a SimpleFIN sync looks identical to a row the
 user typed by hand once it's been accepted. Same for OFX file
-imports, and same for the tens of thousands of MD-bootstrapped rows. The user
-flagged this:
-
-> need indicators in the registries for transactions that have
-> been ingested from online (simplefin) or file (ofx) post accept
-> or accept/merge and distinguish between all
+imports, and same for the MD-bootstrapped rows. The register
+needs an indicator that survives Approve (and accept/merge) and
+distinguishes online-ingested, file-ingested and hand-typed rows.
 
 Plus the merge state: today the loser of a merge is hidden via
 `is_merged_into`, but the winner has no visible indicator that
 "something was merged into me." That state has to surface too.
 
-Investigating revealed a deeper structural problem in
-`txn_headers.origin`. The column conflated two concepts:
+Underneath is a structural problem in `txn_headers.origin`. The
+column conflated two concepts:
 
 1. **How** the row reached Coffer (which ingest mechanism wrote it)
 2. **Where** the underlying transaction originated (online feed
@@ -32,10 +29,9 @@ live-feed row that MD had previously captured looked identical to
 a row the user typed by hand in MD. The register couldn't render a
 provenance indicator post-accept because the data didn't carry it.
 
-The user's mental model: rows have THREE meaningful provenance
-classes — manual / online / file — and within each, a specific
-provider (SimpleFIN, MD+, OFX, QIF, CSV) the user wants to remember
-for audit purposes.
+Rows have THREE meaningful provenance classes — manual / online /
+file — and within each, a specific provider (SimpleFIN, MD+, OFX,
+QIF, CSV) worth keeping for audit purposes.
 
 ## Decision
 
@@ -59,7 +55,7 @@ is.
 ### §2. Drop `moneydance_import` as an origin value
 
 The MD JSON importer is a one-time bootstrap, not a permanent
-provenance class. Mig 107 decomposes the tens of thousands of rows by reading
+provenance class. Mig 107 decomposes the bootstrapped rows by reading
 MD per-row metadata and reclassifying:
 
 | MD signal | Origin | provider_key |
@@ -95,15 +91,12 @@ from the row's account ref to pick `online_import` vs
 to `online_import` — same as the pre-mig-110 behaviour, so existing
 rows don't move until a re-import populates the account payloads.
 
-**Note on the legacy date-prefixed FITIDs.** An earlier draft of
-this ADR mis-classified rows of the shape `YYYYMMDD:<payee>:...`
-as `file_import / csv` based on the synthetic shape. User
-correction during review: MD+ ingested these rows online during
-an earlier era and stopped supporting the date-prefix format
-later. The rows stayed in MD's database unchanged. They are
+**Note on the legacy date-prefixed FITIDs.** Rows of the shape
+`YYYYMMDD:<payee>:...` look synthetic but are not CSV: the
+date-prefix is an older MD+ online wire format that MD+ no longer
+emits, and MD keeps rows written in it unchanged. They are
 `online_import / mdplus` — same provider, just a legacy wire
-shape. Affects a few thousand rows in a real-world dataset,
-concentrated on a small number of accounts.
+shape.
 
 The bootstrap fact survives on a separate column —
 `txn_headers.import_source` (TEXT, NULL by default). Mig 107
@@ -124,9 +117,9 @@ inside MD (or any future tracker); `import_source` records the
 one-time delivery path into Coffer. The same row can have both
 populated. **Mig 107 step 7h conflated them** — every MD-bootstrap
 row whose classifier signal lived in the discarded `qif_*` fields
-fell through to `origin='manual'`. The user reasonably objected:
-many thousands of rows showing the ✏ manual icon when MD says they were
-imported into MD via QIF / CSV / OFX. The fix is to keep the two
+fell through to `origin='manual'`. A row MD says was imported into
+MD via QIF / CSV / OFX must not show the ✏ manual icon. The fix is
+to keep the two
 axes apart, never let "I came from the MD bootstrap" imply
 "I'm a manual entry."
 
@@ -137,12 +130,9 @@ Mig 107's classifier ran as a pure SQL backfill against
 right signals — including `qif_invst_action`, `qif.orig-txn`,
 `qif_sn` — but those fields lived only in the transient MD JSON.
 The importer read them, applied the rule, set `origin`, and dropped
-the source. When mig 107 ran months later, the data wasn't in any
-column it could see, so the rule was unreachable. The comment at
-step 7h documented the consequence ("Lossy on the QFX-file MD
-couldn't recognize case but unavoidable without an MD JSON
-discriminator") without flagging that the lossiness was itself
-the bug.
+the source. A later migration has no column to read that data from,
+so for mig 107 the rule was unreachable. That lossiness is a defect
+in how the data was stored, not an unavoidable property of the source.
 
 The rule going forward, applied uniformly to every provider:
 
@@ -158,15 +148,14 @@ The consequence for migrations: any future "we should have
 classified this differently" question is a forward SQL migration
 that reads `provider_raw_payload` directly — no file dependency,
 no out-of-band CLI tool to remember, no risk of the source file
-being lost. The pattern matches how the database has to behave in
-production, where the import file is gone and `git pull && restart`
+being lost. The pattern matches how the database has to behave on
+a deployed install, where the import file is gone and an upgrade
 is the only fix path.
 
 ### §4 Drop carry-through MD audit columns (mig 109)
 
-Auditing every `txn_headers` column for "written by an importer,
-never read by anything else" yielded four dead carry-throughs that
-should live inside `provider_raw_payload` going forward:
+Four `txn_headers` columns are written by an importer and read by
+nothing else. They belong inside `provider_raw_payload`:
 
 | Column | Source | Why drop |
 |---|---|---|
@@ -183,47 +172,28 @@ The mig-105 CHECK `is_user_defined OR external_id IS NOT NULL`
 becomes `external_id IS NOT NULL OR origin = 'manual'` — same
 invariant, expressed in the new vocabulary.
 
-Verified against a large real-world MD export with targeted
-spot-checks against four representative accounts spanning the
-source mix (one bank with mixed online + manual history; one
-investment with predominantly MD+; one credit card with a
-CSV-heavy era; one investment with legacy MD+ date-prefix
-FITIDs). The decompose went through three rounds of correction
-during review:
+Three rules in the decompose guard against plausible
+mis-classifications:
 
-1. Initial pass mis-classified the legacy date-prefix FITIDs as
-   `file_import / csv`. User correction: those were MD+ online
-   feeds in an earlier era (a few thousand rows; see note above).
-2. Initial pass also used `online_match_orig_id IS NOT NULL` as
-   a QIF proxy. That column is set on EVERY OL-matched row (it
-   carries MD's JSON-blob preservation of the bank-original
-   txn), not just QIF — so the rule grabbed many thousands of rows and
-   shadowed every CSV / MD+ / OFX classification below it.
-   Dropped the QIF-from-backfill rule entirely; the importer
-   detects QIF correctly on fresh imports via
-   `MdTxn.QifInvstAction` / `QifOrigTxn` / `QifSn`. See
-   §"Migration safety" for the lossiness this introduces.
-3. Without the dedicated `md{txt,csv,qif}import:` FITID-prefix
-   rule, the CSV-imported rows on the credit-card account
-   would have mis-classified as `online_import / ofx` because
-   their `ol_fitid` doesn't have a recognizable prefix without
-   the explicit check.
+1. The legacy date-prefix FITIDs are MD+ online rows, not
+   `file_import / csv` (see note above).
+2. `online_match_orig_id IS NOT NULL` is NOT a QIF proxy. That
+   column is set on EVERY OL-matched row (it carries MD's
+   JSON-blob preservation of the bank-original txn), not just
+   QIF — so a rule on it would grab every OL-matched row and
+   shadow every CSV / MD+ / OFX classification below it. The
+   backfill has no QIF rule; the importer detects QIF on fresh
+   imports via `MdTxn.QifInvstAction` / `QifOrigTxn` / `QifSn`.
+   See §"Migration safety" for the lossiness this introduces.
+3. The dedicated `md{txt,csv,qif}import:` FITID-prefix rule keeps
+   CSV-imported rows from classifying as `online_import / ofx`:
+   their `ol_fitid` has no other recognizable prefix.
 
-Final classification counts after the corrected mig:
-
-| Origin | Provider | Magnitude |
-|---|---|---|
-| `manual` | NULL | tens of thousands |
-| `online_import` | `ofx` | tens of thousands |
-| `online_import` | `mdplus` | thousands |
-| `online_import` | `simplefin` | hundreds |
-| `file_import` | `csv` | hundreds |
-
-The `manual` bucket includes thousands of QIF-only rows that the
+The `manual` bucket includes QIF-only rows that the
 backfill cannot detect from txn_headers columns alone (see
-§"Migration safety"). Re-running the MD importer over the
-original JSON will re-stamp `provider_key='qif'` on those rows
-via the importer's per-row UPSERT path.
+§"Migration safety"). A fresh import classifies them correctly; an
+existing ledger cannot be re-imported (ADR-0052 D2: the import only
+seeds a fresh ledger).
 
 ### §3. Acknowledged lossiness: OFX-file vs OFX-online
 
@@ -231,10 +201,10 @@ A QFX file imported into MD where MD recognized the financial
 institution populates `ol_fi_id='ofx:<FI>:...'` identically to an
 OFX-online row. MD's JSON export doesn't carry a per-row
 discriminator that distinguishes file-OFX from online-OFX, so we
-classify both as `online_import / ofx`. Practical impact: rare
-(modern MD users use either MD+ or QFX-from-bank with
-unrecognized FIs, both of which classify correctly). The user
-accepted this lossiness during slice design.
+classify both as `online_import / ofx`. Only a QFX file from an
+FI that MD recognized is affected; MD+ rows and QFX files from FIs
+MD did not recognize both classify correctly. This lossiness is
+accepted.
 
 ### §4. `is_merge_winner` denormalized flag
 
@@ -264,12 +234,15 @@ count column ever becomes useful.
 
 ### §5. SPA visual treatment — icon column, three icons
 
-Decided after presenting three alternatives (icon column / left-bar
-extension / inline chip):
+An icon column, chosen over a left-bar extension and an inline
+chip (rejected below):
 
 - **🌐 (Globe)** — `origin='online_import'`. Muted accent palette.
   Hover label: `Online import · <provider>` (e.g. `Online import · SimpleFIN`).
-- **📄 (FileText)** — `origin='file_import'`. Muted warning palette.
+- **📄 (FileText)** — `origin='file_import'`. Muted text palette, as
+  `manual` (amended 2026-11-03: it was the muted warning palette, and amber
+  only ever means a warning; a file import is not one, and the icon's shape
+  already tells it apart from a manual row).
   Hover label: `File import · <provider>` (e.g. `File import · OFX`).
 - **✏ (Pencil)** — `origin='manual'`. Muted text palette.
   Hover label: `Manual entry`.
@@ -311,10 +284,9 @@ orchestrator / mapper bugs before they leak into user data.
 ## Consequences
 
 - Mig 107 is the largest single migration since mig 102. It runs
-  ten coordinated UPDATEs against the tens-of-thousands-row table and adds two
+  ten coordinated UPDATEs against the whole `txn_headers` table and adds two
   columns + two constraints. The defensive `RAISE EXCEPTION`
-  inside the backfill catches any row the decompose missed (zero
-  rows in real-world data).
+  inside the backfill catches any row the decompose missed.
 
 - `IngestOrchestrator` dedup queries shift from `origin` to
   `provider_key`. Both `RunPullAsync` (SimpleFIN) and `RunFileAsync`
@@ -342,9 +314,9 @@ orchestrator / mapper bugs before they leak into user data.
 
 ## Migration safety
 
-- All decomposition rules tested against a real-world export
-  before the mig was written; the `RAISE EXCEPTION` in step 9
-  catches any drift between rule and data.
+- The `RAISE EXCEPTION` in step 9 catches any row no
+  decomposition rule claims, so drift between rule and data fails
+  the migration instead of passing silently.
 - `is_merge_winner` backfill is idempotent — running the UPDATE
   twice produces the same result.
 - The mig is one transaction; either every change lands or nothing
@@ -357,23 +329,23 @@ orchestrator / mapper bugs before they leak into user data.
 The mig CANNOT classify QIF-only rows (no `ol_fitid`, only
 `qif_*` fields in MD JSON) as `file_import / qif` because the QIF
 metadata was never projected to `txn_headers` columns — only the
-`ol_*` family is on the table. In real-world data, thousands of
-QIF-only rows classify as `origin='manual'` after the backfill.
+`ol_*` family is on the table. QIF-only rows therefore
+classify as `origin='manual'` after the backfill.
 They are not visibly distinct from truly-typed manual rows in
 the register (both render with the ✏ pencil icon).
 
 Three ways to recover the QIF tagging:
 
-1. **Re-run the MD importer over the original JSON.** The
-   importer's `DecomposeOrigin` reads `MdTxn.QifInvstAction` /
-   `QifOrigTxn` / `QifSn` and correctly classifies. The
-   per-row UPSERT path updates `provider_key='qif'` on rows
-   it identifies. Cleanest fix; safe to re-run.
+1. **Import into a fresh ledger.** The importer's
+   `DecomposeOrigin` reads `MdTxn.QifInvstAction` /
+   `QifOrigTxn` / `QifSn` and classifies correctly. Re-running
+   it over an existing ledger is not available: since ADR-0052 D2
+   the import only seeds a fresh ledger.
 2. **Add a `had_qif_signal BOOLEAN` column to `txn_headers`**
    in a future mig + extend the importer to set it on insert.
    Forward-compatible but doesn't fix existing data without
    option 1.
-3. **Live with the lossiness.** Those thousands of rows still carry
+3. **Live with the lossiness.** Those rows still carry
    their `online_match_orig_id` JSON blob if anyone wants to
    query for "rows MD had OFX-original data for"; the
    classification is just less precise in the register icon.

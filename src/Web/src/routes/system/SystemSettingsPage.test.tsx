@@ -12,7 +12,7 @@ import {
 
 import { SystemSettingsPage } from './SystemSettingsPage';
 import * as apiModule from '@/lib/api';
-import type { BackupSchedule } from '@/lib/types';
+import type { BackupSchedule, SystemAttention } from '@/lib/types';
 
 // System settings page (ADR-0060): About is visible to everyone; the Backups
 // tab only appears for admins (and the API is RequireAdmin regardless).
@@ -28,7 +28,9 @@ const SCHEDULE_OFF: BackupSchedule = {
     consecutiveFailures: 0, lastError: null, lastFailureAt: null, disabledReason: null,
 };
 
-function renderSystem(isAdmin: boolean) {
+const NOTHING_OUTSTANDING: SystemAttention = { worst: null, subjects: [], upgradeVersion: null };
+
+function renderSystem(isAdmin: boolean, attention: SystemAttention = NOTHING_OUTSTANDING) {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     queryClient.setQueryData(['me'], {
         id: '00000000-0000-0000-0000-000000000001',
@@ -36,6 +38,8 @@ function renderSystem(isAdmin: boolean) {
         displayName: 'Alice',
         isAdmin,
     });
+    // Seeded, so a test that is not about the dots makes no request for them.
+    queryClient.setQueryData(['system-attention'], attention);
 
     const root = createRootRoute();
     const systemRoute = createRoute({
@@ -147,6 +151,107 @@ describe('SystemSettingsPage', () => {
         // The panel surface renders: live-state line + the enable action.
         expect(await screen.findByText(/MCP is stopped/i)).toBeInTheDocument();
         expect(screen.getByRole('button', { name: /enable mcp/i })).toBeInTheDocument();
+    });
+
+    it('puts the Upgrade tab next to Backups for an admin and opens the panel (ADR-0110)', async () => {
+        vi.spyOn(apiModule, 'fetchUpgradeStatus').mockResolvedValue({
+            installed: '0.128.1', inAppEnabled: true, autoCheck: false, privateRepo: false, tokenStored: false,
+            repository: 'example/coffer', installDir: '/srv/coffer', hostNote: '',
+            host: { state: 'running', at: null }, latest: null, checkedAt: null, checkError: null,
+            updateAvailable: false, canStart: false, cannotStartReason: 'There is no newer release.', attempt: null,
+        });
+
+        renderSystem(true);
+        const user = userEvent.setup();
+
+        const tabs = (await screen.findAllByRole('tab')).map((t) => t.textContent);
+        expect(tabs.indexOf('Upgrade')).toBe(tabs.indexOf('Backups') + 1);
+
+        await user.click(screen.getByRole('tab', { name: /^upgrade$/i }));
+        expect(await screen.findByText('Not checked yet')).toBeInTheDocument();
+    });
+
+    // The trail the gear starts, followed down to the tab that holds the thing (ADR-0102, amended
+    // for ADR-0110): Upgrade lights for the upgrade alone, Notifications for everything else, so
+    // one subject never lights two tabs.
+    const SINCE = '2026-11-02T12:00:00Z';
+
+    it('lights the Upgrade tab for an available release, and not Notifications', async () => {
+        renderSystem(true, {
+            worst: 'warning',
+            subjects: [{ subject: 'upgrade', severity: 'warning', since: SINCE }],
+            upgradeVersion: '0.131.0',
+        });
+
+        expect(await screen.findByRole('tab', { name: 'Upgrade Update available: 0.131.0' }))
+            .toBeInTheDocument();
+        // The simpler rule: the upgrade is the Upgrade tab's alone, so Notifications stays plain.
+        expect(screen.getByRole('tab', { name: 'Notifications' })).toBeInTheDocument();
+    });
+
+    it('lights the Notifications tab for a problem, and leaves Upgrade plain', async () => {
+        renderSystem(true, {
+            worst: 'critical',
+            subjects: [{ subject: 'backup', severity: 'critical', since: SINCE }],
+            upgradeVersion: null,
+        });
+
+        expect(await screen.findByRole('tab', { name: 'Notifications 1 problem outstanding on this install' }))
+            .toBeInTheDocument();
+        expect(screen.getByRole('tab', { name: 'Upgrade' })).toBeInTheDocument();
+    });
+
+    it('lights each tab for its own subject when both are outstanding', async () => {
+        renderSystem(true, {
+            worst: 'critical',
+            subjects: [
+                { subject: 'backup', severity: 'critical', since: SINCE },
+                { subject: 'upgrade', severity: 'warning', since: SINCE },
+            ],
+            upgradeVersion: '0.131.0',
+        });
+
+        expect(await screen.findByRole('tab', { name: 'Upgrade Update available: 0.131.0' }))
+            .toBeInTheDocument();
+        // One problem, not two: the upgrade is not counted among what Notifications lists.
+        expect(screen.getByRole('tab', { name: 'Notifications 1 problem outstanding on this install' }))
+            .toBeInTheDocument();
+    });
+
+    it('draws the same dot a ledger problem does: an outline for a warning, a fill for critical', async () => {
+        renderSystem(true, {
+            worst: 'critical',
+            subjects: [
+                { subject: 'backup', severity: 'critical', since: SINCE },
+                { subject: 'upgrade', severity: 'warning', since: SINCE },
+            ],
+            upgradeVersion: '0.131.0',
+        });
+
+        const upgradeTab = await screen.findByRole('tab', { name: /^Upgrade Update available/ });
+        const notificationsTab = screen.getByRole('tab', { name: /^Notifications 1 problem/ });
+        // The weight difference ADR-0102 D4 settled on, not a second visual language for upgrades.
+        expect(upgradeTab.querySelector('.border-mark-warning')).not.toBeNull();
+        expect(notificationsTab.querySelector('.bg-mark-danger')).not.toBeNull();
+    });
+
+    it('asks nothing about attention for a non-admin, and shows no dot', async () => {
+        const spy = vi.spyOn(apiModule, 'fetchSystemAttention');
+        renderSystem(false, {
+            worst: 'warning',
+            subjects: [{ subject: 'upgrade', severity: 'warning', since: SINCE }],
+            upgradeVersion: '0.131.0',
+        });
+
+        expect(await screen.findByRole('tab', { name: /appearance/i })).toBeInTheDocument();
+        expect(spy).not.toHaveBeenCalled();
+        expect(screen.queryByText(/update available/i)).not.toBeInTheDocument();
+    });
+
+    it('hides the Upgrade tab from a non-admin', async () => {
+        renderSystem(false);
+        expect(await screen.findByRole('tab', { name: /appearance/i })).toBeInTheDocument();
+        expect(screen.queryByRole('tab', { name: /^upgrade$/i })).not.toBeInTheDocument();
     });
 
     it('hides the MCP tab from a non-admin', async () => {

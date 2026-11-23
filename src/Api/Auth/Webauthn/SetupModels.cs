@@ -9,11 +9,10 @@ namespace Coffer.Api.Auth.Webauthn;
 /// and submitted.
 /// </summary>
 /// <remarks>
-/// Deliberately empty (ADR-0088). This used to carry the ledgers the new user
-/// could join, but a fresh install has no real ledgers to offer — the rows it
-/// listed were empty placeholders from migration 055, now dropped by migration
-/// 186. Install shape is a single question on the form ("include a Demo
-/// ledger?"), and ledgers are created afterwards from the hub. The endpoint
+/// Deliberately empty (ADR-0088): no ledgers the new user could join, because a
+/// fresh install has no real ledgers to offer (migration 186 drops migration
+/// 055's empty placeholders). Setup asks nothing about ledgers (ADR-0088, amended by
+/// ADR-0115 D2); ledgers are created afterwards from the hub. The endpoint
 /// remains because token validation is its real job.
 /// </remarks>
 /// <param name="RestorePartSizeBytes">
@@ -53,25 +52,22 @@ public sealed record SetupBeginResponse(Guid ChallengeId, CredentialCreateOption
 /// JSON request body for <c>POST /api/auth/setup/{token}/complete</c>.
 /// </summary>
 /// <remarks>
-/// <para>Setup no longer asks which ledger to use (ADR-0088). It creates the
-/// user and passkey, and optionally a Demo ledger; the user then lands on the
-/// ledger hub, which offers "New ledger" and "Import from Moneydance". A user
-/// with zero ledgers is a supported state — the hub renders an empty state with
-/// both calls to action, so it is not the dead end the old mandatory ledger
-/// choice was guarding against.</para>
+/// <para>Setup asks nothing about ledgers and creates none (ADR-0088, amended by
+/// ADR-0115 D2). It creates the user and passkey; the user then lands on the
+/// ledger hub, which offers "Import from Moneydance", "Demo ledger" and "New
+/// ledger". A user with zero ledgers is a supported state — the hub renders an
+/// empty state with those choices, so it is not the dead end the old mandatory
+/// ledger choice was guarding against.</para>
+/// <para>A client built before that change may still send <c>includeDemo</c>. The
+/// field is not read: System.Text.Json ignores a member the type does not declare,
+/// so setup completes as usual, creates no ledger, and the user adds a Demo from
+/// the hub.</para>
 /// </remarks>
 public sealed class SetupCompleteRequest
 {
     public Guid ChallengeId { get; init; }
     public AuthenticatorAttestationRawResponse AttestationResponse { get; init; } = null!;
     public string CredentialNickname { get; init; } = string.Empty;
-
-    /// <summary>
-    /// Create a Demo ledger seeded with the bundled sample dataset, owned by the
-    /// new user. Seeded post-commit and best-effort: setup has already succeeded
-    /// by then, so a slow or failing import never costs the passkey registration.
-    /// </summary>
-    public bool IncludeDemo { get; init; }
 }
 
 /// <summary>
@@ -81,9 +77,7 @@ public sealed class SetupCompleteRequest
 /// appear again.
 /// </summary>
 /// <remarks>
-/// <see cref="LedgerId"/> / <see cref="LedgerName"/> are null unless a Demo
-/// ledger was requested AND its seed succeeded (ADR-0088) — setup itself no
-/// longer creates a ledger. Callers must treat "no ledger" as the normal case.
+/// It names no ledger: setup creates none (ADR-0088, amended by ADR-0115 D2).
 /// </remarks>
 public sealed record SetupCompleteResponse(
     Guid UserId,
@@ -91,8 +85,6 @@ public sealed record SetupCompleteResponse(
     Guid SessionId,
     DateTime SessionExpiresAt,
     IReadOnlyList<string> RecoveryCodes,
-    Guid? LedgerId,
-    string? LedgerName,
     /// <summary>
     /// The install's master KEK, base64 (ADR-0092 D2). Startup minted it on this
     /// virgin install; setup is where the operator is first shown it, because it is

@@ -1,10 +1,11 @@
 import { useMemo, useState } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as apiModule from '@/lib/api';
+import { stubFetch, type FetchStub } from '@/lib/annotations/fetchStub';
 
 import { withoutComments } from './csvSniff';
 import { CsvMappingStep, type CsvMappingChoice } from './CsvMappingStep';
@@ -13,15 +14,15 @@ import { EMPTY_CSV_DRAFT, type CsvDraft } from './csvDraft';
 /**
  * The guided mapping step (ADR-0031 Phase 5).
  *
- * The first version of this was a YAML textarea, which is not a wizard — nobody
- * importing a statement should have to know that columns count from 1 or that `M` is
- * month. These tests are about the guided path: seeing your own rows, pointing at
+ * A YAML textarea alone is not a wizard — nobody importing a statement should have to
+ * know that columns count from 1 or that `M` is month. These tests are about the
+ * guided path: seeing your own rows, pointing at
  * columns, and answering a question about the FILE rather than about the mapping.
  *
  * Synthetic throughout: invented merchants, `ANYTOWN ST`, tab-separated with a .csv
- * name because that is the shape a real export turned out to have.
+ * name because a bank export can be tab-separated under a .csv name.
  */
-const STORE_CARD_TSV = [
+const CARD_ISSUER_TSV = [
     '09/02/2026\t$40.25\tSAMPLE.COM              ANYTOWN      ST\tpurchase',
     '09/03/2026\t$6.50\tSAMPLE STORE            ANYTOWN      ST\tpurchase',
     '09/04/2026\t-$23.50\tSAMPLE STORE            ANYTOWN      ST\tpurchase',
@@ -32,7 +33,7 @@ const STORE_CARD_TSV = [
  *
  * Held here rather than inside the step because the real dialog unmounts the step on
  * every move between screens — so state kept inside it does not survive Back from the
- * preview, which is how an entire hand-written mapping used to be lost.
+ * preview, and an entire hand-written mapping would be lost.
  */
 function Harness({ body, filename, onChoose }: {
     body: string;
@@ -40,9 +41,9 @@ function Harness({ body, filename, onChoose }: {
     onChoose: (m: CsvMappingChoice) => void;
 }) {
     const [draft, setDraft] = useState<CsvDraft>(EMPTY_CSV_DRAFT);
-    // ONE File for the life of the harness. Built inline it was a new object on every
-    // render, so the step's read effect re-fired on each one — which is also what the
-    // real dialog does: it holds the File in state and hands the same one down.
+    // ONE File for the life of the harness. Built inline it would be a new object on
+    // every render, re-firing the step's read effect each time. Holding it is also what
+    // the real dialog does: it keeps the File in state and hands the same one down.
     const file = useMemo(() => new File([body], filename, { type: 'text/csv' }), [body, filename]);
     return (
         <CsvMappingStep
@@ -60,7 +61,7 @@ function Harness({ body, filename, onChoose }: {
     );
 }
 
-function renderStep(body = STORE_CARD_TSV, filename = 'unbilled.csv') {
+function renderStep(body = CARD_ISSUER_TSV, filename = 'statement.csv') {
     const onChoose = vi.fn<(m: CsvMappingChoice) => void>();
     const queryClient = new QueryClient({
         defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -89,6 +90,8 @@ const SAMPLE_SHAPE = {
     amountInvert: false,
     debitColumn: null,
     creditColumn: null,
+    // A version-1 document reads with a point (ADR-0114 D15).
+    decimalSeparator: 'point',
 } as const;
 
 /** Open the naming dialog from whichever button offers it, and fill it in. */
@@ -111,7 +114,7 @@ describe('CsvMappingStep', () => {
         vi.spyOn(apiModule, 'fetchCsvMappings').mockResolvedValue([
             {
                 id: 'map-1',
-                name: 'Store card statement',
+                name: 'Credit card statement',
                 definitionYaml: SAVED_YAML,
                 schemaVersion: 1,
                 createdAt: '2026-09-01T00:00:00Z',
@@ -135,8 +138,8 @@ describe('CsvMappingStep', () => {
     it('keeps the data on screen when the YAML tab takes over', async () => {
         // The grid is context for BOTH views, not one tab's content. Hand-writing YAML
         // is exactly when you most need to see which column is which, so switching must
-        // not take the file away — reported from a screenshot after the first attempt
-        // put the grid inside the Guided panel.
+        // not take the file away, which it would if the grid sat inside the Guided
+        // panel.
         const { user, onChoose } = renderStep();
         await latestYaml(onChoose);
         await screen.findByRole('table');
@@ -272,10 +275,10 @@ describe('CsvMappingStep', () => {
 
     it('re-reads a hand edit so the controls really do show the document', async () => {
         // The tabs claim to be two views of ONE document, and that only holds if
-        // editing the text moves the controls. It did not — they kept whatever they
-        // last held, while a yellow box asserted they "show what it says". The box was
-        // also shown after merely OPENING a saved layout, accusing the reader of a
-        // hand edit they had not made.
+        // editing the text moves the controls. Controls that keep whatever they last
+        // held contradict a notice saying they "show what it says"; and that notice
+        // must not appear after merely OPENING a saved layout, which would accuse the
+        // reader of a hand edit they had not made.
         vi.spyOn(apiModule, 'validateCsvMapping').mockResolvedValue({
             valid: true, errors: [], mapping: { ...SAMPLE_SHAPE, payeeColumn: 4 },
         });
@@ -316,9 +319,9 @@ describe('CsvMappingStep', () => {
     });
 
     it('names the empty choice after the choice, not after the screen', async () => {
-        // It read "Describe this file…" — the heading of the screen it was already on,
-        // phrased as an instruction, sitting in a list of layout names. The option
-        // means "no saved layout", so that is what it says.
+        // "Describe this file…" would repeat the heading of the screen it is already
+        // on, phrased as an instruction, in a list of layout names. The option means
+        // "no saved layout", so that is what it says.
         const { onChoose } = renderStep();
         await latestYaml(onChoose);
 
@@ -329,19 +332,19 @@ describe('CsvMappingStep', () => {
 
     it('does not re-read a document that has not changed', async () => {
         // What `parsedFrom` is actually for. Not a loop guard — the effect is
-        // deps-guarded, so I was wrong about that — but without it every trip to the
-        // YAML tab and back spends a round trip re-reading a document nobody touched.
+        // deps-guarded — but without it every trip to the YAML tab and back spends a
+        // round trip re-reading a document nobody touched.
         mockLoadOfSavedLayout();
         const { user, onChoose } = renderStep();
         await latestYaml(onChoose);
-        await screen.findByRole('option', { name: /store card statement/i });
+        await screen.findByRole('option', { name: /credit card statement/i });
         await user.selectOptions(screen.getByLabelText(/^layout$/i), 'map-1');
         await screen.findByText(/rename or delete it in settings/i);
 
         // ONE. Loading already reads the document to fill the form; reading it again
         // immediately is pure waste, and the waste lands before any later snapshot —
         // so this has to be an absolute count, not a "did it grow" comparison. A
-        // relative one passed happily at two.
+        // relative one would pass at two.
         await new Promise((r) => setTimeout(r, 50));
         expect(vi.mocked(apiModule.validateCsvMapping).mock.calls.length).toBe(1);
 
@@ -356,15 +359,14 @@ describe('CsvMappingStep', () => {
     });
 
     it('gives every button in the Layout bar one weight', async () => {
-        // Reported: "the save as and revert styling is different than other buttons".
-        // Revert and Save as copy were ghosts beside a bordered Update, so two of the
-        // three read as text that happened to be clickable. Asserted as "identical to
+        // Ghost buttons beside a bordered Update make two of the three read as text
+        // that happens to be clickable. Asserted as "identical to
         // each other" rather than against a class name, so restyling the button system
         // does not break this while the inconsistency it guards stays fixed.
         mockLoadOfSavedLayout();
         const { user, onChoose } = renderStep();
         await latestYaml(onChoose);
-        await screen.findByRole('option', { name: /store card statement/i });
+        await screen.findByRole('option', { name: /credit card statement/i });
         await user.selectOptions(screen.getByLabelText(/^layout$/i), 'map-1');
         await screen.findByText(/rename or delete it in settings/i);
         await user.selectOptions(screen.getByLabelText(/payee column/i), '3');
@@ -379,8 +381,8 @@ describe('CsvMappingStep', () => {
 
     it('gets out of the way when the document it was asked to save is invalid', async () => {
         // The problem list belongs beside the document it describes. Leaving the
-        // naming dialog up put it behind a modal, where the answer to "why did that
-        // not save" is unreadable.
+        // naming dialog up would put it behind a modal, where the answer to "why did
+        // that not save" is unreadable.
         vi.spyOn(apiModule, 'validateCsvMapping').mockResolvedValue({
             valid: false, mapping: null,
             errors: [{ path: 'amount.column', line: 11, message: 'Columns are numbered from 1.' }],
@@ -395,15 +397,14 @@ describe('CsvMappingStep', () => {
     });
 
     it('does not complain about a name nobody is typing', async () => {
-        // Reported from a screenshot: "A layout is already called that." sat under a
-        // loaded layout with no name box on screen at all. Two causes, both mine — the
-        // draft's name was preloaded with the layout's own name, which is by definition
-        // taken, and the warning was a sibling of the whole bar rather than of the
-        // input it describes.
+        // "A layout is already called that." must not sit under a loaded layout with
+        // no name box on screen. Two ways to cause it: preloading the draft's name
+        // with the layout's own name, which is by definition taken, and placing the
+        // warning beside the whole bar rather than beside the input it describes.
         mockLoadOfSavedLayout();
         const { user, onChoose } = renderStep();
         await latestYaml(onChoose);
-        await screen.findByRole('option', { name: /store card statement/i });
+        await screen.findByRole('option', { name: /credit card statement/i });
 
         await user.selectOptions(screen.getByLabelText(/^layout$/i), 'map-1');
         await screen.findByText(/rename or delete it in settings/i);
@@ -418,14 +419,14 @@ describe('CsvMappingStep', () => {
     });
 
     it('takes the name warning away with the box it belongs to', async () => {
-        // The warning and the box it describes now leave together, because they are
-        // the same dialog. Inline, they were siblings of the whole bar: closing the
-        // box left the complaint behind, about a name in a field that was gone. A
-        // dialog removes the class of bug rather than this instance of it.
+        // The warning and the box it describes leave together, because they are the
+        // same dialog. Inline siblings of the whole bar would let closing the box
+        // leave the complaint behind, about a name in a field that is gone. A dialog
+        // removes the class of bug rather than one instance of it.
         mockLoadOfSavedLayout();
         const { user, onChoose } = renderStep();
         await latestYaml(onChoose);
-        await screen.findByRole('option', { name: /store card statement/i });
+        await screen.findByRole('option', { name: /credit card statement/i });
         await user.selectOptions(screen.getByLabelText(/^layout$/i), 'map-1');
         await screen.findByText(/rename or delete it in settings/i);
         await user.selectOptions(screen.getByLabelText(/payee column/i), '3');
@@ -433,7 +434,7 @@ describe('CsvMappingStep', () => {
         await user.click(await screen.findByRole('button', { name: /save as copy/i }));
         const nameBox = await screen.findByLabelText(/^name$/i);
         await user.clear(nameBox);
-        await user.type(nameBox, 'Store card statement');
+        await user.type(nameBox, 'Credit card statement');
         expect(await screen.findByText(/already called that/i)).toBeTruthy();
 
         // Scoped: the step's own footer has a Cancel too, sitting behind the backdrop.
@@ -449,12 +450,29 @@ describe('CsvMappingStep', () => {
         mockLoadOfSavedLayout();
         const { user, onChoose } = renderStep();
         await latestYaml(onChoose);
-        await screen.findByRole('option', { name: /store card statement/i });
+        await screen.findByRole('option', { name: /credit card statement/i });
 
         await user.selectOptions(screen.getByLabelText(/^layout$/i), 'map-1');
         await screen.findByText(/rename or delete it in settings/i);
 
         expect(screen.queryByText(/edited by hand/i)).toBeNull();
+    });
+
+    it('reads a chosen layout once, however fast the choice is made again', async () => {
+        // The choice reads the layout in (a request): it holds from the change
+        // (pending.ts), so a second choice before the first has rendered pending
+        // sends no second read to race it.
+        const { onChoose } = renderStep();
+        await latestYaml(onChoose);
+        await screen.findByRole('option', { name: /credit card statement/i });
+        const validate = vi.spyOn(apiModule, 'validateCsvMapping').mockReturnValue(new Promise(() => {}));
+        const picker = screen.getByLabelText(/^layout$/i);
+
+        fireEvent.change(picker, { target: { value: 'map-1' } });
+        fireEvent.change(picker, { target: { value: 'map-1' } });
+        await new Promise((resolve) => { setTimeout(resolve, 20); });
+
+        expect(validate).toHaveBeenCalledTimes(1);
     });
 
     it('names every problem at once, with its key and line', async () => {
@@ -478,13 +496,13 @@ describe('CsvMappingStep', () => {
     });
 
     it('offers saving from the start, not behind a Check nobody knew to press', async () => {
-        // The affordance was previously revealed only after a successful Check, which
-        // is why a first-time user reported there was no way to save at all.
+        // Revealed only after a successful Check, the affordance is invisible to anyone
+        // who does not know to press Check, and reads as no way to save at all.
         const { onChoose } = renderStep();
         await latestYaml(onChoose);
 
         // The button is on screen from the start; the box it opens is a dialog, which
-        // can be dismissed. Revealed inline it had no way of going away again.
+        // can be dismissed. Revealed inline it would have no way of going away again.
         expect(screen.getByRole('button', { name: /^save…$/i })).toBeTruthy();
         expect(screen.queryByLabelText(/^name$/i)).toBeNull();
     });
@@ -533,13 +551,13 @@ describe('CsvMappingStep', () => {
     }
 
     it('opens a saved layout in the form instead of hiding everything', async () => {
-        // The defect this replaces: choosing a saved mapping unmounted the grid, the
-        // tabs, every control and the document, so reuse meant picking a name and
-        // hoping — and override was impossible, because there was nothing to edit.
+        // If choosing a saved mapping unmounted the grid, the tabs, every control and
+        // the document, reuse would mean picking a name and hoping — and override
+        // would be impossible, because there would be nothing to edit.
         mockLoadOfSavedLayout();
         const { user, onChoose } = renderStep();
         await latestYaml(onChoose);
-        await screen.findByRole('option', { name: /store card statement/i });
+        await screen.findByRole('option', { name: /credit card statement/i });
 
         await user.selectOptions(screen.getByLabelText(/^layout$/i), 'map-1');
 
@@ -559,7 +577,7 @@ describe('CsvMappingStep', () => {
         mockLoadOfSavedLayout();
         const { user, onChoose } = renderStep();
         await latestYaml(onChoose);
-        await screen.findByRole('option', { name: /store card statement/i });
+        await screen.findByRole('option', { name: /credit card statement/i });
 
         await user.selectOptions(screen.getByLabelText(/^layout$/i), 'map-1');
         await waitFor(() =>
@@ -571,19 +589,19 @@ describe('CsvMappingStep', () => {
     });
 
     it('updates a saved layout in place rather than making a second one', async () => {
-        // "How do I override one" had no answer at all: the only route to a corrected
-        // layout was copying the YAML out of settings, saving it under a new name and
-        // deleting the original, which is how people end up with "Store card statement 2".
+        // Without an in-place update, the only route to a corrected layout is copying
+        // the YAML out of settings, saving it under a new name and deleting the
+        // original, which is how people end up with "Credit card statement 2".
         mockLoadOfSavedLayout();
         const update = vi.spyOn(apiModule, 'updateCsvMapping').mockResolvedValue({
-            id: 'map-1', name: 'Store card statement', definitionYaml: 'version: 1',
+            id: 'map-1', name: 'Credit card statement', definitionYaml: 'version: 1',
             schemaVersion: 1,
             createdAt: '2026-09-01T00:00:00Z', updatedAt: '2026-09-02T00:00:00Z',
         });
 
         const { user, onChoose } = renderStep();
         await latestYaml(onChoose);
-        await screen.findByRole('option', { name: /store card statement/i });
+        await screen.findByRole('option', { name: /credit card statement/i });
         await user.selectOptions(screen.getByLabelText(/^layout$/i), 'map-1');
         await screen.findByText(/rename or delete it in settings/i);
 
@@ -596,7 +614,7 @@ describe('CsvMappingStep', () => {
 
         await waitFor(() => expect(update).toHaveBeenCalled());
         expect(update.mock.calls[0]![1]).toBe('map-1');
-        expect(update.mock.calls[0]![2]).toBe('Store card statement');
+        expect(update.mock.calls[0]![2]).toBe('Credit card statement');
         expect(update.mock.calls[0]![3]).toContain('payee:\n  column: 3');
     });
 
@@ -607,7 +625,7 @@ describe('CsvMappingStep', () => {
         mockLoadOfSavedLayout();
         const { user, onChoose } = renderStep();
         await latestYaml(onChoose);
-        await screen.findByRole('option', { name: /store card statement/i });
+        await screen.findByRole('option', { name: /credit card statement/i });
         await user.selectOptions(screen.getByLabelText(/^layout$/i), 'map-1');
 
         await waitFor(() =>
@@ -623,15 +641,16 @@ describe('CsvMappingStep', () => {
     });
 
     it('keeps the columns inside the file when the separator changes', async () => {
-        // A four-column tab file is a ONE-column comma file. The dropdowns then had no
-        // option matching the stored number and rendered blank, while the document
-        // quietly kept pointing at column 3 — and Check said nothing, because the
-        // validator sees a document, not a file.
+        // A four-column tab file is a ONE-column comma file. Unclamped, the dropdowns
+        // would have no option matching the stored number and render blank, while the
+        // document quietly kept pointing at column 3 — and Check would say nothing,
+        // because the validator sees a document, not a file.
         const { user, onChoose } = renderStep();
         await latestYaml(onChoose);
         expect((screen.getByLabelText(/payee column/i) as HTMLSelectElement).value).toBe('3');
 
-        await user.selectOptions(screen.getByLabelText(/separator/i), 'comma');
+        // Exact label: "Decimal separator" is a separator too.
+        await user.selectOptions(screen.getByLabelText(/^separator$/i), 'comma');
 
         const payee = screen.getByLabelText(/payee column/i) as HTMLSelectElement;
         // Not blank: the control shows a column the file actually has.
@@ -642,9 +661,9 @@ describe('CsvMappingStep', () => {
     });
 
     it('will not continue while there is no document to continue with', async () => {
-        // Continue was disabled only while a preview was in flight, so in the window
-        // before a file had been read it was live — and ran the new file against
-        // whatever mapping the dialog was still holding.
+        // Disabling Continue only while a preview is in flight would leave it live in
+        // the window before a file has been read — running the new file against
+        // whatever mapping the dialog is still holding.
         const { onChoose } = renderStep('   \n');
 
         // An empty file yields no document at all; say so, and leave the button dead.
@@ -658,7 +677,7 @@ describe('CsvMappingStep', () => {
         mockLoadOfSavedLayout();
         const { user, onChoose } = renderStep();
         await latestYaml(onChoose);
-        await screen.findByRole('option', { name: /store card statement/i });
+        await screen.findByRole('option', { name: /credit card statement/i });
         await user.selectOptions(screen.getByLabelText(/^layout$/i), 'map-1');
         await screen.findByText(/rename or delete it in settings/i);
 
@@ -675,13 +694,13 @@ describe('CsvMappingStep', () => {
     });
 
     it('offers nothing to save while a saved layout is untouched', async () => {
-        // Nothing to do, so nothing on offer. The old bar showed a name box reading
-        // back the layout's own name beside a dead Save button — a control whose only
-        // possible outcome was an error from the unique index.
+        // Nothing to do, so nothing on offer. A name box reading back the layout's own
+        // name beside a Save button would be a control whose only possible outcome is
+        // an error from the unique index.
         mockLoadOfSavedLayout();
         const { user, onChoose } = renderStep();
         await latestYaml(onChoose);
-        await screen.findByRole('option', { name: /store card statement/i });
+        await screen.findByRole('option', { name: /credit card statement/i });
         await user.selectOptions(screen.getByLabelText(/^layout$/i), 'map-1');
         await screen.findByText(/rename or delete it in settings/i);
 
@@ -694,7 +713,7 @@ describe('CsvMappingStep', () => {
         mockLoadOfSavedLayout();
         const { user, onChoose } = renderStep();
         await latestYaml(onChoose);
-        await screen.findByRole('option', { name: /store card statement/i });
+        await screen.findByRole('option', { name: /credit card statement/i });
         await user.selectOptions(screen.getByLabelText(/^layout$/i), 'map-1');
         await screen.findByText(/rename or delete it in settings/i);
         await user.selectOptions(screen.getByLabelText(/payee column/i), '3');
@@ -703,13 +722,13 @@ describe('CsvMappingStep', () => {
 
         const nameBox = await screen.findByLabelText(/^name$/i);
         // Prefilled with something that is not already taken, so Save works as-is.
-        expect((nameBox as HTMLInputElement).value).toBe('Store card statement copy');
+        expect((nameBox as HTMLInputElement).value).toBe('Credit card statement copy');
         expect((screen.getByRole('button', { name: /^save$/i }) as HTMLButtonElement).disabled)
             .toBe(false);
 
         // ...and typing a name that IS taken says so while it is being typed.
         await user.clear(nameBox);
-        await user.type(nameBox, 'Store card statement');
+        await user.type(nameBox, 'Credit card statement');
         expect(await screen.findByText(/already called that/i)).toBeTruthy();
         expect((screen.getByRole('button', { name: /^save$/i }) as HTMLButtonElement).disabled)
             .toBe(true);
@@ -749,5 +768,152 @@ describe('CsvMappingStep', () => {
 
         await waitFor(() =>
             expect(onChoose).toHaveBeenLastCalledWith({ mappingId: 'map-new' }));
+    });
+});
+
+/**
+ * The decimal separator on the "Describe this file" step (ADR-0114 D15, boards CS-1 to
+ * CS-3). Fetch is stubbed at the request layer, so the step runs through the real API
+ * client against the wire shapes the server sends.
+ *
+ * The sample is the CS-1 board's: semicolon-separated, dotted dates, amounts that group
+ * thousands with a point and write a decimal comma. Synthetic payees throughout.
+ */
+describe('CsvMappingStep, decimal separator', () => {
+    const COMMA_DECIMAL_SAMPLE = [
+        'Date;Payee;Memo;Amount',
+        '03.11.2026;Sample Grocer;Shop;-47,05',
+        '04.11.2026;Sample Bakery;;-8,90',
+        '05.11.2026;Sample Payroll;Salary;2.500,00',
+        '07.11.2026;Sample Pharmacy;;-12,34',
+        '09.11.2026;Sample Landlord;Rent;-1.234,56',
+        '10.11.2026;Sample Cafe;;-3,20',
+    ].join('\n');
+
+    /** What the server reads a saved layout as: this file's columns, saved with Point. */
+    const SAVED_POINT_SHAPE = {
+        version: 2,
+        delimiter: 'semicolon',
+        headerRows: 1,
+        footerRows: 0,
+        dateColumn: 1,
+        dateFormat: 'dd.MM.yyyy',
+        payeeColumn: 2,
+        memoColumn: 3,
+        amountShape: 'signed',
+        amountColumn: 4,
+        amountInvert: false,
+        debitColumn: null,
+        creditColumn: null,
+        decimalSeparator: 'point',
+    } as const;
+
+    let stub: FetchStub;
+
+    beforeEach(() => {
+        // The describe above spies on the client module; this one goes through it.
+        vi.restoreAllMocks();
+        stub = stubFetch()
+            .on('GET', /^\/api\/ledgers\/led-1\/csv-mappings$/, [{
+                id: 'map-point',
+                name: 'Saved point layout',
+                definitionYaml: 'version: 2\n# saved with a point\n',
+                schemaVersion: 2,
+                createdAt: '2026-11-01T00:00:00Z',
+                updatedAt: '2026-11-01T00:00:00Z',
+            }])
+            .on('POST', /^\/api\/ledgers\/led-1\/csv-mappings\/validate$/, {
+                valid: true, errors: [], mapping: SAVED_POINT_SHAPE,
+            });
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    const separator = () => screen.getByLabelText(/^decimal separator/i) as HTMLSelectElement;
+
+    async function chooseSavedLayout(user: ReturnType<typeof userEvent.setup>) {
+        await screen.findByRole('option', { name: 'Saved point layout' });
+        await user.selectOptions(screen.getByLabelText(/^layout$/i), 'map-point');
+        await screen.findByText('Saved. Rename or delete it in Settings.');
+    }
+
+    it('presets Comma on a new layout from a comma-decimal sample, and says it was guessed', async () => {
+        const { onChoose } = renderStep(COMMA_DECIMAL_SAMPLE);
+        await latestYaml(onChoose);
+
+        expect(separator().value).toBe('comma');
+        expect(screen.getByText('Guessed from the sample.')).toBeTruthy();
+        // The guess reaches the document the import runs under.
+        expect(withoutComments(await latestYaml(onChoose))).toContain('decimal_separator: comma');
+
+        // At the foot of the Amount fieldset, after both amount shapes: it applies to
+        // either one.
+        const amount = screen.getByRole('group', { name: 'Amount' });
+        expect(within(amount).getByLabelText(/^decimal separator/i)).toBe(separator());
+        const pair = within(amount).getByRole('radio', { name: /separate columns/i });
+        expect(pair.compareDocumentPosition(separator()) & Node.DOCUMENT_POSITION_FOLLOWING)
+            .toBeTruthy();
+    });
+
+    it('offers Point and Comma, each followed by an example', async () => {
+        const { onChoose } = renderStep(COMMA_DECIMAL_SAMPLE);
+        await latestYaml(onChoose);
+
+        expect(Array.from(separator().options).map((o) => [o.value, o.textContent]))
+            .toEqual([['point', 'Point  1,234.56'], ['comma', 'Comma  1.234,56']]);
+    });
+
+    it('stops saying it was guessed once the choice is changed', async () => {
+        // The line describes the preset. Once the select holds something else, the
+        // value is no longer the guess.
+        const { user, onChoose } = renderStep(COMMA_DECIMAL_SAMPLE);
+        await latestYaml(onChoose);
+
+        await user.selectOptions(separator(), 'point');
+
+        expect(screen.queryByText('Guessed from the sample.')).toBeNull();
+        await waitFor(async () =>
+            expect(withoutComments(await latestYaml(onChoose))).toContain('decimal_separator: point'));
+    });
+
+    it('keeps a saved layout\'s Point on a sample that would guess Comma, with no guessed line', async () => {
+        // The negative case: a saved layout is never guessed again (ADR-0114 D15). Its
+        // separator comes from the server's reading of the document, not from the file.
+        const { user, onChoose } = renderStep(COMMA_DECIMAL_SAMPLE);
+        await latestYaml(onChoose);
+        expect(separator().value).toBe('comma');
+
+        await chooseSavedLayout(user);
+
+        await waitFor(() => expect(separator().value).toBe('point'));
+        expect(screen.queryByText('Guessed from the sample.')).toBeNull();
+        expect(stub.callsTo('POST', /\/csv-mappings\/validate$/)).toHaveLength(1);
+    });
+
+    it('guesses again when the layout goes back to Not saved', async () => {
+        const { user, onChoose } = renderStep(COMMA_DECIMAL_SAMPLE);
+        await latestYaml(onChoose);
+        await chooseSavedLayout(user);
+        await waitFor(() => expect(separator().value).toBe('point'));
+
+        await user.selectOptions(screen.getByLabelText(/^layout$/i), '');
+
+        await waitFor(() => expect(separator().value).toBe('comma'));
+        expect(screen.getByText('Guessed from the sample.')).toBeTruthy();
+    });
+
+    it('shows the cells as the file writes them, with no column of amounts as read', async () => {
+        // The server is the only reader of a layout; the amounts as read are on the
+        // next step.
+        const { onChoose } = renderStep(COMMA_DECIMAL_SAMPLE);
+        await latestYaml(onChoose);
+
+        const grid = screen.getByRole('table');
+        expect(within(grid).getByText('-1.234,56')).toBeTruthy();
+        expect(within(grid).getByText('2.500,00')).toBeTruthy();
+        expect(within(grid).getAllByRole('columnheader').map((h) => h.textContent))
+            .toEqual(['1', '2', '3', '4']);
     });
 });

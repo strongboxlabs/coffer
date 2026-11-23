@@ -4,15 +4,16 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import * as apiModule from '@/lib/api';
 import type { InvestmentLotDto } from '@/lib/types';
 import { FifoPreviewPopover } from './FifoPreviewPopover';
+import { formatCurrency } from '@/lib/money';
 
 /**
  * The preview measures a sale against the position on its own date, without
- * itself (FU-097). It used to ask for today's lots, so editing an old sale on a
- * since-closed account showed "No open lots" and warned on every edit.
+ * itself (FU-097). Asking for today's lots would make editing an old sale on a
+ * since-closed account show "No open lots" and warn on every edit.
  */
 const lot: InvestmentLotDto = { lotId: 'leg-1', acquiredAt: '2014-01-10T00:00:00Z', quantity: 10, unitCost: 10 };
 
-function renderPopover(sharesInput: number) {
+function renderPopover(sharesInput: number, currency: string | null = 'USD') {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     return render(
         <QueryClientProvider client={queryClient}>
@@ -24,6 +25,7 @@ function renderPopover(sharesInput: number) {
                 sharesInput={sharesInput}
                 postedAt="2014-02-01"
                 excludeHeaderId="header-1"
+                currency={currency}
             />
         </QueryClientProvider>,
     );
@@ -54,5 +56,27 @@ describe('FifoPreviewPopover', () => {
 
         expect(await screen.findByText(/Exceeds the position held on this date by 2/)).toBeTruthy();
         expect(screen.getByText(/Save will be refused/)).toBeTruthy();
+    });
+
+    it("prints each lot's cost and the total basis in the brokerage's currency", async () => {
+        vi.spyOn(apiModule, 'fetchOpenLots').mockResolvedValue([lot]);
+
+        renderPopover(8, 'EUR');
+
+        expect(await screen.findByText('Will close 1 lot')).toBeTruthy();
+        expect(screen.getByText(/8\/10 sh @/)).toHaveTextContent(formatCurrency(10, 'EUR'));
+        expect(screen.getByText(formatCurrency(80, 'EUR'), { selector: '.font-semibold' })).toBeTruthy();
+        expect(screen.queryByText(/\$/)).toBeNull();
+    });
+
+    it('prints no cost while the brokerage currency is not known', async () => {
+        vi.spyOn(apiModule, 'fetchOpenLots').mockResolvedValue([lot]);
+
+        renderPopover(8, null);
+
+        expect(await screen.findByText('Will close 1 lot')).toBeTruthy();
+        expect(screen.getByText('Total basis closed')).toBeTruthy();
+        expect(screen.queryByText(/[$€£]/)).toBeNull();
+        expect(screen.queryByText(/80\.00/)).toBeNull();
     });
 });

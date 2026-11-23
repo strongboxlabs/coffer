@@ -47,6 +47,25 @@ public sealed class UsersRepository
             .ConfigureAwait(false);
 
     /// <summary>
+    /// Display names of these users, keyed by id; an id with no user is absent. Like
+    /// <see cref="ExistsAsync"/> it spans users, so it uses the service role and callers
+    /// are admin-gated.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<Guid, string>> DisplayNamesAsync(
+        IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(ids);
+        if (ids.Count == 0)
+            return new Dictionary<Guid, string>();
+
+        await using var db = _serviceFactory.Create();
+        return await db.Users.AsNoTracking()
+            .Where(u => ids.Contains(u.Id))
+            .ToDictionaryAsync(u => u.Id, u => u.DisplayName, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Whether any (non-system) user has this id — for admin actions on ANOTHER user,
     /// which <see cref="GetByIdAsync"/> can't answer because RLS limits it to the
     /// caller's own row. Service role; callers are admin-gated.

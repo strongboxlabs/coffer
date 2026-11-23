@@ -9,18 +9,19 @@ namespace Coffer.Api.Tests.Integration.Auth;
 /// whether an install had them depended on a proxy configuration nobody was told to write.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class SecurityHeadersTests
+public sealed class SecurityHeadersTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SecurityHeadersTests(PostgresFixture fixture) => _fixture = fixture;
+    public SecurityHeadersTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     [Theory]
     [InlineData("/api/meta/version")]   // an API answer
     [InlineData("/api/no-such-route")]  // a 404, which carries them too
     public async Task A_response_carries_the_security_headers(string path)
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var response = await client.GetAsync(path);
@@ -41,7 +42,7 @@ public sealed class SecurityHeadersTests
     [Fact]
     public async Task Over_https_it_also_asks_for_https_from_now_on()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
         {
             BaseAddress = new Uri("https://localhost"),
@@ -56,7 +57,7 @@ public sealed class SecurityHeadersTests
     [Fact]
     public async Task No_cross_origin_opener_policy_that_would_cut_a_connectors_popup_sign_in()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var response = await client.GetAsync("/api/meta/version");

@@ -25,11 +25,12 @@ namespace Coffer.Api.Tests.Integration.Ingest;
 /// needs no inference at all, which is why it exists instead.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ImportUndoTests
+public sealed class ImportUndoTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ImportUndoTests(PostgresFixture fixture) => _fixture = fixture;
+    public ImportUndoTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     // Two buys, minimal but real-shaped. Synthesised — no real fund or account data.
     private const string TwoBuysQif = """
@@ -123,14 +124,14 @@ public sealed class ImportUndoTests
         // WHICH RUN, so a second upload of the same statement produced rows
         // indistinguishable from the first — same provider, same dates, same amounts —
         // and cleanup meant hunting duplicates by eye.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var import = await ImportAsync(client, ledger.LedgerId, brokerage.Id);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var headers = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif")
             .ToListAsync();
@@ -145,9 +146,9 @@ public sealed class ImportUndoTests
         // The point of the stamp, and the assertion that earns it: the FIRST import must
         // survive. A test that only counted the total after undo would pass on an
         // implementation that deleted everything the provider had ever written.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var first = await ImportAsync(client, ledger.LedgerId, brokerage.Id);
@@ -158,7 +159,7 @@ public sealed class ImportUndoTests
         // Two different files, so four rows. Re-uploading the SAME qif would have given
         // two — QIF dedups on its own synthetic external_id — which is why this test
         // uses a second file rather than repeating the first.
-        await using (var before = _fixture.NewDbContext())
+        await using (var before = Db.NewDbContext())
         {
             Assert.Equal(4, await before.TxnHeaders.AsNoTracking()
                 .CountAsync(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif"));
@@ -169,13 +170,13 @@ public sealed class ImportUndoTests
         var result = await undo.Content.ReadFromJsonAsync<UndoImportResult>();
         Assert.Equal(2, result!.Found);
 
-        // REMOVED, not hidden. Hiding was the first design and it was wrong: a hidden
-        // row keeps its external_id, and the import dedup matches on external_id with no
-        // is_hidden filter, so the same file could never be imported again — see
+        // REMOVED, not hidden. A hidden row keeps its external_id, and the import dedup
+        // matches on external_id with no is_hidden filter, so hiding would mean the same
+        // file could never be imported again — see
         // Undoing_an_import_lets_the_same_file_be_imported_again.
         Assert.Equal(2, result.Deleted);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var rows = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif")
             .ToListAsync();
@@ -201,9 +202,9 @@ public sealed class ImportUndoTests
         // is_hidden alone" so a re-sync cannot undo a manual hide. Together those mean a
         // re-import matches every hidden row, counts it alreadyKnown, inserts nothing,
         // and leaves the register empty while reporting success.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var first = await ImportAsync(client, ledger.LedgerId, brokerage.Id);
@@ -223,7 +224,7 @@ public sealed class ImportUndoTests
         // ...and this proves the register actually shows them, which is the claim the
         // user cares about. A version that inserted rows while leaving the originals
         // hidden would pass the counts above and still look empty.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var visible = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId
                         && h.ProviderKey == "qif"
@@ -236,9 +237,9 @@ public sealed class ImportUndoTests
     [Fact]
     public async Task A_dry_run_counts_without_deleting_anything()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var import = await ImportAsync(client, ledger.LedgerId, brokerage.Id);
@@ -253,7 +254,7 @@ public sealed class ImportUndoTests
 
         // Both halves asserted: a dry run that reported the count and deleted anyway
         // would pass on the count alone.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Equal(2, await db.TxnHeaders.AsNoTracking()
             .CountAsync(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif"));
     }
@@ -265,12 +266,12 @@ public sealed class ImportUndoTests
         // anything. Refused by name rather than returning zero rows, which would read
         // as a successful undo of nothing — the success-shaped non-event this repo keeps
         // finding in its own tooling.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var quoteRunId = Guid.NewGuid();
-        await using (var seed = _fixture.NewDbContext())
+        await using (var seed = Db.NewDbContext())
         {
             seed.LedgerOperations.Add(new LedgerOperationRow
             {
@@ -293,8 +294,8 @@ public sealed class ImportUndoTests
     [Fact]
     public async Task Undo_of_an_unknown_operation_is_not_silently_a_success()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(UndoUrl(ledger.LedgerId, Guid.NewGuid()), null);
@@ -306,11 +307,11 @@ public sealed class ImportUndoTests
     {
         // Defence in depth over RLS: the lookup is keyed on ledger_id too, so a guessed
         // operation id from another ledger finds nothing here.
-        var mine = await SyntheticLedger.CreateAsync(_fixture);
-        var theirs = await SyntheticLedger.CreateAsync(_fixture);
+        var mine = await SyntheticLedger.CreateAsync(Db);
+        var theirs = await SyntheticLedger.CreateAsync(Db);
         var theirAccount = await theirs.AddInvestmentAccountAsync("brokerage");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var theirClient = await AuthedClientAsync(factory, theirs);
         var theirImport = await ImportAsync(theirClient, theirs.LedgerId, theirAccount.Id);
 
@@ -320,7 +321,7 @@ public sealed class ImportUndoTests
         Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
 
         // ...and their rows are untouched.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Equal(2, await db.TxnHeaders.AsNoTracking()
             .CountAsync(h => h.LedgerId == theirs.LedgerId && h.ProviderKey == "qif"));
     }

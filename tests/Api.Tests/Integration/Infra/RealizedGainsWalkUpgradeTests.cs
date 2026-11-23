@@ -31,11 +31,12 @@ namespace Coffer.Api.Tests.Integration.Infra;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class RealizedGainsWalkUpgradeTests
+public sealed class RealizedGainsWalkUpgradeTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public RealizedGainsWalkUpgradeTests(PostgresFixture fixture) => _fixture = fixture;
+    public RealizedGainsWalkUpgradeTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private const string Mig217 = "217_realized_gains_walk_sees_long_term.sql";
 
@@ -53,15 +54,21 @@ public sealed class RealizedGainsWalkUpgradeTests
     /// at runtime, on the first consistency check after the upgrade. Returning the row without
     /// counting would hide exactly that.
     /// </remarks>
-    private static async Task<string> WalkResultShapeAsync(string connectionString)
+    private static Task<string> WalkResultShapeAsync(string connectionString)
+        => ResultShapeAsync(connectionString, "realized_gains_walk");
+
+    /// <summary>The one function named <paramref name="name"/> in <c>public</c>, as
+    /// <see cref="WalkResultShapeAsync"/> renders it. Throws unless there is exactly one.</summary>
+    private static async Task<string> ResultShapeAsync(string connectionString, string name)
     {
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
         await using var command = new NpgsqlCommand(
             "SELECT pg_get_function_result(p.oid), pg_get_function_identity_arguments(p.oid) "
             + "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
-            + "WHERE n.nspname = 'public' AND p.proname = 'realized_gains_walk' "
+            + "WHERE n.nspname = 'public' AND p.proname = @name "
             + "ORDER BY 1", connection);
+        command.Parameters.AddWithValue("name", name);
 
         var shapes = new List<string>();
         await using (var reader = await command.ExecuteReaderAsync())
@@ -72,10 +79,45 @@ public sealed class RealizedGainsWalkUpgradeTests
 
         Assert.True(
             shapes.Count == 1,
-            $"expected exactly one realized_gains_walk in public, found {shapes.Count}: "
+            $"expected exactly one {name} in public, found {shapes.Count}: "
             + string.Join(" ||| ", shapes));
 
         return shapes[0];
+    }
+
+    private const string Mig301 = "301_each_currency_keeps_its_minor_units.sql";
+
+    /// <summary>
+    /// Migration 301 redefines both realized-gains functions to round at the account
+    /// currency's places (ADR-0114 D15) and leaves each one overload with the shape it
+    /// had: the walk's (account, security) signature and nine result columns, and the
+    /// writer's three-argument signature returning a count.
+    /// </summary>
+    /// <remarks>
+    /// 301 uses CREATE OR REPLACE, which cannot change a result shape and keeps the one
+    /// overload; a future rewrite to DROP + CREATE with a drifted argument type would
+    /// leave a second overload, which this catches.
+    /// </remarks>
+    [Fact]
+    public async Task Migration_301_leaves_one_walk_and_one_writer_with_their_shapes()
+    {
+        var work = NewWorkDir();
+        var connectionString = Db.EmptyDatabaseConnectionString("rehearsal_gains_walk_301");
+        UpgradeRehearsal.RunStaged(connectionString, UpgradeRehearsal.StageBefore(Mig301, work));
+
+        var walkBefore = await WalkResultShapeAsync(connectionString);
+        var writerBefore = await ResultShapeAsync(connectionString, "recompute_holdings_cost_basis");
+
+        UpgradeRehearsal.Apply(connectionString, work, Mig301);
+
+        var walkAfter = await WalkResultShapeAsync(connectionString);
+        Assert.Equal(walkBefore, walkAfter);
+        Assert.StartsWith("(p_account_id uuid, p_security_id uuid) ->", walkAfter, StringComparison.Ordinal);
+        Assert.Equal(9, walkAfter[(walkAfter.IndexOf("-> ", StringComparison.Ordinal) + 3)..].Split(',').Length);
+
+        var writerAfter = await ResultShapeAsync(connectionString, "recompute_holdings_cost_basis");
+        Assert.Equal(writerBefore, writerAfter);
+        Assert.Equal("(p_ledger_id uuid, p_account_id uuid, p_security_id uuid) -> integer", writerAfter);
     }
 
     /// <summary>
@@ -92,7 +134,7 @@ public sealed class RealizedGainsWalkUpgradeTests
     public async Task An_install_on_the_six_column_walk_gains_the_long_term_columns()
     {
         var work = NewWorkDir();
-        var connectionString = _fixture.EmptyDatabaseConnectionString("rehearsal_gains_walk");
+        var connectionString = Db.EmptyDatabaseConnectionString("rehearsal_gains_walk");
         UpgradeRehearsal.RunStaged(connectionString, UpgradeRehearsal.StageBefore(Mig217, work));
 
         var before = await WalkResultShapeAsync(connectionString);
@@ -124,7 +166,7 @@ public sealed class RealizedGainsWalkUpgradeTests
     /// 217 applied twice against the database it just changed.
     /// </summary>
     /// <remarks>
-    /// Not hypothetical for this one. <c>DROP FUNCTION IF EXISTS</c> then <c>CREATE FUNCTION</c>
+    /// <c>DROP FUNCTION IF EXISTS</c> then <c>CREATE FUNCTION</c>
     /// is re-runnable by construction, but only while the <c>IF EXISTS</c> and the plain
     /// <c>CREATE</c> stay in that pairing — swap the create for one without a preceding drop and
     /// the script becomes a one-shot that fails on the operator's next restore, long after the
@@ -134,7 +176,7 @@ public sealed class RealizedGainsWalkUpgradeTests
     public async Task Applying_217_twice_leaves_one_function_and_no_error()
     {
         var work = NewWorkDir();
-        var connectionString = _fixture.EmptyDatabaseConnectionString("rehearsal_gains_walk_rerun");
+        var connectionString = Db.EmptyDatabaseConnectionString("rehearsal_gains_walk_rerun");
         UpgradeRehearsal.RunStaged(connectionString, UpgradeRehearsal.StageBefore(Mig217, work));
 
         await UpgradeRehearsal.ApplyAndProveRerunnableAsync(connectionString, work, Mig217);

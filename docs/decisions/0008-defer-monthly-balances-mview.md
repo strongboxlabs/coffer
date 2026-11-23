@@ -31,7 +31,7 @@ PostgreSQL rejects this — aggregates cannot take window-function results as ar
 - The materialized-view design is revisited at the time it actually gets exercised (Phase 8 reports), giving us a chance to look at refresh cadence, concurrency, and incremental-refresh trade-offs in context.
 
 **Negative**
-- Until Phase 8, net-worth-history reports must aggregate live. For the initial single-user dataset (one large real-world export), live aggregation in Postgres is fast enough that this is not a real cost.
+- Until Phase 8, net-worth-history reports must aggregate live. At single-user scale, live aggregation in Postgres is fast enough that this is not a real cost.
 
 ## Alternatives considered
 

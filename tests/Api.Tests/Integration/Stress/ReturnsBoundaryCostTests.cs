@@ -11,36 +11,33 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Stress;
 
 /// <summary>
-/// Measures what a TWR boundary actually costs, because
-/// <c>MaxReturnsBoundaries</c> is a wall-clock budget and a budget set without a
-/// measurement is a guess — as this test's own first version proved.
+/// Measures what a time-weighted return costs as its boundary count grows, against
+/// a realistically sized ledger.
 /// </summary>
 /// <remarks>
 /// <para>A boundary valuation reads every scoped account's balance and holdings
-/// as of that instant. The first version of this test seeded a NEAR-EMPTY ledger
-/// — one holding, no history — measured 3.4 ms per boundary, and the cap was
-/// raised from 400 to 2000 on that basis. Against a realistic ledger the figure
-/// was 80-100 ms, so that reasoning was ~60x optimistic and would have licensed
-/// a seven-minute request. The ledger is seeded through <c>StressLedger</c> now
-/// for exactly that reason: the cost is O(ledger), so measuring it without one
-/// measures nothing.</para>
-/// <para>Measured on 50000 transactions, per boundary: <b>~165 ms</b> before
-/// migration 198 and <b>~90 ms</b> after it. The cap is a wall-clock budget
-/// derived from that: 700 boundaries is roughly 60 s.</para>
+/// as of that instant, so its cost is O(ledger). Against a NEAR-EMPTY ledger —
+/// one holding, no history — it reads ~60x cheaper than against a realistic one,
+/// so a figure taken there says nothing about a real request. The ledger is
+/// seeded through <c>StressLedger</c> for that reason.</para>
+/// <para><c>ReturnsAsync</c> values every interior boundary in two set-based
+/// queries — holdings through <c>holdings_market_value_as_of_set</c> and cash
+/// through <c>account_balance_as_of_instants</c> — rather than two per boundary,
+/// so no boundary-count limit applies. The printed per-boundary figure is how a
+/// return to per-boundary valuation (cost boundaries × history) shows up.</para>
 /// <para>No timing bound is asserted — the numbers are the output, and hardware
 /// differs. The assertion is a correctness one: every measured scale must still
-/// PRODUCE a time-weighted return rather than silently degrade to IRR, which is
-/// the regression a too-low cap causes.</para>
+/// PRODUCE a time-weighted return, not just the money-weighted one, which is what
+/// a boundary-count limit or a per-boundary timeout would cause.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class ReturnsBoundaryCostTests
+public sealed class ReturnsBoundaryCostTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
     private readonly ITestOutputHelper _output;
 
     public ReturnsBoundaryCostTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
         _output = output;
     }
 
@@ -49,14 +46,13 @@ public sealed class ReturnsBoundaryCostTests
     [Theory]
     [InlineData(100)]
     [InlineData(200)]
-    [InlineData(390)]   // just inside the cap
+    [InlineData(390)]
     public async Task Twr_still_computes_as_boundary_count_grows(int flowDates)
     {
         // A REALISTIC ledger underneath the flows. A boundary valuation costs
-        // O(ledger), not O(1): measuring against a near-empty ledger reported
-        // 3.4 ms per boundary and a cap sized from that was ~60x optimistic.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await StressLedger.SeedAsync(_fixture, ledger, StressLedger.Scale.Default);
+        // O(ledger), not O(1): a near-empty ledger underestimates it ~60x.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await StressLedger.SeedAsync(Db, ledger, StressLedger.Scale.Default);
 
         var bank = await ledger.AddBankAccountAsync("Checking");
         var brokerage = await ledger.AddInvestmentAccountAsync("Flow Brokerage");
@@ -72,7 +68,7 @@ public sealed class ReturnsBoundaryCostTests
         await ledger.AddInvestmentBuyAsync(brokerage.Id, holdings, sec, 100m, 10m, start);
         await ledger.AddSecurityPriceAsync(sec, 12m, start.AddDays((flowDates * 2) + 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var repository = new InvestmentReportingRepository(db, TimeProvider.System);
 
         var sw = Stopwatch.StartNew();
@@ -85,7 +81,8 @@ public sealed class ReturnsBoundaryCostTests
         _output.WriteLine(string.Create(CultureInfo.InvariantCulture,
             $"boundaries={flowDates,5}  elapsed={sw.ElapsedMilliseconds,6}ms  per-boundary={perBoundary:F2}ms"));
 
-        // The regression that bit: a cap set too low silently drops TWR entirely.
+        // The regression this guards: TWR silently dropped at a boundary count the
+        // report has to serve.
         Assert.NotNull(result.TimeWeightedReturn);
         Assert.Null(result.TimeWeightedUnavailableReason);
     }
@@ -95,13 +92,12 @@ public sealed class ReturnsBoundaryCostTests
     /// can actually be asserted: batching does not change the ANSWER.
     /// </summary>
     /// <remarks>
-    /// An earlier version asserted per-instant cost must not grow with instant count.
-    /// That was wrong twice over. It is not a property the design promises — the
-    /// merged stream is positions x instants rows through a sort, so mild
-    /// superlinearity is expected and measured (1.35ms each at 100 instants,
-    /// 1.63ms at 420). And it would not have caught the regression it existed for:
-    /// going back to one replay per instant ALSO gives a roughly flat per-instant
-    /// cost, just a much larger one, so a ratio cannot tell the two apart. Only the
+    /// Per-instant cost is not asserted flat. It is not a property the design
+    /// promises — the merged stream is positions x instants rows through a sort, so
+    /// mild superlinearity is expected (on the <c>StressLedger</c> default, 1.35ms
+    /// each at 100 instants and 1.63ms at 420). Nor would a ratio catch the regression that matters: one
+    /// replay per instant ALSO gives a roughly flat per-instant cost, just a much
+    /// larger one, so a ratio cannot tell the two apart. Only the
     /// absolute figure distinguishes them, and this lane deliberately asserts no
     /// absolute timings because it runs on whatever hardware invokes it — the
     /// printed numbers are the output.
@@ -109,18 +105,18 @@ public sealed class ReturnsBoundaryCostTests
     [Fact]
     public async Task Batched_holdings_feeder_prints_cost_and_agrees_with_itself()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await StressLedger.SeedAsync(_fixture, ledger, StressLedger.Scale.Default);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await StressLedger.SeedAsync(Db, ledger, StressLedger.Scale.Default);
 
         var start = Utc(2016, 1, 1);
         DateTime[] Instants(int n) =>
             Enumerable.Range(0, n).Select(i => start.AddDays(i * 4)).ToArray();
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
 
         // NULL account set = every holdings account. An EMPTY array means none, and
-        // passing one measured a query that returned nothing while reporting a 56x
-        // speedup — the reason this note is here.
+        // passing one would time a query that returns nothing and report it as a
+        // large speedup.
         async Task<(long Ms, List<(DateTime AsOf, decimal Mv)> Rows)> TimeIt(int n)
         {
             var sw = Stopwatch.StartNew();

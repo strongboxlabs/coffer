@@ -9,7 +9,7 @@
 -- originated from inline SQL inside the API repositories
 -- (`InvestmentTransactionsRepository.Create/Patch/DeleteAsync` and
 -- `AccountsRepository.SetIsTradeCommissionAsync`), which violates
--- the no-raw-sql-in-API policy (memory `feedback_no_raw_sql_in_api`).
+-- the no-raw-sql-in-API policy (scripts/audit-no-raw-sql.sh).
 --
 -- This migration moves the recompute trigger to the DB layer:
 --

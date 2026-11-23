@@ -13,18 +13,19 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// right way), matching the symmetric-posting model.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class ReportingRepositoryTests
+public sealed class ReportingRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public ReportingRepositoryTests(PostgresFixture fixture) => _fixture = fixture;
+    public ReportingRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static readonly DateTime May = new(2026, 5, 15, 12, 0, 0, DateTimeKind.Utc);
     private static readonly DateTime Jun = new(2026, 6, 15, 12, 0, 0, DateTimeKind.Utc);
 
     private async Task<(Guid Ledger, Guid Groceries, Guid Rent, Guid Salary)> SeedAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var groceries = await ledger.AddCategoryAsync("Groceries", "expense");
         var rent = await ledger.AddCategoryAsync("Rent", "expense");
@@ -44,7 +45,7 @@ public sealed class ReportingRepositoryTests
         return (ledger.LedgerId, groceries.Id, rent.Id, salary.Id);
     }
 
-    private ReportingRepository NewRepo() => new(_fixture.NewDbContext(), TimeProvider.System);
+    private ReportingRepository NewRepo() => new(Db.NewDbContext(), TimeProvider.System);
 
     [Fact]
     public async Task Spending_by_month_and_category_sums_positive()
@@ -120,5 +121,5 @@ public sealed class ReportingRepositoryTests
     }
 
     private static decimal Cell(ReportResult r, string period, Guid categoryId) =>
-        r.Rows.Single(x => x.Period == period && x.GroupId == categoryId).Amount;
+        r.Rows.Single(x => x.Period == period && x.GroupId == categoryId).Amount!.Value;
 }

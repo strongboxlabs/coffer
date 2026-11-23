@@ -1,5 +1,7 @@
 // Bulk selection API types (ADR-0024).
 
+import type { RateUnavailable } from './conversion';
+
 /**
  * Status-filter discriminator the SPA carries in `'all'`-kind
  * selections. Mirrors the API's `Coffer.Api.Contracts.SelectionRequest`
@@ -36,16 +38,22 @@ export type SelectionStatusFilter =
 export type SelectionRequest =
     | {
           kind: 'explicit';
-          /** Account scope so the server can compute the selection Σ on this
-           *  account (the sum is account-scoped). The bulk-apply query ignores
-           *  it for explicit selections — it acts on exactly `headerIds` — so
-           *  this only feeds the summary sum. */
-          accountId?: string;
+          /** The register's account, required: a selection is made on one
+           *  register. The server computes the selection Σ on it; the
+           *  bulk-apply query ignores it for explicit selections — it acts on
+           *  exactly `headerIds`. */
+          accountId: string;
           headerIds: readonly string[];
+          /** The register is widened to the category's descendants (mig 226):
+           *  the server refuses a bulk change naming a row this register shows
+           *  read-only, and it needs the register's scope to know which. */
+          includeSubcategories?: boolean;
       }
     | {
           kind: 'all';
-          accountId?: string;
+          /** The register's account, required: select-all covers that
+           *  register's rows. */
+          accountId: string;
           statusFilter: SelectionStatusFilter;
           /** ISO-8601 UTC timestamp string — when the user clicked
            *  select-all. Predicate only matches rows whose
@@ -84,12 +92,29 @@ export type SelectionRequest =
 
 /**
  * Mirror of API `Coffer.Api.Contracts.SelectionSummary`. Drives the
- * footer's "N selected · Σ $X.XX" readout. `sumOnAccount` is null for
- * ledger-wide selections (no single currency to sum into).
+ * footer's "N selected · M read-only · Σ $X.XX" readout and the bulk
+ * confirmations' counts.
  */
 export interface SelectionSummary {
+    /** Rows a bulk change acts on: a select-all's editable rows, or every row
+     *  an explicit selection names. The delete and move confirmations state it. */
     count: number;
+    /** Rows the selection covers, read-only rows included: the footer's
+     *  "N selected" for a select-all. */
+    totalCount: number;
+    /** How many of `totalCount` the register shows read-only. */
+    readOnlyCount: number;
+    /** The Σ of the selected rows' own legs in the register's scope, over every
+     *  row `totalCount` counts, read-only rows included, in both selection modes,
+     *  in `currencyCode`. Null, with `rateUnavailable`, when it needs a missing rate. */
     sumOnAccount: number | null;
+    /** The currency `sumOnAccount` is in (ADR-0114 D7): a real account's own. On a
+     *  category's register, whose rows are each in the paying account's currency, the
+     *  one currency the selected rows are in, or, when they are in several, the
+     *  reporting currency, each row converted at its date. */
+    currencyCode: string;
+    /** Every missing rate the sum needed (ADR-0114 D9); absent when none is missing. */
+    rateUnavailable?: RateUnavailable[];
 }
 
 /** Mirror of API `BulkReconStatusResponse`. */
@@ -111,4 +136,7 @@ export interface BulkUnhideResponse {
 /** Mirror of API `BulkMoveAccountResponse` (ADR-0072 D3). */
 export interface BulkMoveAccountResponse {
     moved: number;
+    /** How many mirrored pairs the move left across currencies, so each now carries two
+     *  amounts (ADR-0114 D13). Zero when the target is in the source's currency. */
+    becameTwoAmount: number;
 }

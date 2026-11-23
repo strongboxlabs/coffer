@@ -30,13 +30,11 @@ namespace Coffer.Api.Tests.Integration.FeedConnections;
 ///     actionable code.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class FeedConnectionsEndpointsTests
+public sealed class FeedConnectionsEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public FeedConnectionsEndpointsTests(PostgresFixture fixture)
+    public FeedConnectionsEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -82,7 +80,7 @@ public sealed class FeedConnectionsEndpointsTests
         const string claimUrl = "https://bridge.simplefin.org/simplefin/claim/abc";
         const string accessUrl = "https://u:p@bridge.simplefin.org/simplefin/access/xyz";
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(req =>
             {
                 if (req.Method == HttpMethod.Post && req.RequestUri!.AbsoluteUri == claimUrl)
@@ -119,7 +117,7 @@ public sealed class FeedConnectionsEndpointsTests
 
         // Core security property: the access URL is sealed in the
         // DB, never stored plaintext.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.FeedConnections.AsNoTracking()
             .SingleAsync(r => r.Id == body.Id);
         Assert.NotNull(row.AccessUrlCiphertext);
@@ -131,7 +129,7 @@ public sealed class FeedConnectionsEndpointsTests
         // ciphertext back to the original access URL.
         var ledgerRow = await db.Ledgers.AsNoTracking()
             .SingleAsync(l => l.Id == ledger.LedgerId);
-        var keys = _fixture.NewLedgerKeyService();
+        var keys = Db.NewLedgerKeyService();
         var opened = keys.Open(ledgerRow.WrappedLek!, row.AccessUrlCiphertext!);
         Assert.Equal(accessUrl, Encoding.UTF8.GetString(opened));
     }
@@ -140,7 +138,7 @@ public sealed class FeedConnectionsEndpointsTests
     public async Task Post_returns_422_when_setup_token_is_missing()
     {
         var ledger = await SyntheticLedgerWithLekAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             // Stub never gets called — request rejected before the
             // exchange. Returns a valid-looking response just in
             // case the gate slips.
@@ -166,7 +164,7 @@ public sealed class FeedConnectionsEndpointsTests
     {
         var alice = await SyntheticLedgerWithLekAsync();
         var bob = await SyntheticLedgerWithLekAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(_ =>
                 new HttpResponseMessage(HttpStatusCode.OK)
                 {
@@ -193,7 +191,7 @@ public sealed class FeedConnectionsEndpointsTests
         // endpoint then maps the exception to 422 with a typed
         // code so the SPA can render "generate a fresh token."
         var ledger = await SyntheticLedgerWithLekAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(_ =>
                 new HttpResponseMessage(HttpStatusCode.Forbidden)));
         using var client = await AuthedClientAsync(factory, ledger);
@@ -215,10 +213,10 @@ public sealed class FeedConnectionsEndpointsTests
         // the endpoint generates a fresh LEK transparently, wraps
         // it with the current master KEK, persists, then proceeds
         // with the seal. ADR-0026 lazy-backfill path.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         // Deliberately don't patch on a LEK — leaves wrapped_lek NULL.
         const string accessUrl = "https://u:p@bridge.simplefin.org/access/xyz";
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(req =>
                 req.Method == HttpMethod.Post
                     ? new HttpResponseMessage(HttpStatusCode.OK)
@@ -234,7 +232,7 @@ public sealed class FeedConnectionsEndpointsTests
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
 
         // Ledger row now carries a wrapped LEK + kek_id.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var ledgerRow = await db.Ledgers.AsNoTracking()
             .SingleAsync(l => l.Id == ledger.LedgerId);
         Assert.NotNull(ledgerRow.WrappedLek);
@@ -246,7 +244,7 @@ public sealed class FeedConnectionsEndpointsTests
         var conn = await response.Content.ReadFromJsonAsync<FeedConnectionSummary>();
         var connRow = await db.FeedConnections.AsNoTracking()
             .SingleAsync(c => c.Id == conn!.Id);
-        var keys = _fixture.NewLedgerKeyService();
+        var keys = Db.NewLedgerKeyService();
         var opened = keys.Open(ledgerRow.WrappedLek!, connRow.AccessUrlCiphertext!);
         Assert.Equal(accessUrl, Encoding.UTF8.GetString(opened));
     }
@@ -258,7 +256,7 @@ public sealed class FeedConnectionsEndpointsTests
         // order. Also pins that per-user RLS scope holds: a stranger
         // sees an empty list, not the alice rows.
         var ledger = await SyntheticLedgerWithLekAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(req =>
                 req.Method == HttpMethod.Post
                     ? new HttpResponseMessage(HttpStatusCode.OK)
@@ -284,7 +282,7 @@ public sealed class FeedConnectionsEndpointsTests
         // signal for the ordering assertion.
         var firstId = (await first.Content.ReadFromJsonAsync<FeedConnectionSummary>())!.Id;
         var secondId = (await second.Content.ReadFromJsonAsync<FeedConnectionSummary>())!.Id;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var row = await db.FeedConnections.SingleAsync(r => r.Id == secondId);
             row.LastSyncedAt = DateTime.UtcNow;
@@ -304,7 +302,7 @@ public sealed class FeedConnectionsEndpointsTests
     {
         var alice = await SyntheticLedgerWithLekAsync();
         var bob = await SyntheticLedgerWithLekAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var bobClient = await AuthedClientAsync(factory, bob);
 
         var response = await bobClient.GetAsync(
@@ -319,7 +317,7 @@ public sealed class FeedConnectionsEndpointsTests
     public async Task Delete_removes_a_connection()
     {
         var ledger = await SyntheticLedgerWithLekAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        await using var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(_ =>
                 new HttpResponseMessage(HttpStatusCode.OK)
                     { Content = new StringContent("https://u:p@host/access/a") }));
@@ -345,7 +343,7 @@ public sealed class FeedConnectionsEndpointsTests
     public async Task Delete_returns_422_feed_connection_not_found_for_unknown_id()
     {
         var ledger = await SyntheticLedgerWithLekAsync();
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var response = await client.DeleteAsync(
@@ -354,6 +352,164 @@ public sealed class FeedConnectionsEndpointsTests
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal("feed-connection-not-found",
             doc.RootElement.GetProperty("code").GetString());
+    }
+
+    // ------------------------------------------------------------------
+    // An account's currency must match what is imported into it
+    // (ADR-0114 D13): the bind refuses a feed account in another
+    // currency, and the sync refuses a binding the bind could not judge.
+    // ------------------------------------------------------------------
+
+    /// <summary>A feed with one account in each of two currencies and one that reports
+    /// none, each carrying one posted row.</summary>
+    private const string TwoCurrencyFeed = """
+        {"connections":[
+          {"conn_id":"c-A","name":"Bank A","org_id":"banka","sfin_url":"https://sfin/banka"}
+        ],"errlist":[],"accounts":[
+          {"id":"sf-eur","conn_id":"c-A","name":"Account E",
+           "currency":"EUR","balance":"0.00","transactions":[
+            {"id":"fitid-eur","posted":1715000000,"amount":"-10.00","description":"Row E","pending":false}
+          ]},
+          {"id":"sf-usd","conn_id":"c-A","name":"Account U",
+           "currency":"usd","balance":"0.00","transactions":[
+            {"id":"fitid-usd","posted":1715000000,"amount":"-10.00","description":"Row U","pending":false}
+          ]},
+          {"id":"sf-none","conn_id":"c-A","name":"Account N",
+           "balance":"0.00","transactions":[]}
+        ]}
+        """;
+
+    /// <summary>A connection on a ledger whose SimpleFIN answers every fetch with
+    /// <paramref name="accountsBody"/>.</summary>
+    private async Task<(ApiFactory Factory, SyntheticLedger Ledger, Guid ConnectionId)> ConnectAsync(
+        string accountsBody)
+    {
+        var ledger = await SyntheticLedgerWithLekAsync();
+        const string accessUrl = "https://u:p@bridge.simplefin.org/simplefin/access/abc";
+        var factory = new ApiFactory(Db).WithoutDevAuth()
+            .WithService<SimpleFinClient>(_ => ClientWithStubHandler(req =>
+                req.Method == HttpMethod.Post
+                    ? new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(accessUrl) }
+                    : new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(accountsBody) }));
+        using var client = await AuthedClientAsync(factory, ledger);
+        var created = await client.PostAsJsonAsync(
+            $"/api/ledgers/{ledger.LedgerId}/feed-connections",
+            new CreateFeedConnectionRequest { SetupToken = SetupTokenFor("https://x/c") });
+        created.EnsureSuccessStatusCode();
+        var connection = (await created.Content.ReadFromJsonAsync<FeedConnectionSummary>())!;
+        return (factory, ledger, connection.Id);
+    }
+
+    private static Task<HttpResponseMessage> BindAsync(
+        HttpClient client, SyntheticLedger ledger, Guid accountId, Guid connectionId, string externalId) =>
+        client.SendAsync(new HttpRequestMessage(
+            HttpMethod.Patch, $"/api/ledgers/{ledger.LedgerId}/accounts/{accountId}/feed-mapping")
+        {
+            Content = JsonContent.Create(new PatchAccountFeedMappingRequest
+            {
+                FeedConnectionId = connectionId,
+                SimpleFinAccountId = externalId,
+            }),
+        });
+
+    private async Task<string?> BoundExternalIdAsync(Guid accountId)
+    {
+        await using var db = Db.NewDbContext();
+        return await db.Accounts.AsNoTracking()
+            .Where(a => a.Id == accountId).Select(a => a.ExternalId).SingleAsync();
+    }
+
+    [Fact]
+    public async Task Binding_a_feed_account_in_another_currency_is_refused_and_one_in_the_accounts_own_binds()
+    {
+        var setup = await ConnectAsync(TwoCurrencyFeed);
+        await using var factory = setup.Factory;
+        using var client = await AuthedClientAsync(factory, setup.Ledger);
+        var usdAccount = await setup.Ledger.AddBankAccountAsync("account-a");
+        var eurAccount = await setup.Ledger.AddBankAccountAsync("account-b", currencyCode: "EUR");
+        var otherUsdAccount = await setup.Ledger.AddBankAccountAsync("account-c");
+
+        // A first sync fills the connection's directory, each feed account with its currency.
+        var sync = await client.PostAsync(
+            $"/api/ledgers/{setup.Ledger.LedgerId}/feed-connections/{setup.ConnectionId}/sync", content: null);
+        Assert.Equal(HttpStatusCode.OK, sync.StatusCode);
+
+        var refused = await BindAsync(client, setup.Ledger, usdAccount.Id, setup.ConnectionId, "sf-eur");
+        var refusedBody = await refused.Content.ReadAsStringAsync();
+        Assert.True(refused.StatusCode == HttpStatusCode.UnprocessableEntity,
+            $"{(int)refused.StatusCode}: {refusedBody}");
+        using (var doc = JsonDocument.Parse(refusedBody))
+        {
+            Assert.Equal("feed-account-currency-mismatch", doc.RootElement.GetProperty("code").GetString());
+            var detail = doc.RootElement.GetProperty("detail").GetString()!;
+            Assert.Contains("EUR", detail, StringComparison.Ordinal);
+            Assert.Contains("USD", detail, StringComparison.Ordinal);
+        }
+        Assert.Null(await BoundExternalIdAsync(usdAccount.Id));
+
+        // The anchor: the same feed account binds to an account in its own currency.
+        var bound = await BindAsync(client, setup.Ledger, eurAccount.Id, setup.ConnectionId, "sf-eur");
+        Assert.Equal(HttpStatusCode.NoContent, bound.StatusCode);
+        Assert.Equal("sf-eur", await BoundExternalIdAsync(eurAccount.Id));
+
+        // A feed account that reports its code in another case is the same currency.
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await BindAsync(client, setup.Ledger, otherUsdAccount.Id, setup.ConnectionId, "sf-usd")).StatusCode);
+
+        // A feed account that reports no currency is not judged.
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await BindAsync(client, setup.Ledger, usdAccount.Id, setup.ConnectionId, "sf-none")).StatusCode);
+        Assert.Equal("sf-none", await BoundExternalIdAsync(usdAccount.Id));
+    }
+
+    /// <summary>
+    /// A binding the bind could not judge, because the directory did not yet know the
+    /// feed account's currency, is judged at sync: that account's pull fails with an
+    /// error naming both currencies and none of its rows lands, while an account bound in
+    /// its own currency on the same connection imports as before (ADR-0114 D13).
+    /// </summary>
+    [Fact]
+    public async Task A_binding_in_another_currency_made_before_the_directory_knew_it_fails_that_accounts_pull()
+    {
+        var setup = await ConnectAsync(TwoCurrencyFeed);
+        await using var factory = setup.Factory;
+        using var client = await AuthedClientAsync(factory, setup.Ledger);
+        var usdAccount = await setup.Ledger.AddBankAccountAsync("account-a");
+        var otherUsdAccount = await setup.Ledger.AddBankAccountAsync("account-b");
+
+        // No sync has run, so the directory is empty and the bind has nothing to judge.
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await BindAsync(client, setup.Ledger, usdAccount.Id, setup.ConnectionId, "sf-eur")).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await BindAsync(client, setup.Ledger, otherUsdAccount.Id, setup.ConnectionId, "sf-usd")).StatusCode);
+
+        var sync = await client.PostAsync(
+            $"/api/ledgers/{setup.Ledger.LedgerId}/feed-connections/{setup.ConnectionId}/sync", content: null);
+        var syncBody = await sync.Content.ReadAsStringAsync();
+        Assert.True(sync.StatusCode == HttpStatusCode.OK, $"{(int)sync.StatusCode}: {syncBody}");
+        var result = JsonSerializer.Deserialize<SyncResultDto>(syncBody, new JsonSerializerOptions(JsonSerializerDefaults.Web))!;
+
+        var error = Assert.Single(result.Errors);
+        Assert.Equal("feed-account-currency-mismatch", error.Code);
+        Assert.Contains("EUR", error.Message, StringComparison.Ordinal);
+        Assert.Contains("USD", error.Message, StringComparison.Ordinal);
+        // The anchor: the account bound in its own currency imported its row.
+        Assert.Equal(1, result.TransactionsForReview);
+
+        await using var db = Db.NewDbContext();
+        var landed = await db.TxnLegs.AsNoTracking()
+            .Where(l => l.LedgerId == setup.Ledger.LedgerId)
+            .Select(l => l.AccountId)
+            .ToListAsync();
+        Assert.DoesNotContain(usdAccount.Id, landed);
+        Assert.Contains(otherUsdAccount.Id, landed);
+        // The failed account keeps its watermark, so a fixed binding fetches the same window.
+        Assert.Null(await db.Accounts.AsNoTracking()
+            .Where(a => a.Id == usdAccount.Id).Select(a => a.LastSimpleFinSyncAt).SingleAsync());
+        // The directory still records what the feed reports.
+        Assert.Equal("EUR", await db.FeedConnectionAccounts.AsNoTracking()
+            .Where(d => d.FeedConnectionId == setup.ConnectionId && d.ExternalId == "sf-eur")
+            .Select(d => d.Currency).SingleAsync());
     }
 
     /// <summary>
@@ -365,9 +521,9 @@ public sealed class FeedConnectionsEndpointsTests
     /// </summary>
     private async Task<SyntheticLedger> SyntheticLedgerWithLekAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var keys = _fixture.NewLedgerKeyService();
-        await using var db = _fixture.NewDbContext();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var keys = Db.NewLedgerKeyService();
+        await using var db = Db.NewDbContext();
         var row = await db.Ledgers.SingleAsync(l => l.Id == ledger.LedgerId);
         row.WrappedLek = keys.CreateWrappedLek();
         row.LekKekId = keys.CurrentKekId;

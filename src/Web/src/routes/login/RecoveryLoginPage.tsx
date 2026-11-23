@@ -1,5 +1,6 @@
 import { useId, useState, type FormEvent } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 import { useNavigate } from '@tanstack/react-router';
 import { LineChart } from 'lucide-react';
 
@@ -12,9 +13,9 @@ import { Panel, PanelBody } from '@/components/ui/Panel';
 
 /**
  * Recovery-code sign-in (ADR-0013). The fallback when no passkey can be
- * used — a lost authenticator, or (the case that motivated building this)
- * a restored database whose passkeys were bound to a different RP id
- * (ADR-0061), making every stored credential unusable on the new host.
+ * used — a lost authenticator, or a restored database whose passkeys are
+ * bound to a different RP id (ADR-0061), which makes every stored credential
+ * unusable on the new host.
  *
  * On success the session cookie is set and the user lands on
  * /account/security — not the dashboard — so they're prompted to register
@@ -77,7 +78,7 @@ export function RecoveryLoginPage() {
                                 autoCorrect="off"
                                 spellCheck={false}
                                 required
-                                disabled={recoveryMutation.isPending}
+                                pending={recoveryMutation.isPending}
                                 value={username}
                                 onChange={(event) => setUsername(event.target.value)}
                             />
@@ -94,7 +95,7 @@ export function RecoveryLoginPage() {
                                 spellCheck={false}
                                 placeholder="ABCDE-FGHJK"
                                 required
-                                disabled={recoveryMutation.isPending}
+                                pending={recoveryMutation.isPending}
                                 value={recoveryCode}
                                 onChange={(event) => setRecoveryCode(event.target.value)}
                                 className="font-mono tabular-nums"
@@ -112,14 +113,12 @@ export function RecoveryLoginPage() {
 
                         <Button
                             type="submit"
-                            disabled={
-                                recoveryMutation.isPending ||
-                                username.trim().length === 0 ||
-                                recoveryCode.trim().length === 0
-                            }
+                            disabled={username.trim().length === 0 || recoveryCode.trim().length === 0}
+                            pending={recoveryMutation.isPending}
+                            pendingLabel="Signing in…"
                             className="w-full"
                         >
-                            {recoveryMutation.isPending ? 'Signing in…' : 'Sign in'}
+                            Sign in
                         </Button>
                     </form>
 

@@ -47,6 +47,8 @@ export interface MasterKeyRotation {
     notificationTargetsRotated: number;
     /** The keys MCP clients' sign-ins are issued with (FU-069). */
     oauthKeysRotated: boolean;
+    /** A private fork's repository token for the Upgrade tab (ADR-0110). */
+    upgradeTokenRotated: boolean;
     /** Where the previous key file was moved, so a mistaken rotation is
      *  reversible. Null when there was no prior file. */
     previousKeyArchivedAt: string | null;

@@ -4,11 +4,10 @@
 --
 -- Diagnostic / audit storage for the original JSON SimpleFIN (and
 -- future OFX / CSV providers) sent for each ingested transaction.
--- Real-world data surfaced a gap: classifier coverage is institution-
--- specific (a major brokerage / 529 / a bank use formats nothing like
--- another brokerage's "YOU BOUGHT (TICKER)" pattern), and we have no way to
--- iterate on classifier patterns without a permanent record of what
--- the providers actually send.
+-- The gap: classifier coverage is institution-specific (one
+-- institution's description format says nothing about another's), and
+-- we have no way to iterate on classifier patterns without a permanent
+-- record of what the providers actually send.
 --
 -- The orchestrator's pull path now stores this column on every new
 -- row insert AND backfills it on the "already known" dedup branch

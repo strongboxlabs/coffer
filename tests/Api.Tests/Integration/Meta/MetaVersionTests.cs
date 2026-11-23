@@ -17,13 +17,11 @@ namespace Coffer.Api.Tests.Integration.Meta;
 /// authentication.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class MetaVersionTests
+public sealed class MetaVersionTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public MetaVersionTests(PostgresFixture fixture)
+    public MetaVersionTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(
@@ -41,14 +39,14 @@ public sealed class MetaVersionTests
     [Fact]
     public async Task Reports_db_schema_version_matching_the_latest_applied_migration()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
         // Expected DB version = the latest migration DbUp recorded in
         // this bootstrapped database. Derive it from the journal the
         // same way the endpoint does, so the test tracks new migrations
         // automatically instead of hard-coding today's number.
         string latestScript;
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             latestScript = await db.SchemaMigrations.AsNoTracking()
                 .OrderByDescending(m => m.SchemaVersionsId)
@@ -59,7 +57,7 @@ public sealed class MetaVersionTests
         Assert.True(expectedVersion > 0,
             $"fixture should have applied numbered migrations; got '{latestScript}'");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync("/api/meta/version");
@@ -88,8 +86,8 @@ public sealed class MetaVersionTests
     public async Task Requires_authentication()
     {
         // Anonymous request to a RequireAuthorization endpoint → 401.
-        await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions
         {
             HandleCookies = false,

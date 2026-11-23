@@ -6,8 +6,8 @@
 --
 -- A4.c.3's InvestmentTxnRowEdit save flow calls
 -- `recompute_holdings_cost_basis(ledger_id)` after every POST / PATCH /
--- DELETE. The function walks EVERY holding in the ledger — for a
--- brokerage with many holdings each save took ~2.2 s end-to-end. The
+-- DELETE. The function walks EVERY holding in the ledger — so for a
+-- brokerage with many holdings each save paid for all of them. The
 -- recompute itself dominated (per-holding outer loop × UNION ALL over
 -- txn_legs + security_splits + per-lot FIFO updates).
 --
@@ -22,8 +22,8 @@
 -- migration's safety scrub) continue to walk the whole ledger.
 --
 -- New callers in the API repository (slice A4.c.3 perf fix) pass both
--- so a save recomputes the single affected holding. Target: ~100-200 ms
--- per save instead of ~2.2 s.
+-- so a save recomputes the single affected holding: its cost is one
+-- holding's walk, however many the ledger holds.
 --
 -- COMPATIBILITY
 --
@@ -215,5 +215,5 @@ COMMENT ON FUNCTION recompute_holdings_cost_basis(UUID, UUID, UUID) IS
     'Migration 063 added a zero-qty guard in the lot reset. Migration 067 '
     'added p_account_id + p_security_id narrowing parameters (both default '
     'NULL = walk everything) so per-save recomputes touch only the affected '
-    'holding instead of the whole ledger (~10-20x speedup on N-holding '
-    'brokerages).';
+    'holding instead of the whole ledger, so their cost scales with one '
+    'holding rather than with every holding in it.';

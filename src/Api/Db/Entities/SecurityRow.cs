@@ -48,6 +48,11 @@ internal sealed class SecurityRow
     // DB CHECK (mig 156): may only be false when QuoteSymbol is non-null.
     public bool QuoteSymbolPublic { get; set; } = true;
 
+    // ADR-0114 D5 (migration 300): when a Yahoo read last named this security's
+    // currency. Written only by QuoteCurrencyConfirmation, with the re-stamp of the
+    // security's fetch rows; NULL until a read has named it.
+    public DateTime? QuoteCurrencyConfirmedAt { get; set; }
+
     // Importer-managed; not editable from the catalog UI (the share-
     // precision is a Moneydance-derived display hint per migration 012,
     // not a user-facing knob).

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react';
-import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import {
     ApiError,
@@ -9,12 +10,12 @@ import {
     setReconStatus,
 } from '@/lib/api';
 import { todayInputValue } from '@/lib/dates';
-import type { ReconStatus, RegisterRow } from '@/lib/types';
+import type { ReconStatus, RegisterEntry, RegisterRow } from '@/lib/types';
 import {
     useWindowedRegister,
     type UseWindowedRegisterResult,
 } from '@/lib/useWindowedRegister';
-import type { IndexBucketDto } from '@/lib/types/register';
+import type { HeaderBalanceDto, IndexBucketDto } from '@/lib/types/register';
 import type {
     RegisterFilterArgs,
     RegisterServerStatus,
@@ -23,9 +24,8 @@ import type {
 import type { StatusFilter } from './registerStatus';
 
 /**
- * Shared register-container controller (review #18). Extracted
- * verbatim from the duplicated wiring that BankRegisterPage and
- * InvestmentRegisterPage previously each reimplemented:
+ * Shared register-container controller: the wiring BankRegisterPage
+ * and InvestmentRegisterPage would otherwise each reimplement:
  *
  *   * the windowed-register hook itself,
  *   * the month-bucket query for the date-aware scroll-track,
@@ -33,25 +33,57 @@ import type { StatusFilter } from './registerStatus';
  *   * `seekToBucket` (re-seed the window on a bucket anchor),
  *   * `refreshLoadedBalances` (in-place balance refresh after a
  *     balance-affecting save / delete — no virtuoso data-swap),
+ *   * `reseatIfMoved` (re-seed anchored at a row whose write moved its
+ *     sort key),
  *   * the optimistic recon-status patch + mutation + cycle order.
  *
  * Both pages consume this so they differ only in row rendering +
- * editor wiring. This is an EXTRACTION, not a rewrite — the logic
- * is the same code, just moved here once.
+ * editor wiring.
  */
 
 /**
- * Decide whether a saved edit moved a row's date-sorted position. The
- * register sorts by posted DATE (calendar day), so a same-day time
- * change — or no change — leaves the row where it is. Pure + exported
- * so the decision is unit-testable without the windowed-register hook.
+ * One loaded entry with the server's fresh balance and net amount for its header,
+ * every leg of a group alike. A category balance can be null for a missing rate
+ * (ADR-0114 D9): the rates it needed come with it, and a balance that has its rate
+ * again drops the ones it carried. Pure + exported so the patch is unit-testable.
  */
-export function shouldRepositionForDate(
+export function withFreshBalance(entry: RegisterEntry, fresh: HeaderBalanceDto): RegisterEntry {
+    const patch = {
+        balanceAfter: fresh.balanceAfter,
+        balanceRateUnavailable: fresh.balanceRateUnavailable,
+        headerAccountNetAmount: fresh.netAmount,
+    };
+    if (entry.kind === 'txn') return { ...entry, txn: { ...entry.txn, ...patch } };
+    return { ...entry, legs: entry.legs.map((leg) => ({ ...leg, ...patch })) };
+}
+
+/**
+ * Decide whether a saved write (an edit, an accept, a merge) can have moved a
+ * row's sorted position, so the window must be re-seated rather than patched
+ * in place.
+ *
+ * Under the date sort the key is the full posted TIMESTAMP, then the header's
+ * immutable insertion sequence (the register keyset and the balance walk both
+ * order by it). A change of time moves the row among that day's rows and
+ * re-orders their running balances. The server keeps the stored time on a save
+ * whose date is the stored day, so only a changed date, or a merge survivor
+ * adopting the imported row's time, moves it. Comparing only the calendar day
+ * would leave a merge survivor where it was, with balances that belonged to the
+ * new order.
+ *
+ * Under any other sort the key is a server-side aggregate of the entry's legs
+ * (amount, payee, category, ...) that any write can change, so a write always
+ * re-seats. Pure + exported so the decision is unit-testable without the
+ * windowed-register hook.
+ */
+export function shouldReseatAfterWrite(
     oldPostedAt: string | undefined,
     newPostedAt: string,
+    sortColumn: string = 'date',
 ): boolean {
     if (oldPostedAt === undefined) return false;
-    return oldPostedAt.slice(0, 10) !== newPostedAt.slice(0, 10);
+    if (sortColumn !== 'date') return true;
+    return Date.parse(oldPostedAt) !== Date.parse(newPostedAt);
 }
 
 /**
@@ -131,13 +163,12 @@ export interface UseRegisterControllerResult {
     /** Fetch fresh balance_after + net_amount for every loaded
      *  header and patch each entry in place. */
     refreshLoadedBalances: () => Promise<void>;
-    /** After a saved edit, if the header's posted DATE changed, re-seed
-     *  the window anchored at it so the row relocates to its new
-     *  date-sorted position; returns true. Same-day (or unchanged) →
-     *  no-op, returns false so the caller patches the row in place.
-     *  The register sorts by posted date, so an in-place patch leaves a
-     *  date-edited row stuck at its old slot — this moves it. */
-    repositionIfDateChanged: (headerId: string, newPostedAt: string) => boolean;
+    /** After a saved write (edit, accept, merge), if the header's sort key
+     *  can have moved (see {@link shouldReseatAfterWrite}), re-seed the
+     *  window anchored at it so the row lands at its sorted position with
+     *  the server's running balances; returns true. Otherwise a no-op that
+     *  returns false, so the caller patches the row in place. */
+    reseatIfMoved: (headerId: string, newPostedAt: string) => boolean;
     /** Optimistic recon-status patch over a set of header ids. */
     patchHeadersStatus: (
         headerIds: ReadonlySet<string>,
@@ -164,8 +195,8 @@ export function useRegisterController({
 
     // The Hidden tab re-fetches the soft-hidden payload (ADR-0072 D1); every
     // other filter walks the visible register. Derived HERE so both registers
-    // get identical fetch behavior from one rule — not a per-page derivation
-    // (which is how the investment Hidden view silently never fetched).
+    // get identical fetch behavior from one rule — not a per-page derivation,
+    // where a page that omits it shows an empty Hidden tab without fetching.
     const hidden = statusFilter === 'hidden';
 
     // Fold the status tabs into the server filter (mig 164): all/hidden carry no
@@ -319,34 +350,17 @@ export function useRegisterController({
             if (!id) return entry;
             const fresh = byId.get(id);
             if (!fresh) return entry;
-            if (entry.kind === 'txn') {
-                return {
-                    ...entry,
-                    txn: {
-                        ...entry.txn,
-                        balanceAfter: fresh.balanceAfter,
-                        headerAccountNetAmount: fresh.netAmount,
-                    },
-                };
-            }
-            return {
-                ...entry,
-                legs: entry.legs.map((leg) => ({
-                    ...leg,
-                    balanceAfter: fresh.balanceAfter,
-                    headerAccountNetAmount: fresh.netAmount,
-                })),
-            };
+            return withFreshBalance(entry, fresh);
         });
     }, [register, ledgerId, accountId]);
 
-    // Date-edit reposition. The register is sorted by posted date, so
-    // patching a date-edited row in place leaves it stuck at its old
-    // slot. When the saved date differs from the row's loaded date,
-    // re-seed the window anchored at the header (same mechanism a new
-    // transaction uses) so the row appears at its new position with the
-    // scroll following it — what the user expects after a date edit.
-    const repositionIfDateChanged = useCallback(
+    // Re-seat after a write that moved the row's sort key. Patching such a
+    // row in place leaves it stuck at its old slot, beside balances computed
+    // for its new one. Re-seed the window anchored at the header (same
+    // mechanism a new transaction uses) so the row appears at its sorted
+    // position with fresh balances and the scroll following it.
+    const sortColumn = sort?.column ?? 'date';
+    const reseatIfMoved = useCallback(
         (headerId: string, newPostedAt: string): boolean => {
             const current = register.entries.find((e) => {
                 const id = e.kind === 'txn' ? e.txn?.headerId : e.legs?.[0]?.headerId;
@@ -357,11 +371,11 @@ export function useRegisterController({
                 : current.kind === 'txn'
                     ? current.txn?.postedAt
                     : current.legs?.[0]?.postedAt;
-            if (!shouldRepositionForDate(oldPostedAt, newPostedAt)) return false;
+            if (!shouldReseatAfterWrite(oldPostedAt, newPostedAt, sortColumn)) return false;
             register.refresh(headerId);
             return true;
         },
-        [register],
+        [register, sortColumn],
     );
 
     // Optimistic recon-status patch — applied synchronously so the
@@ -440,7 +454,7 @@ export function useRegisterController({
         currentYearMonth,
         seekToBucket,
         refreshLoadedBalances,
-        repositionIfDateChanged,
+        reseatIfMoved,
         patchHeadersStatus,
         reconStatusMutation,
         cycleReconStatus,

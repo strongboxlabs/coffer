@@ -10,23 +10,24 @@ namespace Coffer.Api.Tests.Integration.Backup;
 /// deny-all to <c>coffer_app</c>, and never pruned.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class AdminAuditRepositoryTests
+public sealed class AdminAuditRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
+    public AdminAuditRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
-    public AdminAuditRepositoryTests(PostgresFixture fixture) => _fixture = fixture;
-
-    private AdminAuditRepository NewRepo() => new(_fixture.NewServiceFactory(), TimeProvider.System);
+    private AdminAuditRepository NewRepo() => new(Db.NewServiceFactory(), TimeProvider.System);
 
     [Fact]
     public async Task Appends_an_event_with_actor_and_detail()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
 
         var id = await NewRepo().AppendAsync(
             AdminAuditActions.MasterKeyRevealed, ledger.UserId, "credential abc");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.AdminAuditEvents.AsNoTracking().SingleAsync(e => e.Id == id);
         Assert.Equal("master-key.revealed", row.Action);
         Assert.Equal(ledger.UserId, row.ActorUserId);
@@ -41,7 +42,7 @@ public sealed class AdminAuditRepositoryTests
         var id = await NewRepo().AppendAsync(
             AdminAuditActions.MasterKeyAdopted, actorUserId: null, detail: "boot-time adoption");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.AdminAuditEvents.AsNoTracking().SingleAsync(e => e.Id == id);
         Assert.Null(row.ActorUserId);
     }
@@ -51,14 +52,14 @@ public sealed class AdminAuditRepositoryTests
     {
         // The FK is ON DELETE SET NULL on purpose: removing a user must not erase the
         // record of what they did.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var id = await NewRepo().AppendAsync(
             AdminAuditActions.MasterKeyRotated, ledger.UserId, "'v1' -> 'v2'");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
             await db.Users.Where(u => u.Id == ledger.UserId).ExecuteDeleteAsync();
 
-        await using var check = _fixture.NewDbContext();
+        await using var check = Db.NewDbContext();
         var row = await check.AdminAuditEvents.AsNoTracking().SingleAsync(e => e.Id == id);
         Assert.Null(row.ActorUserId);
         Assert.Equal("'v1' -> 'v2'", row.Detail);
@@ -102,10 +103,10 @@ public sealed class AdminAuditRepositoryTests
         // REVOKE ALL means a hard 42501 permission-denied, not an RLS-filtered empty
         // set — the grant is gone, so no policy is even consulted. Stronger than
         // filtering, and worth pinning as the actual behaviour.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await NewRepo().AppendAsync(AdminAuditActions.MasterKeyRevealed, null, "rls-probe");
 
-        await using var appDb = _fixture.NewAppDbContextAsUser(ledger.UserId);
+        await using var appDb = Db.NewAppDbContextAsUser(ledger.UserId);
         var ex = await Assert.ThrowsAsync<Npgsql.PostgresException>(
             () => appDb.AdminAuditEvents.AsNoTracking().ToListAsync());
         Assert.Equal("42501", ex.SqlState);

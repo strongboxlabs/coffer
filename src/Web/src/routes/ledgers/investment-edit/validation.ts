@@ -3,6 +3,7 @@ import type {
     LedgerInvestmentAction,
     PatchInvestmentTransactionRequest,
 } from '@/lib/types';
+import { normalizeMemo, sameTagSet } from '@/lib/annotations/notes';
 import { ACTION_LAYOUTS, SHARES_SIGN_RULE, type FieldKey } from './actionLayout';
 
 /**
@@ -33,15 +34,26 @@ export interface InvestmentTxnDraft {
     amount: number | null;
     categoryAccountId: string | null;
     transferAccountId: string | null;
+    /**
+     * The second amount's magnitude: the transfer account's own figure on an Xfr, BuyXfr,
+     * SellXfr or DividendXfr to a real account in another currency (ADR-0114 D13, D14),
+     * paired with the trade amount, not the fee. Its sign follows from the action and
+     * Amount, so the field holds none and a save applies one. Absent or null while there
+     * is none; picking another transfer account drops it.
+     */
+    transferAmount?: number | null;
+    /** True once the second amount is typed in, or seeded from a stored figure: it is
+     *  never refilled from a rate then (ADR-0114 D14). Absent: it follows Amount. */
+    transferAmountFixed?: boolean;
     feeAccountId: string | null;
     feeAmount: number | null;
     /**
-     * Header-level tags (ADR-0009). Always an array, never null — the editor
-     * sends it on every save, so an emptied list clears the header's tags
-     * rather than leaving them alone.
+     * The event's tags as this brokerage owns them (ADR-0009). Always an
+     * array, never null. A create sends them; an edit sends them only when
+     * they changed, and an emptied list clears them.
      *
-     * Not in ACTION_LAYOUTS and not validated: tags apply to every action
-     * because they describe the event, not its shape.
+     * Not in ACTION_LAYOUTS: tags apply to every action because they describe
+     * the event, not its shape. Only the tag limit applies (see the editor).
      */
     tags: readonly string[];
 }
@@ -79,7 +91,10 @@ export type ValidationKey =
     | 'action'
     | 'brokerageAccount'
     | FieldKey
-    | 'feeAmount';
+    | 'feeAmount'
+    // The second amount, which the editor checks itself: whether it shows depends on
+    // the transfer account's currency, which the draft alone does not know.
+    | 'transferAmount';
 
 /**
  * Pure validation function: given an action and a draft, return the
@@ -180,9 +195,14 @@ function validateField(
  * have already confirmed via `validate(draft)` returns no errors
  * (otherwise the server will reject with the same matrix-driven
  * codes — but it's nicer to gate at the client too).
+ *
+ * `transferAmount` is the second amount as it is sent: the transfer account's own leg,
+ * signed, on a transfer between currencies (ADR-0114 D13). Null leaves the key out, as a
+ * category or same-currency transfer does, so its body is as before.
  */
 export function draftToCreateRequest(
     draft: InvestmentTxnDraft,
+    transferAmount: number | null = null,
 ): CreateInvestmentTransactionRequest {
     if (!draft.action || !draft.brokerageAccountId) {
         throw new Error('draftToCreateRequest called with incomplete draft.');
@@ -197,7 +217,7 @@ export function draftToCreateRequest(
         transactedAt: new Date(draft.transactedAt || draft.postedAt).toISOString(),
         action: draft.action,
         payee: draft.payee || null,
-        memo: draft.memo || null,
+        memo: normalizeMemo(draft.memo),
         checkNumber: draft.checkNumber || null,
         securityId: draft.securityId,
         shares: draft.shares,
@@ -205,6 +225,7 @@ export function draftToCreateRequest(
         amount: draft.amount,
         categoryAccountId: draft.categoryAccountId,
         transferAccountId: draft.transferAccountId,
+        ...(transferAmount !== null ? { transferAmount } : {}),
         feeAccountId: draft.feeAccountId,
         feeAmount: draft.feeAmount,
         // Always sent, never omitted. The editor holds the whole tag set, so an
@@ -215,18 +236,54 @@ export function draftToCreateRequest(
     };
 }
 
+/** The memo and tags that differ from what the editor opened with; the rest are left out. */
+function changedNotes(
+    draft: Pick<InvestmentTxnDraft, 'memo' | 'tags'>,
+    opened: { memo: string; tags: readonly string[] },
+): { memo?: string | null; tags?: readonly string[] } {
+    const memo = normalizeMemo(draft.memo);
+    const notes: { memo?: string | null; tags?: readonly string[] } = {};
+    if (memo !== normalizeMemo(opened.memo)) notes.memo = memo;
+    if (!sameTagSet(draft.tags, opened.tags)) notes.tags = draft.tags;
+    return notes;
+}
+
+/**
+ * A stored template's create-shaped body (an investment reminder edit), with
+ * memo and tags sent only when they differ from what the editor opened with.
+ * The body replaces the template's shape, but its memo and tags follow
+ * presence like the PATCH: an omitted memo or tag set is left as it is, so an
+ * edit never clears what the editor could not show.
+ */
+export function draftToStoredRequest(
+    draft: InvestmentTxnDraft,
+    opened: { memo: string; tags: readonly string[] },
+    transferAmount: number | null = null,
+): CreateInvestmentTransactionRequest {
+    const { memo: _memo, tags: _tags, ...rest } = draftToCreateRequest(draft, transferAmount);
+    return { ...rest, ...changedNotes(draft, opened) };
+}
+
 /**
  * Convert a validated draft to a PATCH request body (ADR-0029). Same
  * shape as the create request — per ADR-0025 the PATCH-shape's nulls
  * mean "this field is null in the new state," NOT "leave alone." The
  * supplied draft IS the new state of the world.
+ *
+ * Except memo and tags, which follow PRESENCE: sent only when they differ from
+ * what the editor opened with (`opened`). An omitted memo is left as it is, so
+ * an untouched save from a brokerage that shows the other side's memo writes
+ * nothing, and never copies that memo onto the brokerage as its own.
  */
 export function draftToPatchRequest(
     draft: InvestmentTxnDraft,
+    opened: { memo: string; tags: readonly string[] },
+    transferAmount: number | null = null,
 ): PatchInvestmentTransactionRequest {
     if (!draft.action || !draft.brokerageAccountId) {
         throw new Error('draftToPatchRequest called with incomplete draft.');
     }
+    const notes = changedNotes(draft, opened);
     return {
         brokerageAccountId: draft.brokerageAccountId,
         postedAt: new Date(draft.postedAt).toISOString(),
@@ -237,7 +294,6 @@ export function draftToPatchRequest(
         transactedAt: new Date(draft.transactedAt || draft.postedAt).toISOString(),
         action: draft.action,
         payee: draft.payee || null,
-        memo: draft.memo || null,
         checkNumber: draft.checkNumber || null,
         securityId: draft.securityId,
         shares: draft.shares,
@@ -245,12 +301,9 @@ export function draftToPatchRequest(
         amount: draft.amount,
         categoryAccountId: draft.categoryAccountId,
         transferAccountId: draft.transferAccountId,
+        ...(transferAmount !== null ? { transferAmount } : {}),
         feeAccountId: draft.feeAccountId,
         feeAmount: draft.feeAmount,
-        // Always sent, never omitted. The editor holds the whole tag set, so an
-        // emptied list has to reach the server as [] — omitting it is the
-        // server's "leave them alone", which would make a tag impossible to
-        // remove from this surface.
-        tags: draft.tags,
+        ...notes,
     };
 }

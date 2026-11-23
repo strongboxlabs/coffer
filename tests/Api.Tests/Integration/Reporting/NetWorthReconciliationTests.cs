@@ -17,17 +17,18 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// either: break one side and that side's own tests fail, so the missing agreement
 /// never shows up. It has to be written.
 /// <para>
-/// This is the same shape as a discrepancy found on a real ledger between an
+/// This is the same shape as a discrepancy between an
 /// allocation total and a returns total: two paths to one number, agreeing by
 /// habit rather than by construction, with nothing to notice when they stop.
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class NetWorthReconciliationTests
+public sealed class NetWorthReconciliationTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public NetWorthReconciliationTests(PostgresFixture fixture) => _fixture = fixture;
+    public NetWorthReconciliationTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Utc(int y, int m, int d) => new(y, m, d, 0, 0, 0, DateTimeKind.Utc);
 
@@ -39,7 +40,7 @@ public sealed class NetWorthReconciliationTests
     public async Task Overview_net_worth_matches_the_history_series_at_the_same_instant(
         Boundary.Position p)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("Checking");
         var savings = await ledger.AddBankAccountAsync("Savings", openingBalance: 1_500m);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
@@ -60,11 +61,11 @@ public sealed class NetWorthReconciliationTests
         // Priced above cost, at PriceScale — the valuation both routes must agree on.
         await ledger.AddSecurityPriceAsync(sec, p.SellPrice, Utc(2024, 6, 1));
 
-        await using var db = _fixture.NewDbContext();
-        var balances = new AccountBalancesRepository(db);
+        await using var db = Db.NewDbContext();
+        var balances = new AccountBalancesRepository(db, TimeProvider.System);
         var investment = new InvestmentReportingRepository(db, TimeProvider.System);
         var overviewRepo = new OverviewRepository(db, balances, investment);
-        var overview = await overviewRepo.GetAsync(ledger.LedgerId);
+        var overview = await overviewRepo.GetAsync(ledger.LedgerId, today: null);
 
         // The history series clamps its final point to `to`, so ask for a window
         // ending now and compare against the overview's current figure.
@@ -85,6 +86,37 @@ public sealed class NetWorthReconciliationTests
         var marketValue = decimal.Round(p.Quantity * p.SellPrice, Boundary.MoneyScale);
         Assert.Equal(
             CashFloat + marketValue,
-            decimal.Round(overview.InvestmentsValue, Boundary.MoneyScale));
+            decimal.Round(overview.InvestmentsValue!.Value, Boundary.MoneyScale));
+    }
+
+    [Fact]
+    public async Task A_value_that_ends_on_a_half_rounds_the_same_way_on_both_routes()
+    {
+        // The quantity times the price ends exactly half a unit past the fourth place.
+        // The feeder's ROUND takes a half away from zero; a C# decimal.Round left at
+        // its default takes it to the even digit, a ten-thousandth lower. Two routes
+        // to one figure, apart only on a midpoint.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("Checking");
+        var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
+        var holdings = brokerage.HoldingsAccountId!.Value;
+        var sec = await ledger.AddSecurityAsync("Growth", "GRW");
+
+        await ledger.AddTransactionPairAsync(brokerage.Id, bank.Id, 30_000m, Utc(2024, 1, 10));
+        await ledger.AddHoldingAsync(holdings, sec, 0m, 0m);
+        await ledger.AddInvestmentBuyAsync(brokerage.Id, holdings, sec, 2.5m, 10_693.3333m, Utc(2024, 1, 10));
+        await ledger.RecomputeHoldingsAsync();
+        await ledger.AddSecurityPriceAsync(sec, 10_693.3333m, Utc(2024, 6, 1));
+
+        await using var db = Db.NewDbContext();
+        var balances = new AccountBalancesRepository(db, TimeProvider.System);
+        var investment = new InvestmentReportingRepository(db, TimeProvider.System);
+        var overviewRepo = new OverviewRepository(db, balances, investment);
+        var overview = await overviewRepo.GetAsync(ledger.LedgerId, today: null);
+        var history = await new AccountsReportingRepository(db, balances, investment, overviewRepo)
+            .NetWorthHistoryAsync(ledger.LedgerId, Utc(2024, 1, 1), DateTime.UtcNow, ReportTimeBucket.Year);
+
+        Assert.Equal(26_733.3333m, overview.Portfolio.Value);
+        Assert.Equal(overview.NetWorth, history.Points[^1].NetWorth);
     }
 }

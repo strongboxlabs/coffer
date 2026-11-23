@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Options;
 
 using Coffer.Api.Configuration;
@@ -40,15 +41,13 @@ namespace Coffer.Api.Db;
 /// That omission is deliberate and is the whole point of this factory.
 /// </para>
 /// <para>
-/// <b>The three RECOMPUTE interceptors are attached, and their absence was a
-/// bug.</b> This factory used to build options with <c>UseNpgsql</c> and nothing
-/// else, so every writer on a background tick saved without recomputing what it
-/// changed. That is not a hypothetical: <c>FeedSyncJobHandler</c> builds its
+/// <b>The four RECOMPUTE interceptors are attached.</b> Options built with
+/// <c>UseNpgsql</c> and nothing else would let every writer on a background tick
+/// save without recomputing what it changed. <c>FeedSyncJobHandler</c> builds its
 /// orchestrator over the supplied service context precisely so RLS does not hide
-/// every row, and <see cref="Coffer.Api.Ingest.IngestOrchestrator"/> states in
-/// three places that balance recompute "is automatic via
-/// LegDerivedRecomputeInterceptor" — true on the request path, false here. A
-/// scheduled feed sync wrote <c>txn_legs</c> and left
+/// every row, and <see cref="Coffer.Api.Ingest.IngestOrchestrator"/> relies on
+/// balance recompute being "automatic via LegDerivedRecomputeInterceptor" — so
+/// without them a scheduled feed sync writes <c>txn_legs</c> and leaves
 /// <c>txn_header_account_balances</c>, holdings, lots and trade-sourced prices
 /// untouched.
 /// </para>
@@ -65,13 +64,33 @@ public sealed class ServiceDbContextFactory
     private readonly LegDerivedRecomputeInterceptor _legDerived;
     private readonly HoldingsRecomputeInterceptor _holdings;
     private readonly TradePriceFromLegInterceptor _tradePrice;
+    private readonly LegNotesRecomputeInterceptor _notes;
+    private readonly IInterceptor[] _extra;
 
     public ServiceDbContextFactory(
         IOptions<ApiOptions> options,
         LegDerivedRecomputeInterceptor legDerived,
         HoldingsRecomputeInterceptor holdings,
-        TradePriceFromLegInterceptor tradePrice)
+        TradePriceFromLegInterceptor tradePrice,
+        LegNotesRecomputeInterceptor notes)
+        : this(options, legDerived, holdings, tradePrice, notes, [])
     {
+    }
+
+    /// <summary>
+    /// The production factory plus <paramref name="extra"/> interceptors on every context it
+    /// creates, after production's own: a test's seam for injecting a fault into a path that
+    /// takes this factory (the app itself passes none).
+    /// </summary>
+    internal ServiceDbContextFactory(
+        IOptions<ApiOptions> options,
+        LegDerivedRecomputeInterceptor legDerived,
+        HoldingsRecomputeInterceptor holdings,
+        TradePriceFromLegInterceptor tradePrice,
+        LegNotesRecomputeInterceptor notes,
+        IInterceptor[] extra)
+    {
+        ArgumentNullException.ThrowIfNull(extra);
         ArgumentNullException.ThrowIfNull(options);
         var connectionString = options.Value.ServiceConnectionString;
         if (string.IsNullOrWhiteSpace(connectionString))
@@ -80,9 +99,11 @@ public sealed class ServiceDbContextFactory
         _legDerived = legDerived;
         _holdings = holdings;
         _tradePrice = tradePrice;
+        _notes = notes;
+        _extra = extra;
         _options = new DbContextOptionsBuilder<AppDbContext>()
             .UseNpgsql(connectionString)
-            .AddInterceptors(legDerived, holdings, tradePrice)
+            .AddInterceptors([legDerived, holdings, tradePrice, notes, .. extra])
             .Options;
     }
 
@@ -103,7 +124,7 @@ public sealed class ServiceDbContextFactory
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
         return new AppDbContext(new DbContextOptionsBuilder<AppDbContext>()
             .UseNpgsql(connectionString)
-            .AddInterceptors(_legDerived, _holdings, _tradePrice)
+            .AddInterceptors([_legDerived, _holdings, _tradePrice, _notes, .. _extra])
             .Options);
     }
 }

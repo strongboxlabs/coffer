@@ -1,6 +1,6 @@
 -- 156_securities_quote_symbol_public.sql
 -- ADR-0054 D2. A ticker is always a public market symbol, but the quote-symbol
--- OVERRIDE may be a private / feed-internal identifier — e.g. a 529 plan's
+-- OVERRIDE may be a private / feed-internal identifier — e.g. a plan's
 -- internal portfolio number (a short all-digit code). Such a symbol must be
 -- matchable by the no-egress SimpleFIN holdings provider (which recovers it
 -- from the feed payload) but must

@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>Coffer.Domain.Annotations</RootNamespace>
+    <AssemblyName>Coffer.Domain.Annotations</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- Memo and tags per side: the one inheritance definition (MemoTagRules) and the
+       one write primitive (AnnotationPlanner), shared by the API and the Moneydance
+       importer. No package or project dependencies on purpose: the rule is plain
+       System.Linq.Expressions, so EF composes it and nothing here can reach a
+       database. -->
+
+</Project>

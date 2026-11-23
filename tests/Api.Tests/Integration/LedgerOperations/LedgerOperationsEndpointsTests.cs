@@ -14,13 +14,11 @@ namespace Coffer.Api.Tests.Integration.LedgerOperations;
 /// newest first, filterable by provider + recency.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class LedgerOperationsEndpointsTests
+public sealed class LedgerOperationsEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public LedgerOperationsEndpointsTests(PostgresFixture fixture)
+    public LedgerOperationsEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -37,13 +35,13 @@ public sealed class LedgerOperationsEndpointsTests
     [Fact]
     public async Task Lists_runs_across_families_filterable_by_provider_and_days()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await SeedRunAsync(ledger, "ingest", "simplefin", "manual", DateTime.UtcNow.AddHours(-1));
         await SeedRunAsync(ledger, "ingest", "ofx", "file-upload", DateTime.UtcNow.AddHours(-2));
         await SeedRunAsync(ledger, "quote", "quote-refresh", "manual", DateTime.UtcNow.AddHours(-3));
         await SeedRunAsync(ledger, "ingest", "simplefin", "manual", DateTime.UtcNow.AddDays(-10)); // old
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var basePath = $"/api/ledgers/{ledger.LedgerId}/ledger-operations";
 

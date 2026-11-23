@@ -5,38 +5,38 @@ using Coffer.Importer.Moneydance.Mappers;
 namespace Coffer.Api.Endpoints;
 
 /// <summary>
-/// Wire-level validation of a header's tag list — the one rule both the bank
-/// and the investment write surfaces enforce.
+/// Wire-level validation of the tag names a write carries — the one rule every
+/// write surface enforces before the names reach the dictionary.
 /// </summary>
 /// <remarks>
 /// <para>Moved out of <see cref="TransactionsEndpoints"/> when the investment
-/// contracts gained a <c>Tags</c> field. Duplicating it would have put the caps
+/// contracts gained a <c>Tags</c> field. Duplicating it would have put the cap
 /// in two places, and a cap that disagrees with itself is worse than no cap:
-/// the editor enforces the same 64 / 20 limits client-side, so a divergence
+/// the editor enforces the same 64-character limit client-side, so a divergence
 /// would only ever show up through the API, on the surface nobody was
 /// watching.</para>
 ///
-/// <para>Persistence-side normalization (trim, case-insensitive dedupe,
-/// create-on-first-use) lives in <c>HeaderTags</c>. This is the part that has
+/// <para>The number of tags is not checked here. A set may already hold more than
+/// the limit (a system merge never drops a tag), and only GROWING a set past it is
+/// refused, which needs the stored set: the write primitive decides that.</para>
+///
+/// <para>Persistence-side normalization (trim, one tag per name key,
+/// create-on-first-use) lives in <c>TagDictionary</c>. This is the part that has
 /// to REJECT rather than normalize.</para>
 /// </remarks>
 internal static class TagValidation
 {
     private const int MaxTagNameLength = TagName.MaxLength;
-    private const int MaxTagsPerHeader = 20;
 
     /// <summary>
-    /// Per-tag validation (slice 2c.6b). Empty list is legal — it means "clear
-    /// all tags." Each name is trimmed; empty-after-trim is a hard 422 (no
-    /// silent drops). Name length and total count are capped to keep payloads
-    /// predictable. Returns null when the list is acceptable.
+    /// Per-tag validation (slice 2c.6b). An empty list is legal. Each name is
+    /// trimmed; empty-after-trim is a hard 422 (no silent drops), and a name's length
+    /// is capped to keep payloads predictable. Returns null when every name is
+    /// acceptable.
     /// </summary>
-    public static IResult? ValidateTags(IReadOnlyList<string> tags)
+    public static IResult? ValidateTags(IEnumerable<string?> tags)
     {
-        if (tags.Count > MaxTagsPerHeader)
-            return BusinessError.Problem(
-                BusinessError.Codes.TransactionTagsTooMany,
-                $"At most {MaxTagsPerHeader} tags may be applied to one transaction.");
+        ArgumentNullException.ThrowIfNull(tags);
         foreach (var raw in tags)
         {
             var trimmed = raw?.Trim();

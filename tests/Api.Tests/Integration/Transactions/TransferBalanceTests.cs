@@ -22,11 +22,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// Atomic per-test ledger.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class TransferBalanceTests
+public sealed class TransferBalanceTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public TransferBalanceTests(PostgresFixture fixture) => _fixture = fixture;
+    public TransferBalanceTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -85,18 +86,18 @@ public sealed class TransferBalanceTests
     [Fact]
     public async Task Create_transfer_populates_both_account_balance_chains()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("checking");
         var savings = await ledger.AddBankAccountAsync("savings");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var transferId = await CreateTransferAsync(
             client, ledger.LedgerId, checking.Id, savings.Id,
             amount: -100m, postedAt: new DateTime(2026, 3, 5, 12, 0, 0, DateTimeKind.Utc));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var rows = await db.TxnHeaderAccountBalances.AsNoTracking()
             .Where(r => r.HeaderId == transferId)
             .OrderBy(r => r.AccountId)
@@ -116,11 +117,11 @@ public sealed class TransferBalanceTests
     [Fact]
     public async Task Edit_transfer_amount_shifts_both_accounts()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("checking");
         var savings = await ledger.AddBankAccountAsync("savings");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var transferId = await CreateTransferAsync(
@@ -144,7 +145,7 @@ public sealed class TransferBalanceTests
             patchResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)patchResp.StatusCode}: {await patchResp.Content.ReadAsStringAsync()}");
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var checkingRow = await db.TxnHeaderAccountBalances.AsNoTracking()
             .SingleAsync(r => r.HeaderId == transferId && r.AccountId == checking.Id);
         var savingsRow = await db.TxnHeaderAccountBalances.AsNoTracking()
@@ -161,12 +162,12 @@ public sealed class TransferBalanceTests
     [Fact]
     public async Task Move_transfer_date_later_past_a_checking_row_recomputes_both_chains()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("checking");
         var savings = await ledger.AddBankAccountAsync("savings");
         var category = await ledger.AddCategoryAsync("category");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Checking: May 5 the transfer out, May 12 a smaller expense; each balance
@@ -178,7 +179,7 @@ public sealed class TransferBalanceTests
             client, ledger.LedgerId, checking.Id, category.Id,
             amount: -30m, postedAt: new DateTime(2026, 5, 12, 12, 0, 0, DateTimeKind.Utc));
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             var transferPre = await db.TxnHeaderAccountBalances.AsNoTracking()
                 .SingleAsync(r => r.HeaderId == transferId && r.AccountId == checking.Id);
@@ -207,7 +208,7 @@ public sealed class TransferBalanceTests
             patchResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)patchResp.StatusCode}: {await patchResp.Content.ReadAsStringAsync()}");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             // New checking order: expense (May 12) -> transfer (May 20).
             // The expense is now FIRST on checking -> its own amount alone (NOT the
@@ -233,12 +234,12 @@ public sealed class TransferBalanceTests
     [Fact]
     public async Task Delete_transfer_leaves_no_stale_rows_on_either_account()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("checking");
         var savings = await ledger.AddBankAccountAsync("savings");
         var category = await ledger.AddCategoryAsync("category");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Checking: the transfer out (Jun 3), then a smaller expense (Jun 9).
@@ -249,7 +250,7 @@ public sealed class TransferBalanceTests
             client, ledger.LedgerId, checking.Id, category.Id,
             amount: -30m, postedAt: new DateTime(2026, 6, 9, 12, 0, 0, DateTimeKind.Utc));
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.Equal(2, await db.TxnHeaderAccountBalances.AsNoTracking()
                 .CountAsync(r => r.HeaderId == transferId));
@@ -264,7 +265,7 @@ public sealed class TransferBalanceTests
             deleteResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)deleteResp.StatusCode}: {await deleteResp.Content.ReadAsStringAsync()}");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             // No rows survive for the deleted transfer on EITHER account.
             Assert.Equal(0, await db.TxnHeaderAccountBalances.AsNoTracking()

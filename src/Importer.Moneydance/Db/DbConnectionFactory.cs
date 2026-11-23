@@ -19,14 +19,10 @@ public sealed class DbConnectionFactory
     /// importer command runs. Registering it here, at the one gateway every
     /// importer DB path opens its connection through, means no host can forget.
     ///
-    /// It previously lived only in the CLI entry point and the importer test
-    /// fixture, so the API had it registered nowhere. That went unnoticed
-    /// because the only DateOnly parameter was
-    /// <c>recurring_transactions.start_date</c> and the bundled demo export
-    /// carries no reminders — an API-side import of a real file with reminders
-    /// would have hit it. Seeding accounts.opened_on made every account carry a
-    /// DateOnly, which turned a latent failure into a certain one and is how it
-    /// finally surfaced.
+    /// A host that registered it only in its own entry point (the CLI, the test
+    /// fixture) would leave every other host — the API — without it, and fail on
+    /// the first DateOnly parameter: <c>accounts.opened_on</c> on every account,
+    /// <c>recurring_transactions.start_date</c> on every reminder.
     ///
     /// Register() is idempotent, so the CLI and test fixture calling it too is
     /// harmless.
@@ -67,10 +63,10 @@ public sealed class DbConnectionFactory
 
     public async Task<NpgsqlConnection> OpenAsync(CancellationToken cancellationToken = default)
     {
-        // Importer transactions accumulate a six-figure count of INSERTs in a single commit
+        // Importer transactions accumulate every INSERT of the import in a single commit
         // (paired transactions + price snapshots). The deferred symmetric-
-        // pairing constraint trigger fires per-row at COMMIT, which on
-        // a large real-world export takes well past Npgsql's default 30-second per-command
+        // pairing constraint trigger fires per-row at COMMIT, so its cost grows
+        // with the export and a large one can run past Npgsql's default 30-second per-command
         // timeout — and the timeout fires on COMMIT itself, rolling everything
         // back. Force a generous timeout via the connection-string builder
         // (parsing the user's value first so explicit overrides win).

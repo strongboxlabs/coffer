@@ -67,7 +67,7 @@ public static class OAuthEndpoints
               .AllowAnonymous()
               .RequireRateLimiting(DcrRateLimitPolicy);
         // What the consent page shows, fetched by its ticket so it is what the server
-        // registered rather than what the link says (2026-10-12 audit, H1).
+        // registered rather than what the link says (ADR-0105 D5).
         routes.MapGet("/api/oauth/consent/{ticket}", ConsentInfoAsync)
               .RequireAuthorization();
         return routes;
@@ -78,10 +78,10 @@ public static class OAuthEndpoints
     /// loopback host for a native client listening on localhost.
     /// </summary>
     /// <remarks>
-    /// The check used to be <c>scheme == https || uri.IsLoopback</c>. <c>IsLoopback</c>
-    /// looks only at the host, so <c>javascript://localhost/…</c> passed — and with
-    /// form_post, approving consent ran that script on Coffer's origin (2026-10-12 audit,
-    /// H1, confirmed by test). The scheme is now checked on both sides.
+    /// <c>scheme == https || uri.IsLoopback</c> is not enough. <c>IsLoopback</c> looks
+    /// only at the host, so <c>javascript://localhost/…</c> passes it — and with
+    /// form_post, approving consent would run that script on Coffer's origin
+    /// (ADR-0105 D5). So the scheme is checked on both sides.
     /// </remarks>
     /// <summary>An OAuth error answered by OpenIddict, which returns it to the client in
     /// the form the endpoint calls for: a redirect from authorize, JSON from token.</summary>
@@ -205,7 +205,7 @@ public static class OAuthEndpoints
                     }));
             }
 
-            // Allow must be said, not assumed: a missing decision used to mean allow.
+            // Allow must be said, not assumed: a missing decision is not allow.
             // And it must carry the ticket minted when this user was shown consent for
             // this exact request (OAuthConsentTickets) — a page that merely posts here,
             // from a sibling subdomain say, never saw one.
@@ -284,9 +284,9 @@ public static class OAuthEndpoints
         var principal = result.Principal
             ?? throw new InvalidOperationException("The stored authorization principal cannot be retrieved.");
 
-        // A refresh re-signed the stored principal with no look at the user, so a
-        // disabled user's app kept access for as long as it kept refreshing
-        // (2026-10-12 audit, H2). Disabling revokes their grants; this also covers a
+        // A refresh that re-signs the stored principal with no look at the user lets a
+        // disabled user's app keep access for as long as it keeps refreshing
+        // (ADR-0105 D3). Disabling revokes their grants; this also covers a
         // code or refresh token minted in the same instant.
         var users = context.RequestServices.GetRequiredService<UsersRepository>();
         if (!Guid.TryParse(principal.GetClaim(Claims.Subject), out var subject)
@@ -370,6 +370,7 @@ public static class OAuthEndpoints
         var clientId = Guid.NewGuid().ToString("N");
         var clientSecret = isPublic ? null : GenerateClientSecret();
         var displayName = string.IsNullOrWhiteSpace(request.ClientName) ? clientId : request.ClientName!;
+        var issuedAt = clock.GetUtcNow();
 
         var descriptor = new OpenIddictApplicationDescriptor
         {
@@ -394,6 +395,9 @@ public static class OAuthEndpoints
         };
         foreach (var uri in redirectUris)
             descriptor.RedirectUris.Add(uri);
+        // OpenIddict keeps no creation time; the admin list shows this one.
+        descriptor.Properties[OAuthClientRegistration.RegisteredAtProperty] =
+            OAuthClientRegistration.RegisteredAtValue(issuedAt);
         await applications.CreateAsync(descriptor).ConfigureAwait(false);
 
         logger.LogInformation(
@@ -403,7 +407,7 @@ public static class OAuthEndpoints
         var response = new Dictionary<string, object?>
         {
             ["client_id"] = clientId,
-            ["client_id_issued_at"] = clock.GetUtcNow().ToUnixTimeSeconds(),
+            ["client_id_issued_at"] = issuedAt.ToUnixTimeSeconds(),
             ["client_name"] = displayName,
             ["redirect_uris"] = request.RedirectUris,
             ["grant_types"] = new[] { "authorization_code", "refresh_token" },

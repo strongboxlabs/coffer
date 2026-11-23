@@ -2,10 +2,9 @@ import { describe, it, expect } from 'vitest';
 
 import { formatBytes } from './format';
 
-// One formatter for byte sizes. It exists because three local copies had
-// drifted: different MB precision, and only one of them had a GB tier — so a
-// large backup rendered as "2.00 GB" in the backups list and "2048.0 MB" in
-// the restore picker directly below it.
+// One formatter for byte sizes. Separate local copies drift — different MB
+// precision, a GB tier in one and not another — so the same size renders
+// differently on two surfaces that sit side by side.
 
 describe('formatBytes', () => {
     it('steps through the units', () => {
@@ -22,8 +21,8 @@ describe('formatBytes', () => {
     });
 
     it('renders GB rather than four-digit MB', () => {
-        // The tier the shared copy was missing. A whole-database backup is the
-        // one thing here that realistically reaches it, and "2048.0 MB" is not
+        // A whole-database backup is the one thing here that can reach the GB
+        // tier, and "2048.0 MB" is not
         // what anyone wants to read off a disaster-recovery screen.
         expect(formatBytes(2 * 1024 * 1024 * 1024)).toBe('2.00 GB');
         expect(formatBytes(1024 * 1024 * 1024 - 1)).toBe('1024.0 MB');

@@ -20,6 +20,7 @@ import { request } from './_request';
  *
  * Surfaces the API's 422 codes verbatim via `ApiError`:
  *   * `selection-kind-invalid`           — kind ∉ { explicit, all }.
+ *   * `account-not-in-ledger`            — no accountId.
  *   * `selection-empty`                  — explicit mode with no ids.
  *   * `selection-status-filter-invalid`  — statusFilter ∉ valid set.
  *   * `selection-exclude-too-large`      — excludeIds/headerIds > 10000.
@@ -59,6 +60,9 @@ export function bulkSetReconStatus(
  * per-row hard-delete vs soft-hide policy across every header in
  * the selection inside one transaction. Caller surfaces a typed-
  * confirmation dialog for large counts (ADR-0024 threshold).
+ * `selection-includes-read-only`: an explicit selection names a row this
+ * register shows read-only; nothing is deleted (also bulk-unhide and
+ * bulk-move-account).
  */
 export function bulkDeleteTransactions(
     ledgerId: string,
@@ -96,11 +100,22 @@ export function bulkUnhideTransactions(
  *   * `transaction-move-target-invalid`          — target is not in this ledger.
  *   * `transaction-move-domain-crossed`          — a category ↔ account move.
  *   * `account-inactive`                         — the target is deactivated.
- *   * `transaction-move-source-required`         — selection isn't account-scoped.
+ *   * `transaction-move-source-required`         — the selection's account is not in this ledger.
  *   * `transaction-move-target-same-as-source`   — target === source.
  *   * `transaction-move-split-to-investment`     — a split headed to an investment account.
  *   * `transaction-move-split-from-investment`   — a split leaving one for a bank.
  *   * `transaction-move-collision`               — target already on a selected row.
+ *   * `selection-includes-read-only`             — an explicit selection names a row
+ *                                                  this register shows read-only.
+ *   * `relabel-pair-not-representable`, `relabel-places-exceed-currency` — see below.
+ *
+ * A move relabels (ADR-0114 D13): the figures are kept and read in the target's
+ * currency. The answer says how many mirrored pairs now carry two amounts. Its
+ * `relabel-places-exceed-currency` refusal carries `count` (how many transactions have
+ * a leg that does not fit, a category's mirror not counted again and a transaction
+ * merged into another left out, ADR-0114 D15), `accountFigures` (empty on a move, which
+ * moves no account's own figures), `currencyCode` and `places`. A move of one
+ * transaction is an explicit selection of one.
  */
 export function bulkMoveToAccount(
     ledgerId: string,

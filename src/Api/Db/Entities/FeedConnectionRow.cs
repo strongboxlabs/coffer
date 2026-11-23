@@ -25,9 +25,11 @@ public sealed class FeedConnectionRow
     /// hit a log line or response body. Migration 036.
     /// </summary>
     public byte[]? AccessUrlCiphertext { get; init; }
-    /// <summary>FI display name surfaced from SimpleFIN /info or the
-    /// first synced account's <c>org.name</c>. NULL until first sync
-    /// populates; SPA falls back to "SimpleFIN".</summary>
+    /// <summary>The connection's name. The connect step sets it from
+    /// SimpleFIN's connection list when that names exactly one
+    /// institution, and leaves it NULL otherwise; an owner can rename
+    /// it (<c>FeedConnectionsRepository.RenameAsync</c>), and syncs
+    /// never write it. The SPA renders "SimpleFIN" for NULL.</summary>
     public string? InstitutionName { get; set; }
     /// <summary>User who initiated this connection — audit only.
     /// NULL after that user is removed (FK ON DELETE SET NULL).

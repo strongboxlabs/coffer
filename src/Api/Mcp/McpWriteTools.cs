@@ -6,6 +6,7 @@ using ModelContextProtocol.Server;
 using Coffer.Api.Contracts;
 using Coffer.Api.Db.Repositories;
 using Coffer.Api.Ingest.Csv;
+using Coffer.Api.Quotes.MarketSeries;
 
 namespace Coffer.Api.Mcp;
 
@@ -55,12 +56,13 @@ public sealed class McpWriteTools
         "saving a document the importer would then fail on row by row. " +
         "dryRun=true validates and reports without writing. " +
         "Names are unique per ledger, case-insensitively. " +
-        "See validate_csv_mapping for the document shape.")]
+        "See validate_csv_mapping for the document shape. " +
+        CsvMappingTools.DecimalSeparatorGuidance)]
     public static async Task<McpWriteResult> SaveCsvMapping(
         McpWriteGuard guard,
         CsvMappingsRepository mappings,
         [Description("Ledger id (GUID) from list_ledgers.")] Guid ledgerId,
-        [Description("What to call it; unique per ledger, e.g. 'Store card statement'.")]
+        [Description("What to call it; unique per ledger, e.g. 'Card statement CSV'.")]
         string name,
         [Description("The YAML document.")] string definitionYaml,
         [Description("Existing mapping id (GUID) to replace. Omit to create a new one.")]
@@ -150,7 +152,8 @@ public sealed class McpWriteTools
         // Current value (incl. inactive accounts — they're the ones with null
         // tax_status) for the before echo + not-in-ledger detection.
         var before = (await accountsRead
-                .ListAccountsAsync(ledgerId, includeCategories: true, includeInactive: true, type: null, cancellationToken)
+                .ListAccountsAsync(ledgerId, includeCategories: true, includeInactive: true, type: null,
+                    today: null, cancellationToken)
                 .ConfigureAwait(false))
             .FirstOrDefault(a => a.Id == accountId);
         if (before is null)
@@ -211,7 +214,7 @@ public sealed class McpWriteTools
     {
         guard.EnsureWritable();
 
-        var before = await securities.GetByIdAsync(ledgerId, securityId, cancellationToken)
+        var before = await securities.GetByIdAsync(ledgerId, securityId, today: null, cancellationToken)
             .ConfigureAwait(false);
         if (before is null) return McpWriteResult.Fail(securityId, "security-not-in-ledger");
 
@@ -263,7 +266,7 @@ public sealed class McpWriteTools
         if (result != SecuritiesRepository.PatchResult.Ok)
             return McpWriteResult.Fail(securityId, result.ToString());
 
-        var after = await securities.GetByIdAsync(ledgerId, securityId, cancellationToken)
+        var after = await securities.GetByIdAsync(ledgerId, securityId, today: null, cancellationToken)
             .ConfigureAwait(false);
         return new McpWriteResult(securityId, true, beforeStr, FmtClassification(after!), null);
     }
@@ -272,13 +275,23 @@ public sealed class McpWriteTools
         "Merge ONE source category into a target (ADR-0068) — the lever for collapsing " +
         "duplicate / redundant categories. Repoints every transaction (and reminder) " +
         "from the source to the target, reparents the source's child categories to the " +
-        "target, then DEACTIVATES the emptied source (reversible — the row is preserved, " +
-        "not deleted; re-activate it from the accounts list if you change your mind). " +
-        "Both must be categories of the same kind (income↔income / expense↔expense); the " +
-        "source can't be a system category. One pair per call; the assistant runs a " +
-        "category revamp as many merge_category calls. dryRun=true reports how many " +
-        "transactions / child categories would move without writing. Resolve ids via " +
-        "list_accounts (categories).")]
+        "target, then DEACTIVATES the emptied source (the row is preserved, not deleted; " +
+        "re-activating it brings back an EMPTY category — moved transactions, child " +
+        "categories and budget targets are not restored). The kinds may differ (a " +
+        "cross-kind merge is how a category is reclassified); the target must not be the " +
+        "source or beneath it (refused as TargetIsDescendant), and the source can't be a " +
+        "system category. Budget targets follow the source and are summed where the " +
+        "target holds one for the same month, in the target's currency: a source target " +
+        "typed in another currency converts at the month's last day (the latest rate for " +
+        "the current month), and when that exchange rate is missing the whole merge is " +
+        "refused as RateUnavailable, naming the currency pair and day, and nothing is " +
+        "written; a target that would sit beneath another for " +
+        "the same month (anything beneath the target against the target's, what arrives " +
+        "against the target's ancestors') is dropped; a real merge reports how many moved " +
+        "and were dropped. One pair per call; the assistant runs a category revamp as many " +
+        "merge_category calls. dryRun=true reports how many transactions / child " +
+        "categories would move without writing (budget targets are not previewed). " +
+        "Resolve ids via list_accounts (categories).")]
     public static async Task<McpWriteResult> MergeCategory(
         McpWriteGuard guard,
         AccountsRepository accounts,
@@ -292,13 +305,18 @@ public sealed class McpWriteTools
 
         var r = await accounts.MergeCategoryAsync(ledgerId, sourceId, targetId, dryRun, cancellationToken)
             .ConfigureAwait(false);
+        if (r.Result == AccountsRepository.MergeCategoryResult.RateUnavailable && r.MissingRate is { } missing)
+            return McpWriteResult.Fail(sourceId,
+                $"RateUnavailable: no {missing.FromCurrency}->{missing.ToCurrency} rate for {missing.Date:yyyy-MM-dd}; "
+                + "nothing was merged");
         if (r.Result != AccountsRepository.MergeCategoryResult.Ok)
             return McpWriteResult.Fail(sourceId, r.Result.ToString());
 
         var before = $"{r.TransactionsMoved} txns, {r.ChildrenReparented} child categories";
         var after = dryRun
             ? $"would merge into {targetId}; source deactivated"
-            : $"merged into {targetId}; source deactivated";
+            : $"merged into {targetId}; source deactivated; "
+              + $"{r.BudgetTargetsMoved} budget targets moved, {r.BudgetTargetsDropped} dropped";
         return new McpWriteResult(sourceId, true, before, after, null);
     }
 
@@ -334,13 +352,17 @@ public sealed class McpWriteTools
     [McpServerTool(Name = "set_transaction_category"), Description(
         "Recategorize one or MANY simple transactions to a single target category " +
         "(ADR-0068). Best-effort: each single-posting, bank-shape transaction with exactly " +
-        "one category leg is repointed to the new category; a split (multiple postings), a " +
+        "one category leg is repointed to the new category, and the category side's own memo " +
+        "and tags move with that leg; a split (multiple postings), a " +
         "transfer (no category), or an investment transaction is REJECTED and returned in " +
         "'rejects' with a reason (edit those in the app) so one bad row never blocks the " +
         "rest. The whole call is rejected (nothing written) only when the target category " +
         "isn't in the ledger or the id list is empty. Returns { recategorized, unchanged, " +
         "category, rejects: [{ headerId, reason }] }. reason is one of split / transfer / " +
-        "investment-transaction / not-in-ledger. dryRun=true previews the split without " +
+        "investment-transaction / not-in-ledger / ledger-write-busy. Each transaction is " +
+        "saved on its own, so recategorized counts every one that moved, whatever was " +
+        "rejected after it. ledger-write-busy means another change to the ledger was still " +
+        "being saved: that transaction was not changed; send it again. dryRun=true previews the split without " +
         "writing. Resolve header ids via the register / list_transactions and the category " +
         "id via list_accounts.")]
     public static async Task<McpBulkRecategorizeResult> SetTransactionCategory(
@@ -381,7 +403,10 @@ public sealed class McpWriteTools
         "splits it can't touch. Best-effort across headerIds: a header that isn't a " +
         "bank-shape split with a fromCategory posting is returned in 'rejects' with a reason " +
         "(investment-transaction / not-a-split / posting-not-found / unsupported-shape / " +
-        "not-in-ledger / apply-failed), so one bad row never blocks the rest. BANK-SHAPE " +
+        "not-in-ledger / apply-failed / ledger-write-busy), so one bad row never blocks the " +
+        "rest. Each transaction is saved on its own, so moved counts every posting that moved, " +
+        "whatever was rejected after it. ledger-write-busy means another change to the ledger " +
+        "was still being saved: that transaction was not changed; send it again. BANK-SHAPE " +
         "ONLY — investment transactions are rejected. The whole call fails (nothing written) " +
         "only when the target category isn't in the ledger or the id list is empty. EVERY " +
         "fromCategory posting in a header moves (a re-home; no per-posting targeting). " +
@@ -424,7 +449,8 @@ public sealed class McpWriteTools
 
     [McpServerTool(Name = "create_category"), Description(
         "Create ONE new category (ADR-0068) — for building out a clean category tree. " +
-        "kind = income | expense. Optional parentId nests it under an existing category in " +
+        "kind = income | expense | adjustment (adjustment: a valuation or other entry that is " +
+        "neither income nor spending). Optional parentId nests it under an existing category in " +
         "the same ledger (omit for a root category). Returns the new category's id. " +
         "dryRun=true previews without creating. Pair with merge_category / " +
         "reparent_category / rename_category to reshape the tree.")]
@@ -433,7 +459,7 @@ public sealed class McpWriteTools
         AccountsRepository accounts,
         [Description("Ledger id (GUID) from list_ledgers.")] Guid ledgerId,
         [Description("Category name.")] string name,
-        [Description("income | expense.")] string kind,
+        [Description("income | expense | adjustment.")] string kind,
         [Description("Optional parent category id (GUID) to nest under; omit for a root category.")]
         Guid? parentId = null,
         [Description("Preview only — report without creating.")] bool dryRun = false,
@@ -505,7 +531,7 @@ public sealed class McpWriteTools
     {
         guard.EnsureWritable();
 
-        var before = await securities.GetByIdAsync(ledgerId, securityId, cancellationToken).ConfigureAwait(false);
+        var before = await securities.GetByIdAsync(ledgerId, securityId, today: null, cancellationToken).ConfigureAwait(false);
         if (before is null) return McpWriteResult.Fail(securityId, "security-not-in-ledger");
 
         if (ticker is null && cusip is null && name is null)
@@ -528,7 +554,7 @@ public sealed class McpWriteTools
         if (result != SecuritiesRepository.PatchResult.Ok)
             return McpWriteResult.Fail(securityId, result.ToString());
 
-        var after = await securities.GetByIdAsync(ledgerId, securityId, cancellationToken).ConfigureAwait(false);
+        var after = await securities.GetByIdAsync(ledgerId, securityId, today: null, cancellationToken).ConfigureAwait(false);
         return new McpWriteResult(securityId, true, beforeStr, FmtSecurity(after!), null);
     }
 
@@ -536,7 +562,11 @@ public sealed class McpWriteTools
         "Convert a mis-recorded in-kind transfer (ADR-0065/0068): a (sell/sellx)+(buy/buyx) " +
         "pair that is really shares moving between two accounts — same security, same date, " +
         "equal quantity, distinct investment accounts — into ONE transfer_shares (carrying " +
-        "the FIFO lots + basis, zero realized gain). Pass the two header ids. Use the read " +
+        "the FIFO lots + basis, zero realized gain). Between accounts in different " +
+        "currencies each lot's basis converts at the derived rate for its acquisition day " +
+        "(ADR-0114 D13); a lot with no rate refuses the whole conversion, naming each " +
+        "missing rate. The transfer's memo joins the two " +
+        "events' memos (the sell's first) and its tags are the union of theirs. Pass the two header ids. Use the read " +
         "tool that finds in-kind candidates to identify pairs. (No dryRun — preview the pair " +
         "via that read first.)")]
     public static async Task<McpWriteResult> ConvertInKindTransfer(
@@ -554,8 +584,22 @@ public sealed class McpWriteTools
             .ConfigureAwait(false);
         return r.Result == InvestmentTransactionsRepository.ConvertInKindResult.Ok
             ? new McpWriteResult(r.HeaderId, true, "sell + buy pair", "transfer_shares", null)
-            : McpWriteResult.Fail(sellHeaderId,
-                r.CreateFail is { } f ? $"{r.Result}:{f}" : r.Result.ToString());
+            : McpWriteResult.Fail(sellHeaderId, ConvertFailure(r));
+    }
+
+    /// <summary>
+    /// Why a conversion failed: the outcome and the validation failure, and for a pair
+    /// between brokerages in different currencies whose lots have no rate (ADR-0114 D13)
+    /// each missing stored leg, in the direction it is stored, and its day.
+    /// </summary>
+    private static string ConvertFailure(InvestmentTransactionsRepository.ConvertInKindOutcome r)
+    {
+        if (r.CreateFail is not { } f) return r.Result.ToString();
+        var reason = $"{r.Result}:{f}";
+        return r.Detail?.MissingRates is { Count: > 0 } missing
+            ? reason + " (no rate: " + string.Join("; ", missing.Select(m =>
+                $"{m.FromCurrency}->{m.ToCurrency} on {m.Date.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture)}")) + ")"
+            : reason;
     }
 
     [McpServerTool(Name = "reparent_category"), Description(
@@ -630,8 +674,9 @@ public sealed class McpWriteTools
         "same fund). Repoints every transaction, realized gain, and provider-mapping from " +
         "the source to the target, rebuilds holdings, then DEACTIVATES the source " +
         "(reversible — not deleted; its own price history stays with it). One pair per call. " +
-        "dryRun=true reports how many transactions / accounts would move. Resolve ids via " +
-        "list_securities.")]
+        "The answer counts the transaction lines that move and the accounts whose holdings are " +
+        "rebuilt: each account that holds the source or carries its shares on a transaction. " +
+        "dryRun=true reports those counts without writing. Resolve ids via list_securities.")]
     public static async Task<McpWriteResult> MergeSecurities(
         McpWriteGuard guard,
         SecuritiesRepository securities,
@@ -639,14 +684,20 @@ public sealed class McpWriteTools
         [Description("Source (duplicate) security id (GUID) — merged away (deactivated).")] Guid sourceId,
         [Description("Target (keeper) security id (GUID).")] Guid targetId,
         [Description("Preview only — report counts without writing.")] bool dryRun = false,
+        MarketSeriesWriteTrigger? starts = null,
         CancellationToken cancellationToken = default)
     {
         guard.EnsureWritable();
 
+        // ADR-0114 D11: the target takes the source's positions, so the target's price
+        // currencies meet accounts they did not, which can add a position pair.
+        var needed = dryRun || starts is null ? null : await starts.ReadAsync(ledgerId, cancellationToken).ConfigureAwait(false);
         var r = await securities.MergeSecuritiesAsync(ledgerId, sourceId, targetId, dryRun, cancellationToken)
             .ConfigureAwait(false);
         if (r.Result != SecuritiesRepository.MergeSecuritiesResult.Ok)
             return McpWriteResult.Fail(sourceId, r.Result.ToString());
+        if (needed is not null)
+            await starts!.StartIfWidenedAsync(ledgerId, needed, cancellationToken).ConfigureAwait(false);
         var before = $"{r.LegsMoved} txns across {r.AccountsRecomputed} account(s)";
         var after = dryRun
             ? $"would merge into {targetId}; source deactivated"
@@ -659,39 +710,54 @@ public sealed class McpWriteTools
         "deliberate BULK exception; every other write tool is one-entity-per-call). " +
         "'tags' is the COMPLETE set to assign to each transaction (a replace-set, not " +
         "additive): pass [\"reimbursable\",\"tax-2026\"] to set exactly those, or [] to " +
-        "clear all tags. Tags are freeform labels orthogonal to the single category; " +
-        "unknown names are created on first use (case-insensitive). ALL transactionIds " +
-        "must be in the ledger — if any isn't, the whole call is rejected and nothing " +
-        "is tagged, so fix the id and retry. dryRun=true reports the count + normalized " +
-        "tags without writing. Resolve transaction ids via the register / activity " +
-        "tools and tag names via list_tags.")]
-    public static async Task<McpWriteResult> SetTransactionTags(
+        "clear them. Tags are freeform labels orthogonal to the single category; " +
+        "unknown names are created on first use (case-insensitive). 'accountId' is the " +
+        "register the tags are written from, because each side of a transaction carries " +
+        "its own: on a one-posting transaction they are that account's, on a split the " +
+        "whole transaction's. ALL transactionIds must be in the ledger, and each must be " +
+        "one that account's register may edit — if any isn't (an id outside the ledger, " +
+        "an account not on the transaction, a row that register shows read-only), the " +
+        "whole call is rejected and nothing is tagged. dryRun=true reports, per " +
+        "transaction, where the tags would land ('side' or 'transaction') or why not, " +
+        "without writing. Resolve transaction ids via the register / activity tools and " +
+        "tag names via list_tags.")]
+    public static async Task<McpSetTransactionTagsResult> SetTransactionTags(
         McpWriteGuard guard,
         TransactionsRepository transactions,
         [Description("Ledger id (GUID) from list_ledgers.")] Guid ledgerId,
         [Description("Transaction (header) ids to tag — one or many.")] Guid[] transactionIds,
-        [Description("The complete tag set to assign to each transaction; [] clears all tags.")] string[] tags,
-        [Description("Preview only — report the count + tags without writing.")] bool dryRun = false,
+        [Description("The register account (GUID) the tags are written from.")] Guid accountId,
+        [Description("The complete tag set to assign to each transaction; [] clears it.")] string[] tags,
+        [Description("Preview only — report where the tags would land without writing.")] bool dryRun = false,
         CancellationToken cancellationToken = default)
     {
         guard.EnsureWritable();
 
         if (transactionIds is null || transactionIds.Length == 0)
-            return McpWriteResult.Fail(Guid.Empty, "no-transactions");
+            return McpSetTransactionTagsResult.Fail("no-transactions");
+        if (accountId == Guid.Empty)
+            return McpSetTransactionTagsResult.Fail($"{SetTransactionTagsContract.AccountIdParameter}-required");
 
         var outcome = await transactions
-            .SetTransactionTagsAsync(ledgerId, transactionIds, tags ?? Array.Empty<string>(), dryRun, cancellationToken)
+            .SetTransactionTagsAsync(ledgerId, transactionIds, accountId, tags ?? Array.Empty<string>(), dryRun, cancellationToken)
             .ConfigureAwait(false);
 
         if (outcome.Result == TransactionsRepository.SetTagsResult.HeadersNotInLedger)
-            return McpWriteResult.Fail(Guid.Empty,
+            return McpSetTransactionTagsResult.Fail(
                 $"transactions-not-in-ledger: {string.Join(", ", outcome.UnknownHeaderIds)}");
+        if (outcome.Result == TransactionsRepository.SetTagsResult.Refused)
+        {
+            var refused = outcome.Placements.Where(p => p.Refused is not null)
+                .Select(p => $"{p.TransactionId} ({p.Refused})");
+            return McpSetTransactionTagsResult.Fail(
+                $"refused, nothing tagged: {string.Join(", ", refused)}", outcome.Placements);
+        }
 
         var tagList = outcome.Tags.Count == 0 ? "(cleared)" : string.Join(", ", outcome.Tags);
         var verb = dryRun ? "would tag" : "tagged";
-        return new McpWriteResult(
-            Guid.Empty, true, null,
-            $"{verb} {outcome.HeaderCount} transaction(s) -> [{tagList}]", null);
+        return new McpSetTransactionTagsResult(
+            true, dryRun, $"{verb} {outcome.HeaderCount} transaction(s) -> [{tagList}]",
+            outcome.Tags, outcome.Placements, null);
     }
 
     // --- Tag lifecycle (Tags v1) — the tag-dictionary curation the category side
@@ -740,11 +806,14 @@ public sealed class McpWriteTools
     }
 
     [McpServerTool(Name = "merge_tags"), Description(
-        "Merge ONE tag into another (Tags v1): repoint every transaction from the source tag " +
-        "to the target, then delete the source. The lever for collapsing duplicates / " +
-        "near-duplicates (e.g. 'reimburse' -> 'reimbursable'). One pair per call. dryRun " +
-        "reports the source's current usage (an upper bound - assignments already on the " +
-        "target are de-duped, not double-counted) without writing. Resolve ids via list_tags.")]
+        "Merge ONE tag into another (Tags v1): repoint every assignment (transaction level " +
+        "and per side) from the source tag to the target, then delete the source. Saved " +
+        "reports filtered on the source are repointed to the target too, every member's " +
+        "included; the result reports how many of those you can see. The lever for " +
+        "collapsing duplicates / near-duplicates (e.g. 'reimburse' -> 'reimbursable'). One " +
+        "pair per call. dryRun reports the source's current assignment count (an upper " +
+        "bound - assignments already on the target are de-duped, not double-counted) " +
+        "without writing; it does not count saved reports. Resolve ids via list_tags.")]
     public static async Task<McpWriteResult> MergeTags(
         McpWriteGuard guard,
         TagsRepository tags,
@@ -764,23 +833,25 @@ public sealed class McpWriteTools
         if (source is null) return McpWriteResult.Fail(sourceTagId, "source-tag-not-in-ledger");
         if (target is null) return McpWriteResult.Fail(intoTagId, "target-tag-not-in-ledger");
 
-        var before = $"'{source.Name}' ({source.UsageCount} txns)";
+        var before = $"'{source.Name}' ({source.UsageCount} assignments)";
         if (dryRun)
             return new McpWriteResult(sourceTagId, true, before, $"would merge into '{target.Name}'", null);
 
         var outcome = await tags.MergeAsync(ledgerId, sourceTagId, intoTagId, cancellationToken).ConfigureAwait(false);
         return outcome.Result == TagsRepository.MergeTagResult.Ok
             ? new McpWriteResult(sourceTagId, true, before,
-                $"merged into '{target.Name}'; {outcome.TransactionsRepointed} repointed", null)
+                $"merged into '{target.Name}'; {outcome.TransactionsRepointed} repointed, "
+                + $"{outcome.SavedReportsRepointed} saved report(s) now filter on it", null)
             : McpWriteResult.Fail(sourceTagId, outcome.Result.ToString());
     }
 
     [McpServerTool(Name = "delete_tag"), Description(
-        "Delete ONE tag (Tags v1). Removes the tag and drops it from every transaction " +
-        "carrying it (the junction cascades) - so deleting an in-use tag is allowed and " +
-        "clears it everywhere, and deleting a 0-use tag cleans up a stray. To keep the " +
-        "assignments under a different label, use merge_tags instead. dryRun reports the tag " +
-        "+ how many transactions would lose it. Resolve the id via list_tags.")]
+        "Delete ONE tag (Tags v1). Removes the tag and every assignment of it, at transaction " +
+        "level and per side (the junctions cascade) - so deleting an in-use tag is allowed and " +
+        "clears it everywhere, and deleting a 0-use tag cleans up a stray. A side left with no " +
+        "tags of its own then shows the other side's as inherited. To keep the assignments " +
+        "under a different label, use merge_tags instead. dryRun reports the tag + how many " +
+        "assignments would be removed. Resolve the id via list_tags.")]
     public static async Task<McpWriteResult> DeleteTag(
         McpWriteGuard guard,
         TagsRepository tags,
@@ -795,7 +866,7 @@ public sealed class McpWriteTools
             .FirstOrDefault(t => t.Id == tagId);
         if (current is null) return McpWriteResult.Fail(tagId, "tag-not-in-ledger");
 
-        var before = $"'{current.Name}' ({current.UsageCount} txns)";
+        var before = $"'{current.Name}' ({current.UsageCount} assignments)";
         if (dryRun) return new McpWriteResult(tagId, true, before, "would delete", null);
 
         var result = await tags.DeleteAsync(ledgerId, tagId, cancellationToken).ConfigureAwait(false);
@@ -805,8 +876,11 @@ public sealed class McpWriteTools
     }
 
     [McpServerTool(Name = "cleanup_unused_tags"), Description(
-        "Delete EVERY tag in the ledger with zero transactions (Tags v1) - one-shot cleanup " +
-        "of strays left by prior untag / removals. dryRun reports how many would be removed " +
+        "Delete EVERY tag in the ledger with no assignments at all (usageCount 0 in list_tags; " +
+        "Tags v1) - one-shot cleanup of strays left by prior untag / removals. A tag whose only " +
+        "transactions are hidden, merged away or reminder templates, or whose tags a line's own " +
+        "tags hide, still has assignments and is kept, even when its transactionCount is 0. " +
+        "dryRun reports how many would be removed " +
         "(and their names) without deleting. Returns the count removed.")]
     public static async Task<McpWriteResult> CleanupUnusedTags(
         McpWriteGuard guard,
@@ -838,40 +912,77 @@ public sealed class McpWriteTools
         "price OWNS its day: if a price already exists for that security+date (from any " +
         "source) it is replaced and marked manual (protected from automated-fetch " +
         "overwrites). close is the price (must be > 0); high / low / volume optional (high < " +
-        "low is rejected). dryRun previews without writing. Resolve securityId via " +
-        "list_securities; read current prices via price_history.")]
+        "low is rejected). currency is the price's ISO 4217 code (e.g. EUR); omitted, it is " +
+        "the security's latest price's currency, else the currency of the accounts holding " +
+        "it when they all agree, else the call fails with security-price-currency-required " +
+        "and must be repeated with a currency (ADR-0114 D5). A currency that is not three " +
+        "characters once trimmed fails with security-price-currency-invalid. A pence (or other minor-unit) " +
+        "figure is entered in its major unit: pounds, not pence. The result names the " +
+        "currency used. dryRun previews without writing, including the currency it would " +
+        "use. Resolve securityId via list_securities; read current prices via price_history.")]
     public static async Task<McpWriteResult> AddPrice(
         McpWriteGuard guard,
         SecuritiesRepository securities,
         [Description("Ledger id (GUID) from list_ledgers.")] Guid ledgerId,
         [Description("Security id (GUID) from list_securities.")] Guid securityId,
         [Description("Price date, e.g. 2026-07-21.")] DateTime date,
-        [Description("The price / close (must be > 0).")] decimal close,
+        [Description("The price / close (must be > 0), in the major unit of its currency.")] decimal close,
+        [Description("ISO 4217 currency of the price, e.g. USD or EUR (optional; see the tool description for the default).")] string? currency = null,
         [Description("Intraday high (optional).")] decimal? high = null,
         [Description("Intraday low (optional).")] decimal? low = null,
         [Description("Volume (optional).")] long? volume = null,
         [Description("Preview only - report without writing.")] bool dryRun = false,
+        MarketSeriesWriteTrigger? starts = null,
         CancellationToken cancellationToken = default)
     {
         guard.EnsureWritable();
 
         var priceDate = DateOnly.FromDateTime(date);
         if (dryRun)
-            return new McpWriteResult(securityId, true, null, $"would set {priceDate:yyyy-MM-dd} close={close}", null);
+        {
+            // The same currency the write would store, so a preview never shows one
+            // currency and the write another.
+            if (await securities.GetByIdAsync(ledgerId, securityId, today: null, cancellationToken)
+                    .ConfigureAwait(false) is null)
+            {
+                return McpWriteResult.Fail(securityId, "security-not-in-ledger");
+            }
+            var (preview, previewCurrency) = await securities
+                .ResolvePriceCurrencyAsync(ledgerId, securityId, currency, cancellationToken)
+                .ConfigureAwait(false);
+            return preview == SecuritiesRepository.AddPriceResult.Ok
+                ? new McpWriteResult(securityId, true, null,
+                    $"would set {priceDate:yyyy-MM-dd} close={close} {previewCurrency}", null)
+                : McpWriteResult.Fail(securityId, AddPriceFailureCode(preview));
+        }
 
+        // ADR-0114 D11: a price can add a position pair or move one's start earlier.
+        var before = starts is null ? null : await starts.ReadAsync(ledgerId, cancellationToken).ConfigureAwait(false);
         var outcome = await securities.AddPriceAsync(ledgerId, securityId, new CreateSecurityPriceRequest
         {
             Price = close,
             PriceDate = priceDate,
+            CurrencyCode = currency,
             High = high,
             Low = low,
             Volume = volume,
         }, cancellationToken).ConfigureAwait(false);
+        if (outcome.Kind == SecuritiesRepository.AddPriceResult.Ok && before is not null)
+            await starts!.StartIfWidenedAsync(ledgerId, before, cancellationToken).ConfigureAwait(false);
 
         return outcome.Kind == SecuritiesRepository.AddPriceResult.Ok && outcome.PriceId is { } pid
-            ? new McpWriteResult(pid, true, null, $"{priceDate:yyyy-MM-dd} close={close}", null)
-            : McpWriteResult.Fail(securityId, outcome.Kind.ToString());
+            ? new McpWriteResult(pid, true, null, $"{priceDate:yyyy-MM-dd} close={close} {outcome.CurrencyCode}", null)
+            : McpWriteResult.Fail(securityId, AddPriceFailureCode(outcome.Kind));
     }
+
+    /// <summary>The error an <c>add_price</c> refusal reports: the REST code for the two
+    /// currency refusals, which a caller must act on, else the result's name as before.</summary>
+    private static string AddPriceFailureCode(SecuritiesRepository.AddPriceResult kind) => kind switch
+    {
+        SecuritiesRepository.AddPriceResult.CurrencyInvalid => Errors.BusinessError.Codes.SecurityPriceCurrencyInvalid,
+        SecuritiesRepository.AddPriceResult.CurrencyRequired => Errors.BusinessError.Codes.SecurityPriceCurrencyRequired,
+        _ => kind.ToString(),
+    };
 
     [McpServerTool(Name = "update_price"), Description(
         "Edit ONE existing price point (ADR-0070) - correct a close / high / low / volume or " +
@@ -891,6 +1002,7 @@ public sealed class McpWriteTools
         [Description("New volume; null leaves it.")] long? volume = null,
         [Description("New date, e.g. 2026-07-21; null leaves it.")] DateTime? date = null,
         [Description("Preview only.")] bool dryRun = false,
+        MarketSeriesWriteTrigger? starts = null,
         CancellationToken cancellationToken = default)
     {
         guard.EnsureWritable();
@@ -899,6 +1011,8 @@ public sealed class McpWriteTools
             return McpWriteResult.Fail(priceId, "nothing-to-change");
         if (dryRun) return new McpWriteResult(priceId, true, null, "would update price point", null);
 
+        // ADR-0114 D11: a price moved earlier can move its pair's start earlier.
+        var before = starts is null ? null : await starts.ReadAsync(ledgerId, cancellationToken).ConfigureAwait(false);
         var result = await securities.PatchPriceAsync(ledgerId, securityId, priceId, new PatchSecurityPriceRequest
         {
             Price = close,
@@ -907,6 +1021,8 @@ public sealed class McpWriteTools
             Volume = volume,
             PriceDate = date is { } d ? DateOnly.FromDateTime(d) : null,
         }, cancellationToken).ConfigureAwait(false);
+        if (result == SecuritiesRepository.PatchPriceResult.Ok && before is not null)
+            await starts!.StartIfWidenedAsync(ledgerId, before, cancellationToken).ConfigureAwait(false);
 
         return result == SecuritiesRepository.PatchPriceResult.Ok
             ? new McpWriteResult(priceId, true, null, "updated", null)
@@ -956,6 +1072,17 @@ public sealed record McpWriteResult(
     Guid Id, bool Ok, string? Before, string? After, string? Error)
 {
     public static McpWriteResult Fail(Guid id, string error) => new(id, false, null, null, error);
+}
+
+/// <summary>Outcome of <c>set_transaction_tags</c>: a summary, the tag set, and per
+/// transaction where the tags land (<c>side</c> or <c>transaction</c>) or the reason
+/// they would not, which on a refusal names every transaction that refused the call.</summary>
+public sealed record McpSetTransactionTagsResult(
+    bool Ok, bool DryRun, string? After, IReadOnlyList<string> Tags,
+    IReadOnlyList<SetTransactionTagsPlacement> Placements, string? Error)
+{
+    public static McpSetTransactionTagsResult Fail(string error, IReadOnlyList<SetTransactionTagsPlacement>? placements = null) =>
+        new(false, false, null, [], placements ?? [], error);
 }
 
 /// <summary>One header a bulk recategorize could not move (ADR-0068): its id + why

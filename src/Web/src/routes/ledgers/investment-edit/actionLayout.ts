@@ -1,4 +1,8 @@
-import type { LedgerInvestmentAction } from '@/lib/types';
+import type { AccountSummary, LedgerInvestmentAction } from '@/lib/types';
+import { TRANSFER_AMOUNT_ACTIONS } from '@/lib/types/investment';
+import type { SecondAmountDirection, SecondAmountSide } from '@/lib/secondAmount';
+
+import { formatInvestmentAction } from '../register/strategies/investmentStrategy';
 
 /**
  * Identifier for one slot in the editor form. Each key corresponds to
@@ -46,44 +50,40 @@ export const ACTION_LAYOUTS: Record<LedgerInvestmentAction, readonly FieldKey[]>
  * The action set the picker displays in dropdown order. Matches the
  * ADR-0027 catalog order; the editor's action selector iterates this
  * array so the order is data-driven, not hard-coded in JSX.
+ *
+ * The picker holds only the order and the hints. Each label is the action's
+ * one word from `formatInvestmentAction`, the word the register's chip shows,
+ * so the picker and the chip cannot name an action differently.
  */
 export const ACTION_PICKER_ENTRIES: ReadonlyArray<{
     action: LedgerInvestmentAction;
     label: string;
     /** Short hint shown below the label on focus / hover. */
     hint: string;
-}> = [
+}> = ([
     { action: 'buy',
-      label: 'Buy',
       hint: 'Acquire shares (cash out)' },
     { action: 'buyx',
-      label: 'BuyXfr',
       hint: 'Acquire shares with cash from another account' },
     { action: 'sell',
-      label: 'Sell',
       hint: 'Dispose shares (cash in)' },
     { action: 'sellx',
-      label: 'SellXfr',
       hint: 'Dispose shares with proceeds to another account' },
     { action: 'dividend_cash',
-      label: 'Div',
       hint: 'Cash dividend received' },
     { action: 'dividend_reinvest',
-      label: 'DivReinvest',
       hint: 'Dividend reinvested into shares' },
     { action: 'divx',
-      label: 'DivXfr',
       hint: 'Dividend received then transferred out' },
     { action: 'transfer',
-      label: 'Xfr',
       hint: 'Cash transfer in or out of the brokerage' },
     { action: 'misc',
-      label: 'Misc',
       hint: 'Other income or expense (sign on amount discriminates)' },
     { action: 'transfer_shares',
-      label: 'Transfer shares',
       hint: 'Move shares in-kind to another investment account (carries cost basis, no gain)' },
-];
+] satisfies ReadonlyArray<{ action: LedgerInvestmentAction; hint: string }>).map(
+    (entry) => ({ ...entry, label: formatInvestmentAction(entry.action) }),
+);
 
 /**
  * Per-field signed-amount sign requirement, per the field component's
@@ -140,3 +140,52 @@ export const AMOUNT_SIGN_HINT: Record<LedgerInvestmentAction, string | null> = {
     misc:              'positive = income, negative = expense',
     transfer_shares:   null,    // amount field hidden (in-kind, no cash)
 };
+
+/**
+ * Which way the money moves for the transfer account, the second amount's caption
+ * (ADR-0114 D14): BuyXfr pays from it (Sent); SellXfr and DividendXfr pay into it
+ * (Received); an Xfr goes by Amount's sign, money into the brokerage being money the
+ * other account sent.
+ */
+export function transferAmountDirection(
+    action: LedgerInvestmentAction,
+    amount: number | null,
+): SecondAmountDirection {
+    switch (action) {
+        case 'buyx':
+            return 'sent';
+        case 'sellx':
+        case 'divx':
+            return 'received';
+        default:
+            return amount !== null && amount > 0 ? 'sent' : 'received';
+    }
+}
+
+/**
+ * The second amount's account, while the transfer account is a real account in another
+ * currency than the brokerage's on an Xfr, BuyXfr, SellXfr or DividendXfr (ADR-0114 D13,
+ * D14); null otherwise: a category, the same currency, an in-kind share move, a
+ * currency not yet known. The transfer field's own eligibility is unchanged.
+ */
+export function transferAmountSide(args: {
+    action: LedgerInvestmentAction | null;
+    transferAccountId: string | null;
+    amount: number | null;
+    accounts: readonly AccountSummary[];
+    /** The brokerage's currency; null while it is not known. */
+    currency: string | null;
+    accountName: (id: string) => string;
+}): SecondAmountSide | null {
+    const { action, transferAccountId, currency } = args;
+    if (action === null || !TRANSFER_AMOUNT_ACTIONS.includes(action)) return null;
+    if (transferAccountId === null || currency === null) return null;
+    const other = args.accounts.find((a) => a.id === transferAccountId);
+    if (other === undefined || other.accountType === 'category' || other.currencyCode === currency) return null;
+    return {
+        accountId: other.id,
+        accountName: args.accountName(other.id),
+        currency: other.currencyCode,
+        direction: transferAmountDirection(action, args.amount),
+    };
+}

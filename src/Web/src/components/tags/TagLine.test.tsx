@@ -6,9 +6,10 @@ import { TagColorsValueProvider } from './TagColorsContext';
 
 // The register stacks a category Chip over a TagLine in one cell. The chip is
 // px-1.5, so its text sits 6px in, and the line has to match that inset whether
-// or not its first tag carries a colour. It did not: the colour stripe (2px
-// plus a 4px margin = 6px) was the only thing providing it, so an uncoloured
-// tag started flush against the cell edge and the column read as crooked.
+// or not its first tag carries a colour. The colour stripe (2px plus a 4px
+// margin = 6px) cannot be what provides it: an uncoloured tag has no stripe, so
+// it would start flush against the cell edge and the column would read as
+// crooked. The `inset` prop provides it instead.
 function renderLine(
     tags: readonly string[],
     colors: ReadonlyArray<{ name: string; color: string | null }>,
@@ -75,16 +76,15 @@ describe('the left inset matches the category chip above it', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Dimension 25 of the fixture audit: 8+ tags with 50-character names.
+// Dimension 25: 8+ tags with 50-character names.
 //
 // This is the case the component was BUILT for — its own doc comment says
 // chips "fall apart at eight" and that 50-character names are "the normal case
-// here, not an outlier" — and until the demo sample grew one, no fixture and no
-// test had ever produced a row with more than a single tag.
+// here, not an outlier".
 //
-// What actually matters is that ROW HEIGHT does not grow with tag count: the
-// defect that killed chips was one register row standing three times as tall as
-// its neighbours, which breaks the only reading pattern a register has. jsdom
+// What actually matters is that ROW HEIGHT does not grow with tag count: with
+// chips, one register row can stand three times as tall as its neighbours,
+// which breaks the only reading pattern a register has. jsdom
 // has no layout engine, so a height assertion here would pass against anything
 // and prove nothing. These assert the STRUCTURE that delivers the height
 // instead — one truncating line box whatever the count — and leave pixels to
@@ -186,5 +186,63 @@ describe('eight tags with 50-character names', () => {
         expect(container.querySelectorAll('[aria-hidden]')).toHaveLength(
             MIXED.filter((c) => c.color !== null).length,
         );
+    });
+});
+
+describe('inherited tags', () => {
+    it('lead with the marker naming the account they come from', () => {
+        render(
+            <TagColorsValueProvider colors={[{ name: 'Work', color: '#14b8a6' }]}>
+                <TagLine tags={['Work']} inset inherited={{ from: 'Checking' }} />
+            </TagColorsValueProvider>,
+        );
+        const line = screen.getByTitle('Work');
+        expect(line).toHaveAttribute('data-inherited', 'true');
+        expect(screen.getByRole('img', { name: 'From Checking' })).toBeInTheDocument();
+        expect(line.querySelector('.truncate')).toHaveClass('text-text-subtle');
+    });
+
+    it('keep the line at the chip inset with the marker in front', () => {
+        render(
+            <TagColorsValueProvider colors={[{ name: 'Work', color: null }]}>
+                <TagLine tags={['Work']} inset inherited={{ from: null }} />
+            </TagColorsValueProvider>,
+        );
+        const line = screen.getByTitle('Work');
+        expect(line).toHaveClass('pl-1.5');
+        // The names do not pad a second time behind the marker.
+        expect(line.querySelector('.truncate')).not.toHaveClass('pl-1.5');
+    });
+
+    it('own tags carry no marker', () => {
+        render(
+            <TagColorsValueProvider colors={[{ name: 'Work', color: null }]}>
+                <TagLine tags={['Work']} inset inherited={false} />
+            </TagColorsValueProvider>,
+        );
+        expect(screen.getByTitle('Work')).not.toHaveAttribute('data-inherited');
+        expect(screen.queryByRole('img', { name: /^From / })).not.toBeInTheDocument();
+    });
+});
+
+describe("own names' colour", () => {
+    it("is muted by default, as a register row's secondary line", () => {
+        render(
+            <TagColorsValueProvider colors={[{ name: 'Work', color: null }]}>
+                <TagLine tags={['Work']} inset />
+            </TagColorsValueProvider>,
+        );
+        expect(screen.getByTitle('Work').querySelector('.truncate')).toHaveClass('text-text-muted');
+    });
+
+    it('is the full text colour with ownTone="text", and inherited names stay subtle', () => {
+        render(
+            <TagColorsValueProvider colors={[{ name: 'Work', color: null }, { name: 'Home', color: null }]}>
+                <TagLine tags={['Work']} ownTone="text" />
+                <TagLine tags={['Home']} ownTone="text" inherited={{ from: 'Checking' }} />
+            </TagColorsValueProvider>,
+        );
+        expect(screen.getByTitle('Work').querySelector('.truncate')).toHaveClass('text-text');
+        expect(screen.getByTitle('Home').querySelector('.truncate')).toHaveClass('text-text-subtle');
     });
 });

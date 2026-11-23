@@ -23,11 +23,12 @@ namespace Coffer.Api.Tests.Integration.Auth;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class SessionAuthMethodUpgradeTests
+public sealed class SessionAuthMethodUpgradeTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SessionAuthMethodUpgradeTests(PostgresFixture fixture) => _fixture = fixture;
+    public SessionAuthMethodUpgradeTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private const string Mig248 = "248_session_auth_method_and_disabled_users.sql";
     private const string Mig249 = "249_setup_marker_deterministic.sql";
@@ -50,7 +51,7 @@ public sealed class SessionAuthMethodUpgradeTests
     private (string ConnectionString, string WorkDir) InstallBefore248(string dbName)
     {
         var work = Directory.CreateTempSubdirectory("coffer-mig248-").FullName;
-        var cs = _fixture.EmptyDatabaseConnectionString(dbName);
+        var cs = Db.EmptyDatabaseConnectionString(dbName);
         UpgradeRehearsal.RunStaged(cs, UpgradeRehearsal.StageBefore(Mig248, work));
         return (cs, work);
     }
@@ -99,10 +100,10 @@ public sealed class SessionAuthMethodUpgradeTests
     [Fact]
     public async Task The_marker_says_when_setup_completed_however_late_the_upgrade_runs()
     {
-        // 248 alone stamped the marker with now(), so the same data migrated at two
-        // moments gave two different rows; the restore drill caught it, comparing a
-        // backup migrated at restore time with a database migrated at upgrade time.
-        // 249 makes the result a function of the data: when the first user arrived.
+        // A marker stamped with now() would give the same data migrated at two moments
+        // two different rows — a backup migrated at restore time would differ from a
+        // database migrated at upgrade time. 249 makes the result a function of the
+        // data: when the first user arrived.
         var (cs, work) = InstallBefore248("mig248_marker_time");
         await SeedLiveInstallAsync(cs);
 
@@ -128,17 +129,19 @@ public sealed class SessionAuthMethodUpgradeTests
     [Fact]
     public async Task Every_step_up_action_has_its_flow_and_an_unknown_one_is_refused()
     {
-        var (cs, work) = InstallBefore248("mig248_flows");
-        await SeedLiveInstallAsync(cs);
-        UpgradeRehearsal.Apply(cs, work, Mig248);
+        // Against the current schema, not the 248 rehearsal: each action since (mig 270: upgrade)
+        // widens the same constraint in a later migration, and the migration runner cannot
+        // apply one without the chain before it.
+        var cs = Db.ServiceConnectionString;
+        var user = (await SyntheticLedger.CreateAsync(Db)).UserId;
 
         // Driven from the code's own list, so an action added without widening the
         // constraint fails here rather than as a 500 on its first tap.
         foreach (var action in StepUpActions.All)
-            await InsertChallengeAsync(cs, StepUpActions.FlowFor(action));
+            await InsertChallengeAsync(cs, StepUpActions.FlowFor(action), user);
 
         var ex = await Assert.ThrowsAsync<PostgresException>(
-            () => InsertChallengeAsync(cs, StepUpActions.FlowFor("not-a-real-action")));
+            () => InsertChallengeAsync(cs, StepUpActions.FlowFor("not-a-real-action"), user));
         Assert.Equal(PostgresErrorCodes.CheckViolation, ex.SqlState);
         Assert.Equal("webauthn_pending_challenges_flow_check", ex.ConstraintName);
     }
@@ -148,7 +151,7 @@ public sealed class SessionAuthMethodUpgradeTests
             "SELECT count(*) FROM system_settings WHERE key = 'setup.completed' AND value = 'true'::jsonb") == 1;
 
     /// <summary>Insert a challenge for <paramref name="flow"/> and roll it back.</summary>
-    private static async Task InsertChallengeAsync(string connectionString, string flow)
+    private static async Task InsertChallengeAsync(string connectionString, string flow, Guid? user = null)
     {
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync();
@@ -160,7 +163,7 @@ public sealed class SessionAuthMethodUpgradeTests
             """, connection, tx))
         {
             command.Parameters.AddWithValue("flow", flow);
-            command.Parameters.AddWithValue("user", UserId);
+            command.Parameters.AddWithValue("user", user ?? UserId);
             await command.ExecuteNonQueryAsync();
         }
         await tx.RollbackAsync();

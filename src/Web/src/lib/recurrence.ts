@@ -28,6 +28,26 @@ function ruleParts(rrule: string): Map<string, string> {
     return map;
 }
 
+/**
+ * What the series' start date fixes when the rule names no day: its day of the
+ * month and its weekday. RFC 5545 takes a part the rule leaves out from DTSTART,
+ * and the server's expander (Ical.Net) anchors DTSTART at the series start, so a
+ * `FREQ=MONTHLY` with no BYMONTHDAY recurs on the start's day, and a
+ * `FREQ=WEEKLY` with no BYDAY on its weekday. Null when the date is missing or
+ * malformed.
+ */
+function startParts(startDate: string | null | undefined): { day: number; weekday: string } | null {
+    if (startDate === null || startDate === undefined) return null;
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(startDate);
+    if (!m) return null;
+    const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+    if (Number.isNaN(d.getTime())) return null;
+    return { day: d.getUTCDate(), weekday: DAY_ORDER[d.getUTCDay()]! };
+}
+
+/** Whether a rule constrains the day with any BY* part of its own. */
+const namesNoDay = (parts: ReadonlyMap<string, string>) => ![...parts.keys()].some((k) => k.startsWith('BY'));
+
 function ordinal(n: number): string {
     const v = n % 100;
     if (v >= 11 && v <= 13) return `${n}th`;
@@ -50,13 +70,16 @@ function everyN(n: number, unit: string): string {
  * - blank / irregular (no rule) → `"Custom"` (a manual-fire reminder).
  * - a rule outside the supported pattern set → `"Custom schedule"`
  *   (never a wrong phrase — we don't guess at BYSETPOS etc.).
+ * - a monthly or weekly rule that names no day reads the day the series'
+ *   `startDate` fixes, as the server expands it; without the date it says no day.
  */
-export function humanizeRrule(rrule: string | null | undefined): string {
+export function humanizeRrule(rrule: string | null | undefined, startDate?: string | null): string {
     if (rrule === null || rrule === undefined || rrule.trim().length === 0) {
         return 'Custom';
     }
     const parts = ruleParts(rrule);
     const interval = Number(parts.get('INTERVAL') ?? '1') || 1;
+    const start = namesNoDay(parts) ? startParts(startDate) : null;
 
     switch (parts.get('FREQ')?.toUpperCase()) {
         case 'DAILY':
@@ -64,7 +87,7 @@ export function humanizeRrule(rrule: string | null | undefined): string {
 
         case 'WEEKLY': {
             const base = everyN(interval, 'week');
-            const byday = parts.get('BYDAY');
+            const byday = parts.get('BYDAY') ?? start?.weekday;
             if (byday === undefined) return base;
             const codes = byday.split(',')
                 .map((d) => d.trim().toUpperCase())
@@ -77,7 +100,7 @@ export function humanizeRrule(rrule: string | null | undefined): string {
 
         case 'MONTHLY': {
             const base = interval === 1 ? 'Monthly' : `Every ${interval} months`;
-            const monthDay = parts.get('BYMONTHDAY');
+            const monthDay = parts.get('BYMONTHDAY') ?? (start ? String(start.day) : undefined);
             if (monthDay === '-1') return `${base} on the last day`;
             const day = Number(monthDay);
             return monthDay !== undefined && !Number.isNaN(day)
@@ -136,19 +159,38 @@ export function buildRrule(state: RecurrenceState): string {
     return segments.join(';');
 }
 
+/** The parts each frequency's editor state holds; a rule with any other part is not
+ *  one the editor can hold, and saving it would drop that part. */
+const EDITABLE_PARTS: Readonly<Record<string, readonly string[]>> = {
+    DAILY: ['FREQ', 'INTERVAL'],
+    WEEKLY: ['FREQ', 'INTERVAL', 'BYDAY'],
+    MONTHLY: ['FREQ', 'INTERVAL', 'BYMONTHDAY'],
+    YEARLY: ['FREQ', 'INTERVAL'],
+};
+
 /**
  * Parse an RFC-5545 RRULE back into editor state for edit-mode prefill.
  *
  * Returns null for blank/null input OR any rule outside the supported set
- * (unknown FREQ, BYSETPOS, ordinal BYDAY like `2MO`, etc.) — never guesses.
+ * (unknown FREQ, BYSETPOS, ordinal BYDAY like `2MO`, a part the editor would
+ * drop on save such as BYMONTH, UNTIL or COUNT, etc.) — never guesses.
+ *
+ * A rule that names no day takes it from the series' `startDate`, as the server
+ * expands it (startParts): a monthly rule with no BYMONTHDAY is on the start's
+ * day, so saving it unchanged writes that day and the reminder stays where it
+ * was. Without the date a monthly rule with no day cannot be held, and is null;
+ * a weekly one keeps no weekdays, which saves as no BYDAY, the same rule.
  */
-export function parseRrule(rrule: string | null | undefined): RecurrenceState | null {
+export function parseRrule(rrule: string | null | undefined, startDate?: string | null): RecurrenceState | null {
     if (rrule === null || rrule === undefined || rrule.trim().length === 0) {
         return null;
     }
     const parts = ruleParts(rrule);
     const freqRaw = parts.get('FREQ')?.toUpperCase();
     const interval = Number(parts.get('INTERVAL') ?? '1') || 1;
+    const editable = freqRaw === undefined ? undefined : EDITABLE_PARTS[freqRaw];
+    if (editable === undefined || [...parts.keys()].some((k) => !editable.includes(k))) return null;
+    const start = startParts(startDate);
 
     switch (freqRaw) {
         case 'DAILY':
@@ -166,7 +208,7 @@ export function parseRrule(rrule: string | null | undefined): RecurrenceState | 
         case 'WEEKLY': {
             if (parts.has('BYMONTHDAY')) return null;
             const byday = parts.get('BYDAY');
-            let weekdays: string[] = [];
+            let weekdays: string[] = start ? [start.weekday] : [];
             if (byday !== undefined) {
                 const codes = byday.split(',').map((d) => d.trim().toUpperCase());
                 // Reject ordinal prefixes (e.g. `2MO`) and unknown codes — out of set.
@@ -179,7 +221,8 @@ export function parseRrule(rrule: string | null | undefined): RecurrenceState | 
         case 'MONTHLY': {
             if (parts.has('BYDAY')) return null;
             const raw = parts.get('BYMONTHDAY');
-            let monthDay: number | 'last' = 1;
+            if (raw === undefined && start === null) return null;
+            let monthDay: number | 'last' = start?.day ?? 1;
             if (raw !== undefined) {
                 if (raw === '-1') {
                     monthDay = 'last';

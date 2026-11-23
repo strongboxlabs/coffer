@@ -14,25 +14,23 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// its figures from postings it would value such an account at zero, and a
 /// ledger's largest single asset would silently not count.</para>
 ///
-/// <para>The audit scored this ✗ for the demo. <b>Measured, that was wrong:</b>
-/// the demo's house account has carried a six-figure opening balance and zero
-/// transactions since the sample grew a net worth to report. The fixture had
-/// the case all along and nothing asserted it — which is the same shape as
-/// dimensions 7 and 35, and a reminder that a ✗ written without measuring is
-/// a guess.</para>
+/// <para>The Demo carries this case (a dormant certificate of deposit: an
+/// opening balance and no transactions), and <see cref="Provisioning.FullDemoTests"/> pins
+/// that it keeps it. These tests pin what the balance paths do with it.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class UntouchedAccountTests
+public sealed class UntouchedAccountTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public UntouchedAccountTests(PostgresFixture fixture) => _fixture = fixture;
+    public UntouchedAccountTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     // Net worth reads through the Overview, which needs the balance and
     // investment repositories; real instances over the same context suffice.
     private static AccountsReportingRepository NewRepository(AppDbContext db)
     {
-        var balances = new AccountBalancesRepository(db);
+        var balances = new AccountBalancesRepository(db, TimeProvider.System);
         var investment = new InvestmentReportingRepository(db, TimeProvider.System);
         var overview = new OverviewRepository(db, balances, investment);
         return new AccountsReportingRepository(db, balances, investment, overview);
@@ -41,7 +39,7 @@ public sealed class UntouchedAccountTests
     [Fact]
     public async Task Net_worth_counts_an_account_that_has_never_been_transacted()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var touched = await ledger.AddBankAccountAsync("Checking", openingBalance: 1_000m);
         await ledger.AddBankAccountAsync("Rainy Day", openingBalance: 25_000m);
 
@@ -51,8 +49,8 @@ public sealed class UntouchedAccountTests
         await ledger.AddTransactionPairAsync(
             groceries.Id, touched.Id, 250m, new DateTime(2026, 5, 1, 12, 0, 0, DateTimeKind.Utc));
 
-        var netWorth = await NewRepository(_fixture.NewDbContext())
-            .NetWorthAsync(ledger.LedgerId);
+        var netWorth = await NewRepository(Db.NewDbContext())
+            .NetWorthAsync(ledger.LedgerId, today: null);
 
         var rainy = netWorth.Breakdown.SingleOrDefault(a => a.Name == "Rainy Day");
         Assert.NotNull(rainy);
@@ -72,19 +70,16 @@ public sealed class UntouchedAccountTests
         // The sign half. An untouched ASSET that read zero would understate
         // net worth; an untouched liability that read zero would OVERSTATE it,
         // and an error in that direction is the one nobody goes looking for.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         await ledger.AddBankAccountAsync("Checking", openingBalance: 5_000m);
         await ledger.AddAccountAsync("Old Card Balance", "credit_card", openingBalance: -800m);
 
-        var netWorth = await NewRepository(_fixture.NewDbContext())
-            .NetWorthAsync(ledger.LedgerId);
+        var netWorth = await NewRepository(Db.NewDbContext())
+            .NetWorthAsync(ledger.LedgerId, today: null);
 
         Assert.Equal(4_200m, netWorth.NetWorth);
         // TotalLiabilities is SIGNED, not a magnitude — net worth is
-        // assets + liabilities, not assets - liabilities. Asserted as found
-        // rather than as assumed; the first draft of this line expected the
-        // positive magnitude and was wrong about the convention, not about the
-        // behaviour.
+        // assets + liabilities, not assets - liabilities.
         Assert.Equal(-800m, netWorth.TotalLiabilities);
         Assert.Equal(5_000m, netWorth.TotalAssets);
     }

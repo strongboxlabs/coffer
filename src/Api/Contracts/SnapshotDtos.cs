@@ -16,9 +16,11 @@ public sealed record SnapshotSummaryDto(
     string Kind,
     string? Description,
     string SchemaVersion,
-    /// <summary>Uncompressed JSON size in bytes. The SPA renders this
-    /// as "N MB before compression" on the snapshots panel.</summary>
-    int ContentSizeUncompressed,
+    /// <summary>Bytes the snapshot occupies as stored, compression included
+    /// (migration 271). The snapshots panel shows this, not the length of the
+    /// payload's JSON text, which reads as several times what the snapshot
+    /// costs and has nothing to compare with.</summary>
+    long ContentSizeStored,
     /// <summary>
     /// Whether a restore of this snapshot could succeed right now — that is,
     /// whether <see cref="SchemaVersion"/> still matches the live schema

@@ -8,8 +8,8 @@ namespace Coffer.Api.Tests.Integration.Rls;
 
 /// <summary>
 /// The row-level security catalog, checked whole (FU-086). The API's own authorization
-/// hid every gap this suite would have caught: tables shipped without RLS, write policies
-/// that admitted viewers, a member able to delete another member's report. Each rule
+/// hides every gap this suite catches: a table without RLS, a write policy that admits
+/// viewers, a member able to delete another member's report. Each rule
 /// reads the live catalog of the fully migrated database, so a new table, grant, policy,
 /// view or function is held to it without anyone remembering to add it here.
 /// </summary>
@@ -18,11 +18,12 @@ namespace Coffer.Api.Tests.Integration.Rls;
 /// adding one to make a failure go away is the thing this suite exists to make visible.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed partial class RlsCatalogTests
+public sealed partial class RlsCatalogTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public RlsCatalogTests(PostgresFixture fixture) => _fixture = fixture;
+    public RlsCatalogTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     /// <summary>Tables coffer_app reaches without row-level security.</summary>
     private static readonly Dictionary<string, string> WithoutRls = new()
@@ -45,12 +46,12 @@ public sealed partial class RlsCatalogTests
     {
         ["users.users_self"] = "a user's own row (its UPDATE is column-limited by grant)",
         ["mcp_access_tokens.mcp_access_tokens_per_user"] = "a user's own MCP tokens",
+        ["oauth_connection_meta.oauth_connection_meta_per_user"] =
+            "a user's own OAuth connection names; the last-used stamp runs after authentication via coffer_service",
         ["mcp_tool_invocations.mcp_tool_invocations_per_user"] =
             "the MCP write audit; it records a refused attempt in the attempting user's context",
         ["report_pins.report_pins_per_user"] = "a user's own pins; a viewer pins reports too",
         ["user_preferences.user_preferences_per_user"] = "a user's own preferences",
-        ["user_account_groups.user_account_groups_self"] = "a user's own sidebar groups",
-        ["user_account_group_members.user_account_group_members_own_groups"] = "the members of a user's own groups",
         ["saved_reports.saved_reports_own"] = "a user's own saved reports; a viewer saves reports too",
     };
 
@@ -59,17 +60,38 @@ public sealed partial class RlsCatalogTests
     {
         ["current_app_user_is_admin"] =
             "reads users.is_admin for policies; a definer so the check cannot recurse into users' own policy",
+        ["saved_reports_repoint_tag"] =
+            "rewrites saved_reports.spec.tagId across members on a tag merge, after the caller's "
+            + "owner/editor grant check",
     };
+
+    /// <summary>
+    /// Definers that WRITE: callable by the request role alone, and owned by a role that
+    /// bypasses RLS. A definer reading a boolean leaves PUBLIC's default EXECUTE alone;
+    /// one that changes other members' rows may not. Which definers write is read from
+    /// their SQL too, so a writing definer declared as a reading one fails.
+    /// </summary>
+    private static readonly HashSet<string> WritingDefiners = ["saved_reports_repoint_tag"];
+
+    /// <summary>
+    /// A statement that writes rows, or a dynamic statement, which could: in a definer's
+    /// SQL, either makes it a writing definer. A row lock (<c>FOR UPDATE</c>) is not a write.
+    /// </summary>
+    [GeneratedRegex(@"\b(?:INSERT\s+INTO|DELETE\s+FROM|MERGE\s+INTO|TRUNCATE|COPY|EXECUTE)\b|\bUPDATE\s+(?:ONLY\s+)?(?:\w+\.)?\w+(?:\s+(?:AS\s+)?\w+)?\s+SET\b", RegexOptions.IgnoreCase)]
+    private static partial Regex WritesRows();
 
     [GeneratedRegex(@"role = ANY \(ARRAY\['owner'::text, 'editor'::text\]\)|role = 'owner'::text")]
     private static partial Regex RoleGate();
 
-    [GeneratedRegex(@"\b(user_id|owner_user_id|id) = current_app_user_id\(\)")]
+    // The row's OWN column, unqualified: a qualified one (ulg.user_id) is the grant
+    // lookup every ledger-membership policy has, and matching it would pass a policy
+    // that admits any member as one pinned to the writer's own rows.
+    [GeneratedRegex(@"(?<![.\w])(user_id|owner_user_id|id) = current_app_user_id\(\)")]
     private static partial Regex OwnRowGate();
 
     private async Task<List<T>> QueryAsync<T>(string sql, Func<NpgsqlDataReader, T> read)
     {
-        await using var connection = new NpgsqlConnection(_fixture.SuperuserConnectionString);
+        await using var connection = new NpgsqlConnection(Db.SuperuserConnectionString);
         await connection.OpenAsync();
         await using var command = new NpgsqlCommand(sql, connection);
         await using var reader = await command.ExecuteReaderAsync();
@@ -108,8 +130,8 @@ public sealed partial class RlsCatalogTests
     public async Task Every_privilege_coffer_app_holds_is_one_its_policies_serve()
     {
         // Granted on purpose, per table, since migration 254 removed the default grant.
-        // A privilege no policy can use did nothing while RLS was on, and was the whole
-        // door the day a table shipped without it.
+        // A privilege no policy can use does nothing while RLS is on, and is the whole
+        // door for any table without it.
         var excess = await QueryAsync("""
             WITH privs(priv) AS (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'))
             SELECT c.relname, p.priv
@@ -167,7 +189,7 @@ public sealed partial class RlsCatalogTests
             if (Gated(h => h.Contains("current_app_user_is_admin()", StringComparison.Ordinal))) continue;
             if (SelfScopedWrites.ContainsKey(key))
             {
-                if (!Gated(h => OwnRowGate().IsMatch(h) || h.Contains("g.user_id = current_app_user_id()", StringComparison.Ordinal)))
+                if (!Gated(h => OwnRowGate().IsMatch(h)))
                     violations.Add($"{key} is listed as the writer's own rows, but does not pin them to current_app_user_id()");
                 continue;
             }
@@ -213,6 +235,41 @@ public sealed partial class RlsCatalogTests
         // caller put first on it, as its owner.
         AssertNone(definers.Where(d => !d.Config.Contains("search_path=", StringComparison.Ordinal)).Select(d => d.Name),
             "SECURITY DEFINER functions without a fixed search_path");
+    }
+
+    [Fact]
+    public async Task A_writing_definer_runs_for_coffer_app_alone_and_as_a_role_that_bypasses_rls()
+    {
+        var facts = await QueryAsync("""
+            SELECT p.proname,
+                   ARRAY(SELECT CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE a.grantee::regrole::text END
+                           FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+                          WHERE a.privilege_type = 'EXECUTE' AND a.grantee <> p.proowner
+                          ORDER BY 1),
+                   r.rolbypassrls,
+                   p.prosrc
+              FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner
+             WHERE p.pronamespace = 'public'::regnamespace AND p.prosecdef
+            """, r => (Name: r.GetString(0), Callers: r.GetFieldValue<string[]>(1), Bypass: r.GetBoolean(2), Sql: r.GetString(3)));
+
+        AssertNone(WritingDefiners.Where(w => !facts.Any(f => f.Name == w)),
+            "these writing definers do not exist; remove them");
+        // What a definer's SQL does, not what it is declared as, decides which rules it meets.
+        var writesBySql = facts.Where(f => WritesRows().IsMatch(f.Sql)).Select(f => f.Name).ToHashSet(StringComparer.Ordinal);
+        AssertNone(writesBySql.Where(w => !WritingDefiners.Contains(w)),
+            "definers whose SQL writes rows but are not declared as writing definers");
+        AssertNone(WritingDefiners.Where(w => facts.Any(f => f.Name == w) && !writesBySql.Contains(w)),
+            "declared as writing definers, but their SQL writes no rows; check the scan or remove them");
+        var writing = facts.Where(f => WritingDefiners.Contains(f.Name) || writesBySql.Contains(f.Name)).ToList();
+        // Anyone but coffer_app — PUBLIC's default above all — could rewrite other
+        // members' rows through it.
+        AssertNone(writing.Where(f => !f.Callers.SequenceEqual(["coffer_app"]))
+                          .Select(f => $"{f.Name}: callable by {string.Join(", ", f.Callers)}"),
+            "writing definers callable by a role other than coffer_app");
+        // An owner subject to RLS would see no other member's rows and silently change
+        // nothing, which reads as success.
+        AssertNone(writing.Where(f => !f.Bypass).Select(f => f.Name),
+            "writing definers owned by a role that does not bypass RLS");
     }
 
     [Fact]

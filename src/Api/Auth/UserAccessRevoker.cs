@@ -12,10 +12,10 @@ namespace Coffer.Api.Auth;
 /// OAuth grants with the tokens issued under them.
 /// </summary>
 /// <remarks>
-/// <para>Disabling a user used to block only NEW logins (2026-10-12 audit, H2). An
-/// open session kept working for up to 30 days, an MCP token for 90 or forever, an
-/// OAuth grant for as long as its client kept refreshing — and a disabled admin could
-/// re-enable themselves. Disabling now calls <see cref="RevokeEverywhereAsync"/>, and
+/// <para>A disable that blocks only NEW logins leaves an open session working for up
+/// to 30 days, an MCP token for 90 or forever, an OAuth grant for as long as its client
+/// keeps refreshing — and lets a disabled admin re-enable themselves (ADR-0105 D3). So
+/// disabling calls <see cref="RevokeEverywhereAsync"/>, and
 /// re-enabling does not bring any of it back: the user signs in again and reconnects
 /// their apps. Every credential check also refuses a disabled user, which covers a
 /// credential minted in the same instant.</para>

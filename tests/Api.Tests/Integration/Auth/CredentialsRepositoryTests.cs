@@ -6,13 +6,11 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Auth;
 
 [Collection(ApiCollection.Name)]
-public sealed class CredentialsRepositoryTests
+public sealed class CredentialsRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public CredentialsRepositoryTests(PostgresFixture fixture)
+    public CredentialsRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static byte[] FreshBytes(int length)
@@ -25,9 +23,9 @@ public sealed class CredentialsRepositoryTests
     [Fact]
     public async Task Insert_round_trips_every_field()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new CredentialsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new CredentialsRepository(Db.NewServiceFactory(), TimeProvider.System);
 
         var credentialId = FreshBytes(64);
         var publicKey = FreshBytes(77);
@@ -64,9 +62,9 @@ public sealed class CredentialsRepositoryTests
     [Fact]
     public async Task DeleteOwn_last_credential_is_refused_unless_allowLast()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var only = await ledger.AddCredentialAsync();
-        var repo = new CredentialsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var repo = new CredentialsRepository(Db.NewServiceFactory(), TimeProvider.System);
 
         // Guarded: the user's last credential can't be removed...
         Assert.Equal(CredentialDeleteResult.WasLastCredential,
@@ -80,9 +78,9 @@ public sealed class CredentialsRepositoryTests
     [Fact]
     public async Task GetByUser_returns_every_credential_owned_by_the_user()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new CredentialsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new CredentialsRepository(Db.NewServiceFactory(), TimeProvider.System);
 
         for (var i = 0; i < 3; i++)
         {
@@ -104,9 +102,9 @@ public sealed class CredentialsRepositoryTests
     [Fact]
     public async Task GetByCredentialId_returns_null_when_not_present()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new CredentialsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new CredentialsRepository(Db.NewServiceFactory(), TimeProvider.System);
 
         Assert.Null(await repo.GetByCredentialIdAsync(FreshBytes(64)));
     }
@@ -119,9 +117,9 @@ public sealed class CredentialsRepositoryTests
         // on two users, even across distinct ledgers. The ledger isolation
         // doesn't relax this; the index is on the bare column, no per-ledger
         // scope.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new CredentialsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new CredentialsRepository(Db.NewServiceFactory(), TimeProvider.System);
         var sharedCredId = FreshBytes(64);
 
         await repo.InsertAsync(
@@ -145,10 +143,10 @@ public sealed class CredentialsRepositoryTests
     [Fact]
     public async Task UpdateAfterAssertion_bumps_counter_and_last_used_at()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var inserted = await ledger.AddCredentialAsync();
-        await using var db = _fixture.NewDbContext();
-        var repo = new CredentialsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        await using var db = Db.NewDbContext();
+        var repo = new CredentialsRepository(Db.NewServiceFactory(), TimeProvider.System);
 
         Assert.True(await repo.UpdateAfterAssertionAsync(
             inserted.Id, verifiedAgainst: inserted.SignatureCounter, newSignatureCounter: 7));
@@ -164,9 +162,9 @@ public sealed class CredentialsRepositoryTests
         // FU-095: both racing assertions were verified against the stored counter before
         // either wrote it. The update was unconditional, so both signed in, and the later
         // write could move the counter back. Compare-and-set lets one through.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var inserted = await ledger.AddCredentialAsync();
-        var repo = new CredentialsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var repo = new CredentialsRepository(Db.NewServiceFactory(), TimeProvider.System);
         var seen = inserted.SignatureCounter;
 
         var first = await repo.UpdateAfterAssertionAsync(inserted.Id, seen, newSignatureCounter: seen + 2);
@@ -182,9 +180,9 @@ public sealed class CredentialsRepositoryTests
     [InlineData("   ")]
     public async Task Insert_rejects_blank_nickname(string nickname)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new CredentialsRepository(_fixture.NewServiceFactory(), TimeProvider.System);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new CredentialsRepository(Db.NewServiceFactory(), TimeProvider.System);
 
         await Assert.ThrowsAsync<ArgumentException>(() => repo.InsertAsync(
             userId: ledger.UserId,

@@ -24,7 +24,7 @@ namespace Coffer.Api.Contracts;
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "kind")]
 [JsonDerivedType(typeof(BankRowDto), typeDiscriminator: "bank")]
 [JsonDerivedType(typeof(InvestmentRowDto), typeDiscriminator: "investment")]
-public abstract record RegisterRowDto
+public abstract record RegisterRowDto : IRegisterRowNotes
 {
     public required Guid Id { get; init; }
     public required Guid AccountId { get; init; }
@@ -43,8 +43,39 @@ public abstract record RegisterRowDto
     public required string Status { get; init; }
 
     public required bool IsHidden { get; init; }
-    public required bool HasOverrides { get; init; }
+
+    /// <summary>
+    /// The currency <see cref="Amount"/> is in: on a real account, that account's; on a
+    /// category, which has no currency of its own, the currency of the real account on
+    /// the other side of the row's posting, or the category's own code when the posting
+    /// is between two categories (ADR-0114 D7). Rows of one category register can be in
+    /// different currencies.
+    /// </summary>
+    public string CurrencyCode { get; init; } = string.Empty;
+
+    /// <summary>
+    /// The running balance after this row. On a real account it is the account's own, in
+    /// its own currency. On a category it combines accounts, so it is in
+    /// <see cref="BalanceCurrencyCode"/>, the ledger's reporting currency: each transaction
+    /// converted at its own date, summed in the register's walk order, rounded once
+    /// (ADR-0114 D7). Null when a rate it needs is missing, with
+    /// <see cref="BalanceRateUnavailable"/> naming each (ADR-0114 D9).
+    /// </summary>
     public decimal? BalanceAfter { get; init; }
+
+    /// <summary>The currency <see cref="BalanceAfter"/> is in: the account's own on a real
+    /// account, the ledger's reporting currency on a category.</summary>
+    public string BalanceCurrencyCode { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Every missing rate the category balance needed, from the first transaction of the
+    /// category to this row, when <see cref="BalanceAfter"/> is null for want of one: it and
+    /// every later balance are then null, never a partial sum (ADR-0114 D9). Absent from
+    /// the JSON otherwise.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<RateUnavailable>? BalanceRateUnavailable { get; init; }
+
     public required string Origin { get; init; }
     public required bool IsPending { get; init; }
     public string? ExternalId { get; init; }
@@ -60,6 +91,19 @@ public abstract record RegisterRowDto
     public Guid? CounterpartyAccountId { get; init; }
     public string? CounterpartyAccountName { get; init; }
     public string? CounterpartyAccountType { get; init; }
+
+    /// <summary>
+    /// The counterparty leg's own amount on a transfer between real accounts in different
+    /// currencies, signed, in <see cref="CounterpartyCurrencyCode"/> (ADR-0114 D13, D14):
+    /// the register shows it after the account chip. Null on a mirrored pair: a category
+    /// row, a transfer in one currency, a posting with no other side.
+    /// </summary>
+    public decimal? CounterpartyAmount { get; init; }
+
+    /// <summary>The currency <see cref="CounterpartyAmount"/> is in, the counterparty
+    /// account's own; null exactly when it is.</summary>
+    public string? CounterpartyCurrencyCode { get; init; }
+
     public required IReadOnlyList<string> Tags { get; init; }
 
     /// <summary>
@@ -85,22 +129,20 @@ public abstract record RegisterRowDto
     /// </summary>
     public required DateTime CreatedAt { get; init; }
 
-    // Migration 032 (ADR-0025): raw leg-vs-header memo split so the
-    // SPA's editor + display can distinguish per-posting from umbrella
-    // memos. The Memo field above remains the full 4-way COALESCE.
-    public string? LegMemo { get; init; }
-
-    /// <summary>
-    /// Tags on THIS posting (ADR-0103, mig 243). Always a (possibly empty)
-    /// array, never null — same contract as <c>Tags</c> above, which carries the
-    /// HEADER's tags and is a different claim, not a superset of this one.
-    /// <para>The register row itself does not render these (ADR-0103 D4 keeps
-    /// the row showing the transaction's own tags): this is here so the editor,
-    /// which builds its postings from a split's sibling rows, can show a posting
-    /// its own tags instead of silently dropping them on the next save.</para>
-    /// </summary>
-    public IReadOnlyList<string> LegTags { get; init; } = Array.Empty<string>();
     public string? HeaderMemo { get; init; }
+
+    // The memo-and-tags fields of IRegisterRowNotes. Memo, Tags and HeaderMemo above
+    // carry the same contract: what the row shows, and the transaction's memo only
+    // where the header is in play. The raw per-leg values are not on the row, so
+    // the browser cannot show anything the rule did not decide.
+    public bool MemoInherited { get; init; }
+    public bool TagsInherited { get; init; }
+    public string? InheritedMemo { get; init; }
+    public IReadOnlyList<string> InheritedTags { get; init; } = Array.Empty<string>();
+    public Guid? InheritFromAccountId { get; init; }
+    public IReadOnlyList<string>? HeaderTags { get; init; }
+    public string NotesKind { get; init; } = string.Empty;
+    public bool IsReadOnly { get; init; }
 
     // Migration 034: OFX online-match identity — fitid + fi_id are the
     // OFX dedup composite key. Universal: both bank and investment rows
@@ -113,6 +155,34 @@ public abstract record RegisterRowDto
     // yet. SPA renders flagged rows with a visual treatment until POST
     // /transactions/{headerId}/approve clears the flag.
     public required bool NeedsReview { get; init; }
+
+    /// <summary>
+    /// The bank's figure for the transaction as the row's originals keep it
+    /// (<c>txn_header_originals.amount</c>, ADR-0114 D15): its amount on its originating
+    /// account, in the row's stored sign, exactly as sent. A JSON string, not a number, so
+    /// every digit reaches the client, a trailing zero included. Null when the row has no
+    /// originals, or they were captured before the column existed.
+    /// </summary>
+    public string? OriginalAmount { get; init; }
+
+    /// <summary>True when an import or a promote-on-clear rounded the bank's figure,
+    /// <see cref="OriginalAmount"/>, to the account currency's places (ADR-0114 D15). With
+    /// <see cref="NeedsReview"/> it shows the Review marker.</summary>
+    public bool RoundedAtImport { get; init; }
+
+    /// <summary>
+    /// The bank's cleared figure that put the row back in review because the row does not
+    /// hold it (<c>txn_headers.review_cleared_amount</c>, ADR-0114 D15): a merged loser's
+    /// when <see cref="ReviewClearedByMatch"/>, else the row's own, on a split whose lines
+    /// add up to another total. A JSON string, exactly as sent, as <see cref="OriginalAmount"/>
+    /// is. Null when no such hold explains the row's review. With <see cref="NeedsReview"/>
+    /// it shows the Review marker in place of the rounded note.
+    /// </summary>
+    public string? ReviewClearedAmount { get; init; }
+
+    /// <summary>True when <see cref="ReviewClearedAmount"/> is a merged loser's cleared
+    /// figure, so the row is the winner it was folded into (ADR-0114 D15).</summary>
+    public bool ReviewClearedByMatch { get; init; }
 
     // ADR-0031 follow-up (migration 078/079): original provider JSON
     // payload, surfaced to the SPA's "Show raw provider data" diagnostic
@@ -153,6 +223,9 @@ public abstract record RegisterRowDto
     // Mig 108 / ADR-0036: total distinct posting_index values across
     // the whole header (all accounts).
     public required int HeaderTotalPostings { get; init; }
+
+    // The override flag (has_overrides) is not on the row: nothing in the SPA or MCP
+    // reads it (ADR-0100's originals and the view column stay).
 }
 
 /// <summary>
@@ -225,10 +298,10 @@ public sealed record InvestmentRowDto : RegisterRowDto
     // next ingest will look up.
     public string? IngestSecurityTickerHint { get; init; }
 
-    // ADR-0080: server-side investment-event aggregation. The register now
+    // ADR-0080: server-side investment-event aggregation. The register
     // returns one collapsed event per header (InvestmentEventProjector), so
-    // these synthesized slot fields — previously computed client-side in
-    // investmentAggregator.ts — are part of the contract. Null on rows where
+    // these synthesized slot fields are part of the contract, not computed
+    // client-side. Null on rows where
     // the corresponding role leg is absent.
     //
     //   Category slot  — the income-role leg's counterparty (slot 6 line-1 left).
@@ -240,6 +313,17 @@ public sealed record InvestmentRowDto : RegisterRowDto
     public Guid? TransferAccountId { get; init; }
     public string? TransferAccountName { get; init; }
     public string? TransferAccountType { get; init; }
+
+    /// <summary>The transfer slot's other leg, on the transfer account, signed, in
+    /// <see cref="TransferCurrencyCode"/>, when that account is a real account in another
+    /// currency than this one (ADR-0114 D13, D14; ADR-0028 Slot 6): an Xfr, BuyXfr, SellXfr
+    /// or DividendXfr between currencies. Null when the transfer mirrors.</summary>
+    public decimal? TransferAmount { get; init; }
+
+    /// <summary>The transfer account's currency, which <see cref="TransferAmount"/> is
+    /// in; null exactly when it is.</summary>
+    public string? TransferCurrencyCode { get; init; }
+
     public decimal? FeeAmount { get; init; }
     public Guid? FeeCategoryId { get; init; }
     public string? FeeCategoryName { get; init; }
@@ -251,8 +335,9 @@ public sealed record InvestmentRowDto : RegisterRowDto
     /// <remarks>
     /// The two disagree precisely when the event is cash-neutral, which is not
     /// an edge: a reinvestment, an in-kind transfer and a fee-consumed sale all
-    /// net to zero by construction, and the register showed each of them as
-    /// zero while the editor behind the same row showed the trade value.
+    /// net to zero by construction, so a register reading only the cash net
+    /// shows each of them as zero while the editor behind the same row shows
+    /// the trade value.
     /// Null when no leg carries a settled amount.
     /// </remarks>
     public decimal? SettledAmount { get; init; }
@@ -328,6 +413,43 @@ public sealed record RegisterPage(
     string? CursorForNewer);
 
 /// <summary>
+/// One entry of <c>GET /api/ledgers/{ledgerId}/transactions/entries</c>: a register
+/// entry, with the account whose register shows it and that account's currency.
+/// </summary>
+/// <param name="AccountId">The account whose register shows <paramref name="Entry"/>.
+/// The same header can be an entry on more than one account (a transfer between two
+/// of them is one on each), so an entry is named by this and its key, never by its
+/// header alone.</param>
+/// <param name="CurrencyCode">That account's ISO 4217 currency, the one every amount in
+/// <paramref name="Entry"/> is in. Entries on accounts in different currencies sit on one
+/// page; nothing here converts them.</param>
+/// <param name="Entry">The entry exactly as that account's register page
+/// (<c>GET /transactions?account_id=</c>) returns it: a single row, or a split on the
+/// side it belongs to as one group with its lines.</param>
+public sealed record LedgerEntryDto(Guid AccountId, string CurrencyCode, RegisterEntryDto Entry);
+
+/// <summary>
+/// The newest register entries across a ledger, for the home screen's lists: every
+/// account a person reads (not a category, not a holdings sibling; inactive ones too).
+/// </summary>
+/// <param name="Entries">The entries, newest first: by date, then as each register
+/// orders the entries of one day, then by account.</param>
+/// <param name="HasMore">Whether more entries match than the page holds. There is no
+/// cursor: this is a first page, and the registers are where the rest is read.</param>
+public sealed record LedgerEntriesPage(IReadOnlyList<LedgerEntryDto> Entries, bool HasMore);
+
+/// <summary>
+/// What a save (bank and investment PATCH, approve, merge) answers when the caller
+/// names the register it is looking at: every entry the surviving header has in that
+/// account, in the order and grouping the page shows them. The SPA replaces that
+/// header's rows in its window with exactly these. A header with no entry there gets
+/// 204 instead.
+/// </summary>
+/// <param name="Entries">One or more entries: one on the side the header belongs
+/// to, one per line on an opposite side.</param>
+public sealed record SavedEntriesResponse(IReadOnlyList<RegisterEntryDto> Entries);
+
+/// <summary>
 /// One bucket on the date-aware scroll-track (ADR-0034 follow-up).
 /// Drives the SPA's custom scroll-track that replaces the native
 /// scrollbar on the register: each bucket is one month with at least
@@ -338,8 +460,9 @@ public sealed record RegisterPage(
 /// <param name="YearMonth">ISO-8601 month, <c>yyyy-MM</c>. Sortable as
 /// a string. The SPA renders the year part as the gutter label and
 /// uses the full key for cache identity.</param>
-/// <param name="Count">Distinct register entries (header count, not
-/// leg count) in this month for the requested account. Useful for
+/// <param name="Count">Register entries in this month for the requested
+/// account, as the page groups them: one per header on the side it
+/// belongs to, one per line on an opposite side. Useful for
 /// hover tooltips ("Mar 2024 — 87 entries") and a future activity
 /// overlay, even though the v1 track sizing is uniform-per-month.</param>
 /// <param name="SampleHeaderId">A header in this month — specifically
@@ -365,16 +488,21 @@ public sealed record IndexBucketDto(
 /// <param name="HeaderId">Owning header. Pair with the per-account
 /// scope from the request to identify the row.</param>
 /// <param name="BalanceAfter">Running balance on the requested account
-/// after this header applies. Sourced verbatim from
-/// <c>txn_header_account_balances.balance_after</c>.</param>
-/// <param name="NetAmount">Per-(header, account) cash delta. The
-/// step contributed to <see cref="BalanceAfter"/> by this header
-/// (mig 098). The SPA reads it onto every leg of the entry so
-/// multi-posting collapses match the server-stored value.</param>
+/// after this header applies, as the register row shows it
+/// (<see cref="RegisterRowDto.BalanceAfter"/>): on a real account the stored
+/// <c>txn_header_account_balances.balance_after</c>; on a category converted into the
+/// ledger's reporting currency, and null when a rate it needs is missing.</param>
+/// <param name="NetAmount">Per-(header, account) cash delta, as stored (mig 098). The
+/// SPA reads it onto every leg of the entry so multi-posting collapses match the
+/// server-stored value.</param>
+/// <param name="BalanceRateUnavailable">Every missing rate a null category balance needed
+/// (ADR-0114 D9); absent from the JSON otherwise.</param>
 public sealed record HeaderBalanceDto(
     Guid HeaderId,
-    decimal BalanceAfter,
-    decimal NetAmount);
+    decimal? BalanceAfter,
+    decimal NetAmount,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    IReadOnlyList<RateUnavailable>? BalanceRateUnavailable = null);
 
 /// <summary>
 /// Body for <c>POST /transactions/balances</c>. The list of header
@@ -387,15 +515,27 @@ public sealed class HeaderBalancesRequest
 }
 
 /// <summary>
-/// One row of balance drift surfaced by the balance health check.
-/// Each entry represents a stored
-/// <c>txn_header_account_balances.balance_after</c> value that differs
-/// from what a fresh <c>fn_recompute_balances_for_account</c> would
-/// produce for the same row. The health endpoint runs the recompute
-/// (which is idempotent + auto-heals), so receiving a non-empty
-/// <c>drifted</c> array means BOTH (a) drift was present at check
-/// time and (b) it has now been corrected.
+/// One row of balance drift found by the balance check or the balance repair
+/// (<c>RegisterRepository</c>), which the consistency check and the <c>balances</c>
+/// projection's repair shape as mismatches. Either a running-balance row the walk of the
+/// legs produces (the rows the recompute stores) whose stored
+/// <c>txn_header_account_balances</c> row holds another <c>balance_after</c> or does not
+/// exist, or a stored row the walk does not produce at all. From the check, the drift is
+/// present now; from the repair, it was present before the repair rewrote the rows.
 /// </summary>
+/// <param name="StoredBefore">The stored <c>balance_after</c>; 0 when no row is stored
+/// (<paramref name="Reason"/> <see cref="NotStored"/>), so <paramref name="Diff"/> is then
+/// the whole walked balance rather than a difference against a value that does not
+/// exist.</param>
+/// <param name="RecomputedAfter">The walk's <c>balance_after</c> for the row; 0 when the
+/// walk produces none (<paramref name="Reason"/> <see cref="NotDerived"/>), the row the
+/// repair removes.</param>
+/// <param name="Diff"><paramref name="RecomputedAfter"/> less <paramref name="StoredBefore"/>.</param>
+/// <param name="Reason">What kind of drift: <see cref="ValueDiffers"/> (a stored row holds
+/// another balance), <see cref="NotStored"/> (no row is stored for one the walk produces)
+/// or <see cref="NotDerived"/> (a row is stored that the walk does not produce). Data, so
+/// a reader never has to tell a missing row, or one that should not exist, from a stored
+/// 0 by the figures.</param>
 public sealed record BalanceHealthDriftDto(
     Guid AccountId,
     string AccountName,
@@ -403,19 +543,32 @@ public sealed record BalanceHealthDriftDto(
     DateTime PostedAt,
     decimal StoredBefore,
     decimal RecomputedAfter,
-    decimal Diff);
+    decimal Diff,
+    string Reason)
+{
+    /// <summary>A stored row holds a balance other than the walk's
+    /// (<see cref="ConsistencyReasons.ValueDiffers"/>).</summary>
+    public const string ValueDiffers = ConsistencyReasons.ValueDiffers;
+
+    /// <summary>No row is stored for a (header, account) the walk produces
+    /// (<see cref="ConsistencyReasons.NotStored"/>).</summary>
+    public const string NotStored = ConsistencyReasons.NotStored;
+
+    /// <summary>A row is stored for a (header, account) the walk does not produce
+    /// (<see cref="ConsistencyReasons.NotDerived"/>).</summary>
+    public const string NotDerived = ConsistencyReasons.NotDerived;
+}
 
 /// <summary>
-/// Result of <c>GET /api/ledgers/{ledgerId}/balances/health</c>.
-/// <see cref="Healthy"/> mirrors <c>Drifted.Count == 0</c>.
+/// What the balance check or the balance repair (<c>RegisterRepository</c>) found, before
+/// the consistency check and the <c>balances</c> projection's repair shape it as that
+/// projection's report. <see cref="Healthy"/> mirrors <c>Drifted.Count == 0</c>.
 /// </summary>
 /// <remarks>
-/// Drift reported here is drift present NOW. This comment used to say the
-/// endpoint was a POST and that "the recompute side-effect has already healed
-/// the rows" — true before migration 206 split calculation from persistence, and
-/// the exact opposite of the truth after it. Repair is a separate, deliberate
-/// <c>POST .../balances/repair</c>. A caller that believes this report healed
-/// anything leaves the ledger stale.
+/// From the check, the drift is present NOW: checking does not heal anything (migration
+/// 206 splits calculation from persistence). Repair is a separate, deliberate
+/// <c>POST .../balances/consistency/balances/repair</c>. A caller that believes the check
+/// healed anything leaves the ledger stale.
 /// </remarks>
 public sealed record BalanceHealthReport(
     bool Healthy,

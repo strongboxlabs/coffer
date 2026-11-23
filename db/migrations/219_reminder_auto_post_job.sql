@@ -2,10 +2,9 @@
 -- 219 — reminder auto-post becomes a schedulable job.
 -- =============================================================================
 --
--- WHY: `RecurrenceBuilder.tsx` has rendered an "Auto-post / N days before" control for a
--- long time. The value validates, persists and round-trips on edit, and NOTHING HAS EVER
--- FIRED IT — src/Api/Scheduling carries handlers for quotes, snapshots and feed sync and
--- none for reminders. A user who set it was told their rent posts itself; it does not,
+-- WHY: `RecurrenceBuilder.tsx` renders an "Auto-post / N days before" control. The
+-- value validates, persists and round-trips on edit, and NOTHING FIRES IT — src/Api/Scheduling carries handlers for quotes, snapshots and feed sync and
+-- none for reminders. A user who sets it is told the bill posts itself; it does not,
 -- and the missing transaction looks like their own oversight.
 --
 -- ADR-0097 settles the shape: a FIRST-CLASS job type, not a monitor riding the scheduler
@@ -39,11 +38,8 @@ ALTER TABLE scheduled_jobs
     ADD CONSTRAINT ck_scheduled_jobs_type
         CHECK (job_type IN ('quote-refresh', 'snapshot', 'feed-sync', 'reminder-auto-post'));
 
--- Mig 215's version of this comment says "a unit test asserts this set matches
--- NotificationMonitors.Ledger exactly". That was true when written and is not now:
--- MonitorScopeTests was deliberately weakened to one-directional when the consistency
--- monitor arrived, because that monitor is not a job and set equality forbade it.
--- Restating the accurate rule rather than copying the stale sentence forward.
+-- The constraint comment states the current rule: MonitorScopeTests is one-directional,
+-- because the consistency monitor is not a job and set equality would forbid it.
 COMMENT ON CONSTRAINT ck_scheduled_jobs_type ON scheduled_jobs IS
     'Mirrors Coffer.Api.Scheduling.JobTypes. A unit test asserts every JobTypes.All value '
     'appears in NotificationMonitors.Ledger — so no schedulable job lacks a dead-man''s '
@@ -51,9 +47,8 @@ COMMENT ON CONSTRAINT ck_scheduled_jobs_type ON scheduled_jobs IS
     'allow-list. The two are not set-equal: the consistency monitor runs on every tick and '
     'is intentionally not configurable.';
 
--- Mig 124 introduced this column with "(the firing worker is a later slice)". This is
--- that slice, so the parenthetical is now false and can only be corrected by replacing
--- the whole comment.
+-- The column comment names the firing worker, which this migration adds; a column
+-- comment can only be replaced whole.
 COMMENT ON COLUMN recurring_transactions.auto_commit_days_before IS
     'ADR-0047 / ADR-0097: MD acdays. NULL = manual approve; N >= 0 = post the occurrence '
     'automatically once it is within N days of its due date, fired by the '

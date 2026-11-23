@@ -49,15 +49,15 @@
 --
 -- There is no single money scale in this schema — realized_gains is (19,2),
 -- txn_legs.amount is (19,4) WITH a 2dp CHECK, txn_leg_overrides.amount is (19,4)
--- with no CHECK and holds sub-cent values today, loan_terms is (20,4). The line in
+-- with no CHECK, so it can hold sub-cent values, loan_terms is (20,4). The line in
 -- docs/database-schema.md calling (19,4) the convention is stale as a universal
 -- rule.
 --
 -- (19,2) is right for THIS column because it is typed by a human, never computed,
 -- and never divided. The column does the single correct rounding and there is no
--- second CHECK to keep in step. Per mig 209 — which exists only to undo a
--- double-round introduced by a well-meaning round(x,4) three migrations earlier —
--- round NOWHERE else: not in a function, not in the repository.
+-- second CHECK to keep in step. Per mig 209 — a round to a finer scale than the
+-- column is a second rounding — round NOWHERE else: not in a function, not in the
+-- repository.
 --
 -- ===== WHAT THIS TABLE CANNOT ENFORCE, AND WHERE THE REAL GATE IS =====
 --
@@ -86,10 +86,9 @@
 --
 --     SELECT pg_get_functiondef('fn_ledger_snapshot_payload'::regproc);
 --
--- and NOT copied from the migration that introduced each one. That distinction has
--- already cost this repo once: mig 205 re-declared a body from a superseded copy
--- and silently reverted a scale fix from three migrations earlier, which is the
--- entire reason mig 209 exists. Current owners are not where you would guess —
+-- and NOT copied from the migration that introduced each one: a body copied from a
+-- superseded migration silently reverts every fix made since. Current owners are
+-- not where you would guess —
 -- fn_ledger_snapshot_payload last changed in 188, while the other four last
 -- changed in 193, so 193 is NOT the latest owner of everything it introduced.
 --
@@ -155,8 +154,8 @@ CREATE INDEX ix_budget_targets_ledger_month
 --
 -- Nothing in CI, preflight or the schema guards enumerates relrowsecurity, and
 -- the budget integration tests build both contexts from the service role, which
--- is BYPASSRLS. So a missing policy here would be invisible to every gate.
--- mig 207 made exactly this mistake on two tables and it survived to mig 213.
+-- is BYPASSRLS. So a missing policy here would be invisible to every gate
+-- (mig 213 adds the policies mig 207's two tables lacked).
 -- ---------------------------------------------------------------------------
 ALTER TABLE budget_targets ENABLE ROW LEVEL SECURITY;
 
@@ -212,8 +211,8 @@ BEGIN
         'txn_legs',                         (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_legs t WHERE t.ledger_id = p_ledger_id),
         'txn_leg_recon',                    (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_leg_recon t WHERE t.ledger_id = p_ledger_id),
         'lots',                             (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM lots t WHERE t.ledger_id = p_ledger_id),
-        -- mig 188: realized_gains is derived, but re-deriving it on restore cost
-        -- ~27s and overwrote the holdings/lots restored above. Keys on
+        -- mig 188: realized_gains is derived, but re-deriving it on restore walked
+        -- the whole ledger and overwrote the holdings/lots restored above. Keys on
         -- sell_leg_id (a captured txn_legs row) so it round-trips 1:1.
         'realized_gains',                   (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM realized_gains t WHERE t.ledger_id = p_ledger_id),
         'txn_header_overrides',             (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM txn_header_overrides t WHERE t.ledger_id = p_ledger_id),

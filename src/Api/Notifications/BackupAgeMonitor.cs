@@ -8,8 +8,7 @@ namespace Coffer.Api.Notifications;
 /// <remarks>
 /// First on purpose, ahead of anything about data consistency. Projection drift is
 /// slow damage that a repair fixes; a missing backup is data that does not come
-/// back. This is the alert whose absence has already cost something — backups and
-/// snapshots each once stopped for days with no signal at all.
+/// back. Without it, a backup or snapshot job can stop and nothing anywhere says so.
 /// <para>
 /// <b>Two mechanisms, and the difference matters.</b> A heartbeat published on every
 /// successful backup is the load-bearing one: an external monitor counts those pings
@@ -28,8 +27,8 @@ public sealed class BackupAgeMonitor
     /// <remarks>
     /// 48 rather than 24: a daily schedule that slips once is not an emergency, and
     /// an alert that fires on a single missed night gets muted, at which point it
-    /// protects nothing. An outage like the real one, where backups silently stopped
-    /// for days, is still caught on the second miss.
+    /// protects nothing. A schedule that has silently stopped is still caught on the
+    /// second missed night.
     /// </remarks>
     public const int CriticalAfterHours = 48;
 

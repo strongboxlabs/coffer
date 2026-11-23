@@ -5,10 +5,9 @@ namespace Coffer.Api.Db.Entities;
 /// without one transaction (<c>holdings_fifo_open_lots</c>, migration 256).
 /// </summary>
 /// <remarks>
-/// The editor's lot preview used to read the <c>lots</c> table, which FIFO
-/// drains IN PLACE — so it only ever knew today, and editing a years-old sale on a
-/// since-closed account showed "no open lots". This is the position the sale
-/// actually met. Keyed by the acquiring leg: a derived lot has no row id.
+/// Not the <c>lots</c> table, which FIFO drains IN PLACE — that only ever knows
+/// today, so a lot preview read from it shows "no open lots" for a years-old sale on
+/// a since-closed account. This is the position the sale actually met. Keyed by the acquiring leg: a derived lot has no row id.
 /// </remarks>
 internal sealed class HoldingsFifoOpenLotRow
 {

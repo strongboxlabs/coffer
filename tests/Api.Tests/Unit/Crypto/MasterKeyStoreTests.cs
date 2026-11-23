@@ -176,7 +176,7 @@ public sealed class MasterKeyStoreTests : IDisposable
     [Fact]
     public void Archive_moves_the_existing_key_aside_and_returns_its_path()
     {
-        // Adopting a source install's KEK on restore (D4) must stay reversible.
+        // Adopting a source install's KEK on restore (ADR-0092 D4) must stay reversible.
         var store = NewStore();
         store.Write("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
 
@@ -201,8 +201,8 @@ public sealed class MasterKeyStoreTests : IDisposable
     // and the install crash-loops into unavailability instead of refusing one
     // operation.
     //
-    // Those guards are only as good as the exception type they catch, and nothing
-    // pinned it. If Write ever surfaced something outside those two, the catch
+    // Those guards are only as good as the exception type they catch, so this pins
+    // it. If Write ever surfaced something outside those two, the catch
     // clauses would stop matching and the careful recovery would silently become
     // the crash loop it was written to prevent.
 

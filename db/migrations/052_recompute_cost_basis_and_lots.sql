@@ -13,14 +13,13 @@
 --   the true market value (a fake large unrealized "loss"). For any user
 --   who has sold shares of anything, the hero card lies.
 --
--- Wrong #2: lots were not rebuilt after the dec=9 / 10^5× scrub.
---   When share_decimals=4 was hardcoded against MD's dec=9 mutual funds,
---   lots stored qty×10^5 with unit_cost÷10^5. The data scrub on
---   2026-05-19 fixed `txn_legs` and `holdings.quantity` but left `lots`
---   stale (every lot of an affected fund showed one flat unit_cost
---   instead of the real per-event price). Lots are not currently consumed by the API
---   (no FIFO/LIFO display surface yet), so the corruption was invisible,
---   but it would have undermined the future tax-lot report.
+-- Wrong #2: lots are not derived from txn_legs, so repairing the legs
+--   leaves them stale. An import that clamped share_decimals to 4 stored
+--   a security's lots at qty×10^(dec-4) with unit_cost÷10^(dec-4), and
+--   correcting `txn_legs` and `holdings.quantity` does not touch `lots`.
+--   Lots are not currently consumed by the API (no FIFO/LIFO display
+--   surface yet), so a stale lot is invisible, but it would undermine the
+--   future tax-lot report.
 --
 -- THE STRUCTURAL FIX
 --
@@ -48,7 +47,7 @@
 --
 -- A migration-time consistency check at the bottom verifies that every
 -- holding now reconciles: market_value / cost_basis sanity bands assume
--- no holding is more than 10× under/over water relative to its avg
+-- no holding is more than 100× under/over water relative to its avg
 -- purchase price (a generous band that catches scaling regressions
 -- without false-positiving real losses).
 -- =============================================================================
@@ -176,8 +175,9 @@ SELECT recompute_holdings_cost_basis(NULL);
 -- -----------------------------------------------------------------------------
 -- Part 4: Sanity check — fail loudly if any holding is wildly off.
 --
--- A 100× band catches scaling regressions (10^5× past, plausible
--- 10× future) without false-positiving real underwater positions.
+-- A 100× band catches a scaling defect of that size or more (the
+-- share-decimals clamp scales by 10^(dec-4)) without false-positiving
+-- real underwater positions.
 -- Compares cost_basis/qty against the latest known price for the
 -- security; skips holdings with no price data or zero qty.
 -- -----------------------------------------------------------------------------

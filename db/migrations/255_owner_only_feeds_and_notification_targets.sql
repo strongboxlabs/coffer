@@ -1,7 +1,7 @@
 -- 255 — Bank connections and notification targets are the owner's (FU-095)
 --
--- Decided 2026-10-19: of what the editor role covered, connecting and disconnecting a bank
--- and choosing where a ledger's events are sent become the owner's. The API enforces it
+-- Of what the editor role covered, connecting and disconnecting a bank and choosing
+-- where a ledger's events are sent become the owner's. The API enforces it
 -- (AsLedgerOwner on those routes); this is the RLS half, so a missed API check still
 -- cannot let an editor do either (ADR-0083 D2).
 --

@@ -8,7 +8,7 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// The FIFO recompute preserves quantity and cost basis at every magnitude.
 /// </summary>
 /// <remarks>
-/// This is the path that failed in production: the recompute stores
+/// This is the path that overflows without a bound: the recompute stores
 /// <c>quantity × unit_cost</c>, both <c>NUMERIC(25,12)</c>, so a fractional lot
 /// produces up to 24 decimal places — ~30 significant digits at a seven-figure
 /// position, past <c>System.Decimal</c>. Postgres NUMERIC stored it happily and
@@ -17,17 +17,18 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// than from a schema guard.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class CostBasisRecomputeBoundaryTests
+public sealed class CostBasisRecomputeBoundaryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public CostBasisRecomputeBoundaryTests(PostgresFixture fixture) => _fixture = fixture;
+    public CostBasisRecomputeBoundaryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     [Theory]
     [MemberData(nameof(Boundary.Positions), MemberType = typeof(Boundary))]
     public async Task Recompute_preserves_quantity_and_basis(Boundary.Position p)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var sec = await ledger.AddSecurityAsync("Index Fund", "IDX");
@@ -35,7 +36,7 @@ public sealed class CostBasisRecomputeBoundaryTests
         await ledger.AddBoundaryPositionAsync(
             brokerage.Id, holdings, sec, p, new DateTime(2024, 1, 10, 0, 0, 0, DateTimeKind.Utc));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.Holdings.AsNoTracking()
             .SingleAsync(h => h.AccountId == holdings && h.SecurityId == sec);
 
@@ -51,7 +52,7 @@ public sealed class CostBasisRecomputeBoundaryTests
         // Re-running must be a no-op. The recompute re-derives from legs, so a scale
         // bug that rounded on each pass would drift a little further every time.
         await ledger.RecomputeHoldingsAsync();
-        await using var db2 = _fixture.NewDbContext();
+        await using var db2 = Db.NewDbContext();
         var again = await db2.Holdings.AsNoTracking()
             .SingleAsync(h => h.AccountId == holdings && h.SecurityId == sec);
         Assert.Equal(row.Quantity, again.Quantity);

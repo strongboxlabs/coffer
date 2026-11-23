@@ -28,19 +28,24 @@ namespace Coffer.Api.Quotes.Yahoo;
 /// UTC calendar date so daily closes dedupe cleanly and a same-day manual
 /// price still wins under the source-aware upsert.</para>
 ///
+/// <para>The price is stamped with the currency the response names,
+/// <c>meta.currency</c>, read by <see cref="YahooCurrency"/> (ADR-0114 D5): a minor
+/// unit is divided into its major one, and a missing or unrecognised currency fails
+/// that symbol closed with its own error code. Nothing the orchestrator asked for
+/// says what currency a symbol trades in, so the response is the only source.</para>
+///
 /// <para>GETs are sequential per symbol — Yahoo rate-limits bursts, and a
 /// 404 / 429 / 5xx on one symbol becomes a per-symbol error, not a run
 /// failure. Bounded concurrency is a future optimization if book sizes
 /// warrant.</para>
 /// </remarks>
-public sealed class YahooFinanceQuoteProvider : IQuotePullProvider
+public sealed class YahooFinanceQuoteProvider : IQuotePullProvider, IQuoteCurrencyLookup
 {
     public const string Key = "yahoo";
 
     private readonly HttpClient _http;
     private readonly ILogger<YahooFinanceQuoteProvider> _logger;
-    private readonly TimeSpan _requestDelay;
-    private readonly TimeSpan _maxBackoff;
+    private readonly YahooQuoteOptions _options;
     private readonly TimeProvider _clock;
 
     public YahooFinanceQuoteProvider(
@@ -49,11 +54,10 @@ public sealed class YahooFinanceQuoteProvider : IQuotePullProvider
         ILogger<YahooFinanceQuoteProvider> logger,
         TimeProvider clock)
     {
+        ArgumentNullException.ThrowIfNull(options);
         _http = http;
         _logger = logger;
-        var opts = options.Value;
-        _requestDelay = TimeSpan.FromMilliseconds(Math.Max(0, opts.RequestDelayMs));
-        _maxBackoff = TimeSpan.FromSeconds(Math.Max(0, opts.MaxBackoffSeconds));
+        _options = options.Value;
         _clock = clock;
     }
 
@@ -61,43 +65,64 @@ public sealed class YahooFinanceQuoteProvider : IQuotePullProvider
     public string DisplayName => "Yahoo Finance";
     // External HTTP egress — opt-in per ledger via the `quotes` pref (ADR-0057).
     public bool RequiresOptIn => true;
+    // The chart host every Yahoo caller is configured with (YahooChart.Configure).
+    public string? DestinationHost => YahooChart.BaseAddress.Host;
 
     public async Task<QuoteResult> PullAsync(
         QuotePullContext context,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(context);
+        var (quotes, errors) = await ForEachSymbolAsync(context.Securities, FetchOneAsync, cancellationToken)
+            .ConfigureAwait(false);
+        return new QuoteResult(quotes, errors);
+    }
 
-        var quotes = new List<QuoteEntry>();
+    /// <summary>
+    /// The currency-only lookup (ADR-0114 D5, amendment): one chart request per symbol,
+    /// the same request, throttle and error codes as <see cref="PullAsync"/>, reading only
+    /// <c>meta.currency</c> through <see cref="YahooCurrency"/>. No price is read or
+    /// returned, so nothing is stored but the currency.
+    /// </summary>
+    public async Task<QuoteCurrencyLookupResult> LookupCurrenciesAsync(
+        IReadOnlyList<QuoteSecurityRef> securities, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(securities);
+        var (currencies, errors) = await ForEachSymbolAsync(securities, LookupOneAsync, cancellationToken)
+            .ConfigureAwait(false);
+        return new QuoteCurrencyLookupResult(currencies, errors);
+    }
+
+    /// <summary>
+    /// One request per security, in order, under one throttle (ADR-0054): a fixed gap
+    /// between requests, and after a 429 the capped backoff before the next. A failure is
+    /// that security's error, never the run's.
+    /// </summary>
+    private async Task<(List<T> Found, List<QuoteError> Errors)> ForEachSymbolAsync<T>(
+        IReadOnlyList<QuoteSecurityRef> securities,
+        Func<QuoteSecurityRef, CancellationToken, Task<(T? Value, QuoteError? Error)>> fetchOne,
+        CancellationToken cancellationToken)
+        where T : class
+    {
+        var quotes = new List<T>();
         var errors = new List<QuoteError>();
-        var first = true;
+        // Throttle (ADR-0054): a fixed gap between sequential requests
+        // keeps the burst rate polite to Yahoo's unofficial endpoint.
+        var gate = new YahooRequestGate(_options, _clock);
 
-        foreach (var sec in context.Securities)
+        foreach (var sec in securities)
         {
             cancellationToken.ThrowIfCancellationRequested();
-
-            // Throttle (ADR-0054): a fixed gap between sequential requests
-            // keeps the burst rate polite to Yahoo's unofficial endpoint.
-            if (!first && _requestDelay > TimeSpan.Zero)
-            {
-                await Task.Delay(_requestDelay, _clock, cancellationToken).ConfigureAwait(false);
-            }
-            first = false;
+            await gate.WaitTurnAsync(cancellationToken).ConfigureAwait(false);
 
             try
             {
-                var entry = await FetchOneAsync(sec, cancellationToken)
+                var fetched = await fetchOne(sec, cancellationToken)
                     .ConfigureAwait(false);
-                if (entry is not null)
-                {
+                if (fetched.Value is { } entry)
                     quotes.Add(entry);
-                }
                 else
-                {
-                    errors.Add(new QuoteError(
-                        sec.SecurityId, sec.Ticker, "ticker-not-resolved",
-                        $"Yahoo returned no usable close for '{sec.Ticker}'."));
-                }
+                    errors.Add(fetched.Error!);
             }
             catch (OperationCanceledException)
             {
@@ -112,86 +137,97 @@ public sealed class YahooFinanceQuoteProvider : IQuotePullProvider
                     "Yahoo rate-limited {Ticker}; backing off before next symbol.",
                     sec.Ticker);
                 errors.Add(new QuoteError(
-                    sec.SecurityId, sec.Ticker, "rate-limited",
+                    sec.SecurityId, sec.Ticker, YahooErrorCodes.RateLimited,
                     $"{sec.Ticker}: Yahoo returned 429 (rate limited)."));
-                var backoff = ex.RetryAfter is { } ra && ra < _maxBackoff ? ra : _maxBackoff;
-                if (backoff > TimeSpan.Zero)
-                {
-                    await Task.Delay(backoff, _clock, cancellationToken).ConfigureAwait(false);
-                }
+                await gate.BackOffAsync(ex.RetryAfter, cancellationToken).ConfigureAwait(false);
             }
             catch (YahooHttpException ex)
             {
                 _logger.LogDebug(ex, "Yahoo fetch failed: {Ticker}", sec.Ticker);
                 errors.Add(new QuoteError(
-                    sec.SecurityId, sec.Ticker, "fetch-failed",
+                    sec.SecurityId, sec.Ticker, YahooErrorCodes.FetchFailed,
                     $"{sec.Ticker}: {ex.Message}"));
             }
             catch (HttpRequestException ex)
             {
                 _logger.LogDebug(ex, "Yahoo request failed: {Ticker}", sec.Ticker);
                 errors.Add(new QuoteError(
-                    sec.SecurityId, sec.Ticker, "fetch-failed",
+                    sec.SecurityId, sec.Ticker, YahooErrorCodes.FetchFailed,
                     $"{sec.Ticker}: {ex.Message}"));
             }
             catch (JsonException ex)
             {
                 _logger.LogDebug(ex, "Yahoo response parse failed: {Ticker}", sec.Ticker);
                 errors.Add(new QuoteError(
-                    sec.SecurityId, sec.Ticker, "parse-failed",
+                    sec.SecurityId, sec.Ticker, YahooErrorCodes.ParseFailed,
                     $"{sec.Ticker}: {ex.Message}"));
             }
         }
 
-        return new QuoteResult(quotes, errors);
+        return (quotes, errors);
     }
 
-    private async Task<QuoteEntry?> FetchOneAsync(
+    private async Task<(QuoteCurrency? Currency, QuoteError? Error)> LookupOneAsync(
+        QuoteSecurityRef sec, CancellationToken ct)
+    {
+        using var doc = await YahooChart.GetAsync(
+                _http, YahooChart.Path(sec.Ticker, "interval=1d&range=5d"), ct)
+            .ConfigureAwait(false);
+        if (!YahooChart.TryGetResult(doc.RootElement, out var r0))
+            return (null, NotResolved(sec));
+
+        var metaCurrency = YahooChart.MetaString(r0, "currency");
+        var currency = YahooCurrency.Resolve(metaCurrency);
+        return currency.Resolved
+            ? (new QuoteCurrency(sec.SecurityId, currency.CurrencyCode!, currency.Factor), null)
+            : (null, CurrencyError(sec, currency, metaCurrency));
+    }
+
+    private static QuoteError CurrencyError(
+        QuoteSecurityRef sec, YahooCurrencyResolution currency, string? metaCurrency) =>
+        new(sec.SecurityId, sec.Ticker, currency.ErrorCode!,
+            currency.ErrorCode == YahooCurrency.MissingCode
+                ? $"{sec.Ticker}: Yahoo named no currency for this symbol."
+                : $"{sec.Ticker}: Yahoo named currency '{metaCurrency}', which Coffer does not recognise.");
+
+    private async Task<(QuoteEntry? Entry, QuoteError? Error)> FetchOneAsync(
         QuoteSecurityRef sec, CancellationToken ct)
     {
         // 5-day window @ 1d granularity → take the most recent complete close.
-        var url = $"/v8/finance/chart/{Uri.EscapeDataString(sec.Ticker)}"
-                  + "?interval=1d&range=5d";
-        using var resp = await _http.GetAsync(url, ct).ConfigureAwait(false);
-        if (!resp.IsSuccessStatusCode)
+        using var doc = await YahooChart.GetAsync(
+                _http, YahooChart.Path(sec.Ticker, "interval=1d&range=5d"), ct)
+            .ConfigureAwait(false);
+
+        if (!YahooChart.TryGetResult(doc.RootElement, out var r0)
+            || !YahooChart.TryGetTimestamps(r0, out var timestamps)
+            || !YahooChart.TryGetCloses(r0, out var closes))
         {
-            // 404 unknown symbol; 429 rate-limited; 5xx upstream. Carry the
-            // status (+ Retry-After on 429) so the pull loop can throttle and
-            // tag the per-symbol error in QuoteResult.Errors.
-            throw new YahooHttpException(
-                resp.StatusCode,
-                resp.Headers.RetryAfter?.Delta,
-                $"HTTP {(int)resp.StatusCode} from Yahoo chart endpoint");
+            return (null, NotResolved(sec));
         }
 
-        await using var stream = await resp.Content
-            .ReadAsStreamAsync(ct).ConfigureAwait(false);
-        using var doc = await JsonDocument
-            .ParseAsync(stream, cancellationToken: ct).ConfigureAwait(false);
-
-        if (!TryGetChartSeries(doc.RootElement, out var timestamps, out var closes))
-        {
-            return null;
-        }
+        // The currency the response names, before any price is read from it: a
+        // symbol whose currency is missing or unrecognised stores nothing, so no
+        // pence figure is ever stored as pounds and no other currency as USD.
+        var metaCurrency = YahooChart.MetaString(r0, "currency");
+        var currency = YahooCurrency.Resolve(metaCurrency);
+        if (!currency.Resolved)
+            return (null, CurrencyError(sec, currency, metaCurrency));
 
         // Walk newest → oldest; first usable close wins (a holiday/halt bar
         // can carry a null close).
         var n = Math.Min(timestamps.GetArrayLength(), closes.GetArrayLength());
         for (var i = n - 1; i >= 0; i--)
         {
-            var c = closes[i];
-            if (c.ValueKind != JsonValueKind.Number) continue;
-            if (!c.TryGetDecimal(out var price)) continue;
-            if (price <= 0m) continue;
+            if (YahooChart.PositiveValue(closes[i]) is not { } quoted) continue;
 
-            var asOfDate = timestamps[i].ValueKind == JsonValueKind.Number
-                           && timestamps[i].TryGetInt64(out var unix)
-                ? DateTimeOffset.FromUnixTimeSeconds(unix).UtcDateTime.Date
-                : _clock.GetUtcNow().UtcDateTime.Date;
+            var asOfDate = YahooChart.BarDay(timestamps[i])
+                ?? DateOnly.FromDateTime(_clock.GetUtcNow().UtcDateTime);
 
-            return new QuoteEntry(
+            return (new QuoteEntry(
                 sec.SecurityId,
-                // 4, matching security_prices.price NUMERIC(19,4) — not 12.
+                // Into the major unit first, then 4dp, matching security_prices.price
+                // NUMERIC(19,4) — not 12. Divided before rounding so the stored value is
+                // rounded once, at the destination scale.
                 //
                 // Rounding finer than the destination column rounds TWICE, and here the
                 // second rounding happens where nobody can see it. The visible cost is
@@ -208,68 +244,17 @@ public sealed class YahooFinanceQuoteProvider : IQuotePullProvider
                 // producers already round to 4dp" — true of the SimpleFIN provider and
                 // the Moneydance importer, but this provider predates it and was never
                 // revisited. Same shape as mig 205 vs realized_gains (see mig 209).
-                decimal.Round(price, 4),
-                DateTime.SpecifyKind(asOfDate, DateTimeKind.Utc),
-                sec.CurrencyCode,
-                PriceSource.Fetch);
+                decimal.Round(currency.ToMajor(quoted), 4),
+                DateTime.SpecifyKind(asOfDate.ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc),
+                currency.CurrencyCode!,
+                PriceSource.Fetch,
+                currency.Factor), null);
         }
 
-        return null;
+        return (null, NotResolved(sec));
     }
 
-    /// <summary>
-    /// Pull the <c>timestamp[]</c> + <c>indicators.quote[0].close[]</c> arrays
-    /// out of a chart response. Returns false on any shape mismatch (Yahoo
-    /// <c>chart.error</c>, empty result, missing series).
-    /// </summary>
-    private static bool TryGetChartSeries(
-        JsonElement root, out JsonElement timestamps, out JsonElement closes)
-    {
-        timestamps = default;
-        closes = default;
-
-        if (!root.TryGetProperty("chart", out var chart)) return false;
-        if (!chart.TryGetProperty("result", out var result)
-            || result.ValueKind != JsonValueKind.Array
-            || result.GetArrayLength() == 0)
-        {
-            return false;
-        }
-
-        var r0 = result[0];
-        if (!r0.TryGetProperty("timestamp", out timestamps)
-            || timestamps.ValueKind != JsonValueKind.Array)
-        {
-            return false;
-        }
-        if (!r0.TryGetProperty("indicators", out var indicators)) return false;
-        if (!indicators.TryGetProperty("quote", out var quote)
-            || quote.ValueKind != JsonValueKind.Array
-            || quote.GetArrayLength() == 0)
-        {
-            return false;
-        }
-        if (!quote[0].TryGetProperty("close", out closes)
-            || closes.ValueKind != JsonValueKind.Array)
-        {
-            return false;
-        }
-
-        return true;
-    }
-
-    /// <summary>Non-success HTTP from the Yahoo chart endpoint, carrying the
-    /// status + any <c>Retry-After</c> so the pull loop can throttle on 429.</summary>
-    private sealed class YahooHttpException : Exception
-    {
-        public YahooHttpException(HttpStatusCode statusCode, TimeSpan? retryAfter, string message)
-            : base(message)
-        {
-            StatusCode = statusCode;
-            RetryAfter = retryAfter;
-        }
-
-        public HttpStatusCode StatusCode { get; }
-        public TimeSpan? RetryAfter { get; }
-    }
+    private static QuoteError NotResolved(QuoteSecurityRef sec) =>
+        new(sec.SecurityId, sec.Ticker, YahooErrorCodes.TickerNotResolved,
+            $"Yahoo returned no usable close for '{sec.Ticker}'.");
 }

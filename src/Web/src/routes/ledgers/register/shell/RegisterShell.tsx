@@ -5,11 +5,10 @@ import { RegisterStates } from './RegisterStates';
 // Shared register chrome (ADR-0030 reuse; ADR-0021 revision).
 //
 // Both the bank and investment registers render their list through this
-// one shell so the chrome can't drift — previously each page hand-rolled
-// the surface + header band, and they diverged (the investment list was
-// missing the white `bg-surface` wrapper, so its rows showed the grey
-// app canvas, and the header-band padding was tuned differently on each
-// side).
+// one shell so the chrome can't drift — a surface + header band hand-rolled
+// per page diverges (a list missing the white `bg-surface` wrapper shows
+// its rows on the grey app canvas, and header-band padding gets tuned
+// differently on each side).
 //
 // The shell owns the white list surface (so rows read on white, not the
 // grey canvas) and the grey column-header band (one definition, one

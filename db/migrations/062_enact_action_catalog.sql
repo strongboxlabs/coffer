@@ -6,16 +6,16 @@
 --   buy, buyx, sell, sellx, dividend_cash, dividend_reinvest, divx,
 --   transfer, misc
 --
--- The pre-A4 set in production was:
+-- The pre-A4 CHECK (mig 043, less the `split` mig 060 dropped) allowed:
 --   buy, sell, dividend_cash, dividend_reinvest, interest, transfer,
 --   misc_income, misc_expense
 --
 -- Plus the importer was FLATTENING MD's compound `buyx`/`sellx`/`divx`
 -- txntypes to `buy`/`sell`/`dividend_cash` with extra postings — this
--- left many rows in the dev DB carrying "hidden compound" shapes
+-- left imported rows carrying "hidden compound" shapes
 -- (e.g. action=buy with a {security, transfer} posting set, which is
--- structurally a buyx). Many more carried off-catalog shapes that the
--- importer's old discriminator misclassified.
+-- structurally a buyx). Off-catalog shapes were misclassified by the
+-- importer's old discriminator as well.
 --
 -- This migration enacts ADR-0027 in two steps:
 --

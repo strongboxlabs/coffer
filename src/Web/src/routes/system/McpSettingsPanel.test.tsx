@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 import { McpSettingsPanel } from './McpSettingsPanel';
@@ -72,5 +72,25 @@ describe('McpSettingsPanel — connect address', () => {
 
         await screen.findByText(/MCP is running/i);
         expect(screen.queryByRole('button', { name: /^copy$/i })).not.toBeInTheDocument();
+    });
+});
+
+describe('McpSettingsPanel — the two switches', () => {
+    beforeEach(() => vi.restoreAllMocks());
+
+    it('sends one save for Disable MCP then Disable AI writes pressed back to back, so the second never turns MCP back on', async () => {
+        // Each switch builds its save from the setting last read: one group
+        // (pending.ts), so the first press holds both until its save lands.
+        vi.spyOn(apiModule, 'fetchMcpSetting').mockResolvedValue({ ...BASE, writesEnabled: true, writesActive: true });
+        const save = vi.spyOn(apiModule, 'setMcpSetting').mockReturnValue(new Promise(() => {}));
+        renderPanel();
+
+        const disableMcp = await screen.findByRole('button', { name: 'Disable MCP' });
+        fireEvent.click(disableMcp);
+        fireEvent.click(screen.getByRole('button', { name: 'Disable AI writes' }));
+        await new Promise((resolve) => { setTimeout(resolve, 20); });
+
+        expect(save).toHaveBeenCalledTimes(1);
+        expect(save).toHaveBeenCalledWith(false, false);
     });
 });

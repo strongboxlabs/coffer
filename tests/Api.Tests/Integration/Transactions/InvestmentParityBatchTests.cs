@@ -10,16 +10,17 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Transactions;
 
 /// <summary>
-/// Server-side fixes from the bank/investment parity audit (2026-09-22): the
-/// investment delete path's missing reminder-occurrence carve-out, and the
-/// in-kind convert reading raw dates while its own detector reads effective ones.
+/// Bank/investment parity on the server: the investment delete path keeps the
+/// reminder-occurrence carve-out the bank paths have, and the in-kind convert reads
+/// the same effective dates its own detector reads.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class InvestmentParityBatchTests
+public sealed class InvestmentParityBatchTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public InvestmentParityBatchTests(PostgresFixture fixture) => _fixture = fixture;
+    public InvestmentParityBatchTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Utc(int y, int m, int d) =>
         new(y, m, d, 12, 0, 0, DateTimeKind.Utc);
@@ -50,11 +51,11 @@ public sealed class InvestmentParityBatchTests
     [Fact]
     public async Task Deleting_a_fired_investment_reminder_occurrence_soft_hides_it()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
         var securityId = await ledger.AddSecurityAsync("RMND", ticker: "RMND");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var created = await client.PostAsJsonAsync(
@@ -97,7 +98,7 @@ public sealed class InvestmentParityBatchTests
         // Stamp the investment row as a fired occurrence of it. Setting the two
         // columns directly keeps the test about DELETE rather than about the whole
         // reminders stack.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.Database.ExecuteSqlInterpolatedAsync($"""
                 UPDATE txn_headers
@@ -112,7 +113,7 @@ public sealed class InvestmentParityBatchTests
         Assert.True(deleted.IsSuccessStatusCode,
             $"expected 2xx, got {(int)deleted.StatusCode}");
 
-        await using var check = _fixture.NewDbContext();
+        await using var check = Db.NewDbContext();
         var header = await check.TxnHeaders.AsNoTracking()
             .FirstOrDefaultAsync(h => h.Id == headerId);
 
@@ -128,22 +129,21 @@ public sealed class InvestmentParityBatchTests
     /// The in-kind convert agrees with the detector about which dates count.
     /// </summary>
     /// <remarks>
-    /// The detector reads <c>resolved_transactions</c>; the convert's own
-    /// validation read raw <c>txn_headers</c>. So a sell/buy pair a user had dated
-    /// onto the same day via the override layer was OFFERED by the detector and
-    /// then refused by the convert as <c>NotAValidPair</c> — two surfaces
-    /// disagreeing about one pair. A curated date is what the register shows, so
+    /// The detector reads <c>resolved_transactions</c>. A convert whose validation
+    /// read raw <c>txn_headers</c> would refuse, as <c>NotAValidPair</c>, a sell/buy
+    /// pair dated onto the same day via the override layer that the detector
+    /// OFFERS — two surfaces disagreeing about one pair. A curated date is what the register shows, so
     /// it is what a same-day test has to mean.
     /// </remarks>
     [Fact]
     public async Task Convert_in_kind_honours_a_curated_date_like_its_detector_does()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var source = await ledger.AddInvestmentAccountAsync("Source");
         var dest = await ledger.AddInvestmentAccountAsync("Dest");
         var security = await ledger.AddSecurityAsync("Index Fund", "IDX");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         async Task<Guid> Post(CreateInvestmentTransactionRequest req)

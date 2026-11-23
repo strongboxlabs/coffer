@@ -17,6 +17,32 @@ namespace Coffer.Importer.Moneydance.Db;
 public sealed record LegReconSeed(Guid LegId, string Status, DateTimeOffset? ClearedAt);
 
 /// <summary>
+/// A <c>txn_header_originals</c> seed (migration 230, FU-024): the FEED's payee
+/// and memo for a header whose curated values differ from them.
+/// <see cref="HeaderId"/> is the PROPOSED header id.
+/// </summary>
+/// <remarks>
+/// <para>Moneydance keeps the bank's original text in <c>ol.orig-payee</c> /
+/// <c>ol.orig-memo</c> beside the user's curated <c>desc</c> / <c>memo</c>. The
+/// importer writes the curated values onto the header, which is exactly the
+/// state the API's first edit leaves behind — so the feed's values belong in the
+/// originals sidecar, where payee recall reads them and
+/// <c>resolved_transactions.has_overrides</c> reports the row.</para>
+///
+/// <para>Payee, memo and the amount are carried. The row's <c>posted_at</c>,
+/// <c>transacted_at</c> and <c>check_number</c> are copied from the header AS
+/// WRITTEN, at insert time, so they cannot drift from it (Moneydance keeps no
+/// feed original for those).</para>
+///
+/// <para><see cref="Amount"/> is the transaction's amount on its originating
+/// account as written, the sum of its legs there, as
+/// <c>HeaderOriginals.CaptureAsync</c> snapshots it; null for a header with no
+/// originating account. A seed is a whole-row snapshot, not a rounding, so its
+/// <c>rounded_at_import</c> is false (ADR-0114 D15).</para>
+/// </remarks>
+public sealed record HeaderOriginalsSeed(Guid HeaderId, string? Payee, string? Memo, decimal? Amount = null);
+
+/// <summary>
 /// Dapper-backed gateway to the normalised <c>txn_headers</c> +
 /// <c>txn_legs</c> tables (ADR-0022). One header per event, two legs
 /// per posting, paired structurally via shared
@@ -30,10 +56,10 @@ public sealed record LegReconSeed(Guid LegId, string Status, DateTimeOffset? Cle
 /// persisted header id.</para>
 ///
 /// <para>Seed-once (ADR-0052 D2): the Moneydance importer only ever
-/// seeds an EMPTY ledger — <see cref="ImportCommand"/> refuses to run
-/// against a ledger that already holds transactions, because MD re-keys
-/// <c>txn.Id</c> on online-merge and a second import would resurrect
-/// hidden/merged rows as duplicates. With that guard in place these
+/// seeds an EMPTY ledger — <see cref="Pipeline.MoneydanceImportService"/>
+/// creates the ledger in the transaction that fills it and never writes into an
+/// existing one, because MD re-keys <c>txn.Id</c> on online-merge and a second
+/// import would resurrect hidden/merged rows as duplicates. So these
 /// writes are always fresh inserts, so the former ON CONFLICT … DO
 /// UPDATE idempotency machinery (and the leg-replace pre-delete) is
 /// gone — both statements are plain INSERTs. The RETURNING / id-map
@@ -49,22 +75,6 @@ public sealed class TransactionsRepository
     {
         _connection = connection;
     }
-
-    /// <summary>
-    /// Count of transaction headers already in the ledger. The Moneydance
-    /// importer seeds a fresh ledger exactly ONCE (ADR-0052 D2): a non-zero
-    /// count means the ledger is already populated, so the import is refused.
-    /// It is a seed, not a re-import or sync - MD re-keys <c>txn.Id</c> on
-    /// online-merge, so seeding a populated ledger would resurrect
-    /// hidden/merged rows as duplicates. To (re)seed, use a new ledger or a
-    /// wiped-empty one (prune-batch / Demo refresh).
-    /// </summary>
-    public async Task<int> CountTransactionHeadersAsync(
-        Guid ledgerId, CancellationToken cancellationToken = default) =>
-        await _connection.ExecuteScalarAsync<int>(new CommandDefinition(
-            "SELECT COUNT(*) FROM txn_headers WHERE ledger_id = @LedgerId",
-            new { LedgerId = ledgerId }, cancellationToken: cancellationToken))
-            .ConfigureAwait(false);
 
     /// <summary>
     /// Outcome of <see cref="BulkUpsertAsync"/>. Headers are keyed by
@@ -84,11 +94,14 @@ public sealed class TransactionsRepository
     /// per chunk (seed-once, ADR-0052 D2 — every write is fresh). Returns
     /// the proposed → persisted id maps for both headers and legs so
     /// callers (lots, etc.) can rebind their FKs to the persisted ids.
+    /// <paramref name="headerOriginals"/> (FU-024) seeds
+    /// <c>txn_header_originals</c> for the headers named in it.
     /// </summary>
     public async Task<UpsertResult> BulkUpsertAsync(
         IReadOnlyList<TxnHeaderRow> headers,
         IReadOnlyList<TxnLegRow> legs,
         IReadOnlyList<LegReconSeed>? legRecons = null,
+        IReadOnlyList<HeaderOriginalsSeed>? headerOriginals = null,
         int chunkSize = 5000,
         CancellationToken cancellationToken = default)
     {
@@ -116,7 +129,8 @@ public sealed class TransactionsRepository
                 action,
                 provider_key,
                 provider_raw_payload,
-                is_recurring_template
+                is_recurring_template,
+                originating_account_id
             )
             SELECT * FROM unnest(
                 @Ids::uuid[],
@@ -137,7 +151,8 @@ public sealed class TransactionsRepository
                 @Actions::text[],
                 @ProviderKeys::text[],
                 @ProviderRawPayloads::jsonb[],
-                @IsRecurringTemplates::bool[]
+                @IsRecurringTemplates::bool[],
+                @OriginatingAccountIds::uuid[]
             )
             RETURNING id, ledger_id, external_id;
             """;
@@ -154,6 +169,55 @@ public sealed class TransactionsRepository
             {
                 if (row.ExternalId is not null)
                     persistedHeaderIds[(row.LedgerId, row.ExternalId)] = row.Id;
+            }
+        }
+
+        // -- Originals seed (FU-024, migration 230) --------------------
+        // Payee, memo and amount come from the seed; ledger_id, posted_at,
+        // transacted_at and check_number are read off the header row just
+        // inserted, so the sidecar holds the header's WRITTEN values (the
+        // NOT NULL transacted_at fallback above included) — the same whole-row
+        // snapshot HeaderOriginals.CaptureAsync takes in the API. The amount is
+        // the one written to the originating account's legs, so the flag that
+        // marks a rounded import is false (ADR-0114 D15). The join keys on the
+        // proposed id, which seed-once makes the persisted one; a seed whose
+        // header was not written (a FITID duplicate the caller dropped) finds
+        // no row and writes nothing.
+        if (headerOriginals is { Count: > 0 })
+        {
+            const string originalsSql = """
+                INSERT INTO txn_header_originals (
+                    header_id, ledger_id, payee, memo,
+                    posted_at, transacted_at, check_number,
+                    amount, rounded_at_import
+                )
+                SELECT h.id, h.ledger_id, o.payee, o.memo,
+                       h.posted_at, h.transacted_at, h.check_number,
+                       o.amount, false
+                FROM unnest(@HeaderIds::uuid[], @Payees::text[], @Memos::text[], @Amounts::numeric[])
+                     AS o(header_id, payee, memo, amount)
+                JOIN txn_headers h ON h.id = o.header_id;
+                """;
+            for (var offset = 0; offset < headerOriginals.Count; offset += chunkSize)
+            {
+                var length = Math.Min(chunkSize, headerOriginals.Count - offset);
+                var headerIds = new Guid[length];
+                var payees    = new string?[length];
+                var memos     = new string?[length];
+                var amounts   = new decimal?[length];
+                for (var i = 0; i < length; i++)
+                {
+                    var seed = headerOriginals[offset + i];
+                    headerIds[i] = seed.HeaderId;
+                    payees[i]    = seed.Payee;
+                    memos[i]     = seed.Memo;
+                    amounts[i]   = seed.Amount;
+                }
+                var command = new CommandDefinition(
+                    originalsSql,
+                    new { HeaderIds = headerIds, Payees = payees, Memos = memos, Amounts = amounts },
+                    cancellationToken: cancellationToken);
+                await _connection.ExecuteAsync(command).ConfigureAwait(false);
             }
         }
 
@@ -348,6 +412,7 @@ public sealed class TransactionsRepository
         var providerKeys         = new string?[length];
         var providerRawPayloads  = new string?[length];
         var isRecurringTemplates = new bool[length];
+        var originatingAccountIds = new Guid?[length];
 
         for (var i = 0; i < length; i++)
         {
@@ -374,6 +439,7 @@ public sealed class TransactionsRepository
             providerKeys[i]         = row.ProviderKey;
             providerRawPayloads[i]  = row.ProviderRawPayload;
             isRecurringTemplates[i] = row.IsRecurringTemplate;
+            originatingAccountIds[i] = row.OriginatingAccountId;
         }
 
         return new
@@ -397,6 +463,7 @@ public sealed class TransactionsRepository
             ProviderKeys         = providerKeys,
             ProviderRawPayloads  = providerRawPayloads,
             IsRecurringTemplates = isRecurringTemplates,
+            OriginatingAccountIds = originatingAccountIds,
         };
     }
 

@@ -135,7 +135,8 @@ builder.Services.AddScoped<AppUserDbConnectionInterceptor>();
 builder.Services.AddSingleton<LegDerivedRecomputeInterceptor>();
 // Mig 104 sibling: holdings + lots recompute after every API write
 // that mutates investment-shape txn_legs (security_id IS NOT NULL +
-// quantity IS NOT NULL). Replaces the txn_legs holdings trigger
+// quantity IS NOT NULL), or a header field the FIFO walk reads (date,
+// action, hidden, merged) on a header that has them. Replaces the txn_legs holdings trigger
 // family (mig 068 / 073). Same SavingChangesAsync / SavedChangesAsync
 // lifecycle as the balance interceptor; reads the ChangeTracker and
 // invokes HoldingsRecomputeService for the affected (account, security)
@@ -144,11 +145,15 @@ builder.Services.AddSingleton<LegDerivedRecomputeInterceptor>();
 builder.Services.AddSingleton<HoldingsRecomputeInterceptor>();
 // ADR-0084 sibling: seed a `trade`-source security_prices row after every API
 // write that lands an investment trade leg (security_id set, quantity <> 0,
-// unit_price > 0). Same SavingChanges / SavedChanges lifecycle as the holdings
+// unit_price > 0), or changes a header field the price rule reads (date, action,
+// provider payload, hidden, merged) on a header that has one. Same SavingChanges / SavedChanges lifecycle as the holdings
 // interceptor; reads the ChangeTracker and invokes TradePriceRecomputeService
 // (the rank-gated Postgres upsert, mig 177) post-save. Independent of the other
 // interceptors — each scans the ChangeTracker for its own surface.
 builder.Services.AddSingleton<TradePriceFromLegInterceptor>();
+// Mig 264: the stored memo-and-tags presentation of every header a save changed an
+// input of, recomputed by the one C# rule after the save. Same lifecycle again.
+builder.Services.AddSingleton<LegNotesRecomputeInterceptor>();
 builder.Services.AddDbContext<AppDbContext>((sp, options) =>
 {
     var apiOpts = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<ApiOptions>>().Value;
@@ -156,9 +161,10 @@ builder.Services.AddDbContext<AppDbContext>((sp, options) =>
     var balanceInterceptor = sp.GetRequiredService<LegDerivedRecomputeInterceptor>();
     var holdingsInterceptor = sp.GetRequiredService<HoldingsRecomputeInterceptor>();
     var tradePriceInterceptor = sp.GetRequiredService<TradePriceFromLegInterceptor>();
+    var notesInterceptor = sp.GetRequiredService<LegNotesRecomputeInterceptor>();
     options.UseNpgsql(apiOpts.ConnectionString)
            .AddInterceptors(roleInterceptor, balanceInterceptor, holdingsInterceptor,
-                            tradePriceInterceptor);
+                            tradePriceInterceptor, notesInterceptor);
 });
 builder.Services.AddSingleton<ServiceDbContextFactory>();
 
@@ -186,8 +192,8 @@ if (apiOptions.DevAuth)
 // COFFER_API__Mcp__Enabled config (a bootstrap/test/headless override) OR the
 // `mcp.enabled` system setting an admin toggles in the UI. Read at startup so
 // that when off the MCP scheme/policy/server/endpoints are never registered —
-// the surface is absent, not merely 404 (D7). The DB read is defensive: a fresh
-// install with no system_settings table yet falls back to false (D8), so
+// the surface is absent, not merely 404 (ADR-0063 D7). The DB read is defensive: a fresh
+// install with no system_settings table yet falls back to false (ADR-0063 D8), so
 // default-off always holds; the admin's choice applies on the next restart.
 var mcpEnabled = apiOptions.Mcp.Enabled
     || SystemSettingsBootstrap.TryReadBool(
@@ -206,7 +212,7 @@ var mcpWritesEnabled = mcpEnabled
             SystemSettingsRepository.McpWritesEnabledKey,
             fallback: false));
 // Expose the live state so the admin settings endpoint can report "pending
-// restart" when a persisted toggle differs from what's actually running (D8).
+// restart" when a persisted toggle differs from what's actually running (ADR-0063 D8).
 builder.Services.AddSingleton(new Coffer.Api.Mcp.McpRuntimeState(mcpEnabled, mcpWritesEnabled));
 
 var authBuilder = builder.Services.AddAuthentication(defaultScheme: AuthSchemes.Cookie);
@@ -234,8 +240,8 @@ builder.Services.AddAuthorization(options =>
         .RequireAuthenticatedUser()
         .Build();
     // An endpoint that says nothing about authorization requires a signed-in user
-    // (FU-095). It used to be open: forgetting RequireAuthorization() on a new route
-    // published it. Anonymous is now something an endpoint declares, and
+    // (FU-095). Without a fallback, forgetting RequireAuthorization() on a new route
+    // publishes it. Anonymous is something an endpoint declares, and
     // EndpointAuthorizationCatalogTests holds every route to declaring one or the other.
     options.FallbackPolicy = options.DefaultPolicy;
 
@@ -320,6 +326,24 @@ builder.Services.AddScoped<Coffer.Api.Backup.IBackupRunner>(
 // "Never delete" pins (ADR-0062 ④b+c) — excluded from retention.
 builder.Services.AddScoped<Coffer.Api.Db.Repositories.CsvMappingsRepository>();
 builder.Services.AddScoped<Coffer.Api.Db.Repositories.BackupPinsRepository>();
+builder.Services.AddScoped<Coffer.Api.Upgrades.UpgradeRepoTokenStore>();
+// The release check (ADR-0110): GitHub's fixed host, so no outbound policy (as the quote provider).
+builder.Services.AddSingleton<Coffer.Api.Upgrades.ReleaseCheckState>();
+// One upgrade at a time, from the click to the host's word. A singleton: the attempt is process state.
+builder.Services.AddSingleton<Coffer.Api.Upgrades.IUpgradeBackups, Coffer.Api.Upgrades.ManualBackupRuns>();
+builder.Services.AddSingleton<Coffer.Api.Upgrades.UpgradeCoordinator>();
+builder.Services.AddScoped<Coffer.Api.Upgrades.UpgradeNotices>();
+builder.Services.AddHttpClient<Coffer.Api.Upgrades.ReleaseCheckService>(c => c.Timeout = TimeSpan.FromSeconds(15));
+// The upgrade mailbox (ADR-0110): a directory on the coffer_mailbox volume the host updater
+// reads. Defaults to mailbox beside the binary; tests override via Api:Upgrade:MailboxDir.
+builder.Services.AddSingleton(sp =>
+{
+    var upgrade = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<ApiOptions>>().Value.Upgrade;
+    var dir = string.IsNullOrWhiteSpace(upgrade.MailboxDir)
+        ? Path.Combine(AppContext.BaseDirectory, "mailbox")
+        : upgrade.MailboxDir;
+    return new Coffer.Api.Upgrades.UpgradeMailbox(dir, sp.GetRequiredService<TimeProvider>());
+});
 // Deployment-level admin audit (ADR-0092 D2) — service-role only, append-only.
 builder.Services.AddScoped<Coffer.Api.Db.Repositories.AdminAuditRepository>();
 // Admin-editable backup retention (ADR-0074) — the single source of truth for
@@ -353,17 +377,16 @@ builder.Services.AddScoped<Coffer.Api.Auth.UserAccessRevoker>();
 builder.Services.AddSingleton<Coffer.Api.Auth.OAuthConsentTickets>();
 
 // Master KEK (ADR-0026, sourced per ADR-0092 D1): resolved once at startup from
-// the key file at Api:MasterKey:Path — the only source. The
-// COFFER_MASTER_KEK_BASE64 env var and its one-release migration window (D6) are
-// gone; nothing needs to feed a key in, because a virgin install mints its own
-// below (D3). Fail-fast on missing /
+// the key file at Api:MasterKey:Path — the only source; no environment variable
+// is read. Nothing needs to feed a key in, because a virgin install mints its own
+// below (ADR-0092 D3). Fail-fast on missing /
 // malformed / wrong size — the API refuses to serve rather than silently fall
 // through to a default. Registered as a singleton because the bytes never change
 // at runtime; per-ledger LEK ops go through LedgerKeyService (scoped, since it's
 // pulled into request-scoped repositories).
 //
 // The store is registered too: the rotation swap (ADR-0092 D4) and the restore
-// adopt path (D5) write through it, and the setup ceremony (D2) creates the
+// adopt path (ADR-0092 D5) write through it, and the setup ceremony (ADR-0092 D2) creates the
 // initial key with it.
 var masterKeyStore = new MasterKeyStore(apiOptions.MasterKey.Path);
 builder.Services.AddSingleton(masterKeyStore);
@@ -380,10 +403,71 @@ foreach (var note in MasterKeyRelocation.Run(
     Console.WriteLine(note);
 MasterKeyLoader.KeySource masterKeySource;
 var masterKeyWasMinted = false;
+// Set by a `--adopt-new-kek` run over wrapped material (ADR-0092 D3): the minted key,
+// not yet saved. The run reconciles under it after migrations, saves it, and exits.
+(string Base64, string Id)? adoptingNewKek = null;
+// Set by a virgin start without the flag: its minted key, not yet saved. Saved once the
+// start has stored its OAuth keys under it, its first sealed secret (below the OAuth load).
+(string Base64, string Id)? virginMint = null;
+// Held by a start that mints, from before it re-reads the key file until the minted key
+// is written (MasterKeyMintLock): a virgin mint releases it below, an adopt run after its
+// key write.
+MasterKeyMintLock? mintLock = null;
+var adoptFlag = args.Contains("--adopt-new-kek");
 {
     var resolution = MasterKeyLoader.Resolve(masterKeyStore);
+    if (resolution.Key is null)
+    {
+        // Every start that may mint queues here, and re-reads the file once it holds the
+        // lock: a start that waited on another's mint or adoption uses that key.
+        try
+        {
+            mintLock = MasterKeyMintLock.Acquire(
+                apiOptions.ServiceConnectionString, TimeSpan.FromMinutes(10),
+                () => Console.Error.WriteLine(
+                    "No master KEK found, and another start is minting or adopting one; waiting for it."));
+        }
+        catch (TimeoutException ex)
+        {
+            throw new InvalidOperationException(
+                $"No master KEK found at '{masterKeyStore.Path}', and another start has been minting "
+                + "or adopting one for longer than this start waits. Nothing was written. Let that "
+                + "start finish (its log says what it is doing), then start this one again.", ex);
+        }
+        catch (Exception ex) when (ex is Npgsql.NpgsqlException or InvalidOperationException)
+        {
+            throw new InvalidOperationException(
+                $"No master KEK found at '{masterKeyStore.Path}', and the database could not be "
+                + $"checked before minting one ({ex.Message}). Nothing was written. Fix the database "
+                + "connection and start again.", ex);
+        }
+        resolution = MasterKeyLoader.Resolve(masterKeyStore);
+        if (resolution.Key is not null)
+        {
+            mintLock.Dispose();
+            mintLock = null;
+        }
+    }
     var resolvedKey = resolution.Key;
     masterKeySource = resolution.Source;
+
+    // The flag with a key in place: the adoption already happened (a restart with the flag
+    // still set, which `restart: unless-stopped` produces when the flag was delivered as a
+    // compose `command:` override), or the key was never lost. Serving would leave the flag
+    // armed, and a later start that found no key would mint and wipe again with no one
+    // deciding to. Refuse until the flag is removed.
+    if (resolvedKey is not null && adoptFlag)
+    {
+        Console.Error.WriteLine(
+            $"--adopt-new-kek was passed, but a master KEK is already at '{masterKeyStore.Path}', so "
+            + "there is nothing to adopt: either an earlier run already adopted it, or the key was "
+            + "never lost. Refusing to start. Remove --adopt-new-kek and start normally. Left in "
+            + "place, the flag would make any later start that finds no key mint a new one and "
+            + "clear everything sealed again. If that file is the WRONG key (a mis-mounted volume, "
+            + "or another install's key) and the right one is lost, move it aside first, keeping "
+            + "it, then run with --adopt-new-kek again.");
+        return 1;
+    }
 
     if (resolvedKey is null)
     {
@@ -394,32 +478,35 @@ var masterKeyWasMinted = false;
         // decided to abandon it. The probe fails CLOSED, so an unreachable
         // database refuses rather than being mistaken for virgin.
         Exception? probeFailure = null;
-        var adoptNew = args.Contains("--adopt-new-kek");
+        var adoptNew = adoptFlag;
         var hasWrapped = WrappedMaterialProbe.Exists(
             apiOptions.ServiceConnectionString, ex => probeFailure = ex);
 
         if (hasWrapped && !adoptNew)
+        {
+            mintLock?.Dispose();
             throw new InvalidOperationException(
                 $"No master KEK found, and this database already holds KEK-wrapped material"
                 + $"{(probeFailure is null ? "" : $" (could not verify: {probeFailure.Message})")}. "
                 + $"Minting a new key would orphan it. Put the install's existing base64 key at "
                 + $"'{masterKeyStore.Path}' (configure the location with Api:MasterKey:Path), or "
-                + $"re-run with --adopt-new-kek to mint a fresh key and abandon the wrapped "
-                + $"secrets — the SimpleFIN feed tokens, the stored backup passphrase, and the "
-                + $"Google Drive token, all of which can be re-established. "
+                + $"start once with --adopt-new-kek to mint a fresh key and abandon the wrapped "
+                + $"secrets — {SealedSecrets.Described}, all of which can be re-established. "
+                + $"Abandoning is irreversible: the old key turning up later recovers nothing. "
                 + $"See docs/decisions/0092-kek-lifecycle-in-the-ui.md.");
+        }
 
         var minted = Convert.ToBase64String(
             System.Security.Cryptography.RandomNumberGenerator.GetBytes(32));
 
         // Write the id INTO the file, so it is self-describing exactly like the one the
-        // D4 rotation produces. Without it the id silently falls back
-        // to the id fallback, which is how `--adopt-new-kek` ended up labelling a
-        // brand-new key with the same id the orphaned rows still carry — one label
-        // naming two different keys, which is misleading precisely when someone is
-        // reading it during an incident.
+        // ADR-0092 D4 rotation produces. Without it the id falls back to the configured
+        // default (MasterKeyLoader.ResolveId), so a key minted by `--adopt-new-kek`
+        // carries the same id the orphaned rows still carry — one label naming two
+        // different keys, which is misleading precisely when someone is reading it
+        // during an incident.
         //
-        // On adopt-new-kek the id is bumped for that reason. It stays a best-effort
+        // On adopt-new-kek the id is therefore bumped. It stays a best-effort
         // distinction, not a guarantee: the id is advisory, only rotation reads it, and
         // whether a blob actually opens is decided by trial-decrypt. Reading the
         // database's existing ids to guarantee non-collision would be real machinery
@@ -427,34 +514,38 @@ var masterKeyWasMinted = false;
         var mintedId = adoptNew
             ? MasterKeyLoader.NextKekId(MasterKeyLoader.ResolveId())
             : MasterKeyLoader.ResolveId();
-        masterKeyStore.Write(minted, mintedId);
         resolvedKey = MasterKeyLoader.LoadFromValueOrThrow(
             minted, mintedId, masterKeyStore.Path);
         masterKeyWasMinted = true;
 
-        // A deliberate abandon EXITS instead of going on to serve, because of how the
-        // flag has to be delivered: the container is refusing to boot, so `exec` has
-        // nothing to attach to and the flag arrives as a temporary compose `command:`
-        // override. If the process then served normally, that override would be left in
-        // place — and the next boot that found no key would mint again silently, which
-        // is the one thing this gate exists to prevent. Exiting makes it a one-shot the
-        // operator must undo to get a running install.
+        // A deliberate abandon EXITS instead of going on to serve. The container is
+        // refusing to boot, so `exec` has nothing to attach to: the flag arrives on a
+        // one-shot `docker compose run --rm api --adopt-new-kek`, whose container has no
+        // restart policy, or on a `command:` override that the service's restart policy
+        // would rerun. Serving would leave the flag armed for a later start that finds no
+        // key. Exiting makes it a one-shot, and a start with the flag and a key in place
+        // refuses (above), so a rerun cannot serve with it either.
         //
-        // A virgin install minting its own first key is NOT this case: nothing was
-        // abandoned, there is no flag to remove, and it goes on to serve the setup
-        // ceremony that shows the key (D3).
-        if (adoptNew && hasWrapped)
-        {
-            Console.Error.WriteLine(
-                $"Minted a new master KEK (id '{mintedId}') at '{masterKeyStore.Path}' and "
-                + "ABANDONED the previously wrapped secrets: the SimpleFIN feed tokens, the "
-                + "stored backup passphrase, and the Google Drive connection. Ledger data and "
-                + "passkeys are unaffected. Re-establish those three in the UI after starting."
-                + Environment.NewLine
-                + "Now REMOVE --adopt-new-kek before starting normally — leaving it in place "
-                + "means a future boot with no key would mint again instead of refusing.");
-            return 0;
-        }
+        // It exits only after migrations, though, not here: what the lost key sealed is
+        // cleared under the new one first (NewKekAdoption, below the migrations), and
+        // the key file is written only once that has committed, so a failed run leaves
+        // the install as it was. Until then the key lives in this process alone, and the
+        // mint lock stays held so no other start mints or reads a key in between.
+        //
+        // With the flag, every path takes this one, sealed material or not: the flag never
+        // serves. Over nothing sealed the clearing finds nothing, and the run saves its key,
+        // says there was nothing to wipe, and exits all the same.
+        //
+        // A virgin install minting its own first key without the flag is NOT this case:
+        // nothing was abandoned, there is no flag to remove, and it goes on to serve the
+        // setup ceremony that shows the key (ADR-0092 D3). Like an adopt run it saves the key only
+        // after it has stored its OAuth keys under it, its first sealed secret, and keeps the
+        // mint lock until then: a start that waited and cannot see this key file then finds
+        // sealed material and refuses, and a start that fails before that saves nothing.
+        if (adoptNew)
+            adoptingNewKek = (minted, mintedId);
+        else
+            virginMint = (minted, mintedId);
     }
 
     builder.Services.AddSingleton(resolvedKey);
@@ -512,7 +603,7 @@ builder.Services.AddScoped<Coffer.Api.Ingest.IPullProvider, Coffer.Api.Ingest.Si
 // can resolve `1252` when it walks the header.
 System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
 builder.Services.AddSingleton<Coffer.Api.Ingest.IFileProvider, Coffer.Api.Ingest.Ofx.OfxFileProvider>();
-// ADR-0042: QIF file upload (a workplace 401(k) plan + generic
+// ADR-0042: QIF file upload (workplace-plan exports + generic
 // QIF). Hand-rolled parser, no NuGet dependency. The orchestrator
 // resolves all IFileProvider registrations into a key→provider map.
 builder.Services.AddSingleton<Coffer.Api.Ingest.IFileProvider, Coffer.Api.Ingest.Qif.QifFileProvider>();
@@ -544,14 +635,42 @@ builder.Services.AddScoped<
 // chart-endpoint shape.
 builder.Services.Configure<Coffer.Api.Quotes.Yahoo.YahooQuoteOptions>(
     builder.Configuration.GetSection(Coffer.Api.Quotes.Yahoo.YahooQuoteOptions.SectionName));
-builder.Services.AddHttpClient<Coffer.Api.Quotes.Yahoo.YahooFinanceQuoteProvider>(c =>
+builder.Services.AddHttpClient<Coffer.Api.Quotes.Yahoo.YahooFinanceQuoteProvider>(
+    Coffer.Api.Quotes.Yahoo.YahooChart.Configure);
+// ADR-0114 D2: the benchmark side of the same adapter — the add-time check and the daily
+// growth read. Same host, agent and throttle settings; a pure translator, so its callers
+// own the opt-in gate and every write.
+builder.Services.AddHttpClient<Coffer.Api.Quotes.Yahoo.YahooBenchmarkClient>(
+    Coffer.Api.Quotes.Yahoo.YahooChart.Configure);
+// ADR-0114 D4 / D8: exchange rates from Frankfurter's blended feed, a pure translator. Its
+// base URL is install configuration (Quotes:Frankfurter:BaseUrl, from COFFER_FX_RATES_URL in
+// docker-compose), so an operator can point it at their own container. Egress is opt-in per
+// ledger like Yahoo: the `frankfurter` key is registered as an opt-in provider so the quotes
+// preference accepts it and the Quotes tab lists it, off by default. It is not a quote pull
+// provider, so the quote refresh never runs it.
+builder.Services.Configure<Coffer.Api.Quotes.Frankfurter.FrankfurterOptions>(
+    builder.Configuration.GetSection(Coffer.Api.Quotes.Frankfurter.FrankfurterOptions.SectionName));
+builder.Services.AddHttpClient<Coffer.Api.Quotes.Frankfurter.FrankfurterRatesClient>(c =>
 {
-    c.BaseAddress = new Uri("https://query1.finance.yahoo.com");
-    c.Timeout = TimeSpan.FromSeconds(15);
-    c.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (compatible; CofferQuotes/1.0)");
+    c.Timeout = TimeSpan.FromSeconds(30);
+    c.DefaultRequestHeaders.UserAgent.ParseAdd("CofferRates/1.0");
 });
+// The Quotes tab names the host the rates go to: the configured base URL's, so an install
+// that points at its own container shows its own (null when the URL is not usable).
+builder.Services.AddSingleton(sp => new Coffer.Api.Quotes.OptInProvider(
+    Coffer.Api.Quotes.Frankfurter.FrankfurterRatesClient.Key,
+    Coffer.Api.Quotes.Frankfurter.FrankfurterRatesClient.DisplayName,
+    sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Coffer.Api.Quotes.Frankfurter.FrankfurterOptions>>()
+        .Value.ResolveBaseUri()?.Host));
 builder.Services.AddScoped<Coffer.Api.Quotes.IQuotePullProvider>(
     sp => sp.GetRequiredService<Coffer.Api.Quotes.Yahoo.YahooFinanceQuoteProvider>());
+// ADR-0114 D11: benchmarks and exchange rates ride the quote refresh's run-all path
+// (QuoteOrchestrator takes the fetcher; RunPullAsync, the post-sync path, never calls it),
+// and an immediate backfill runs in the background after the requests that need one.
+builder.Services.AddScoped<Coffer.Api.Quotes.MarketSeries.MarketSeriesFetcher>();
+builder.Services.AddSingleton<Coffer.Api.Quotes.MarketSeries.MarketSeriesBackfill>();
+// The same rule for an MCP write tool, which has no endpoint of its own to read it in.
+builder.Services.AddScoped<Coffer.Api.Quotes.MarketSeries.MarketSeriesWriteTrigger>();
 builder.Services.AddScoped<Coffer.Api.Quotes.QuoteOrchestrator>();
 // Slice 2c.2: in-process per-connection lock paired with the
 // DB-level UNIQUE partial index on sync_runs. Singleton so the
@@ -563,9 +682,13 @@ builder.Services.AddScoped<Coffer.Api.Auth.LedgerAuthorizer>();
 builder.Services.AddScoped<InvitesRepository>();
 builder.Services.AddScoped<AccountsRepository>();
 builder.Services.AddScoped<AccountBalancesRepository>();
+builder.Services.AddScoped<BalanceForecastRepository>();
 builder.Services.AddScoped<OverviewRepository>();
+// The one place conversion reads exchange rates (ADR-0114 D9).
+builder.Services.AddScoped<ExchangeRateLookup>();
 builder.Services.AddScoped<BudgetProgressRepository>();
 builder.Services.AddScoped<BudgetTargetsRepository>();
+builder.Services.AddScoped<MarketSeriesRepository>();
 builder.Services.AddScoped<ReportingRepository>();
 builder.Services.AddScoped<InvestmentReportingRepository>();
 builder.Services.AddScoped<AccountsReportingRepository>();
@@ -580,6 +703,7 @@ builder.Services.AddScoped<AccountsReportingRepository>();
 // Desktop use) reconnect-loop and drop the connector; a single self-hosted
 // container holds session state in memory fine. Gated + mapped below.
 builder.Services.AddScoped<McpTokensRepository>();
+builder.Services.AddScoped<OAuthConnectionMetaRepository>();
 // Audit-log retention (ADR-0081 D3): prune mcp_tool_invocations + ledger_operations to
 // Api:AuditRetentionDays (default 180) on a daily cadence. Always on — NOT gated on
 // MCP, since ledger-operation retention applies regardless; a system invariant, not an
@@ -623,6 +747,8 @@ if (mcpEnabled)
     // The write-tool authorization + kill-switch choke point (ADR-0081 D1/D2).
     builder.Services.AddHttpContextAccessor();
     builder.Services.AddScoped<Coffer.Api.Mcp.McpWriteGuard>();
+    // The OAuth connections people hold, read for both the user's own list and the admin's.
+    builder.Services.AddScoped<Coffer.Api.Mcp.OAuthConnectionsService>();
 
     // OAuth 2.1 AS (ADR-0063 §D2) for the native one-click connector flow:
     // authorization-code + PKCE + refresh, revocable reference access tokens,
@@ -669,10 +795,27 @@ if (mcpEnabled)
                 b.UseInlineHandler(ctx => { ctx.Request["resource"] = null; return default; })
                  .SetOrder(int.MinValue + 100_000));
 
-            // No form_post (2026-10-12 audit, H1). It answers consent with a page that
+            // The issuer is the origin with no trailing slash. OpenIddict serialises it
+            // through Uri.AbsoluteUri, which appends "/" to a root URL; our
+            // protected-resource metadata names the authorization server without one, and
+            // RFC 8414 §3.3 needs the two to match exactly (the MCP SDK enforces it). The
+            // discovery document is trimmed in the middleware below; the RFC 9207 `iss`
+            // authorization-response parameter is trimmed here, so it still matches the
+            // metadata. The order matters: OpenIddict has set `iss` by order 0, and the
+            // redirect handler ends the pipeline early, so a handler ordered any later
+            // than that never runs.
+            o.AddEventHandler<OpenIddictServerEvents.ApplyAuthorizationResponseContext>(b =>
+                b.UseInlineHandler(ctx =>
+                {
+                    if ((string?)ctx.Response["iss"] is { } iss)
+                        ctx.Response["iss"] = iss.TrimEnd('/');
+                    return default;
+                }).SetOrder(1));
+
+            // No form_post (ADR-0105 D5). It answers consent with a page that
             // auto-submits a form to the redirect_uri, from Coffer's own origin — with a
-            // javascript: redirect_uri that ran attacker script as the user. Redirect URIs
-            // are now https or loopback http, but MCP clients use the query mode anyway,
+            // javascript: redirect_uri that runs attacker script as the user. Redirect URIs
+            // are https or loopback http, but MCP clients use the query mode anyway,
             // so the mode that turns a bad redirect into script execution goes too.
             o.Configure(options => options.ResponseModes.Remove(
                 OpenIddict.Abstractions.OpenIddictConstants.ResponseModes.FormPost));
@@ -704,10 +847,10 @@ builder.Services.AddScoped<UserPreferencesRepository>();
 builder.Services.AddScoped<SchedulesRepository>();
 builder.Services.AddScoped<GlobalSchedulesRepository>();
 // Always registered (not gated by mcpEnabled): the admin System-settings
-// endpoint must be reachable to TURN MCP ON when it is currently off (D8).
+// endpoint must be reachable to TURN MCP ON when it is currently off (ADR-0063 D8).
 builder.Services.AddScoped<SystemSettingsRepository>();
 builder.Services.AddScoped<MetaRepository>();
-builder.Services.AddScoped<AccountGroupsRepository>();
+builder.Services.AddScoped<AccountFoldersRepository>();
 builder.Services.AddScoped<SavedReportsRepository>();
 builder.Services.AddScoped<ReportPinsRepository>();
 builder.Services.AddScoped<FeedConnectionsRepository>();
@@ -722,7 +865,7 @@ builder.Services.AddScoped<RegisterRepository>();
 // decoration — only a Heartbeat provider can report what did NOT happen, because
 // noticing silence needs something outside the deployment to be counting. A
 // message-only webhook says nothing when the container is dead, which is the
-// failure that once went unnoticed for days.
+// one failure nothing inside the deployment can report.
 // ---------------------------------------------------------------------------
 // Both deliver to a URL a user entered, so both connect through the outbound policy
 // (FU-082).
@@ -743,7 +886,11 @@ builder.Services.AddScoped<Coffer.Api.Notifications.NotificationPublisher>();
 builder.Services.AddScoped<Coffer.Api.Notifications.BackupAgeMonitor>();
 builder.Services.AddScoped<Coffer.Api.Notifications.DriveSyncMonitor>();
 builder.Services.AddScoped<Coffer.Api.Notifications.ConsistencyMonitor>();
+builder.Services.AddScoped<Coffer.Api.Notifications.ConsistencyVerdicts>();
 builder.Services.AddScoped<LedgerConsistencyRepository>();
+// One consistency repair per ledger at a time; singleton so the per-ledger semaphores
+// live across requests.
+builder.Services.AddSingleton<ConsistencyRepairLock>();
 builder.Services.AddScoped<PayeesRepository>();
 builder.Services.AddScoped<TransactionsRepository>();
 builder.Services.AddScoped<TagsRepository>();
@@ -808,8 +955,15 @@ builder.Services.AddSingleton<Coffer.Api.Import.ImportMemoryGate>();
 // embedded catalogue once.
 builder.Services.AddSingleton<Coffer.Api.Provisioning.StarterCategoriesSeeder>();
 
-// Demo-ledger seeding (ADR-0088), driven by the setup form's "include Demo" box.
-builder.Services.AddSingleton<Coffer.Api.Provisioning.ProvisioningService>();
+// What the hub's Demo ledger generates for a given today (ADR-0115 D1): the whole
+// window from the default seed. A seam, so a test can build a shorter span.
+builder.Services.AddSingleton<Func<DateOnly, Coffer.Api.Provisioning.Demo.DemoSpec>>(
+    Coffer.Api.Provisioning.Demo.DemoSpec.Full);
+// The Demo job's examples phase, run by the import runner once a Demo's import has
+// committed (ADR-0115 D3), and the startup sweep that closes the record of one a restart
+// ended: no job survives a restart, so a marker still running at startup is an orphan.
+builder.Services.AddSingleton<Coffer.Api.Provisioning.DemoSeeding.DemoSeeder>();
+builder.Services.AddHostedService<Coffer.Api.Provisioning.DemoSeeding.DemoMarkerSweep>();
 
 // Fido2NetLib registration. RP id / origins / timeout come from
 // Api:Fido2; tests overlay these with localhost values from the
@@ -878,9 +1032,8 @@ builder.Services.AddRateLimiter(options =>
 });
 
 // -- multipart upload ceiling (ADR-0094). ASP.NET defaults
-// FormOptions.MultipartBodyLengthLimit to 128 MB, which used to be the reason a
-// large restore needed the `restore` CLI. That subcommand is gone, so the UI is the
-// only restore path and must not be capped below what a real backup weighs.
+// FormOptions.MultipartBodyLengthLimit to 128 MB. The UI is the only restore path
+// (there is no `restore` CLI), so it must not be capped below what a backup weighs.
 //
 // Raised rather than removed: the two restore endpoints (admin restore, bootstrap
 // restore) lift Kestrel's per-request MaxRequestBodySize to null, so this limit is their
@@ -942,15 +1095,14 @@ foreach (var outcome in dbTimeZoneOutcomes.Where(o => o.OverriddenZone is not nu
 
 // -- a freshly minted key (ADR-0092 D3). Said at Warning, not Information: on a
 // virgin install this is the moment the key that wraps everything came into
-// existence, and the operator has not seen it yet — the setup ceremony (D2) shows
-// it. If they reached here with --adopt-new-kek instead, the previously wrapped
-// secrets are now unreadable and need re-establishing.
-if (masterKeyWasMinted)
+// existence, and the operator has not seen it yet — the setup ceremony (ADR-0092 D2) shows
+// it. A --adopt-new-kek run says its own piece when it exits, below.
+if (masterKeyWasMinted && adoptingNewKek is null)
     app.Logger.LogWarning(
-        "A new master KEK was generated at {Path}. Back it up — it is shown once during setup, "
-        + "and it is what carries sealed secrets (feed tokens, the stored backup passphrase, the "
-        + "Google Drive token) to another install. Your ledger data and passkeys do not depend on it.",
-        masterKeyStore.Path);
+        "A new master KEK was generated; it is saved at {Path} before the server serves. Back it up — it is shown once during setup, "
+        + "and it is what carries sealed secrets ({Sealed}) to another install. Your ledger data "
+        + "and passkeys do not depend on it.",
+        masterKeyStore.Path, SealedSecrets.Described);
 
 // -- bootstrap restore (ADR-0061): if a backup was staged (setup screen or admin
 // panel), apply it BEFORE migrating/serving. RestoreAsync builds the backup as a
@@ -959,19 +1111,24 @@ if (masterKeyWasMinted)
 // new database is dropped and the live one was never touched. The outcome is
 // recorded either way and read back by the browser that asked — "the server
 // answers again" says nothing about whether a restore happened, and treating it
-// as success is how a failed restore once reported "Restore complete". Any
+// as success would report a failed restore as "Restore complete". Any
 // failure clears the request (no boot loop). Runs before the HTTP host starts,
 // never concurrent with serving. Skipped under the same `Migrations:Skip` flag
-// the migration/CLI blocks use: test fixtures share one database, so a staging
-// marker leaked by a test must never trigger a restore at the next
-// WebApplicationFactory boot.
+// the migration/CLI blocks use: test hosts share one process and its restore
+// staging directory, so a staging marker leaked by a test must never trigger a
+// restore at the next WebApplicationFactory boot.
 // Only the server's own boot applies a staged restore. A CLI subcommand
 // (`docker compose exec api dotnet coffer-api.dll backup …`) runs this same program,
-// and letting it apply a pending restore meant two processes building and swapping
+// and letting it apply a pending restore would mean two processes building and swapping
 // at once — one dropping the other's half-built database, then swapping under a
 // server that had already reported the restore failed. Flags such as
 // --adopt-new-kek are not subcommands.
 var isServerBoot = args.Length == 0 || args[0].StartsWith("--", StringComparison.Ordinal);
+
+// A --adopt-new-kek run applies no staged restore and adopts no staged source key: it
+// clears, saves its own key and exits, and a pending restore waits for the next start,
+// which applies it under the new key and reconciles as usual.
+var appliesStagedRestore = isServerBoot && adoptingNewKek is null;
 
 // Leftovers of a restore or verification that was killed: the decrypted dump of the whole
 // database and unfinished upload buffers (FU-075). A server boot only — a CLI command
@@ -998,7 +1155,7 @@ if (isServerBoot && BootstrapRestoreStaging.SourceKeyIsOlderThanArchive())
 //
 // Ordering is the whole design here. The MasterKey singleton was resolved during
 // DI registration, so this process holds the LOCAL key; applying the restore now
-// would leave D5's reconciliation running under the wrong key and clearing secrets
+// would leave ADR-0092 D5's reconciliation running under the wrong key and clearing secrets
 // the operator explicitly supplied the key for. So: adopt the key, restart, and let
 // the NEXT boot — whose MasterKey is the adopted one — apply the still-pending
 // restore and reconcile against it.
@@ -1007,7 +1164,7 @@ if (isServerBoot && BootstrapRestoreStaging.SourceKeyIsOlderThanArchive())
 // carries no fingerprint for the upload to check), reconciliation on that boot
 // clears what won't open — the same outcome as not supplying a key at all.
 if (!app.Configuration.GetValue<bool>("Migrations:Skip")
-    && isServerBoot
+    && appliesStagedRestore
     && BootstrapRestoreStaging.IsPending()
     && BootstrapRestoreStaging.HasSourceKey())
 {
@@ -1020,7 +1177,7 @@ if (!app.Configuration.GetValue<bool>("Migrations:Skip")
     // must too, and more carefully: a throw here happens BEFORE ClearSourceKey, so the
     // staged key survives and the next boot tries again — a permanent crash loop that
     // takes the install down rather than just refusing one operation. Clear the
-    // staging and let the restore proceed WITHOUT adopting: D5 reconciliation then
+    // staging and let the restore proceed WITHOUT adopting: ADR-0092 D5 reconciliation then
     // does the honest thing and reports what it had to abandon.
     string? archived = null;
     var adopted = false;
@@ -1032,6 +1189,18 @@ if (!app.Configuration.GetValue<bool>("Migrations:Skip")
         // the restored rows' lek_kek_id values (the source's) and this file's id can
         // disagree. Harmless: the id is advisory, only rotation reads it, and rotation
         // re-wraps every row regardless of what it says.
+        // A virgin start that applies a staged restore still holds the mint lock here; one
+        // that lost it may be racing another start's mint, so it writes nothing and exits,
+        // leaving the source key staged for the next start.
+        if (mintLock is not null && !mintLock.IsStillHeld())
+        {
+            mintLock.Dispose();
+            await Console.Error.WriteLineAsync(
+                "The lock that keeps two starts from minting a master key at once was lost before "
+                + "the staged source key could be adopted. Nothing was written; the source key is "
+                + "still staged. Start again once no other start is running.");
+            return 1;
+        }
         masterKeyStore.Write(sourceKey, MasterKeyLoader.ResolveId());
         adopted = true;
         // So the restore boot can put it back if the restore then fails.
@@ -1052,9 +1221,9 @@ if (!app.Configuration.GetValue<bool>("Migrations:Skip")
             "Could not adopt the source install's master KEK: the key file at {Path} is not "
             + "writable (an injected read-only secret?). Continuing WITHOUT it — the restore will "
             + "apply and reconciliation will clear the secrets that key would have preserved "
-            + "(feeds, backup passphrase, Drive). Put the key in place where that secret is "
-            + "managed and re-upload if you need them carried over.",
-            masterKeyStore.Path);
+            + "({Sealed}). Put the key in place where that secret is managed and re-upload if "
+            + "you need them carried over.",
+            masterKeyStore.Path, SealedSecrets.Described);
     }
 
     // Shred the staged copy either way — it now lives in the key file, or it never
@@ -1115,7 +1284,7 @@ if (!app.Configuration.GetValue<bool>("Migrations:Skip")
 var restoreApplied = false;
 
 if (!app.Configuration.GetValue<bool>("Migrations:Skip")
-    && isServerBoot
+    && appliesStagedRestore
     && BootstrapRestoreStaging.IsPending())
 {
     using var scope = app.Services.CreateScope();
@@ -1258,17 +1427,77 @@ if (!app.Configuration.GetValue<bool>("Migrations:Skip"))
     MigrationRunner.Run(apiOpts.ServiceConnectionString, migrationsDirectory, migrationLogger);
 }
 
+// -- finish a --adopt-new-kek run (ADR-0092 D3). AFTER migrations, for the reason
+// post-restore reconciliation is: it reads through the current EF model. BEFORE anything
+// else that writes at boot, and the process exits here, so it never serves.
+//
+// Everything the lost key sealed is replaced or cleared, by the same reconciliation a
+// cross-install restore runs, under the key this run minted: nothing opens under it, so
+// everything goes. Left in place, those blobs fail every use and abort every later
+// rotation. The key file is written only once that has committed; NewKekAdoption says why
+// that order makes a failed run safe to repeat. A failure exits non-zero.
+if (adoptingNewKek is { } adoption)
+{
+    KekReconciliationService.ReconciliationResult abandoned;
+    try
+    {
+        // The OAuth keys are the new key's first sealed secret, stored before the key is
+        // saved and the lock released, as a virgin start does: a start that waited and
+        // cannot see this key file then finds sealed material and refuses instead of
+        // minting a second key. A store that fails stops the run before the key is saved.
+        using var scope = app.Services.CreateScope();
+        abandoned = await NewKekAdoption.CompleteAsync(
+            scope.ServiceProvider.GetRequiredService<KekReconciliationService>(),
+            masterKeyStore, adoption.Base64, adoption.Id, clock, mintLock!,
+            _ => LoadOAuthServerKeysAsync(app));
+    }
+    catch (NewKekAdoptionException ex)
+    {
+        await Console.Error.WriteLineAsync(ex.Message);
+        return 1;
+    }
+    finally
+    {
+        // Released only now: a start that was waiting re-reads the key file and uses this
+        // key, or meets the sealed OAuth keys and refuses, or meets the failure's state.
+        mintLock?.Dispose();
+        mintLock = null;
+    }
+
+    var oauthKeys =
+        "OAuth server keys are stored under the new master key: the key files of a release "
+        + "before 0.121.0 if they were still on the data volume, which keeps MCP clients signed "
+        + "in, otherwise a new pair, after which every MCP client connects again.";
+    var startNormally =
+        "Now start normally WITHOUT --adopt-new-kek. A start with the flag and a key in place "
+        + "refuses, so it cannot be left armed.";
+    await Console.Error.WriteLineAsync(abandoned.AnythingChanged
+        ? $"Minted a new master KEK (id '{adoption.Id}') at '{masterKeyStore.Path}' and ABANDONED "
+          + "what the lost key sealed, clearing it so nothing is left that this install cannot open:"
+          + Environment.NewLine
+          + NewKekAdoption.Describe(abandoned)
+          + Environment.NewLine
+          + "This cannot be undone: the old key turning up later recovers nothing. Ledger data "
+          + "and passkeys are unaffected. Reconnect bank feeds and Google Drive, set the backup "
+          + "passphrase, and re-enter notification targets in the UI after starting. "
+          + oauthKeys + Environment.NewLine + startNormally
+        : $"Minted a new master KEK (id '{adoption.Id}') and saved it at '{masterKeyStore.Path}'. "
+          + "There was nothing sealed to wipe: the database held no secret under any other key. "
+          + oauthKeys + Environment.NewLine + startNormally);
+    return 0;
+}
+
 // -- LEK backfill. AFTER migrations, for the same reason reconciliation is.
 //
-// Migration 035 shipped `ledgers.wrapped_lek` nullable and promised "a subsequent
-// migration sets NOT NULL once backfill is verified complete". No such migration could
-// exist: wrapping a LEK needs the master KEK, which SQL does not have. So the backfill
+// `ledgers.wrapped_lek` is nullable (migration 035), and no migration can backfill it
+// and set NOT NULL: wrapping a LEK needs the master KEK, which SQL does not have. So the backfill
 // runs here, in the process that holds the key, and the constraint can only follow in a
 // LATER release — migrations run before this line on the same boot.
 //
 // The NULLs are not API-created ledgers (CreateWithOwnerAsync has wrapped one in the
-// ledger's own INSERT since ADR-0026); they come from the Moneydance importer, a
-// separate binary with no KEK that inserts `ledgers (id, name)` directly.
+// ledger's own INSERT since ADR-0026); they come from the Moneydance import, whose
+// library writes through its own repository, has no KEK and inserts `ledgers (id, name)`
+// directly.
 //
 // Does not abort the boot, matching the reconciliation posture below: a ledger without
 // a LEK is exactly as usable as it was a moment ago — nothing can seal a secret for it
@@ -1307,7 +1536,7 @@ if (!app.Configuration.GetValue<bool>("Migrations:Skip"))
 // couldn't be checked.
 //
 // A failure here does NOT abort the boot. The install would otherwise crash-loop into
-// unavailability, and the state left behind is the same one that existed before D5 —
+// unavailability, and the state left behind is the same one that existed before ADR-0092 D5 —
 // bad, but serving. Logged at Error so it's discoverable rather than silent.
 if (restoreApplied)
 {
@@ -1355,8 +1584,7 @@ if (args is ["bootstrap-token", ..])
 }
 
 // Replace the OAuth server's signing and encryption keys (FU-069): the remedy for a
-// key compromise, which used to be "delete data/openiddict and restart". The keys are
-// in the database now, so this replaces them there; the running server keeps the old
+// key compromise. The keys are in the database, so this replaces them there; the running server keeps the old
 // pair in memory until it restarts. This process has its own rotation gate, so it cannot
 // see a rotation the server is running: a pair it seals mid-rotation is stranded under
 // the old key, and the next boot says so and points back here.
@@ -1428,8 +1656,8 @@ if (args is ["backup", ..])
 }
 
 // (The `restore` subcommand is gone. It duplicated the bootstrap and admin restore
-// UIs (ADR-0061 / ADR-0071 D3) and every reason it existed for turned out not to
-// hold: "works on a schema too broken to serve" is answered by reinstalling, since
+// UIs (ADR-0061 / ADR-0071 D3) and none of the reasons it existed for
+// holds: "works on a schema too broken to serve" is answered by reinstalling, since
 // a restore builds a fresh database and never reads the old schema; "skips migrations" was a
 // collision-avoidance detail of this code path, not a capability the UI lacked; the
 // ~128 MB ceiling was ASP.NET's default MultipartBodyLengthLimit, now raised; and a
@@ -1437,11 +1665,10 @@ if (args is ["backup", ..])
 // Upload limits imposed by a reverse proxy are the operator's to configure — the
 // same position the Moneydance import upload already takes. See ADR-0094.)
 
-// (The `provision --mode clean|demo` subcommand was retired in ADR-0088. It
-// shaped install state before the first user existed, which only made sense
-// while migrations seeded placeholder Default/Demo ledgers. Migration 186 drops
-// those, so there is nothing to clean, and the Demo ledger is now an opt-in
-// checkbox on the setup form that runs the same import as any other.)
+// (No `provision` subcommand, per ADR-0088: migration 186 drops the placeholder
+// Default/Demo ledgers, so there is no install state to shape before the first
+// user, and a Demo ledger is added from the hub, as a background import like any
+// other (ADR-0115).)
 
 // -- unknown subcommand. Every dispatch block above returns, so reaching here with
 // a non-flag first argument means it matched nothing — and the default behaviour
@@ -1450,7 +1677,7 @@ if (args is ["backup", ..])
 // memory or an old runbook silently got a SECOND API instance against the same
 // database — exactly what scripts/dev-up-docker.sh goes out of its way to prevent.
 //
-// Flags are excluded on purpose: `--adopt-new-kek` (D3) and friends are read by the
+// Flags are excluded on purpose: `--adopt-new-kek` (ADR-0092 D3) and friends are read by the
 // startup path, not dispatched here, so they must still reach the server.
 if (args.Length > 0 && !args[0].StartsWith('-'))
 {
@@ -1474,6 +1701,40 @@ if (args.Length > 0 && !args[0].StartsWith('-'))
 // earlier releases wrote are moved in and deleted even while MCP is off. And not fatal,
 // matching the blocks above: without keys only OAuth sign-in fails, and the next boot
 // retries.
+//
+// A virgin start still holds the mint lock here, with its key unsaved. It saves the key
+// only once this has stored the OAuth keys under it, then releases the lock. If the store
+// failed it saves nothing and exits non-zero, so the restart retries a clean first start:
+// serving without MCP is right for an install whose keys exist, but a first start that
+// cannot store its first secret would release the lock over nothing sealed, and a start
+// on another key volume would then mint a second key.
+var oauthKeysStored = await LoadOAuthServerKeysAsync(app);
+if (virginMint is { } firstKey)
+{
+    if (!oauthKeysStored)
+    {
+        mintLock?.Dispose();
+        await Console.Error.WriteLineAsync(
+            "This first start could not store the OAuth server keys under its new master key (the "
+            + "log above says why), so it saved no key and is exiting; the next start tries again.");
+        return 1;
+    }
+    if (mintLock is null || !mintLock.IsStillHeld())
+    {
+        mintLock?.Dispose();
+        await Console.Error.WriteLineAsync(
+            "The lock that keeps two starts from minting a master key at once was lost before this "
+            + "first start could save its key, so it saved none and is exiting; the next start "
+            + "tries again.");
+        return 1;
+    }
+    masterKeyStore.Write(firstKey.Base64, firstKey.Id);
+}
+mintLock?.Dispose();
+mintLock = null;
+
+// True when the pair is stored and loaded; false, with the reason logged, otherwise.
+static async Task<bool> LoadOAuthServerKeysAsync(WebApplication app)
 {
     using var scope = app.Services.CreateScope();
     var oidcLogger = scope.ServiceProvider
@@ -1485,7 +1746,7 @@ if (args.Length > 0 && !args[0].StartsWith('-'))
         : mcpOpts.LegacyKeyDirectory;
     try
     {
-        await scope.ServiceProvider.GetRequiredService<OpenIddictKeyMaterial>().LoadAsync(
+        return await scope.ServiceProvider.GetRequiredService<OpenIddictKeyMaterial>().LoadAsync(
             scope.ServiceProvider.GetRequiredService<Coffer.Api.Crypto.LedgerKeyService>(),
             legacyKeyDirectory);
     }
@@ -1494,6 +1755,7 @@ if (args.Length > 0 && !args[0].StartsWith('-'))
         oidcLogger.LogError(ex,
             "Loading the OAuth server keys FAILED, so MCP sign-in is unavailable until a boot "
             + "succeeds. Key files under {Directory} were left in place.", legacyKeyDirectory);
+        return false;
     }
 }
 
@@ -1547,9 +1809,8 @@ if (!app.Configuration.GetValue<bool>("Migrations:Skip"))
 // And X-Forwarded-For, so the client address — what every rate limit partitions on —
 // is the client's and not the proxy's (FU-088). All three are believed only from the
 // trusted proxies (Api:TrustedProxies; loopback and the private ranges by default):
-// they used to be believed from any peer, which on a published port let anyone set
-// the scheme and host the app builds its URLs from, and would have let anyone pick
-// their own rate-limit bucket.
+// believed from any peer, they would let anyone on a published port set the scheme
+// and host the app builds its URLs from, and pick their own rate-limit bucket.
 var forwardedHeaderOptions = new ForwardedHeadersOptions
 {
     ForwardedHeaders = ForwardedHeaders.XForwardedFor
@@ -1577,7 +1838,7 @@ app.UseMiddleware<RequestScopeMiddleware>();
 // scope (ADR-0086). Framework request logging stays at Warning; this is ours.
 app.UseMiddleware<RequestAccessLogMiddleware>();
 // Cross-site request forgery: a cookie-carrying unsafe request must come from our own
-// origin (2026-10-12 audit, M1). After forwarded headers, so "our origin" is the one
+// origin (ADR-0105 D6). After forwarded headers, so "our origin" is the one
 // the browser sees; after the access log, so a refusal is logged; before the
 // endpoints, so nothing forged reaches one.
 app.UseMiddleware<Coffer.Api.Auth.SameOriginRequestMiddleware>();
@@ -1629,6 +1890,9 @@ if (mcpEnabled)
             && (ctx.Response.ContentType?.Contains("json", StringComparison.OrdinalIgnoreCase) ?? false)
             && JsonNode.Parse(buffer) is JsonObject doc)
         {
+            // Same issuer the protected-resource metadata names: no trailing slash.
+            if (doc["issuer"]?.GetValue<string>() is { } issuer)
+                doc["issuer"] = issuer.TrimEnd('/');
             if (doc["registration_endpoint"] is null)
                 doc["registration_endpoint"] = $"{ctx.Request.Scheme}://{ctx.Request.Host}/oauth/register";
             var bytes = Encoding.UTF8.GetBytes(doc.ToJsonString());
@@ -1644,10 +1908,14 @@ if (mcpEnabled)
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseRateLimiter();
+// Last-used stamp for OAuth connections to /mcp. After authorization, so only a request the
+// RequireMcp policy let through counts as a use.
+if (mcpEnabled)
+    app.UseMiddleware<Coffer.Api.Mcp.McpOAuthUsageMiddleware>();
 
 // OpenAPI document at /openapi/v1.json (the .NET 10 default), in Development only
-// (FU-095): it was served to anyone in production, a map of every route for whoever
-// asked. Nothing in the app reads it; it is for local tooling.
+// (FU-095): served anywhere else it is a map of every route for whoever asks.
+// Nothing in the app reads it; it is for local tooling.
 if (app.Environment.IsDevelopment())
     app.MapOpenApi().AllowAnonymous();
 
@@ -1670,7 +1938,7 @@ app.MapInvitesEndpoints();
 app.MapAccountsEndpoints();
 app.MapCategoriesEndpoints();
 app.MapTagsEndpoints();
-app.MapAccountGroupsEndpoints();
+app.MapAccountFoldersEndpoints();
 app.MapReportsEndpoints();
 app.MapSavedReportsEndpoints();
 app.MapFeedConnectionsEndpoints();
@@ -1693,14 +1961,16 @@ app.MapRemindersEndpoints();
 app.MapPayeesEndpoints();
 app.MapSecuritiesEndpoints();
 app.MapQuotesEndpoints();
+app.MapMarketSeriesEndpoints();
 app.MapAdminBackupsEndpoints();
 app.MapAdminDriveSyncEndpoints();
 // Master-KEK reveal (ADR-0092 D2) — admin-gated, and the reveal itself needs a
 // fresh passkey assertion on top of the session.
 app.MapAdminMasterKeyEndpoints();
 // Always mapped (independent of mcpEnabled): the admin reads/sets the MCP
-// runtime toggle here even while MCP itself is off (D8).
+// runtime toggle here even while MCP itself is off (ADR-0063 D8).
 app.MapAdminSystemSettingsEndpoints();
+app.MapAdminUpgradeEndpoints();
 
 // MCP server (ADR-0063): streamable-HTTP JSON-RPC at /mcp, authenticated by the
 // revocable bearer-token scheme (RequireMcp — least privilege, no REST access).

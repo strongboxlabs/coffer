@@ -17,15 +17,17 @@ namespace Coffer.Api.Tests.Integration.Logging;
 
 /// <summary>
 /// No credential reaches a log line the default configuration writes (FU-083): not the
-/// token in an invite or setup link, which the access log used to write with the raw path,
-/// and not the URL of a delivery target, which HttpClient's own logging wrote on every send.
+/// token in an invite or setup link, which an access log writing the raw path would
+/// carry, and not the URL of a delivery target, which HttpClient's own logging writes on
+/// every send.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed partial class AccessLogRedactionTests
+public sealed partial class AccessLogRedactionTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AccessLogRedactionTests(PostgresFixture fixture) => _fixture = fixture;
+    public AccessLogRedactionTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private const string Secret = "Zq7pV3secretTokenK2";
 
@@ -43,7 +45,7 @@ public sealed partial class AccessLogRedactionTests
     public async Task A_link_token_is_never_written_by_the_access_log(string method, string path, string logged)
     {
         var logs = new CapturedLogs();
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithServices(s => s.AddSingleton<ILoggerProvider>(logs));
         using var client = factory.CreateClient();
 
@@ -61,7 +63,7 @@ public sealed partial class AccessLogRedactionTests
         // What the access log is FOR: which ledger, which account. Redacting by route
         // shape would have cost these too.
         var logs = new CapturedLogs();
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithServices(s => s.AddSingleton<ILoggerProvider>(logs));
         using var client = factory.CreateClient();
         var ledgerId = Guid.NewGuid();
@@ -81,7 +83,9 @@ public sealed partial class AccessLogRedactionTests
     /// </summary>
     private static readonly Dictionary<string, string> NotSecret = new()
     {
-        ["id"] = "a backup file's name",
+        ["id"] = "a backup file's name; an MCP connection's id (a token row's, or an OAuth "
+                 + "authorization's), which names the connection and is never the credential",
+        ["kind"] = "which sort of MCP connection an admin is acting on: token or oauth",
         ["clientId"] = "an OAuth client's public identifier",
         ["catalogKey"] = "a built-in report's key",
         ["projection"] = "a projection's name",
@@ -89,6 +93,8 @@ public sealed partial class AccessLogRedactionTests
         ["documentName"] = "an OpenAPI document's name",
         ["grantId"] = "an OAuth grant's id; ending one needs the session of the user it belongs to",
         ["path"] = "the SPA fallback; its pages are classified by the router catalog below",
+        ["fromCurrency"] = "an ISO 4217 currency code, the rate's from side (ADR-0114 D10)",
+        ["toCurrency"] = "an ISO 4217 currency code, the rate's to side (ADR-0114 D10)",
     };
 
     private static readonly string[] IdentifierConstraints = ["guid", "int", "long"];
@@ -96,7 +102,7 @@ public sealed partial class AccessLogRedactionTests
     [Fact]
     public async Task Every_api_route_parameter_is_an_identifier_a_declared_non_secret_or_redacted()
     {
-        await using var factory = new ApiFactory(_fixture).WithMcpEnabled();
+        await using var factory = new ApiFactory(Db).WithMcpEnabled();
         using var _ = factory.CreateClient();
         var routes = factory.Services.GetRequiredService<EndpointDataSource>()
             .Endpoints.OfType<RouteEndpoint>().ToList();
@@ -203,7 +209,7 @@ public sealed partial class AccessLogRedactionTests
             });
 
             var logs = new CapturedLogs();
-            await using var factory = new ApiFactory(_fixture)
+            await using var factory = new ApiFactory(Db)
                 .WithConfig("Api:Outbound:AllowedNetworks", "127.0.0.1")
                 .WithServices(s => s.AddSingleton<ILoggerProvider>(logs));
             using var _ = factory.CreateClient();

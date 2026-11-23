@@ -25,12 +25,12 @@ public sealed class NextDueCalculatorTests
     [Fact]
     public void Floor_lands_on_the_first_occurrence_after_the_acknowledged_date()
     {
-        // A mortgage reminder running since 2015, acknowledged through June 2026:
-        // the cursor must be July 2026, NOT the 2015 first occurrence.
+        // An invented series started years ago (2012-03-04), acknowledged through
+        // February 2025: the cursor must be March 2025, NOT the 2012 first occurrence.
         var next = NextDueCalculator.NextDue(
-            Expander, Monthly10th, new DateOnly(2015, 6, 9), endDate: null,
-            consumedThrough: new DateOnly(2026, 6, 10));
-        Assert.Equal(new DateOnly(2026, 7, 10), next);
+            Expander, Monthly10th, new DateOnly(2012, 3, 4), endDate: null,
+            consumedThrough: new DateOnly(2025, 2, 10));
+        Assert.Equal(new DateOnly(2025, 3, 10), next);
     }
 
     [Fact]
@@ -38,29 +38,29 @@ public sealed class NextDueCalculatorTests
     {
         // Ack date isn't itself an occurrence (the 27th); next is the following 10th.
         var next = NextDueCalculator.NextDue(
-            Expander, Monthly10th, new DateOnly(2015, 6, 9), endDate: null,
-            consumedThrough: new DateOnly(2026, 4, 27));
-        Assert.Equal(new DateOnly(2026, 5, 10), next);
+            Expander, Monthly10th, new DateOnly(2012, 3, 4), endDate: null,
+            consumedThrough: new DateOnly(2025, 1, 27));
+        Assert.Equal(new DateOnly(2025, 2, 10), next);
     }
 
     [Fact]
     public void Individually_consumed_slots_after_the_floor_are_skipped()
     {
-        var consumed = new HashSet<DateOnly> { new(2026, 7, 10) };
+        var consumed = new HashSet<DateOnly> { new(2025, 3, 10) };
         var next = NextDueCalculator.NextDue(
-            Expander, Monthly10th, new DateOnly(2015, 6, 9), endDate: null,
-            consumedThrough: new DateOnly(2026, 6, 10), consumedDates: consumed);
-        Assert.Equal(new DateOnly(2026, 8, 10), next);
+            Expander, Monthly10th, new DateOnly(2012, 3, 4), endDate: null,
+            consumedThrough: new DateOnly(2025, 2, 10), consumedDates: consumed);
+        Assert.Equal(new DateOnly(2025, 4, 10), next);
     }
 
     [Fact]
     public void End_date_before_the_next_open_occurrence_yields_null()
     {
         var next = NextDueCalculator.NextDue(
-            Expander, Monthly10th, new DateOnly(2015, 6, 9),
-            endDate: new DateOnly(2026, 6, 30),
-            consumedThrough: new DateOnly(2026, 6, 10));
-        Assert.Null(next);   // next would be 2026-07-10, past the end
+            Expander, Monthly10th, new DateOnly(2012, 3, 4),
+            endDate: new DateOnly(2025, 2, 28),
+            consumedThrough: new DateOnly(2025, 2, 10));
+        Assert.Null(next);   // next would be 2025-03-10, past the end
     }
 
     [Fact]

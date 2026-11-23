@@ -4,7 +4,7 @@
 --
 -- An admin can pin a backup so retention never prunes it — locally OR on Drive.
 -- The key is the artifact id (the .cofferbak filename stem, e.g.
--- coffer-20260625T012107576Z-4c2b7336), which is identical for the local file and
+-- coffer-20260101T000000000Z-0a1b2c3d), which is identical for the local file and
 -- its Drive copy, so one pin covers both. Deployment-global, service-role only
 -- (backups are a deployment capability, not per-ledger) — same posture as
 -- global_scheduled_jobs / drive_sync.

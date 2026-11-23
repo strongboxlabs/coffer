@@ -14,26 +14,27 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// Selling shares the account did not hold (migration 256).
 /// </summary>
 /// <remarks>
-/// <para>Until 256 an oversell was silently accepted and corrupted two numbers.
-/// The FIFO walk drained every open lot and stopped with the excess unread; the
-/// holding then took the FULL sale and went negative, and the realized gain
-/// booked the unmatched shares at zero cost. The API defined
-/// <c>investment-txn-insufficient-shares</c> and never returned it.</para>
+/// <para>An unguarded oversell corrupts two numbers. The FIFO walk drains every
+/// open lot and stops with the excess unread; the holding then takes the FULL
+/// sale and goes negative, and the realized gain books the unmatched shares at
+/// zero cost. Since 256 the API returns
+/// <c>investment-txn-insufficient-shares</c> instead.</para>
 ///
-/// <para>The editor's lot preview could not stand in for a guard: it read the
-/// <c>lots</c> table, which FIFO drains in place and so only knows today. On a
-/// since-closed account it warned about every historical edit, while a real
-/// oversell went through.</para>
+/// <para>A lot preview read from the <c>lots</c> table cannot stand in for a
+/// guard: FIFO drains that table in place, so it only knows today. On a
+/// since-closed account it would warn about every historical edit while letting a
+/// real oversell through.</para>
 ///
 /// <para>The guard asks the walk itself, before and after the save, and refuses
 /// a save that leaves any position MORE short than it found it.</para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class InvestmentShortfallGuardTests
+public sealed class InvestmentShortfallGuardTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public InvestmentShortfallGuardTests(PostgresFixture fixture) => _fixture = fixture;
+    public InvestmentShortfallGuardTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Day(int month, int day) =>
         new(2014, month, day, 12, 0, 0, DateTimeKind.Utc);
@@ -44,13 +45,13 @@ public sealed class InvestmentShortfallGuardTests
 
     private async Task<(Seed Seed, HttpClient Client, IAsyncDisposable Factory)> SeedAsync()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("401(k)");
         var securityId = await ledger.AddSecurityAsync("Target Date Fund", ticker: "TDFA");
         var checking = await ledger.AddBankAccountAsync("Checking");
         var savings = await ledger.AddBankAccountAsync("Savings");
 
-        var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var factory = new ApiFactory(Db).WithoutDevAuth();
         var cookie = await ledger.IssueSessionCookieAsync();
         var client = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
         client.DefaultRequestHeaders.Add("Cookie", $"__Host-coffer.session={cookie}");
@@ -110,7 +111,7 @@ public sealed class InvestmentShortfallGuardTests
 
     private async Task<decimal> HeldAsync(Seed s)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.Holdings.AsNoTracking()
             .Where(h => h.AccountId == s.HoldingsId && h.SecurityId == s.SecurityId)
             .Select(h => h.Quantity)
@@ -119,7 +120,7 @@ public sealed class InvestmentShortfallGuardTests
 
     private async Task<decimal?> SharesOnAsync(Guid headerId, Guid holdingsId)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         return await db.TxnLegs.AsNoTracking()
             .Where(l => l.HeaderId == headerId && l.AccountId == holdingsId)
             .Select(l => l.Quantity)
@@ -148,10 +149,10 @@ public sealed class InvestmentShortfallGuardTests
     [Fact]
     public async Task A_sale_on_a_since_closed_position_can_still_be_edited()
     {
-        // THE CASE THAT SURFACED THIS: a years-old SellXfr on a workplace plan that
-        // has since been sold out, opened to change where the cash went. The preview said
-        // "no open lots — server may reject", because it asked about TODAY. The
-        // save must go through, and the preview must see what the sale met.
+        // An old SellXfr on a position that has since been sold out, opened to
+        // change where the cash went. A preview that asks about TODAY reports
+        // "no open lots — server may reject". The save must go through, and the
+        // preview must see what the sale met.
         var (s, client, factory) = await SeedAsync();
         await using var _ = factory;
         using var __ = client;
@@ -162,7 +163,7 @@ public sealed class InvestmentShortfallGuardTests
         var resp = await PatchAsync(client, s, sale, "sellx", -10m, Day(2, 1), s.SavingsId);
         Assert.Equal(HttpStatusCode.NoContent, resp.StatusCode);
 
-        // Today, nothing is open — which is true, and was the wrong question.
+        // Today, nothing is open — which is true, and is the wrong question.
         var lotsUrl = $"/api/ledgers/{s.Ledger.LedgerId}/accounts/{s.BrokerageId}"
             + $"/securities/{s.SecurityId}/lots";
         var today = await client.GetFromJsonAsync<List<InvestmentLotDto>>(lotsUrl);
@@ -265,9 +266,8 @@ public sealed class InvestmentShortfallGuardTests
     [Fact]
     public async Task An_already_short_sale_stays_editable_but_cannot_be_made_worse()
     {
-        // WHY THE RULE IS "WORSE", NOT "SHORT". Imported data carries residues —
-        // the case that started this was a sale short by a small fraction of a
-        // share. Refusing any
+        // WHY THE RULE IS "WORSE", NOT "SHORT". Imported data can carry residues —
+        // a sale short by a fraction of a share, say. Refusing any
         // save on a short position would lock the user out of the very rows they
         // are cleaning up.
         var (s, client, factory) = await SeedAsync();
@@ -280,7 +280,7 @@ public sealed class InvestmentShortfallGuardTests
         // The residue, written directly. This is a state the product really
         // holds — the Moneydance importer writes it, and so did this API until
         // 256 — but no request can create it any more, which is the point.
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             await db.TxnLegs
                 .Where(l => l.HeaderId == buy && l.AccountId == s.HoldingsId)

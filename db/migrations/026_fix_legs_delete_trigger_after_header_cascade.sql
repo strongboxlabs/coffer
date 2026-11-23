@@ -1,7 +1,7 @@
 -- 026_fix_legs_delete_trigger_after_header_cascade.sql
 --
--- Trigger ordering bug surfaced by verify_balance_trigger.sql under
--- the ADR-0022 schema: when `DELETE FROM txn_headers WHERE id = $X`
+-- Trigger ordering bug under the ADR-0022 schema (pinned by
+-- verify_balance_trigger.sql): when `DELETE FROM txn_headers WHERE id = $X`
 -- fires, Postgres cascades to delete the associated `txn_legs` rows
 -- and then runs the AFTER DELETE STATEMENT trigger on `txn_legs`
 -- (`fn_trg_legs_balance_after`). By that time the parent header is
@@ -13,9 +13,8 @@
 -- Fix: switch the join in the DELETE branch to LEFT JOIN with a
 -- COALESCE fallback to an early-enough date. When the header is
 -- gone the recompute walks the entire account from opening_balance,
--- which is correct (just more work than the targeted recompute).
--- Cascade-from-header-delete is rare in normal use; the safety
--- matters more than the targeted optimisation.
+-- which is correct (just more work than the targeted recompute):
+-- correctness outranks the targeted optimisation.
 --
 -- Migration 023's original function is replaced via CREATE OR
 -- REPLACE; no schema change.

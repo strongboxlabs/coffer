@@ -1,6 +1,6 @@
 // Reminders read + manage + authoring client (ADR-0047 / ADR-0049 / ADR-0051).
 // Mirror of the routes on RemindersEndpoints.cs (list / upcoming / detail /
-// active / skip / fire, plus create + edit for bank and investment series).
+// active / skip / fire per shape, plus create + edit for bank and investment series).
 
 import type {
     ReminderSummary,
@@ -10,7 +10,6 @@ import type {
     SkipReminderRequest,
     SkipReminderResponse,
     UnskipReminderResponse,
-    FireReminderRequest,
     FireReminderResponse,
     FireBankReminderRequest,
     FireInvestmentReminderRequest,
@@ -38,11 +37,17 @@ export function fetchUpcomingReminders(
     return request<UpcomingOccurrence[]>(`${base(ledgerId)}/upcoming?${qs}`);
 }
 
-/** GET /reminders/{id} — series detail + template legs (editor/detail load). */
+/** GET /reminders/{id} — series detail + template legs (editor/detail load).
+ * `occurrenceDate` ('YYYY-MM-DD') is the occurrence a managed loan's split legs
+ * are priced for, on the loan's balance as of that payment's own date (ADR-0078);
+ * without it the server prices the series' next due occurrence. */
 export function fetchReminderDetail(
-    ledgerId: string, reminderId: string,
+    ledgerId: string, reminderId: string, occurrenceDate?: string,
 ): Promise<ReminderDetail> {
-    return request<ReminderDetail>(`${base(ledgerId)}/${encodeURIComponent(reminderId)}`);
+    const qs = occurrenceDate === undefined
+        ? ''
+        : `?occurrenceDate=${encodeURIComponent(occurrenceDate)}`;
+    return request<ReminderDetail>(`${base(ledgerId)}/${encodeURIComponent(reminderId)}${qs}`);
 }
 
 /** PATCH /reminders/{id}/active — soft disable/enable (204). */
@@ -76,15 +81,6 @@ export function unskipReminder(
         `${base(ledgerId)}/${encodeURIComponent(reminderId)}/skip`
         + `?occurrenceDate=${encodeURIComponent(occurrenceDate)}`,
         { method: 'DELETE' });
-}
-
-/** POST /reminders/{id}/fire — materialize one occurrence into a committed
- * transaction (Moneydance "Record next occurrence"). */
-export function fireReminder(
-    ledgerId: string, reminderId: string, body: FireReminderRequest,
-): Promise<FireReminderResponse> {
-    return request<FireReminderResponse>(
-        `${base(ledgerId)}/${encodeURIComponent(reminderId)}/fire`, { method: 'POST', body });
 }
 
 /** POST /reminders/{id}/fire/bank — adjust-at-post for a BANK series: commit

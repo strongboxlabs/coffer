@@ -19,16 +19,11 @@ namespace Coffer.Api.Tests.Integration.Backup;
 /// sequentially).
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class AdminDriveSyncEndpointsTests
+public sealed class AdminDriveSyncEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AdminDriveSyncEndpointsTests(PostgresFixture fixture) => _fixture = fixture;
-
-    private async Task ResetAsync()
+    public AdminDriveSyncEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        await using var db = _fixture.NewDbContext();   // service role
-        await db.Database.ExecuteSqlRawAsync("DELETE FROM drive_sync;");
     }
 
     private static async Task<HttpClient> CookieClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -67,8 +62,8 @@ public sealed class AdminDriveSyncEndpointsTests
     [Fact]
     public async Task Non_admin_cookie_is_forbidden()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await CookieClientAsync(factory, alice);
 
         var resp = await client.GetAsync("/api/admin/drive-sync");
@@ -78,7 +73,7 @@ public sealed class AdminDriveSyncEndpointsTests
     [Fact]
     public async Task Anonymous_is_unauthorized()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
 
         var resp = await client.GetAsync("/api/admin/drive-sync");
@@ -88,8 +83,7 @@ public sealed class AdminDriveSyncEndpointsTests
     [Fact]
     public async Task Status_defaults_to_not_connected()
     {
-        await ResetAsync();
-        await using var factory = WithFakeDrive(new ApiFactory(_fixture));
+        await using var factory = WithFakeDrive(new ApiFactory(Db));
         using var client = factory.CreateClient();
 
         var status = await (await client.GetAsync("/api/admin/drive-sync"))
@@ -102,8 +96,7 @@ public sealed class AdminDriveSyncEndpointsTests
     [Fact]
     public async Task Connect_start_requires_client_credentials()
     {
-        await ResetAsync();
-        await using var factory = WithFakeDrive(new ApiFactory(_fixture));
+        await using var factory = WithFakeDrive(new ApiFactory(Db));
         using var client = factory.CreateClient();
 
         var resp = await client.PostAsJsonAsync(
@@ -115,8 +108,7 @@ public sealed class AdminDriveSyncEndpointsTests
     [Fact]
     public async Task Connect_start_returns_a_google_authorization_url()
     {
-        await ResetAsync();
-        await using var factory = WithFakeDrive(new ApiFactory(_fixture));
+        await using var factory = WithFakeDrive(new ApiFactory(Db));
         using var client = factory.CreateClient();
 
         var start = await (await client.PostAsJsonAsync(
@@ -130,8 +122,7 @@ public sealed class AdminDriveSyncEndpointsTests
     [Fact]
     public async Task Callback_with_valid_state_connects_and_seals()
     {
-        await ResetAsync();
-        await using var factory = WithFakeDrive(new ApiFactory(_fixture));
+        await using var factory = WithFakeDrive(new ApiFactory(Db));
         // Don't follow the redirect — assert on the 302 + its Location.
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
 
@@ -147,7 +138,7 @@ public sealed class AdminDriveSyncEndpointsTests
         Assert.Contains("drive=connected", callback.Headers.Location!.ToString());
 
         // The sealed token landed in the DB; status never exposes it.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var row = await db.DriveSync.AsNoTracking()
             .Where(d => d.Id == (short)1).FirstAsync();
         Assert.NotNull(row.OauthCiphertext);
@@ -161,8 +152,7 @@ public sealed class AdminDriveSyncEndpointsTests
     [Fact]
     public async Task Callback_with_unknown_state_redirects_with_error()
     {
-        await ResetAsync();
-        await using var factory = WithFakeDrive(new ApiFactory(_fixture));
+        await using var factory = WithFakeDrive(new ApiFactory(Db));
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
 
         var callback = await client.GetAsync(
@@ -176,8 +166,7 @@ public sealed class AdminDriveSyncEndpointsTests
     {
         // No dev-auth, no cookie — the callback is guarded by the state, not auth,
         // because Google redirects the browser to it cross-site.
-        await ResetAsync();
-        await using var factory = WithFakeDrive(new ApiFactory(_fixture).WithoutDevAuth());
+        await using var factory = WithFakeDrive(new ApiFactory(Db).WithoutDevAuth());
         using var client = factory.CreateClient(
             new WebApplicationFactoryClientOptions { AllowAutoRedirect = false, HandleCookies = false });
 
@@ -190,8 +179,7 @@ public sealed class AdminDriveSyncEndpointsTests
     [Fact]
     public async Task Enable_without_connection_is_422()
     {
-        await ResetAsync();
-        await using var factory = WithFakeDrive(new ApiFactory(_fixture));
+        await using var factory = WithFakeDrive(new ApiFactory(Db));
         using var client = factory.CreateClient();
 
         var resp = await client.PutAsJsonAsync(
@@ -203,8 +191,7 @@ public sealed class AdminDriveSyncEndpointsTests
     [Fact]
     public async Task Upload_all_without_connection_is_422()
     {
-        await ResetAsync();
-        await using var factory = WithFakeDrive(new ApiFactory(_fixture));
+        await using var factory = WithFakeDrive(new ApiFactory(Db));
         using var client = factory.CreateClient();
 
         var resp = await client.PostAsync("/api/admin/drive-sync/upload-all", content: null);
@@ -215,8 +202,7 @@ public sealed class AdminDriveSyncEndpointsTests
     [Fact]
     public async Task Disconnect_after_connect_clears_status()
     {
-        await ResetAsync();
-        await using var factory = WithFakeDrive(new ApiFactory(_fixture));
+        await using var factory = WithFakeDrive(new ApiFactory(Db));
         using var noRedirect = factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
 
         var start = await (await noRedirect.PostAsJsonAsync(
@@ -241,9 +227,8 @@ public sealed class AdminDriveSyncEndpointsTests
     public async Task Disconnect_revokes_the_refresh_token_at_google()
     {
         // Before, disconnect forgot the token here and left the grant live at Google.
-        await ResetAsync();
         var oauth = new FakeOAuthClient();
-        await using var factory = WithFakeDrive(new ApiFactory(_fixture), oauth);
+        await using var factory = WithFakeDrive(new ApiFactory(Db), oauth);
         await ConnectAsync(factory);
         using var client = factory.CreateClient();
 
@@ -257,9 +242,8 @@ public sealed class AdminDriveSyncEndpointsTests
     [Fact]
     public async Task Disconnect_still_forgets_the_token_here_when_google_cannot_be_told_and_says_so()
     {
-        await ResetAsync();
         var oauth = new FakeOAuthClient { RevokeSucceeds = false };
-        await using var factory = WithFakeDrive(new ApiFactory(_fixture), oauth);
+        await using var factory = WithFakeDrive(new ApiFactory(Db), oauth);
         await ConnectAsync(factory);
         using var client = factory.CreateClient();
 
@@ -275,9 +259,8 @@ public sealed class AdminDriveSyncEndpointsTests
     [Fact]
     public async Task Disconnecting_when_nothing_is_connected_revokes_nothing()
     {
-        await ResetAsync();
         var oauth = new FakeOAuthClient();
-        await using var factory = WithFakeDrive(new ApiFactory(_fixture), oauth);
+        await using var factory = WithFakeDrive(new ApiFactory(Db), oauth);
         using var client = factory.CreateClient();
 
         var disc = await client.PostAsync("/api/admin/drive-sync/disconnect", content: null);

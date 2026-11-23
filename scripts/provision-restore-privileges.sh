@@ -3,12 +3,12 @@
 # (ADR-0061, amended 2026-10-09): coffer_service gets CREATEDB and becomes the owner
 # of the live database. ALTER DATABASE ... RENAME requires both.
 #
-# Why the API needs this. A restore used to empty the live database object by
-# object and reload it; the service role could do that without either privilege.
-# It was also how restores broke: the emptying step worked from a hand-kept list of
-# object kinds, two migrations added kinds the list did not know, and every restore
-# over an existing install failed. Building a new database needs no such list and
-# leaves the live one untouched until the new one is complete.
+# Why the API needs this. Emptying the live database object by object and
+# reloading it needs neither privilege, but the emptying step works from a
+# hand-kept list of object kinds, and a migration that adds a kind the list does
+# not know breaks every restore over an existing install. Building a new database
+# needs no such list and leaves the live one untouched until the new one is
+# complete.
 #
 # What it changes, and why that is not a wider door. coffer_service already owns
 # every table and can drop all of them; owning the database adds the ability to

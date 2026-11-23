@@ -16,8 +16,8 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// When the date shifts, the recompute must anchor at <c>MIN(old, new)</c>
 /// so the rows in the vacated <c>[old, new)</c> range are re-walked — not
 /// just the rows from the new date forward. Moving a row LATER across
-/// intervening rows is the highest-value stress of that logic (the bug
-/// that drifted real balances by the moved txn's amount).
+/// intervening rows is the highest-value stress of that logic (getting it
+/// wrong drifts balances by the moved txn's amount).
 ///
 /// <para>Important code-path note: the bank PATCH endpoint routes EVERY
 /// header-field edit — posted_at included — through
@@ -35,11 +35,12 @@ namespace Coffer.Api.Tests.Integration.Transactions;
 /// unambiguous. Atomic per-test ledger.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class DateMoveBalanceTests
+public sealed class DateMoveBalanceTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public DateMoveBalanceTests(PostgresFixture fixture) => _fixture = fixture;
+    public DateMoveBalanceTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
     {
@@ -85,17 +86,17 @@ public sealed class DateMoveBalanceTests
     [Fact]
     public async Task Date_moved_earlier_recomputes_now_downstream_rows()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var category = await ledger.AddCategoryAsync("category");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var tEarly = await CreateAsync(client, ledger.LedgerId, bank.Id, category.Id, 5, 1000m);
         var tLate = await CreateAsync(client, ledger.LedgerId, bank.Id, category.Id, 20, -200m);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.Equal(1000m, await BalanceAfterAsync(db, tEarly, bank.Id));
             Assert.Equal(800m, await BalanceAfterAsync(db, tLate, bank.Id));
@@ -113,7 +114,7 @@ public sealed class DateMoveBalanceTests
             patchResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)patchResp.StatusCode}: {await patchResp.Content.ReadAsStringAsync()}");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.Equal(-200m, await BalanceAfterAsync(db, tLate, bank.Id));
             Assert.Equal(800m, await BalanceAfterAsync(db, tEarly, bank.Id));
@@ -131,11 +132,11 @@ public sealed class DateMoveBalanceTests
     [Fact]
     public async Task Date_moved_across_multiple_intervening_rows_recomputes_each()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var category = await ledger.AddCategoryAsync("category");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Five deposits on distinct dates, May 2 to May 18. t2 (May 6) is the
@@ -147,7 +148,7 @@ public sealed class DateMoveBalanceTests
         var t4 = await CreateAsync(client, ledger.LedgerId, bank.Id, category.Id, 14, 7m);
         var t5 = await CreateAsync(client, ledger.LedgerId, bank.Id, category.Id, 18, 4m);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.Equal(641m, await BalanceAfterAsync(db, t5, bank.Id));
         }
@@ -165,7 +166,7 @@ public sealed class DateMoveBalanceTests
             patchResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)patchResp.StatusCode}: {await patchResp.Content.ReadAsStringAsync()}");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.Equal(100m, await BalanceAfterAsync(db, t1, bank.Id));
             Assert.Equal(130m, await BalanceAfterAsync(db, t3, bank.Id)); // vacated
@@ -184,11 +185,11 @@ public sealed class DateMoveBalanceTests
     [Fact]
     public async Task Same_day_time_only_change_leaves_balances_unchanged()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var category = await ledger.AddCategoryAsync("category");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Three rows on May 10, 11 and 12: two deposits, then an outflow.
@@ -196,7 +197,7 @@ public sealed class DateMoveBalanceTests
         var t2 = await CreateAsync(client, ledger.LedgerId, bank.Id, category.Id, 11, 25m);
         var t3 = await CreateAsync(client, ledger.LedgerId, bank.Id, category.Id, 12, -40m);
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.Equal(125m, await BalanceAfterAsync(db, t2, bank.Id));
             Assert.Equal(85m, await BalanceAfterAsync(db, t3, bank.Id));
@@ -215,7 +216,7 @@ public sealed class DateMoveBalanceTests
             patchResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)patchResp.StatusCode}: {await patchResp.Content.ReadAsStringAsync()}");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.Equal(100m, await BalanceAfterAsync(db, t1, bank.Id));
             Assert.Equal(125m, await BalanceAfterAsync(db, t2, bank.Id));
@@ -233,11 +234,11 @@ public sealed class DateMoveBalanceTests
     [Fact]
     public async Task Date_moved_later_via_override_modify_recomputes_vacated_range()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var bank = await ledger.AddBankAccountAsync("checking");
         var category = await ledger.AddCategoryAsync("category");
 
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // tA May 5, a deposit; tX May 10, an outflow; tB May 15, a smaller deposit.
@@ -257,7 +258,7 @@ public sealed class DateMoveBalanceTests
             firstResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)firstResp.StatusCode}: {await firstResp.Content.ReadAsStringAsync()}");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.Equal(850m, await BalanceAfterAsync(db, tB, bank.Id));
         }
@@ -276,7 +277,7 @@ public sealed class DateMoveBalanceTests
             secondResp.StatusCode is HttpStatusCode.OK or HttpStatusCode.NoContent,
             $"expected 2xx, got {(int)secondResp.StatusCode}: {await secondResp.Content.ReadAsStringAsync()}");
 
-        await using (var db = _fixture.NewDbContext())
+        await using (var db = Db.NewDbContext())
         {
             Assert.Equal(1000m, await BalanceAfterAsync(db, tA, bank.Id));
             Assert.Equal(1050m, await BalanceAfterAsync(db, tB, bank.Id)); // vacated

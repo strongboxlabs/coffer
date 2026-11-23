@@ -1,10 +1,11 @@
 import { useState } from 'react';
-import { useMutation } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import { ApiError, restoreSnapshot } from '@/lib/api';
 import type { SnapshotSummary } from '@/lib/types';
 import { Button } from '@/components/ui/Button';
 import { Modal } from '@/components/ui/Modal';
+import { pendingChoiceProps } from '@/components/ui/pending';
 
 /**
  * Restore confirmation dialog (ADR-0037 slice 2). Destructive
@@ -52,6 +53,10 @@ export function RestoreSnapshotDialog({
     // The user dismisses via Done in the post-action states — we
     // don't auto-close because a destructive action this big
     // deserves an explicit acknowledgment of what just happened.
+    // A retry keeps the failure shown until its own result replaces it
+    // (ADR-0023 §L), so the failure phase's buttons are pending while
+    // the retry is in flight: Try again sends one restore per press,
+    // and Close waits as Esc and the backdrop do.
     const phase: 'idle' | 'success' | 'failure' =
         restoreMutation.isSuccess ? 'success'
         : restoreMutation.isError ? 'failure'
@@ -111,7 +116,7 @@ export function RestoreSnapshotDialog({
                                 variant="secondary"
                                 size="sm"
                                 onClick={onClose}
-                                disabled={restoreMutation.isPending}
+                                pending={restoreMutation.isPending}
                             >
                                 Cancel
                             </Button>
@@ -120,9 +125,11 @@ export function RestoreSnapshotDialog({
                                 variant="danger"
                                 size="sm"
                                 onClick={() => restoreMutation.mutate()}
-                                disabled={!confirmed || restoreMutation.isPending}
+                                disabled={!confirmed}
+                                pending={restoreMutation.isPending}
+                                pendingLabel="Restoring…"
                             >
-                                {restoreMutation.isPending ? 'Restoring…' : 'Restore'}
+                                Restore
                             </Button>
                         </>
                     ) : phase === 'failure' ? (
@@ -132,6 +139,7 @@ export function RestoreSnapshotDialog({
                                 variant="ghost"
                                 size="sm"
                                 onClick={onClose}
+                                pending={restoreMutation.isPending}
                             >
                                 Close
                             </Button>
@@ -145,6 +153,8 @@ export function RestoreSnapshotDialog({
                                     variant="primary"
                                     size="sm"
                                     onClick={() => restoreMutation.mutate()}
+                                    pending={restoreMutation.isPending}
+                                    pendingLabel="Restoring…"
                                 >
                                     Try again
                                 </Button>
@@ -190,8 +200,10 @@ function PreActionBody({
                 <input
                     type="checkbox"
                     checked={confirmed}
-                    onChange={(e) => onToggleConfirmed(e.target.checked)}
-                    disabled={pending}
+                    className="aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
+                    {...pendingChoiceProps<HTMLInputElement>(pending, {
+                        onChange: (e) => onToggleConfirmed(e.target.checked),
+                    })}
                 />
                 <span>
                     I understand this will replace the current ledger data.

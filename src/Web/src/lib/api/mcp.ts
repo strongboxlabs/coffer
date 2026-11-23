@@ -38,7 +38,7 @@ export function fetchMcpTokens(): Promise<McpTokenSummary[]> {
 
 /**
  * Mint a token for a connected app. Returns the one-time plaintext. A token reads
- * everything the user can for up to 90 days, so it needs a passkey tap (audit, M2).
+ * everything the user can for up to 90 days, so it needs a passkey tap (ADR-0105 D1).
  */
 export async function createMcpToken(name: string): Promise<IssuedMcpToken> {
     const headers = await stepUpHeaders('mcp-token');
@@ -46,6 +46,14 @@ export async function createMcpToken(name: string): Promise<IssuedMcpToken> {
         method: 'POST',
         body: { name },
         headers,
+    });
+}
+
+/** Rename one of the current user's tokens. A token keeps a name: blank is refused. */
+export function renameMcpToken(id: string, name: string): Promise<void> {
+    return request<void>(`/api/account/mcp-tokens/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: { name },
     });
 }
 
@@ -62,10 +70,18 @@ export function revokeMcpToken(id: string): Promise<void> {
  */
 export interface OAuthGrantSummary {
     id: string;
+    /**
+     * The name the app registered itself under. Every install of one app reports the same
+     * string, so this alone cannot tell two of them apart: that is what `label` is for.
+     */
     appName: string;
     canWrite: boolean;
     connectedAt: string;
     expiresAt: string;
+    /** The user's own name for this connection; null when they have not set one. */
+    label: string | null;
+    /** Null when no use is recorded: never used, or connected before use was recorded. */
+    lastUsedAt: string | null;
 }
 
 /** The apps the current user connected through OAuth. 404 when MCP is off, like the tokens. */
@@ -73,7 +89,15 @@ export function fetchOAuthGrants(): Promise<OAuthGrantSummary[]> {
     return request<OAuthGrantSummary[]>('/api/account/oauth-grants', { method: 'GET' });
 }
 
-/** Disconnect one: the app's grant and every token issued under it end. */
+/** Name one of the current user's OAuth connections. A blank name clears it. */
+export function renameOAuthGrant(id: string, name: string): Promise<void> {
+    return request<void>(`/api/account/oauth-grants/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: { name },
+    });
+}
+
+/** Revoke one: the app's grant and every token issued under it end. */
 export function revokeOAuthGrant(id: string): Promise<void> {
     return request<void>(`/api/account/oauth-grants/${encodeURIComponent(id)}`, {
         method: 'DELETE',
@@ -111,7 +135,7 @@ export function fetchMcpSetting(): Promise<McpSetting> {
 /** Set the MCP runtime toggles (admin only). `enabled` (the master switch) takes
  *  effect on the next API restart; `writesEnabled` (ADR-0068/0081 D2) is a HOT
  *  flag — the write kill-switch flips immediately, no restart.
- *  Turning writes ON needs a passkey tap (security audit, M2); turning them off
+ *  Turning writes ON needs a passkey tap (ADR-0105 D1); turning them off
  *  never does — the kill-switch stays one click. */
 export function setMcpSetting(enabled: boolean, writesEnabled: boolean): Promise<McpSetting> {
     return withStepUpIfRequired('mcp-writes', (headers) =>
@@ -123,9 +147,69 @@ export function setMcpSetting(enabled: boolean, writesEnabled: boolean): Promise
     );
 }
 
-// --- Admin: OAuth client management (ADR-0081 D5) ---
+// --- Admin: connections to /mcp and the OAuth clients behind them (ADR-0081 D5) ---
 
-/** Mirror of API `McpClientDto` — an OAuth client registered against the MCP AS. */
+/** What a connection is: a personal token, or an app the owner signed in to. */
+export type McpConnectionKind = 'token' | 'oauth';
+
+/** Mirror of API `McpConnectionDto` — one connection to `/mcp`, with who holds it. */
+export interface McpConnection {
+    kind: McpConnectionKind;
+    /** A token's id or an OAuth authorization's id; with `kind` it addresses the connection. */
+    id: string;
+    userId: string;
+    /** The owner's display name. */
+    user: string;
+    /** What to call it: the owner's name for it, else the app's own. */
+    name: string;
+    /** The owner's name for an OAuth connection; null when unset, and always null for a token. */
+    label: string | null;
+    /** The app's own registered name; OAuth only. Says which software this is. */
+    appName: string | null;
+    /**
+     * The client id of the registration an OAuth connection was made through, matching
+     * `McpClient.clientId`; null for a token, and for one whose registration is gone.
+     */
+    clientId: string | null;
+    canWrite: boolean;
+    connectedAt: string;
+    /** Null when no use is recorded: never used, or connected before use was recorded. */
+    lastUsedAt: string | null;
+    expiresAt: string | null;
+}
+
+/** Every live connection of every user (admin only). 404 when MCP is off. */
+export function fetchMcpConnections(): Promise<McpConnection[]> {
+    return request<McpConnection[]>('/api/admin/mcp/connections', { method: 'GET' });
+}
+
+/**
+ * Rename anyone's connection. A blank name clears an OAuth connection's name, falling
+ * back to the app's own; a token must keep one.
+ */
+export function renameMcpConnection(
+    kind: McpConnectionKind,
+    id: string,
+    name: string,
+): Promise<void> {
+    return request<void>(
+        `/api/admin/mcp/connections/${kind}/${encodeURIComponent(id)}`,
+        { method: 'PATCH', body: { name } },
+    );
+}
+
+/** Revoke anyone's connection (admin only); its tokens stop working immediately. */
+export function revokeMcpConnection(kind: McpConnectionKind, id: string): Promise<void> {
+    return request<void>(`/api/admin/mcp/connections/${kind}/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+    });
+}
+
+/**
+ * Mirror of API `McpClientDto` — an OAuth client registered against the MCP AS. A
+ * registration is shared by everyone who connects through it, so it says nothing about
+ * who is using it: that is `McpConnection`.
+ */
 export interface McpClient {
     clientId: string;
     /**
@@ -136,26 +220,18 @@ export interface McpClient {
     displayName: string;
     clientType: string;
     redirectUris: string[];
-    activeAuthorizations: number;
-    /** Operator-assigned name; shown in preference to `displayName` when set. */
-    label: string | null;
+    /**
+     * How many live connections (valid, inside their age) were made through it: what
+     * revoking it ends, by the rule the connection list shows by. Zero means prune removes it.
+     */
+    liveConnections: number;
+    /** When it registered; null for one registered before Coffer recorded it. */
+    registeredAt: string | null;
 }
 
 /** List the OAuth clients that can reach `/mcp` (admin only). 404 when MCP is off. */
 export function fetchMcpClients(): Promise<McpClient[]> {
     return request<McpClient[]>('/api/admin/mcp/clients', { method: 'GET' });
-}
-
-/**
- * Rename a client. Pass null or an empty string to clear the label and fall back
- * to the client's own registered name. The label lives with the registration, so
- * revoking and re-registering the client loses it.
- */
-export function setMcpClientLabel(clientId: string, label: string | null): Promise<void> {
-    return request<void>(`/api/admin/mcp/clients/${encodeURIComponent(clientId)}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ label }),
-    });
 }
 
 /** Revoke a client — deletes it and its tokens + authorizations (admin only). */
@@ -165,7 +241,7 @@ export function revokeMcpClient(clientId: string): Promise<void> {
     });
 }
 
-/** Prune clients with no authorizations (admin only); returns how many were removed. */
+/** Prune clients with no live connection (admin only); returns how many were removed. */
 export function pruneMcpClients(): Promise<{ pruned: number }> {
     return request<{ pruned: number }>('/api/admin/mcp/clients/prune', { method: 'POST' });
 }
@@ -200,7 +276,7 @@ export function clearMcpAudit(): Promise<{ deleted: number }> {
 }
 
 /**
- * What the OAuth consent page shows (security audit, H1): the client and redirect as
+ * What the OAuth consent page shows (ADR-0105 D5): the client and redirect as
  * the SERVER registered them, looked up by the consent ticket — not the name a link
  * carries. 404 once the ticket has expired, been used, or belongs to someone else.
  */

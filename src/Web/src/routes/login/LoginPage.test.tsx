@@ -115,4 +115,34 @@ describe('LoginPage', () => {
         const alert = await screen.findByRole('alert');
         expect(alert).toHaveTextContent(/operation either timed out or was not allowed/);
     });
+
+    // ADR-0023 §L: the button rule applies to fields. Enter in the username
+    // submits the form; the field it was pressed in stays focused through the
+    // ceremony and after a refusal, read-only rather than disabled, which in a
+    // browser would drop focus to the page.
+    it('keeps focus in the username through a sign-in started with Enter, and after its refusal', async () => {
+        let refuse: (error: unknown) => void = () => {};
+        vi.spyOn(authModule, 'performLogin').mockImplementation(
+            () => new Promise((_resolve, reject) => { refuse = reject; }),
+        );
+
+        renderLogin();
+
+        const user = userEvent.setup();
+        const username = await screen.findByLabelText(/username/i);
+        await user.type(username, 'alice{Enter}');
+
+        expect(await screen.findByRole('button', { name: /signing in/i })).toHaveAttribute('aria-busy', 'true');
+        expect(username).toHaveFocus();
+        expect(username).not.toBeDisabled();
+        expect(username).toHaveAttribute('readonly');
+        expect(username).toHaveAttribute('aria-busy', 'true');
+        await user.type(username, 'x');
+        expect(username).toHaveValue('alice');
+
+        refuse(new ApiError(401, 'Authentication failed.'));
+        expect(await screen.findByRole('alert')).toHaveTextContent('Authentication failed.');
+        expect(username).toHaveFocus();
+        expect(username).not.toHaveAttribute('readonly');
+    });
 });

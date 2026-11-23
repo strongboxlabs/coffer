@@ -1,6 +1,6 @@
 # 0021 — UI layout and visual principles: workflow-dense sidebar + slate teal, light only
 
-* Status: Accepted
+* Status: Accepted; amended 2026-10-20 by [ADR-0106](0106-folders-replace-tabs.md) (the rail collapses, resizes and shows balances; tabs are gone); amended 2026-10-31 by [ADR-0109](0109-overview-is-an-attention-first-home.md) (page widths; the Overview's side column is page content); amended 2026-11-03 by [ADR-0111](0111-structure-is-one-page.md) (an account is deactivated from its row menu or the sidebar, not from the editor); amended 2026-11-03 with [ADR-0109](0109-overview-is-an-attention-first-home.md)'s second slice (Rule 5: the system Uncategorized category is always the neutral chip and dot); amended 2026-11-04 (Rule 1: every scroll area that holds page content is the containing block of what it scrolls, so the document never scrolls); amended 2026-11-06 with [ADR-0109](0109-overview-is-an-attention-first-home.md)'s third slice (Rule 5: a report chart fills each series with its family's chart shade, one per family and theme, slate left to Other; every pair of fills in a theme at ΔE2000 13 or more and each at 3:1 or more on the card); amended 2026-11-13 by [ADR-0114](0114-benchmarks-and-currency-conversion.md) (the Overview's, the Budget page's and Reports' totals convert into the reporting currency); amended 2026-11-14 by [ADR-0114](0114-benchmarks-and-currency-conversion.md) (Rule 6: a register row on a transfer between currencies shows the other leg's amount after the account chip)
 * Date: 2026-05-11
 * Affects: every screen in `src/Web/`; the design-system PR cluster that follows this ADR; the throwaway `mockups/` directory (artifacts of the comparison)
 
@@ -39,8 +39,8 @@ C won on three grounds:
 
 A `mockups/c-softened/` variant was also tried — warmer palette,
 Inter for numbers, rounded corners, soft shadows, colored category
-chips — and rejected as "nice but the original C uses the entire
-screen, and the sidebar is more legible." Three softening touches
+chips — and rejected: the original C uses the entire screen, and its
+sidebar is more legible. Three softening touches
 from that variant were grafted onto C: colored category chips, status
 badges (✓ / P), and a barely-there panel shadow.
 
@@ -68,6 +68,27 @@ Sidebar structure, top-to-bottom:
 The grouped-accounts pattern is non-negotiable for a ledger with many
 accounts: a flat "Accounts" link that lists everything is a dead end.
 Account groups in the sidebar surface every account in one click.
+
+*2026-10-20 (ADR-0106).* Items 1 and 4 are built as written: the
+collapse button and the per-account balances shipped in 0.126.0, with
+section and folder totals beside them. The width is no longer fixed:
+it defaults to the 224px above and the reader drags it, within limits.
+See the amendment at the end of this ADR.
+
+*2026-10-31 (ADR-0109).* "No right-rail panel" is about chrome that
+varies by surface. The Overview's side column is page content inside
+the main pane: it scrolls with the page and joins the single column at
+narrow widths, and the chrome around it is unchanged.
+
+*2026-11-04.* The document never scrolls: the frame is exactly the
+viewport, and only its scroll areas move. Every scroll area that holds
+page content is therefore the containing block of what it scrolls. The
+main pane, the rail's nav and a dialog body that scrolls are `relative`;
+the dialog overlay is `fixed`, which already makes it one. An absolutely
+positioned box adds to the overflow of its containing block, not of the
+scroll containers in between, so `sr-only` text with no positioned
+ancestor inside an unpositioned scroll area escapes it and extends the
+document, which then scrolls and carries the top bar and the rail with it.
 
 ### Rule 2 — Visual treatment: hard borders, no rounding on panels, barely-there shadow
 
@@ -120,8 +141,7 @@ looking like a tool, not like a marketing site.
   for inflow / cleared, amber for pending / warning) are not
   accents — they're semantic and reserved for the data, never for
   chrome.
-- **Four themes** (revised; this rule previously read "light theme
-  only"). The bet that a dark pass would be "a token swap, not a
+- **Four themes.** The bet that a dark pass would be "a token swap, not a
   screen-by-screen rebuild" held: every theme is a block of
   `--color-*` overrides in `index.css` keyed off `data-theme` on
   `<html>`, and no component changed to support them.
@@ -136,8 +156,7 @@ looking like a tool, not like a marketing site.
   dark themes use `teal-400` / `#2dd4bf`, because on a dark ground
   contrast runs the other way. The single-accent rule is unchanged;
   what varies is the value, not the count.
-- **Two inversions that are not symmetric.** Porting to dark surfaced
-  both, and neither is a token swap:
+- **Two inversions that are not symmetric.** Neither is a token swap:
   - The header band and canvas go DARKER than the surface on dark and
     LIGHTER on light. Lifting the band the way light does leaves
     muted text at 4.04:1 on it.
@@ -160,9 +179,9 @@ looking like a tool, not like a marketing site.
   - The +74° offset is not invented. It is the teal/slate relationship
     this design already encodes (slate sits 40° off teal in HSL, 74° in
     OKLCh, at a fraction of its chroma), generalised. It holds well at
-    rust and stretches at indigo; violet was tried and dropped for
-    looking contrived, so treat the rule as having a working range
-    rather than as a law.
+    rust, stretches at indigo and looks contrived at violet, which is
+    not offered, so treat the rule as having a working range rather
+    than as a law.
   - **OKLCh, not HSL.** HSL saturation is not perceptually uniform —
     rotating slate's 33% saturation gave a plum ground at indigo and
     olive at rust. The shipping ramp measures a near-constant OKLCh
@@ -185,9 +204,13 @@ looking like a tool, not like a marketing site.
 
 ### Rule 5 — Status and category color system
 
-- **Status badges.** Cleared = green pill with ✓ (`#dcfce7` bg /
-  `#15803d` text); Pending = amber pill with P (`#fef3c7` bg /
-  `#92400e` text). Small fixed circle, 1rem × 1rem.
+- **Status badges.** Cleared = pill with ✓, in the accent treatment
+  below (it began as a green pill, which that treatment replaced);
+  Pending = amber pill with P (`#fef3c7` bg / `#92400e` text). Small
+  fixed circle, 1rem × 1rem. The style guide's register row draws the
+  register's own `StatusBadge`, so its sample cannot drift from it, and
+  its green swatch is labelled with what green marks: a status that
+  succeeded, never an amount (ADR-0023 §H) and never Cleared.
 - **The badge column: the glyph carries the meaning.** Every state has
   its own mark — check, dot, `P`, `S`, `!`, empty ring — so nothing is
   identified by colour alone. That is what lets the column work without
@@ -198,27 +221,27 @@ looking like a tool, not like a marketing site.
   - Pending and Failed keep their status colours — those are warnings,
     and they should not blend into the app's own tone.
   - Uncleared stays a hollow ring: nothing asserted yet.
-- **The check was Tailwind green (hue 142) and should not have been.**
-  The accent is at 172 and the neutral ramp at 215 — the whole app
-  lives in the teal/blue half, so a pure green was the only thing at
-  its hue and read as foreign rather than as meaningful. Reported on
-  the dark themes as the check being "a different shade of green" from
-  the sage-toned Reconciling marker. Moving it a few degrees was not
-  enough and neither was desaturating it; the answer was that it did
-  not need its own colour at all.
-  `state-success` still exists and still colours positive amounts in
-  the investment register. It is simply not what paints the badge.
+- **The check is not Tailwind green (hue 142).** The accent is at 172
+  and the neutral ramp at 215 — the whole app lives in the teal/blue
+  half, so a pure green is the only thing at its hue and reads as
+  foreign rather than as meaningful; on the dark themes it reads as a
+  different shade of green from the sage-toned Reconciling marker.
+  Shifting or desaturating it does not fix that; the check needs no
+  colour of its own.
+  `state-success` is a status colour only; no amount is green
+  (ADR-0023 §H). It is simply not what paints the badge.
 - **Split-leg amounts carry no opacity.** A leg row is de-emphasised by
   the nested `surface-muted` plane and the tree glyph, never by dimming
-  its amount. `state-success` at 70% over that plane is 2.88:1 and no
-  opacity value clears AA, so leg amounts render at full token
-  strength in both registers.
+  its amount. No opacity value lets a coloured amount clear AA over
+  that plane, so leg amounts render at full token strength in both
+  registers. The lines of a Scheduled split drop the colour with their
+  parent (ADR-0023 §H).
 - **Needs-review row treatment** (slice 2c, migration 037). The
   register flags bank-feed rows the user hasn't approved with a
   3px left bar in `state-warning` plus a soft `state-warning-soft`
-  row tint at ~30% opacity. Concept-parity with MD's yellow-row +
-  orange-bar pattern (user reference screenshot 2026-05-16);
-  treatment in our palette, not MD's literal yellow. Decouples
+  row tint at 70% opacity (`bg-state-warning-soft/70`, full on hover;
+  ADR-0045). Concept-parity with MD's yellow-row +
+  orange-bar pattern; treatment in our palette, not MD's literal yellow. Decouples
   from the bank-pending state — a row can be both
   `needs_review` (left bar + tint) and bank-pending (status
   badge); the visual layers cleanly. Clicking Approve in the
@@ -235,7 +258,8 @@ looking like a tool, not like a marketing site.
   - transfer — slate (`#f1f5f9` / `#475569`)
   - phone — sky (`#f0f9ff` / `#075985`)
   - recreation — pink (`#fdf2f8` / `#9d174d`)
-  - **uncategorized** — amber warning (`#fef3c7` / `#92400e`)
+  - **uncategorized** — amber warning (`#fef3c7` / `#92400e`). *(Superseded
+    2026-11-03: the system Uncategorized category is the neutral chip, below.)*
 - **Tag chips are the exception, and they are solid.** A tag's colour
   is USER DATA, not a token — the recolor endpoint validates the
   `#rrggbb` shape, not palette membership — so it cannot be audited
@@ -264,11 +288,42 @@ looking like a tool, not like a marketing site.
   its account id to one, so every transaction in a category lands on
   the same colour. Category colour is therefore entirely TOKEN-driven —
   it rotates with the theme and is covered by the token audit, which is
-  exactly why categories did not suffer the tag-chip contrast failure.
-  - **There is no per-category override.** This rule claimed one
-    ("with a per-category override on the category-edit form") for long
-    enough to be quoted back as fact; there is no `color` field on the
-    category type and no endpoint for it. Corrected 2026-09-14.
+  why the tag-chip contrast failure cannot reach a category.
+  - *(Amended 2026-11-03.)* **The system Uncategorized category is
+    always the neutral chip**, and its identity dot the neutral dot,
+    everywhere a category chip or dot is drawn: both registers, the home
+    screen's rows and the budget dots. It is where unclassified rows
+    land, not a category anyone chose, and a hashed colour made it look
+    like one. It is recognised by the account's `isSystem` flag on a
+    category (the ledger's one system category), never by its name,
+    which a person's own category may share (`lib/categoryChip.ts`).
+  - *(Amended 2026-11-06, with
+    [ADR-0109](0109-overview-is-an-attention-first-home.md)'s third slice.)*
+    **A report chart fills each series with its family's chart shade**,
+    `--color-cat-<family>-chart`, not the chip's `-text` shade. The text
+    shades are tuned for words on a chip, and several pairs of them cannot
+    be told apart as fills side by side. Nine families have one, in each of
+    the four theme blocks and the `@theme` default; slate has none, because
+    slate is a chart's Other (`--color-cat-xfer-text`), so no series can
+    look like the fold. Chips and dots keep the `-text` shades, so a
+    category is the same family everywhere and a different shade only on a
+    chart. The system Uncategorized category's own colour, the neutral, is
+    no series colour, so on a chart it borrows a free family, as a category
+    whose family another holds does (ADR-0104 D4).
+  - **The chart shades' floors, per theme**, held by `chartShades.test.ts`:
+    every pair of fills one chart can hold, Other's slate included, at
+    ΔE2000 13 or more, and every fill at 3:1 or more on the theme's card
+    (`--color-surface`). The pair floor is what a chart needs: a contrast
+    floor is per colour, and cannot see two fills that each clear it and
+    look alike. The chip text shades all clear AA and fail the pair floor,
+    which the test also asserts, so it can fail on real input. The floor
+    is the closest pair the light set reaches within the families, the
+    tightest theme. The test computes ΔE2000 itself and checks it against
+    the formula's published reference pairs, since an error in the formula
+    would pass every shade. The style guide's Chart shades section shows
+    them side by side, as a stack of neighbours is read.
+  - **There is no per-category override.** There is no `color` field
+    on the category type and no endpoint for it.
   - If one is ever built it takes a user-supplied hex, which puts it in
     the same class as tags: outside the token system, invisible to the
     token audit, and reachable by arbitrary `#rrggbb`. Use the tag
@@ -284,6 +339,10 @@ Cleared / Pending / Uncategorized) and a "+ Filter" affordance.
 Bulk-action footer when ≥1 row is selected (Categorize / Tag / Flag /
 Hide). Keyboard-first: arrow keys move row focus, space toggles
 selection, `c` opens the category combobox on the focused row.
+*(Amended 2026-11-14, [ADR-0114](0114-benchmarks-and-currency-conversion.md) D14: on a transfer between currencies the category
+cell, which shows the counterparty, shows the other leg's amount after the account chip,
+muted, in the app's format (the symbol, no plus). A long name truncates and the amount
+stays whole. Same-currency transfers and category rows are unchanged.)*
 
 These behaviors are not in this ADR — they live in the design-system
 PRs and the per-surface PRs — but the layout reserves the chrome for
@@ -316,10 +375,9 @@ visual silhouette is already locked in.
 
 ### Rule 9 — Action affordances: one shape for "commit or back out"
 
-Added after an Appearance panel shipped a left-aligned **Apply / Cancel**
-while all 25 other action footers in the app were right-aligned
-**Cancel / Save**. Nothing caught it, because the pattern existed 25
-times and was owned by nobody.
+A pattern repeated across every action footer in the app and owned by
+nobody drifts: a left-aligned **Apply / Cancel** among right-aligned
+**Cancel / Save** footers passes review unremarked.
 
 - **Right-aligned, `flex justify-end gap-2`.** The commit action sits
   furthest right, where the eye and the thumb finish.
@@ -339,7 +397,7 @@ times and was owned by nobody.
 This is a description of what the app already does, not a new
 invention — `ConfirmDialog`, `LayoutNameDialog`, `AccountEditorDialog`
 and the split-posting editor all follow it. The rule exists so the
-26th one does too.
+next one does too.
 
 **Use `ActionFooter`.** The rule is mechanical, so it lives in a
 primitive rather than in this paragraph: `components/ui/ActionFooter`
@@ -365,8 +423,8 @@ Button outside the primitive fails, with the nineteen pre-existing
 sites frozen in a list that may shrink and must not grow.
 
 Know what that guard cannot do. It is a text scan, and it errs both
-ways: it would NOT have caught the defect that prompted this rule
-(`justify-start`), and it DOES flag right-aligned toolbar actions that
+ways: it does NOT catch a left-aligned footer (`justify-start`),
+and it DOES flag right-aligned toolbar actions that
 are not footers at all. The threshold is one Button rather than two
 because the two errors cost differently — a false positive is one line
 on the frozen list, a false negative is drift nobody sees. It stops the
@@ -374,17 +432,16 @@ next hand-rolled footer; it does not verify the rule.
 
 ### Rule 10 — A visible affordance, with right-click as the accelerator
 
-Added after the Tags and Categories settings panels were found to
-contain ZERO `<Button>` and ZERO `<IconButton>` between them: eight
-actions — rename, recolour, merge, delete, add sub-category, move —
-reachable only by right-clicking a row.
+A panel whose row actions — rename, recolour, merge, delete, add
+sub-category, move — are reachable only by right-clicking a row has
+no visible path to them, and none at all on touch.
 
 - **Every action needs a path you can see.** Right-click is an
   accelerator for people who already know, never the only way in.
 - **A `title` tooltip is not an affordance.** "Right-click for actions"
   does not exist on touch, is not announced as an action, and is
   invisible until you are already hovering the thing you did not know
-  was interactive. Both panels relied on exactly that.
+  was interactive.
 - **On a list row, the visible path is `RowActionsButton`** — a kebab
   that opens the same `ContextMenu`, anchored to the button so keyboard
   users get a sensible position rather than a pointer coordinate that
@@ -403,15 +460,13 @@ action there should ask whether it also belongs on the bulk bar.
 **Built.** `components/ui/RowActions.test.ts` checks that every surface
 attaching `onContextMenu` also renders a `RowActionsButton`, or is
 listed as an exception WITH A REASON (the register trio, on the terms
-above). It failed on its first run, naming a surface nobody had
-looked at.
+above).
 
-**On a dense rail, only the SELECTED row carries the kebab.** Added
-after that first run flagged `AuthedSidebar.tsx`: account tab
-membership was reachable only by right-clicking a nav row, and the
-empty state literally read *"Right-click an account … to add it"* —
-an instruction that cannot be followed on touch at all, which is the
-same defect as the `title` tooltip above and more explicit about it.
+**On a dense rail, only the SELECTED row carries the kebab.** A rail
+action reachable only by right-clicking a nav row — with an empty
+state reading *"Right-click an account … to add it"* — cannot be
+followed on touch at all, the same defect as the `title` tooltip
+above and more explicit about it.
 
 A control on every row of a ~23px rail is the cost Rule 10 already
 declines to pay in the register. One on the selected row is not:
@@ -448,28 +503,29 @@ actions clearly.
 The same row keeps `onContextMenu`, so the guard in `RowActions.test.ts` still
 holds the file to prescribing a visible path.
 
-**What the guard cannot check, and what that cost.** It is file-level,
-so it proves a surface has *an* affordance, not that every row type
-does. Note also that "renders any button" would have been worthless
-here: the sidebar carries four IconButtons — System settings, collapse,
-Account security, Sign out — all global chrome, none a row action. The
-check names the mechanism the rule prescribes instead.
+**What the guard cannot check.** It is file-level, so it proves a
+surface has *an* affordance, not that every row type does. "Renders any
+button" would be worthless as a check: the sidebar carries four
+IconButtons — System settings, collapse, Account security, Sign out —
+all global chrome, none a row action. The check names the mechanism the
+rule prescribes instead.
 
-**A correction worth keeping.** The first reading of this finding was
-that deactivate had no visible path either. It does: the account editor
-dialog carries an "Active" checkbox. The grep that found
-`setAccountActive` called only from the sidebar missed it because the
-dialog PATCHes `isActive` through a different call. Only tab membership
-was actually stranded — and membership belongs where the tabs are, not
-on the accounts page, which sections by type and never names a tab.
+Deactivating an account has a visible path: the kebab and right-click
+menu of its row on Structure's Accounts tab, and the sidebar's, both
+through `setAccountActive`. *(Amended 2026-11-03, [ADR-0111](0111-structure-is-one-page.md)
+D4: the account editor dialog used to carry an "Active" checkbox that
+PATCHed `isActive` through a different call, deactivating on Save without
+the question the menu asks. It is gone, so Deactivate always asks and a
+grep for `setAccountActive` finds every path.)* Tab membership belongs
+where the tabs are, not on the accounts page, which sections by type and
+never names a tab.
 
 ### Rule 11 — Three kinds of length, and rhythm rides a ramp
 
-Written down after a census found the spacing vocabulary was already
-coherent — 1690 of 1691 rhythm utilities sat on the ramp below — but
-undefended. Nothing distinguished `py-2.5` (the list-row standard, nine
-call sites) from `py-3.5` (one tile, no reason), because the vocabulary
-grew by copying the neighbouring component rather than by decision.
+A spacing vocabulary that grows by copying the neighbouring component
+rather than by decision drifts unless it is defended: nothing but a rule
+distinguishes `py-2.5` (the list-row standard) from `py-3.5` (a one-off
+with no reason).
 
 **Rhythm** — padding, margin, gap, space — uses only:
 
@@ -503,14 +559,13 @@ all.)
 v4 derives every rhythm utility from `--spacing`, so `p-4` is
 `calc(var(--spacing) * 4)`. An arbitrary value does not move when that
 variable does, so it stops matching its neighbours at every density but
-the one it was eyeballed at. The sidebar nav row was pinned at
-`py-[0.3rem]` exactly this way. If a value is genuinely needed it gets
+the one it was eyeballed at. If a value is genuinely needed it gets
 a token, not a bracket.
 
 Enforced by `src/Web/src/styles/spacingScale.test.ts`, which is a proof
 rather than a proxy — exact utility matches, not a heuristic. It scans
-comments too: the first run flagged a comment describing the sidebar
-padding as `py-[0.3rem]`, a claim about to go stale in the same diff.
+comments too, because a comment quoting an arbitrary value goes stale
+with the code it describes.
 
 ### Rule 11a — Density is the third Appearance axis, and it moves space only
 
@@ -537,26 +592,21 @@ rhythm (`gap-2` → 6.4px) because layout is subpixel-positioned.
 
 **What holds the line.** `pinnedLengths.test.ts` bans numeric sizers
 outright — `h-4`, `w-24`, `size-4`, `min-h-9` — rather than setting a
-threshold. An earlier draft allowed control-sized squares to scale, and
-that judgement call is precisely what produced a split `h-7
-w-fixed-28px` pair: the height still scaling, the width no longer
-doing so, every icon button visibly non-square at any setting except
-the default, and correct-looking in review. The same file asserts that
+threshold. A threshold that lets control-sized squares scale produces
+split pairs such as `h-7 w-fixed-28px`: the height scaling, the width
+not, every icon button visibly non-square at any setting except the
+default, and correct-looking in review. The same file asserts that
 the density blocks declare `--spacing` and nothing else, and that the
 Rule 10 row-action spacer still matches `IconButton`.
 
 ### Rule 11b — A preview varies one axis; everything else shows what you have
 
 "Staged" is a claim about what the user SEES, not about where the state
-lives. The Appearance panel satisfied the second and failed the first,
-and it was reported twice as applying on the fly.
-
-Nothing was ever saved on selection — the root attributes were correct
-throughout. What broke the illusion was that every preview followed
-every *draft*: one density click repainted 7 of the 10 cards, and one
-theme click darkened 6 of them. A panel where most of the surface
-changes the instant you click is indistinguishable from one that
-applied your choice.
+lives. A panel can save nothing on selection and still read as applying
+on the fly: if every preview follows every *draft*, one click repaints
+most of the cards, and a panel where most of the surface changes the
+instant you click is indistinguishable from one that applied your
+choice.
 
 - **Each card shows its own option against the APPLIED values of the
   other axes.** A click moves the radio and nothing else.
@@ -565,7 +615,7 @@ applied your choice.
   save. That is the honest reading — they show what you currently have
   — and it beats the churn. The helper text says so.
 - **A preview must be a large enough sample to show its own axis.**
-  The density cards were three heights of 16 / 20 / 24px, a 4px spread
+  Density cards of three heights, 16 / 20 / 24px, are a 4px spread
   beside a two-line label, and read as identical — the same *symptom*
   as the compound-selector bug in Rule 4, from a different cause.
   Density is cumulative, so the sample has to accumulate: six rows puts
@@ -620,6 +670,12 @@ inside the system, not around it.
 * Add `lucide-react`; replace hand-rolled SVGs with named components.
 * Sidebar collapse for narrow widths (icons-only ≤ 1024px, hidden
   ≤ 768px with a hamburger trigger).
+  *2026-10-20 (ADR-0106):* collapse shipped as the reader's choice, not
+  by breakpoint. A button, `Ctrl+\` or the resize handle collapses the
+  rail to a column of icons, and the choice is remembered per browser.
+  No breakpoint collapses or hides it. The one rule tied to the window
+  is a width ceiling of 40% of it, so a width saved on a wide screen
+  cannot crowd the main pane on a narrow one.
 * Top-bar `⌘K` opens a command palette (initially: ledger
   switching, account jump, recent actions). The actual command set
   fills in over later PRs — D.3 ships the affordance + the empty
@@ -680,6 +736,80 @@ inside the system, not around it.
   hand-rolling ~12 primitives is one PR of work. Re-evaluable
   later if the primitive set grows past ~25.
 - **Dark mode in this ADR.** Doubles the token-validation surface
-  area for the first design-system PR with no shipped value (the
-  user works in light). Deferred to a later ADR + PR after the
+  area for the first design-system PR with no shipped value.
+  Deferred to a later ADR + PR after the
   light system is stable.
+
+## Amendment, 2026-10-20 — the rail collapses, resizes and shows balances; tabs are gone (ADR-0106)
+
+**Rule 1 is built.** The header carries the collapse button it always
+listed, and every account row carries its balance in monospace at the
+right edge.
+
+- **Width.** The default stays Rule 1's 224px. A handle on the rail's
+  right edge resizes it, held between 200px and the smaller of 480px and
+  40% of the window. The handle is a `role="separator"`: arrow keys
+  resize, Enter collapses, double-click resets to the default.
+- **Collapsed** is a 56px column: the destinations' icons, one icon per
+  account type present, named with that type's total, and an expand
+  button. There is no tooltip primitive, so the icons carry `title` text.
+- **Width, collapse and each folder's open state are remembered per
+  browser**, and the first two are applied before first paint, as theme
+  and density are (Rules 4 and 11a). ADR-0106 D7 gives the reasons.
+- **Nothing new is drawn.** The new rows take the rail's existing sizes,
+  tokens and components, and a balance renders as the dashboard renders
+  one; where the design's measurements differed, the app's won
+  (ADR-0106 D8). The one new token is `--spacing-fixed-56px`, the
+  collapsed width.
+- **Balances.** An account shows its current balance, a folder the sum of
+  everything under it, and a section heading its type's total. Liabilities
+  are negative, as on the dashboard. A total that spans currencies shows
+  "mixed", not a sum; the dashboard sums without conversion instead, so
+  this is new (ADR-0106 D6).
+- **Folders** sit inside each type's section, nested, folders before
+  accounts. Each level indents with the rail's existing grouped-block
+  device, an indent under a faint left border (ADR-0106 D2 to D5, D8).
+
+**Rule 10's tab text is history.** The tab strip, its reserved-slot
+exemption, and "membership belongs where the tabs are" described tabs,
+which ADR-0106 removed. The rule itself stands, and folders are held to
+it: every move a drag makes is also on a row menu, because there is no
+drag on touch or from a keyboard. The collapse button named in the
+guard's note above now exists, and the "New tab" button is gone.
+
+Each section heading gains a new-folder button for owners and editors,
+the folder-with-plus icon rather than a bare plus, which on a list of
+accounts reads as "add account". It takes this rule's third answer, not
+a hover-reveal: present and reachable by Tab at rest, quiet until the
+heading is hovered or focused. On touch it is the only way to make a
+top-level folder, so it cannot be invisible there.
+
+**D.3's breakpoints are not built.** Collapse is the reader's choice;
+see the note under D.3.
+
+## Amendment, 2026-10-31 — page widths, and the Overview (ADR-0109)
+
+**Page widths are stated here.** Context point 3 says C uses the full
+viewport; only the registers do. The widths are:
+
+- **Registers** run the full width of the main pane.
+- **Destination pages** cap their content at `max-w-5xl`.
+- **The Overview** caps its content at `max-w-fixed-1600px`, a pinned
+  token (`--spacing-fixed-1600px`). It is the only page with two columns
+  side by side.
+- **The Securities catalog** caps at `max-w-6xl`. It is the only
+  destination page that is one wide table, and the extra width goes to
+  the security's name.
+
+**The Overview's breakpoints are container queries on the main pane**,
+not on the viewport, because the rail resizes and collapses: the page is
+an `@container/page` and each panel an `@container/panel`. They are the
+first container queries in the SPA. D.3's viewport breakpoints remain
+unbuilt.
+
+**The Overview shows "mixed" as the rail does.** The amendment above
+says the dashboard summed across currencies; it no longer does. Every
+aggregate on the Overview that spans currencies shows the rail's marker
+and wording, and so do the totals on the Budget page and in Reports.
+*(Superseded 2026-11-13 by [ADR-0114](0114-benchmarks-and-currency-conversion.md) D7: those totals convert into the
+ledger's reporting currency and show a figure.)*

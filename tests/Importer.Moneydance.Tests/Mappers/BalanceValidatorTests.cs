@@ -11,13 +11,37 @@ namespace Coffer.Importer.Moneydance.Tests.Mappers;
 /// </summary>
 public sealed class BalanceValidatorTests
 {
+    /// <summary>The fixture items, with the currencies they name: a <c>curr</c> item
+    /// whose id is <c>USD</c> (the base, 2 places) and one whose id is <c>JPY</c>
+    /// (0 places).</summary>
     private static MdExport ExportFromJson(string allItems) =>
         MdItemReader.ReadString($$"""
             {
               "metadata": {"exporter":"x","moneydance_build":1,"export_date":1,"file_name":"y"},
-              "all_items": [ {{allItems}} ]
+              "all_items": [
+                {"obj_type":"curr","id":"USD","currid":"USD","name":"US Dollar","dec":"2","isbase":"1"},
+                {"obj_type":"curr","id":"JPY","currid":"JPY","name":"Yen","dec":"0"},
+                {{allItems}} ]
             }
             """);
+
+    [Fact]
+    public void Each_accounts_flows_are_scaled_by_its_own_currencys_places()
+    {
+        // A yen account (dec 0) pays a dollar account (dec 2): the pamt out of the yen
+        // account as whole yen, the samt into the dollar one in cents, each at its own scale.
+        var export = ExportFromJson("""
+            {"obj_type":"acct","id":"a-yen","name":"Account Y","type":"b","currid":"JPY","sbal":"100000"},
+            {"obj_type":"acct","id":"a-usd","name":"Account D","type":"b","currid":"USD","sbal":"0"},
+            {"obj_type":"txn","id":"t-1","acctid":"a-yen","desc":"x","dt":"20260101",
+             "0.id":"s-1","0.acctid":"a-usd","0.samt":"900","0.pamt":"-1500"}
+            """);
+
+        var balances = BalanceValidator.ComputeExpectedByMdAccountId(export);
+
+        Assert.Equal(98_500m, balances["a-yen"]);
+        Assert.Equal(9.00m, balances["a-usd"]);
+    }
 
     [Fact]
     public void Account_with_no_transactions_keeps_starting_balance()

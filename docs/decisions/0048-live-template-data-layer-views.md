@@ -18,7 +18,7 @@ view layering, what the recompute reads, the read/write split, and how the
 existing reminders convert — capturing the *why* for each, because the
 reasoning is the load-bearing part.
 
-Guiding principle (the user's): the raw transaction tables are encapsulated
+Guiding principle: the raw transaction tables are encapsulated
 behind a view abstraction. **Reads never name the raw partitioned tables;
 the live/template partition is enforced structurally, in one place.**
 
@@ -45,12 +45,16 @@ denormalization of the flag onto legs.
 
 **Why not the raw tables:** encapsulation — no consumer names the raw
 partitioned tables, so the template exclusion cannot be forgotten.
+*(Amended 2026-10-27, ADR-0108 D5, D11: one deliberate exception. The stored
+memo-and-tags recompute (`LegNotes`) and its upgrade backfill
+(`LegNotesBackfill`) read `txn_headers` itself, because a reminder template's
+legs carry stored values too, and `live_txn_headers` would hide them.)*
 
 **Why not `resolved_transactions` (the Layer-2 fat view):** it LEFT JOINs
 `txn_header_account_balances` — the table the balance recompute *rewrites* —
 so a recompute reading it would be self-referential and fragile; and it
 carries many joins (overrides, the counterparty self-join, securities, the
-`tags` array subquery, `account_path()`, provider mappings), which would
+`tags` array subquery (dropped in migration 266), `account_path()`, provider mappings), which would
 regress the recompute hot path (a per-account loop + a full-ledger one-shot;
 the ADR-0046 perf surface).
 
@@ -138,8 +142,7 @@ re-importable. So the migration reshapes the schema (adds the new columns,
 drops the denormalized shape columns); the **rewritten importer
 re-materializes** each reminder as a template header+legs on the next MD
 import (idempotent via `external_id`), through the single validated
-construction path. No data loss; one re-import (already part of the MD
-refresh workflow). Rejected: A (fragile / duplicated) and C (a one-time C#
+construction path. No data loss; one re-import. Rejected: A (fragile / duplicated) and C (a one-time C#
 startup backfill — a new pattern + a two-phase column drop). B reuses the
 existing importer + import flow with the least new surface.
 

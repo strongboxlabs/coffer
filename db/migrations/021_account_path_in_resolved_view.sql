@@ -14,9 +14,9 @@
 -- DEFINER, so RLS on accounts evaluates as usual through the
 -- security_invoker resolved_transactions view.
 --
--- Depth is 1-3 levels in practice, bounded by Moneydance's category
--- UI conventions.
--- The recursive walk is at most three PK lookups per call.
+-- The recursive walk is one PK lookup per level of the account's
+-- ancestry, so a call costs the depth of that one path, not the size
+-- of the ledger.
 --
 -- View rewrite
 -- ------------

@@ -15,8 +15,7 @@ namespace Coffer.Api.Tests.Integration.Notifications;
 /// </summary>
 /// <remarks>
 /// <para>
-/// This monitor had NO tests, which is how three separate delivery blockers reached
-/// 0.65.0. Untested time arithmetic in an alerting path is the specific way you end up
+/// Untested time arithmetic in an alerting path is the specific way you end up
 /// with an alert that never fires: nothing about a threshold comparison is
 /// self-evidently right, and the failure mode is silence — indistinguishable from
 /// "nothing was wrong" until the day something is.
@@ -29,16 +28,15 @@ namespace Coffer.Api.Tests.Integration.Notifications;
 /// </para>
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class BackupAgeMonitorTests : IDisposable
+public sealed class BackupAgeMonitorTests : DatabaseTest, IDisposable
 {
     private const string TimestampFormat = "yyyyMMdd'T'HHmmssfff'Z'";
 
-    private readonly PostgresFixture _fixture;
     private readonly string _dir;
 
-    public BackupAgeMonitorTests(PostgresFixture fixture)
+    public BackupAgeMonitorTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
         _dir = Path.Combine(Path.GetTempPath(), "coffer-agemon-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(_dir);
     }
@@ -58,20 +56,22 @@ public sealed class BackupAgeMonitorTests : IDisposable
     private BackupAgeMonitor Monitor() => new(
         new BackupStore(_dir, NullLogger<BackupStore>.Instance, 1024 * 1024, TimeProvider.System),
         new NotificationPublisher(
-            _fixture.NewServiceFactory(),
-            _fixture.NewLedgerKeyService(),
+            Db.NewServiceFactory(),
+            Db.NewLedgerKeyService(),
             [],
             NullLogger<NotificationPublisher>.Instance, TimeProvider.System), TimeProvider.System);
 
+    /// <summary>The template carries this monitor's first alert (a host's first boot
+    /// writes it), and the alert throttles its own repeats; each test starts without it.</summary>
     private async Task ResetEventsAsync()
     {
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         await db.SystemEvents.ExecuteDeleteAsync();
     }
 
     private async Task<List<string>> EventKeysAsync()
     {
-        await using var db = _fixture.NewServiceDbContext();
+        await using var db = Db.NewServiceDbContext();
         return await db.SystemEvents.AsNoTracking()
             .OrderBy(e => e.OccurredAt)
             .Select(e => e.EventKey)
@@ -151,7 +151,7 @@ public sealed class BackupAgeMonitorTests : IDisposable
         await monitor.CheckAsync();
         Assert.Single(await EventKeysAsync());
 
-        await using (var db = _fixture.NewServiceDbContext())
+        await using (var db = Db.NewServiceDbContext())
         {
             await db.SystemEvents
                 .Where(e => e.EventKey == "backup.stale")

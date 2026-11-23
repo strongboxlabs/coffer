@@ -6,12 +6,12 @@
 -- recompute (ADR-0064) computes cost_basis_sold as SUM(consumed_qty * unit_cost).
 -- Migration 180 widened lots.unit_cost to NUMERIC(25,12); a fractional-share lot
 -- (quantity is also (25,12)) times a 12dp unit_cost yields up to 24 decimal
--- places. On a 6-figure position that is ~30 significant digits -- past the .NET
--- `decimal` ceiling (~28-29 sig digits) -- so Npgsql threw System.OverflowException
+-- places. With six integer digits that is ~30 significant digits -- past the .NET
+-- `decimal` ceiling (~28-29 sig digits) -- so Npgsql throws System.OverflowException
 -- while MATERIALISING the realized_gains read (InvestmentReportingRepository
--- .RealizedGainsAsync), i.e. the `realized_gains` MCP tool + report failed
+-- .RealizedGainsAsync), i.e. the `realized_gains` MCP tool + report fail
 -- outright. Pre-180 (unit_cost 4dp) the product was ~16dp and stayed under the
--- ceiling, so it never surfaced; small synthetic test amounts never reached it.
+-- ceiling; small amounts stay under it at any precision.
 --
 -- These are MONEY (ADR-0073): 2 decimals, authoritative. Constrain them so the
 -- DB rounds on store (producer can't persist sub-cent noise) and reads can never

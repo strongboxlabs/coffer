@@ -13,20 +13,18 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Ingest;
 
 /// <summary>
-/// End-to-end checks for ADR-0042 — the QIF file import (a
-/// workplace 401(k) plan and generic QIF). Fixtures mirror a real
-/// workplace-plan export shape (MM/DD/YYYY dates, <c>U</c>+<c>T</c>
+/// End-to-end checks for ADR-0042 — the QIF file import (workplace
+/// retirement plans and generic QIF). Fixtures follow a workplace-plan
+/// export shape (MM/DD/YYYY dates, <c>U</c>+<c>T</c>
 /// amounts, security names with a trailing parenthetical fund code,
 /// memo with trailing pad spaces) but use generic fund names.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class QifIngestTests
+public sealed class QifIngestTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public QifIngestTests(PostgresFixture fixture)
+    public QifIngestTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(
@@ -63,7 +61,7 @@ public sealed class QifIngestTests
 
     /// <summary>
     /// workplace-plan-shape investment QIF. Covers the action variety
-    /// seen in real data plus a ReinvDiv (to pin the zero-cash
+    /// such a QIF writes plus a ReinvDiv (to pin the zero-cash
     /// contract) and a StkSplit (unsupported → skip-with-warning):
     ///   Buy (Contribution), ShrsOut (Fees), Sell (Exchange Out),
     ///   ReinvDiv, StkSplit.
@@ -72,12 +70,12 @@ public sealed class QifIngestTests
     /// emits (the parser trims them).
     /// </summary>
     /// <summary>
-    /// A workplace-plan-shaped export: the cash moves that
-    /// make up most of a real plan statement — ContribX / WithdrwX for
+    /// A workplace-plan-shaped export: the cash moves a plan
+    /// statement can carry — ContribX / WithdrwX for
     /// payroll and hardship, XIn / XOut for rollovers — plus a RtrnCap.
-    /// Every one of these used to be dropped with a skip warning, which
-    /// left the account's cash balance wrong and made the missing rows
-    /// look like the user's own oversight.
+    /// Dropping any of these with a skip warning would leave the account's
+    /// cash balance wrong and make the missing rows look like the user's
+    /// own oversight.
     /// Synthesised — no real plan, fund, or participant data.
     /// </summary>
     private const string WorkplacePlanCashQif = """
@@ -167,8 +165,8 @@ public sealed class QifIngestTests
     [Fact]
     public async Task Preview_returns_single_investment_account_with_supported_count()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -209,8 +207,8 @@ public sealed class QifIngestTests
     [Fact]
     public async Task Preview_rejects_empty_upload_with_422()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var content = new MultipartFormDataContent
@@ -229,9 +227,9 @@ public sealed class QifIngestTests
     [Fact]
     public async Task Import_persists_investment_actions_with_ticker_hints_and_carriers()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -239,7 +237,7 @@ public sealed class QifIngestTests
             FileUpload(InvestmentQif, accountId: brokerage.Id, providerAccountId: "qif"));
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var headers = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif")
             .OrderBy(h => h.PostedAt)
@@ -266,8 +264,13 @@ public sealed class QifIngestTests
         Assert.Equal(5.000m, byDate["2024-01-05"].IngestShares);
         Assert.Equal(100.00m, byDate["2024-01-05"].IngestUnitPrice);
 
-        // Memo (M) trailing pad spaces are trimmed.
-        Assert.Equal("Contribution", byDate["2024-01-05"].Memo);
+        // Memo (M) trailing pad spaces are trimmed. It is the account imported
+        // into's own memo, on its leg; the other side inherits it.
+        var buyId = byDate["2024-01-05"].Id;
+        Assert.Null(byDate["2024-01-05"].Memo);
+        Assert.Equal("Contribution", await db.TxnLegs.AsNoTracking()
+            .Where(l => l.HeaderId == buyId && l.AccountId == brokerage.Id)
+            .Select(l => l.LegMemo).SingleAsync());
     }
 
     [Fact]
@@ -277,9 +280,9 @@ public sealed class QifIngestTests
         // FITID. online_match_fitid is the OFX-protocol-only
         // cross-source-dedup substrate; a QIF import must never write
         // its synthetic id there (would pollute the OFX-only column).
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -287,7 +290,7 @@ public sealed class QifIngestTests
             FileUpload(InvestmentQif, accountId: brokerage.Id, providerAccountId: "qif"));
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var headers = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif")
             .ToListAsync();
@@ -302,9 +305,9 @@ public sealed class QifIngestTests
     [Fact]
     public async Task Import_buy_lands_negative_cash_sell_positive_reinvest_zero()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -312,7 +315,7 @@ public sealed class QifIngestTests
             FileUpload(InvestmentQif, accountId: brokerage.Id, providerAccountId: "qif"));
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var headers = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif")
             .ToListAsync();
@@ -337,8 +340,8 @@ public sealed class QifIngestTests
     [Fact]
     public async Task Workplace_plan_cash_moves_import_instead_of_warning()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -355,9 +358,9 @@ public sealed class QifIngestTests
         Assert.Equal(5, account.TransactionCount);
 
         // And nothing is skipped. This is the half worth asserting
-        // explicitly: the old behaviour was a SUCCESSFUL import that
-        // silently contained none of these rows, so a count alone would
-        // have passed against a preview that warned five times.
+        // explicitly: a SUCCESSFUL import can silently contain none of
+        // these rows, so a count alone would pass against a preview that
+        // warned five times.
         Assert.DoesNotContain(preview.Errors,
             e => e.Code == "qif_investment_action_unsupported");
     }
@@ -365,9 +368,9 @@ public sealed class QifIngestTests
     [Fact]
     public async Task Workplace_plan_contributions_land_cash_in_and_withdrawals_cash_out()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var plan = await ledger.AddInvestmentAccountAsync("plan");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(
@@ -375,7 +378,7 @@ public sealed class QifIngestTests
             FileUpload(WorkplacePlanCashQif, accountId: plan.Id, providerAccountId: "qif"));
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var headers = await db.TxnHeaders.AsNoTracking()
             .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif")
             .ToListAsync();
@@ -409,9 +412,9 @@ public sealed class QifIngestTests
     [Fact]
     public async Task Reimport_of_same_file_dedups_against_synthetic_external_ids()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("brokerage");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var first = await client.PostAsync(
@@ -431,19 +434,276 @@ public sealed class QifIngestTests
         Assert.Equal(4, secondResult.AlreadyKnown);
 
         // Still exactly 4 rows in the DB after the re-import.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var count = await db.TxnHeaders.AsNoTracking()
             .CountAsync(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif");
         Assert.Equal(4, count);
     }
 
+    // -------------------------------------------------------------
+    // Numbers that do not read (ADR-0114 D15)
+    // -------------------------------------------------------------
+
+    /// <summary>A readable row on lines 2-5, an amount that is not a number on line 7,
+    /// an amount with an ambiguous comma on line 11, and a readable row with grouped
+    /// thousands on lines 14-17.</summary>
+    private const string BankQifWithUnreadableAmounts =
+        "!Type:Bank\n"
+        + "D01/05/2026\nT-12.00\nPSAMPLE STORE\n^\n"
+        + "D01/06/2026\nT-1O.00\nPSAMPLE CAFE\n^\n"
+        + "D01/07/2026\nT-12,34\nPSAMPLE MARKET\n^\n"
+        + "D01/08/2026\nT1,234.50\nPSAMPLE PAYER\n^\n";
+
+    [Fact]
+    public async Task An_import_skips_each_row_whose_amount_does_not_read_names_its_line_and_imports_the_rest()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var resp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/qif/import",
+            FileUpload(BankQifWithUnreadableAmounts, accountId: bank.Id, providerAccountId: "qif"));
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var result = await resp.Content.ReadFromJsonAsync<FileIngestImportResponse>();
+        Assert.Equal(2, result!.TransactionsForReview);
+        Assert.Equal(
+            [
+                "Line 7: '-1O.00' does not read as an amount. The row was skipped.",
+                "Line 11: '-12,34' does not read as an amount one way only: a comma not followed by "
+                    + "exactly three digits could be a decimal comma. The row was skipped.",
+            ],
+            result.Errors.Select(e => e.Message));
+        Assert.All(result.Errors, e => Assert.Equal("qif_row_unreadable", e.Code));
+
+        // No silent zero: the two rows that do not read are not in the register at all,
+        // and the grouped thousands read as thousands.
+        await using var db = Db.NewDbContext();
+        var amounts = await db.TxnLegs.AsNoTracking()
+            .Where(l => l.AccountId == bank.Id)
+            .Join(db.TxnHeaders.AsNoTracking(), l => l.HeaderId, h => h.Id, (l, h) => new { h.Payee, l.Amount })
+            .ToDictionaryAsync(x => x.Payee!, x => x.Amount);
+        Assert.Equal(2, amounts.Count);
+        Assert.Equal(-12.00m, amounts["SAMPLE STORE"]);
+        Assert.Equal(1234.50m, amounts["SAMPLE PAYER"]);
+    }
+
+    private const string BankQifWithGroupedThousands =
+        "!Type:Bank\nD01/05/2026\nT-1,234\nPSAMPLE STORE\n^\n";
+
+    [Fact]
+    public async Task A_comma_followed_by_three_digits_is_refused_in_a_three_place_account_at_import_and_at_a_preview_that_names_it()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var threePlace = await ledger.AddBankAccountAsync("dinar", currencyCode: "KWD");
+        var twoPlace = await ledger.AddBankAccountAsync("checking");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        const string refusal =
+            "Line 3: '-1,234' does not read as an amount one way only: in a KWD account, whose currency "
+            + "has three decimal places, a comma followed by three digits could be a decimal comma or a "
+            + "thousands separator. The row was skipped.";
+
+        var import = await (await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/qif/import",
+                FileUpload(BankQifWithGroupedThousands, accountId: threePlace.Id, providerAccountId: "qif")))
+            .Content.ReadFromJsonAsync<FileIngestImportResponse>();
+        Assert.Equal(0, import!.TransactionsForReview);
+        Assert.Equal([refusal], import.Errors.Select(e => e.Message));
+
+        // The preview reports what the import will, once the dialog has named the account.
+        var named = await (await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/qif/preview",
+                FileUpload(BankQifWithGroupedThousands, accountId: threePlace.Id)))
+            .Content.ReadFromJsonAsync<FileIngestPreviewResponse>();
+        Assert.Equal(0, named!.Accounts.Single().TransactionCount);
+        Assert.Equal([refusal], named.Errors.Select(e => e.Message));
+
+        // A preview that names no account, or an import into a two-place account, reads
+        // the comma as thousands.
+        var unnamed = await (await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/qif/preview",
+                FileUpload(BankQifWithGroupedThousands)))
+            .Content.ReadFromJsonAsync<FileIngestPreviewResponse>();
+        Assert.Equal(1, unnamed!.Accounts.Single().TransactionCount);
+        Assert.Empty(unnamed.Errors);
+
+        var imported = await (await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/qif/import",
+                FileUpload(BankQifWithGroupedThousands, accountId: twoPlace.Id, providerAccountId: "qif")))
+            .Content.ReadFromJsonAsync<FileIngestImportResponse>();
+        Assert.Equal(1, imported!.TransactionsForReview);
+        Assert.Empty(imported.Errors);
+    }
+
+    /// <summary>Two rows with lakh-grouped amounts, on lines 3 and 7.</summary>
+    private const string BankQifWithLakhGrouping =
+        "!Type:Bank\n"
+        + "D01/05/2026\nT-1,23,456.78\nPSAMPLE STORE\n^\n"
+        + "D01/06/2026\nT12,34,567.00\nPSAMPLE PAYER\n^\n";
+
+    [Fact]
+    public async Task A_lakh_grouped_file_imports_whole_and_a_reimport_matches_its_rows()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("checking");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var first = await (await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/qif/import",
+                FileUpload(BankQifWithLakhGrouping, accountId: bank.Id, providerAccountId: "qif")))
+            .Content.ReadFromJsonAsync<FileIngestImportResponse>();
+        Assert.Empty(first!.Errors);
+        Assert.Equal(2, first.TransactionsForReview);
+
+        var second = await (await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/qif/import",
+                FileUpload(BankQifWithLakhGrouping, accountId: bank.Id, providerAccountId: "qif")))
+            .Content.ReadFromJsonAsync<FileIngestImportResponse>();
+        Assert.Empty(second!.Errors);
+        Assert.Equal(0, second.TransactionsForReview);
+        Assert.Equal(2, second.AlreadyKnown);
+
+        await using var db = Db.NewDbContext();
+        var amounts = await db.TxnLegs.AsNoTracking()
+            .Where(l => l.AccountId == bank.Id)
+            .Join(db.TxnHeaders.AsNoTracking(), l => l.HeaderId, h => h.Id, (l, h) => new { h.Payee, l.Amount })
+            .ToDictionaryAsync(x => x.Payee!, x => x.Amount);
+        Assert.Equal(2, amounts.Count);
+        Assert.Equal(-123456.78m, amounts["SAMPLE STORE"]);
+        Assert.Equal(1234567.00m, amounts["SAMPLE PAYER"]);
+    }
+
+    [Fact]
+    public async Task A_lakh_grouped_amount_is_refused_in_a_three_place_account_naming_its_line()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var threePlace = await ledger.AddBankAccountAsync("dinar", currencyCode: "KWD");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var import = await (await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/qif/import",
+                FileUpload(BankQifWithLakhGrouping, accountId: threePlace.Id, providerAccountId: "qif")))
+            .Content.ReadFromJsonAsync<FileIngestImportResponse>();
+        Assert.Equal(0, import!.TransactionsForReview);
+        Assert.Equal(
+            [
+                "Line 3: '-1,23,456.78' does not read as an amount one way only: in a KWD account, whose "
+                    + "currency has three decimal places, a comma followed by three digits could be a decimal "
+                    + "comma or a thousands separator. The row was skipped.",
+                "Line 7: '12,34,567.00' does not read as an amount one way only: in a KWD account, whose "
+                    + "currency has three decimal places, a comma followed by three digits could be a decimal "
+                    + "comma or a thousands separator. The row was skipped.",
+            ],
+            import.Errors.Select(e => e.Message));
+    }
+
+    [Fact]
+    public async Task A_preview_that_names_an_account_outside_the_ledger_is_refused()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var otherLedger = await SyntheticLedger.CreateAsync(Db);
+        var foreignAccount = await otherLedger.AddBankAccountAsync("foreign");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var resp = await client.PostAsync(
+            $"/api/ledgers/{ledger.LedgerId}/ingest/qif/preview",
+            FileUpload(BankQifWithGroupedThousands, accountId: foreignAccount.Id));
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, resp.StatusCode);
+        using var problem = System.Text.Json.JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        Assert.Equal("account-not-in-ledger", problem.RootElement.GetProperty("code").GetString());
+    }
+
+    // -------------------------------------------------------------
+    // The external id hashes the amount as parsed (ADR-0114 D15)
+    // -------------------------------------------------------------
+
+    private static string WholeUnitQif(string amount) =>
+        $"!Type:Bank\nD01/05/2026\nT{amount}\nPSAMPLE STORE\n^\n";
+
+    [Fact]
+    public async Task A_rounded_row_is_known_on_reimport_and_its_originals_are_seeded_once()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("checking", currencyCode: "JPY");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        var first = await (await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/qif/import",
+                FileUpload(WholeUnitQif("-1234.5"), accountId: bank.Id, providerAccountId: "qif")))
+            .Content.ReadFromJsonAsync<FileIngestImportResponse>();
+        Assert.Equal(1, first!.TransactionsForReview);
+
+        await using (var db = Db.NewDbContext())
+        {
+            var header = await db.TxnHeaders.AsNoTracking()
+                .SingleAsync(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif");
+            Assert.Equal(-1235m, await db.TxnLegs.AsNoTracking()
+                .Where(l => l.HeaderId == header.Id && l.AccountId == bank.Id)
+                .Select(l => l.Amount).SingleAsync());
+            var originals = await db.TxnHeaderOriginals.AsNoTracking().SingleAsync(o => o.HeaderId == header.Id);
+            Assert.Equal(-1234.5m, originals.Amount);
+            Assert.True(originals.RoundedAtImport);
+        }
+
+        var second = await (await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/qif/import",
+                FileUpload(WholeUnitQif("-1234.5"), accountId: bank.Id, providerAccountId: "qif")))
+            .Content.ReadFromJsonAsync<FileIngestImportResponse>();
+        Assert.Equal(0, second!.TransactionsForReview);
+        Assert.Equal(1, second.AlreadyKnown);
+
+        await using var after = Db.NewDbContext();
+        var headerIds = await after.TxnHeaders.AsNoTracking()
+            .Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif")
+            .Select(h => h.Id).ToListAsync();
+        Assert.Single(headerIds);
+        Assert.Equal(1, await after.TxnHeaderOriginals.AsNoTracking().CountAsync(o => headerIds.Contains(o.HeaderId)));
+    }
+
+    [Fact]
+    public async Task Two_figures_that_round_alike_are_two_rows_because_each_is_hashed_as_parsed()
+    {
+        // Hashing the rounded figure would give the second its predecessor's id, and the
+        // import would drop it as already known.
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("checking", currencyCode: "JPY");
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+
+        Assert.Equal(1, (await (await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/qif/import",
+                FileUpload(WholeUnitQif("-1234.4"), accountId: bank.Id, providerAccountId: "qif")))
+            .Content.ReadFromJsonAsync<FileIngestImportResponse>())!.TransactionsForReview);
+
+        var second = await (await client.PostAsync(
+                $"/api/ledgers/{ledger.LedgerId}/ingest/qif/import",
+                FileUpload(WholeUnitQif("-1234.3"), accountId: bank.Id, providerAccountId: "qif")))
+            .Content.ReadFromJsonAsync<FileIngestImportResponse>();
+        Assert.Equal(1, second!.TransactionsForReview);
+        Assert.Equal(0, second.AlreadyKnown);
+
+        await using var db = Db.NewDbContext();
+        var originals = await db.TxnHeaderOriginals.AsNoTracking()
+            .Join(db.TxnHeaders.AsNoTracking().Where(h => h.LedgerId == ledger.LedgerId && h.ProviderKey == "qif"),
+                o => o.HeaderId, h => h.Id, (o, h) => o.Amount)
+            .ToListAsync();
+        Assert.Equal([-1234.3m, -1234.4m], originals.Select(a => a!.Value).OrderByDescending(a => a));
+    }
+
     [Fact]
     public async Task Import_422s_when_account_does_not_belong_to_ledger()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        var otherLedger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var otherLedger = await SyntheticLedger.CreateAsync(Db);
         var foreignAccount = await otherLedger.AddInvestmentAccountAsync("foreign");
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.PostAsync(

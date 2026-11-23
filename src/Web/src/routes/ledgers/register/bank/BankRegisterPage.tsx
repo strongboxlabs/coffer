@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 import { useNavigate, useParams, useSearch } from '@tanstack/react-router';
 import { type VirtuosoHandle } from 'react-virtuoso';
 
@@ -14,9 +15,6 @@ import {
     fetchPayees,
     fetchTags,
     approveTransaction,
-    fetchVisibleLedgers,
-    mergeTransaction,
-    patchTransaction,
     syncAccount,
 } from '@/lib/api';
 import type {
@@ -26,7 +24,6 @@ import type {
     BulkReconStatusResponse,
     CreateTransactionRequest,
     DeleteTransactionResponse,
-    LedgerSummary,
     PatchTransactionRequest,
     PayeeSuggestion,
     ReconStatus,
@@ -34,14 +31,21 @@ import type {
     RegisterRow as RegisterRowUnion,
 } from '@/lib/types';
 import { useSelection, type UseSelectionResult } from '@/lib/useSelection';
-import { TxnRowEdit, patchErrorMessage } from '../../TxnRowEdit';
+import { entryPostedAt } from '@/lib/useWindowedRegister';
+import { invalidateHomeReads } from '@/lib/registerInvalidation';
+import { TxnRowEdit } from '../../TxnRowEdit';
+import { saveRefusal } from '../../saveErrorWords';
 import type { TxnRowNewPrefill } from '../../TxnRowEdit';
+import { bankEditSeed } from '../../bank-edit/editSeed';
+import { rowsToDuplicatePrefill } from './duplicatePrefill';
+import { saveBankEdit } from '../../bank-edit/save';
 import { ReminderEditorDialog } from '../../reminders/ReminderEditorDialog';
 import {
     invalidateRegisterStatusCounts,
     useRegisterController,
 } from '../shell/useRegisterController';
 import { RegisterDeleteConfirm } from '../shell/RegisterDeleteConfirm';
+import { useRegisterFocusHome } from '../shell/useRegisterFocusHome';
 import { useRegisterKeyboardNav } from '../shell/useRegisterKeyboardNav';
 import { useRegisterBulkRecovery } from '../shell/useRegisterBulkRecovery';
 import { buildAccountPathMap } from '@/lib/accountPath';
@@ -57,12 +61,13 @@ import { MainArea } from '@/components/ui/SidebarLayout';
 
 import { RegisterTopBar } from '../shell/RegisterTopBar';
 import { RegisterShell } from '../shell/RegisterShell';
+import { accountReadError } from '../shell/accountReadError';
 import { RegisterScrollSurface } from '../shell/RegisterScrollSurface';
 import { RegisterScrollTrack } from '../RegisterScrollTrack';
 import { RegisterDateJumpPopover } from '../RegisterDateJumpPopover';
 import { RegisterControlsBar } from '../shell/RegisterControlsBar';
 import { DEFAULT_SORT, type RegisterSortState } from '../shell/registerSort';
-import { toSelectionStatusFilter } from '../shell/registerStatus';
+import { arrivalStatusOf, toSelectionStatusFilter, type RegisterArrivalStatus } from '../shell/registerStatus';
 import {
     isRegisterFilterActive,
     type RegisterFilterArgs,
@@ -74,10 +79,11 @@ import {
     buildDisplayRows,
     groupAmount,
     groupBalanceAfter,
-    regroupTargetSplits,
+    groupBalanceRateUnavailable,
     rowHasHeader,
     type DisplayRow,
 } from '@/lib/splitCollapse';
+import { splitParentNotes } from '@/lib/annotations/splitHeader';
 
 import {
     BANK_COLS,
@@ -92,8 +98,12 @@ import { RawDataModal } from '../shell/RawDataModal';
 import { REGISTER_SELECT_ALL_LABEL } from '../shell/registerLabels';
 import { bankRowStrategy } from '../strategies/bankRowStrategy';
 import { RegisterBulkActionBar } from '../shell/RegisterBulkActionBar';
+import { selectionFooterCounts } from '../shell/selectionFooterCounts';
 import { ensureRowFullyVisible } from '../shell/ensureRowFullyVisible';
 import { buildBankRowMenuItems } from './bankRowMenu';
+import { rowActionsFor } from '../shell/viewerRowActions';
+import { useLedgerRole } from '@/lib/useLedgerRole';
+import { systemCategoryIds } from '@/lib/categoryChip';
 
 // Per-account register, full Moneydance feature-parity columns:
 //   * Toolbar with status filters (All / Cleared / Pending / Scheduled)
@@ -109,10 +119,12 @@ import { buildBankRowMenuItems } from './bankRowMenu';
 //   * Tags chips — small default-variant chips, deterministic order
 //   * Outflow / Inflow / Balance — monospace tabular-num
 //
-// Future-dated rows render with muted text (text-text-muted on cells)
-// per the design call on 2026-05-11 — feature parity with MD's
-// scheduled-entry indicator, but our own treatment (no yellow
-// highlight, just de-emphasis + the S badge).
+// Future-dated (scheduled) rows are de-emphasised: italic subtle text
+// (the shared RegisterRow state treatment), amounts without the
+// inflow/outflow colour, and the S status badge. A scheduled entry has
+// not happened yet, so it reads as distinct from posted rows; it is
+// de-emphasised rather than highlighted so it does not compete with
+// the needs-review and status cues.
 
 import { formatLedgerDate } from '@/lib/dates';
 
@@ -124,33 +136,6 @@ const PAGE_SIZE = 100;
 // non-component module the row components share). Split-transaction
 // collapse logic lives in `@/lib/splitCollapse`; the page renders the
 // resulting DisplayRow stream below.
-
-/**
- * Build a new-transaction prefill (Duplicate path) from one OR MORE
- * source rows. A single-row duplicate passes `[row]` → one posting; a
- * split duplicate passes all the group's legs → N postings. Same path —
- * a single row is just the N=1 case (no split special-casing). Header
- * fields come from the first row; posted_at defaults to today in the
- * editor.
- */
-function rowsToDuplicatePrefill(
-    rows: readonly BankRow[],
-): TxnRowNewPrefill {
-    const head = rows[0]!;
-    return {
-        payee: head.payee,
-        memo: head.headerMemo,
-        checkNumber: head.checkNumber,
-        postings: rows.map((r) => ({
-            counterpartyAccountId: r.counterpartyAccountId,
-            amount: r.amount,
-            legMemo: r.legMemo,
-            // Duplicating a rental split and losing which unit each posting was
-            // for would defeat the point of having recorded it.
-            legTags: r.legTags,
-        })),
-    };
-}
 
 export function BankRegisterPage() {
     const { ledgerId, accountId } = useParams({ strict: false }) as {
@@ -165,6 +150,7 @@ export function BankRegisterPage() {
     const search = useSearch({ strict: false }) as {
         focus?: string;
         subcategories?: boolean;
+        status?: RegisterArrivalStatus;
     };
     const focusFromUrl = search.focus;
     // `?subcategories` is URL-owned, unlike the rest of the filter. It decides
@@ -175,10 +161,9 @@ export function BankRegisterPage() {
     // the figure you clicked would not be the figure you land on.
     const subtreeIncluded = search.subcategories === true;
 
-    const ledgersQuery = useQuery({
-        queryKey: ['ledgers'],
-        queryFn: fetchVisibleLedgers,
-    });
+    // A viewer reads the register and writes nothing: no new transaction, no
+    // editor, no write item in the row menu, no bulk action, import or sync.
+    const { ledger, canEdit } = useLedgerRole(ledgerId);
     // The register works with the full account universe — including inactive
     // accounts (so an inactive account's register still resolves its name +
     // currency for the breadcrumb) and every counterparty (so the row chips +
@@ -191,7 +176,6 @@ export function BankRegisterPage() {
         queryFn: () => fetchAccounts(ledgerId, { includeInactive: true }),
     });
 
-    const ledger = findById<LedgerSummary>(ledgersQuery.data, ledgerId);
     const account = findById<AccountSummary>(accountsQuery.data, accountId);
     // RegisterRouter dispatches investment accounts to
     // InvestmentRegisterPage, so this page only ever renders
@@ -199,7 +183,7 @@ export function BankRegisterPage() {
     // liability / loan / category). The cell renderers are bank-
     // specific and imported directly from `../strategies/bankStrategy`.
 
-    // Shared register-container controller (review #18): owns the
+    // Shared register-container controller: owns the
     // windowed register, the index-bucket query, currentYearMonth,
     // seekToBucket, refreshLoadedBalances, and the recon-status
     // optimistic patch + mutation + cycle order. Initial load anchors
@@ -208,7 +192,10 @@ export function BankRegisterPage() {
     // Status filter, incl. the ADR-0072 Hidden view. Declared here —
     // above the controller — because `hidden` re-scopes the windowed
     // fetch, so the controller takes it as an input.
-    const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+    // Seeded from `?status=` on arrival (Needs review or Hidden); the register's own
+    // state after.
+    const [statusFilter, setStatusFilter] = useState<StatusFilter>(
+        arrivalStatusOf(search.status) ?? 'all');
     // Structured/search filter (mig 164). useState keeps a stable reference
     // between renders — required, since the controller threads it into the
     // windowed hook's effect deps.
@@ -233,7 +220,7 @@ export function BankRegisterPage() {
         currentYearMonth,
         seekToBucket,
         refreshLoadedBalances,
-        repositionIfDateChanged,
+        reseatIfMoved,
         patchHeadersStatus,
         cycleReconStatus,
     } = useRegisterController({
@@ -340,24 +327,17 @@ export function BankRegisterPage() {
     function refreshAfterImportChange() {
         register.refresh();
         queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+        invalidateHomeReads(queryClient, ledgerId);
         queryClient.invalidateQueries({
             queryKey: ['register-index-buckets', ledgerId, accountId],
         });
     }
 
     const patchMutation = useMutation({
+        // A merge or the PATCH, by the body (bank-edit/save.ts).
         mutationFn: (args: { headerId: string; body: PatchTransactionRequest }) =>
-            // A merge is a command with its own route. The editor produces a
-            // merge-only body by construction (the fields are moot once a
-            // candidate is armed), so the presence of mergeFromHeaderId IS the
-            // signal — there is no mixed edit-and-merge save to disambiguate.
-            // The server would reject it either way now: the field is
-            // [JsonIgnore] on the PATCH contract.
-            args.body.mergeFromHeaderId
-                ? mergeTransaction(
-                      ledgerId, args.headerId, args.body.mergeFromHeaderId, accountId)
-                : patchTransaction(ledgerId, args.headerId, args.body, accountId),
-        onSuccess: (savedEntry, args) => {
+            saveBankEdit(ledgerId, args.headerId, args.body, accountId),
+        onSuccess: (savedEntries, args) => {
             queryClient.invalidateQueries({ queryKey: ['payees', ledgerId] });
             // Any save can clear / drop a `needs_review` row: an
             // edit-then-approve (approve: true) clears the flag, and a
@@ -368,6 +348,7 @@ export function BankRegisterPage() {
             // (lightweight background refetch, no page reload) when the
             // last pending item in the account is handled.
             queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+            invalidateHomeReads(queryClient, ledgerId);
             // Slice 2c.6 follow-up: any save can shift the Accept-
             // flow chip surfaces — accepting a row clears its
             // needs_review (the editor's gates now return empty);
@@ -382,19 +363,19 @@ export function BankRegisterPage() {
             queryClient.invalidateQueries({ queryKey: ['merge-candidates', ledgerId] });
             queryClient.invalidateQueries({ queryKey: ['similar-payees', ledgerId] });
 
-            // Always patch the saved row in place from the server's
-            // response (or drop it if the row no longer matches the
-            // view's visibility filters — e.g. it became hidden /
-            // merged-away). For BALANCE-AFFECTING edits we ALSO
+            // Always swap the saved header's rows in place for the server's
+            // answer: every entry the header has in this account, which can
+            // be several (each line of a split seen from its other side is
+            // its own row), or none when it left the register (e.g. it
+            // became hidden / merged-away). For BALANCE-AFFECTING edits we ALSO
             // fetch fresh balance + net-amount for every header
             // currently loaded and patch them in place — same
             // refresh path the user sees on a manual reload, just
             // scoped to the loaded window so virtuoso doesn't
             // data-swap and the scroll position survives.
             //
-            // Previously this branch called `register.refresh(headerId)`
-            // which re-fetched the whole page, swapped virtuoso's
-            // data prop, and jerked the viewport. The in-place
+            // Not `register.refresh(headerId)`, which re-fetches the whole
+            // page, swaps virtuoso's data prop, and jerks the viewport. The in-place
             // balance refresh below preserves the row's screen
             // position — important after the user spends seconds in
             // an edit and expects to land back where they were.
@@ -405,74 +386,53 @@ export function BankRegisterPage() {
                 // (savedHeaderId) became the loser; the candidate
                 // (mergedIntoId) is the surviving canonical row.
                 // The server returned the survivor's freshly-
-                // resolved entry, so swap THAT into place (it may
+                // resolved entries, so swap THOSE into place (they may
                 // have a refreshed balance / is_merge_winner flag),
                 // and remove the editor row from the view.
-                register.removeEntries((entry) =>
-                    (entry.kind === 'txn' ? entry.txn.headerId : entry.legs[0]!.headerId)
-                        === savedHeaderId);
-                if (savedEntry !== null) {
-                    // ADR-0034 / #324: the survivor adopts the imported (loser)
-                    // row's posted date, which can move its sort position. Re-seed
-                    // anchored at the survivor — the same reposition the date-edit
-                    // branch below does — so it lands in its new date-sorted slot
-                    // (the re-fetch also brings fresh running balances). Without
-                    // this the merged row is stuck at its OLD slot until a manual
-                    // refresh. When the date did NOT move, fall through to the
-                    // in-place swap that keeps the viewport steady.
-                    const survivorPostedAt =
-                        savedEntry.kind === 'txn'
-                            ? savedEntry.txn.postedAt
-                            : savedEntry.legs[0]!.postedAt;
-                    if (repositionIfDateChanged(mergedIntoId, survivorPostedAt)) {
+                register.replaceHeaderEntries(savedHeaderId, []);
+                const survivor = savedEntries[0];
+                if (survivor !== undefined) {
+                    // ADR-0034: the survivor adopts the imported (loser)
+                    // row's posted timestamp, which can move its sort position,
+                    // even within the same day. Re-seat anchored at the survivor —
+                    // the same re-seat the edit branch below does — so it lands in
+                    // its sorted slot (the re-fetch also brings fresh running
+                    // balances). Without this the merged row is stuck at its OLD
+                    // slot until a manual refresh. When the key did NOT move, fall
+                    // through to the in-place swap that keeps the viewport steady.
+                    if (reseatIfMoved(mergedIntoId, entryPostedAt(survivor))) {
                         queryClient.invalidateQueries({
                             queryKey: ['register-index-buckets', ledgerId, accountId],
                         });
                         return;
                     }
-                    register.mutateEntries((entry) => {
-                        const entryHeaderId =
-                            entry.kind === 'txn'
-                                ? entry.txn.headerId
-                                : entry.legs[0]!.headerId;
-                        return entryHeaderId === mergedIntoId ? savedEntry : entry;
-                    });
                 }
+                register.replaceHeaderEntries(mergedIntoId, savedEntries);
                 // Date unchanged: the survivor was swapped in-place above and is
                 // focused in-place by saveEdit (setFocusedRowId on the returned
                 // entry) — so the viewport stays put after a fold. Do NOT navigate
                 // to ?focus=survivor here: that re-seeds the windowed register and
-                // jerks the scroll on every merge (regression — merges should
-                // highlight the survivor in place, not re-fetch + scroll).
-            } else if (savedEntry === null) {
-                register.removeEntries((entry) =>
-                    (entry.kind === 'txn' ? entry.txn.headerId : entry.legs[0]!.headerId)
-                        === savedHeaderId);
+                // jerks the scroll on every merge — merges highlight the
+                // survivor in place, not re-fetch + scroll.
+            } else if (savedEntries.length === 0) {
+                register.replaceHeaderEntries(savedHeaderId, []);
             } else {
-                // A posted-date change moves the row's sort position, so
-                // patching in place would leave it stuck. Re-seed the
-                // window anchored at the header so it relocates to its
-                // new date-sorted slot (the re-fetch also brings fresh
-                // balances, so skip the in-place patch + balance refresh
-                // below). Non-date edits fall through to the in-place
-                // patch that preserves the row's screen position.
-                const newPostedAt =
-                    savedEntry.kind === 'txn'
-                        ? savedEntry.txn.postedAt
-                        : savedEntry.legs[0]!.postedAt;
-                if (repositionIfDateChanged(savedHeaderId, newPostedAt)) {
+                // A posted-timestamp change moves the row's sort position, so
+                // patching in place would leave it stuck. An Accept writes the
+                // date at midnight, so a feed row that carried a time of day
+                // moves even when the day is unchanged. Re-seed the window
+                // anchored at the header so it relocates to its sorted slot
+                // (the re-fetch also brings fresh balances, so skip the
+                // in-place patch + balance refresh below). Writes that keep
+                // the key fall through to the in-place patch that preserves
+                // the row's screen position.
+                if (reseatIfMoved(savedHeaderId, entryPostedAt(savedEntries[0]!))) {
                     queryClient.invalidateQueries({
                         queryKey: ['register-index-buckets', ledgerId, accountId],
                     });
                     return;
                 }
-                register.mutateEntries((entry) => {
-                    const entryHeaderId =
-                        entry.kind === 'txn'
-                            ? entry.txn.headerId
-                            : entry.legs[0]!.headerId;
-                    return entryHeaderId === savedHeaderId ? savedEntry : entry;
-                });
+                register.replaceHeaderEntries(savedHeaderId, savedEntries);
             }
 
             const isBalanceAffecting =
@@ -514,6 +474,11 @@ export function BankRegisterPage() {
             queryClient.invalidateQueries({
                 queryKey: ['register-index-buckets', ledgerId, accountId],
             });
+            // The new row moves this account's balance, and a transfer's
+            // other side too: the prefix refreshes the account list and the
+            // sidebar's figures (FU-052).
+            queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+            invalidateHomeReads(queryClient, ledgerId);
             // Navigate to ?focus=<newHeaderId> so the Show-Other-Side
             // arrival path takes over: useWindowedRegister re-seeds
             // with starting_at=<headerId>, anchors the new row at the
@@ -555,9 +520,10 @@ export function BankRegisterPage() {
     // THAT would let the edit land and the approval fail, leaving the row
     // changed but still queued.
     //
-    // Returns the freshly-resolved register entry when account-scoped, which
-    // this mutation ignores: the optimistic patch already fired in onMutate.
-    const approveMutation = useMutation<RegisterEntry | null, ApiError, { headerId: string }>({
+    // Returns the freshly-resolved register entries when account-scoped, which
+    // this mutation ignores: the optimistic patch already fired in onMutate,
+    // on every row of the header.
+    const approveMutation = useMutation<RegisterEntry[], ApiError, { headerId: string }>({
         mutationFn: (args) => approveTransaction(ledgerId, args.headerId, accountId),
         onMutate: (args) => patchHeaderNeedsReview(args.headerId, false),
         onSuccess: () => {
@@ -566,6 +532,7 @@ export function BankRegisterPage() {
             // dot (sourced from `needsReviewCount`) resets live when
             // this was the account's last pending item — no reload.
             queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+            invalidateHomeReads(queryClient, ledgerId);
         },
     });
 
@@ -584,6 +551,7 @@ export function BankRegisterPage() {
             // appear at their date-sorted position.
             register.refresh();
             queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+            invalidateHomeReads(queryClient, ledgerId);
             queryClient.invalidateQueries({
                 queryKey: ['register-index-buckets', ledgerId, accountId],
             });
@@ -596,7 +564,7 @@ export function BankRegisterPage() {
     const [importDialogOpen, setImportDialogOpen] = useState(false);
 
     // DELETE a single transaction. Bank registers may show legs
-    // from investment headers (Transfer / DivXfr cash side), but
+    // from investment headers (Transfer / DividendXfr cash side), but
     // those rows are read-only here — the `↗ Investment` badge +
     // context-menu gate prevent the user from initiating a delete
     // on a row whose canonical owner is an investment header. So
@@ -615,12 +583,11 @@ export function BankRegisterPage() {
     // values — same bug class as patch-without-refresh.
     // Also invalidate the holdings + accounts queries since deletes
     // can shift cost-basis + review-dot counts.
-    // A refused delete used to vanish. Neither delete mutation defined onError,
-    // and the single path is invoked as `void onDelete(target)` — so a 422 or a
-    // dropped connection became an unhandled rejection, the confirm dialog closed,
-    // and the row stayed on screen. It reads as a click that did not register, so
-    // the user clicks again. The investment register has surfaced this since it
-    // shipped; this is that behaviour, not a new one.
+    // A refused delete must not vanish. The single path is invoked as
+    // `void onDelete(target)`, so without an onError a 422 or a dropped connection
+    // becomes an unhandled rejection, the confirm dialog closes, and the row stays
+    // on screen. It reads as a click that did not register, so the user clicks
+    // again. The error is shown instead, as the investment register shows it.
     const [deleteError, setDeleteError] = useState<string | null>(null);
 
     const deleteMutation = useMutation<
@@ -641,6 +608,7 @@ export function BankRegisterPage() {
                     === deletedId);
             void refreshLoadedBalances();
             queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+            invalidateHomeReads(queryClient, ledgerId);
             queryClient.invalidateQueries({ queryKey: ['holdings'] });
             queryClient.invalidateQueries({
                 queryKey: ['register-index-buckets', ledgerId, accountId],
@@ -709,6 +677,7 @@ export function BankRegisterPage() {
             // review-dot (sourced from `needsReviewCount`) resets live
             // without a page reload.
             queryClient.invalidateQueries({ queryKey: ['accounts', ledgerId] });
+            invalidateHomeReads(queryClient, ledgerId);
             queryClient.invalidateQueries({
                 queryKey: ['register-index-buckets', ledgerId, accountId],
             });
@@ -735,10 +704,11 @@ export function BankRegisterPage() {
     // investment accounts to InvestmentRegisterPage, so any non-`bank`
     // row here would be a routing bug — drop it rather than coerce).
     // Everything downstream then operates on `BankRow` with no casts.
-    // Cluster ADR-0036 target-splits into expandable parents — the shared
-    // regroup (ADR-0080), the same one the investment register uses.
+    // No client-side clustering: only the account that owns a split gets a
+    // group entry, and each line of a split seen from its other side is its
+    // own row.
     const allEntries = useMemo<readonly BankEntry[]>(
-        () => regroupTargetSplits<BankRow>(narrowToBankEntries(register.entries)),
+        () => narrowToBankEntries(register.entries),
         [register.entries],
     );
 
@@ -799,7 +769,11 @@ export function BankRegisterPage() {
         [visibleEntries, expandedGroups],
     );
 
-    const currency = account?.currencyCode ?? 'USD';
+    // The account's currency. Each row's Amount and Balance print in the currencies
+    // the row names (ADR-0114 D7): on a category the Amount is the paying account's and
+    // the Balance the reporting currency's. Until the account list has the account the
+    // list keeps its loading state, as the editor and the header figures read this one.
+    const currency = account?.currencyCode ?? null;
 
     function toggleGroupExpanded(groupId: string) {
         setExpandedGroups((prev) => {
@@ -823,7 +797,7 @@ export function BankRegisterPage() {
                             QIF — ADR-0042). Only for an active real account —
                             never a category (you don't import a statement into a
                             budget category) nor an inactive account. */}
-                        {account?.isActive && account?.accountType !== 'category' ? (
+                        {canEdit && account?.isActive && account?.accountType !== 'category' ? (
                             <Button
                                 type="button"
                                 variant="secondary"
@@ -836,7 +810,8 @@ export function BankRegisterPage() {
                                 Import
                             </Button>
                         ) : null}
-                        {account?.isActive
+                        {canEdit
+                        && account?.isActive
                         && account?.feedConnectionId !== null
                         && account?.feedConnectionId !== undefined ? (
                             // Slice 2c.3: per-account sync. Visible only when
@@ -849,17 +824,12 @@ export function BankRegisterPage() {
                                 size="sm"
                                 title="Sync this account from SimpleFIN"
                                 onClick={() => syncAccountMutation.mutate()}
-                                disabled={syncAccountMutation.isPending}
+                                pending={syncAccountMutation.isPending}
+                                pendingLabel={<><RefreshCw className="size-icon-sm animate-spin" aria-hidden />Syncing…</>}
                                 className="ml-1 gap-1.5"
                             >
-                                <RefreshCw
-                                    className={
-                                        'size-icon-sm ' +
-                                        (syncAccountMutation.isPending ? 'animate-spin' : '')
-                                    }
-                                    aria-hidden
-                                />
-                                {syncAccountMutation.isPending ? 'Syncing…' : 'Sync account'}
+                                <RefreshCw className="size-icon-sm" aria-hidden />
+                                Sync account
                             </Button>
                         ) : null}
                     </>
@@ -900,6 +870,7 @@ export function BankRegisterPage() {
 
                     <RegisterTable
                         ledgerId={ledgerId}
+                        canEdit={canEdit}
                         displayRows={displayRows}
                         currency={currency}
                         today={today}
@@ -972,7 +943,9 @@ export function BankRegisterPage() {
                         hasSubcategories={hasSubcategories}
                         statusCounts={statusCounts}
                         initialLoaded={register.initialLoaded}
-                        initialError={register.initialError}
+                        // The list also waits for the account (its currency), so
+                        // the account read's failure is the list's too.
+                        initialError={register.initialError ?? accountReadError(accountsQuery, account)}
                         isEmpty={allEntries.length === 0}
                         filterActive={filterActive}
                     />
@@ -985,6 +958,7 @@ export function BankRegisterPage() {
                 count={selection.summary?.count ?? 0}
                 pending={recovery.bulkMovePending}
                 error={recovery.moveError}
+                becameTwoAmount={recovery.moveBecameTwoAmount}
                 onConfirm={recovery.onMoveConfirm}
                 onCancel={recovery.closeMoveDialog}
             />
@@ -1007,8 +981,14 @@ interface RegisterTableProps {
     /** Ledger scope. Threaded down to TxnRowEdit so the editor's
      *  similar-payees fetch (slice 2c.6c) has a per-ledger key. */
     ledgerId: string;
+    /** The user may write to this ledger (owner or editor). False for a
+     *  viewer: every write control is withheld (lib/ledgerRole.ts). */
+    canEdit: boolean;
     displayRows: readonly DisplayRow<BankRow>[];
-    currency: string;
+    /** The account's currency; null until the account list has the account.
+     *  Until then the list keeps its loading state, no Σ is drawn and no new
+     *  transaction opens, so no figure prints in a currency it is not in. */
+    currency: string | null;
     today: Date;
     /** Bulk-selection facade (ADR-0024). Owns the discriminated
      *  explicit-vs-all selection state and exposes per-row +
@@ -1085,8 +1065,9 @@ interface RegisterTableProps {
     currentAccountId: string;
     /** Apply the patch to a single transaction. Returns the mutation
      *  promise so the edit row can exit edit mode only after the
-     *  server confirms (or surface errors on failure). */
-    onPatch: (headerId: string, body: PatchTransactionRequest) => Promise<RegisterEntry | null>;
+     *  server confirms (or surface errors on failure). Resolves to every
+     *  entry the saved header has in this register, in register order. */
+    onPatch: (headerId: string, body: PatchTransactionRequest) => Promise<RegisterEntry[]>;
     /** True while a save is in flight — disables Save and the input
      *  cells in the edit row so a rapid second commit doesn't race
      *  the first. */
@@ -1207,7 +1188,10 @@ function RegisterTable({
     indexBuckets,
     currentYearMonth,
     onSeekBucket,
+    canEdit,
 }: RegisterTableProps) {
+    // The ledger's Uncategorized, whose chip is always neutral.
+    const systemIds = useMemo(() => systemCategoryIds(accounts), [accounts]);
     // Ledger tag dictionary — feeds the Tag filter's autocomplete. The row
     // chips' colours come from TagColorsProvider (wraps the shell below),
     // which shares this ['tags', ledgerId] cache key so one fetch serves both.
@@ -1235,8 +1219,8 @@ function RegisterTable({
     }, [displayRows]);
 
     // Which header (if any) is in row-level edit mode. The edit row
-    // shows ALL editable fields at once with Save / Cancel — per-cell
-    // commit-on-blur turned out to be a UX dead-end on review.
+    // shows ALL editable fields at once with Save / Cancel, not per-cell
+    // commit-on-blur.
     const [editingHeaderId, setEditingHeaderId] = useState<string | null>(null);
     // Whether a new-transaction row is being composed. Mutually
     // exclusive with editingHeaderId — entering one cancels the
@@ -1247,7 +1231,7 @@ function RegisterTable({
     // sets focus; arrow keys move focus; Enter on focused row
     // opens edit. Selection (checkboxes) is unaffected by focus
     // changes, and vice versa.
-    const [saveError, setSaveError] = useState<string | null>(null);
+    const [saveError, setSaveError] = useState<string | ApiError | null>(null);
     // Scroll container ref. virtuoso owns the actual list element
     // but reads its scroll offset from this parent so the sticky
     // toolbar + column header (siblings of the list, inside the
@@ -1258,8 +1242,8 @@ function RegisterTable({
     const [scrollParent, setScrollParent] = useState<HTMLDivElement | null>(null);
     const virtuosoRef = useRef<VirtuosoHandle | null>(null);
 
-    // Keyboard navigation + focus cursor (review #18 — shared with
-    // the investment register). Owns `focusedRowId`, the synchronous
+    // Keyboard navigation + focus cursor (shared with the investment
+    // register). Owns `focusedRowId`, the synchronous
     // ref-mirror, `moveFocus`, and the document ArrowUp/Down/Enter/N
     // handler. Cursor is distinct from selection (ADR-0023 §B).
     const { focusedRowId, setFocusedRowId } = useRegisterKeyboardNav<DisplayRow<BankRow>>({
@@ -1270,25 +1254,24 @@ function RegisterTable({
         // Filtering is now server-side (mig 164) — the payload IS the filtered
         // set, so edge-load always paginates through matches (never suppressed).
         suppressEdgeLoad: false,
-        // LOCAL index. The comment here used to claim virtuoso adds its own
-        // firstItemIndex offset internally — it does not. The scroll-to-index
-        // system takes only { gap, listRefresh, sizes, totalCount }; it never
-        // receives firstItemIndex, so it cannot subtract one, and the index it
-        // wants is in the same space as `sizes` — the rendered data array.
-        // Adding the offset overshot after a front eviction (firstItemIndex
-        // climbs) and clamped to the top after a prepend (it goes negative),
-        // so keyboard navigation scrolled to the wrong row once the window had
-        // moved. Harmless until then, because the offset is 0 on a fresh window
-        // — which is why it survived. The investment register always passed the
-        // local index and was right.
+        // LOCAL index. Virtuoso does not add a firstItemIndex offset internally:
+        // the scroll-to-index system takes only { gap, listRefresh, sizes,
+        // totalCount }; it never receives firstItemIndex, so it cannot subtract
+        // one, and the index it wants is in the same space as `sizes` — the
+        // rendered data array. Adding the offset would overshoot after a front
+        // eviction (firstItemIndex climbs) and clamp to the top after a prepend
+        // (it goes negative), so keyboard navigation would scroll to the wrong
+        // row once the window has moved — while looking right on a fresh window,
+        // where the offset is 0. The investment register passes the local index
+        // too.
         scrollRowIntoView: (localIndex) =>
             virtuosoRef.current?.scrollIntoView({ index: localIndex }),
         enabled: editingHeaderId === null && !isCreatingNew,
         // ArrowRight expands a focused split parent, ArrowLeft collapses it —
-        // the conventional treegrid keys, previously unbound. #547 gave the
-        // split parent Enter-to-edit but left expansion reachable only by
-        // Tabbing to the toggle, which works and is not what a keyboard user
-        // reaches for on a disclosure row.
+        // the conventional treegrid keys. Enter edits a split parent, so
+        // without these expansion is reachable only by Tabbing to the toggle,
+        // which works and is not what a keyboard user reaches for on a
+        // disclosure row.
         //
         // No-ops deliberately when the row is not a split parent, or when it is
         // already in the asked-for state: without preventDefault the browser
@@ -1306,22 +1289,27 @@ function RegisterTable({
             // of double-click, which both editable shapes already wire to
             // this same `startEdit`.
             //
-            // Split parents used to be excluded, with a comment saying the
-            // no-op stood "until the split-edit slice lands". It has landed
-            // (bank-edit/fields/SplitsGrid.tsx), and until now the omission
-            // left a keyboard user with NO route to a split's legs at all:
-            // the split-parent context menu carried no Edit item either.
+            // Split parents are included (bank-edit/fields/SplitsGrid.tsx edits
+            // them): excluding them would leave a keyboard user with NO route
+            // to a split's legs at all.
             //
             // A split LEG stays a no-op on purpose. The group owns the edit,
             // and the editor opened from a leg would be the same editor —
             // so Enter there would silently act on something other than the
             // row under the cursor.
+            //
+            // A read-only row is a no-op too, for the same reason double-click
+            // is: it is edited in the register that owns it.
+            // A viewer edits nothing.
+            if (!canEdit) return;
             const row = displayRows.find((r) => displayRowId(r) === currentId);
             if (row === undefined) return;
             if (row.kind === 'txn') {
+                if (row.txn.isReadOnly) return;
                 e.preventDefault();
                 startEdit(row.txn.headerId);
             } else if (row.kind === 'split-parent') {
+                if (row.legs[0]!.isReadOnly) return;
                 e.preventDefault();
                 startEdit(row.legs[0]!.headerId);
             }
@@ -1331,7 +1319,16 @@ function RegisterTable({
         // the button while leaving the hotkey live left the action reachable by
         // the exact route a regular would take — and the editor it opened
         // authors against the register's own account, which here is a category.
-        onCreate: isCategory ? undefined : startCreate,
+        // Undefined for a viewer too, for the same reason, and until the
+        // account's currency is known, as New transaction is disabled until
+        // then: a press would open the editor by itself later.
+        onCreate: isCategory || !canEdit || currency === null ? undefined : startCreate,
+    });
+    // Focus taken away with the bulk bar's buttons or a closing editor goes
+    // to the row list, never the page (ADR-0023 §L).
+    useRegisterFocusHome(scrollParent, {
+        editing: editingHeaderId !== null || isCreatingNew,
+        hasSelection: selection.hasSelection,
     });
     // Viewport-center `yyyy-MM` for the date-aware scroll-track's
     // "you are here" indicator. Updated by virtuoso's rangeChanged
@@ -1410,22 +1407,37 @@ function RegisterTable({
     // parent component, which has the canonical row data; no need
     // to keep a parallel visible-set here.
 
-    /** Footer count/Σ. Defers to the server summary when present;
+    /** The rows a bulk change acts on, for the delete and move
+     *  confirmations. Defers to the server summary when present;
      *  falls back to the explicit ids count while the debounced
-     *  summary query is still in flight (so the footer doesn't
-     *  blink 0 on the first checkbox click). Σ uses the same
-     *  fallback. */
+     *  summary query is still in flight. */
     const selectedCount =
         selection.summary?.count ??
         (selection.selection.kind === 'explicit'
             ? selection.selection.headerIds.length
             : 0);
-    const selectedSum =
-        selection.summary?.sumOnAccount ?? 0;
+    // In the summary's own currency (ADR-0114 D7): on a category's register whose
+    // selected rows are in several currencies, the reporting one, each row converted
+    // at its date, or null for a missing rate. Zero in the account's currency until
+    // the first summary answers.
+    const selectedSum = selection.summary === null ? 0 : selection.summary.sumOnAccount;
+    const selectedSumCurrency = currency === null ? null : selection.summary?.currencyCode ?? currency;
+    /** Footer count: every selected row, read-only rows included, with the
+     *  read-only part named beside it ("N selected · M read-only"). */
+    const footerCounts = useMemo(
+        () => selectionFooterCounts(
+            selection.selection,
+            selection.summary,
+            selection.isSummaryCurrent,
+            displayRows,
+        ),
+        [selection.selection, selection.summary, selection.isSummaryCurrent, displayRows],
+    );
 
     /** True when the user's selection includes any row that's
-     *  read-only from this register's perspective (investment-owned,
-     *  or counter-side of a multi-posting split). Bulk Delete sends
+     *  read-only from this register's perspective (the row's
+     *  `isReadOnly`: an investment event's counterpart, or a split
+     *  line seen from its other side). Bulk Delete sends
      *  the selection to `/transactions/bulk-delete` (bank-shape only);
      *  read-only rows must be excluded to avoid silent cross-domain
      *  mutations OR a server-side 422 mid-batch. Bulk recon-status
@@ -1433,39 +1445,38 @@ function RegisterTable({
      *
      *  Only meaningful for 'explicit' selections (returns false in
      *  'all'-mode): in 'all'-mode the server restricts bulk ops to
-     *  headers this account ORIGINATES (ADR-0036), so unloaded
-     *  target-split rows are excluded server-side and there's nothing
-     *  for the client to audit. */
+     *  headers with a row this register can edit, by the same stored
+     *  read-only flag the row carries, so unloaded read-only rows are
+     *  excluded server-side and there's nothing for the client to
+     *  audit. */
     const selectionHasReadOnly = useMemo(() => {
         if (selection.selection.kind !== 'explicit') return false;
         const selectedIds = new Set(selection.selection.headerIds);
         for (const row of displayRows) {
             if (row.kind !== 'txn') continue;
             if (!selectedIds.has(row.txn.headerId)) continue;
-            const inv = isInvestmentOwnedRow(row.txn);
-            const split = !inv && row.txn.txnGroupId !== null;
-            if (inv || split) return true;
+            if (row.txn.isReadOnly) return true;
         }
         return false;
     }, [selection.selection, displayRows]);
 
     /** Bulk Delete is disabled only when an explicit selection includes
      *  a read-only row. 'all'-mode is now allowed: the server restricts
-     *  all-mode bulk ops to headers this account ORIGINATES (ADR-0036),
-     *  so it can never touch a header owned by another account. The
+     *  all-mode bulk ops to headers with a row this register can edit,
+     *  so it can never touch a row shown read-only here. The
      *  typed-confirm dialog (count > threshold → type "delete N") still
      *  guards large all-mode deletes. */
     const bulkDeleteDisabled = selectionHasReadOnly;
 
     /**
-     * MOVE does not share Delete's gate, and used to.
+     * MOVE does not share Delete's gate.
      *
      * `selectionHasReadOnly` means "this row's canonical owner is elsewhere",
      * which is exactly right for Delete: removing a split's counter-side from
      * here would destroy a transaction another account owns. A move touches
      * only the legs sitting on THIS register's account, so a split's leg can
      * be recategorised from here without the rest of the transaction noticing
-     * — and borrowing Delete's rule blocked that.
+     * — and borrowing Delete's rule would block that.
      *
      * What stays blocked is an investment-owned row on a non-category
      * register: moving the brokerage's own leg would leave its holdings on the
@@ -1519,21 +1530,25 @@ function RegisterTable({
         setSaveError(null);
     }
 
+    // A save error stays shown until this save's result replaces or clears it,
+    // never at the press: cleared then, the alert would go and move the
+    // editor's Save from under the pointer (ADR-0023 §L).
     async function saveEdit(headerId: string, body: PatchTransactionRequest) {
-        setSaveError(null);
         try {
-            const savedEntry = await onPatch(headerId, body);
+            const savedEntries = await onPatch(headerId, body);
+            setSaveError(null);
             setEditingHeaderId(null);
             // Move the keyboard cursor onto the saved row's NEW
             // id. Important when the patch reshaped the entry —
             // single → split changes the row id from the source
             // leg id to `g:<headerId>`, and the previous
             // focusedRowId would silently become a no-op.
-            // patchMutation.onSuccess already swapped the entry
-            // into the window via mutateEntries (same logical
+            // patchMutation.onSuccess already swapped the entries
+            // into the window via replaceHeaderEntries (same logical
             // index, no scroll change); we just need to retarget
-            // focus.
-            if (savedEntry !== null) {
+            // focus, onto the header's first row.
+            const savedEntry = savedEntries[0];
+            if (savedEntry !== undefined) {
                 const newRowId =
                     savedEntry.kind === 'txn'
                         ? savedEntry.txn.id
@@ -1541,17 +1556,17 @@ function RegisterTable({
                 setFocusedRowId(newRowId);
             }
         } catch (error) {
-            setSaveError(patchErrorMessage(error));
+            setSaveError(saveRefusal(error));
         }
     }
 
     async function saveCreate(body: CreateTransactionRequest) {
-        setSaveError(null);
         try {
             await onCreate(body);
+            setSaveError(null);
             setIsCreatingNew(false);
         } catch (error) {
-            setSaveError(patchErrorMessage(error));
+            setSaveError(saveRefusal(error));
         }
     }
 
@@ -1562,11 +1577,10 @@ function RegisterTable({
     //
     // Resolved by HEADER ID against displayRows, not by index. Two index spaces
     // exist here — the hook counts ENTRIES, this list renders ROWS after
-    // regrouping target splits, applying the status filter and expanding groups
-    // — and they are not equal. The previous form read
-    // `displayRows[focusIndex - firstItemIndex]`, mixing both, and then passed
-    // that logical index to `scrollIntoView`, which takes a LOCAL one. An id
-    // cannot be in the wrong space.
+    // applying the status filter and expanding groups — and they are not equal. `displayRows[focusIndex - firstItemIndex]`
+    // mixes both, and passing that logical index to `scrollIntoView`, which
+    // takes a LOCAL one, scrolls to the wrong row. An id cannot be in the
+    // wrong space.
     //
     // The gate is the anchor id plus a nonce, so an anchored refresh onto the
     // SAME row (post-save, the common case) re-seeds rather than being skipped
@@ -1593,12 +1607,12 @@ function RegisterTable({
         const handle = window.setTimeout(() => {
             // No `align` → virtuoso's default "smart" mode: no-op when the row
             // is already in the viewport, otherwise the minimum scroll to bring
-            // it in. `align: 'start'` used to yank the saved row to the top
+            // it in. `align: 'start'` would yank the saved row to the top
             // after every save-refresh, which is disruptive mid-list.
             //
             // "Already in the viewport" is the catch: a row clipped by a pixel
-            // at the top edge passes that test, so smart mode left it half
-            // under the header band and called it done. The correction below
+            // at the top edge passes that test, so smart mode leaves it half
+            // under the header band and calls it done. The correction below
             // settles it from the DOM instead of from virtuoso's opinion.
             virtuosoRef.current?.scrollIntoView({
                 index: localIndex,
@@ -1686,56 +1700,29 @@ function RegisterTable({
     // styles anymore — measurement happens via virtuoso's
     // ResizeObserver automatically.
     function renderRow(index: number, row: DisplayRow<BankRow>): JSX.Element {
+        // The list renders only once the currency is known (the shell's loading
+        // state holds until then), so this is never taken.
+        if (currency === null) return <div />;
         if (row.kind === 'split-parent') {
             const focusId = `g:${row.groupId}`;
             const canonical = row.legs[0]!;
-            if (editingHeaderId === canonical.headerId) {
+            if (editingHeaderId === canonical.headerId && !canonical.isReadOnly) {
                 // Editing a split → load every source-side leg as a
                 // posting seed so the user sees the full breakdown
-                // in the editor. The group's expansion state was
-                // already collapsed by startEdit so the now-hidden
-                // leg rows don't double-render below the editor.
+                // in the editor (bank-edit/editSeed.ts). The group's
+                // expansion state was already collapsed by startEdit so
+                // the now-hidden leg rows don't double-render below the
+                // editor.
                 return (
                     <TxnRowEdit
                         ledgerId={ledgerId}
-                        mode={{
-                            kind: 'edit',
-                            headerId: canonical.headerId,
-                            sourceAccountId: canonical.accountId,
-                            postings: row.legs.map((leg) => ({
-                                legId: leg.id,
-                                counterpartyAccountId: leg.counterpartyAccountId,
-                                counterpartyAccountName: leg.counterpartyAccountName,
-                                amount: leg.amount,
-                                legMemo: leg.legMemo,
-                                legTags: leg.legTags,
-                            })),
-                            payee: canonical.payee,
-                            // Raw header memo (ADR-0025) — see the
-                            // single-row branch above.
-                            memo: canonical.headerMemo,
-                            checkNumber: canonical.checkNumber,
-                            postedAt: canonical.postedAt,
-                            // Must be seeded: the editor sends transactedAt on
-                            // every save, so an unseeded field would silently
-                            // clear a tax date the transaction already had.
-                            transactedAt: canonical.transactedAt,
-                            balanceAfter: canonical.balanceAfter,
-                            // Slice 2c.6b: header-level tags. Per
-                            // ADR-0009 tags live on the header so any
-                            // leg's `tags` array is the same set.
-                            tags: canonical.tags,
-                            // Slice 2c.6 follow-up: capture open-time
-                            // review state. Flips the save into an
-                            // Accept flow — `approve: true` rides on
-                            // the PATCH, button label becomes
-                            // "Accept" (or "Merge & Accept").
-                            needsReview: canonical.needsReview,
-                        }}
+                        mode={bankEditSeed({ kind: 'group', legs: row.legs })}
                         payees={payees}
                         accounts={accounts}
                         accountPaths={accountPaths}
-                        currency={currency}
+                        // On a category the legs are in the paying account's
+                        // currency, not the register's (ADR-0114 D7, D14).
+                        currency={isCategory ? canonical.currencyCode : currency}
                         cols={COLS}
                         onSavePatch={(body) =>
                             void saveEdit(canonical.headerId, body)
@@ -1747,12 +1734,17 @@ function RegisterTable({
                 );
             }
             // Synthesize the representative parent row: the canonical leg
-            // with the group's net amount + balance-after-last-leg, so the
-            // strategy reads off `row` directly (no in-strategy group math).
+            // with the group's net amount + balance-after-last-leg and the
+            // transaction's memo and tags, so the strategy reads off `row`
+            // directly (no in-strategy group math, no header reads). A category's
+            // split paid from accounts in different currencies has no net
+            // (ADR-0114 D7): its Amount cell reads the legs it is handed and shows
+            // the mixed marker, and the 0 standing in for the net is never printed.
             const parentRow: BankRow = {
-                ...canonical,
-                amount: groupAmount(row.legs),
+                ...splitParentNotes(canonical, row.legs),
+                amount: groupAmount(row.legs) ?? 0,
                 balanceAfter: groupBalanceAfter(row.legs),
+                balanceRateUnavailable: groupBalanceRateUnavailable(row.legs),
             };
             const parentStatus = resolveRowStatus(canonical, today);
             return (
@@ -1768,6 +1760,7 @@ function RegisterTable({
                     // depending on whether the row was a split.
                     cmdClickToggles
                     accountPaths={accountPaths}
+                    systemCategoryIds={systemIds}
                     // `parentRow` is a synthesized representative carrying the
                     // group's NET amount, so it cannot answer "which
                     // categories are in here". The legs can.
@@ -1792,7 +1785,7 @@ function RegisterTable({
                     status={parentStatus}
                     cycleStatus={canonical.status}
                     statusHeaderId={canonical.headerId}
-                    statusStatic={parentStatus === 'scheduled' || canonical.isPending}
+                    statusStatic={parentStatus === 'scheduled' || canonical.isPending || !canEdit}
                     expand={{
                         expanded: row.expanded,
                         onToggle: () => onToggleGroupExpanded(row.groupId),
@@ -1802,16 +1795,19 @@ function RegisterTable({
                     focused={focusedRowId === focusId}
                     onFocus={() => setFocusedRowId(focusId)}
                     onCycleReconStatus={onCycleReconStatus}
-                    onDoubleClickEdit={() => startEdit(canonical.headerId)}
+                    readOnly={canonical.isReadOnly}
+                    onDoubleClickEdit={canEdit ? () => startEdit(canonical.headerId) : undefined}
                     onContextMenu={(anchor) =>
                         setContextMenu({
                             anchor,
                             target: canonical,
-                            originatingSplit: true,
+                            originatingSplit: !canonical.isReadOnly,
                             splitLegs: row.legs,
                         })
                     }
-                    title="Click to focus · double-click to edit · right-click for actions"
+                    title={canEdit
+                        ? 'Click to focus · double-click to edit · right-click for actions'
+                        : 'Click to focus · right-click for actions'}
                 />
             );
         }
@@ -1829,6 +1825,7 @@ function RegisterTable({
                     row={row.leg}
                     rowIndex={index}
                     accountPaths={accountPaths}
+                    systemCategoryIds={systemIds}
                     currency={currency}
                     today={today}
                     // Leg rows are non-interactive except focus-on-click;
@@ -1838,6 +1835,7 @@ function RegisterTable({
                     onToggleSelected={() => {}}
                     status={row.leg.status}
                     cycleStatus={row.leg.status}
+                    statusHeaderId={row.leg.headerId}
                     onCycleReconStatus={() => {}}
                     focused={focusedRowId === row.leg.id}
                     onFocus={() => setFocusedRowId(row.leg.id)}
@@ -1845,46 +1843,18 @@ function RegisterTable({
             );
         }
         const txn = row.txn;
-        if (editingHeaderId === txn.headerId) {
+        if (editingHeaderId === txn.headerId && !txn.isReadOnly) {
             return (
                 <TxnRowEdit
                     ledgerId={ledgerId}
-                    mode={{
-                        kind: 'edit',
-                        headerId: txn.headerId,
-                        sourceAccountId: txn.accountId,
-                        // Single-row → 1 posting seed.
-                        postings: [
-                            {
-                                legId: txn.id,
-                                counterpartyAccountId: txn.counterpartyAccountId,
-                                counterpartyAccountName: txn.counterpartyAccountName,
-                                amount: txn.amount,
-                                legMemo: txn.legMemo,
-                                legTags: txn.legTags,
-                            },
-                        ],
-                        payee: txn.payee,
-                        // Raw header memo only (ADR-0025) — falling
-                        // back to txn.memo would load a leg-memo into
-                        // the umbrella field, then save would promote
-                        // it to the header memo column.
-                        memo: txn.headerMemo,
-                        checkNumber: txn.checkNumber,
-                        postedAt: txn.postedAt,
-                        // See the split branch: unseeded means saving wipes it.
-                        transactedAt: txn.transactedAt,
-                        balanceAfter: txn.balanceAfter,
-                        // Slice 2c.6b: header-level tags.
-                        tags: txn.tags,
-                        // Slice 2c.6 follow-up: open-time review
-                        // state drives the Accept flow.
-                        needsReview: txn.needsReview,
-                    }}
+                    // Single-row → 1 posting seed (bank-edit/editSeed.ts).
+                    mode={bankEditSeed({ kind: 'txn', txn })}
                     payees={payees}
                     accounts={accounts}
                     accountPaths={accountPaths}
-                    currency={currency}
+                    // On a category the row is in the paying account's currency,
+                    // not the register's (ADR-0114 D7, D14).
+                    currency={isCategory ? txn.currencyCode : currency}
                     cols={COLS}
                     onSavePatch={(body) =>
                         void saveEdit(txn.headerId, body)
@@ -1895,13 +1865,11 @@ function RegisterTable({
                 />
             );
         }
-        // Read-only row guards (mirror the former BankTxnRow): an
-        // investment-owned cash leg (canonical owner is the brokerage
-        // register) or a split counter-side (source side owns edit /
-        // delete). Recon-status cycling stays enabled either way.
-        const isInvestmentOwned = isInvestmentOwnedRow(txn);
-        const isSplitCounter = !isInvestmentOwned && txn.txnGroupId !== null;
-        const isReadOnly = isInvestmentOwned || isSplitCounter;
+        // Read-only rows (an investment event's counterpart, or a split line
+        // seen from its other side) open no editor; the server's `isReadOnly`
+        // says which rows those are. Recon-status cycling stays enabled
+        // either way.
+        const isReadOnly = txn.isReadOnly;
         const txnStatus = resolveRowStatus(txn, today);
         const txnScheduled = txnStatus === 'scheduled';
         return (
@@ -1911,6 +1879,7 @@ function RegisterTable({
                 row={txn}
                 rowIndex={index}
                 accountPaths={accountPaths}
+                systemCategoryIds={systemIds}
                 rollupRootId={rollupRootId}
                 currency={currency}
                 today={today}
@@ -1927,17 +1896,19 @@ function RegisterTable({
                 status={txnStatus}
                 cycleStatus={txn.status}
                 statusHeaderId={txn.headerId}
-                statusStatic={txnScheduled || txn.isPending}
+                statusStatic={txnScheduled || txn.isPending || !canEdit}
                 needsReview={txn.needsReview}
-                onDoubleClickEdit={() => startEdit(txn.headerId)}
+                onDoubleClickEdit={canEdit ? () => startEdit(txn.headerId) : undefined}
                 onContextMenu={(anchor) =>
                     setContextMenu({ anchor, target: txn })
                 }
                 onCycleReconStatus={onCycleReconStatus}
                 title={
-                    txn.needsReview
-                        ? 'Needs review · right-click → Accept to clear the flag'
-                        : 'Click to focus · double-click to edit · right-click for actions'
+                    !canEdit
+                        ? 'Click to focus · right-click for actions'
+                        : txn.needsReview
+                            ? 'Needs review · right-click → Accept to clear the flag'
+                            : 'Click to focus · double-click to edit · right-click for actions'
                 }
             />
         );
@@ -1947,7 +1918,7 @@ function RegisterTable({
         <TagColorsProvider ledgerId={ledgerId}>
         <RegisterShell
             columns={COLS}
-            initialLoaded={initialLoaded}
+            initialLoaded={initialLoaded && currency !== null}
             initialError={initialError}
             isEmpty={isEmpty}
             filterActive={filterActive}
@@ -1961,7 +1932,7 @@ function RegisterTable({
                     // (left) + New-transaction button & keyboard hint
                     // (right), one row. Identical to investment.
                     <RegisterControlsBar
-                        hideNew={isCategory}
+                        hideNew={isCategory || !canEdit}
                         showSubcategoryScope={isCategory && hasSubcategories}
                         statusFilter={statusFilter}
                         onStatusFilterChange={onStatusFilterChange}
@@ -1976,14 +1947,18 @@ function RegisterTable({
                         // so a Category picker filtered an axis the rows do
                         // not have and could never match.
                         counterpartyKind={isCategory ? 'account' : 'category'}
+                        // The amount range is in the account's currency; a
+                        // category's rows can be in several, so its range has no
+                        // symbol and no places (ADR-0114 D14).
+                        currency={isCategory ? null : currency}
                         tags={tagsQuery.data ?? []}
                         resultCount={filterResultCount}
                         statusCounts={statusCounts}
                         onNew={startCreate}
-                        newDisabled={isCreatingNew}
+                        newDisabled={isCreatingNew || currency === null}
                     />
                 )}
-                newTxnEditor={isCreatingNew ? (
+                newTxnEditor={isCreatingNew && currency !== null ? (
                         <TxnRowEdit
                             ledgerId={ledgerId}
                             mode={{
@@ -2075,9 +2050,8 @@ function RegisterTable({
                     // Always 0. Virtuoso reads this ONCE at mount, before the
                     // hook's fetch has resolved an anchor, so it could never
                     // carry a focus arrival — the seed effect above does that,
-                    // for exactly this reason. It previously read an entry-space
-                    // index into a prop that takes a local one, which was
-                    // harmless only because the value was still -1 at mount.
+                    // for exactly this reason. An entry-space index would be the
+                    // wrong space for a prop that takes a local one.
                     initialTopMostItemIndex={0}
                     atTimelineHead={atTimelineHead}
                     atTimelineTail={atTimelineTail}
@@ -2086,9 +2060,13 @@ function RegisterTable({
             </RegisterScrollSurface>
 
             <RegisterBulkActionBar
-                selectedCount={selectedCount}
+                readOnly={!canEdit}
+                selectedCount={footerCounts.selected}
+                readOnlyCount={footerCounts.readOnly}
                 selectedSum={selectedSum}
-                currency={currency}
+                sumRateUnavailable={selection.summary?.rateUnavailable}
+                summaryError={selection.summaryError}
+                currency={selectedSumCurrency}
                 loading={loadingOlder || loadingNewer}
                 bulkDeleteDisabled={bulkDeleteDisabled}
                 bulkDeleteDisabledTitle={bulkDeleteDisabledTitle}
@@ -2098,6 +2076,8 @@ function RegisterTable({
                 statusFilter={statusFilter}
                 onBulkUnhide={onBulkUnhide}
                 bulkUnhidePending={bulkUnhidePending}
+                unhideDisabled={selectionHasReadOnly}
+                unhideDisabledTitle="Selection includes rows whose canonical owner is elsewhere (investment header, or split counter-side). Unhide those from the source register."
                 onOpenMoveDialog={onOpenMoveDialog}
                 moveDisabled={moveDisabled}
                 moveIsCategory={isCategory}
@@ -2128,7 +2108,7 @@ function RegisterTable({
         {contextMenu ? (
             <ContextMenu
                 anchor={contextMenu.anchor}
-                items={buildBankRowMenuItems(contextMenu.target, {
+                items={rowActionsFor(buildBankRowMenuItems(contextMenu.target, {
                     onApprove,
                     onEdit: (target) => startEdit(target.headerId),
                     onDuplicate: (target) => {
@@ -2159,7 +2139,7 @@ function RegisterTable({
                 }, {
                     originatingSplit: contextMenu.originatingSplit,
                     noAuthoring: isCategory,
-                })}
+                }), canEdit)}
                 onClose={closeContextMenu}
             />
         ) : null}

@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useEffect, useMemo, useState, type RefObject } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import {
-    ApiError,
     createReminderBank, createReminderInvestment,
     fetchAccounts, fetchPayees, fetchReminderDetail,
     updateReminderBank, updateReminderInvestment,
@@ -14,15 +14,14 @@ import { buildRrule, parseRrule } from '@/lib/recurrence';
 import { errorMessage } from '@/lib/errorMessage';
 import { buildAccountPathMap } from '@/lib/accountPath';
 import { todayInputValue } from '@/lib/dates';
+import type { SecondAmountSide } from '@/lib/secondAmount';
 import { AccountCategoryPicker } from '@/components/register/AccountCategoryPicker';
+import { EditorDialog } from '@/components/ui/EditorDialog';
 import { TxnRowEdit, type TxnRowNewPrefill } from '@/routes/ledgers/TxnRowEdit';
-import { BANK_COLS } from '@/routes/ledgers/register/bank/columns';
 import { InvestmentTxnRowEdit } from '@/routes/ledgers/investment-edit/InvestmentTxnRowEdit';
 import type { InvestmentTxnDraft } from '@/routes/ledgers/investment-edit/validation';
-import { INVESTMENT_FORM_COLS } from '@/routes/ledgers/register/investment/columns';
 
 import { RecurrenceBuilder, defaultSchedule, type ScheduleValue } from './RecurrenceBuilder';
-import { ReminderDialogShell } from './ReminderDialogShell';
 import { reminderBankPrefill, reminderInvestmentDraft } from './reminderOccurrenceDraft';
 
 // Reminder series editor (ADR-0051 slice B). Create + edit a reminder, bank OR
@@ -49,10 +48,12 @@ export interface ReminderEditorDialogProps {
     fromInvestmentTransaction?: { sourceAccountId: string; draft: InvestmentTxnDraft } | null;
     onClose: () => void;
     onSaved: () => void;
+    /** Where focus goes on close when nothing on the page opened the editor (EditorDialog). */
+    fallbackFocusRef?: RefObject<HTMLElement | null>;
 }
 
 export function ReminderEditorDialog({
-    ledgerId, reminderId, fromTransaction, fromInvestmentTransaction, onClose, onSaved,
+    ledgerId, reminderId, fromTransaction, fromInvestmentTransaction, onClose, onSaved, fallbackFocusRef,
 }: ReminderEditorDialogProps) {
     const isEdit = reminderId != null;
     const queryClient = useQueryClient();
@@ -78,6 +79,17 @@ export function ReminderEditorDialog({
     );
     const sourceId = isEdit ? (detail?.sourceAccountId ?? null) : picked;
     const sourceAccount = useMemo(() => accounts.find((a) => a.id === sourceId) ?? null, [accounts, sourceId]);
+    // The source's currency, which every figure in the editor is in. A deactivated
+    // source (an edit of its series) is not in the account list, so it is read from
+    // the rail's list, which keeps inactive accounts; it is asked only then.
+    const everyAccountQuery = useQuery({
+        queryKey: ['accounts', ledgerId, { includeInactive: true }],
+        queryFn: () => fetchAccounts(ledgerId, { includeInactive: true }),
+        enabled: sourceId !== null && accountsQuery.isSuccess && sourceAccount === null,
+    });
+    const currency = sourceAccount?.currencyCode
+        ?? everyAccountQuery.data?.find((a) => a.id === sourceId)?.currencyCode
+        ?? null;
 
     // Kind derives from the source account's type (no toggle). On edit it's the
     // series' own kind (the source might be inactive / unusual, so trust detail).
@@ -92,7 +104,7 @@ export function ReminderEditorDialog({
     useEffect(() => {
         if (!isEdit || !detail || scheduleSeeded) return;
         setSchedule({
-            recurrence: parseRrule(detail.rrule) ?? defaultSchedule(detail.startDate).recurrence,
+            recurrence: parseRrule(detail.rrule, detail.startDate) ?? defaultSchedule(detail.startDate).recurrence,
             startDate: detail.startDate,
             endDate: detail.endDate,
             autoCommitDaysBefore: detail.autoCommitDaysBefore,
@@ -106,10 +118,15 @@ export function ReminderEditorDialog({
 
     const [error, setError] = useState<string | null>(null);
 
+    // The embedded bank editor's one posting, while it is a transfer to a real account in
+    // another currency: an estimate then sets that side from each due date's rate, which
+    // the Schedule says (ADR-0114 D13). The editor tells it as the posting changes.
+    const [secondSide, setSecondSide] = useState<SecondAmountSide | null>(null);
+
     // An imported reminder whose RRULE the builder can't represent ("custom" /
     // unsupported pattern) seeds the default schedule — so saving would REPLACE
     // its real schedule. Warn explicitly rather than silently rewrite it.
-    const customSchedule = isEdit && detail != null && parseRrule(detail.rrule) === null;
+    const customSchedule = isEdit && detail != null && parseRrule(detail.rrule, detail.startDate) === null;
 
     // Prefill for the embedded editors (from-transaction or edit).
     const bankPrefill = useMemo<{ sourceAccountId: string; prefill: TxnRowNewPrefill } | null>(() => {
@@ -142,7 +159,7 @@ export function ReminderEditorDialog({
     }
     // Mig 220: only a single-posting, non-loan BANK series can estimate.
     //
-    // A loan reminder's amount is computed from its terms and current balance — real
+    // A loan reminder's amount is computed from its terms and balance — real
     // information an average would degrade — and a split has no single amount to
     // estimate. The server rejects both regardless; this only decides whether to offer
     // the control, so a user is not shown an option that would be refused.
@@ -172,16 +189,21 @@ export function ReminderEditorDialog({
                     // switching back to "As entered" would silently leave it on.
                     clearEstimate: r.estimateSampleCount === null,
                     estimateSampleCount: r.estimateSampleCount,
-                    payee: body.payee, memo: body.memo, checkNumber: body.checkNumber,
+                    payee: body.payee, checkNumber: body.checkNumber,
                     postings: { sourceAccountId: body.sourceAccountId, items: body.postings },
+                    // The embedded editor compares the transaction's values
+                    // against the template it was seeded from, and restates
+                    // every line's (see bank-edit/notesBody.ts).
+                    notes: body.notes,
                 });
             }
             return createReminderBank(ledgerId, {
                 rrule: r.rrule, startDate: r.startDate, endDate: r.endDate,
                 autoCommitDaysBefore: r.autoCommitDaysBefore,
                 estimateSampleCount: r.estimateSampleCount,
-                payee: body.payee, memo: body.memo, checkNumber: body.checkNumber,
+                payee: body.payee, checkNumber: body.checkNumber,
                 sourceAccountId: body.sourceAccountId, postings: body.postings,
+                notes: body.notes,
             });
         },
         onSuccess: () => { invalidate(); onSaved(); onClose(); },
@@ -210,10 +232,11 @@ export function ReminderEditorDialog({
 
     // The embedded editor's Save fires these; the schedule is validated first so
     // an incomplete schedule blocks the create/edit (the editor already ran its
-    // own posting validation before calling us).
+    // own posting validation before calling us). An error stays shown until the
+    // new result replaces it or the dialog closes, never cleared at the press
+    // (ADR-0023 §L).
     function onBankSubmit(body: CreateTransactionRequest) {
         if (saveBank.isPending) return;   // guard double-submit
-        setError(null);
         const se = scheduleError();
         if (se !== null) { setError(se); return; }
         saveBank.mutate(body);
@@ -222,36 +245,32 @@ export function ReminderEditorDialog({
         // The embedded investment editor ('fire' mode) has no in-flight flag of
         // its own, so guard re-entrant submits here to avoid duplicate series.
         if (saveInvestment.isPending) return;
-        setError(null);
         const se = scheduleError();
         if (se !== null) { setError(se); return; }
         saveInvestment.mutate(req);
     }
 
     const submitting = saveBank.isPending || saveInvestment.isPending;
-    const loading = accountsQuery.isPending || payeesQuery.isPending || (isEdit && detailQuery.isPending);
-    const loadError = accountsQuery.isError || payeesQuery.isError || (isEdit && detailQuery.isError);
-    const currency = sourceAccount?.currencyCode ?? 'USD';
-    const saveError = (saveBank.error ?? saveInvestment.error) instanceof ApiError
-        ? ((saveBank.error ?? saveInvestment.error) as ApiError).detail : null;
+    // A source whose currency no list has yet keeps the editor loading: it prints
+    // no figure in a currency it is not in. One no list holds is a failed load.
+    const currencyPending = sourceId !== null && currency === null && !everyAccountQuery.isFetched;
+    const loading = accountsQuery.isPending || payeesQuery.isPending || (isEdit && detailQuery.isPending)
+        || currencyPending;
+    const loadError = accountsQuery.isError || payeesQuery.isError || (isEdit && detailQuery.isError)
+        || (sourceId !== null && currency === null && !currencyPending);
 
     // The source picker shows only on a from-scratch create (edit + from-txn fix
     // the source). Until a source is chosen there, the schedule + editor wait.
     const showSourcePicker = !isEdit && fromTransaction == null && fromInvestmentTransaction == null;
 
     return (
-        <ReminderDialogShell
+        <EditorDialog
             ariaLabel={isEdit ? 'Edit reminder' : 'New reminder'}
-            title={
-                <>
-                    {isEdit ? 'Edit reminder' : 'New reminder'}
-                    {sourceAccount !== null ? (
-                        <span className="ml-2 text-sm font-normal text-text-muted">{sourceAccount.name}</span>
-                    ) : null}
-                </>
-            }
+            title={isEdit ? 'Edit reminder' : 'New reminder'}
+            subtitle={sourceAccount?.name}
             onClose={onClose}
             bodyClassName="space-y-4"
+            fallbackFocusRef={fallbackFocusRef}
         >
             {error !== null ? (
                 <p role="alert" className="text-xs text-state-danger">{error}</p>
@@ -284,7 +303,7 @@ export function ReminderEditorDialog({
                         </div>
                     ) : null}
 
-                    {sourceId !== null && kind !== null ? (
+                    {sourceId !== null && kind !== null && currency !== null ? (
                         <>
                             <div>
                                 <p className={sectionClass}>Schedule</p>
@@ -298,8 +317,19 @@ export function ReminderEditorDialog({
                                     <RecurrenceBuilder
                                         value={schedule}
                                         onChange={setSchedule}
-                                        disabled={submitting}
+                                        pending={submitting}
                                         estimateEligible={estimateEligible}
+                                        // Its line names the money received in, or sent
+                                        // from, the other account.
+                                        transferAcrossCurrencies={
+                                            kind === 'bank' && secondSide !== null
+                                                ? {
+                                                    accountName: secondSide.accountName,
+                                                    fromCurrency: currency,
+                                                    toCurrency: secondSide.currency,
+                                                    direction: secondSide.direction,
+                                                }
+                                                : null}
                                     />
                                 </div>
                             </div>
@@ -310,30 +340,47 @@ export function ReminderEditorDialog({
                                     {kind === 'bank' ? (
                                         <TxnRowEdit
                                             ledgerId={ledgerId}
-                                            mode={{ kind: 'new', sourceAccountId: sourceId, prefill: bankPrefill?.prefill }}
+                                            mode={{
+                                                kind: 'new',
+                                                sourceAccountId: sourceId,
+                                                prefill: bankPrefill?.prefill,
+                                                // On an edit the prefill IS the stored
+                                                // template: a save sends only what
+                                                // differs from it.
+                                                prefillIsStored: isEdit,
+                                            }}
                                             payees={payeesQuery.data ?? []}
                                             accounts={accounts}
                                             accountPaths={accountPaths}
                                             currency={currency}
-                                            cols={BANK_COLS}
+                                            layout="dialog"
                                             onSaveCreate={onBankSubmit}
                                             onCancel={onClose}
                                             isSaving={saveBank.isPending}
-                                            saveError={saveError}
+                                            // A refused save is shown once, in
+                                            // this dialog's alert above, as for
+                                            // the investment editor.
+                                            saveError={null}
                                             cancelOnOutsideClick={false}
+                                            onSecondAmountSideChange={setSecondSide}
                                         />
                                     ) : (
                                         <InvestmentTxnRowEdit
                                             ledgerId={ledgerId}
                                             brokerageAccountId={sourceId}
                                             accounts={accounts}
+                                            currency={currency}
                                             isTradeCommission={sourceAccount?.isTradeCommission ?? false}
-                                            cols={INVESTMENT_FORM_COLS}
+                                            layout="dialog"
                                             onCancel={onClose}
                                             isSaving={saveInvestment.isPending}
                                             mode={{
                                                 kind: 'fire',
                                                 initialDraft: investmentDraft?.draft,
+                                                // As for the bank editor: on an
+                                                // edit the draft IS the stored
+                                                // template.
+                                                initialIsStored: isEdit,
                                                 onSubmit: onInvestmentSubmit,
                                             }}
                                         />
@@ -348,6 +395,6 @@ export function ReminderEditorDialog({
                     )}
                 </>
             )}
-        </ReminderDialogShell>
+        </EditorDialog>
     );
 }

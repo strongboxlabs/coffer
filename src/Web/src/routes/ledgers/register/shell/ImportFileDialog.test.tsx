@@ -1,9 +1,10 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as apiModule from '@/lib/api';
+import { stubFetch } from '@/lib/annotations/fetchStub';
 import type { OfxImportResponse } from '@/lib/types';
 
 import { ImportFileDialog } from './ImportFileDialog';
@@ -79,6 +80,20 @@ describe('ImportFileDialog undo', () => {
         vi.restoreAllMocks();
     });
 
+    // ADR-0079 as amended 2026-11-03: an import is a precise writer, so it
+    // refreshes the home screen's reads and never the register's window key.
+    it('refreshes the home screen\'s reads once the import lands, not the register\'s window', async () => {
+        const spy = vi.spyOn(QueryClient.prototype, 'invalidateQueries');
+
+        await atResultStep();
+
+        const keys = spy.mock.calls.map((c) => c[0]?.queryKey);
+        expect(keys).toContainEqual(['home', 'led-1']);
+        expect(keys).toContainEqual(['overview', 'led-1']);
+        expect(keys).toContainEqual(['budget-progress', 'led-1']);
+        expect(keys.some((k) => Array.isArray(k) && k[0] === 'register')).toBe(false);
+    });
+
     it('counts before it removes anything', async () => {
         // Two-phase on purpose: the first click only asks how many rows would go, so
         // the confirm can state a real number. A single click that deletes money is
@@ -100,9 +115,9 @@ describe('ImportFileDialog undo', () => {
 
     it('lets you back out after asking what undo would do', async () => {
         // Asking is not agreeing. The dry run is the only way to learn how many rows
-        // are at stake, and it used to permanently replace the safe button with a red
-        // "Confirm undo" sitting beside "Import another" and "Done" — one mis-click
-        // from deleting the rows, with no way back but closing the dialog.
+        // are at stake, and if it permanently replaced the safe button with a red
+        // "Confirm undo" beside "Import another" and "Done", the user would be one
+        // mis-click from deleting the rows, with no way back but closing the dialog.
         const undo = vi.spyOn(apiModule, 'undoImport').mockResolvedValue({
             found: 47, deleted: 0, tooLarge: false,
         });
@@ -123,11 +138,11 @@ describe('ImportFileDialog undo', () => {
     });
 
     it('never warns about edits — this dialog just did the import', async () => {
-        // The confirm used to carry "N of them have been edited since — those
-        // edits will be lost". Removed 2026-09-25: undo is offered here, in the
-        // modal that performed the import, so nobody has had the chance to edit
-        // anything. The count was reliably zero and the sentence only added
-        // doubt to an action the user had just chosen.
+        // No "N of them have been edited since — those edits will be lost":
+        // undo is offered here, in the modal that performed the import, so
+        // nobody has had the chance to edit anything. The count would be
+        // reliably zero and the sentence would only add doubt to an action the
+        // user has just chosen.
         //
         // Anchored on the confirm copy first, which appears only once the dry
         // run resolves — so the absence below is judged on a settled frame and
@@ -170,14 +185,13 @@ describe('ImportFileDialog undo', () => {
     });
 
     it('tells the page to refresh, or the rows stay on screen', async () => {
-        // THE BUG THIS FILE MISSED. The first version invalidated
-        // ['transactions', ledgerId] — a key nothing registers — so nothing refreshed
-        // and every undone transaction stayed visible until a manual reload. The
-        // windowed register (ADR-0079) re-reads on register.refresh(), which only the
-        // page can call, so the dialog has to hand the refresh back.
+        // Invalidating ['transactions', ledgerId] — a key nothing registers — would
+        // refresh nothing, leaving every undone transaction visible until a manual
+        // reload. The windowed register (ADR-0079) re-reads on register.refresh(),
+        // which only the page can call, so the dialog has to hand the refresh back.
         //
-        // Asserting the API call and the copy was not enough: both were right while
-        // the visible consequence was wrong.
+        // Asserting the API call and the copy is not enough: both can be right while
+        // the visible consequence is wrong.
         vi.spyOn(apiModule, 'undoImport')
             .mockResolvedValueOnce({ found: 47, deleted: 0, tooLarge: false })
             .mockResolvedValueOnce({ found: 47, deleted: 47, tooLarge: false });
@@ -226,7 +240,7 @@ describe('ImportFileDialog undo', () => {
  * and therefore the only one with answers that a step change can destroy.
  *
  * Synthetic data throughout: invented merchants, tab-separated under a .csv name
- * because that is the shape a real export turned out to have.
+ * because a bank export can be tab-separated under a .csv name.
  */
 describe('ImportFileDialog, delimited path', () => {
     const FOUR_COLUMN = [
@@ -340,10 +354,10 @@ describe('ImportFileDialog, delimited path', () => {
     });
 
     it("does not show the previous file's import failure over a new file's preview", async () => {
-        // Only the PREVIEW mutation was reset on Back and on picking a file, so a failed
-        // import outlived both. The next file previewed cleanly and rendered the last
-        // file's error underneath it, before Import had been pressed at all — a message
-        // about a file no longer on screen, clearing only on the next attempt.
+        // If only the PREVIEW mutation were reset on Back and on picking a file, a failed
+        // import would outlive both: the next file would preview cleanly and render the
+        // last file's error underneath it, before Import had been pressed at all — a
+        // message about a file no longer on screen, clearing only on the next attempt.
         const user = renderDialog();
         vi.spyOn(apiModule, 'importCsv').mockRejectedValue(new Error('server said no'));
         await upload(user, FOUR_COLUMN, 'statement-a.csv');
@@ -354,7 +368,7 @@ describe('ImportFileDialog, delimited path', () => {
         expect((await screen.findByRole('alert')).textContent).toContain('server said no');
 
         // Back to the mapping, back again to the picker, then a different file entirely.
-        // Both hops matter: the error survived each of them independently.
+        // Both hops matter: the error could survive each of them independently.
         await user.click(screen.getByRole('button', { name: /back/i }));
         await screen.findByLabelText(/payee column/i);
         await user.click(screen.getByRole('button', { name: /back/i }));
@@ -368,9 +382,9 @@ describe('ImportFileDialog, delimited path', () => {
     });
 
     it('moves focus to each new step and names it', async () => {
-        // Advancing unmounted the focused button and left activeElement on <body>,
-        // which the modal's focus trap does not redirect — so the next Tab walked into
-        // the register behind the backdrop, where rows and menus are still clickable.
+        // Advancing unmounts the focused button; left on <body>, activeElement is not
+        // redirected by the modal's focus trap — so the next Tab would walk into the
+        // register behind the backdrop, where rows and menus are still clickable.
         const user = renderDialog();
         expect(screen.getByRole('heading', { level: 2 }).textContent)
             .toMatch(/import statement file/i);
@@ -386,10 +400,175 @@ describe('ImportFileDialog, delimited path', () => {
 });
 
 /**
+ * A cell the chosen decimal separator cannot read (ADR-0114 D15, board CS-3). It is
+ * reported after Continue, on the "Confirm the import" step, in the Preview warnings
+ * box, as the server's `csv_row_unreadable` naming the line. Fetch is stubbed at the
+ * request layer, so the preview runs through the real API client.
+ */
+describe('ImportFileDialog, a row the decimal separator cannot read', () => {
+    // The CS-3 board's file: point decimals, and one cell that groups with a point and
+    // writes a decimal comma. Synthetic payees.
+    const POINT_FILE_WITH_A_COMMA_CELL = [
+        'Date,Payee,Memo,Amount',
+        '10/01/2026,Sample Grocer,Shop,-52.10',
+        '10/02/2026,Sample Bakery,,-6.75',
+        '10/05/2026,Sample Payroll,Salary,"2,500.00"',
+        '10/07/2026,Sample Pharmacy,,-19.40',
+        '10/12/2026,Sample Landlord,Rent,"-1.234,56"',
+        '10/14/2026,Sample Cafe,,-3.20',
+    ].join('\n');
+
+    // The server's message as the board shows it, sent and rendered as is.
+    const UNREADABLE = "Line 6: '-1.234,56' is not an amount with a point as the decimal separator."
+        + ' The row was skipped.';
+
+    beforeEach(() => {
+        vi.restoreAllMocks();
+        stubFetch()
+            .on('GET', /^\/api\/ledgers\/led-1\/csv-mappings$/, [])
+            .on('POST', /^\/api\/ledgers\/led-1\/ingest\/csv\/preview$/, {
+                accounts: [{
+                    providerAccountId: 'csv',
+                    accountType: 'bank',
+                    currency: null,
+                    transactionCount: 5,
+                    accountName: null,
+                }],
+                errors: [{ code: 'csv_row_unreadable', message: UNREADABLE }],
+            });
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    it('shows the server\'s csv_row_unreadable message in the Preview warnings box, as sent', async () => {
+        const queryClient = new QueryClient({
+            defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+        });
+        render(
+            <QueryClientProvider client={queryClient}>
+                <ImportFileDialog
+                    ledgerId="led-1"
+                    accountId="acc-1"
+                    accountName="Checking"
+                    accountKind="bank"
+                    onClose={vi.fn()}
+                    onImported={vi.fn()}
+                    onUndone={vi.fn()}
+                />
+            </QueryClientProvider>,
+        );
+        const user = userEvent.setup();
+        await user.upload(
+            screen.getByLabelText('Statement file'),
+            new File([POINT_FILE_WITH_A_COMMA_CELL], 'statement.csv', { type: 'text/csv' }),
+        );
+        await user.click(screen.getByRole('button', { name: /upload/i }));
+        await screen.findByLabelText(/^decimal separator/i);
+        await user.click(screen.getByRole('button', { name: /continue/i }));
+
+        const heading = await screen.findByText('Preview warnings (1):');
+        const item = within(heading.parentElement!).getByRole('listitem');
+        expect(item.textContent).toBe(`csv_row_unreadable: ${UNREADABLE}`);
+        // Only the readable rows are counted, as the server counted them.
+        expect(screen.getByRole('button', { name: /^import 5 txns/i })).toBeTruthy();
+    });
+});
+
+/**
+ * The preview names the account the file will go into, so the server reads the file
+ * under that account's currency and reports in the preview what the import would
+ * refuse for that currency's places (ADR-0114 D15). Fetch is stubbed at the request
+ * layer and the multipart body read back, because a spy on the client function cannot
+ * see what the client puts in the form.
+ */
+describe('ImportFileDialog, the preview names the target account', () => {
+    const PREVIEW = {
+        accounts: [{
+            providerAccountId: 'one',
+            accountType: 'bank',
+            currency: null,
+            transactionCount: 1,
+            accountName: null,
+        }],
+        errors: [],
+    };
+
+    beforeEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    async function previewBody(
+        segment: 'qif' | 'ofx' | 'fidelity',
+        fileName: string,
+        body: string,
+        kind: 'bank' | 'investment',
+    ): Promise<FormData> {
+        const stub = stubFetch()
+            .on('POST', new RegExp(`^/api/ledgers/led-1/ingest/${segment}/preview$`), PREVIEW);
+        const queryClient = new QueryClient({
+            defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+        });
+        render(
+            <QueryClientProvider client={queryClient}>
+                <ImportFileDialog
+                    ledgerId="led-1"
+                    accountId="acc-1"
+                    accountName="Target"
+                    accountKind={kind}
+                    importProviderKey={segment === 'fidelity' ? 'csv-fidelity' : null}
+                    onClose={vi.fn()}
+                    onImported={vi.fn()}
+                    onUndone={vi.fn()}
+                />
+            </QueryClientProvider>,
+        );
+        const user = userEvent.setup();
+        await user.upload(
+            screen.getByLabelText('Statement file'),
+            new File([body], fileName, { type: 'application/octet-stream' }),
+        );
+        await user.click(screen.getByRole('button', { name: /upload/i }));
+        // Anchored on the preview step, which renders only once the response is in.
+        await screen.findByRole('button', { name: /^import \d+ txn/i });
+
+        expect(stub.unrouted).toEqual([]);
+        const fetchMock = vi.mocked(globalThis.fetch);
+        const sent = fetchMock.mock.calls.filter(([input]) =>
+            String(input).endsWith(`/ingest/${segment}/preview`));
+        expect(sent).toHaveLength(1);
+        const form = sent[0]![1]!.body;
+        expect(form).toBeInstanceOf(FormData);
+        return form as FormData;
+    }
+
+    it('sends the account with a QIF preview', async () => {
+        const form = await previewBody('qif', 'export.qif', '!Type:Bank', 'bank');
+        expect(form.get('accountId')).toBe('acc-1');
+    });
+
+    it('sends the account with an OFX preview', async () => {
+        const form = await previewBody('ofx', 'export.ofx', 'OFXHEADER:100', 'bank');
+        expect(form.get('accountId')).toBe('acc-1');
+    });
+
+    it('sends the account with a brokerage CSV preview', async () => {
+        const form = await previewBody(
+            'fidelity', 'statement.csv', 'Run Date,Action\n', 'investment');
+        expect(form.get('accountId')).toBe('acc-1');
+    });
+});
+
+/**
  * Investment accounts import a BROKERAGE's own CSV; bank accounts describe a delimited
- * file with a mapping. The two were one flow, which is how the generic bank mapping came
- * to be offered on an investment account — where it cannot express shares, price or
- * action, so it would not fail, it would post a share purchase as a cash withdrawal.
+ * file with a mapping. As one flow, the generic bank mapping would be offered on an
+ * investment account — where it cannot express shares, price or action, so it would
+ * not fail, it would post a share purchase as a cash withdrawal.
  */
 describe('ImportFileDialog, split by account kind', () => {
     const ACTIVITY_CSV = [
@@ -575,9 +754,9 @@ describe('ImportFileDialog, split by account kind', () => {
     });
 
     it('imports through the chosen brokerage, not just previews through it', () => {
-        // Preview and import are separate calls, and only one of them was covered —
-        // so sending the import down the generic CSV path instead changed nothing any
-        // test could see.
+        // Preview and import are separate calls, so a preview test proves nothing about
+        // the import: the import itself must go through the chosen brokerage's endpoint,
+        // never the generic CSV path.
         vi.spyOn(apiModule, 'previewFidelity').mockResolvedValue({
             accounts: [{
                 providerAccountId: 'fidelity',

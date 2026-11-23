@@ -3,10 +3,8 @@ namespace Coffer.Api.Crypto;
 /// <summary>
 /// Singleton holder for the deployment-level master KEK (ADR-0014
 /// §Layer 4, refined by ADR-0026). Loaded once at API startup from the key
-/// file at <c>Api:MasterKey:Path</c> (ADR-0092 D1); the
-/// <c>COFFER_MASTER_KEK_BASE64</c> environment variable it used to come from
-/// is deprecated and ignored while that file exists. Stays in-process memory
-/// only.
+/// file at <c>Api:MasterKey:Path</c> (ADR-0092 D1), the only source; no
+/// environment variable is read. Stays in-process memory only.
 /// </summary>
 /// <remarks>
 /// <para>The <see cref="Id"/> ("v1", "v2", …) tags every wrapped

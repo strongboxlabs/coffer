@@ -1,6 +1,5 @@
 import type { BankRow } from '@/lib/types';
 import type { ContextMenuItem } from '@/components/ui/ContextMenu';
-import { isInvestmentOwnedRow } from './columns';
 
 /** Callbacks the per-row context menu fires. The page owns the
  *  mutations / state these dispatch into. */
@@ -27,10 +26,11 @@ interface BankRowMenuActions {
  * is the row the user right-clicked; hidden / merged-into rows are
  * filtered by the API, so everything that reaches here is actionable.
  *
- * Read-only rows (investment-owned OR split counter-side) only get the
- * read-only `Show other side` item — mutating actions belong on the
- * canonical-owner register so the user can see the full impact before
- * confirming.
+ * Read-only rows (the row's `isReadOnly`: an investment event's
+ * counterpart, or a split line seen from its other side) only get the
+ * read-only `Show other side` and `Show raw data` items — no Edit, no
+ * Duplicate; mutating actions belong on the register that owns the row so
+ * the user can see the full impact before confirming.
  *
  * Pure builder (extracted from `BankRegisterPage` verbatim): no JSX,
  * no hooks — the page passes its action callbacks in and renders the
@@ -40,11 +40,9 @@ export function buildBankRowMenuItems(
     target: BankRow,
     actions: BankRowMenuActions,
     opts?: {
-        /** The target is a multi-leg split-parent that ORIGINATES in
-         *  this account (ADR-0036) — editable, NOT a read-only
-         *  counter-side. Its `txnGroupId` is non-null (every split
-         *  header is), so without this flag the counter-side guard
-         *  below would misclassify it as read-only. A split has no
+        /** The target is a multi-leg split-parent on the account that
+         *  owns the split — editable, NOT a read-only line seen from its
+         *  other side. A split has no
          *  single "other side", so the parent offers Edit (opens the
          *  multi-leg editor), Duplicate (the page passes every leg, so
          *  it clones the whole split), Create reminder and Delete
@@ -73,9 +71,9 @@ export function buildBankRowMenuItems(
                 onSelect: () => actions.onApprove(target.headerId),
             });
         }
-        // Edit opens the multi-leg editor on the whole split. Until this
-        // item existed, a split parent had NO menu route to its own legs
-        // and Enter was a no-op, so the only way in was a double-click.
+        // Edit opens the multi-leg editor on the whole split. Without this
+        // item a split parent has NO menu route to its own legs, and a
+        // double-click is the only way in.
         items.push({
             id: 'edit',
             label: 'Edit',
@@ -104,11 +102,10 @@ export function buildBankRowMenuItems(
         });
         return items;
     }
-    const isInvestmentOwnedTarget = isInvestmentOwnedRow(target);
-    const isSplitCounterTarget =
-        !isInvestmentOwnedTarget && target.txnGroupId !== null;
-    const isCrossDomainTarget =
-        isInvestmentOwnedTarget || isSplitCounterTarget;
+    // Read-only from this register: an investment event's counterpart, or a
+    // split line seen from its other side. The server's `isReadOnly` says so;
+    // nothing here re-derives it from posting counts.
+    const isCrossDomainTarget = target.isReadOnly;
     // Slice 2c: Accept appears at the top when the row carries
     // the bank-feed review flag — discoverability for the
     // primary action on a freshly-synced row. Matches the

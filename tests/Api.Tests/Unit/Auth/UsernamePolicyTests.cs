@@ -18,9 +18,9 @@ namespace Coffer.Api.Tests.Unit.Auth;
 public sealed class UsernamePolicyTests
 {
     [Theory]
-    // The case that started this: an email address must be acceptable. It was
-    // rejected by a client-only pattern that neither the API nor the invite form
-    // enforced, so the FIRST user was refused what every invited user could use.
+    // An email address must be acceptable. A client-only pattern that neither the
+    // API nor the invite form enforces would refuse the FIRST user what every
+    // invited user can use.
     [InlineData("ada.reyes@example.com")]
     [InlineData("ada.reyes+coffer@example.co.uk")]
     // Plain handles still fine.
@@ -30,7 +30,7 @@ public sealed class UsernamePolicyTests
     // Mixed case is allowed — folding is storage's job (username_ci), not a
     // keyboard restriction.
     [InlineData("AdaReyes")]
-    // Non-ASCII scripts, which the old [a-z0-9_-] rule made unusable.
+    // Non-ASCII scripts, which an [a-z0-9_-] rule would make unusable.
     [InlineData("josé")]
     [InlineData("Иван")]
     [InlineData("山田太郎")]

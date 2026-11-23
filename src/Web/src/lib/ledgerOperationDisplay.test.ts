@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { summarizeLedgerOperation } from './ledgerOperationDisplay';
+import { ledgerOperationLabel, summarizeLedgerOperation } from './ledgerOperationDisplay';
 import type { LedgerOperationSummary } from './types';
 
 // summarizeLedgerOperation reads only `family` + `details`, so a partial run + cast
@@ -42,6 +42,29 @@ function ingestRun(providerKey: string, details: Record<string, number>): Ledger
     return { family: 'ingest', providerKey, details } as LedgerOperationSummary;
 }
 
+describe('summarizeLedgerOperation — rates and benchmarks (ADR-0114 D11)', () => {
+    it('names a standalone backfill and says what it stored, not "0 new"', () => {
+        const run = {
+            family: 'quote', providerKey: 'market-series-backfill',
+            details: { prices_inserted: 0, prices_updated: 0, rates_inserted: 240, benchmark_days_inserted: 1 },
+        } as unknown as LedgerOperationSummary;
+        expect(ledgerOperationLabel(run.providerKey)).toBe('Rates and benchmarks backfill');
+        expect(summarizeLedgerOperation(run)).toBe('240 rate days · 1 benchmark day');
+    });
+
+    it('says a backfill that stored nothing stored nothing', () => {
+        const run = { family: 'quote', providerKey: 'market-series-backfill', details: { rates_inserted: 0 } } as unknown as LedgerOperationSummary;
+        expect(summarizeLedgerOperation(run)).toBe('Nothing new');
+    });
+
+    it('adds a refresh\'s rates, benchmark days and currency checks after its prices', () => {
+        const s = summarizeLedgerOperation(quoteRun({
+            prices_inserted: 2, rates_inserted: 1, benchmark_days_inserted: 3, currencies_confirmed: 2, rows_restamped: 5,
+        }));
+        expect(s).toBe('2 new · 1 rate day · 3 benchmark days · 2 currencies confirmed · 5 re-stamped');
+    });
+});
+
 describe('summarizeLedgerOperation — new operation kinds (ADR-0086)', () => {
     it('totals Moneydance import step counts and shows elapsed', () => {
         const run = ingestRun('moneydance', {
@@ -60,5 +83,46 @@ describe('summarizeLedgerOperation — new operation kinds (ADR-0086)', () => {
         // Restore stores snapshot_id (a GUID) which is not in the numeric map.
         const run = { family: 'snapshot', providerKey: 'snapshot-restore', details: {} as Record<string, number> } as LedgerOperationSummary;
         expect(summarizeLedgerOperation(run)).toBe('Restored from a snapshot');
+    });
+});
+
+describe('summarizeLedgerOperation — a Demo marker (ADR-0115 D9)', () => {
+    it('labels the marker as the Demo examples, not as an import', () => {
+        expect(ledgerOperationLabel('demo')).toBe('Demo examples');
+    });
+
+    it('counts the steps recorded as added, out of every examples step', () => {
+        // The server's details: one entry per step, 1 added and 0 not.
+        const run = ingestRun('demo', {
+            resolve: 1, folders: 1, investments: 0, budgets: 1, register: 0, 'card-statement': 0,
+            reminders: 1, reports: 1, home: 1, snapshot: 0, check: 1,
+        });
+        expect(summarizeLedgerOperation(run)).toBe('7 of 11 example steps added');
+    });
+
+    it('counts every step on a completed marker', () => {
+        const run = ingestRun('demo', {
+            resolve: 1, folders: 1, investments: 1, budgets: 1, register: 1, 'card-statement': 1,
+            reminders: 1, reports: 1, home: 1, snapshot: 1, check: 1,
+        });
+        expect(summarizeLedgerOperation(run)).toBe('11 of 11 example steps added');
+    });
+
+    it('counts none while a marker records nothing yet, rather than reading as an import', () => {
+        // A running marker's details are empty; the ingest summary would say "0 new".
+        expect(summarizeLedgerOperation(ingestRun('demo', {}))).toBe('0 of 11 example steps added');
+    });
+});
+
+describe('ledgerOperationLabel — file imports by their reader', () => {
+    // A file run is recorded under its reader's key, so each CSV reader's key needs a
+    // name; the raw key is what an unnamed one shows.
+    it('names a CSV import by its reader', () => {
+        expect(ledgerOperationLabel('csv-generic')).toBe('CSV import');
+        expect(ledgerOperationLabel('csv-fidelity')).toBe('Fidelity CSV import');
+    });
+
+    it('still names a run recorded before runs carried their reader', () => {
+        expect(ledgerOperationLabel('file')).toBe('File import');
     });
 });

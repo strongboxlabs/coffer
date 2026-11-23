@@ -161,11 +161,11 @@ interface SetupCompleteRequest {
     challengeId: string;
     credentialNickname: string;
     attestationResponse: RegistrationResponseJSON;
-    includeDemo: boolean;
 }
 
 /**
- * Mirror of API `SetupCompleteResponse`. <b>recoveryCodes</b> are
+ * Mirror of API `SetupCompleteResponse`. Setup creates no ledger (ADR-0088, as
+ * amended by ADR-0115 D2), so the response names none. <b>recoveryCodes</b> are
  * returned exactly once at registration time — the caller MUST
  * surface them to the user and acknowledge the display before
  * navigating away. There is no API to retrieve them again later.
@@ -176,10 +176,6 @@ export interface SetupCompleteResponse {
     sessionId: string;
     sessionExpiresAt: string;
     recoveryCodes: string[];
-    /** Null unless a Demo ledger was requested and its seed succeeded (ADR-0088). */
-    ledgerId: string | null;
-    /** Null unless a Demo ledger was requested and its seed succeeded (ADR-0088). */
-    ledgerName: string | null;
     /**
      * The install's master key, base64 (ADR-0092 D2). Startup minted it on this
      * virgin install; setup is where the operator is first shown it. Unlike
@@ -205,12 +201,6 @@ export interface SetupInput {
      * disambiguate.
      */
     credentialNickname: string;
-    /**
-     * Also create a Demo ledger seeded with the bundled sample dataset
-     * (ADR-0088). Setup creates no ledger otherwise — the user lands on the
-     * hub and creates or imports one there.
-     */
-    includeDemo: boolean;
     /**
      * Optional callback fired right after /begin returns and the
      * WebAuthn ceremony is about to start. The setup page uses this
@@ -268,7 +258,6 @@ export async function performSetup(input: SetupInput): Promise<SetupCompleteResp
         challengeId: begin.challengeId,
         credentialNickname: input.credentialNickname,
         attestationResponse,
-        includeDemo: input.includeDemo,
     };
 
     return request<SetupCompleteResponse>(
@@ -518,9 +507,9 @@ export function forgetPendingRestore(): void {
 /**
  * Wait for the boot that applies a restore to record what it did, and return
  * that. The server answering again says nothing about a restore — it answers
- * after a failed one too, and treating it as success is how a restore that
- * failed and changed nothing once reported "Restore complete" — so this asks for
- * THIS attempt's recorded outcome until there is one.
+ * after a failed one too, and treating it as success would report a restore that
+ * failed and changed nothing as "Restore complete" — so this asks for THIS
+ * attempt's recorded outcome until there is one.
  *
  * Resolves null ("unconfirmed") only once the server has gone on answering that
  * it recorded nothing for this attempt for {@link notFoundGraceMs} — a single
@@ -603,7 +592,7 @@ export function fetchCredentials(): Promise<CredentialSummary[]> {
 
 /**
  * Remove one of the current user's passkeys (the server refuses the last one).
- * Needs a tap from another passkey (security audit, M2).
+ * Needs a tap from another passkey (ADR-0105 D1).
  */
 export async function deleteCredential(id: string): Promise<void> {
     const headers = await stepUpHeaders('passkey-delete');
@@ -619,8 +608,8 @@ export async function deleteCredential(id: string): Promise<void> {
  * right before the authenticator prompt so the UI can hint "tap your
  * authenticator".
  *
- * Adding a passkey needs a tap from one the user already has (security audit,
- * M2) — except right after signing in with a recovery code, when the server lets
+ * Adding a passkey needs a tap from one the user already has (ADR-0105 D1)
+ * — except right after signing in with a recovery code, when the server lets
  * the session add one untapped. So the begin is tried without a tap first, and the
  * tap only runs if the server asks for it.
  */
@@ -659,7 +648,7 @@ export function fetchRecoveryCodesStatus(): Promise<RecoveryCodesStatus> {
  * RecoveryCodes component) and the old set is now invalid.
  */
 export async function regenerateRecoveryCodes(): Promise<string[]> {
-    // New codes replace the old ones: a tap, not just the session (audit, M2).
+    // New codes replace the old ones: a tap, not just the session (ADR-0105 D1).
     const headers = await stepUpHeaders('recovery-codes');
     const result = await request<{ recoveryCodes: string[] }>(
         '/api/auth/recovery-codes/regenerate',
@@ -670,7 +659,7 @@ export async function regenerateRecoveryCodes(): Promise<string[]> {
 
 /**
  * End every other session this account has — other browsers and devices — and keep
- * this one (ADR-0013's "sign out everywhere"; 2026-10-12 security audit). Returns how
+ * this one (ADR-0013's "sign out everywhere"; ADR-0105 D3). Returns how
  * many were ended. App connections are managed separately, under connected apps.
  */
 export async function signOutOtherSessions(): Promise<number> {

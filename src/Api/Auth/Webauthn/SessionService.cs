@@ -37,7 +37,7 @@ public sealed class SessionService
     /// The cookie name, read by everything that sets, clears or validates it.
     /// </summary>
     /// <remarks>
-    /// <c>__Host-</c>-prefixed whenever the cookie is Secure (2026-10-12 audit, M1).
+    /// <c>__Host-</c>-prefixed whenever the cookie is Secure (ADR-0105 D2).
     /// The browser then refuses the cookie unless it is Secure, host-only and
     /// <c>Path=/</c> — so a sibling subdomain can no longer plant a
     /// <c>Domain=.example.com</c> cookie of the same name to swap the operator into

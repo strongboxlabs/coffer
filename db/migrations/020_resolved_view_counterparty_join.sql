@@ -6,12 +6,10 @@
 --
 -- Why
 -- ---
--- EXPLAIN ANALYZE on a 100-entry register page showed
--- register_entry_rows running 289ms with tens of thousands of disk reads, dominated
--- by around a thousand scalar subquery evaluations against the cold transactions
--- + accounts pages (3 subqueries × the page's few hundred rows). A single
--- hash/merge join plans these as ONE per-row lookup instead of three,
--- cutting the page query time substantially.
+-- Three correlated scalar subqueries are evaluated for every row the view
+-- returns, each a separate probe of transactions + accounts, so a register
+-- page costs three lookups per row. A single hash/merge join plans these as
+-- ONE per-row lookup instead of three.
 --
 -- Output shape
 -- ------------
@@ -66,11 +64,10 @@ SELECT
     ct.account_id           AS counterparty_account_id,
     ca.name                 AS counterparty_account_name,
     ca.account_type         AS counterparty_account_type,
-    -- Tags stays as a per-row ARRAY-agg. Per-row cost is small
-    -- (transaction_tags PK is (transaction_id, tag_id); typical
-    -- rows have 0-1 tags) and rewriting it as a LATERAL JOIN +
-    -- array_agg adds complexity without obvious win. Revisit if a
-    -- future EXPLAIN flags it.
+    -- Tags stays as a per-row ARRAY-agg. Per-row cost is one index
+    -- probe (transaction_tags PK is (transaction_id, tag_id)), and
+    -- rewriting it as a LATERAL JOIN + array_agg adds complexity
+    -- without removing that probe.
     COALESCE(
         ARRAY(SELECT tg.name
               FROM transaction_tags tt

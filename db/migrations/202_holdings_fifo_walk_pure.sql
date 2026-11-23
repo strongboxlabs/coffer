@@ -33,13 +33,12 @@
 -- unchanged in behaviour and now expressed over arrays instead of table updates.
 --
 -- PORTED FROM MIGRATION 169, which is this function's current definition — not from
--- 148, which introduced FIFO but was superseded three times after it. A first draft
--- of this migration ported 148 and silently dropped everything added later: the
--- merged-header exclusion (163), the transfer_shares disposal gate (152/165), and
--- the realized-gains short/long-term split (169). The last surfaced as long-term
--- gain reading zero in an existing test, because mig 169's three _lt columns are
--- NOT NULL DEFAULT 0 and an INSERT omitting them silently gets zeros. So every
--- behaviour that has to survive is listed here:
+-- 148, which introduced FIFO but was superseded three times after it. A port of 148
+-- silently drops everything added later: the merged-header exclusion (163), the
+-- transfer_shares disposal gate (152/165), and the realized-gains short/long-term
+-- split (169). The last fails quietly, as long-term gain reading zero, because mig
+-- 169's three _lt columns are NOT NULL DEFAULT 0 and an INSERT omitting them
+-- silently gets zeros. So every behaviour that has to survive is listed here:
 --
 --   * merged and hidden headers excluded from the event stream and from lot reset;
 --   * a transfer_shares disposal consumes lots but records NO realized_gains row

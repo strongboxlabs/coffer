@@ -36,4 +36,11 @@ public sealed class LedgerRow
     /// ledger row itself being touched.</summary>
     public DateTime? LekCreatedAt { get; set; }
 
+    /// <summary>
+    /// The ledger's reporting currency (migration 280, ADR-0114 D7): what a figure that
+    /// combines accounts converts into. ISO 4217, validated by the API as
+    /// <see cref="AccountRow.CurrencyCode"/> is. <c>USD</c> unless the writer names
+    /// another, the column's default and <c>DisplayCurrency.Fallback</c>.
+    /// </summary>
+    public string CurrencyCode { get; init; } = "USD";
 }

@@ -57,25 +57,84 @@ public sealed class UserPreferencesRepository
             JsonSerializer.Serialize(prefs, JsonOpts), cancellationToken);
 
     /// <summary>
-    /// The <c>dashboard</c> layout preference for (user, ledger). Empty (no
-    /// widgets) when unset — the SPA resolves that to the canonical default.
+    /// The stored <c>dashboard</c> document for (user, ledger) as stored, whatever its
+    /// version, and the row's <c>updated_at</c>; both null when there is no row. The
+    /// SPA resolves the document, so it is passed through rather than typed here.
     /// </summary>
-    public async Task<DashboardPrefs> GetDashboardAsync(
+    public async Task<(string? Json, DateTime? UpdatedAt)> GetDashboardAsync(
         Guid userId, Guid ledgerId, CancellationToken cancellationToken = default)
     {
-        var json = await GetRawAsync(userId, ledgerId, Namespaces.Dashboard, cancellationToken)
+        var row = await _db.UserPreferences.AsNoTracking()
+            .Where(p => p.UserId == userId && p.LedgerId == ledgerId && p.Namespace == Namespaces.Dashboard)
+            .Select(p => new { p.ValueJson, p.UpdatedAt })
+            .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
-        if (json is null)
-            return new DashboardPrefs();
-        return JsonSerializer.Deserialize<DashboardPrefs>(json, JsonOpts) ?? new DashboardPrefs();
+        return row is null ? (null, null) : (row.ValueJson, row.UpdatedAt);
     }
 
-    /// <summary>Upsert the <c>dashboard</c> layout preference for (user, ledger).</summary>
-    public Task SetDashboardAsync(
-        Guid userId, Guid ledgerId, DashboardPrefs prefs, CancellationToken cancellationToken = default) =>
-        UpsertRawAsync(
-            userId, ledgerId, Namespaces.Dashboard,
-            JsonSerializer.Serialize(prefs, JsonOpts), cancellationToken);
+    /// <summary>
+    /// Write the <c>dashboard</c> document if the row is still as the caller last read
+    /// it: <paramref name="expectedUpdatedAt"/> null means no row may exist, a value
+    /// means the row's <c>updated_at</c> must equal it. Returns the row's new
+    /// <c>updated_at</c>, or null when the write was stale and nothing was written.
+    /// </summary>
+    /// <remarks>
+    /// A compare-and-swap of its own rather than the shared upsert, which writes
+    /// whatever it is given. Two tabs each saving a layout would otherwise each erase
+    /// the other's without either knowing. The new <c>updated_at</c> is cut to
+    /// microseconds, the column's precision, so the value returned is the value stored
+    /// and the caller's next write can match it.
+    /// </remarks>
+    public async Task<DateTime?> SaveDashboardAsync(
+        Guid userId, Guid ledgerId, string json, DateTime? expectedUpdatedAt,
+        CancellationToken cancellationToken = default)
+    {
+        var now = _clock.GetUtcNow().UtcDateTime;
+        now = new DateTime(now.Ticks - (now.Ticks % TimeSpan.TicksPerMicrosecond), DateTimeKind.Utc);
+
+        if (expectedUpdatedAt is { } expected)
+        {
+            var at = expected.Kind == DateTimeKind.Utc ? expected : expected.ToUniversalTime();
+            var written = await _db.UserPreferences
+                .Where(p => p.UserId == userId && p.LedgerId == ledgerId
+                            && p.Namespace == Namespaces.Dashboard && p.UpdatedAt == at)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(p => p.ValueJson, json)
+                    .SetProperty(p => p.UpdatedAt, now), cancellationToken)
+                .ConfigureAwait(false);
+            return written == 1 ? now : null;
+        }
+
+        var row = new UserPreferenceRow
+        {
+            UserId = userId,
+            LedgerId = ledgerId,
+            Namespace = Namespaces.Dashboard,
+            ValueJson = json,
+            UpdatedAt = now,
+        };
+        _db.UserPreferences.Add(row);
+        try
+        {
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            return now;
+        }
+        catch (DbUpdateException ex) when (ex.InnerException is Npgsql.PostgresException
+                                               { SqlState: Npgsql.PostgresErrorCodes.UniqueViolation })
+        {
+            // A row exists after all: the caller's read is out of date.
+            _db.Entry(row).State = EntityState.Detached;
+            return null;
+        }
+    }
+
+    /// <summary>Remove the <c>dashboard</c> document for (user, ledger), if any. The
+    /// SPA's default layout applies again.</summary>
+    public Task DeleteDashboardAsync(
+        Guid userId, Guid ledgerId, CancellationToken cancellationToken = default) =>
+        _db.UserPreferences
+            .Where(p => p.UserId == userId && p.LedgerId == ledgerId && p.Namespace == Namespaces.Dashboard)
+            .ExecuteDeleteAsync(cancellationToken);
 
     private async Task<string?> GetRawAsync(
         Guid userId, Guid ledgerId, string ns, CancellationToken cancellationToken)

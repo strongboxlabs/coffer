@@ -58,8 +58,7 @@ knobs (`API_PORT`, `ASPNETCORE_ENVIRONMENT`, `COFFER_RP_ID`, `COFFER_WEB_ORIGIN_
 
 **The port.** `"${API_PORT}:8080"` publishes on every interface, IPv4 and IPv6, and
 Docker's rules for a published port are evaluated before ufw's and firewalld's, so the
-host firewall does not close it. The README called the default "nothing published
-beyond it", which was wrong. The default stays: an install reached from a LAN proxy or
+host firewall does not close it. The default stays: an install reached from a LAN proxy or
 another machine keeps working on upgrade. It is now stated plainly in the README,
 operations.md and at the end of every `install.sh` run, and `API_BIND` in `.env` closes
 it (`127.0.0.1`). The compose line is `"${API_BIND:+${API_BIND}:}${API_PORT:-8080}:8080"`,
@@ -80,11 +79,11 @@ filesystem was not taken, because a restore decrypts the whole backup to temp.
 
 ## Amendment, 2026-10-20 — the refusal carries the fix itself (0.122.1)
 
-The first production upgrade to 0.122.0 changed the tag in `.env` instead of running
-`install.sh`. The API refused to start, as designed, but the fix it named was
-`sudo bash scripts/own-api-volumes.sh`, and upgrading.md said the same. That script
-reaches a host only with a 0.122.0 or later `install.sh`, so every host that can hit the
-refusal is one that does not have it.
+An upgrade to 0.122.0 or later that changes the tag in `.env` instead of running
+`install.sh` skips the volume hand-over, and the API refuses to start, as designed. Until
+0.122.1 the fix the refusal named was `sudo bash scripts/own-api-volumes.sh`, and
+upgrading.md said the same. That script reaches a host only with a 0.122.0 or later
+`install.sh`, so every host that can hit the refusal is one that does not have it.
 
 The refusal now prints the hand-over as one command for the host:
 - a one-off container with `--volumes-from` and the API container's own image, running

@@ -4,7 +4,7 @@ The Coffer SPA, per [ADR-0007](../../docs/decisions/0007-react-spa-over-nextjs.m
 
 ## Stack (pinned, boring on purpose)
 
-- **Vite 5** + **React 18** + **TypeScript 5.7** (strict). Pinned to the most-trodden tier of each — see [`feedback_frontend_engineering_posture`](#) (memory) and [engineering-standards §4.3.1](../../docs/engineering-standards.md).
+- **Vite 5** + **React 18** + **TypeScript 5.7** (strict). Pinned to the most-trodden tier of each — see `feedback_frontend_engineering_posture` (memory) and [engineering-standards §4.3.1](../../docs/engineering-standards.md).
 - **TanStack Router** (code-based, no codegen) + **TanStack Query** (one client, 30s staleTime).
 - **Tailwind v3** + hand-built shadcn-style primitives (`components/ui/{Button,Input,Label}.tsx`).
 - **`@simplewebauthn/browser`** for the login ceremony.

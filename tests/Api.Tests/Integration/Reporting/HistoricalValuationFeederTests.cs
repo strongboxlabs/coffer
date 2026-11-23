@@ -16,18 +16,19 @@ namespace Coffer.Api.Tests.Integration.Reporting;
 /// edge.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class HistoricalValuationFeederTests
+public sealed class HistoricalValuationFeederTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public HistoricalValuationFeederTests(PostgresFixture fixture) => _fixture = fixture;
+    public HistoricalValuationFeederTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private static DateTime Utc(int y, int m, int d) => new(y, m, d, 0, 0, 0, DateTimeKind.Utc);
 
     [Fact]
     public async Task HoldingsMarketValueAsOf_split_adjusts_both_quantity_and_price()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var brokerage = await ledger.AddInvestmentAccountAsync("Brokerage");
         var holdings = brokerage.HoldingsAccountId!.Value;
         var sec = await ledger.AddSecurityAsync("Splitter", "SPL");
@@ -40,7 +41,7 @@ public sealed class HistoricalValuationFeederTests
         await ledger.AddSecuritySplitAsync(sec, ratio: 2m, splitAt: Utc(2024, 6, 1));
         await ledger.AddSecurityPriceAsync(sec, 6m, Utc(2024, 7, 1));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         // Via the batched feeder with a one-element instant array — the per-instant
         // form was dropped in mig 203, since a single instant is a set of one.
         async Task<HoldingsMarketValueAsOfSetRow?> ValueAt(DateTime asOf) =>
@@ -82,7 +83,7 @@ public sealed class HistoricalValuationFeederTests
     [Fact]
     public async Task AccountBalanceAsOf_reflects_only_headers_up_to_the_instant()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("Checking");
         var groceries = await ledger.AddCategoryAsync("Groceries");
 
@@ -91,7 +92,7 @@ public sealed class HistoricalValuationFeederTests
         await ledger.AddTransactionPairAsync(checking.Id, groceries.Id, -40m, Utc(2024, 1, 10));
         await ledger.AddTransactionPairAsync(checking.Id, groceries.Id, -25m, Utc(2024, 2, 10));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         async Task<decimal> BalanceAt(DateTime asOf) =>
             (await db.AccountBalanceAsOfInstants(ledger.LedgerId, [asOf], [checking.Id]).ToListAsync())
             .Single().Balance;
@@ -104,7 +105,7 @@ public sealed class HistoricalValuationFeederTests
     [Fact]
     public async Task AccountBalanceAsOf_honors_a_posted_at_override_date()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db);
         var checking = await ledger.AddBankAccountAsync("Checking");
         var groceries = await ledger.AddCategoryAsync("Groceries");
 
@@ -117,7 +118,7 @@ public sealed class HistoricalValuationFeederTests
         // (COALESCE(o.posted_at, h.posted_at)). Its effective date is now December.
         await ledger.EditHeaderAsync(feb, postedAt: Utc(2024, 12, 31));
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         async Task<decimal> BalanceAt(DateTime asOf) =>
             (await db.AccountBalanceAsOfInstants(ledger.LedgerId, [asOf], [checking.Id]).ToListAsync())
             .Single().Balance;

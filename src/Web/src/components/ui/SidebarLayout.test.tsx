@@ -78,4 +78,29 @@ describe('SidebarLayout primitives', () => {
         expect(screen.getByText('Active')).toHaveAttribute('aria-current', 'page');
         expect(screen.getByText('Inactive')).not.toHaveAttribute('aria-current');
     });
+
+    // The frame is exactly the viewport and the document never scrolls; only
+    // these two areas do. An absolutely positioned box (`sr-only` text above
+    // all) adds to the overflow of its containing block, not of the scroll
+    // containers between the two, so each scroll area must BE that containing
+    // block, or the text extends the document past the window. jsdom has no
+    // layout, so the positioning class is what can be pinned here; the browser
+    // is where the document's height is proven. A caller's own classes must
+    // not drop it.
+    it('makes each scroll area the containing block of what it scrolls', () => {
+        render(
+            <SidebarLayout>
+                <Sidebar>
+                    <SidebarNav data-testid="nav" className="px-2" />
+                </Sidebar>
+                <MainArea>
+                    <MainPane data-testid="pane" className="p-4" />
+                </MainArea>
+            </SidebarLayout>,
+        );
+
+        for (const id of ['nav', 'pane']) {
+            expect(screen.getByTestId(id)).toHaveClass('relative', 'overflow-y-auto');
+        }
+    });
 });

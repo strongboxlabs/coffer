@@ -1,3 +1,5 @@
+using Coffer.Domain.Annotations;
+
 namespace Coffer.Api.Db.Entities;
 
 /// <summary>
@@ -18,8 +20,9 @@ internal sealed class TxnLegRow
     public Guid LedgerId { get; init; }
     // Everything a reshape can edit is mutable (get; set;). The bank's
     // postings-reshape flow (ADR-0025) needs AccountId / PostingIndex /
-    // Amount / LegMemo; the investment PATCH additionally rewrites the
-    // investment metadata in place, so that is mutable too.
+    // Amount; the investment PATCH additionally rewrites the investment
+    // metadata in place, so that is mutable too. LegMemo is the exception:
+    // only the write primitive's adapter assigns it (AssignLegMemo).
     //
     // The investment metadata was init-only on the reasoning that it never
     // changes after row creation. That was true only because the investment
@@ -32,7 +35,14 @@ internal sealed class TxnLegRow
     // particular being immutable.
     public Guid AccountId { get; set; }
     public int PostingIndex { get; set; }
-    public string? LegMemo { get; set; }
+    /// <summary>
+    /// This side's own memo, or a split line's on its split side. Written only by
+    /// the write primitive's adapter, through <see cref="AssignLegMemo"/>.
+    /// </summary>
+    public string? LegMemo { get; private set; }
+
+    /// <summary>Store a planned leg memo (see <see cref="LegMemo"/>).</summary>
+    internal void AssignLegMemo(string? memo) => LegMemo = memo;
     public decimal Amount { get; set; }
     public Guid? SecurityId { get; set; }
     public decimal? Quantity { get; set; }
@@ -50,11 +60,10 @@ internal sealed class TxnLegRow
     /// <see cref="AccountPostingsOnHeader"/> is the number of postings of
     /// this leg's header that touch this leg's <see cref="AccountId"/>;
     /// <see cref="HeaderTotalPostings"/> is the header's total posting
-    /// count. When they're equal the account ORIGINATES the header (it's
-    /// touched by every posting); when
-    /// <c>AccountPostingsOnHeader &lt; HeaderTotalPostings</c> this is a
-    /// target-split leg whose header is owned elsewhere (read-only from
-    /// this account's register).
+    /// count. When they're equal the account is touched by every posting;
+    /// that does not make it the header's owner (a split whose every line
+    /// lands on one category is equal there too). Whether this account's
+    /// register can edit the row is <see cref="NotesIsReadOnly"/>.
     /// <para>Maintained entirely by
     /// <c>fn_recompute_posting_counts_for_header</c> (the recompute
     /// interceptor); read-only from EF's side. The DB defaults both to 1
@@ -70,4 +79,37 @@ internal sealed class TxnLegRow
     /// </summary>
     public int HeaderTotalPostings { get; init; }
     public DateTime CreatedAt { get; init; }
+
+    // The stored memo-and-tags presentation (migration 264), INSERT-ONLY here: a writer
+    // that already knows every input of a new leg's header inserts the leg with them
+    // (LegNotes.Stamp, the only caller of StampNotes), so the recompute after the save
+    // finds nothing to change. Mapped with an after-save behaviour of Throw, so setting
+    // one on a leg already saved fails the save; every later change is LegNotes' own
+    // update through its private store. Not read from here: readers read the view.
+    public LegKind? NotesKind { get; private set; }
+    public bool? NotesIsReadOnly { get; private set; }
+    public bool? NotesGroupsByHeader { get; private set; }
+    public string? NotesMemo { get; private set; }
+    public bool? NotesMemoInherited { get; private set; }
+    public string? NotesInheritedMemo { get; private set; }
+    public Guid? NotesInheritFromAccountId { get; private set; }
+    public bool? NotesTagsInherited { get; private set; }
+    public string? NotesHeaderMemo { get; private set; }
+    public bool? NotesHeaderInPlay { get; private set; }
+
+    /// <summary>Set the leg's stored presentation before its insert. Called by <see cref="LegNotes.Stamp"/> only.</summary>
+    internal void StampNotes(LegNotes.LegValues values)
+    {
+        ArgumentNullException.ThrowIfNull(values);
+        NotesKind = values.Kind;
+        NotesIsReadOnly = values.IsReadOnly;
+        NotesGroupsByHeader = values.GroupsByHeader;
+        NotesMemo = values.Memo;
+        NotesMemoInherited = values.MemoInherited;
+        NotesInheritedMemo = values.InheritedMemo;
+        NotesInheritFromAccountId = values.InheritFromAccountId;
+        NotesTagsInherited = values.TagsInherited;
+        NotesHeaderMemo = values.HeaderMemo;
+        NotesHeaderInPlay = values.HeaderInPlay;
+    }
 }

@@ -1,3 +1,4 @@
+using Coffer.Domain.Investment;
 using Dapper;
 using Npgsql;
 
@@ -142,13 +143,13 @@ public sealed class AccountsRepository
                                   is_system, holdings_account_id,
                                   notes, account_number,
                                   institution_name, routing_number, account_url,
-                                  provider_raw_payload, opened_on)
+                                  provider_raw_payload, tax_status, opened_on)
             VALUES (@Id, @LedgerId, @ParentId, @Name, @AccountType, @CategoryKind,
                     @CurrencyCode, @OpeningBalance, @IsActive, @ExternalId,
                     @IsSystem, @HoldingsAccountId,
                     @Notes, @AccountNumber,
                     @InstitutionName, @RoutingNumber, @AccountUrl,
-                    @ProviderRawPayload::jsonb, @OpenedOn)
+                    @ProviderRawPayload::jsonb, @TaxStatus, @OpenedOn)
             RETURNING id;
             """;
         var insertedId = await _connection.ExecuteScalarAsync<Guid>(new CommandDefinition(
@@ -239,6 +240,56 @@ public sealed class AccountsRepository
             cancellationToken: cancellationToken)).ConfigureAwait(false);
 
         return holdingsId;
+    }
+
+    /// <summary>
+    /// Return the ledger's system Uncategorized category, creating it if the
+    /// ledger has none, and whether this call inserted it.
+    /// </summary>
+    /// <remarks>
+    /// The same row the API's <c>IngestOrchestrator.EnsureUncategorizedAsync</c>
+    /// lazily creates for bank feeds — same lookup (ledger, <c>is_system</c>,
+    /// account type, name) and the same field values, both read from the shared
+    /// <see cref="UncategorizedCategory"/> — so an import and a later feed share
+    /// one account instead of each minting its own. No <c>external_id</c> and no
+    /// <c>account_external_ids</c> junction: it is a Coffer-native row, not a
+    /// Moneydance account. Its currency is not part of the lookup.
+    /// </remarks>
+    /// <param name="currencyCode">The currency a created row is stamped with: the
+    /// ledger's reporting currency, which every imported category takes (ADR-0114 D7).</param>
+    public async Task<(Guid Id, bool Inserted)> EnsureUncategorizedAsync(
+        Guid ledgerId, string currencyCode, CancellationToken cancellationToken = default)
+    {
+        var existing = await _connection.ExecuteScalarAsync<Guid?>(new CommandDefinition("""
+            SELECT id FROM accounts
+             WHERE ledger_id = @ledgerId AND is_system
+               AND account_type = @accountType AND name = @name
+             LIMIT 1;
+            """,
+            new { ledgerId, accountType = UncategorizedCategory.AccountType, name = UncategorizedCategory.Name },
+            cancellationToken: cancellationToken)).ConfigureAwait(false);
+        if (existing is { } found) return (found, false);
+
+        var id = await InsertSystemAccountAsync(new AccountRow(
+            Id: Guid.NewGuid(),
+            LedgerId: ledgerId,
+            ParentId: null,
+            Name: UncategorizedCategory.Name,
+            AccountType: UncategorizedCategory.AccountType,
+            CategoryKind: UncategorizedCategory.CategoryKind,
+            CurrencyCode: currencyCode,
+            OpeningBalance: 0m,
+            IsActive: true,
+            ExternalId: null,
+            IsSystem: true,
+            HoldingsAccountId: null,
+            Notes: null,
+            AccountNumber: null,
+            InstitutionName: null,
+            RoutingNumber: null,
+            AccountUrl: null
+        ), cancellationToken).ConfigureAwait(false);
+        return (id, true);
     }
 
     /// <summary>

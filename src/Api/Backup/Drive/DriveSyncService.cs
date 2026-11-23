@@ -119,9 +119,9 @@ public sealed class DriveSyncService
     }
 
     /// <summary>
-    /// Disconnect: revoke the refresh token at Google, then forget it here (FU-080). Before,
-    /// the token was only forgotten here, so the grant stayed live at Google — and a copy of it
-    /// sits, sealed, in every backup taken while it was connected.
+    /// Disconnect: revoke the refresh token at Google, then forget it here (FU-080). Only
+    /// forgetting it here would leave the grant live at Google — and a copy of it sits,
+    /// sealed, in every backup taken while it was connected.
     /// </summary>
     /// <remarks>
     /// Local forgetting happens whatever Google says: a disconnect that a network failure

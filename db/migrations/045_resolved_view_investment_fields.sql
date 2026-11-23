@@ -14,9 +14,8 @@
 -- this slice adds the per-row data the SPA needs to render an
 -- Action chip + ticker badge + qty×price subtitle.
 --
--- NOT included: `txn_legs.commission`. Audit confirmed the column
--- is dead — no row has a non-zero value; the importer
--- writes 0/null on every row. ADR-0019 Rule 5 makes the fee leg
+-- NOT included: `txn_legs.commission`. The column is dead — the
+-- importer writes 0/null on every row. ADR-0019 Rule 5 makes the fee leg
 -- (separate paired txn_headers row) the source of truth; the lot's
 -- `unit_cost` carries the apportioned commission for cost-basis
 -- math. Dropping `txn_legs.commission` itself is tracked under

@@ -39,7 +39,7 @@ public sealed class MdReminderRruleTests
     [Fact]
     public void Weekly_by_day_with_and_without_interval()
     {
-        // weeklydays 2 = Monday (Java Calendar DOW; verified against a sample export).
+        // weeklydays 2 = Monday (Java Calendar DOW).
         Assert.Equal("FREQ=WEEKLY;BYDAY=MO", MdReminderRrule.Build(R(weeklyDay: 2)));
         Assert.Equal("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO",
             MdReminderRrule.Build(R(weeklyDay: 2, weeklyMod: 2)));
@@ -55,8 +55,8 @@ public sealed class MdReminderRruleTests
     [InlineData(7, "SA")]
     public void Weekly_day_of_week_uses_java_calendar_numbering(int weeklyDay, string byday)
     {
-        // MD weeklydays = Java Calendar DOW (1=SU .. 7=SA), verified against a
-        // sample export ("every Friday" -> 6, "Monday" -> 2). See MdReminderRrule.
+        // MD weeklydays = Java Calendar DOW (1=SU .. 7=SA), so "every Friday"
+        // is 6 and "Monday" is 2. See MdReminderRrule.
         Assert.Equal($"FREQ=WEEKLY;BYDAY={byday}", MdReminderRrule.Build(R(weeklyDay: weeklyDay)));
     }
 

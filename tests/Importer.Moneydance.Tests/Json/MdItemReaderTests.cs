@@ -9,8 +9,8 @@ public sealed class MdItemReaderTests
           "metadata": {
             "exporter": "Moneydance 2024.4 (5253)",
             "moneydance_build": 5253,
-            "export_date": 20260508,
-            "file_name": "vbdata"
+            "export_date": 20260101,
+            "file_name": "sample"
           },
           "all_items": [
             {
@@ -18,8 +18,8 @@ public sealed class MdItemReaderTests
               "id": "a-1",
               "name": "Cash",
               "type": "b",
-              "currid": "1d3b7c05",
-              "ts": "1735253349825"
+              "currid": "c-1",
+              "ts": "1735689600000"
             },
             {
               "obj_type": "curr",
@@ -39,8 +39,8 @@ public sealed class MdItemReaderTests
 
         Assert.Equal("Moneydance 2024.4 (5253)", export.Metadata.Exporter);
         Assert.Equal(5253, export.Metadata.MoneydanceBuild);
-        Assert.Equal(20260508, export.Metadata.ExportDate);
-        Assert.Equal("vbdata", export.Metadata.FileName);
+        Assert.Equal(20260101, export.Metadata.ExportDate);
+        Assert.Equal("sample", export.Metadata.FileName);
         Assert.Equal(2, export.AllItems.Count);
     }
 
@@ -53,7 +53,7 @@ public sealed class MdItemReaderTests
         Assert.Equal("a-1", acct.Id);
         Assert.Equal("Cash", acct.GetString("name"));
         Assert.Equal("b", acct.GetString("type"));
-        Assert.Equal("1d3b7c05", acct.GetString("currid"));
+        Assert.Equal("c-1", acct.GetString("currid"));
         Assert.True(acct.Has("ts"));
     }
 

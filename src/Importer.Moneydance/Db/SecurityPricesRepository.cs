@@ -6,7 +6,7 @@ namespace Coffer.Importer.Moneydance.Db;
 /// <summary>
 /// Dapper-backed gateway to <c>security_prices</c>. The Moneydance importer
 /// produces one row per <c>csnap</c> item that resolves to a known security;
-/// an export's snapshots, which can run to tens of thousands, go through
+/// an export's snapshots, one per security per priced date, go through
 /// <see cref="BulkUpsertAsync"/> in a single multi-row INSERT per chunk.
 /// </summary>
 public sealed class SecurityPricesRepository

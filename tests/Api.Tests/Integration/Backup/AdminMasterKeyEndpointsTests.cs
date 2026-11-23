@@ -32,11 +32,12 @@ namespace Coffer.Api.Tests.Integration.Backup;
 /// itself, which is Fido2NetLib's and is shared with the login ceremony.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class AdminMasterKeyEndpointsTests
+public sealed class AdminMasterKeyEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public AdminMasterKeyEndpointsTests(PostgresFixture fixture) => _fixture = fixture;
+    public AdminMasterKeyEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     /// <summary>The fixture KEK ApiFactory pins — 32 zero bytes.</summary>
     private const string FixtureKeyBase64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -56,7 +57,7 @@ public sealed class AdminMasterKeyEndpointsTests
 
     private async Task PromoteToAdminAsync(SyntheticLedger ledger)
     {
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         await db.Users.Where(u => u.Id == ledger.UserId)
             .ExecuteUpdateAsync(s => s.SetProperty(u => u.IsAdmin, _ => true));
     }
@@ -65,20 +66,6 @@ public sealed class AdminMasterKeyEndpointsTests
     {
         using var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync());
         return doc.RootElement.TryGetProperty("code", out var c) ? c.GetString() : null;
-    }
-
-    /// <summary>
-    /// Clear the two deployment singletons that carry KEK-wrapped blobs. Rotation
-    /// is all-or-nothing over EVERY wrapped value, so one unopenable row anywhere
-    /// aborts it — and neighbouring tests legitimately leave placeholder ciphertext
-    /// (an endpoint test only needs the row to exist, not to be a real sealed blob).
-    /// Same convention <c>AdminBackupsEndpointsTests</c> uses for the backup row.
-    /// </summary>
-    private async Task ResetWrappedSingletonsAsync()
-    {
-        await using var db = _fixture.NewDbContext();       // service role
-        await db.DriveSync.ExecuteDeleteAsync();
-        await db.GlobalScheduledJobs.ExecuteDeleteAsync();
     }
 
     private static AssertionOptions FakeAssertionOptions() => new()
@@ -157,7 +144,7 @@ public sealed class AdminMasterKeyEndpointsTests
     [Fact]
     public async Task Anonymous_cannot_read_status_or_reveal()
     {
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = factory.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
 
         Assert.Equal(HttpStatusCode.Unauthorized,
@@ -172,8 +159,8 @@ public sealed class AdminMasterKeyEndpointsTests
     [Fact]
     public async Task Non_admin_cookie_is_forbidden()
     {
-        var alice = await SyntheticLedger.CreateAsync(_fixture);   // not an admin
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var alice = await SyntheticLedger.CreateAsync(Db);   // not an admin
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await CookieClientAsync(factory, alice);
 
         Assert.Equal(HttpStatusCode.Forbidden,
@@ -186,7 +173,7 @@ public sealed class AdminMasterKeyEndpointsTests
     public async Task Reveal_is_not_reachable_by_GET()
     {
         // Key material must never sit in a URL, a referrer header, or history.
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var resp = await client.GetAsync("/api/admin/master-key/reveal");
@@ -202,7 +189,7 @@ public sealed class AdminMasterKeyEndpointsTests
     [Fact]
     public async Task Status_returns_metadata_and_never_the_key()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();          // dev-auth is admin
 
         var resp = await client.GetAsync("/api/admin/master-key");
@@ -224,7 +211,7 @@ public sealed class AdminMasterKeyEndpointsTests
     [Fact]
     public async Task Reveal_without_an_assertion_is_422_not_a_key()
     {
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var resp = await client.PostAsJsonAsync("/api/admin/master-key/reveal",
@@ -238,7 +225,7 @@ public sealed class AdminMasterKeyEndpointsTests
     public async Task Reveal_with_an_unguessed_challenge_is_401()
     {
         // The "skip /begin and post a random id" shape.
-        await using var factory = new ApiFactory(_fixture).WithService(_ => AcceptingWebAuthn());
+        await using var factory = new ApiFactory(Db).WithService(_ => AcceptingWebAuthn());
         using var client = factory.CreateClient();
 
         var resp = await client.PostAsJsonAsync("/api/admin/master-key/reveal",
@@ -253,16 +240,16 @@ public sealed class AdminMasterKeyEndpointsTests
         // Why MasterKeyRevealFlow is its own flow: otherwise "log in" would be
         // equivalent to "hand me the master key". Written directly to the store so
         // the test doesn't depend on the login endpoint's own preconditions.
-        var alice = await SyntheticLedger.CreateAsync(_fixture);
+        var alice = await SyntheticLedger.CreateAsync(Db);
         await PromoteToAdminAsync(alice);
         var credential = await alice.AddCredentialAsync();
 
-        var challenges = new ChallengeStore(_fixture.NewServiceFactory(), TimeProvider.System);
+        var challenges = new ChallengeStore(Db.NewServiceFactory(), TimeProvider.System);
         var loginChallengeId = await challenges.SaveAsync(
             ChallengeStore.LoginFlow, alice.UserId,
             FakeAssertionOptions().ToJson(), null, TimeSpan.FromMinutes(2));
 
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithoutDevAuth().WithService(_ => AcceptingWebAuthn());
         using var client = await CookieClientAsync(factory, alice);
 
@@ -277,14 +264,14 @@ public sealed class AdminMasterKeyEndpointsTests
     {
         // Without the caller-ownership check, any enrolled user's authenticator
         // would satisfy an admin's reveal.
-        var admin = await SyntheticLedger.CreateAsync(_fixture);
+        var admin = await SyntheticLedger.CreateAsync(Db);
         await PromoteToAdminAsync(admin);
         await admin.AddCredentialAsync();
 
-        var bob = await SyntheticLedger.CreateAsync(_fixture);
+        var bob = await SyntheticLedger.CreateAsync(Db);
         var bobsCredential = await bob.AddCredentialAsync();
 
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithoutDevAuth().WithService(_ => AcceptingWebAuthn());
         using var client = await CookieClientAsync(factory, admin);
 
@@ -303,11 +290,11 @@ public sealed class AdminMasterKeyEndpointsTests
     [Fact]
     public async Task A_failed_signature_verification_returns_401_and_no_key()
     {
-        var admin = await SyntheticLedger.CreateAsync(_fixture);
+        var admin = await SyntheticLedger.CreateAsync(Db);
         await PromoteToAdminAsync(admin);
         var credential = await admin.AddCredentialAsync();
 
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithoutDevAuth().WithService(_ => RejectingWebAuthn());
         using var client = await CookieClientAsync(factory, admin);
 
@@ -327,11 +314,11 @@ public sealed class AdminMasterKeyEndpointsTests
     [Fact]
     public async Task A_verified_assertion_returns_the_key_with_no_store()
     {
-        var admin = await SyntheticLedger.CreateAsync(_fixture);
+        var admin = await SyntheticLedger.CreateAsync(Db);
         await PromoteToAdminAsync(admin);
         var credential = await admin.AddCredentialAsync();
 
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithoutDevAuth().WithService(_ => AcceptingWebAuthn());
         using var client = await CookieClientAsync(factory, admin);
 
@@ -353,7 +340,7 @@ public sealed class AdminMasterKeyEndpointsTests
 
         // Durable audit (ADR-0092 D2): who saw the key, and when. Written before the
         // key goes out, so a reveal can't happen unaudited.
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var audited = await db.AdminAuditEvents.AsNoTracking()
             .Where(e => e.Action == AdminAuditActions.MasterKeyRevealed
                      && e.ActorUserId == admin.UserId)
@@ -366,11 +353,11 @@ public sealed class AdminMasterKeyEndpointsTests
     {
         // The audit must record reveals, not attempts — otherwise a failed ceremony
         // reads later as though the key was handed over.
-        var admin = await SyntheticLedger.CreateAsync(_fixture);
+        var admin = await SyntheticLedger.CreateAsync(Db);
         await PromoteToAdminAsync(admin);
         var credential = await admin.AddCredentialAsync();
 
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithoutDevAuth().WithService(_ => RejectingWebAuthn());
         using var client = await CookieClientAsync(factory, admin);
 
@@ -382,7 +369,7 @@ public sealed class AdminMasterKeyEndpointsTests
             new RevealRequest(challengeId, FakeAssertion(credential.CredentialId)));
         Assert.Equal(HttpStatusCode.Unauthorized, resp.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         Assert.Empty(await db.AdminAuditEvents.AsNoTracking()
             .Where(e => e.ActorUserId == admin.UserId)
             .ToListAsync());
@@ -392,11 +379,11 @@ public sealed class AdminMasterKeyEndpointsTests
     public async Task A_challenge_is_single_use_even_after_a_successful_reveal()
     {
         // A captured challenge id must not be a standing licence to re-read the key.
-        var admin = await SyntheticLedger.CreateAsync(_fixture);
+        var admin = await SyntheticLedger.CreateAsync(Db);
         await PromoteToAdminAsync(admin);
         var credential = await admin.AddCredentialAsync();
 
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithoutDevAuth().WithService(_ => AcceptingWebAuthn());
         using var client = await CookieClientAsync(factory, admin);
 
@@ -414,25 +401,25 @@ public sealed class AdminMasterKeyEndpointsTests
         Assert.DoesNotContain(FixtureKeyBase64, await second.Content.ReadAsStringAsync());
     }
 
-    // --- rotation (D4) ------------------------------------------------------
+    // --- rotation (ADR-0092 D4) ---------------------------------------------
 
     [Fact]
     public async Task Rotate_is_admin_gated_and_needs_an_assertion()
     {
-        await using var anon = new ApiFactory(_fixture).WithoutDevAuth();
+        await using var anon = new ApiFactory(Db).WithoutDevAuth();
         using var anonClient = anon.CreateClient(
             new WebApplicationFactoryClientOptions { HandleCookies = false });
         Assert.Equal(HttpStatusCode.Unauthorized,
             (await anonClient.PostAsJsonAsync("/api/admin/master-key/rotate",
                 new RotateRequest(Guid.NewGuid(), null))).StatusCode);
 
-        var alice = await SyntheticLedger.CreateAsync(_fixture);   // not an admin
+        var alice = await SyntheticLedger.CreateAsync(Db);   // not an admin
         using var nonAdmin = await CookieClientAsync(anon, alice);
         Assert.Equal(HttpStatusCode.Forbidden,
             (await nonAdmin.PostAsJsonAsync("/api/admin/master-key/rotate",
                 new RotateRequest(Guid.NewGuid(), null))).StatusCode);
 
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var admin = factory.CreateClient();                  // dev-auth is admin
         var resp = await admin.PostAsJsonAsync("/api/admin/master-key/rotate",
             new RotateRequest(Guid.NewGuid(), null));
@@ -448,7 +435,7 @@ public sealed class AdminMasterKeyEndpointsTests
         // only produced a list that didn't change the operator's decision — while
         // implying the check was opt-in. An endpoint with no caller is surface nobody
         // exercises and everybody maintains.
-        await using var factory = new ApiFactory(_fixture);
+        await using var factory = new ApiFactory(Db);
         using var client = factory.CreateClient();
 
         var resp = await client.PostAsync("/api/admin/master-key/rotate/preview", null);
@@ -459,11 +446,11 @@ public sealed class AdminMasterKeyEndpointsTests
     [Fact]
     public async Task Rotate_with_a_bogus_assertion_does_not_touch_the_key()
     {
-        var admin = await SyntheticLedger.CreateAsync(_fixture);
+        var admin = await SyntheticLedger.CreateAsync(Db);
         await PromoteToAdminAsync(admin);
         var credential = await admin.AddCredentialAsync();
 
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithoutDevAuth().WithService(_ => RejectingWebAuthn());
         using var client = await CookieClientAsync(factory, admin);
 
@@ -488,11 +475,11 @@ public sealed class AdminMasterKeyEndpointsTests
         // Not show-once (ADR-0092 D2): re-display costs nothing against an admin who
         // can already read every ledger, while show-once strands an operator whose
         // browser died before they wrote the key down.
-        var admin = await SyntheticLedger.CreateAsync(_fixture);
+        var admin = await SyntheticLedger.CreateAsync(Db);
         await PromoteToAdminAsync(admin);
         var credential = await admin.AddCredentialAsync();
 
-        await using var factory = new ApiFactory(_fixture)
+        await using var factory = new ApiFactory(Db)
             .WithoutDevAuth().WithService(_ => AcceptingWebAuthn());
         using var client = await CookieClientAsync(factory, admin);
 

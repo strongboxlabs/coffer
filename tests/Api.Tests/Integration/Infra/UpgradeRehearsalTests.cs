@@ -7,18 +7,18 @@ namespace Coffer.Api.Tests.Integration.Infra;
 /// </summary>
 /// <remarks>
 /// A drill that cannot fail is worse than no drill, because it is cited as
-/// evidence. This project has shipped that mistake twice — an upgrade script
-/// whose no-rotation assertion had no failing branch, and idempotency tests that
-/// asserted only a status code — so the harness four migrations are about to be
-/// verified with does not get to be taken on trust. Each case below breaks
-/// something on purpose and requires the harness to notice.
+/// evidence — an assertion with no failing branch, or one that checks only a
+/// status code, passes whatever happened. So the harness migrations are verified
+/// with is not taken on trust: each case below breaks something on purpose and
+/// requires the harness to notice.
 /// </remarks>
 [Collection(ApiCollection.Name)]
-public sealed class UpgradeRehearsalTests
+public sealed class UpgradeRehearsalTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public UpgradeRehearsalTests(PostgresFixture fixture) => _fixture = fixture;
+    public UpgradeRehearsalTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
+    {
+    }
 
     private const string Mig214 = "214_ledgers_own_their_notifications.sql";
 
@@ -54,7 +54,7 @@ public sealed class UpgradeRehearsalTests
     public async Task Staging_before_a_migration_leaves_the_state_that_migration_acts_on()
     {
         var work = NewWorkDir();
-        var connectionString = _fixture.EmptyDatabaseConnectionString("rehearsal_stage_probe");
+        var connectionString = Db.EmptyDatabaseConnectionString("rehearsal_stage_probe");
         UpgradeRehearsal.RunStaged(connectionString, UpgradeRehearsal.StageBefore(Mig214, work));
 
         Assert.True(
@@ -88,7 +88,7 @@ public sealed class UpgradeRehearsalTests
     /// the migration fail. If this ever goes green the harness is worthless.
     /// </summary>
     /// <remarks>
-    /// The shape is not hypothetical — it is the scheduled <c>SET NOT NULL</c> on
+    /// The shape is that of the scheduled <c>SET NOT NULL</c> on
     /// the ledger key columns, whose backfill has to reach every pre-existing row
     /// or the constraint cannot be added. Here the backfill is deliberately
     /// omitted, and the rehearsal has to report that.
@@ -97,7 +97,7 @@ public sealed class UpgradeRehearsalTests
     public async Task A_constraint_that_existing_rows_violate_fails_the_rehearsal()
     {
         var work = NewWorkDir();
-        var connectionString = _fixture.EmptyDatabaseConnectionString("rehearsal_selftest");
+        var connectionString = Db.EmptyDatabaseConnectionString("rehearsal_selftest");
         UpgradeRehearsal.RunStaged(connectionString, UpgradeRehearsal.StageAll(work));
 
         // A row as an older install left it: no wrapped key material.
@@ -122,7 +122,7 @@ public sealed class UpgradeRehearsalTests
     public async Task A_script_that_cannot_run_twice_is_caught()
     {
         var work = NewWorkDir();
-        var connectionString = _fixture.EmptyDatabaseConnectionString("rehearsal_rerun");
+        var connectionString = Db.EmptyDatabaseConnectionString("rehearsal_rerun");
         UpgradeRehearsal.RunStaged(connectionString, UpgradeRehearsal.StageAll(work));
 
         const string script = "998_selftest_not_rerunnable.sql";
@@ -147,7 +147,7 @@ public sealed class UpgradeRehearsalTests
     public async Task The_digest_catches_a_changed_value_and_ignores_nothing_else()
     {
         var work = NewWorkDir();
-        var connectionString = _fixture.EmptyDatabaseConnectionString("rehearsal_digest");
+        var connectionString = Db.EmptyDatabaseConnectionString("rehearsal_digest");
         UpgradeRehearsal.RunStaged(connectionString, UpgradeRehearsal.StageAll(work));
 
         await ExecAsync(connectionString,

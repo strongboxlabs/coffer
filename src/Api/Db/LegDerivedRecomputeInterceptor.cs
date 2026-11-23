@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.ChangeTracking;
@@ -21,18 +21,19 @@ namespace Coffer.Api.Db;
 /// structural changes, so one snapshot drives both recomputes.
 /// </summary>
 /// <remarks>
-/// <para><b>Why an interceptor (and not a Postgres trigger)</b>. The
-/// trigger family (mig 090 / 094 / 099 / 101) bit us four times: each
-/// fix added more trigger surface and each new surface introduced new
-/// edge cases (cascade-from-header DELETE order, override-on-override
-/// interactions, EF batched SaveChanges firing AFTER STATEMENT triggers
-/// with transition tables that don't span the batch). All of those
-/// failure modes are gone here:</para>
+/// <para><b>Why an interceptor (and not a Postgres trigger)</b>. A
+/// trigger family (mig 090 / 094 / 099 / 101) has failure modes
+/// under EF's batched <c>SaveChanges</c> (ADR-0034): cascade-from-header
+/// DELETE order, override-on-override interactions, and AFTER STATEMENT
+/// triggers whose transition tables don't span the batch. Each fix adds
+/// trigger surface and each new surface brings new edge cases. None of
+/// those failure modes exists here:</para>
 ///
 /// <list type="bullet">
 ///   <item><description>This runs ONCE per <c>SaveChanges</c>, after
-///   every DML statement in the batch has committed to the DB. The
-///   ChangeTracker gives a single consistent snapshot.</description></item>
+///   the save's statements, inside its transaction
+///   (<see cref="LegNotesRecomputeInterceptor"/>). The ChangeTracker
+///   gives a single consistent snapshot.</description></item>
 ///   <item><description>FK cascade DELETEs are handled explicitly:
 ///   when a header is being deleted, we read its legs from the live
 ///   DB inside <see cref="SavingChangesAsync"/> (before the cascade
@@ -54,6 +55,22 @@ namespace Coffer.Api.Db;
 /// posting-count recompute) after the save commits but before the
 /// caller's transaction commits — atomic with the write.</para>
 ///
+/// <para><b>Which changes count</b>. An added or deleted leg always
+/// counts. A modified leg counts only when a property the recomputes
+/// read changed: <see cref="NonRecomputeLegProperties"/> lists the ones
+/// they never read (its memo, the stored memo-and-tags presentation, the
+/// investment metadata), and a change to any other property counts.
+/// The list names what does NOT count, so a new column recomputes until
+/// someone shows the recomputes ignore it; a guard test holds every
+/// <see cref="TxnLegRow"/> property to one of the two sets and the
+/// ignored set to the recompute functions' SQL. A modified header counts
+/// only when a property in <see cref="RecomputeHeaderProperties"/>
+/// changed (<c>posted_at</c>, <c>is_merged_into</c>, <c>is_hidden</c>),
+/// and then counts for every leg it has. The balance recompute re-walks
+/// the account from the posting date, so a change the walk cannot see
+/// must not start one. A second guard test holds that set to the header
+/// columns the recompute SQL names that can change after insert.</para>
+///
 /// <para>If you ARE going to write a leg-affecting mutation via
 /// raw SQL / Dapper / <c>ExecuteUpdateAsync</c> that bypasses the
 /// ChangeTracker, you have to call
@@ -72,8 +89,13 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
     // Per-DbContext snapshot of which (account, anchor) pairs need a
     // post-save recompute. Captured in SavingChangesAsync (where we
     // still see the OLD state of modified rows AND the to-be-cascaded
-    // legs of a doomed header); consumed in SavedChangesAsync.
-    private static readonly ConcurrentDictionary<DbContext, Snapshot> _pending = new();
+    // legs of a doomed header); consumed in SavedChangesAsync. Keyed
+    // weakly, as LegNotesRecomputeInterceptor keys its own: a save that
+    // ends before SavedChanges, SaveChangesFailed or SaveChangesCanceled
+    // removes it (a concurrency failure, which EF reports through neither,
+    // or an interceptor throwing after this one captured) leaves its entry,
+    // which must not keep the context alive. The next save replaces it.
+    private static readonly ConditionalWeakTable<DbContext, Snapshot> _pending = new();
 
     private readonly ILogger<LegDerivedRecomputeInterceptor> _logger;
 
@@ -89,8 +111,9 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
         {
             // Sync path mirrors the async path; SaveChanges() is rare
             // in this codebase but valid.
-            _pending[db] = CaptureSnapshotAsync(db, CancellationToken.None).GetAwaiter().GetResult();
-            LogSnapshot(_pending[db]);
+            var snapshot = CaptureSnapshotAsync(db, CancellationToken.None).GetAwaiter().GetResult();
+            _pending.AddOrUpdate(db, snapshot);
+            LogSnapshot(snapshot);
         }
         return base.SavingChanges(eventData, result);
     }
@@ -102,9 +125,10 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
     {
         if (eventData.Context is AppDbContext db)
         {
-            _pending[db] = await CaptureSnapshotAsync(db, cancellationToken)
+            var snapshot = await CaptureSnapshotAsync(db, cancellationToken)
                 .ConfigureAwait(false);
-            LogSnapshot(_pending[db]);
+            _pending.AddOrUpdate(db, snapshot);
+            LogSnapshot(snapshot);
         }
         return await base.SavingChangesAsync(eventData, result, cancellationToken)
             .ConfigureAwait(false);
@@ -112,8 +136,9 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
 
     public override int SavedChanges(SaveChangesCompletedEventData eventData, int result)
     {
-        if (eventData.Context is AppDbContext db && _pending.TryRemove(db, out var snapshot))
+        if (eventData.Context is AppDbContext db && _pending.TryGetValue(db, out var snapshot))
         {
+            _pending.Remove(db);
             RecomputeAsync(db, snapshot, _logger, CancellationToken.None)
                 .GetAwaiter().GetResult();
         }
@@ -125,8 +150,9 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
         int result,
         CancellationToken cancellationToken = default)
     {
-        if (eventData.Context is AppDbContext db && _pending.TryRemove(db, out var snapshot))
+        if (eventData.Context is AppDbContext db && _pending.TryGetValue(db, out var snapshot))
         {
+            _pending.Remove(db);
             await RecomputeAsync(db, snapshot, _logger, cancellationToken).ConfigureAwait(false);
         }
         return await base.SavedChangesAsync(eventData, result, cancellationToken)
@@ -150,20 +176,32 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
             snap.TouchedHeaders.Count);
     }
 
-    // SaveChangesFailedAsync clears the snapshot so the next save on
-    // the same context starts clean. Without this, a retried save
-    // could see stale entries.
+    // A failed save, and a cancelled one (EF raises SaveChangesCanceled for
+    // a cancel, not SaveChangesFailed), drop the snapshot it captured.
     public override void SaveChangesFailed(DbContextErrorEventData eventData)
     {
-        if (eventData.Context is AppDbContext db) _pending.TryRemove(db, out _);
+        if (eventData.Context is AppDbContext db) _pending.Remove(db);
         base.SaveChangesFailed(eventData);
     }
 
     public override Task SaveChangesFailedAsync(
         DbContextErrorEventData eventData, CancellationToken cancellationToken = default)
     {
-        if (eventData.Context is AppDbContext db) _pending.TryRemove(db, out _);
+        if (eventData.Context is AppDbContext db) _pending.Remove(db);
         return base.SaveChangesFailedAsync(eventData, cancellationToken);
+    }
+
+    public override void SaveChangesCanceled(DbContextEventData eventData)
+    {
+        if (eventData.Context is AppDbContext db) _pending.Remove(db);
+        base.SaveChangesCanceled(eventData);
+    }
+
+    public override Task SaveChangesCanceledAsync(
+        DbContextEventData eventData, CancellationToken cancellationToken = default)
+    {
+        if (eventData.Context is AppDbContext db) _pending.Remove(db);
+        return base.SaveChangesCanceledAsync(eventData, cancellationToken);
     }
 
     // ----- snapshot capture -----
@@ -226,11 +264,88 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
         return snap;
     }
 
+    /// <summary>
+    /// The <see cref="TxnLegRow"/> properties neither recompute reads: a
+    /// modified leg whose changes all fall in this set touches no balance
+    /// and no posting count. Fail closed: a property not listed here
+    /// counts, so a new column recomputes until it is shown to be ignored.
+    /// </summary>
+    internal static readonly IReadOnlySet<string> NonRecomputeLegProperties = new HashSet<string>(StringComparer.Ordinal)
+    {
+        // The leg's own memo (ADR-0108).
+        nameof(TxnLegRow.LegMemo),
+        // Investment metadata. The walk sums amount, which is authoritative
+        // (ADR-0073); holdings recompute from these in their own interceptor.
+        nameof(TxnLegRow.SecurityId),
+        nameof(TxnLegRow.Quantity),
+        nameof(TxnLegRow.UnitPrice),
+        nameof(TxnLegRow.PostingRole),
+        // Row bookkeeping.
+        nameof(TxnLegRow.CreatedAt),
+        // The stored memo-and-tags presentation (mig 264).
+        nameof(TxnLegRow.NotesKind),
+        nameof(TxnLegRow.NotesIsReadOnly),
+        nameof(TxnLegRow.NotesGroupsByHeader),
+        nameof(TxnLegRow.NotesMemo),
+        nameof(TxnLegRow.NotesMemoInherited),
+        nameof(TxnLegRow.NotesInheritedMemo),
+        nameof(TxnLegRow.NotesInheritFromAccountId),
+        nameof(TxnLegRow.NotesTagsInherited),
+        nameof(TxnLegRow.NotesHeaderMemo),
+        nameof(TxnLegRow.NotesHeaderInPlay),
+    };
+
+    /// <summary>
+    /// The <see cref="TxnLegRow"/> properties a recompute reads, or whose
+    /// column the guard test cannot show unread. Not consulted at runtime
+    /// (anything outside <see cref="NonRecomputeLegProperties"/> counts);
+    /// it makes the classification complete, so the guard can fail on a
+    /// property in neither set.
+    /// </summary>
+    internal static readonly IReadOnlySet<string> RecomputeLegProperties = new HashSet<string>(StringComparer.Ordinal)
+    {
+        // Read by the balance walk (the header it nets into, the account it
+        // walks, the amount it sums) and by the posting-count recompute.
+        nameof(TxnLegRow.HeaderId),
+        nameof(TxnLegRow.AccountId),
+        nameof(TxnLegRow.Amount),
+        // Read by the posting-count recompute (distinct postings).
+        nameof(TxnLegRow.PostingIndex),
+        // Written by the posting-count recompute.
+        nameof(TxnLegRow.AccountPostingsOnHeader),
+        nameof(TxnLegRow.HeaderTotalPostings),
+        // Named by the recompute SQL as another table's column. Fixed for
+        // the life of the row, so classing them here costs nothing.
+        nameof(TxnLegRow.Id),
+        nameof(TxnLegRow.LedgerId),
+    };
+
+    /// <summary>
+    /// The <see cref="TxnHeaderRow"/> properties the balance walk reads that can change
+    /// after a header is inserted. A modified header with any of them changed touches
+    /// every leg it has; a change to any other header property starts no recompute.
+    /// </summary>
+    /// <remarks>
+    /// Held to the recompute SQL by a guard test: every header column the balance and
+    /// posting-count functions name, other than one fixed for the life of the row, is
+    /// here, and nothing else is. The posting counts read no header column.
+    /// </remarks>
+    internal static readonly IReadOnlySet<string> RecomputeHeaderProperties = new HashSet<string>(StringComparer.Ordinal)
+    {
+        // The walk's order and its from-date.
+        nameof(TxnHeaderRow.PostedAt),
+        // The walk leaves out a merged and a hidden header.
+        nameof(TxnHeaderRow.IsMergedInto),
+        nameof(TxnHeaderRow.IsHidden),
+    };
+
     private static void CaptureLegEntry(EntityEntry entry, Snapshot snap)
     {
         // Modified: both OLD and NEW account_ids matter — a leg moving
         // accounts means BOTH need recompute (old wipes the stale row,
-        // new builds the fresh row).
+        // new builds the fresh row). A modified leg counts only when a
+        // property outside NonRecomputeLegProperties changed: a memo edit
+        // leaves every balance and posting count as it was.
         if (entry.State == EntityState.Added)
         {
             var leg = (TxnLegRow)entry.Entity;
@@ -244,7 +359,8 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
             var accountId = (Guid)entry.OriginalValues[nameof(TxnLegRow.AccountId)]!;
             snap.AddTouchedLegPair(accountId, headerId);
         }
-        else if (entry.State == EntityState.Modified)
+        else if (entry.State == EntityState.Modified
+                 && entry.Properties.Any(p => p.IsModified && !NonRecomputeLegProperties.Contains(p.Metadata.Name)))
         {
             var oldHeaderId = (Guid)entry.OriginalValues[nameof(TxnLegRow.HeaderId)]!;
             var oldAccountId = (Guid)entry.OriginalValues[nameof(TxnLegRow.AccountId)]!;
@@ -258,16 +374,13 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
     {
         if (entry.State == EntityState.Modified)
         {
-            // posted_at, is_merged_into, is_hidden shift balances; the
-            // recompute filters on all three. status / payee / etc. don't.
-            // is_hidden flips here come from the bank + investment
-            // soft-delete branches (`header.IsHidden = true`) — both go
-            // through SaveChanges and land on this code path.
-            var postedAtChanged = entry.Property(nameof(TxnHeaderRow.PostedAt)).IsModified;
-            var mergedChanged = entry.Property(nameof(TxnHeaderRow.IsMergedInto)).IsModified;
-            var hiddenChanged = entry.Property(nameof(TxnHeaderRow.IsHidden)).IsModified;
-            if (postedAtChanged || mergedChanged || hiddenChanged)
+            // Only what the walk reads (RecomputeHeaderProperties): payee, status and
+            // the rest shift no balance. The soft-delete path flips
+            // is_hidden, a merge stamps is_merged_into and moves the winner's date,
+            // and an edit moves a date; each reaches this through SaveChanges.
+            if (entry.Properties.Any(p => p.IsModified && RecomputeHeaderProperties.Contains(p.Metadata.Name)))
                 snap.AddTouchedHeader(((TxnHeaderRow)entry.Entity).Id);
+            var postedAtChanged = entry.Property(nameof(TxnHeaderRow.PostedAt)).IsModified;
             // A date MOVE: capture the OLD posted_at so the recompute
             // anchors at MIN(old, new) and re-walks the vacated range.
             if (postedAtChanged)
@@ -306,8 +419,8 @@ public sealed class LegDerivedRecomputeInterceptor : SaveChangesInterceptor
 
         if (snap.TouchedLegPairs.Count == 0) return;
 
-        // posted_at for each touched header. Canonical since mig 230 — the
-        // override layer this used to COALESCE through is gone.
+        // posted_at for each touched header. Canonical since mig 230 — there is
+        // no override layer to COALESCE through.
         var headerIds = snap.TouchedLegPairs.Select(p => p.HeaderId).Distinct().ToList();
         var headerInfo = await db.TxnHeaders.AsNoTracking()
             .Where(h => headerIds.Contains(h.Id))

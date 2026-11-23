@@ -12,7 +12,7 @@ import {
 // how the seven API account types render as grouped sections (label + icon)
 // across the app. Mirrors the API's types (bank / cash / credit_card /
 // investment / asset / liability / loan); the Ledger Hub and the sidebar's
-// "All" account list both group by these so they never drift apart.
+// account list both group by these so they never drift apart.
 //
 // `holding` accounts are the system-side sibling of an `investment` account
 // and never group on their own — callers fold them into `investment` before

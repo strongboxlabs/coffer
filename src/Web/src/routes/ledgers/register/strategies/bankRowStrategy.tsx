@@ -1,26 +1,30 @@
 import type { ReactNode } from 'react';
 
 import type { BankRow } from '@/lib/types';
-import { Chip } from '@/components/ui/Chip';
-import { TagLine } from '@/components/tags/TagLine';
+import { InheritedText } from '@/components/register/InheritedMarker';
 import { ProvenanceIcon } from '@/components/register/ProvenanceIcon';
+import { readOnlyBadge } from '@/lib/annotations/notes';
 import { categoryChipVariant } from '@/lib/categoryChip';
 import { displayAccountPath } from '@/lib/accountPath';
 import { formatLedgerDate } from '@/lib/dates';
-import { formatCurrency, formatSignedAmount } from '@/lib/money';
+import { groupCurrency } from '@/lib/splitCollapse';
 
 import type {
     RegisterRowBodyCtx,
     RegisterRowContainerCtx,
     RegisterRowStrategy,
 } from '../shell/RegisterRow';
-import { isInvestmentOwnedRow, resolveRowStatus, taxDateSubLabel } from '../bank/columns';
+import { resolveRowStatus, taxDateSubLabel } from '../bank/columns';
 import {
     BANK_COLS,
+    renderAccountChip,
     renderBankSlot4,
     renderBankSlot5,
     renderBankSlot6,
 } from './bankStrategy';
+import { renderRowMemo, renderRowTags } from './rowNotes';
+import { Mixed } from '../../home/Money';
+import { rowAmountText, rowBalance } from './registerMoney';
 
 // ---------------------------------------------------------------------------
 // Bank register row STRATEGY (ADR-0030 reuse). Implements
@@ -35,14 +39,13 @@ import {
 // ---------------------------------------------------------------------------
 
 function renderTxnBody(txn: BankRow, ctx: RegisterRowBodyCtx): ReactNode {
-    const { currency, today } = ctx;
+    const { today } = ctx;
     const status = resolveRowStatus(txn, today);
     const scheduled = status === 'scheduled';
-    // Read-only row guards (mirror the former BankTxnRow): an
-    // investment-owned cash leg (canonical owner is the brokerage
-    // register) or a split counter-side (source side owns edit / delete).
-    const isInvestmentOwned = isInvestmentOwnedRow(txn);
-    const isReadOnly = ctx.isTargetSplit;
+    // A read-only row names where it is edited: an investment event's
+    // counterpart (the brokerage register) or a split line seen from its other
+    // side (the split's own register). The row's kind says which.
+    const badge = ctx.isReadOnly ? readOnlyBadge(txn.notesKind) : null;
     const taxDateLabel = taxDateSubLabel(txn);
     const dateSubLabel = taxDateLabel ? `tax ${taxDateLabel}` : null;
     return (
@@ -57,35 +60,43 @@ function renderTxnBody(txn: BankRow, ctx: RegisterRowBodyCtx): ReactNode {
                     </span>
                 ) : null}
             </span>
-            <span
-                role="cell"
-                className="truncate font-mono tabular-nums text-text-muted"
-            >
-                {renderBankSlot4(txn)}
-            </span>
-            <span role="cell" className="min-w-0">
-                {isReadOnly ? (
-                    <span className="flex min-w-0 items-baseline gap-1">
-                        <span
-                            className="inline-flex shrink-0 items-center rounded bg-accent-soft px-1 py-px text-[0.625rem] font-medium uppercase tracking-wide text-accent"
-                            title={
-                                isInvestmentOwned
-                                    ? 'Row owned by an investment transaction · view + edit in the brokerage register'
-                                    : 'Counter-side of a split transaction · edit + delete from the source-side register'
-                            }
-                        >
-                            {isInvestmentOwned ? '↗ Investment' : '↗ Split'}
-                        </span>
-                        <span className="min-w-0">
-                            {renderBankSlot5(txn)}
-                        </span>
+            {/* Slot 4: the check number, and on a read-only row the badge
+                above it. The badge sat in front of the payee, where on a
+                narrow cell it left the payee and memo a letter each; here, in
+                the slot the investment register gives its action chip, the
+                payee and memo keep the whole cell. A row without a badge renders
+                this cell exactly as before, so nothing in the column moves. */}
+            {badge !== null ? (
+                <span role="cell" className="flex min-w-0 flex-col items-start gap-0.5">
+                    <span
+                        className="inline-flex shrink-0 items-center rounded bg-accent-soft px-1 py-px text-[0.625rem] font-medium uppercase tracking-wide text-accent"
+                        title={
+                            badge === 'investment'
+                                ? 'Row owned by an investment transaction · view + edit in the brokerage register'
+                                : 'One line of a split transaction · edit it in the split’s own register'
+                        }
+                    >
+                        {badge === 'investment' ? '↗ Investment' : '↗ Split'}
                     </span>
-                ) : (
-                    renderBankSlot5(txn)
-                )}
+                    {txn.checkNumber ? (
+                        <span className="block max-w-full truncate font-mono tabular-nums text-text-muted">
+                            {renderBankSlot4(txn)}
+                        </span>
+                    ) : null}
+                </span>
+            ) : (
+                <span
+                    role="cell"
+                    className="truncate font-mono tabular-nums text-text-muted"
+                >
+                    {renderBankSlot4(txn)}
+                </span>
+            )}
+            <span role="cell" className="min-w-0">
+                {renderBankSlot5(txn, ctx.accountPaths)}
             </span>
             <span role="cell" className="min-w-0 space-y-1.5">
-                {renderBankSlot6(txn, ctx.accountPaths, ctx.rollupRootId)}
+                {renderBankSlot6(txn, ctx.accountPaths, ctx.rollupRootId, ctx.systemCategoryIds)}
             </span>
             <span
                 role="cell"
@@ -99,14 +110,14 @@ function renderTxnBody(txn: BankRow, ctx: RegisterRowBodyCtx): ReactNode {
                 }
             >
                 <span className="block">
-                    {formatSignedAmount(txn.amount, currency)}
+                    {rowAmountText(txn)}
                 </span>
             </span>
             <span
                 role="cell"
                 className="text-right font-mono tabular-nums"
             >
-                {formatCurrency(txn.balanceAfter, currency)}
+                {rowBalance(txn)}
             </span>
         </>
     );
@@ -114,13 +125,16 @@ function renderTxnBody(txn: BankRow, ctx: RegisterRowBodyCtx): ReactNode {
 
 function renderSplitParentBody(row: BankRow, ctx: RegisterRowBodyCtx<BankRow>): ReactNode {
     // The page synthesizes the representative parent row as the canonical
-    // leg with the group's amount + balance-after-last-leg, so the cells
-    // read off `row` directly (same fields the former SplitParentRowCells
-    // computed from canonical / groupAmount / groupBalanceAfter).
-    const { currency, today, expand } = ctx;
+    // leg with the group's amount + balance-after-last-leg, and with the
+    // TRANSACTION's memo and tags in `memo` / `tags` (a line's own fields are
+    // its own), so the cells read off `row` directly.
+    const { today, expand } = ctx;
     const status = resolveRowStatus(row, today);
     const scheduled = status === 'scheduled';
     const taxDateLabel = taxDateSubLabel(row);
+    // A category's split paid from accounts in different currencies has no net, as no
+    // figure adds currencies (ADR-0114 D7): its Amount reads the mixed marker.
+    const mixed = ctx.legs !== undefined && groupCurrency(ctx.legs) === null;
     return (
         <>
             <span role="cell" className="font-mono tabular-nums">
@@ -140,9 +154,8 @@ function renderSplitParentBody(row: BankRow, ctx: RegisterRowBodyCtx<BankRow>): 
                 {row.checkNumber ?? ''}
             </span>
             <span role="cell" className="min-w-0">
-                {/* Parent row shows payee + raw header memo
-                    (migration 032, ADR-0025). Mig 107: leading
-                    provenance icon. */}
+                {/* Parent row shows payee + the transaction's memo. Mig 107:
+                    leading provenance icon. */}
                 <span className="flex items-center gap-1.5 truncate font-medium">
                     <ProvenanceIcon
                         origin={row.origin}
@@ -155,34 +168,24 @@ function renderSplitParentBody(row: BankRow, ctx: RegisterRowBodyCtx<BankRow>): 
                         )}
                     </span>
                 </span>
-                {row.headerMemo ? (
-                    <span className="block truncate text-[0.6875rem] text-text-muted">
-                        {row.headerMemo}
-                    </span>
-                ) : null}
+                {renderRowMemo(row, ctx.accountPaths)}
             </span>
             {/* Combined category · tags column, holding the expand toggle.
-                Tags belong to the header so they wrap beneath.
+                The transaction's tags wrap beneath; each line's own tags show
+                on its expanded row.
 
-                NO LEAD CATEGORY HERE, deliberately. #547 put one at the cell's
-                left edge — the category that "stands for the group", the
-                filter-matched leg or else the largest by absolute summed
-                amount. Removed 2026-09-25.
-
-                It was never requested; it came out of an adversarial review,
-                and it read as misleading precisely because of the property it
-                was designed for. Sitting at the same left edge as a flat row's
-                chip, it makes the column read straight down — which means it
-                makes a heuristic PICK look like the definite category a flat
-                row states. A split has N categories; naming one of them there
-                asserts something untrue. The tie-break compounded it: largest
-                absolute sum, chosen over two alternatives on the evidence of
-                two shapes in this repo.
+                NO LEAD CATEGORY HERE, deliberately: no category at the cell's
+                left edge that "stands for the group" (the filter-matched leg or
+                else the largest by absolute summed amount). Sitting at the same
+                left edge as a flat row's chip, it would make the column read
+                straight down — which makes a heuristic PICK look like the
+                definite category a flat row states. A split has N categories;
+                naming one of them there asserts something untrue, and any
+                tie-break between legs is a guess.
 
                 If a collapsed split should ever answer "which leg matched the
                 active filter, and for how much", that is a different and
-                narrower feature — and the only half of this one that answered
-                a question the user had actually asked. */}
+                narrower feature. */}
             <span role="cell" className="min-w-0 space-y-1.5">
                 <span className="flex min-w-0 items-center gap-1">
                     <button
@@ -196,9 +199,9 @@ function renderSplitParentBody(row: BankRow, ctx: RegisterRowBodyCtx<BankRow>): 
                         // BOTH handlers are needed, and that is the whole
                         // trap. `dblclick` is its own DOM event, not something
                         // derived from the two clicks, so stopping click
-                        // propagation does nothing for it — an impatient
-                        // double-click on the toggle used to expand the split
-                        // AND drop the editor on top of it.
+                        // propagation does nothing for it — without this an
+                        // impatient double-click on the toggle would expand the
+                        // split AND drop the editor on top of it.
                         //
                         // The investment strategy stops only the click and
                         // looks fine, but that is luck: its split parents are
@@ -210,19 +213,18 @@ function renderSplitParentBody(row: BankRow, ctx: RegisterRowBodyCtx<BankRow>): 
                                 ? 'Hide this split’s categories'
                                 : 'Show this split’s categories'
                         }
-                        // FU-061: NO `ml-auto`. It used to push this to the far
+                        // FU-061: NO `ml-auto`. It would push this to the far
                         // right of the 19.5rem cell — about 300px from where
                         // every flat row's category chip sits, hard against the
                         // amount — so on a register with a few split rows it
-                        // read as a sparse extra column between CATEGORY and
-                        // AMOUNT rather than as anything to do with a category.
-                        // The investment strategy renders the same affordance in
-                        // the same slot and never had it, so this was one-sided
-                        // divergence, not a design question.
+                        // would read as a sparse extra column between CATEGORY
+                        // and AMOUNT rather than as anything to do with a
+                        // category. The investment strategy renders the same
+                        // affordance in the same slot without it.
                         //
-                        // What must NOT come back with the space this frees is
-                        // the lead category chip removed on 2026-09-25 (see the
-                        // comment above this cell). A toggle at the left edge
+                        // What must NOT go in the space this frees is a lead
+                        // category chip (see the comment above this cell). A
+                        // toggle at the left edge
                         // states the row's SHAPE, which is true of a split; a
                         // chip there would name one leg of N as though it were
                         // the row's category.
@@ -255,34 +257,38 @@ function renderSplitParentBody(row: BankRow, ctx: RegisterRowBodyCtx<BankRow>): 
                         {expand?.count ?? 0} splits
                     </button>
                 </span>
-                <TagLine tags={row.tags} inset />
+                {renderRowTags(row, ctx.accountPaths)}
             </span>
             <span
                 role="cell"
                 className={
                     'text-right font-mono tabular-nums ' +
-                    (scheduled
+                    (scheduled || mixed
                         ? ''
                         : row.amount < 0
                             ? 'text-state-danger'
                             : 'text-text')
                 }
             >
-                {formatSignedAmount(row.amount, currency)}
+                {mixed ? <Mixed /> : rowAmountText(row)}
             </span>
             <span role="cell" className="text-right font-mono tabular-nums">
-                {formatCurrency(row.balanceAfter, currency)}
+                {rowBalance(row)}
             </span>
         </>
     );
 }
 
 function renderSplitLegBody(leg: BankRow, ctx: RegisterRowBodyCtx): ReactNode {
-    const { currency } = ctx;
+    const { today } = ctx;
+    // A line carries its transaction's date, so a future-dated split's lines
+    // are Scheduled too and drop the colour like their parent (ADR-0023 §H).
+    const scheduled = resolveRowStatus(leg, today) === 'scheduled';
     const chipVariant = categoryChipVariant(
         leg.counterpartyAccountName,
         leg.counterpartyAccountType,
         leg.counterpartyAccountId,
+        leg.counterpartyAccountId !== null && ctx.systemCategoryIds.has(leg.counterpartyAccountId),
     );
     const categoryLabel = displayAccountPath(
         ctx.accountPaths, leg.counterpartyAccountId, leg.counterpartyAccountName,
@@ -295,39 +301,55 @@ function renderSplitLegBody(leg: BankRow, ctx: RegisterRowBodyCtx): ReactNode {
             <span role="cell" />
             <span role="cell" />
             <span role="cell" className="min-w-0 pl-4">
-                {/* Tree-prefix glyph + raw leg memo (migration 032,
-                    ADR-0025). Blank when this leg has no per-leg memo. */}
-                <span className="block truncate">
-                    <span aria-hidden className="mr-1 text-text-subtle">└</span>
-                    {leg.legMemo ?? <span className="text-text-subtle">—</span>}
+                {/* Tree-prefix glyph + the line's memo as this register shows
+                    it. A line with no memo of its own shows "—": it does not
+                    repeat the transaction's, which sits on the parent row. */}
+                <span className="flex min-w-0 items-baseline">
+                    <span aria-hidden className="mr-1 shrink-0 text-text-subtle">└</span>
+                    {leg.memo === null ? (
+                        <span className="text-text-subtle">—</span>
+                    ) : leg.memoInherited ? (
+                        <InheritedText
+                            inherited
+                            from={displayAccountPath(ctx.accountPaths, leg.inheritFromAccountId, null)}
+                        >
+                            {leg.memo}
+                        </InheritedText>
+                    ) : (
+                        <span className="min-w-0 truncate">{leg.memo}</span>
+                    )}
                 </span>
             </span>
-            {/* Combined category · tags. Leg rows are per-posting, so tags
-                (header-level) are intentionally NOT rendered here — they
-                sit on the parent row. Just the category chip. */}
-            <span role="cell" className="min-w-0">
+            {/* Combined category · tags: the line's category and, under it,
+                the line's own tags. A line to an account in another currency
+                shows its own other amount after the chip (ADR-0114 D14). */}
+            <span role="cell" className="min-w-0 space-y-1.5">
                 {leg.counterpartyAccountName ? (
-                    <Chip
-                        variant={chipVariant}
-                        className="max-w-full truncate"
-                        title={categoryLabel ?? undefined}
-                    >
-                        <span className="truncate">
-                            {categoryLabel}
-                        </span>
-                    </Chip>
+                    renderAccountChip({
+                        variant: chipVariant,
+                        label: categoryLabel,
+                        chipClassName: 'max-w-full truncate',
+                        otherAmount: leg.counterpartyAmount,
+                        otherCurrency: leg.counterpartyCurrencyCode,
+                        amount: leg.amount,
+                    })
                 ) : (
                     <span className="text-text-subtle">—</span>
                 )}
+                {renderRowTags(leg, ctx.accountPaths)}
             </span>
             <span
                 role="cell"
                 className={
                     'text-right font-mono tabular-nums ' +
-                    (leg.amount < 0 ? 'text-state-danger' : 'text-text')
+                    (scheduled
+                        ? ''
+                        : leg.amount < 0
+                            ? 'text-state-danger'
+                            : 'text-text')
                 }
             >
-                {formatSignedAmount(leg.amount, currency)}
+                {rowAmountText(leg)}
             </span>
             {/* Balance intentionally blank on leg rows — only the group's
                 final balance is meaningful in the running-total flow. */}
@@ -348,11 +370,10 @@ function bankContainerAttrs(row: BankRow, ctx: RegisterRowContainerCtx) {
         dataAttrs: {
             'aria-rowindex':
                 ctx.rowIndex !== undefined ? ctx.rowIndex + 1 : undefined,
-            // Mirrors the investment strategy. Focus was previously visible on a
-            // bank row only as styling, so "which row has the keyboard cursor"
-            // could not be asserted — which is why the anchor bug below it went
-            // unnoticed: nothing could see that focus had landed on the wrong
-            // row. `data-headerid` is omitted on legs, as investment omits it,
+            // Mirrors the investment strategy. Focus visible only as styling
+            // leaves "which row has the keyboard cursor" unassertable, so a test
+            // cannot see focus land on the wrong row; these attributes make it
+            // checkable. `data-headerid` is omitted on legs, as investment omits it,
             // because a leg is not the header's row.
             'data-headerid': ctx.variant === 'split-leg' ? undefined : row.headerId,
             'data-focused': ctx.focused ? 'true' : 'false',
@@ -362,10 +383,9 @@ function bankContainerAttrs(row: BankRow, ctx: RegisterRowContainerCtx) {
 
 export const bankRowStrategy: RegisterRowStrategy<BankRow> = {
     cols: BANK_COLS,
-    // py-1 so a two-line cell does not sit on the row's border. The row had no
-    // vertical padding at all: at one line of content nothing reached the edge,
-    // but the category cell can now carry a splits indicator AND a tag line, and
-    // 34px of content in a 36px row touches top and bottom — most visible on the
+    // py-1 so a two-line cell does not sit on the row's border. Without vertical
+    // padding, one line of content never reaches the edge, but the category cell
+    // can carry a splits indicator AND a tag line, and 34px of content in a 36px row touches top and bottom — most visible on the
     // selected row, where there is an outline against it. min-h still holds the
     // single-line rows at 36px, so only the rows that need the room take it.
     rowClassName: 'min-h-control-36px items-center py-1',

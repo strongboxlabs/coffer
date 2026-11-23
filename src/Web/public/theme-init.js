@@ -25,4 +25,18 @@
     document.documentElement.setAttribute('data-accent', accentFallback);
     document.documentElement.setAttribute('data-density', densityFallback);
   }
+
+  // The sidebar's remembered width (FU-051), a copy of readStoredWidth + clampWidth in
+  // src/lib/sidebarRail.ts; sidebarRail.test.ts holds the two together. Nothing stored
+  // sets nothing, and the rail keeps its 224px token.
+  try {
+    var w = parseInt(localStorage.getItem('coffer.sidebar.width'), 10);
+    if (isFinite(w)) {
+      var maxW = Math.max(200, Math.min(480, Math.floor(window.innerWidth * 0.4)));
+      w = Math.min(maxW, Math.max(200, Math.round(w)));
+      document.documentElement.style.setProperty('--coffer-sidebar-width', w + 'px');
+    }
+  } catch (e) {
+    // As above: the rail just opens at its default width.
+  }
 })();

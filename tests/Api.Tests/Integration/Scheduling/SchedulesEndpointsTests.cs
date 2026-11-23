@@ -14,13 +14,11 @@ namespace Coffer.Api.Tests.Integration.Scheduling;
 /// snapshot job types.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class SchedulesEndpointsTests
+public sealed class SchedulesEndpointsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public SchedulesEndpointsTests(PostgresFixture fixture)
+    public SchedulesEndpointsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     private static async Task<HttpClient> AuthedClientAsync(ApiFactory factory, SyntheticLedger ledger)
@@ -36,8 +34,8 @@ public sealed class SchedulesEndpointsTests
     [InlineData("snapshot", 3)]
     public async Task Schedule_defaults_then_round_trips(string jobType, int defaultHour)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var path = $"/api/ledgers/{ledger.LedgerId}/schedules/{jobType}";
 
@@ -60,6 +58,35 @@ public sealed class SchedulesEndpointsTests
         Assert.Equal(30, after.MinuteLocal);
     }
 
+    [Fact]
+    public async Task The_list_has_every_job_type_each_as_its_single_read_has_it()
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
+        using var client = await AuthedClientAsync(factory, ledger);
+        var root = $"/api/ledgers/{ledger.LedgerId}/schedules";
+
+        var put = await client.PutAsJsonAsync($"{root}/snapshot", new ScheduleDto(Enabled: true, HourLocal: 4, MinuteLocal: 15));
+        Assert.Equal(HttpStatusCode.OK, put.StatusCode);
+
+        var all = (await client.GetFromJsonAsync<Dictionary<string, ScheduleDto>>(root))!;
+        Assert.Equal(
+            ["feed-sync", "quote-refresh", "reminder-auto-post", "snapshot"],
+            all.Keys.Order(StringComparer.Ordinal).ToArray());
+
+        foreach (var (jobType, listed) in all)
+        {
+            var single = (await client.GetFromJsonAsync<ScheduleDto>($"{root}/{jobType}"))!;
+            Assert.Equal(single, listed);
+        }
+
+        // The configured one as saved; the rest off, at their default hours.
+        Assert.True(all["snapshot"].Enabled);
+        Assert.Equal(4, all["snapshot"].HourLocal);
+        Assert.False(all["feed-sync"].Enabled);
+        Assert.Equal(6, all["feed-sync"].HourLocal);
+    }
+
     /// <summary>
     /// The health a panel needs comes back over the wire, and re-enabling gives the job
     /// a fresh budget rather than a single attempt.
@@ -67,25 +94,25 @@ public sealed class SchedulesEndpointsTests
     /// <remarks>
     /// <para>
     /// Written as one test through the ENDPOINT rather than two against the repository,
-    /// because the defect this closes had a working write path and a read path that
-    /// stopped at ToDto. A repository-level assertion would have passed throughout.
+    /// because a working write path with a read path that stops at ToDto would pass a
+    /// repository-level assertion.
     /// </para>
     /// <para>
-    /// The re-enable half is a live behaviour fix, not presentation: consecutive_failures
-    /// survived a re-enable, so a job auto-disabled at five came back holding five and
-    /// the next single failure computed six and switched it straight off again. Turning
-    /// it back on bought one attempt, not five.
+    /// The re-enable half is behaviour, not presentation: if consecutive_failures
+    /// survived a re-enable, a job auto-disabled at five would come back holding five and
+    /// the next single failure would compute six and switch it straight off again —
+    /// turning it back on would buy one attempt, not five.
     /// </para>
     /// </remarks>
     [Fact]
     public async Task Health_reaches_the_wire_and_re_enabling_restores_the_full_budget()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         // Put the row in the state the scheduler leaves behind when it gives up.
-        await using (var seed = _fixture.NewDbContext())
+        await using (var seed = Db.NewDbContext())
         {
             seed.ScheduledJobs.Add(new Coffer.Api.Db.Entities.ScheduledJobRow
             {
@@ -144,11 +171,11 @@ public sealed class SchedulesEndpointsTests
     [Fact]
     public async Task Changing_the_time_on_an_enabled_failing_job_keeps_its_streak()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
-        await using (var seed = _fixture.NewDbContext())
+        await using (var seed = Db.NewDbContext())
         {
             seed.ScheduledJobs.Add(new Coffer.Api.Db.Entities.ScheduledJobRow
             {
@@ -181,8 +208,8 @@ public sealed class SchedulesEndpointsTests
     [Fact]
     public async Task Put_rejects_out_of_range_time()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var put = await client.PutAsJsonAsync(
@@ -194,8 +221,8 @@ public sealed class SchedulesEndpointsTests
     [Fact]
     public async Task Schedule_honors_the_provided_timezone()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
         var path = $"/api/ledgers/{ledger.LedgerId}/schedules/quote-refresh";
 
@@ -217,8 +244,8 @@ public sealed class SchedulesEndpointsTests
     [Fact]
     public async Task Unknown_job_type_is_rejected()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var factory = new ApiFactory(_fixture).WithoutDevAuth();
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var factory = new ApiFactory(Db).WithoutDevAuth();
         using var client = await AuthedClientAsync(factory, ledger);
 
         var resp = await client.GetAsync($"/api/ledgers/{ledger.LedgerId}/schedules/not-a-job");

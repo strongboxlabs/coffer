@@ -23,13 +23,11 @@ namespace Coffer.Api.Tests.Integration.Ingest;
 /// in the editor's pre-fill flow.
 /// </summary>
 [Collection(ApiCollection.Name)]
-public sealed class IngestBrokerageHintsTests
+public sealed class IngestBrokerageHintsTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public IngestBrokerageHintsTests(PostgresFixture fixture)
+    public IngestBrokerageHintsTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     // ----- test infrastructure -----
@@ -70,12 +68,12 @@ public sealed class IngestBrokerageHintsTests
     /// pieces so the test can map a brokerage + trigger sync.
     /// </summary>
     private async Task<(ApiFactory Factory, SyntheticLedger Ledger, FeedConnectionSummary Connection)>
-        ConnectAsync(string accountsBody)
+        ConnectAsync(string accountsBody, string currencyCode = "USD")
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
+        var ledger = await SyntheticLedger.CreateAsync(Db, currencyCode: currencyCode);
 
-        var keys = _fixture.NewLedgerKeyService();
-        await using (var seed = _fixture.NewDbContext())
+        var keys = Db.NewLedgerKeyService();
+        await using (var seed = Db.NewDbContext())
         {
             var row = await seed.Ledgers.SingleAsync(l => l.Id == ledger.LedgerId);
             row.WrappedLek = keys.CreateWrappedLek();
@@ -85,7 +83,7 @@ public sealed class IngestBrokerageHintsTests
         }
 
         const string accessUrl = "https://u:p@bridge.simplefin.org/simplefin/access/abc";
-        var factory = new ApiFactory(_fixture).WithoutDevAuth()
+        var factory = new ApiFactory(Db).WithoutDevAuth()
             .WithService<SimpleFinClient>(_ => ClientWithStubHandler(req =>
                 req.Method == HttpMethod.Post
                     ? new HttpResponseMessage(HttpStatusCode.OK)
@@ -125,6 +123,46 @@ public sealed class IngestBrokerageHintsTests
 
     // ----- the tests -----
 
+    /// <summary>
+    /// The Uncategorized category a sync lands an unclassified row in takes the ledger's
+    /// reporting currency: a category has no currency of its own (ADR-0109 D9), so on a
+    /// ledger reported in EUR it must not read as a foreign USD row.
+    /// </summary>
+    [Fact]
+    public async Task Sync_creates_Uncategorized_in_the_ledgers_reporting_currency()
+    {
+        const string body = """
+            {"connections":[
+              {"conn_id":"c-A","name":"Bank A","org_id":"bank-a","sfin_url":"https://sfin/bank-a"}
+            ],"errlist":[],"accounts":[
+              {"id":"sf-1","conn_id":"c-A","name":"Account",
+               "currency":"EUR","balance":"1000.00","transactions":[
+                {"id":"fitid-U","posted":1715000000,"amount":"-12.00",
+                 "description":"PAYEE A","pending":false}
+              ]}
+            ]}
+            """;
+        var setup = await ConnectAsync(body, currencyCode: "EUR");
+        await using var factory = setup.Factory;
+        using var client = await AuthedClientAsync(factory, setup.Ledger);
+
+        var bank = await setup.Ledger.AddBankAccountAsync("Account A", currencyCode: "EUR");
+        await BindAccountAsync(client, setup.Ledger, bank.Id, setup.Connection.Id, "sf-1");
+
+        var sync = await client.PostAsync(
+            $"/api/ledgers/{setup.Ledger.LedgerId}/feed-connections/{setup.Connection.Id}/sync",
+            content: null);
+        Assert.Equal(HttpStatusCode.OK, sync.StatusCode);
+
+        await using var db = Db.NewDbContext();
+        var uncategorized = await db.Accounts.AsNoTracking()
+            .SingleAsync(a => a.LedgerId == setup.Ledger.LedgerId && a.IsSystem
+                              && a.AccountType == "category" && a.Name == "Uncategorized");
+        Assert.Equal("EUR", uncategorized.CurrencyCode);
+        // And the synced row's category side is on it.
+        Assert.True(await db.TxnLegs.AsNoTracking().AnyAsync(l => l.AccountId == uncategorized.Id));
+    }
+
     [Fact]
     public async Task Sync_buy_description_persists_IngestActionHint_buy()
     {
@@ -156,7 +194,7 @@ public sealed class IngestBrokerageHintsTests
             content: null);
         Assert.Equal(HttpStatusCode.OK, sync.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .FirstOrDefaultAsync(h => h.LedgerId == setup.Ledger.LedgerId
                                       && h.ExternalId == "fitid-A");
@@ -201,7 +239,7 @@ public sealed class IngestBrokerageHintsTests
         // sync the resolved view should expose the security_id even
         // though no header column stores it (ADR-0038).
         var vooId = await setup.Ledger.AddSecurityAsync("Index ETF A", ticker: "ETFA");
-        await using (var seed = _fixture.NewDbContext())
+        await using (var seed = Db.NewDbContext())
         {
             seed.ProviderSecurityMappings.Add(new ProviderSecurityMappingRow
             {
@@ -220,7 +258,7 @@ public sealed class IngestBrokerageHintsTests
             content: null);
         Assert.Equal(HttpStatusCode.OK, sync.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .FirstOrDefaultAsync(h => h.LedgerId == setup.Ledger.LedgerId
                                       && h.ExternalId == "fitid-A");
@@ -266,7 +304,7 @@ public sealed class IngestBrokerageHintsTests
             content: null);
         Assert.Equal(HttpStatusCode.OK, sync.StatusCode);
 
-        await using var db = _fixture.NewDbContext();
+        await using var db = Db.NewDbContext();
         var header = await db.TxnHeaders.AsNoTracking()
             .FirstOrDefaultAsync(h => h.LedgerId == setup.Ledger.LedgerId
                                       && h.ExternalId == "fitid-A");

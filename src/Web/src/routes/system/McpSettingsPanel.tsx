@@ -1,10 +1,12 @@
 import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation } from '@/lib/mutation';
 
 import { fetchMcpSetting, setMcpSetting } from '@/lib/api';
 import { errorMessage } from '@/lib/errorMessage';
 import { Button } from '@/components/ui/Button';
 import { Panel, PanelBody } from '@/components/ui/Panel';
+import { PendingScope } from '@/components/ui/pending';
 
 const MCP_SETTING_KEY = ['admin-mcp-setting'] as const;
 
@@ -39,6 +41,11 @@ export function McpSettingsPanel() {
                     server restarts; the AI-writes switch takes effect immediately.
                 </p>
             </header>
+            {/* Both switches write one setting, each built from the last one
+                read: one group, so a press of either holds both until its
+                save has landed (pending.ts), and the second never undoes the
+                first. */}
+            <PendingScope>
             <Panel>
                 <PanelBody>
                     {query.isPending ? (
@@ -66,7 +73,8 @@ export function McpSettingsPanel() {
                                         // Disabling MCP also turns writes off (writes imply MCP on).
                                         writesEnabled: setting.enabled ? false : setting.writesEnabled,
                                     })}
-                                    disabled={mutation.isPending || setting.configForced}
+                                    disabled={setting.configForced}
+                                    pending={mutation.isPending}
                                 >
                                     {setting.enabled ? 'Disable MCP' : 'Enable MCP'}
                                 </Button>
@@ -136,7 +144,8 @@ export function McpSettingsPanel() {
                                                 enabled: setting.enabled,
                                                 writesEnabled: !setting.writesEnabled,
                                             })}
-                                            disabled={mutation.isPending || setting.writesConfigForced}
+                                            disabled={setting.writesConfigForced}
+                                            pending={mutation.isPending}
                                         >
                                             {setting.writesEnabled ? 'Disable AI writes' : 'Enable AI writes'}
                                         </Button>
@@ -187,6 +196,7 @@ export function McpSettingsPanel() {
                     )}
                 </PanelBody>
             </Panel>
+            </PendingScope>
         </section>
     );
 }

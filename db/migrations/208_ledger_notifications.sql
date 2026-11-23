@@ -2,13 +2,13 @@
 -- 208 — ledger-scope notifications: events, targets, and inherit-or-own
 -- =============================================================================
 --
--- WHY. Migration 207 built the deployment-scope half of ADR-0096. Its D1 lists
+-- WHY. Migration 207 built the deployment-scope half of ADR-0096. ADR-0096 D1 lists
 -- "this ledger's projections disagree" as LEDGER scope, and the consistency check
 -- had nowhere to publish, because the ledger half did not exist. Writing ledger
 -- events into `system_events` would have broken the scope split the ADR spends its
 -- length arguing for, so the split gets honoured instead.
 --
--- SEPARATE TABLES, NOT A NULLABLE ledger_id. The same four tests D1 applies:
+-- SEPARATE TABLES, NOT A NULLABLE ledger_id. The same four tests ADR-0096 D1 applies:
 --
 --   * authorization — a ledger event is gated by GRANT (an RLS question), a system
 --     event by admin. One table means one policy answering both, and NULL is where
@@ -21,7 +21,7 @@
 --     on and erase newer ones; ledger_notification_subscribers is configuration that
 --     must survive a data rollback, and capturing it would let an old snapshot
 --     re-arm a delivery target the user had deliberately removed. The drift guard
---     refused to let this be left as "arguably right", which is what it is for;
+--     requires each such exclusion to be stated, not left implicit;
 --   * audience — the ledger's holders vs whoever operates the install.
 --
 -- INHERIT OR OWN. A ledger either rides on the deployment's configured targets or

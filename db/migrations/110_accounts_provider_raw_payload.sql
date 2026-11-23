@@ -19,8 +19,8 @@
 --     imports. Per-txn rows with the same shape are `file_import / ofx`.
 --
 -- Currently neither field is persisted; the importer reads them
--- transiently and discards. Same lossy-import bug we just fixed for
--- txns. Fix: persist the per-account MD JSON verbatim, drive the
+-- transiently and discards — the same lossy import ADR-0035 §3 removes
+-- for txns. Fix: persist the per-account MD JSON verbatim, drive the
 -- classifier off it, never depend on the source file again.
 --
 -- This migration adds the column. The importer change (next commit)

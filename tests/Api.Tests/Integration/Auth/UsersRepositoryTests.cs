@@ -7,13 +7,11 @@ using Coffer.Api.Tests.Integration.Infra;
 namespace Coffer.Api.Tests.Integration.Auth;
 
 [Collection(ApiCollection.Name)]
-public sealed class UsersRepositoryTests
+public sealed class UsersRepositoryTests : DatabaseTest
 {
-    private readonly PostgresFixture _fixture;
-
-    public UsersRepositoryTests(PostgresFixture fixture)
+    public UsersRepositoryTests(PostgresFixture fixture, ITestOutputHelper output)
+        : base(fixture, output)
     {
-        _fixture = fixture;
     }
 
     [Fact]
@@ -22,9 +20,9 @@ public sealed class UsersRepositoryTests
         // System user is part of the schema (migration 014/015), not
         // ledger-scoped — but every test still arranges via SyntheticLedger
         // so the per-test isolation pattern is uniform.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new UsersRepository(db, _fixture.NewServiceFactory());
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new UsersRepository(db, Db.NewServiceFactory());
 
         var row = await repo.GetByIdAsync(UserRow.SystemUserId);
         Assert.NotNull(row);
@@ -36,9 +34,9 @@ public sealed class UsersRepositoryTests
     [Fact]
     public async Task GetById_returns_null_for_unknown_id()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new UsersRepository(db, _fixture.NewServiceFactory());
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new UsersRepository(db, Db.NewServiceFactory());
 
         Assert.Null(await repo.GetByIdAsync(Guid.NewGuid()));
     }
@@ -47,9 +45,9 @@ public sealed class UsersRepositoryTests
     public async Task GetByUsername_finds_the_per_test_user()
     {
         // The synthetic ledger already creates a fresh user; just look it up.
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new UsersRepository(db, _fixture.NewServiceFactory());
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new UsersRepository(db, Db.NewServiceFactory());
 
         var found = await repo.GetByUsernameAsync(ledger.Username);
         Assert.NotNull(found);
@@ -59,9 +57,9 @@ public sealed class UsersRepositoryTests
     [Fact]
     public async Task GetByUsername_returns_null_for_unknown_username()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new UsersRepository(db, _fixture.NewServiceFactory());
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new UsersRepository(db, Db.NewServiceFactory());
 
         Assert.Null(await repo.GetByUsernameAsync($"never-{Guid.NewGuid():N}"));
     }
@@ -72,9 +70,9 @@ public sealed class UsersRepositoryTests
     [InlineData("   ")]
     public async Task GetByUsername_returns_null_for_empty_input(string? username)
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new UsersRepository(db, _fixture.NewServiceFactory());
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new UsersRepository(db, Db.NewServiceFactory());
 
         Assert.Null(await repo.GetByUsernameAsync(username!));
     }
@@ -82,9 +80,9 @@ public sealed class UsersRepositoryTests
     [Fact]
     public async Task Create_persists_supplied_fields()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new UsersRepository(db, _fixture.NewServiceFactory());
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new UsersRepository(db, Db.NewServiceFactory());
         var username = $"alice-{Guid.NewGuid():N}";
 
         var row = await repo.CreateAsync(
@@ -101,9 +99,9 @@ public sealed class UsersRepositoryTests
     [Fact]
     public async Task Create_rejects_duplicate_username()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new UsersRepository(db, _fixture.NewServiceFactory());
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new UsersRepository(db, Db.NewServiceFactory());
 
         // EF Core wraps Postgres errors in DbUpdateException; the
         // unique-constraint violation is the InnerException's
@@ -117,9 +115,9 @@ public sealed class UsersRepositoryTests
     [Fact]
     public async Task SetLastOpenedLedger_updates_users_row()
     {
-        var ledger = await SyntheticLedger.CreateAsync(_fixture);
-        await using var db = _fixture.NewDbContext();
-        var repo = new UsersRepository(db, _fixture.NewServiceFactory());
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        await using var db = Db.NewDbContext();
+        var repo = new UsersRepository(db, Db.NewServiceFactory());
 
         await repo.SetLastOpenedLedgerAsync(ledger.UserId, ledger.LedgerId);
         var refreshed = await repo.GetByIdAsync(ledger.UserId);

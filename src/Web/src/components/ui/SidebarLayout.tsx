@@ -53,22 +53,27 @@ export const SidebarLayout = forwardRef<HTMLDivElement, SidebarLayoutProps>(
 
 // --- Sidebar ---------------------------------------------------------------
 
-export type SidebarProps = HTMLAttributes<HTMLElement>;
+export interface SidebarProps extends HTMLAttributes<HTMLElement> {
+    /** The 56px icon rail (FU-051) instead of the full-width sidebar. */
+    collapsed?: boolean;
+}
 
 /**
- * Fixed-width left rail. 224px (`w-fixed-224px`) per ADR-0021 Rule 1. The width
- * is settled here so screens don't drift apart. Responsive collapse
- * (icons-only ≤ 1024px, drawer ≤ 768px) lands in PR 5.3.
+ * Left rail. 224px (`w-fixed-224px`) per ADR-0021 Rule 1, so screens don't
+ * drift apart; `collapsed` makes it the 56px icon rail. The authed sidebar can
+ * be resized and sets its own width inline (lib/sidebarRail.ts); with nothing
+ * set, as on /__styleguide, it is this one.
  */
 export const Sidebar = forwardRef<HTMLElement, SidebarProps>(function Sidebar(
-    { className, ...props },
+    { className, collapsed = false, ...props },
     ref,
 ) {
     return (
         <aside
             ref={ref}
             className={cn(
-                'flex w-fixed-224px flex-col border-r border-border bg-surface-sidebar',
+                'flex flex-col border-r border-border bg-surface-sidebar',
+                collapsed ? 'w-fixed-56px' : 'w-fixed-224px',
                 className,
             )}
             {...props}
@@ -137,13 +142,17 @@ export const SidebarPicker = forwardRef<HTMLButtonElement, SidebarPickerProps>(
 
 export type SidebarNavProps = HTMLAttributes<HTMLElement>;
 
-/** Scrollable nav body — wraps SidebarSection + SidebarNavLink children. */
+/**
+ * Scrollable nav body — wraps SidebarSection + SidebarNavLink children.
+ * `relative` for the reason MainPane gives: a scroll area is the containing
+ * block of what it scrolls.
+ */
 export const SidebarNav = forwardRef<HTMLElement, SidebarNavProps>(
     function SidebarNav({ className, ...props }, ref) {
         return (
             <nav
                 ref={ref}
-                className={cn('flex-1 overflow-y-auto px-1.5 py-2', className)}
+                className={cn('relative flex-1 overflow-y-auto px-1.5 py-2', className)}
                 {...props}
             />
         );
@@ -276,8 +285,8 @@ export const MainArea = forwardRef<HTMLDivElement, MainAreaProps>(
                 // column refuse to shrink. The root is `overflow-hidden`, so
                 // the result is not a scrollbar but a window that stops
                 // reflowing: narrow the browser and the content is simply
-                // clipped. Nothing noticed before because every page capped
-                // itself at `max-w-5xl` and so never exceeded the viewport.
+                // clipped. A page capped at `max-w-5xl` never exceeds the
+                // viewport and so never shows it; an uncapped one does.
                 className={cn('flex min-w-0 flex-1 flex-col', className)}
                 {...props}
             />
@@ -318,6 +327,14 @@ export type MainPaneProps = HTMLAttributes<HTMLElement>;
  * page (or a Settings tab) that doesn't overflow doesn't widen the pane
  * — otherwise the centered (`mx-auto`) content jumps left/right as the
  * scrollbar appears and disappears between views.
+ *
+ * `relative` makes the pane the containing block of anything absolutely
+ * positioned inside it that has no positioned ancestor of its own, `sr-only`
+ * text above all. An absolutely positioned box adds to the overflow of its
+ * containing block, not of the scroll containers between the two, so without
+ * it that text escapes this pane and extends the document: the document grows
+ * past the window and scrolls, and the top bar and the rail move with it
+ * (ADR-0021 Rule 1).
  */
 export const MainPane = forwardRef<HTMLElement, MainPaneProps>(
     function MainPane({ className, ...props }, ref) {
@@ -325,7 +342,7 @@ export const MainPane = forwardRef<HTMLElement, MainPaneProps>(
             <main
                 ref={ref}
                 className={cn(
-                    'flex-1 overflow-y-auto [scrollbar-gutter:stable]',
+                    'relative flex-1 overflow-y-auto [scrollbar-gutter:stable]',
                     className,
                 )}
                 {...props}

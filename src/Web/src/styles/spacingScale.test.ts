@@ -3,15 +3,14 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import { WHOLE_TREE_SCAN_TIMEOUT_MS } from '@/lib/wholeTreeScan';
+
 /**
  * Rhythm — padding, margin, gap, space — comes off a sanctioned ramp.
  *
- * WHY THIS EXISTS. Not to clean anything up: when this landed, 1690 of the
- * SPA's 1691 rhythm utilities were already on the ramp below. The vocabulary
- * was coherent before anyone wrote it down, because it grew by copying the
- * neighbouring component. That is a fine way to hold a line and a terrible way
- * to defend one — nothing distinguished `py-2.5` (the list-row standard, nine
- * call sites) from `py-3.5` (one tile, no reason).
+ * WHY THIS EXISTS. A vocabulary held only by copying the neighbouring
+ * component has nothing that distinguishes a standard step (`py-2.5`, the
+ * list-row standard) from a one-off (`py-3.5` on a single tile, no reason).
  *
  * What makes it worth enforcing is DENSITY. Tailwind v4 derives every one of
  * these utilities from `--spacing`, so `p-4` is `calc(var(--spacing) * 4)`.
@@ -20,8 +19,6 @@ import { describe, expect, it } from 'vitest';
  * step that exists for no reason at 1x is a step nobody reasoned about at
  * 0.8x, and an ARBITRARY value (`py-[0.3rem]`) is worse: it does not move at
  * all, so it silently stops matching its neighbours at every density but one.
- * That was real — the sidebar nav row was pinned at `py-[0.3rem]` while every
- * row around it would have scaled.
  *
  * THREE KINDS OF LENGTH live in this codebase and only the first is rhythm:
  *
@@ -98,6 +95,15 @@ const ALT = RHYTHM.join('|');
 const NUMERIC = new RegExp(`(?<![\\w-])(-?(?:${ALT})-(\\d+(?:\\.5)?))(?![\\w.])`, 'g');
 const ARBITRARY = new RegExp(`(?<![\\w-])(-?(?:${ALT})-\\[[^\\]]+\\])`, 'g');
 
+/**
+ * Whether an arbitrary rhythm value is frozen. `inherit` is not: it is no
+ * length of its own but the parent's rhythm (a pending label's two labels take
+ * their button's gap, `gap-[inherit]`), and that moves with density as the
+ * parent's does. Every other arbitrary value is a length eyeballed at one
+ * density.
+ */
+const frozen = (utility: string) => !utility.endsWith('-[inherit]');
+
 function sourceFiles(dir: string): string[] {
     const out: string[] = [];
     for (const entry of readdirSync(dir)) {
@@ -128,7 +134,7 @@ function scan(files: string[]): Scan {
                 else result.offRamp.push(`${rel}:${i + 1}  ${m[1]}`);
             }
             for (const m of line.matchAll(ARBITRARY)) {
-                result.arbitrary.push(`${rel}:${i + 1}  ${m[1]}`);
+                if (frozen(m[1]!)) result.arbitrary.push(`${rel}:${i + 1}  ${m[1]}`);
             }
         });
     }
@@ -146,10 +152,12 @@ describe('spacing scale', () => {
         // And prove each arm fires on a known-bad string, since "found
         // nothing" is the expected result everywhere else and so proves
         // nothing by itself.
-        const sample = 'className="py-3.5 gap-[7px] -mt-2 sm:px-2.5"';
+        const sample = 'className="py-3.5 gap-[7px] gap-[inherit] -mt-2 sm:px-2.5 mx-[inherit_2px]"';
         const numeric = [...sample.matchAll(NUMERIC)];
         expect(numeric.filter((m) => !RAMP.has(m[2]!)).map((m) => m[1])).toEqual(['py-3.5']);
-        expect([...sample.matchAll(ARBITRARY)].map((m) => m[1])).toEqual(['gap-[7px]']);
+        // The parent's rhythm, taken whole, is the one arbitrary value not frozen.
+        expect([...sample.matchAll(ARBITRARY)].map((m) => m[1]).filter(frozen))
+            .toEqual(['gap-[7px]', 'mx-[inherit_2px]']);
         // `-mt-2` matches once, as itself — not a second time as `mt-2`.
         expect(numeric.map((m) => m[1])).toContain('-mt-2');
         // A variant prefix does not hide a value from the scan.
@@ -165,7 +173,7 @@ describe('spacing scale', () => {
 
         // Listed, not counted — "4 off-ramp values" sends the reader hunting.
         expect(result.offRamp).toEqual([]);
-    });
+    }, WHOLE_TREE_SCAN_TIMEOUT_MS);
 
     it('uses no arbitrary rhythm values', () => {
         // Separate from the ramp check because the FAILURE MODE is different.
@@ -176,5 +184,5 @@ describe('spacing scale', () => {
         // If one is ever genuinely needed it does not belong in a className:
         // give it a token, so the density work can decide what happens to it.
         expect(scan(sourceFiles(SRC)).arbitrary).toEqual([]);
-    });
+    }, WHOLE_TREE_SCAN_TIMEOUT_MS);
 });

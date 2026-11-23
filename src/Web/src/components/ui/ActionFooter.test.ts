@@ -3,21 +3,21 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import { WHOLE_TREE_SCAN_TIMEOUT_MS } from '@/lib/wholeTreeScan';
+
 /**
  * ADR-0021 Rule 9 says every "commit or back out" footer looks the same:
  * right-aligned, Cancel then the affirmative, secondary then primary, size sm.
  *
- * WHY THIS EXISTS. That was true of 22 footers across 16 files and still did
- * not hold — the Appearance panel shipped left-aligned Apply/Cancel, because a
- * convention enforced by review is enforced only when the reviewer remembers
- * it. `ActionFooter` makes the shape unforgettable for anyone who uses it; this
+ * WHY THIS EXISTS. A convention enforced by review is enforced only when the
+ * reviewer remembers it. `ActionFooter` makes the shape unforgettable for anyone who uses it; this
  * test is what stops the next footer being written by hand instead.
  *
  * WHAT IT CANNOT DO. It is a text scan, not a renderer. It sees a `justify-end`
  * container holding two or more `<Button>`s and calls that a hand-rolled
- * footer. It will not notice a footer built some other way, and it would not
- * have caught the Appearance panel's original sin — that one was
- * `justify-start`, which is legal here because plenty of non-footer rows are.
+ * footer. It will not notice a footer built some other way, including a
+ * left-aligned one — `justify-start` is legal here because plenty of
+ * non-footer rows are.
  * Its job is narrower than Rule 9: hold the line at the current count.
  */
 
@@ -99,7 +99,7 @@ describe('action footers (ADR-0021 Rule 9)', () => {
         }
         // Named, not counted — "3 offenders" sends the reader hunting.
         expect(offenders).toEqual([]);
-    });
+    }, WHOLE_TREE_SCAN_TIMEOUT_MS);
 
     it('has no stale entries in the frozen list', () => {
         // A file that got migrated must leave the list, or the list stops

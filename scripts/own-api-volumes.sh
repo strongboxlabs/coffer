@@ -38,7 +38,7 @@ info() { echo "[own-api-volumes] $*"; }
 # The install directory this script lives in, through compose — whatever
 # COFFER_CONTAINER_PREFIX named the container. API_CONTAINER names one directly
 # instead (the restore drill's throwaway stack).
-container="${API_CONTAINER:-$(cd "$repo_root" && $DOCKER compose ps -a -q api 2>/dev/null | head -1)}"
+container="${API_CONTAINER:-$(cd "$repo_root" && $DOCKER compose ps -a -q api 2>/dev/null | sed -n 1p)}"
 if [ -z "$container" ]; then
     info "no api container yet — nothing to hand over."
     exit 0
