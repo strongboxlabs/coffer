@@ -1,7 +1,7 @@
 # Rebuilds the latest release on fresh base images, weekly, and records the new digest
 # on its GitHub Release. The runtime image floats on mcr.microsoft.com/dotnet/aspnet:10.0
-# and PGDG's postgresql-client-16, so without this an install got a patched .NET runtime
-# or libpq only when a release was cut.
+# and PGDG's postgresql-client-16, so without this an install gets a patched .NET runtime
+# or libpq only when a release is cut.
 #
 # Same source, same version: the release's tag is checked out and built as release.yml
 # builds it, pushed under the same image tags, and image-digest.txt is replaced. An

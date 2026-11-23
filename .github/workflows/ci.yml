@@ -164,8 +164,8 @@ jobs:
       # Advisories are gated here as well as in preflight, and high-and-above only:
       # moderate/low in a dev toolchain would fail CI constantly for things that never
       # reach a user. `npm ci --no-audit` above is for install speed, so without this
-      # step nothing checks at all — which is how a high-severity nanoid advisory sat
-      # in the lockfile unnoticed.
+      # step nothing checks advisories at all, and a high-severity one can sit in the
+      # lockfile unnoticed.
       - name: Dependency audit
         run: npm audit --audit-level=high
 

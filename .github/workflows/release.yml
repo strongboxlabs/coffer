@@ -45,21 +45,18 @@ jobs:
 
       # WHY THIS EXISTS AT ALL. .git is dockerignored, so the build stage is not
       # a repo and cannot work its own commit out. Without these three passed in,
-      # Api.csproj consults a .git that is not there — and until the fix in
-      # 0.88.0 it captured git's own "fatal: not a git repository" as the value,
-      # so every public image ever built carried that error text as its version
-      # and rendered it in its own About panel. Post-0.88.0 it degrades honestly
-      # to "X.Y.Z+nogit" instead, which is better but still cannot name a commit.
+      # Api.csproj consults a .git that is not there and the version degrades to
+      # "X.Y.Z+nogit", which cannot name a commit.
       #
       # THE SHA IS THIS REPO'S, deliberately, not the private one it was
       # snapshotted from. A public image should name a commit a consumer can
       # actually check out; the private sha names nothing they can reach, and
       # the two repos share no history by construction.
       #
-      # The private release.yml has had this since 43031e3a. That it took until
-      # 0.88.0 to reach here is the drift the publish script warns about: these
-      # two workflows cannot drift in CONTENT, because nothing is copied between
-      # them — they drift in CAPABILITY, silently, and nothing watches.
+      # This is the drift the publish script warns about: this workflow and the
+      # private release.yml cannot drift in CONTENT, because nothing is copied
+      # between them automatically — they drift in CAPABILITY, silently, and
+      # nothing watches.
       - name: Resolve build identity
         id: ident
         run: |
@@ -98,8 +95,8 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
           # Set these EXPLICITLY. metadata-action otherwise infers them from GitHub's
-          # repository metadata, and the licenses label came out empty — so the GHCR
-          # package page showed no license for an AGPL project. Don't leave a
+          # repository metadata, which can leave the licenses label empty, so the GHCR
+          # package page shows no license for an AGPL project. Don't leave a
           # user-visible legal field to auto-detection.
           labels: |
             org.opencontainers.image.title=Coffer
