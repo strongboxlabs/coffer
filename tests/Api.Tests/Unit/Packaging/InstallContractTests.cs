@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using Coffer.Api.Tests.Integration.Infra;
 
 namespace Coffer.Api.Tests.Unit.Packaging;
 
@@ -14,7 +15,8 @@ namespace Coffer.Api.Tests.Unit.Packaging;
 /// </summary>
 public sealed class InstallContractTests
 {
-    [Fact]
+    // The contract check is the maintainer's script, which the public snapshot does not carry.
+    [MaintainerFact]
     public async Task The_install_and_upgrade_scripts_keep_the_updater_contract()
     {
         // The scripts read /proc/version and use GNU tools; the other script tests skip the same way.

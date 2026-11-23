@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using Coffer.Api.Tests.Integration.Infra;
 
 namespace Coffer.Api.Tests.Unit;
 
@@ -112,7 +113,7 @@ public sealed class DecisionCitationCatalogTests
     /// Markdown and workflow files under <c>src</c>, <c>tests</c>, <c>db</c>,
     /// <c>scripts</c>, <c>docs</c> and <c>.github</c>, and the same kinds at the root.
     /// </remarks>
-    [Fact]
+    [MaintainerFact]
     public void Every_numbered_decision_names_its_ADR()
     {
         var repo = RepoRoot();
@@ -287,7 +288,7 @@ public sealed class DecisionCitationCatalogTests
     /// <c>scripts</c>, <c>docs</c> and <c>.github</c>, and the same kinds at the root),
     /// comments, strings and names alike.
     /// </remarks>
-    [Fact]
+    [MaintainerFact]
     public void Every_section_citation_names_its_document()
     {
         var repo = RepoRoot();

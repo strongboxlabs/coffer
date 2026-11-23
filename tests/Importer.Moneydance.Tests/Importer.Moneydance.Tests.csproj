@@ -80,6 +80,10 @@
          and over the whole Demo, its examples included, by the API's tests: one copy. -->
     <Compile Include="..\Api.Tests\Integration\Infra\MemoPlacementInvariants.cs"
              Link="Infra\MemoPlacementInvariants.cs" />
+    <!-- The skip for a test that reads the maintainer tree, which the public snapshot does
+         not carry: one rule for both assemblies. -->
+    <Compile Include="..\Api.Tests\Integration\Infra\MaintainerTree.cs"
+             Link="Infra\MaintainerTree.cs" />
   </ItemGroup>
 
   <ItemGroup>

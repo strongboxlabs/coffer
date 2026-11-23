@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using Coffer.Api.Tests.Integration.Infra;
 
 namespace Coffer.Api.Tests.Unit;
 
@@ -17,7 +18,7 @@ public sealed class InKindRebuildPredicateTests
     private const string From = "JOIN txn_legs hl ON hl.header_id = u.header_id AND hl.quantity < 0";
     private const string To = "WHERE y.holdings_account_id = hl.account_id AND y.ledger_id = u.ledger_id) = 1";
 
-    [Fact]
+    [MaintainerFact]
     public void The_check_reads_the_rebuild_shape_with_the_migrations_predicate()
     {
         var repo = RepoRoot();

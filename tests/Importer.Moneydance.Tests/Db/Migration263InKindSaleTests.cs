@@ -134,8 +134,12 @@ public sealed class Migration263InKindSaleTests : DatabaseTest
     ];
 
     // ---- tests ------------------------------------------------------------------
+    //
+    // Each test that runs the pre-upgrade check is a MaintainerFact or MaintainerTheory: the
+    // check is the release's script, kept under scripts/maintainer, which the public snapshot
+    // does not carry, and a test that ran without it would no longer be the one recorded here.
 
-    [Fact]
+    [MaintainerFact]
     public async Task Transfers_to_a_category_or_a_bank_upgrade_to_the_sale_the_importer_writes_at_their_cost()
     {
         // t-out-bank is deleted (hidden) after the import, in both ledgers. The walk
@@ -184,7 +188,7 @@ public sealed class Migration263InKindSaleTests : DatabaseTest
         Assert.All(derived, d => Assert.True(d.IdFromHeader && d.StampFromHoldingsLeg, $"a {d.Role} leg was not derived from its header"));
     }
 
-    [Fact]
+    [MaintainerFact]
     public async Task A_transfer_to_another_brokerage_keeps_no_leg_to_rebuild_from_and_refuses_the_upgrade()
     {
         var ledgerId = (await ImportAsync(Export(Out("t-out-brk", "20210601", "a-brkB", Placeholder)))).LedgerId;
@@ -196,7 +200,7 @@ public sealed class Migration263InKindSaleTests : DatabaseTest
         await AssertRefusedAsync(old, work, ledgerId, "t-out-brk", "(c) transfer_shares not owned by its source brokerage: 1");
     }
 
-    [Fact]
+    [MaintainerFact]
     public async Task A_sale_across_the_long_term_line_nets_to_zero_with_offsetting_terms_as_the_importer_writes_it()
     {
         // Both lots of the second fund: one held over a year, one under, the second
@@ -223,7 +227,7 @@ public sealed class Migration263InKindSaleTests : DatabaseTest
         Assert.NotEqual(0m, gainLt);
     }
 
-    [Theory]
+    [MaintainerTheory]
     [InlineData("dearer", 1000.50, 100.05, 0.00)]
     [InlineData("cheaper", 999.50, 99.95, 0.00)]
     [InlineData("half_cent", 1000.05, 100.01, 0.01)]
