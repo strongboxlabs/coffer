@@ -45,12 +45,18 @@ public sealed class ForwardedClientRateLimitTests : DatabaseTest
     }
 
     private ApiFactory Factory(int perAddress = 100_000, int perAccount = 100_000) =>
-        new ApiFactory(Db)
+        Factory(Db, perAddress, perAccount);
+
+    /// <summary>A host whose recovery-login limits are <paramref name="perAddress"/> a minute
+    /// per client address and <paramref name="perAccount"/> an hour per account, and whose
+    /// requests come from the address <c>X-Test-Peer</c> names.</summary>
+    internal static ApiFactory Factory(TestDatabase database, int perAddress = 100_000, int perAccount = 100_000) =>
+        new ApiFactory(database)
             .WithConfig("Api:Auth:RecoveryRateLimitPerMinute", perAddress.ToString(System.Globalization.CultureInfo.InvariantCulture))
             .WithConfig("Api:Auth:RecoveryAttemptsPerAccountPerHour", perAccount.ToString(System.Globalization.CultureInfo.InvariantCulture))
             .WithServices(s => s.AddSingleton<IStartupFilter, PeerFromHeader>());
 
-    private static async Task<HttpStatusCode> AttemptAsync(
+    internal static async Task<HttpStatusCode> AttemptAsync(
         HttpClient client, string peer, string? forwardedFor, string username)
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, "/api/auth/login/recovery")
@@ -62,9 +68,9 @@ public sealed class ForwardedClientRateLimitTests : DatabaseTest
         return (await client.SendAsync(request)).StatusCode;
     }
 
-    private static string Nobody() => $"nobody-{Guid.NewGuid():N}";
+    internal static string Nobody() => $"nobody-{Guid.NewGuid():N}";
 
-    private static async Task<HttpStatusCode> RegisterAsync(HttpClient client, string peer, string forwardedFor)
+    internal static async Task<HttpStatusCode> RegisterAsync(HttpClient client, string peer, string forwardedFor)
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, "/oauth/register")
         {
@@ -78,30 +84,6 @@ public sealed class ForwardedClientRateLimitTests : DatabaseTest
         request.Headers.Add("X-Test-Peer", peer);
         request.Headers.Add("X-Forwarded-For", forwardedFor);
         return (await client.SendAsync(request)).StatusCode;
-    }
-
-    /// <summary>A held request polled each second until it is answered with
-    /// <paramref name="permitted"/>: when, after <paramref name="since"/>, the last refused
-    /// request was sent and the permitted one was answered; null if it is still refused at
-    /// <paramref name="giveUp"/>. Any answer other than a refusal or a permit fails, so
-    /// an endpoint that starts failing is not taken for a window that ended.</summary>
-    private static async Task<(TimeSpan LastRefusedSent, TimeSpan PermittedAnswered)?> LetThroughAfterAsync(
-        System.Diagnostics.Stopwatch since, TimeSpan giveUp, HttpStatusCode permitted,
-        Func<Task<HttpStatusCode>> attempt)
-    {
-        var lastRefusedSent = TimeSpan.Zero;
-        while (since.Elapsed < giveUp)
-        {
-            var sent = since.Elapsed;
-            var status = await attempt();
-            if (status == permitted) return (lastRefusedSent, since.Elapsed);
-            Assert.True(status == HttpStatusCode.TooManyRequests,
-                $"A request sent {sent.TotalSeconds:0.0} s after the first was answered {(int)status} {status}, "
-                + $"neither a refusal nor the {(int)permitted} {permitted} of a permitted one.");
-            lastRefusedSent = sent;
-            await Task.Delay(TimeSpan.FromSeconds(1));
-        }
-        return null;
     }
 
     [Fact]
@@ -132,52 +114,25 @@ public sealed class ForwardedClientRateLimitTests : DatabaseTest
     }
 
     /// <summary>
-    /// Both per-address limits, recovery login and Dynamic Client Registration, are a
-    /// one-minute fixed window: a client held at 429 is let through again when its window
-    /// ends, not before, and no later than a little after it. Takes about a minute.
+    /// Dynamic Client Registration is bounded per client address, as the trusted proxy
+    /// forwards it: a client past its limit is refused, and another client through the
+    /// same proxy is not held up. That the limit is a one-minute window, and lets the
+    /// client through when it ends, is a wait on the real clock, checked in the stress
+    /// lane (<c>RateLimitWindowTests</c>).
     /// </summary>
     [Fact]
-    public async Task A_client_held_at_the_limit_is_let_through_when_its_minute_ends()
+    public async Task Registration_is_bounded_per_client_address()
     {
-        await using var factory = Factory(perAddress: 1)
+        await using var factory = Factory()
             .WithMcpEnabled()
             .WithConfig("Api:Mcp:DcrRateLimitPerMinute", "1")
             .WithConfig("Api:Mcp:MaxDynamicClients", "1000");
         using var client = factory.CreateClient();
         const string proxy = "172.18.0.2";
-        const string held = "203.0.113.9";
 
-        var recoveryWindow = System.Diagnostics.Stopwatch.StartNew();
-        Assert.Equal(HttpStatusCode.Unauthorized, await AttemptAsync(client, proxy, held, Nobody()));
-        var registerWindow = System.Diagnostics.Stopwatch.StartNew();
-        Assert.Equal(HttpStatusCode.Created, await RegisterAsync(client, proxy, held));
-
-        Assert.Equal(HttpStatusCode.TooManyRequests, await AttemptAsync(client, proxy, held, Nobody()));
-        Assert.Equal(HttpStatusCode.TooManyRequests, await RegisterAsync(client, proxy, held));
-        // Registration is per client address too: another client is not held up.
+        Assert.Equal(HttpStatusCode.Created, await RegisterAsync(client, proxy, "203.0.113.9"));
+        Assert.Equal(HttpStatusCode.TooManyRequests, await RegisterAsync(client, proxy, "203.0.113.9"));
         Assert.Equal(HttpStatusCode.Created, await RegisterAsync(client, proxy, "198.51.100.4"));
-
-        var giveUp = TimeSpan.FromSeconds(80);
-        var recovery = LetThroughAfterAsync(recoveryWindow, giveUp, HttpStatusCode.Unauthorized,
-            () => AttemptAsync(client, proxy, held, Nobody()));
-        var register = LetThroughAfterAsync(registerWindow, giveUp, HttpStatusCode.Created,
-            () => RegisterAsync(client, proxy, held));
-        await Task.WhenAll(recovery, register);
-
-        // A window is a minute, measured from the client's first request. A permit is
-        // answered no earlier than that, and a refusal is decided before it ends, so the
-        // last refused request was SENT before it ends, plus a replenishment tick: bounding
-        // when requests were sent, not when they were answered, keeps a slow request from
-        // reading as a long window.
-        foreach (var (limit, after) in new[] { ("recovery login", await recovery), ("registration", await register) })
-        {
-            Assert.True(after is not null, $"The {limit} limit still held the client {giveUp.TotalSeconds:0} s after its first request.");
-            var (lastRefusedSent, permittedAnswered) = after!.Value;
-            Assert.True(permittedAnswered >= TimeSpan.FromSeconds(58),
-                $"The {limit} limit let the client through {permittedAnswered.TotalSeconds:0.0} s after its first request, before its minute ended.");
-            Assert.True(lastRefusedSent < TimeSpan.FromSeconds(65),
-                $"The {limit} limit refused a request sent {lastRefusedSent.TotalSeconds:0.0} s after the client's first: its window is longer than a minute.");
-        }
     }
 
     [Fact]

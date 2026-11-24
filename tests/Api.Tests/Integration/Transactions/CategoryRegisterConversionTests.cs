@@ -35,9 +35,9 @@ public sealed class CategoryRegisterConversionTests : DatabaseTest
     {
     }
 
-    private static DateTime Jan(int day) => new(2026, 1, day, 0, 0, 0, DateTimeKind.Utc);
+    internal static DateTime Jan(int day) => new(2026, 1, day, 0, 0, 0, DateTimeKind.Utc);
 
-    private static DateOnly Day(int day) => new(2026, 1, day);
+    internal static DateOnly Day(int day) => new(2026, 1, day);
 
     /// <summary>Every statement a read sends.</summary>
     private sealed class Statements : DbCommandInterceptor
@@ -113,9 +113,13 @@ public sealed class CategoryRegisterConversionTests : DatabaseTest
 
     /// <summary>EUR to USD on the 1st, 6th, 7th and 12th, fetched through
     /// <paramref name="coveredThrough"/>.</summary>
-    private async Task SeedRatesAsync(SyntheticLedger ledger, DateOnly coveredThrough)
+    private Task SeedRatesAsync(SyntheticLedger ledger, DateOnly coveredThrough) =>
+        SeedRatesAsync(Db, ledger, coveredThrough);
+
+    /// <inheritdoc cref="SeedRatesAsync(SyntheticLedger, DateOnly)"/>
+    internal static async Task SeedRatesAsync(TestDatabase database, SyntheticLedger ledger, DateOnly coveredThrough)
     {
-        await using var db = Db.NewAppDbContextAsUser(ledger.UserId);
+        await using var db = database.NewAppDbContextAsUser(ledger.UserId);
         foreach (var (day, rate) in new[] { (1, 0.9m), (6, 1.1m), (7, 1.123456789012m), (12, 1.2m) })
         {
             db.FxRates.Add(new FxRateRow
@@ -143,7 +147,7 @@ public sealed class CategoryRegisterConversionTests : DatabaseTest
         return (page, statements);
     }
 
-    private static Dictionary<Guid, RegisterRowDto> ByHeader(RegisterPage page) =>
+    internal static Dictionary<Guid, RegisterRowDto> ByHeader(RegisterPage page) =>
         page.Entries.SelectMany(e => e.Txn is { } t ? [t] : e.Legs!).ToDictionary(r => r.HeaderId);
 
     /// <summary>The running sum of each row converted at its rate, rounded once at the
@@ -383,26 +387,41 @@ public sealed class CategoryRegisterConversionTests : DatabaseTest
     }
 
     /// <summary>
-    /// The foreign-leg read is bounded by the category, not the ledger: it reaches the
-    /// category's legs through <c>idx_txn_legs_account_id</c> and each leg's paying side
-    /// through the posting key, and never scans <c>txn_legs</c>. A scan would cost every
-    /// category page the whole ledger's legs.
+    /// The foreign-leg read is bounded by the category, not the ledger: it is written so
+    /// that it reaches the category's legs through <c>idx_txn_legs_account_id</c> and each
+    /// leg's paying side through the posting key, and never needs to scan <c>txn_legs</c>
+    /// or <c>txn_headers</c>. A scan would cost every category page the whole ledger's legs.
+    /// Planned on a few rows with the planner's scans priced out (<see cref="IndexOnlyPlanner"/>),
+    /// so the outcome is the statement's shape, not the table's size. That the planner
+    /// picks this path at scale is checked in the stress lane
+    /// (<c>CategoryRegisterForeignLegPlanTests</c>).
     /// </summary>
     [Fact]
-    public async Task The_foreign_leg_read_reaches_the_category_through_its_account_index()
+    public async Task The_foreign_leg_read_can_reach_the_category_through_its_account_index()
     {
         var ledger = await SyntheticLedger.CreateAsync(Db);
-        await StressLedger.SeedLedgerAsync(Db, ledger, StressLedger.Scale.Smoke);
+        var category = (await ledger.AddCategoryAsync("Category A")).Id;
+        await SeedForeignLegsAsync(Db, ledger, category);
+
+        var plan = await ForeignLegPlanAsync(Db, ledger, category, new IndexOnlyPlanner());
+        AssertReachesTheCategoryThroughItsAccountIndex(plan, Output);
+    }
+
+    /// <summary>Ten euro transactions into <paramref name="category"/>, and the rates to
+    /// convert them into the ledger's dollars.</summary>
+    internal static async Task SeedForeignLegsAsync(TestDatabase database, SyntheticLedger ledger, Guid category)
+    {
         var euros = await ledger.AddBankAccountAsync("Account B", currencyCode: "EUR");
-        var category = StressLedger.CategoryId(ledger.LedgerId, 1);
         for (var day = 1; day <= 10; day++)
             await ledger.AddTransactionPairAsync(euros.Id, category, -(day + 0.5m), Jan(day));
-        await SeedRatesAsync(ledger, Day(31));
-        await using (var conn = Db.OpenServiceConnection())
-        await using (var analyze = new Npgsql.NpgsqlCommand(
-                         "ANALYZE txn_legs; ANALYZE txn_headers; ANALYZE accounts; ANALYZE txn_header_account_balances", conn))
-            await analyze.ExecuteNonQueryAsync();
+        await SeedRatesAsync(database, ledger, Day(31));
+    }
 
+    /// <summary>The plan of the foreign-leg read of <paramref name="category"/>'s page,
+    /// taken as the app takes it (<see cref="ExplainCapture"/>).</summary>
+    internal static async Task<string> ForeignLegPlanAsync(
+        TestDatabase database, SyntheticLedger ledger, Guid category, params IInterceptor[] extra)
+    {
         var capture = new ExplainCapture
         {
             // The foreign-leg read is the one statement that groups legs with the stored
@@ -413,16 +432,64 @@ public sealed class CategoryRegisterConversionTests : DatabaseTest
             Enabled = true,
         };
         RegisterPage page;
-        await using (var db = Db.NewRequestDbContextAsUser(ledger.UserId, capture))
+        await using (var db = database.NewRequestDbContextAsUser(ledger.UserId, [capture, .. extra]))
             page = await new RegisterRepository(db, TimeProvider.System).GetPageAsync(
                 ledger.LedgerId, category, null, RegisterRepository.DirectionBefore, null, 50, hidden: false);
         Assert.Contains(ByHeader(page).Values, r => r.CurrencyCode == "EUR" && r.BalanceAfter is not null);
+        return Assert.Single(capture.Drain()).Plan;
+    }
 
-        var plan = Assert.Single(capture.Drain()).Plan;
-        Output.WriteLine(plan);
-        Assert.Contains("idx_txn_legs_account_id", plan, StringComparison.Ordinal);
+    /// <summary>
+    /// The legs are reached through <c>idx_txn_legs_account_id</c> bounded by an account,
+    /// and every read of <c>txn_legs</c> or <c>txn_headers</c> is an index bounded by a
+    /// condition. A scan shows as a Seq Scan; with scans priced out it can also show as an
+    /// index walked whole, with no condition, which is a scan in all but name.
+    /// </summary>
+    internal static void AssertReachesTheCategoryThroughItsAccountIndex(string plan, ITestOutputHelper output)
+    {
+        output.WriteLine(plan);
         Assert.DoesNotContain("Seq Scan on txn_legs", plan, StringComparison.Ordinal);
         Assert.DoesNotContain("Seq Scan on txn_headers", plan, StringComparison.Ordinal);
+
+        var reads = IndexReads(plan)
+            .Where(r => r.Table is "txn_legs" or "txn_headers").ToList();
+        var byAccount = reads.Where(r => r.Index == "idx_txn_legs_account_id").ToList();
+        Assert.NotEmpty(byAccount);
+        Assert.All(byAccount, r => Assert.Contains("account_id", r.Condition ?? "", StringComparison.Ordinal));
+        var unbounded = reads.Where(r => r.Condition is null).ToList();
+        Assert.True(unbounded.Count == 0,
+            "an index read with no condition walks the whole table: "
+            + string.Join(", ", unbounded.Select(r => $"{r.Index} on {r.Table}")));
+    }
+
+    /// <summary>One index read of a text plan: the index, its table, and its
+    /// <c>Index Cond</c>, null when it has none.</summary>
+    private sealed record IndexRead(string Index, string Table, string? Condition);
+
+    private static readonly System.Text.RegularExpressions.Regex IndexNode = new(
+        @"(?:Index Scan|Index Only Scan)(?: Backward)? using (?<index>\S+) on (?<table>\S+)|Bitmap Index Scan on (?<index>\S+)");
+
+    /// <summary>Each index read in <paramref name="plan"/>, with the condition listed under
+    /// its node, up to the next node. A bitmap index read names no table; it is reported
+    /// against the table of the heap scan above it.</summary>
+    private static List<IndexRead> IndexReads(string plan)
+    {
+        var lines = plan.Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0).ToList();
+        var reads = new List<IndexRead>();
+        string? heapTable = null;
+        for (var i = 0; i < lines.Count; i++)
+        {
+            var heap = System.Text.RegularExpressions.Regex.Match(lines[i], @"Bitmap Heap Scan on (\S+)");
+            if (heap.Success) heapTable = heap.Groups[1].Value;
+            var node = IndexNode.Match(lines[i]);
+            if (!node.Success) continue;
+            var table = node.Groups["table"].Success ? node.Groups["table"].Value : heapTable ?? "";
+            string? condition = null;
+            for (var j = i + 1; j < lines.Count && !lines[j].StartsWith("->", StringComparison.Ordinal); j++)
+                if (lines[j].StartsWith("Index Cond:", StringComparison.Ordinal)) condition = lines[j];
+            reads.Add(new IndexRead(node.Groups["index"].Value, table, condition));
+        }
+        return reads;
     }
 
     [Fact]

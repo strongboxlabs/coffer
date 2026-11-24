@@ -73,7 +73,8 @@ api_shard() {
 }
 importer_shard() {
     dotnet test tests/Importer.Moneydance.Tests/Importer.Moneydance.Tests.csproj \
-        --configuration Release --no-build --logger "console;verbosity=minimal"
+        --configuration Release --no-build --filter "$IMPORTER_FILTER" \
+        --logger "console;verbosity=minimal"
 }
 
 wall_start=$(date +%s)

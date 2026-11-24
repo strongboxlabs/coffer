@@ -29,7 +29,7 @@ public sealed class ExchangeRateLookupTests : DatabaseTest
     {
     }
 
-    private static DateOnly Jan(int day) => new(2026, 1, day);
+    internal static DateOnly Jan(int day) => new(2026, 1, day);
 
     /// <summary>Counts the statements that read the rate tables.</summary>
     private sealed class RateStatements : DbCommandInterceptor
@@ -47,11 +47,13 @@ public sealed class ExchangeRateLookupTests : DatabaseTest
         }
     }
 
-    private async Task SeedAsync(SyntheticLedger ledger, Action<SeedBuilder> build)
+    private Task SeedAsync(SyntheticLedger ledger, Action<SeedBuilder> build) => SeedAsync(Db, ledger, build);
+
+    private static async Task SeedAsync(TestDatabase database, SyntheticLedger ledger, Action<SeedBuilder> build)
     {
         var seed = new SeedBuilder(ledger.LedgerId, ledger.UserId);
         build(seed);
-        await using var db = Db.NewAppDbContextAsUser(ledger.UserId);
+        await using var db = database.NewAppDbContextAsUser(ledger.UserId);
         db.FxRates.AddRange(seed.Rates);
         db.FxPairCoverage.AddRange(seed.Coverage);
         await db.SaveChangesAsync();
@@ -312,39 +314,59 @@ public sealed class ExchangeRateLookupTests : DatabaseTest
         Assert.Equal(1.2m, all.Table.Latest("GBP", "USD").Rate);
     }
 
+    /// <summary>
+    /// Each rate range is written so that it is read through the pair-day key: every day
+    /// bound is an index condition on <c>uq_fx_rates_pair_day</c>, none a filter over the
+    /// pair's whole history. Planned on a few rows with the planner's scans priced out
+    /// (<see cref="IndexOnlyPlanner"/>), so the outcome is the statement's shape, not the
+    /// table's size. That the planner picks the key over a scan at scale is checked in the
+    /// stress lane (<c>ExchangeRateRangePlanTests</c>).
+    /// </summary>
     [Fact]
-    public async Task Each_rate_range_is_read_through_the_pair_day_key_not_a_scan_of_the_table()
+    public async Task Each_rate_range_can_be_read_through_the_pair_day_key()
     {
         var ledger = await SyntheticLedger.CreateAsync(Db);
-        // Years of daily rates for several pairs, so the table is large enough that a scan
-        // of it would cost what the key avoids, and planned on fresh statistics.
-        await SeedAsync(ledger, s =>
+        await SeedDailyRatesAsync(Db, ledger, Jan(1));
+
+        var plan = await RateRangePlanAsync(Db, ledger, new IndexOnlyPlanner());
+        AssertEachDayBoundIsAKeyCondition(plan, Output);
+    }
+
+    /// <summary>A rate for each day from <paramref name="first"/> through the 20th, for
+    /// four pairs into dollars, each covered through the 20th.</summary>
+    internal static Task SeedDailyRatesAsync(TestDatabase database, SyntheticLedger ledger, DateOnly first) =>
+        SeedAsync(database, ledger, s =>
         {
             foreach (var from in new[] { "EUR", "GBP", "CHF", "JPY" })
             {
-                for (var d = new DateOnly(2021, 1, 1); d <= Jan(20); d = d.AddDays(1))
+                for (var d = first; d <= Jan(20); d = d.AddDays(1))
                     s.Fetched(from, "USD", d, 1.1m);
                 s.CoveredThrough(from, "USD", Jan(20));
             }
         });
-        await using (var conn = Db.OpenServiceConnection())
-        await using (var analyze = new Npgsql.NpgsqlCommand("ANALYZE fx_rates", conn))
-            await analyze.ExecuteNonQueryAsync();
 
+    /// <summary>The plan of one load of two days for one pair and one for another, taken
+    /// as the app takes it (<see cref="ExplainCapture"/>).</summary>
+    internal static async Task<string> RateRangePlanAsync(
+        TestDatabase database, SyntheticLedger ledger, params IInterceptor[] extra)
+    {
         var capture = new ExplainCapture
         {
             Selects = sql => sql.Contains("fx_rates", StringComparison.Ordinal), Enabled = true,
         };
-        await using (var db = Db.NewRequestDbContextAsUser(ledger.UserId, capture))
+        await using (var db = database.NewRequestDbContextAsUser(ledger.UserId, [capture, .. extra]))
         {
             var needs = NewNeeds().Add("EUR", "USD", Jan(5)).Add("EUR", "USD", Jan(9))
                 .Add("GBP", "USD", Jan(9));
             var table = await new ExchangeRateLookup(db, Clock).LoadAsync(ledger.LedgerId, needs);
             Assert.Equal(1.1m, table.RateOn("GBP", "USD", Jan(9)).Rate);
         }
+        return Assert.Single(capture.Drain()).Plan;
+    }
 
-        var plan = Assert.Single(capture.Drain()).Plan;
-        Output.WriteLine(plan);
+    internal static void AssertEachDayBoundIsAKeyCondition(string plan, ITestOutputHelper output)
+    {
+        output.WriteLine(plan);
         var lines = plan.Split('\n').Select(l => l.Trim()).ToList();
 
         // Every day bound is an index condition on the pair-day key. A bound the scan

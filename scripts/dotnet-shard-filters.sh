@@ -39,11 +39,12 @@
 # -----------------------------------------------------------------------------
 # THE COMPLEMENT PROPERTY — do not break this
 # -----------------------------------------------------------------------------
-# `rest` runs its own assigned classes AND everything the assignment does not
-# name: it excludes by name what the other shards (and itself) list, so a test
-# class added after the last rebalance falls into it AUTOMATICALLY and can never
-# be silently skipped. It runs until the next rebalance gives it a shard of its
-# own, so a rebalance is a cost matter and never a coverage one.
+# `rest` runs every class no OTHER shard names: it excludes by name what the other
+# shards list, so its own assigned classes are in it, and a test class added after
+# the last rebalance falls into it AUTOMATICALLY and can never be silently skipped.
+# It runs until the next rebalance gives it a shard of its own, so a rebalance is a
+# cost matter and never a coverage one. Its own classes are in the assignment for
+# their cost, which the rebalance packs; its filter does not need to name them.
 #
 # ONE DELIBERATE CARVE-OUT: Integration.Stress is in no shard, so those tests run
 # in no shard at all. That is intended. They are the cost/performance boundary
@@ -77,7 +78,7 @@ while IFS=$'\t' read -r _sf_shard _sf_secs _sf_class; do
     [[ -n "$_sf_shard" && -n "$_sf_class" && "$_sf_shard" != \#* ]] || continue
     _sf_short="${_sf_class#"$_sf_root"}"
     _sf_own[$_sf_shard]+="${_sf_own[$_sf_shard]:+|}FullyQualifiedName~${_sf_short}."
-    _sf_not+="${_sf_not:+&}FullyQualifiedName!~${_sf_short}."
+    [[ "$_sf_shard" == rest ]] || _sf_not+="${_sf_not:+&}FullyQualifiedName!~${_sf_short}."
 done <"$_sf_assignment"
 
 for _sf_name in trx_a trx_b trx_c feeds accounts backup ingest; do
@@ -88,8 +89,36 @@ for _sf_name in trx_a trx_b trx_c feeds accounts backup ingest; do
     printf -v "SHARD_FILTER_$_sf_name" '%s' "${_sf_own[$_sf_name]}"
 done
 
-# The complement shard: its own classes, or anything no shard names. Stress is
-# subtracted from the second part only; it is never assigned.
-SHARD_FILTER_rest="(${_sf_own[rest]:-FullyQualifiedName~Integration.NoSuchNamespace.})|(${_sf_not}&FullyQualifiedName!~Integration.Stress)"
+# The complement shard: anything no other shard names, but Stress, which is never
+# assigned.
+SHARD_FILTER_rest="${_sf_not}&FullyQualifiedName!~Integration.Stress"
 
-unset _sf_dir _sf_assignment _sf_root _sf_own _sf_not _sf_shard _sf_secs _sf_class _sf_short _sf_name
+# A filter is one command-line argument, and a Windows command line has a fixed
+# length (_sf_windows_max), all arguments together. Past that, a local run cannot
+# start the test process, and a listing of the shard comes back empty. So a partition
+# whose filter cannot fit, with room left for the rest of the dotnet test invocation
+# (_sf_limit), stops here, by name. The complement is the longest filter, one clause
+# per class the other shards hold: when this trips, shorten the clauses (a longer
+# common root), not the partition.
+_sf_windows_max=32767
+_sf_limit=$(( _sf_windows_max - 2767 ))
+for _sf_name in trx_a trx_b trx_c feeds accounts backup ingest rest; do
+    _sf_var="SHARD_FILTER_$_sf_name"
+    _sf_value="${!_sf_var}"
+    if (( ${#_sf_value} > _sf_limit )); then
+        echo "dotnet-shard-filters: shard '$_sf_name' filter is ${#_sf_value} characters," >&2
+        echo "  over $_sf_limit, so a Windows command line cannot carry it with the rest of" >&2
+        echo "  the dotnet test invocation, and the shard would list no tests." >&2
+        exit 2
+    fi
+done
+
+# The importer shard: the whole Importer.Moneydance.Tests project but its own Stress
+# namespace, the same carve-out, and run by the same lane. It is a different project, so
+# a namespace is the only partition it needs. Deliberately NOT a SHARD_FILTER_* name:
+# every SHARD_FILTER_* is an Api.Tests filter, and the shard coverage check and the
+# pre-push changed stage apply each of them to that project.
+IMPORTER_FILTER='FullyQualifiedName!~Coffer.Importer.Moneydance.Tests.Stress.'
+
+unset _sf_dir _sf_assignment _sf_root _sf_own _sf_not _sf_shard _sf_secs _sf_class _sf_short _sf_name \
+    _sf_windows_max _sf_limit _sf_var _sf_value

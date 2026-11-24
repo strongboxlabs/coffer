@@ -1,9 +1,10 @@
 using System.Net;
-using System.Diagnostics.Tracing;
+using System.Diagnostics;
 using System.Net.Http.Json;
 
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using Coffer.Api.Contracts;
@@ -263,65 +264,71 @@ public sealed class StoredNotesConsistencyTests : DatabaseTest
         }
     }
 
-    /// <summary>What a run of the check held live: at its peak, and once it returned (its report).</summary>
-    private sealed record Footprint(long Peak, long Held);
+    /// <summary>A ledger of <paramref name="pairs"/> bank-to-category transactions, two legs each.</summary>
+    private async Task<SyntheticLedger> PairsLedgerAsync(int pairs)
+    {
+        var ledger = await SyntheticLedger.CreateAsync(Db);
+        var bank = await ledger.AddBankAccountAsync("Account A");
+        var category = await ledger.AddCategoryAsync("Category A");
+        for (var i = 0; i < pairs; i++)
+            await ledger.AddTransactionPairAsync(bank.Id, category.Id, -10m - i, Utc(3, 1 + (i % 28)), payee: "Payee " + i);
+        return ledger;
+    }
 
     [Fact]
-    public async Task The_checks_peak_does_not_grow_with_the_ledger()
+    public async Task The_check_reads_the_ledger_a_chunk_at_a_time()
     {
-        // Two ledgers, one four times the other, compared a chunk at a time. Agreeing, the
-        // check holds one chunk at its peak, so the larger ledger must not double it. Drifted
-        // throughout, it returns a report naming every header; at its peak it must hold less
-        // than twice that report, so nothing is kept per leg on the way to it.
-        const int chunk = 500;
-        using var gc = new GcPeakListener();
-        var small = await SyntheticLedger.CreateAsync(Db);
-        var large = await SyntheticLedger.CreateAsync(Db);
+        // What the check holds at its peak must not grow with the ledger (CheckStoredNotesAsync),
+        // and what it can hold is what it reads. So this counts the rows every query of the check
+        // reads, on the check's own connection: no query reads more than one chunk's headers
+        // bring, however large the ledger, and a larger ledger is read in more round trips.
+        // Drifted, one query more reads the report itself (each drifted header's owning
+        // account), one row per header reported. Counts, not memory or time: the outcome is the
+        // same on every machine and under any load. The heap itself is measured, at stress
+        // size, in the stress lane (StoredNotesCheckPeakMemoryTests).
+        const int chunk = 4;
+        var small = await PairsLedgerAsync(12);
+        var large = await PairsLedgerAsync(48);
         try
         {
-            await StressLedger.SeedLedgerAsync(Db, small, new StressLedger.Scale(BankTxns: 2_000, Holdings: 2, BuysPerHolding: 2, SellsPerHolding: 1));
-            await StressLedger.SeedLedgerAsync(Db, large, new StressLedger.Scale(BankTxns: 8_000, Holdings: 2, BuysPerHolding: 2, SellsPerHolding: 1));
+            var smallBound = chunk * await RowsPerHeaderAsync(small.LedgerId);
+            var largeBound = chunk * await RowsPerHeaderAsync(large.LedgerId);
+            var smallAgreeing = await ReadsAsync(small.LedgerId, chunk);
+            var largeAgreeing = await ReadsAsync(large.LedgerId, chunk);
 
-            var (smallAgreeing, smallHeaders) = await FootprintsAsync(gc, small.LedgerId, chunk, drifted: false);
-            var (largeAgreeing, largeHeaders) = await FootprintsAsync(gc, large.LedgerId, chunk, drifted: false);
+            Assert.Equal(0, smallAgreeing.Result.Projection.MismatchedCount);
+            Assert.Equal(0, largeAgreeing.Result.Projection.MismatchedCount);
+            var smallHeaders = smallAgreeing.Result.Projection.Checked;
+            var largeHeaders = largeAgreeing.Result.Projection.Checked;
+            Assert.True(smallHeaders >= 3 * chunk, $"{smallHeaders} headers span too few chunks of {chunk}");
+            Assert.True(largeHeaders >= 3 * smallHeaders, $"{largeHeaders} headers against {smallHeaders}");
+            // The bound has teeth: the large ledger's legs alone are several times one chunk's rows.
             await using (var db = Db.NewServiceDbContext())
             {
-                var ledgers = new[] { small.LedgerId, large.LedgerId };
-                await db.TxnLegs.Where(l => ledgers.Contains(l.LedgerId))
+                var legs = await db.TxnLegs.CountAsync(l => l.LedgerId == large.LedgerId);
+                Assert.True(legs > 4 * largeBound, $"{legs} legs against a bound of {largeBound} rows a query");
+            }
+
+            AssertWithin(smallAgreeing.Reads, smallBound, "small agreeing");
+            AssertWithin(largeAgreeing.Reads, largeBound, "large agreeing");
+            Assert.True(largeAgreeing.Reads.Count >= 3 * smallAgreeing.Reads.Count,
+                $"{largeAgreeing.Reads.Count} queries for {largeHeaders} headers against {smallAgreeing.Reads.Count} "
+                + $"for {smallHeaders}: the ledger is not read a chunk at a time");
+
+            await using (var db = Db.NewServiceDbContext())
+            {
+                await db.TxnLegs.Where(l => l.LedgerId == large.LedgerId)
                     .ExecuteUpdateAsync(s => s.SetProperty(l => l.LegMemo, l => (l.LegMemo ?? "") + " written past the API"));
             }
-            var (smallDrifted, _) = await FootprintsAsync(gc, small.LedgerId, chunk, drifted: true);
-            var (largeDrifted, _) = await FootprintsAsync(gc, large.LedgerId, chunk, drifted: true);
-
-            foreach (var (name, runs) in new[]
-                     {
-                         ("small agreeing", smallAgreeing), ("large agreeing", largeAgreeing),
-                         ("small drifted", smallDrifted), ("large drifted", largeDrifted),
-                     })
-                foreach (var run in runs)
-                    Output.WriteLine($"notes-check-footprint {name}: peak={run.Peak / 1024}kB held={run.Held / 1024}kB");
-            Assert.True(largeHeaders >= 3 * smallHeaders, $"{largeHeaders} headers against {smallHeaders}");
-            Assert.True(smallHeaders >= 3 * chunk, $"{smallHeaders} headers span too few chunks of {chunk}");
-
-            var smallPeak = Median(smallAgreeing.Select(r => r.Peak));
-            var largePeak = Median(largeAgreeing.Select(r => r.Peak));
-            // A reading over-estimates the peak (garbage a young collection left alone) and
-            // never misses it, so a check that held the larger ledger shows it in EVERY run's
-            // reading: its lowest is the one to judge growth by. A busy machine inflates one
-            // run or two, and the median of three then reads that noise as growth.
-            var largeLeast = largeAgreeing.Min(r => r.Peak);
-            Assert.True(smallPeak > 0, "the collector reported nothing during the small ledger's check");
-            Assert.True(largeLeast < 2 * smallPeak,
-                $"agreeing, the check peaked at least at {largeLeast / 1024}kB over {largeHeaders} headers "
-                + $"against {smallPeak / 1024}kB over {smallHeaders}: it grows with the ledger");
-
-            var driftedPeak = Median(largeDrifted.Select(r => r.Peak));
-            var report = Median(largeDrifted.Select(r => r.Held));
-            // What it holds on the way to a report is that report plus the chunk it is
-            // working on, which is what the same check peaks at when nothing drifted.
-            Assert.True(driftedPeak < report + 3 * largePeak / 2,
-                $"drifted, the check peaked at {driftedPeak / 1024}kB for a report of {report / 1024}kB "
-                + $"and a working chunk of {largePeak / 1024}kB: it holds more than its report on the way to it");
+            var drifted = await ReadsAsync(large.LedgerId, chunk);
+            var reported = drifted.Result.Projection.MismatchedCount;
+            Assert.True(reported > largeHeaders / 2, $"{reported} of {largeHeaders} headers drifted");
+            // The recheck reads the drifted headers a chunk at a time too; only the report's
+            // own query reads more, and it reads the report.
+            var over = drifted.Reads.Where(r => r.Reads > largeBound + 1).ToList();
+            Assert.True(over.Count == 1 && over[0].Reads == reported + 1,
+                $"drifted, {over.Count} queries read more than {largeBound} rows ("
+                + string.Join(", ", over.Select(r => r.Reads - 1)) + $"); only the report's, of {reported}, may");
         }
         finally
         {
@@ -330,130 +337,94 @@ public sealed class StoredNotesConsistencyTests : DatabaseTest
         }
     }
 
-    private static long Median(IEnumerable<long> values)
+    /// <summary>The most rows any one header of the ledger owns in a table the check reads
+    /// per chunk: its legs, its tags, its legs' tags and its stored note-tag rows, together.</summary>
+    private async Task<int> RowsPerHeaderAsync(Guid ledgerId)
     {
-        var sorted = values.Order().ToList();
-        return sorted[sorted.Count / 2];
+        await using var db = Db.NewServiceDbContext();
+        return await db.TxnHeaders.Where(h => h.LedgerId == ledgerId)
+            .Select(h =>
+                db.TxnLegs.Count(l => l.HeaderId == h.Id)
+                + db.TxnHeaderTags.Count(t => t.HeaderId == h.Id)
+                + db.TxnLegTags.Count(t => db.TxnLegs.Any(l => l.Id == t.LegId && l.HeaderId == h.Id))
+                + db.TxnLegNoteTags.Count(t => t.HeaderId == h.Id))
+            .MaxAsync();
     }
 
-    /// <summary>The check over <paramref name="ledgerId"/>, once to warm up and then measured three times.</summary>
-    private async Task<(IReadOnlyList<Footprint> Runs, int Headers)> FootprintsAsync(
-        GcPeakListener gc, Guid ledgerId, int chunk, bool drifted)
+    private static void AssertWithin(IReadOnlyList<Read> reads, int bound, string run)
     {
-        var runs = new List<Footprint>();
-        var headers = 0;
-        for (var round = 0; round < 4; round++)
-        {
-            await using var db = Db.NewServiceDbContext();
-            db.Database.SetCommandTimeout(600);
-            var repo = RepoFor(db, chunk);
-            // Only figures leave the measurement: a report kept here would still be live
-            // when the next round reads its baseline.
-            var (footprint, (checkedCount, mismatched)) = await FootprintAsync(
-                gc,
-                () => repo.CheckStoredNotesAsync(ledgerId, CancellationToken.None),
-                r => (r.Projection.Checked, r.Projection.MismatchedCount));
-            Assert.True(drifted ? mismatched > checkedCount / 2 : mismatched == 0,
-                $"{mismatched} of {checkedCount} headers drifted");
-            headers = checkedCount;
-            if (round > 0) runs.Add(footprint);
-        }
-        return (runs, headers);
+        Assert.NotEmpty(reads);
+        var over = reads.Where(r => r.Reads > bound + 1).ToList();
+        Assert.True(over.Count == 0,
+            $"{run}: {over.Count} queries read more than one chunk's {bound} rows: "
+            + string.Join(", ", over.Select(r => $"{r.Reads - 1} rows")));
     }
 
-    /// <summary>
-    /// The managed heap <paramref name="work"/> holds: the largest the collector reported
-    /// after any collection it ran by itself while the work ran, and what is left once it
-    /// returns, with its result still held. In-process counters, not time.
-    /// </summary>
-    /// <remarks>
-    /// Nothing here forces a collection while the work runs: the check allocates enough
-    /// that the runtime collects on its own, many times over a ledger this size, and each
-    /// collection reports the size of every generation after it. Forced collections in a
-    /// loop would slow the work being measured several times over. The reading can include
-    /// garbage a generation-0 or -1 collection left alone, which makes it an over-estimate,
-    /// never a miss: a check that held the ledger at its peak shows it in the generations
-    /// the collector reports.
-    /// </remarks>
-    private static async Task<(Footprint Footprint, TFacts Facts)> FootprintAsync<T, TFacts>(
-        GcPeakListener gc, Func<Task<T>> work, Func<T, TFacts> facts)
-    {
-        static long Live()
-        {
-            GC.Collect(2, GCCollectionMode.Forced, blocking: true);
-            return GC.GetTotalMemory(forceFullCollection: false);
-        }
+    /// <summary>One query the check ran: how many reads its reader made, which is a reader
+    /// that ran to its end its rows and one more, the read that found the end.</summary>
+    private sealed record Read(int Reads);
 
-        // The caller holds the previous measurement's task, and through it that run's
-        // result, until it awaits this one: yielding first makes it let go.
-        await Task.Yield();
-        GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
-        GC.WaitForPendingFinalizers();
-        var baseline = Live();
-        gc.Reset();
-        var result = await work();
-        var rise = gc.Rise;
-        var held = Live();
-        var figures = facts(result);
-        return (new Footprint(Math.Max(rise, held - baseline), held - baseline), figures);
+    /// <summary>The stored-notes check over <paramref name="ledgerId"/>, and every query it ran
+    /// on its connection, the inner store's included.</summary>
+    private async Task<(LedgerConsistencyRepository.CheckResult Result, IReadOnlyList<Read> Reads)> ReadsAsync(
+        Guid ledgerId, int chunk)
+    {
+        await using var db = Db.NewServiceDbContext();
+        await db.Database.OpenConnectionAsync();
+        using var recorder = new ReaderRecorder(db.Database.GetDbConnection());
+        var result = await RepoFor(db, chunk).CheckStoredNotesAsync(ledgerId, CancellationToken.None);
+        return (result, recorder.Reads);
     }
 
     /// <summary>
-    /// The size of the managed heap, every generation together, after each collection the
-    /// runtime runs, read from its own events. The largest since <see cref="Reset"/> is
-    /// <see cref="Peak"/>. Process-wide, like the counters the footprints are taken from.
+    /// The rows every data reader on one connection read, from EF Core's own diagnostic events
+    /// (<see cref="RelationalEventId.DataReaderDisposing"/>). The check reads through two
+    /// contexts on the same connection, the second with options of its own, so an interceptor
+    /// on one context would miss the other's queries; the events carry the command, and so its
+    /// connection, for both. Queries on any other connection, another test's, are not counted.
     /// </summary>
-    private sealed class GcPeakListener : EventListener
+    private sealed class ReaderRecorder : IObserver<DiagnosticListener>, IObserver<KeyValuePair<string, object?>>, IDisposable
     {
+        private readonly System.Data.Common.DbConnection _connection;
+        private readonly List<IDisposable> _subscriptions = [];
+        private readonly List<Read> _reads = [];
         private readonly object _gate = new();
-        private long _peak;
-        private long _least = long.MaxValue;
 
-        protected override void OnEventSourceCreated(EventSource eventSource)
+        public ReaderRecorder(System.Data.Common.DbConnection connection)
         {
-            if (eventSource.Name == "Microsoft-Windows-DotNETRuntime")
-                EnableEvents(eventSource, EventLevel.Informational, (EventKeywords)0x1); // GC
+            _connection = connection;
+            var all = DiagnosticListener.AllListeners.Subscribe(this);
+            lock (_gate) _subscriptions.Add(all);
         }
 
-        protected override void OnEventWritten(EventWrittenEventArgs eventData)
+        public IReadOnlyList<Read> Reads
         {
-            if (eventData.EventName is null
-                || !eventData.EventName.StartsWith("GCHeapStats", StringComparison.Ordinal)
-                || eventData.PayloadNames is null
-                || eventData.Payload is null)
-                return;
-            long size = 0;
-            // Gen 1, 2, the large object heap and the pinned object heap: gen 0 is the
-            // allocation budget, whose size follows the machine's cache and not the check.
-            foreach (var name in new[] { "GenerationSize1", "GenerationSize2", "GenerationSize3", "GenerationSize4" })
-            {
-                var at = eventData.PayloadNames.IndexOf(name);
-                if (at >= 0) size += Convert.ToInt64(eventData.Payload[at], System.Globalization.CultureInfo.InvariantCulture);
-            }
-            lock (_gate)
-            {
-                if (size > _peak) _peak = size;
-                if (size < _least) _least = size;
-            }
+            get { lock (_gate) return [.. _reads]; }
         }
 
-        /// <summary>
-        /// How far the reported size rose above the lowest it reported since <see cref="Reset"/>.
-        /// The level the heap sits at between collections differs from one run of the test
-        /// process to the next, by several times what the check holds; the rise within a
-        /// run does not carry it.
-        /// </summary>
-        public long Rise
+        public void OnNext(DiagnosticListener listener)
         {
-            get { lock (_gate) return _peak == 0 ? 0 : _peak - _least; }
+            if (listener.Name != DbLoggerCategory.Name) return;
+            var subscription = listener.Subscribe(this, name => name == RelationalEventId.DataReaderDisposing.Name);
+            lock (_gate) _subscriptions.Add(subscription);
         }
 
-        public void Reset()
+        public void OnNext(KeyValuePair<string, object?> value)
+        {
+            if (value.Value is DataReaderDisposingEventData data && ReferenceEquals(data.Command.Connection, _connection))
+                lock (_gate) _reads.Add(new Read(data.ReadCount));
+        }
+
+        public void OnCompleted() { }
+
+        public void OnError(Exception error) { }
+
+        public void Dispose()
         {
             lock (_gate)
             {
-                _peak = 0;
-                _least = long.MaxValue;
+                foreach (var s in _subscriptions) s.Dispose();
+                _subscriptions.Clear();
             }
         }
     }

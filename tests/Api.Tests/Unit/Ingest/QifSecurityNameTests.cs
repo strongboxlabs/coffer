@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Text.RegularExpressions;
 
 using Coffer.Api.Ingest.Qif;
@@ -56,14 +55,16 @@ public sealed class QifSecurityNameTests
         }
     }
 
+    /// <summary>The answer on the hostile input. How long it takes is measured in the
+    /// stress lane (<c>QifSecurityNameCostTests</c>): a time follows the machine.</summary>
     [Fact]
-    public void A_name_of_many_parentheses_takes_linear_time()
+    public void A_name_of_many_parentheses_is_the_whole_name()
     {
-        // Two hundred thousand of them: the regex retried from each one to the end, about
-        // 2·10^10 steps. The scan reads the string once.
-        var hostile = new string('(', 200_000) + "x";
-        var watch = Stopwatch.StartNew();
+        var hostile = HostileName();
         Assert.Equal((hostile, (string?)null), QifFileProvider.SplitSecurity(hostile));
-        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(2), $"took {watch.Elapsed}");
     }
+
+    /// <summary>Two hundred thousand open parentheses: the regex retried from each one to
+    /// the end, about 2·10^10 steps. The scan reads the string once.</summary>
+    internal static string HostileName() => new string('(', 200_000) + "x";
 }

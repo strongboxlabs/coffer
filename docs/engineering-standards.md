@@ -456,6 +456,38 @@ satisfied by an empty render. The predicate is exact, so there is nothing to sup
 unmodified code" is undecidable in general and a mechanical approximation produces far
 more noise than signal — a gate that cries wolf is one someone turns off.
 
+### 5.0.1 A build's tests are decided by the code; measurements run on demand
+
+**A test that runs on every build passes or fails on the code alone**: the same on any
+machine, under any load, at any table size. What follows the machine or the data's size
+is a measurement, not a functional test, and it lives in a `Stress` namespace
+(`tests/Api.Tests/Integration/Stress/`, `tests/Importer.Moneydance.Tests/Stress/`), which
+no build runs; the stress lane runs it on demand. Measurements are:
+
+- **durations**: a stopwatch bound on any call, however generous;
+- **heap readings**: `GC.GetTotalMemory`, allocation or GC events;
+- **waits on the real clock**: a rate-limit window, an expiry;
+- **the planner's choice at scale**: a plan asserted on a seeded ledger and fresh statistics.
+
+Each promise a measurement guards has an every-build counterpart where the code can
+decide it, and the two name each other in their summaries:
+
+- **A bound on what a read holds** is a count of the rows each query reads, not a heap
+  reading. The stored-notes check counts its readers' rows through EF Core's diagnostic
+  events.
+- **A copy-free reader** shows by failing once its source is disposed.
+- **A statement that can use an index** is planned on a few rows with the planner's scans
+  priced out (`IndexOnlyPlanner`). Which index it uses, and which bounds are index
+  conditions, is the statement's shape. Whether the planner prefers that index at scale
+  is the measurement.
+- **A refusal that beats a timeout** is told apart by the exception's type, not the
+  elapsed time.
+- **An input that once took quadratic time** keeps its answer checked on every build.
+  Its time is a measurement.
+
+A timeout that only stops a hung test, set far above any real run, is not a measurement.
+A minimum wait the code promises (a lock held at least its bound) is functional.
+
 ### 5.1 Unit vs. integration test layout
 
 Test projects keep the two buckets in **separate sub-folders / namespaces**: `Unit/` for pure-logic tests with no I/O and mocked collaborators, `Integration/` for tests that touch a database, an HTTP host, or any other external surface. The split lets reviewers see the cost of a test at a glance and lets contributors run only what they need (`dotnet test --filter FullyQualifiedName~Unit` for the fast path).

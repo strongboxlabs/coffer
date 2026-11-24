@@ -521,9 +521,9 @@ public sealed class LedgerWriteLockTests : DatabaseTest
         await using var db = new AppDbContext(new DbContextOptionsBuilder<AppDbContext>()
             .UseNpgsql(Db.ServiceConnectionString, o => o.CommandTimeout(2)).Options);
         Assert.Equal(1_000, LedgerWriteLock.WaitMilliseconds(db));
-        var watch = Stopwatch.StartNew();
+        // Busy, not a timeout: the command timeout would cancel the statement and surface
+        // as a different exception, so the type alone says the wait ended first. No clock.
         var busy = await Assert.ThrowsAsync<LedgerWriteBusyException>(() => db.BeginLedgerWriteAsync(ledger.LedgerId));
-        Assert.True(watch.ElapsedMilliseconds < 2_000, $"refused after {watch.ElapsedMilliseconds} ms, past the command timeout");
         Assert.Equal(ledger.LedgerId, busy.LedgerId);
         Assert.Null(db.Database.CurrentTransaction);
 
